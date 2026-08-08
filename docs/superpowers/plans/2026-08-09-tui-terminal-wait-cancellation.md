@@ -140,7 +140,7 @@ Update the roadmap row for TUI event/interaction adapters to state that
 terminal observation waits now use runtime-owned cancellation and unconditional
 join semantics.
 
-- [ ] **Step 2: Run the full affected gates.**
+- [x] **Step 2: Run the full affected gates.**
 
 ```bash
 cargo test -p orca-runtime --lib -- --test-threads=1
@@ -149,7 +149,7 @@ cargo fmt --all -- --check
 git diff --check
 ```
 
-- [ ] **Step 3: Review, commit, rebase, and rerun.**
+- [x] **Step 3: Review, commit, rebase, and rerun.**
 
 Review the diff for duplicate waiter ownership, resettable cancellation,
 terminal-wins ordering, and external compatibility. Commit the slice, fetch and
