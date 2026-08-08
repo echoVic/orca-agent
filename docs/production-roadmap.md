@@ -60,6 +60,14 @@ Goal usage now share one rounded micro-dollar conversion, while the surface Goal
 accumulates outer-turn deltas to remain consistent with SQLite across resume.
 This changes no CLI, TUI, server JSONL, or persistence schema.
 
+The 2026-08-09 auto-memory governance slice now passes the owning runtime turn's
+`CancelToken` into final-response project-memory extraction. Auxiliary provider
+work and the subsequent append stop cleanly when that turn is cancelled, and
+project-memory writers serialize through the existing platform `ExclusiveFileLock`
+on a sibling lock file. Manual `/remember` behavior, memory paths, bullet format,
+and all external protocols remain unchanged; no detached memory worker or second
+memory fact source was added.
+
 The 2026-08-08 headless trajectory contract now exercises the existing default
 `128` inner-turn boundary through the real `orca exec` binary. A repeated-tool
 run emits exactly 128 admitted turns and tool terminals, returns exit code `4`

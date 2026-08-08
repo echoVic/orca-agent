@@ -532,6 +532,7 @@ impl RuntimeProviderResponseStep {
                     step_snapshot.config,
                     step_snapshot.turn_context.cwd,
                     &conversation.messages,
+                    step_snapshot.capabilities.cancel,
                     events,
                     sink,
                 )?;
@@ -844,7 +845,7 @@ mod tests {
     use orca_core::config::{
         HistoryMode, ModelRuntimeConfig, OutputFormat, ThemeName, ToolConfig, WorkflowConfig,
     };
-    use orca_core::conversation::Message;
+    use orca_core::conversation::{Conversation, Message};
     use orca_core::external_config::ExternalToolConfig;
     use orca_core::hook_types::HookConfig;
     use orca_core::mcp_types::McpServerConfig;
@@ -1378,6 +1379,100 @@ mod tests {
             matches!(&conversation.messages[0], Message::Assistant { content, tool_calls, .. }
                 if content.as_deref() == Some("done") && tool_calls.is_empty())
         );
+    }
+
+    #[test]
+    fn provider_response_step_auto_memory_honors_cancelled_turn() {
+        let _guard = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+
+        let mut config = config();
+        config.auto_memory = true;
+        let response = ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta("done".to_string())],
+            assistant_content: Some("done".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut events = EventFactory::new("provider-response-auto-memory-cancelled".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        conversation.add_user("remember the runtime ownership boundary".to_string());
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let task_registry =
+            TaskRegistry::new("provider-response-auto-memory-cancelled".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let outcome = RuntimeProviderResponseStep::new()
+            .handle(
+                runtime_response(response),
+                RuntimeProviderResponseInput {
+                    step_context,
+                    sampling_state: &mut sampling_state,
+                    io: RuntimeProviderResponseIo {
+                        events: &mut events,
+                        sink: &mut sink,
+                        conversation: &mut conversation,
+                        history_writer: None,
+                        cost_tracker: &mut cost_tracker,
+                        background_workflows: &mut background_workflows,
+                    },
+                },
+                RuntimeProviderResponseExecutors {
+                    workflow_child_executor: unused_child_executor::<
+                        crate::workflow::runner::SharedEventBuffer,
+                    >,
+                    batch_child_executor: unused_child_executor::<io::Sink>,
+                },
+            )
+            .expect("handle cancelled auto-memory response");
+
+        assert!(matches!(
+            outcome,
+            RuntimeProviderResponseOutcome::Success { .. }
+        ));
+        assert!(!home.path().join("memory").exists());
+        assert!(
+            !String::from_utf8(sink.writer_mut().clone())
+                .unwrap()
+                .contains("memory extraction failed")
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, RunConfig};
@@ -9,7 +11,11 @@ use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model;
 use orca_core::provider_types::ProviderStep;
+use orca_platform::PlatformError;
+use orca_platform::fs::ExclusiveFileLock;
 use orca_provider::{self, ProviderConfig};
+
+const MEMORY_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBlock {
@@ -155,18 +161,25 @@ pub fn extract_project_memory_with_cancel(
     else {
         return Ok(None);
     };
-    remember_project(cwd, &note).map(Some)
+    let Some(root) = memory_root() else {
+        return Err("cannot determine ORCA_HOME or home directory".to_string());
+    };
+    let path = project_memory_path(&root, cwd);
+    append_note_with_cancel(&path, &note, cancel).map(|written| written.then_some(path))
 }
 
 pub(crate) fn extract_project_memory_after_final_response(
     config: &RunConfig,
     cwd: &Path,
     messages: &[Message],
+    cancel: &CancelToken,
     events: &mut EventFactory,
     sink: &mut EventSink<impl std::io::Write>,
 ) -> Result<(), std::io::Error> {
     let provider_config = auto_memory_provider_config(config);
-    if let Err(error) = extract_project_memory(config.provider, &provider_config, cwd, messages) {
+    if let Err(error) =
+        extract_project_memory_with_cancel(config.provider, &provider_config, cwd, messages, cancel)
+    {
         sink.emit(events.error(&format!("memory extraction failed: {error}")))?;
     }
     Ok(())
@@ -221,22 +234,66 @@ fn read_trimmed(path: PathBuf) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-// Append-only file write; no lock needed in current single-session usage.
 fn append_note(path: &Path, note: &str) -> Result<(), String> {
+    append_note_with_cancel(path, note, &CancelToken::new()).map(|_| ())
+}
+
+fn append_note_with_cancel(path: &Path, note: &str, cancel: &CancelToken) -> Result<bool, String> {
     let note = note.trim();
     if note.is_empty() {
         return Err("memory note cannot be empty".to_string());
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create memory dir: {error}"))?;
+    let Some(_lock) = acquire_memory_lock(path, cancel)? else {
+        return Ok(false);
+    };
+    if cancel.is_cancelled() {
+        return Ok(false);
     }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| format!("failed to open memory file: {error}"))?;
-    writeln!(file, "- {note}").map_err(|error| format!("failed to write memory: {error}"))
+    if cancel.is_cancelled() {
+        return Ok(false);
+    }
+    writeln!(file, "- {note}").map_err(|error| format!("failed to write memory: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("failed to flush memory: {error}"))?;
+    Ok(true)
+}
+
+fn memory_lock_path(path: &Path) -> PathBuf {
+    let mut lock_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "memory".into());
+    lock_name.push(".lock");
+    path.with_file_name(lock_name)
+}
+
+fn acquire_memory_lock(
+    path: &Path,
+    cancel: &CancelToken,
+) -> Result<Option<ExclusiveFileLock>, String> {
+    let lock_path = memory_lock_path(path);
+    let deadline = Instant::now() + MEMORY_LOCK_WAIT_TIMEOUT;
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out acquiring memory lock after {}s",
+                MEMORY_LOCK_WAIT_TIMEOUT.as_secs()
+            ));
+        }
+        match ExclusiveFileLock::try_acquire(&lock_path) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(PlatformError::LockContended { .. }) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => return Err(format!("failed to acquire memory lock: {error}")),
+        }
+    }
 }
 
 fn format_messages_for_memory(messages: &[Message]) -> String {
@@ -278,8 +335,11 @@ mod tests {
     use orca_core::config::{
         HistoryMode, ModelRuntimeConfig, OutputFormat, ThemeName, ToolConfig, WorkflowConfig,
     };
+    use orca_core::event_schema::EventFactory;
+    use orca_core::event_sink::EventSink;
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
+    use orca_platform::fs::ExclusiveFileLock;
     use tempfile::TempDir;
 
     fn config() -> RunConfig {
@@ -391,5 +451,103 @@ mod tests {
         .expect("cancelled extraction");
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn final_response_memory_extraction_honors_turn_cancellation() {
+        let dir = TempDir::new().unwrap();
+        let mut conversation = Conversation::new();
+        conversation.add_user("remember the runtime ownership boundary".to_string());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let mut events = EventFactory::new("memory-cancelled-final-response".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+
+        extract_project_memory_after_final_response(
+            &config(),
+            dir.path(),
+            &conversation.messages,
+            &cancel,
+            &mut events,
+            &mut sink,
+        )
+        .expect("cancelled final-response extraction");
+
+        assert!(!dir.path().join("memory").exists());
+        assert!(sink.writer_mut().is_empty());
+    }
+
+    #[test]
+    fn memory_append_waits_for_the_shared_file_lock() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("memory.md");
+        let lock = ExclusiveFileLock::acquire(&memory_lock_path(&path)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            append_note(&writer_path, "serialized note").unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("append completes after lock release");
+        writer.join().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "- serialized note\n");
+    }
+
+    #[test]
+    fn cancelled_memory_append_releases_without_persisting() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("memory.md");
+        let lock = ExclusiveFileLock::acquire(&memory_lock_path(&path)).unwrap();
+        let cancel = CancelToken::new();
+        let writer_cancel = cancel.clone();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            append_note_with_cancel(&writer_path, "cancelled note", &writer_cancel).unwrap()
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cancel.cancel();
+        assert!(!writer.join().unwrap());
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn concurrent_memory_appends_retain_each_complete_record() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("memory.md");
+        let writers = (0..16)
+            .map(|index| {
+                let writer_path = path.clone();
+                std::thread::spawn(move || {
+                    append_note(&writer_path, &format!("concurrent note {index}"))
+                        .expect("append concurrent note");
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let mut lines = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        lines.sort();
+        let mut expected = (0..16)
+            .map(|index| format!("- concurrent note {index}"))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(lines, expected);
     }
 }
