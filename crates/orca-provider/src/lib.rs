@@ -581,9 +581,77 @@ fn current_turn_has_tool_results(conversation: &Conversation) -> bool {
         .any(|message| matches!(message, Message::Tool { .. }))
 }
 
+fn mock_repeat_read_state(conversation: &Conversation) -> Option<(usize, usize, usize)> {
+    let latest_user_index = conversation
+        .messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }))?;
+    let prompt = match &conversation.messages[latest_user_index] {
+        Message::User { content, .. } => content,
+        _ => unreachable!("latest user index must point to a user message"),
+    };
+    let requested_tools = prompt
+        .trim()
+        .strip_prefix("mock_repeat_read ")?
+        .trim()
+        .parse::<usize>()
+        .ok()?
+        .clamp(1, 256);
+    let request_number = conversation
+        .messages
+        .iter()
+        .take(latest_user_index + 1)
+        .filter(|message| {
+            matches!(
+                message,
+                Message::User { content, .. }
+                    if content.trim().starts_with("mock_repeat_read ")
+            )
+        })
+        .count();
+    let completed_tools = conversation
+        .messages
+        .iter()
+        .skip(latest_user_index + 1)
+        .filter(|message| {
+            matches!(
+                message,
+                Message::Tool { tool_call_id, .. }
+                    if tool_call_id.starts_with("mock-repeat-read-")
+            )
+        })
+        .count();
+    Some((requested_tools, request_number, completed_tools))
+}
+
 fn mock_call(conversation: &Conversation) -> ProviderResponse {
     let has_tool_results = current_turn_has_tool_results(conversation);
     let prompt = conversation.last_user_message().unwrap_or("");
+
+    if let Some((requested_tools, request_number, completed_tools)) =
+        mock_repeat_read_state(conversation)
+        && completed_tools < requested_tools
+    {
+        let tool_request = ToolRequest {
+            id: format!("mock-repeat-read-{request_number}-{}", completed_tools + 1),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("README.md".to_string()),
+            raw_arguments: Some(serde_json::json!({ "path": "README.md" }).to_string()),
+        };
+        let raw_call = RawToolCall {
+            id: tool_request.id.clone(),
+            function_name: tool_request.name.as_str().to_string(),
+            arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
+        };
+        return ProviderResponse {
+            steps: vec![ProviderStep::ToolCall(tool_request)],
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls: vec![raw_call],
+            usage: None,
+        };
+    }
 
     if prompt.trim() == "mock_provider_error" {
         return ProviderResponse {
@@ -1690,6 +1758,50 @@ mod tests {
             arguments["schema"]["properties"]["result"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn mock_repeat_read_requests_the_next_unsettled_tool() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_repeat_read 2".to_string());
+
+        let first = mock_call(&conversation);
+        assert_eq!(first.tool_calls[0].id, "mock-repeat-read-1-1");
+        conversation.add_tool_result(
+            "mock-repeat-read-1-1".to_string(),
+            "README contents".to_string(),
+        );
+
+        let second = mock_call(&conversation);
+        assert_eq!(second.tool_calls[0].id, "mock-repeat-read-1-2");
+        conversation.add_tool_result(
+            "mock-repeat-read-1-2".to_string(),
+            "README contents".to_string(),
+        );
+
+        let completed = mock_call(&conversation);
+        assert!(completed.tool_calls.is_empty());
+        assert_eq!(
+            completed.assistant_content.as_deref(),
+            Some("Mock completed after tool execution.")
+        );
+    }
+
+    #[test]
+    fn mock_repeat_read_scopes_progress_and_ids_to_each_user_request() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_repeat_read 1".to_string());
+        let first = mock_call(&conversation);
+        assert_eq!(first.tool_calls[0].id, "mock-repeat-read-1-1");
+        conversation.add_tool_result(
+            "mock-repeat-read-1-1".to_string(),
+            "README contents".to_string(),
+        );
+        conversation.add_user("mock_repeat_read 1".to_string());
+
+        let second = mock_call(&conversation);
+
+        assert_eq!(second.tool_calls[0].id, "mock-repeat-read-2-1");
     }
 
     #[test]

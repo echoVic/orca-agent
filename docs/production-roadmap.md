@@ -60,6 +60,14 @@ Goal usage now share one rounded micro-dollar conversion, while the surface Goal
 accumulates outer-turn deltas to remain consistent with SQLite across resume.
 This changes no CLI, TUI, server JSONL, or persistence schema.
 
+The 2026-08-08 headless trajectory contract now exercises the existing default
+`128` inner-turn boundary through the real `orca exec` binary. A repeated-tool
+run emits exactly 128 admitted turns and tool terminals, returns exit code `4`
+with one `session.completed(status=budget_exhausted)`, and persists the same 128
+flattened tool-terminal records without inventing an unadmitted 129th call. The
+fixture and contract use the existing controller, JSONL sink, and SessionWriter
+owners; no second trajectory source or protocol shape was added.
+
 Earlier v0.2.56 kept the executable as a thin parser and forwarding layer while
 `orca-runtime` and `orca-tui` took ownership of configuration, launch, update,
 history, trust, workflow, protocol, and worker behavior. Stateless JSONL turns

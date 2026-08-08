@@ -86,6 +86,85 @@ fn agent_loop_deepseek_without_key_fails_on_first_turn() {
 }
 
 #[test]
+fn headless_max_inner_turns_preserve_trajectory_truth() {
+    let home = tempdir().expect("temporary ORCA_HOME");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--save-history",
+            "--provider",
+            "mock",
+            "mock_repeat_read 256",
+        ])
+        .output()
+        .expect("run max-turn fixture");
+
+    assert_eq!(output.status.code(), Some(4));
+    let events = parse_jsonl(&output.stdout);
+    let started_turns = events
+        .iter()
+        .filter(|event| event["type"] == "turn.started")
+        .count();
+    assert_eq!(
+        started_turns, 128,
+        "only admitted turns belong in trajectory"
+    );
+    let completed_tools = events
+        .iter()
+        .filter(|event| event["type"] == "tool.call.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_tools.len(),
+        128,
+        "each admitted fixture turn must settle one tool call"
+    );
+    assert!(completed_tools.iter().enumerate().all(|(index, event)| {
+        event["payload"]["id"] == format!("mock-repeat-read-1-{}", index + 1)
+            && event["payload"]["status"] == "completed"
+    }));
+
+    let session_terminals = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"] == "session.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(session_terminals.len(), 1);
+    let (terminal_index, terminal) = session_terminals[0];
+    assert_eq!(terminal["payload"]["status"], "budget_exhausted");
+    assert_eq!(terminal_index, events.len() - 1);
+    let max_turn_error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("budget exhaustion should expose its terminal reason");
+    assert_eq!(max_turn_error["payload"]["message"], "max turns exhausted");
+
+    let records = parse_jsonl(&fs::read(only_session_file(home.path())).expect("read session"));
+    let tool_messages = records
+        .iter()
+        .filter(|record| {
+            record["type"] == "conversation.message" && record["message"]["role"] == "tool"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 128);
+    assert!(tool_messages.iter().enumerate().all(|(index, record)| {
+        record["message"]["tool_call_id"] == format!("mock-repeat-read-1-{}", index + 1)
+    }));
+    assert!(tool_messages.iter().all(|record| {
+        record["message"]["status"] == "completed"
+            && record["message"]["kind"] == "success"
+            && record["message"]["exit_code"] == 0
+    }));
+    assert!(records.iter().all(|record| {
+        record["message"]["tool_call_id"]
+            .as_str()
+            .is_none_or(|id| id != "mock-repeat-read-1-129")
+    }));
+}
+
+#[test]
 fn failed_multi_call_turn_has_one_terminal_per_assistant_call() {
     let home = tempdir().expect("temporary ORCA_HOME");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
