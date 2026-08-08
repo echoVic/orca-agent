@@ -1222,9 +1222,15 @@ The deeper July 9 reference pass changes the next refactor order:
    the same id
    discipline through `mcp_elicitation_request`, `mcp_elicitation/respond`, and
    `mcp_elicitation_resolved`, so remote and bridge clients can drive the same
-   waiting interaction without a TUI-local queue. Next decide whether SSE needs
-   an equivalent streaming request channel before exposing full transport
-   parity.
+   waiting interaction without a TUI-local queue. SSE tool calls now consume
+   bounded response streams message-by-message, route `elicitation/create`
+   through that same typed handler, POST the matching JSON-RPC accept/decline
+   response, and only then return the terminal tool result. Cancellation still
+   closes and joins the request worker, while JSON response bodies remain
+   compatible. Transport accept/decline/malformed/timeout/cancellation tests
+   and runtime MCP interaction contracts cover the parity boundary. A
+   long-lived GET subscription remains out of scope until a user-visible
+   server-push need justifies its additional connection owner.
 5. **P2: Make skills/plugins a manifest-backed capability source only after
    policy and protocol owners are stable.** Codex's skills, connectors, and
    plugin managers are valuable, but adopting them before compaction, exec

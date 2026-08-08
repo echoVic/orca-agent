@@ -21,6 +21,27 @@ const STDIO_RESPONSE_QUEUE_CAPACITY: usize = 8;
 const MAX_STDIO_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_RESPONSE_BYTES: usize = 1024 * 1024;
 
+struct SseElicitationEnvelope {
+    request: Value,
+    response: tokio::sync::oneshot::Sender<Value>,
+}
+
+struct SseRequestContext {
+    endpoint: String,
+    headers: HashMap<String, String>,
+    id: u64,
+    method: String,
+    timeout: Duration,
+}
+
+struct SseAsyncRequest {
+    client: reqwest::Client,
+    context: SseRequestContext,
+    params: Value,
+    cancel: Arc<AtomicBool>,
+    elicitation_sender: mpsc::Sender<SseElicitationEnvelope>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpElicitationMode {
     Form,
@@ -641,6 +662,25 @@ fn mcp_elicitation_response_to_json(response: McpElicitationResponse) -> Value {
     }
 }
 
+fn mcp_elicitation_jsonrpc_response(request: &Value, response: McpElicitationResponse) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(Value::Null),
+        "result": mcp_elicitation_response_to_json(response)
+    })
+}
+
+fn mcp_jsonrpc_error_response(request: &Value, code: i64, message: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(Value::Null),
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+}
+
 fn write_json_line(stdin: &mut ChildStdin, message: &Value) -> Result<(), String> {
     let mut line = serde_json::to_vec(message).map_err(|error| error.to_string())?;
     line.push(b'\n');
@@ -711,6 +751,7 @@ fn kill_process_group(pid: u32) {
 }
 
 struct SseTransport {
+    server_name: String,
     endpoint: String,
     headers: HashMap<String, String>,
     next_id: Mutex<u64>,
@@ -726,6 +767,7 @@ impl SseTransport {
             .clone()
             .ok_or_else(|| format!("MCP SSE server '{}' is missing url", config.name))?;
         Ok(Self {
+            server_name: config.name.clone(),
             endpoint,
             headers: config.headers.clone(),
             next_id: Mutex::new(1),
@@ -759,13 +801,33 @@ impl McpTransport for SseTransport {
     }
 
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String> {
-        self.request_with_timeout(
+        self.request_with_timeout_or_cancel(
             "tools/call",
             json!({
                 "name": name,
                 "arguments": arguments
             }),
             self.tool_timeout,
+            None,
+            &|| false,
+        )
+    }
+
+    fn call_tool_with_elicitation_handler(
+        &self,
+        name: &str,
+        arguments: Value,
+        handler: Option<&dyn McpElicitationHandler>,
+    ) -> Result<Value, String> {
+        self.request_with_timeout_or_cancel(
+            "tools/call",
+            json!({
+                "name": name,
+                "arguments": arguments
+            }),
+            self.tool_timeout,
+            handler,
+            &|| false,
         )
     }
 
@@ -773,7 +835,7 @@ impl McpTransport for SseTransport {
         &self,
         name: &str,
         arguments: Value,
-        _handler: Option<&dyn McpElicitationHandler>,
+        handler: Option<&dyn McpElicitationHandler>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         self.request_with_timeout_or_cancel(
@@ -783,6 +845,7 @@ impl McpTransport for SseTransport {
                 "arguments": arguments
             }),
             self.tool_timeout,
+            handler,
             should_cancel,
         )
     }
@@ -796,6 +859,7 @@ impl McpTransport for SseTransport {
             "resources/list",
             json!({}),
             self.startup_timeout,
+            None,
             should_cancel,
         )
     }
@@ -812,6 +876,7 @@ impl McpTransport for SseTransport {
             "resources/templates/list",
             json!({}),
             self.startup_timeout,
+            None,
             should_cancel,
         )
     }
@@ -837,6 +902,7 @@ impl McpTransport for SseTransport {
                 "uri": uri
             }),
             self.tool_timeout,
+            None,
             should_cancel,
         )
     }
@@ -888,6 +954,7 @@ impl SseTransport {
         method: &str,
         params: Value,
         timeout: Duration,
+        handler: Option<&dyn McpElicitationHandler>,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         if should_cancel() {
@@ -896,26 +963,31 @@ impl SseTransport {
         let id = self.next_request_id()?;
         let endpoint = self.endpoint.clone();
         let headers = self.headers.clone();
+        let server_name = self.server_name.clone();
         let method = method.to_string();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = mpsc::channel();
+        let (elicitation_sender, elicitation_receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| format!("failed to start MCP SSE request runtime: {error}"))
                 .and_then(|runtime| {
-                    runtime.block_on(request_sse_with_async_client(
-                        reqwest::Client::new(),
-                        endpoint,
-                        headers,
-                        id,
-                        method,
+                    runtime.block_on(request_sse_with_async_client(SseAsyncRequest {
+                        client: reqwest::Client::new(),
+                        context: SseRequestContext {
+                            endpoint,
+                            headers,
+                            id,
+                            method,
+                            timeout,
+                        },
                         params,
-                        timeout,
-                        worker_cancel,
-                    ))
+                        cancel: worker_cancel,
+                        elicitation_sender,
+                    }))
                 });
             let _ = sender.send(result);
         });
@@ -935,15 +1007,27 @@ impl SseTransport {
                     return Err("MCP SSE worker stopped before returning".to_string());
                 }
             }
+            if let Ok(envelope) = elicitation_receiver.try_recv() {
+                let response = resolve_sse_elicitation(&server_name, &envelope.request, handler);
+                let _ = envelope.response.send(response);
+                continue;
+            }
             if should_cancel() {
                 cancel.store(true, Ordering::Release);
-                let result = receiver
-                    .recv()
+                while let Ok(envelope) = elicitation_receiver.try_recv() {
+                    let _ = envelope.response.send(mcp_jsonrpc_error_response(
+                        &envelope.request,
+                        -32800,
+                        "MCP tool call cancelled".to_string(),
+                    ));
+                }
+                let result = receiver.recv();
+                let joined = worker.join();
+                if joined.is_err() {
+                    return Err("MCP SSE worker panicked during cancellation".to_string());
+                }
+                return result
                     .map_err(|_| "MCP SSE worker stopped during cancellation".to_string())?;
-                worker
-                    .join()
-                    .map_err(|_| "MCP SSE worker panicked during cancellation".to_string())?;
-                return result;
             }
             match receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(result) => {
@@ -974,46 +1058,58 @@ impl SseTransport {
     }
 }
 
-async fn request_sse_with_async_client(
-    client: reqwest::Client,
-    endpoint: String,
-    headers: HashMap<String, String>,
-    id: u64,
-    method: String,
-    params: Value,
-    timeout: Duration,
-    cancel: Arc<AtomicBool>,
-) -> Result<Value, String> {
-    let mut builder = client.post(&endpoint);
-    for (key, value) in &headers {
+fn resolve_sse_elicitation(
+    server_name: &str,
+    request: &Value,
+    handler: Option<&dyn McpElicitationHandler>,
+) -> Value {
+    match mcp_elicitation_request_from_json(server_name, request) {
+        Ok(request_value) => {
+            let decision = match handler {
+                Some(handler) => handler.handle_elicitation(request_value),
+                None => Ok(McpElicitationResponse::decline()),
+            };
+            match decision {
+                Ok(response) => mcp_elicitation_jsonrpc_response(request, response),
+                Err(error) => mcp_jsonrpc_error_response(request, -32000, error),
+            }
+        }
+        Err(error) => mcp_jsonrpc_error_response(request, -32602, error),
+    }
+}
+
+async fn request_sse_with_async_client(request: SseAsyncRequest) -> Result<Value, String> {
+    let mut builder = request.client.post(&request.context.endpoint);
+    for (key, value) in &request.context.headers {
         builder = builder.header(key, value);
     }
-    let request = builder
-        .timeout(timeout)
+    let response_future = builder
+        .timeout(request.context.timeout)
         .json(&json!({
             "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
+            "id": request.context.id,
+            "method": request.context.method,
+            "params": request.params
         }))
         .send();
-    tokio::pin!(request);
+    tokio::pin!(response_future);
     let response = loop {
         tokio::select! {
-            result = &mut request => {
+            result = &mut response_future => {
                 break result.map_err(|error| {
                     if error.is_timeout() {
                         format!(
-                            "MCP SSE request '{method}' timed out after {}",
-                            format_duration(timeout)
+                            "MCP SSE request '{}' timed out after {}",
+                            request.context.method,
+                            format_duration(request.context.timeout)
                         )
                     } else {
-                        format!("MCP SSE request '{method}' failed: {error}")
+                        format!("MCP SSE request '{}' failed: {error}", request.context.method)
                     }
                 })?;
             }
             _ = tokio::time::sleep(Duration::from_millis(25)) => {
-                if cancel.load(Ordering::Acquire) {
+                if request.cancel.load(Ordering::Acquire) {
                     return Err("MCP tool call cancelled".to_string());
                 }
             }
@@ -1022,11 +1118,155 @@ async fn request_sse_with_async_client(
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("MCP SSE request '{method}' failed with {status}"));
+        return Err(format!(
+            "MCP SSE request '{}' failed with {status}",
+            request.context.method
+        ));
     }
-    let text = read_bounded_async_sse_response(response, &cancel).await?;
-    let response = parse_sse_or_json_response(&text)
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"))
+    {
+        let text = read_bounded_async_sse_response(response, &request.cancel).await?;
+        return parse_terminal_sse_message(&text, &request.context.method, request.context.id);
+    }
+    read_sse_stream(
+        response,
+        &request.cancel,
+        request.context,
+        request.elicitation_sender,
+    )
+    .await
+}
+
+async fn read_sse_stream(
+    mut response: reqwest::Response,
+    cancel: &AtomicBool,
+    context: SseRequestContext,
+    elicitation_sender: mpsc::Sender<SseElicitationEnvelope>,
+) -> Result<Value, String> {
+    let mut buffer = Vec::new();
+    let mut total = 0usize;
+    loop {
+        let chunk = tokio::select! {
+            result = response.chunk() => result
+                .map_err(|error| format!("failed to read MCP SSE response: {error}"))?,
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("MCP tool call cancelled".to_string());
+                }
+                continue;
+            }
+        };
+        let Some(chunk) = chunk else {
+            if !buffer.is_empty() {
+                let text = String::from_utf8(buffer)
+                    .map_err(|error| format!("MCP SSE response was not valid UTF-8: {error}"))?;
+                return parse_terminal_sse_message(&text, &context.method, context.id);
+            }
+            return Err(format!(
+                "MCP SSE request '{}' missing result",
+                context.method
+            ));
+        };
+        total = total.saturating_add(chunk.len());
+        if total > MAX_SSE_RESPONSE_BYTES {
+            return Err(format!(
+                "MCP SSE response exceeded maximum body size of {MAX_SSE_RESPONSE_BYTES} bytes"
+            ));
+        }
+        buffer.extend_from_slice(&chunk);
+        while let Some(end) = sse_event_end(&buffer) {
+            let event = buffer.drain(..end).collect::<Vec<_>>();
+            let Some(message) = parse_sse_event(&event)? else {
+                continue;
+            };
+            if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                elicitation_sender
+                    .send(SseElicitationEnvelope {
+                        request: message.clone(),
+                        response: sender,
+                    })
+                    .map_err(|_| "MCP SSE elicitation handler stopped".to_string())?;
+                let response = await_sse_elicitation_response(receiver, cancel).await?;
+                post_sse_message(
+                    &context.endpoint,
+                    &context.headers,
+                    response,
+                    context.timeout,
+                    cancel,
+                )
+                .await?;
+            } else if message.get("id") == Some(&Value::from(context.id)) {
+                return parse_terminal_message(message, &context.method, context.id);
+            }
+        }
+    }
+}
+
+async fn await_sse_elicitation_response(
+    mut receiver: tokio::sync::oneshot::Receiver<Value>,
+    cancel: &AtomicBool,
+) -> Result<Value, String> {
+    loop {
+        tokio::select! {
+            response = &mut receiver => {
+                return response
+                    .map_err(|_| "MCP SSE elicitation response was dropped".to_string());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("MCP tool call cancelled".to_string());
+                }
+            }
+        }
+    }
+}
+
+fn sse_event_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index + 2)
+        .or_else(|| {
+            buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+        })
+}
+
+fn parse_sse_event(event: &[u8]) -> Result<Option<Value>, String> {
+    let text = std::str::from_utf8(event).map_err(|error| error.to_string())?;
+    let data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|error| format!("invalid MCP SSE event: {error}"))
+}
+
+fn parse_terminal_sse_message(text: &str, method: &str, request_id: u64) -> Result<Value, String> {
+    let response = parse_sse_or_json_response(text)
         .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
+    parse_terminal_message(response, method, request_id)
+}
+
+fn parse_terminal_message(response: Value, method: &str, request_id: u64) -> Result<Value, String> {
+    if response.get("id") != Some(&Value::from(request_id)) {
+        return Err(format!(
+            "MCP SSE request '{method}' returned mismatched response id"
+        ));
+    }
     if let Some(error) = response.get("error") {
         return Err(format!("MCP SSE request '{method}' failed: {error}"));
     }
@@ -1034,6 +1274,40 @@ async fn request_sse_with_async_client(
         .get("result")
         .cloned()
         .ok_or_else(|| format!("MCP SSE request '{method}' missing result"))
+}
+
+async fn post_sse_message(
+    endpoint: &str,
+    headers: &HashMap<String, String>,
+    message: Value,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut builder = reqwest::Client::new().post(endpoint);
+    for (key, value) in headers {
+        builder = builder.header(key, value);
+    }
+    let response_future = builder.timeout(timeout).json(&message).send();
+    tokio::pin!(response_future);
+    let response = loop {
+        tokio::select! {
+            result = &mut response_future => {
+                break result.map_err(|error| format!("failed to write MCP SSE response: {error}"))?;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("MCP tool call cancelled".to_string());
+                }
+            }
+        }
+    };
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to write MCP SSE response: server returned {}",
+            response.status()
+        ));
+    }
+    Ok(())
 }
 
 async fn read_bounded_async_sse_response(
@@ -1104,15 +1378,7 @@ fn request_sse_with_client(
         return Err(format!("MCP SSE request '{method}' failed with {status}"));
     }
     let text = read_bounded_sse_response(response)?;
-    let response = parse_sse_or_json_response(&text)
-        .map_err(|error| format!("invalid MCP SSE response for '{method}': {error}"))?;
-    if let Some(error) = response.get("error") {
-        return Err(format!("MCP SSE request '{method}' failed: {error}"));
-    }
-    response
-        .get("result")
-        .cloned()
-        .ok_or_else(|| format!("MCP SSE request '{method}' missing result"))
+    parse_terminal_sse_message(&text, &method, id)
 }
 
 fn read_bounded_sse_response(response: reqwest::blocking::Response) -> Result<String, String> {
@@ -1985,6 +2251,196 @@ done
                 .unwrap_err()
                 .contains("MCP SSE request 'tools/call' timed out after 100ms")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sse_tool_call_routes_elicitation_request_before_final_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind elicitation SSE fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("set elicitation SSE fixture nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("elicitation SSE fixture address");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut first = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "SSE fixture did not receive tool call"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept SSE elicitation request: {error}"),
+                }
+            };
+            first
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("set first SSE read timeout");
+            let request = read_http_request(&mut first);
+            assert!(request.contains(r#""method":"tools/call""#));
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write SSE headers");
+            first
+                .write_all(
+                    br#"data: {"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create","params":{"message":"Authorize","url":"https://example.test/device","elicitationId":"device-flow"}}
+
+"#,
+                )
+                .expect("write elicitation event");
+            first.flush().expect("flush elicitation event");
+
+            let mut response = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept SSE elicitation response: {error}"),
+                }
+            };
+            let response_request = read_http_request(&mut response);
+            assert!(response_request.contains(r#""id":"prompt-1""#));
+            assert!(response_request.contains(r#""action":"accept""#));
+            write_json_response(&mut response, r#"{"jsonrpc":"2.0","result":{}}"#);
+            first
+                .write_all(
+                    br#"data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"authorized"}],"isError":false}}
+
+"#,
+                )
+                .expect("write final SSE result");
+            first.flush().expect("flush final SSE result");
+            true
+        });
+
+        let transport = connect(&McpServerConfig {
+            name: "elicits-sse".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(format!("http://{address}")),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(1_000),
+            tool_timeout_ms: Some(1_000),
+        })
+        .expect("connect SSE MCP");
+        let handler = RecordingElicitationHandler::new(McpElicitationResponse::accept(
+            serde_json::json!({"code":"1234"}),
+        ));
+        let result = transport
+            .call_tool_with_elicitation_handler(
+                "authorize",
+                Value::Object(Default::default()),
+                Some(&handler),
+            )
+            .expect("tool result after SSE elicitation");
+        assert_eq!(result["content"][0]["text"], "authorized");
+        assert_eq!(
+            handler.requests.lock().unwrap().as_slice(),
+            &[McpElicitationRequest {
+                server_name: "elicits-sse".to_string(),
+                id: "prompt-1".to_string(),
+                mode: McpElicitationMode::Url,
+                message: "Authorize".to_string(),
+                url: Some("https://example.test/device".to_string()),
+                requested_schema: None,
+            }]
+        );
+        assert!(server.join().expect("join SSE fixture"));
+    }
+
+    #[test]
+    fn sse_elicitation_without_handler_builds_decline_response() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-decline",
+            "method": "elicitation/create",
+            "params": {"message": "Authorize"}
+        });
+
+        assert_eq!(
+            mcp_elicitation_jsonrpc_response(&request, McpElicitationResponse::decline()),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "prompt-decline",
+                "result": {"action": "decline"}
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_sse_elicitation_builds_typed_json_rpc_error() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-malformed",
+            "method": "elicitation/create"
+        });
+        let error = mcp_elicitation_request_from_json("server", &request)
+            .expect_err("missing params must fail closed");
+
+        assert_eq!(
+            mcp_jsonrpc_error_response(&request, -32602, error),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "prompt-malformed",
+                "error": {
+                    "code": -32602,
+                    "message": "MCP elicitation request missing params"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn sse_elicitation_resolution_without_handler_declines_and_malformed_fails_closed() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-decline",
+            "method": "elicitation/create",
+            "params": {"message": "Authorize"}
+        });
+        assert_eq!(
+            resolve_sse_elicitation("server", &request, None),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "prompt-decline",
+                "result": {"action": "decline"}
+            })
+        );
+
+        let malformed = json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-malformed",
+            "method": "elicitation/create"
+        });
+        assert_eq!(
+            resolve_sse_elicitation("server", &malformed, None)["error"]["code"],
+            -32602
+        );
+    }
+
+    #[test]
+    fn sse_terminal_response_rejects_mismatched_request_id() {
+        let error = parse_terminal_message(
+            json!({"jsonrpc":"2.0","id":99,"result":{"ok":true}}),
+            "tools/call",
+            1,
+        )
+        .expect_err("terminal response id must match the request");
+        assert!(error.contains("mismatched response id"));
     }
 
     #[test]
