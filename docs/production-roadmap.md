@@ -1859,7 +1859,9 @@ commands and consume versioned events without owning turn execution details.
    profile overrides it. Over-broad globs without a static parent directory are
    still rejected before scanning. Session-scoped `request_permissions` network
    domain grants now persist on server threads and feed later `command/exec`
-   proxy policy; automatic ask-on-block remains a later expansion.
+   proxy policy; automatic ask-on-block now also applies when the effective
+   network policy comes from an active thread permission profile, so callers do
+   not need to repeat `permissionProfile` on every `command/exec` request.
 5. **Protocol item stream:** Codex SDK emits `thread.started`, `turn.started`,
    `item.started/updated/completed`, and terminal turn events. Orca now keeps
    legacy JSONL names stable while the server adapter emits user steer

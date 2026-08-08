@@ -1342,7 +1342,7 @@ fn run_command_exec<W: Write>(
         terminal,
         event_id: id.clone(),
     });
-    if options.permission_profile.is_some() {
+    if !effective_sandbox.network_policy_domains.is_empty() {
         let (block_sender, block_receiver) = runtime_network_block_channel();
         retry_block_reporter = Some(block_sender);
         retry_block_receiver = Some(block_receiver);
@@ -3603,6 +3603,133 @@ enabled = true
                 .iter()
                 .find(|event| event["event"] == "command_exec_completed")
                 .expect("command completed");
+            assert_eq!(completed["stdout"], "network-granted");
+            assert_eq!(completed["exitCode"], 0);
+            let read = crate::thread_store::SessionStore::new()
+                .load_session(&thread_id)
+                .expect("stored thread");
+            assert_eq!(
+                read.meta.network_domain_permissions.get("127.0.0.1"),
+                Some(&orca_core::config::PermissionProfileNetworkAccess::Allow)
+            );
+        });
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn command_exec_inherited_profile_allowlist_miss_requests_permission_and_retries() {
+        with_orca_home(|home| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+            let port = listener.local_addr().expect("server addr").port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).expect("read request") != 0 {
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 15\r\n\r\nnetwork-granted")
+                    .expect("write response");
+            });
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
+[permission_profiles.limited-network]
+extends = ":workspace"
+
+[permission_profiles.limited-network.network]
+enabled = true
+
+[permission_profiles.limited-network.network.domains]
+"api.orca.invalid" = "allow"
+"#,
+            )
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .expect("thread start");
+            let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                .into_iter()
+                .find(|event| event["event"] == "thread_started")
+                .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                .expect("thread id");
+            let turn = format!(
+                r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{thread_id}","activePermissionProfile":{{"id":"limited-network"}},"input":[{{"type":"text","text":"mock_history_echo"}}]}}}}"#
+            );
+            handle_line(&server_config, &mut state, &turn, Arc::clone(&writer))
+                .expect("start profile turn");
+            assert!(
+                wait_for_event(&writer, Duration::from_secs(3), |event| {
+                    event["event"] == "turn_completed"
+                })
+                .is_some(),
+                "profile turn should complete"
+            );
+
+            let request = test_command_exec_request(
+                "cmd-inherited-network",
+                &format!("curl --noproxy '' -sS http://127.0.0.1:{port}/"),
+                json!({"threadId": thread_id, "timeoutMs": 5000}),
+            );
+            handle_line(&server_config, &mut state, &request, Arc::clone(&writer))
+                .expect("command exec");
+            let events = drain_until_command_exec_permission_request(
+                &mut state,
+                &writer,
+                Duration::from_secs(6),
+            );
+            let permission_request = events
+                .iter()
+                .find(|event| event["event"] == "permission_request")
+                .unwrap_or_else(|| panic!("permission request; events: {events:?}"));
+            let request_id = permission_request["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_string();
+            assert_eq!(permission_request["threadId"], thread_id);
+            assert_eq!(
+                permission_request["permissions"]["network"]["domains"]["127.0.0.1"],
+                "allow"
+            );
+
+            let response = format!(
+                r#"{{"id":"perm-inherited-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"session","permissions":{{"network":{{"domains":{{"127.0.0.1":"allow"}}}}}}}}}}"#
+            );
+            handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
+                .expect("permission response");
+            server.join().expect("server joined");
+            drain_command_exec_processes_with_timeout(
+                &mut state,
+                &mut *writer.lock().expect("writer"),
+                Duration::from_secs(2),
+            )
+            .expect("drain retried process");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let completions = events
+                .iter()
+                .filter(|event| event["event"] == "command_exec_completed")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                completions.len(),
+                1,
+                "inherited profile should complete once after its retry: {events:?}"
+            );
+            let completed = completions[0];
             assert_eq!(completed["stdout"], "network-granted");
             assert_eq!(completed["exitCode"], 0);
             let read = crate::thread_store::SessionStore::new()
