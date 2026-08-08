@@ -249,12 +249,22 @@ fn append_note_with_cancel(path: &Path, note: &str, cancel: &CancelToken) -> Res
     if cancel.is_cancelled() {
         return Ok(false);
     }
+    let created = !path.exists();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| format!("failed to open memory file: {error}"))?;
     if cancel.is_cancelled() {
+        if created
+            && file
+                .metadata()
+                .map(|metadata| metadata.len() == 0)
+                .unwrap_or(false)
+        {
+            drop(file);
+            let _ = fs::remove_file(path);
+        }
         return Ok(false);
     }
     writeln!(file, "- {note}").map_err(|error| format!("failed to write memory: {error}"))?;

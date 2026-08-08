@@ -39,6 +39,7 @@ struct SseAsyncRequest {
     context: SseRequestContext,
     params: Value,
     cancel: Arc<AtomicBool>,
+    stream_events: bool,
     elicitation_sender: mpsc::Sender<SseElicitationEnvelope>,
 }
 
@@ -614,12 +615,21 @@ fn mcp_elicitation_request_from_json(
         .ok_or_else(|| "MCP elicitation request missing id".to_string())?;
     let params = message
         .get("params")
-        .ok_or_else(|| "MCP elicitation request missing params".to_string())?;
+        .ok_or_else(|| "MCP elicitation request missing params".to_string())?
+        .as_object()
+        .ok_or_else(|| "MCP elicitation request params must be an object".to_string())?;
     let message = params
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or_default()
+        .filter(|message| !message.trim().is_empty())
+        .ok_or_else(|| "MCP elicitation request missing message".to_string())?
         .to_string();
+    if params
+        .get("url")
+        .is_some_and(|url| !url.is_null() && !url.is_string())
+    {
+        return Err("MCP elicitation request url must be a string".to_string());
+    }
     let url = params
         .get("url")
         .and_then(Value::as_str)
@@ -965,6 +975,7 @@ impl SseTransport {
         let headers = self.headers.clone();
         let server_name = self.server_name.clone();
         let method = method.to_string();
+        let stream_events = method == "tools/call";
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = mpsc::channel();
@@ -986,6 +997,7 @@ impl SseTransport {
                         },
                         params,
                         cancel: worker_cancel,
+                        stream_events,
                         elicitation_sender,
                     }))
                 });
@@ -1122,6 +1134,10 @@ async fn request_sse_with_async_client(request: SseAsyncRequest) -> Result<Value
             "MCP SSE request '{}' failed with {status}",
             request.context.method
         ));
+    }
+    if !request.stream_events {
+        let text = read_bounded_async_sse_response(response, &request.cancel).await?;
+        return parse_terminal_sse_message(&text, &request.context.method, request.context.id);
     }
     if response
         .headers()
@@ -2402,6 +2418,19 @@ done
                 }
             })
         );
+
+        for params in [Value::Null, json!([]), json!({}), json!({"message": 7})] {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": "prompt-malformed-params",
+                "method": "elicitation/create",
+                "params": params,
+            });
+            assert_eq!(
+                resolve_sse_elicitation("server", &request, None)["error"]["code"],
+                -32602
+            );
+        }
     }
 
     #[test]
