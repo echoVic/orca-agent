@@ -528,11 +528,12 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         resume_source: ResumeSourceWitness,
     ) -> Result<MutationReply<ResumeOperationOutput>, SurfaceClientCommandError>;
 
-    fn wait_operation_terminal(
+    fn wait_operation_terminal_with_cancel(
         &self,
         client: RuntimeSurfaceClientHandle,
         request_id: SurfaceRequestId,
         operation_id: SurfaceOperationId,
+        caller_cancel: OptionalProcessLocalCancel,
     ) -> Result<WaitOperationTerminalResult, SurfaceClientCommandError>;
 
     fn manual_compact(
@@ -926,10 +927,28 @@ impl RuntimeSurfaceClientHandle {
         request_id: SurfaceRequestId,
         operation_id: SurfaceOperationId,
     ) -> Result<WaitOperationTerminalResult, SurfaceClientCommandError> {
+        self.wait_operation_terminal_with_cancel(
+            request_id,
+            operation_id,
+            OptionalProcessLocalCancel::new(),
+        )
+    }
+
+    pub fn wait_operation_terminal_with_cancel(
+        &self,
+        request_id: SurfaceRequestId,
+        operation_id: SurfaceOperationId,
+        caller_cancel: OptionalProcessLocalCancel,
+    ) -> Result<WaitOperationTerminalResult, SurfaceClientCommandError> {
         self.dispatcher
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
-            .wait_operation_terminal(self.clone(), request_id, operation_id)
+            .wait_operation_terminal_with_cancel(
+                self.clone(),
+                request_id,
+                operation_id,
+                caller_cancel,
+            )
     }
 
     pub fn manual_compact(

@@ -1320,6 +1320,50 @@ fn tui_pre_admission_cancel_wakes_registered_terminal_waiter() {
 }
 
 #[test]
+fn tui_terminal_wait_cancellation_retires_only_the_caller_waiter() {
+    with_orca_home(|_| {
+        let mut harness = ForegroundHarness::recorded(ExecutionBehavior::PanicIfCalled);
+        let reserved = harness.reserve("cancel only terminal waiter");
+        let operation_id = reserved.operation_id.clone();
+        let cancellation = OptionalProcessLocalCancel::new();
+
+        let wait_client = harness.client.clone();
+        let wait_operation_id = operation_id.clone();
+        let wait_cancellation = cancellation.clone();
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = wait_client.wait_operation_terminal_with_cancel(
+                request_id(),
+                wait_operation_id,
+                wait_cancellation,
+            );
+            let _ = wait_tx.send(result);
+        });
+
+        // Give the actor time to register the waiter before canceling its caller-owned signal.
+        std::thread::sleep(Duration::from_millis(50));
+        cancellation.cancel();
+        let waited = wait_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("canceled terminal waiter did not wake")
+            .expect("canceled terminal waiter failed");
+        assert!(matches!(
+            waited,
+            WaitOperationTerminalResult::WaitCancelled { operation_id: id }
+                if id == operation_id
+        ));
+
+        let terminal = match harness.cancel(operation_id.clone()) {
+            CancelOperationOutput::CancelledBeforeAdmission { terminal } => terminal,
+            _ => panic!("caller-only wait cancellation changed operation state"),
+        };
+        assert_eq!(terminal.operation_id, operation_id);
+        assert_eq!(harness.executor.call_count(), 0);
+        harness.shutdown_host();
+    });
+}
+
+#[test]
 fn tui_requested_operation_is_durably_terminalized_before_shutdown_returns() {
     #[derive(Clone, Copy)]
     enum ShutdownMode {

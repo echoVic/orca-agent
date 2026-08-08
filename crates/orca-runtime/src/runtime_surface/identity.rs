@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{Ordering, compiler_fence};
+use std::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 #[cfg(test)]
 thread_local! {
@@ -861,14 +861,20 @@ pub enum SurfaceUnavailableReason {
     RuntimeUnavailable,
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
-pub struct OptionalProcessLocalCancel(Arc<()>);
+pub struct OptionalProcessLocalCancel(Arc<AtomicBool>);
 
-#[allow(dead_code)]
 impl OptionalProcessLocalCancel {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(()))
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -1236,5 +1242,15 @@ mod tests {
         let mut bytes = vec![1, 2, 3, 4];
         zeroize_process_local_secret(&mut bytes);
         assert_eq!(bytes, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn terminal_wait_cancel_signal_is_one_shot() {
+        let signal = OptionalProcessLocalCancel::new();
+        assert!(!signal.is_cancelled());
+        signal.cancel();
+        assert!(signal.is_cancelled());
+        signal.cancel();
+        assert!(signal.is_cancelled());
     }
 }

@@ -80,18 +80,18 @@ pub(crate) struct SurfaceCommitController<
 > {
     terminals: HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
     pending_terminal_commits: HashMap<surface::SurfaceOperationId, PendingTerminal>,
-    terminal_waiters: HashMap<
-        surface::SurfaceOperationId,
-        Vec<
-            SyncSender<
-                Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
-            >,
-        >,
-    >,
+    terminal_waiters: HashMap<surface::SurfaceOperationId, Vec<SurfaceTerminalWaiter>>,
     terminalization: Option<Terminalization>,
     admission_commits: HashMap<surface::SurfaceOperationId, AdmissionCommit>,
     admission_repairs: HashMap<surface::SurfaceOperationId, AdmissionRepair>,
     admission_terminals: HashMap<surface::SurfaceOperationId, AdmissionTerminal>,
+}
+
+struct SurfaceTerminalWaiter {
+    reply: SyncSender<
+        Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
+    >,
+    caller_cancel: surface::OptionalProcessLocalCancel,
 }
 
 impl<Terminalization, AdmissionCommit, AdmissionRepair, AdmissionTerminal, PendingTerminal>
@@ -149,8 +149,8 @@ where
             .remove(&waiter_operation_id)
             .unwrap_or_default()
             .into_iter()
-            .map(|reply| RuntimeActorEffect::ReplyOperation {
-                reply,
+            .map(|waiter| RuntimeActorEffect::ReplyOperation {
+                reply: waiter.reply,
                 result: Ok(result.clone()),
                 nonblocking: false,
             })
@@ -186,11 +186,45 @@ where
         waiter: SyncSender<
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
         >,
+        caller_cancel: surface::OptionalProcessLocalCancel,
     ) {
         self.terminal_waiters
             .entry(operation_id)
             .or_default()
-            .push(waiter);
+            .push(SurfaceTerminalWaiter {
+                reply: waiter,
+                caller_cancel,
+            });
+    }
+
+    pub(crate) fn has_terminal_waiters(&self) -> bool {
+        !self.terminal_waiters.is_empty()
+    }
+
+    pub(crate) fn cancelled_terminal_waiters(&mut self) -> Vec<RuntimeActorEffect> {
+        let mut effects = Vec::new();
+        let mut remaining = HashMap::new();
+        for (operation_id, waiters) in std::mem::take(&mut self.terminal_waiters) {
+            let mut live = Vec::with_capacity(waiters.len());
+            for waiter in waiters {
+                if waiter.caller_cancel.is_cancelled() {
+                    effects.push(RuntimeActorEffect::ReplyOperation {
+                        reply: waiter.reply,
+                        result: Ok(surface::WaitOperationTerminalResult::WaitCancelled {
+                            operation_id: operation_id.clone(),
+                        }),
+                        nonblocking: true,
+                    });
+                } else {
+                    live.push(waiter);
+                }
+            }
+            if !live.is_empty() {
+                remaining.insert(operation_id, live);
+            }
+        }
+        self.terminal_waiters = remaining;
+        effects
     }
 
     #[cfg(test)]
@@ -212,6 +246,9 @@ where
         self.terminal_waiters
             .remove(operation_id)
             .unwrap_or_default()
+            .into_iter()
+            .map(|waiter| waiter.reply)
+            .collect()
     }
 
     pub(crate) fn settle_terminal_waiters(
@@ -544,7 +581,11 @@ mod tests {
         let mut trace = vec![controller.trace()];
 
         controller.retain_pending_terminal(pending_terminal_id.clone(), pending_terminal);
-        controller.register_terminal_waiter(pending_terminal_id.clone(), waiter_tx);
+        controller.register_terminal_waiter(
+            pending_terminal_id.clone(),
+            waiter_tx,
+            surface::OptionalProcessLocalCancel::new(),
+        );
         let _initial_effect = controller
             .prepare_terminalization(terminalization.clone())
             .unwrap_or_else(|_| panic!("terminalization slot should be empty"));
@@ -703,5 +744,39 @@ mod tests {
             controller.inspect_terminalization(|pending| pending.identity),
             Some(first.identity)
         );
+    }
+
+    #[test]
+    fn cancelled_terminal_waiter_is_retired() {
+        let mut controller =
+            SurfaceCommitController::<Pending, Pending, Pending, Pending, Pending>::new(
+                HashMap::new(),
+            );
+        let operation_id =
+            surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel = surface::OptionalProcessLocalCancel::new();
+        cancel.cancel();
+        controller.register_terminal_waiter(operation_id.clone(), waiter_tx, cancel);
+
+        let effects = controller.cancelled_terminal_waiters();
+        assert_eq!(controller.terminal_waiter_count(&operation_id), 0);
+        assert_eq!(effects.len(), 1);
+        match effects.into_iter().next().unwrap() {
+            RuntimeActorEffect::ReplyOperation {
+                reply,
+                result,
+                nonblocking,
+            } => {
+                assert!(nonblocking);
+                reply.send(result).unwrap();
+            }
+            _ => panic!("canceled terminal wait must reply through the actor effect"),
+        }
+        assert!(matches!(
+            waiter_rx.recv().unwrap().unwrap(),
+            surface::WaitOperationTerminalResult::WaitCancelled { operation_id: id }
+                if id == operation_id
+        ));
     }
 }

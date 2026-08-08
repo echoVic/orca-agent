@@ -12,18 +12,18 @@ use orca_runtime::surface::{
     AttachResult, BackgroundTarget, DisplayText, ExpectedGoal, FreshAttachRequest,
     GoalMutationAction, GoalRunInput, GoalTokenBudgetUpdate, MutationReply, NonEmptyText,
     NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
-    OperationRequestIntent, OperationSettingsPreparation, OperationTerminal, PinnedContextAction,
-    PinnedContextSourceRevision, PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch,
-    RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle,
-    SessionMetadataPatch, SessionMetadataPrecondition, SessionMetadataRevision, Sha256Digest,
-    StaleMutationError, SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability,
-    SurfaceCatalogEntryId, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal,
-    SurfaceGoalFence, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
-    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
-    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence,
-    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput,
-    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
-    WorkflowControlAction, WorkflowPatch,
+    OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
+    OptionalProcessLocalCancel, PinnedContextAction, PinnedContextSourceRevision,
+    PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle,
+    RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, SessionMetadataPatch,
+    SessionMetadataPrecondition, SessionMetadataRevision, Sha256Digest, StaleMutationError,
+    SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
+    SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal, SurfaceGoalFence,
+    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
+    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
+    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceUnavailableReason,
+    SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput, UncommittedMutation,
+    WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -1977,6 +1977,30 @@ fn drain_operation(
     )
 }
 
+struct TerminalWaiterGuard {
+    cancellation: OptionalProcessLocalCancel,
+    waiter: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TerminalWaiterGuard {
+    fn cancel_and_join(&mut self) {
+        self.cancellation.cancel();
+        self.join();
+    }
+
+    fn join(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            let _ = waiter.join();
+        }
+    }
+}
+
+impl Drop for TerminalWaiterGuard {
+    fn drop(&mut self) {
+        self.cancel_and_join();
+    }
+}
+
 fn drain_operation_with_boundary(
     surface: &RuntimeSurfaceHandle,
     client: &RuntimeSurfaceClientHandle,
@@ -1988,18 +2012,26 @@ fn drain_operation_with_boundary(
     defer_compacted_until_terminal: bool,
 ) -> io::Result<TuiHostedOperationOutcome> {
     let (wait_tx, wait_rx) = mpsc::bounded(1);
+    let waiter_cancellation = OptionalProcessLocalCancel::new();
+    let waiter_cancellation_for_thread = waiter_cancellation.clone();
     let waiter_client = client.clone();
     let waiter_operation_id = operation_id.clone();
     let waiter = std::thread::spawn(move || {
-        let result =
-            waiter_client.wait_operation_terminal(SurfaceRequestId::new(), waiter_operation_id);
+        let result = waiter_client.wait_operation_terminal_with_cancel(
+            SurfaceRequestId::new(),
+            waiter_operation_id,
+            waiter_cancellation_for_thread,
+        );
         let _ = wait_tx.send(result);
     });
+    let mut waiter_guard = TerminalWaiterGuard {
+        cancellation: waiter_cancellation,
+        waiter: Some(waiter),
+    };
     let mut terminal_seen = false;
     let mut sealed = false;
     let mut terminal_receipt = None;
     let mut failure: Option<io::Error> = None;
-    let mut waiter_finished = false;
     let mut projected_terminal_event = None;
     let mut projected_compacted_event = None;
     while (!terminal_seen || terminal_receipt.is_none()) && !sealed {
@@ -2143,7 +2175,6 @@ fn drain_operation_with_boundary(
             next_item = subscription.try_recv();
         }
         if let Ok(result) = wait_rx.try_recv() {
-            waiter_finished = true;
             match result {
                 Ok(WaitOperationTerminalResult::Terminal { value }) => {
                     if &value.operation_id == operation_id {
@@ -2199,7 +2230,7 @@ fn drain_operation_with_boundary(
                 status: terminal_status(terminal.terminal.clone()).to_string(),
             });
         let _ = event_tx.send(terminal_event);
-        let _ = waiter.join();
+        waiter_guard.join();
         return Ok(TuiHostedOperationOutcome::Turn {
             status: terminal_status(terminal.terminal).to_string(),
         });
@@ -2211,35 +2242,10 @@ fn drain_operation_with_boundary(
     }
     if let Some(error) = failure {
         let _ = client.cancel_operation(SurfaceRequestId::new(), operation_id.clone());
-        if !waiter_finished {
-            match wait_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(WaitOperationTerminalResult::Terminal { value }))
-                    if &value.operation_id == operation_id =>
-                {
-                    controller.complete_surface(operation_id);
-                    if let Some(compacted) = projected_compacted_event.take() {
-                        let _ = event_tx.send(compacted);
-                    }
-                    let terminal_event =
-                        projected_terminal_event.unwrap_or_else(|| TuiEvent::SessionCompleted {
-                            status: terminal_status(value.terminal.clone()).to_string(),
-                        });
-                    let _ = event_tx.send(terminal_event);
-                    let _ = waiter.join();
-                    return Ok(TuiHostedOperationOutcome::Turn {
-                        status: terminal_status(value.terminal).to_string(),
-                    });
-                }
-                Ok(_) => waiter_finished = true,
-                Err(_) => {}
-            }
-        }
-        if waiter_finished {
-            let _ = waiter.join();
-        }
+        waiter_guard.cancel_and_join();
         return Err(error);
     }
-    let _ = waiter.join();
+    waiter_guard.join();
     let terminal = terminal_receipt.expect("terminal receipt checked above");
     let status = terminal_status(terminal.terminal);
     Ok(TuiHostedOperationOutcome::Turn {

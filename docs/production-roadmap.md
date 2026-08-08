@@ -68,6 +68,14 @@ on a sibling lock file. Manual `/remember` behavior, memory paths, bullet format
 and all external protocols remain unchanged; no detached memory worker or second
 memory fact source was added.
 
+The 2026-08-09 TUI terminal-wait slice now carries a one-shot process-local
+cancellation signal through the runtime surface. Runtime-owned terminal waiters
+are retired as typed `WaitCancelled` results, terminal commits retain precedence,
+and the TUI cancels and joins every waiter before background handoff, projection
+failure, subscription sealing, or recovery failure returns. Existing convenience
+waiters remain uncancelled and source-compatible; no operation state, persistence
+record, or external protocol changed.
+
 The 2026-08-08 headless trajectory contract now exercises the existing default
 `128` inner-turn boundary through the real `orca exec` binary. A repeated-tool
 run emits exactly 128 admitted turns and tool terminals, returns exit code `4`

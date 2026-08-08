@@ -3776,6 +3776,7 @@ enum ThreadCommand {
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         operation_id: surface::SurfaceOperationId,
+        caller_cancel: surface::OptionalProcessLocalCancel,
         reply: SyncSender<
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
         >,
@@ -5204,16 +5205,18 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
         })
     }
 
-    fn wait_operation_terminal(
+    fn wait_operation_terminal_with_cancel(
         &self,
         client: surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         operation_id: surface::SurfaceOperationId,
+        caller_cancel: surface::OptionalProcessLocalCancel,
     ) -> Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError> {
         self.dispatch(|reply| ThreadCommand::SurfaceWaitOperationTerminal {
             client,
             request_id,
             operation_id,
+            caller_cancel,
             reply,
         })
     }
@@ -27011,6 +27014,7 @@ impl ThreadActor {
         &mut self,
         _request_id: surface::SurfaceRequestId,
         operation_id: surface::SurfaceOperationId,
+        caller_cancel: surface::OptionalProcessLocalCancel,
         reply: SyncSender<
             Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
         >,
@@ -27065,7 +27069,13 @@ impl ThreadActor {
         }
         self.resident_surface
             .commit
-            .register_terminal_waiter(operation_id, reply);
+            .register_terminal_waiter(operation_id, reply, caller_cancel);
+    }
+
+    fn cancel_surface_terminal_waiters(&mut self) {
+        for effect in self.resident_surface.commit.cancelled_terminal_waiters() {
+            apply_runtime_actor_reply_effect(effect);
+        }
     }
 
     fn cache_surface_terminal(&mut self, value: surface::OperationTerminalAtCursor) {
@@ -31175,6 +31185,11 @@ impl ThreadActor {
                 let reservation_expiry_at = self.next_ephemeral_reservation_expiry_at();
                 let goal_blocking_in_flight = self.goal_controller.is_blocking();
                 let has_background_tasks = !self.background_controller.is_empty();
+                let has_terminal_waiters = self
+                    .resident_surface
+                    .0
+                    .as_ref()
+                    .is_some_and(|surface| surface.commit.has_terminal_waiters());
                 tokio::select! {
                     biased;
                     _ = wait_for_surface_transition_retry(surface_retry_at) => {
@@ -31182,6 +31197,9 @@ impl ThreadActor {
                     }
                     _ = wait_for_surface_transition_retry(reservation_expiry_at) => {
                         self.expire_ephemeral_reservation();
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(25)), if has_terminal_waiters => {
+                        self.cancel_surface_terminal_waiters();
                     }
                     wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {
                         if wake.is_some()
@@ -31437,10 +31455,19 @@ impl ThreadActor {
             let surface_retry_at = self.next_surface_transition_retry_at();
             let goal_blocking_in_flight = self.goal_controller.is_blocking();
             let has_background_tasks = !self.background_controller.is_empty();
+            let has_terminal_waiters = self
+                .resident_surface
+                .0
+                .as_ref()
+                .is_some_and(|surface| surface.commit.has_terminal_waiters());
             tokio::select! {
                 biased;
                 _ = wait_for_surface_transition_retry(surface_retry_at) => {
                     self.retry_pending_surface_transition(Some(&mut active));
+                    self.active = Some(active);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)), if has_terminal_waiters => {
+                    self.cancel_surface_terminal_waiters();
                     self.active = Some(active);
                 }
                 wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {
@@ -32219,11 +32246,11 @@ impl ThreadActor {
                 client,
                 request_id,
                 operation_id,
+                caller_cancel,
                 reply,
-                ..
             } => {
                 if self.admits_surface_client(&client, surface::SurfaceCapability::ReadSnapshot) {
-                    self.wait_surface_operation(request_id, operation_id, reply);
+                    self.wait_surface_operation(request_id, operation_id, caller_cancel, reply);
                 } else {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
@@ -33050,11 +33077,11 @@ impl ThreadActor {
                 client,
                 request_id,
                 operation_id,
+                caller_cancel,
                 reply,
-                ..
             } => {
                 if self.admits_surface_client(&client, surface::SurfaceCapability::ReadSnapshot) {
-                    self.wait_surface_operation(request_id, operation_id, reply);
+                    self.wait_surface_operation(request_id, operation_id, caller_cancel, reply);
                 } else {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::Unauthorized));
                 }
