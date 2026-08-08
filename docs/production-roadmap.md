@@ -76,6 +76,12 @@ failure, subscription sealing, or recovery failure returns. Existing convenience
 waiters remain uncancelled and source-compatible; no operation state, persistence
 record, or external protocol changed.
 
+The 2026-08-09 MCP SSE wire slice adds socket-level coverage for unhandled
+elicitation decline, malformed-request `-32602` responses, and cancellation while
+the elicitation response POST is held open. Fixtures verify original request ids,
+peer closure, and final tool results while preserving the existing bounded
+single-response path for initialize, list, and resource methods.
+
 The 2026-08-08 headless trajectory contract now exercises the existing default
 `128` inner-turn boundary through the real `orca exec` binary. A repeated-tool
 run emits exactly 128 admitted turns and tool terminals, returns exit code `4`

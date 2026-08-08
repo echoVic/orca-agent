@@ -2378,6 +2378,124 @@ done
         assert!(server.join().expect("join SSE fixture"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sse_elicitation_decline_is_observed_over_wire() {
+        let (url, server) = start_sse_elicitation_wire_fixture(SseWireElicitationMode::Decline);
+        let transport = connect(&McpServerConfig {
+            name: "decline-wire".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(url),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(1_000),
+            tool_timeout_ms: Some(1_000),
+        })
+        .expect("connect decline SSE MCP");
+
+        let result = transport
+            .call_tool_with_elicitation_handler(
+                "authorize",
+                Value::Object(Default::default()),
+                None,
+            )
+            .expect("declined elicitation should still return terminal tool result");
+        assert_eq!(result["content"][0]["text"], "declined");
+
+        let SseWireFixtureObservation::TerminalResponse(observed) =
+            server.join().expect("join decline SSE fixture")
+        else {
+            panic!("decline fixture must observe a terminal response");
+        };
+        assert_eq!(observed["id"], "prompt-decline");
+        assert_eq!(observed["result"]["action"], "decline");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sse_malformed_elicitation_error_is_observed_over_wire() {
+        let (url, server) =
+            start_sse_elicitation_wire_fixture(SseWireElicitationMode::MalformedParams);
+        let transport = connect(&McpServerConfig {
+            name: "malformed-wire".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(url),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(1_000),
+            tool_timeout_ms: Some(1_000),
+        })
+        .expect("connect malformed SSE MCP");
+
+        let result = transport
+            .call_tool_with_elicitation_handler(
+                "authorize",
+                Value::Object(Default::default()),
+                None,
+            )
+            .expect("malformed elicitation should still return terminal tool result");
+        assert_eq!(result["content"][0]["text"], "malformed declined");
+
+        let SseWireFixtureObservation::TerminalResponse(observed) =
+            server.join().expect("join malformed SSE fixture")
+        else {
+            panic!("malformed fixture must observe a terminal response");
+        };
+        assert_eq!(observed["id"], "prompt-malformed");
+        assert_eq!(observed["error"]["code"], -32602);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sse_elicitation_post_cancellation_closes_peer_before_returning() {
+        let (url, server) = start_sse_elicitation_wire_fixture(SseWireElicitationMode::StallPost);
+        let transport = connect(&McpServerConfig {
+            name: "cancel-post-wire".to_string(),
+            transport: McpTransportKind::Sse,
+            command: None,
+            args: Vec::new(),
+            url: Some(url),
+            env: Default::default(),
+            headers: Default::default(),
+            disabled: false,
+            startup_timeout_ms: Some(1_000),
+            tool_timeout_ms: Some(2_000),
+        })
+        .expect("connect cancellation SSE MCP");
+        let handler = RecordingElicitationHandler::new(McpElicitationResponse::accept(
+            json!({"code":"1234"}),
+        ));
+        let started = Instant::now();
+        let result = transport.call_tool_with_elicitation_handler_or_cancel(
+            "authorize",
+            Value::Object(Default::default()),
+            Some(&handler),
+            &|| started.elapsed() >= Duration::from_millis(100),
+        );
+
+        assert_eq!(result.unwrap_err(), "MCP tool call cancelled");
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "elicitation POST cancellation took {:?}",
+            started.elapsed()
+        );
+        let SseWireFixtureObservation::PostPeerClosed(peer_closed) =
+            server.join().expect("join stalled POST fixture")
+        else {
+            panic!("stalled fixture must observe the elicitation POST peer");
+        };
+        assert!(
+            peer_closed,
+            "server did not observe the elicitation POST peer close"
+        );
+    }
+
     #[test]
     fn sse_elicitation_without_handler_builds_decline_response() {
         let request = json!({
@@ -2819,6 +2937,167 @@ done
         fn url(&self) -> String {
             format!("http://{}", self.addr)
         }
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum SseWireElicitationMode {
+        Decline,
+        MalformedParams,
+        StallPost,
+    }
+
+    #[cfg(unix)]
+    enum SseWireFixtureObservation {
+        TerminalResponse(Value),
+        PostPeerClosed(bool),
+    }
+
+    #[cfg(unix)]
+    fn start_sse_elicitation_wire_fixture(
+        mode: SseWireElicitationMode,
+    ) -> (String, std::thread::JoinHandle<SseWireFixtureObservation>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind wire SSE fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("set wire SSE fixture nonblocking");
+        let address = listener.local_addr().expect("wire SSE fixture address");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut first = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "wire fixture did not receive call"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept wire SSE call: {error}"),
+                }
+            };
+            first
+                .set_nonblocking(false)
+                .expect("set wire SSE call blocking");
+            let request = read_http_request(&mut first);
+            assert!(request.contains(r#""method":"tools/call""#));
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write wire SSE headers");
+            let event = match mode {
+                SseWireElicitationMode::Decline => json!({
+                    "jsonrpc": "2.0",
+                    "id": "prompt-decline",
+                    "method": "elicitation/create",
+                    "params": {"message": "Authorize"},
+                }),
+                SseWireElicitationMode::MalformedParams => json!({
+                    "jsonrpc": "2.0",
+                    "id": "prompt-malformed",
+                    "method": "elicitation/create",
+                    "params": null,
+                }),
+                SseWireElicitationMode::StallPost => json!({
+                    "jsonrpc": "2.0",
+                    "id": "prompt-cancel",
+                    "method": "elicitation/create",
+                    "params": {"message": "Authorize"},
+                }),
+            };
+            first
+                .write_all(format!("data: {event}\n\n").as_bytes())
+                .expect("write wire elicitation event");
+            first.flush().expect("flush wire elicitation event");
+
+            let mut response = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "wire fixture did not receive POST"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept wire SSE POST: {error}"),
+                }
+            };
+            response
+                .set_nonblocking(false)
+                .expect("set wire SSE POST blocking");
+            let response_request = read_http_request(&mut response);
+            let body = response_request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap_or_default();
+            let body = serde_json::from_str::<Value>(body).expect("parse wire elicitation body");
+            assert_eq!(body["jsonrpc"], "2.0");
+            match mode {
+                SseWireElicitationMode::Decline => {
+                    assert_eq!(body["id"], "prompt-decline");
+                    assert_eq!(body["result"]["action"], "decline");
+                    write_json_response(
+                        &mut response,
+                        r#"{"jsonrpc":"2.0","id":"prompt-decline","result":{}}"#,
+                    );
+                    first
+                        .write_all(
+                            br#"data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"declined"}],"isError":false}}
+
+"#,
+                        )
+                        .expect("write decline terminal event");
+                    first.flush().expect("flush decline terminal event");
+                    SseWireFixtureObservation::TerminalResponse(body)
+                }
+                SseWireElicitationMode::MalformedParams => {
+                    assert_eq!(body["id"], "prompt-malformed");
+                    assert_eq!(body["error"]["code"], -32602);
+                    write_json_response(
+                        &mut response,
+                        r#"{"jsonrpc":"2.0","id":"prompt-malformed","result":{}}"#,
+                    );
+                    first
+                        .write_all(
+                            br#"data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"malformed declined"}],"isError":false}}
+
+"#,
+                        )
+                        .expect("write malformed terminal event");
+                    first.flush().expect("flush malformed terminal event");
+                    SseWireFixtureObservation::TerminalResponse(body)
+                }
+                SseWireElicitationMode::StallPost => {
+                    assert_eq!(body["id"], "prompt-cancel");
+                    assert_eq!(body["result"]["action"], "accept");
+                    response
+                        .set_read_timeout(Some(Duration::from_millis(50)))
+                        .expect("set stalled POST read timeout");
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let mut byte = [0u8; 1];
+                    let peer_closed = loop {
+                        match response.read(&mut byte) {
+                            Ok(0) => break true,
+                            Ok(_) => {}
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) => {}
+                            Err(_) => break true,
+                        }
+                        if Instant::now() >= deadline {
+                            break false;
+                        }
+                    };
+                    SseWireFixtureObservation::PostPeerClosed(peer_closed)
+                }
+            }
+        });
+        (format!("http://{address}"), server)
     }
 
     fn handle_sse_fixture_request(stream: &mut TcpStream, stall_notification: bool) {
