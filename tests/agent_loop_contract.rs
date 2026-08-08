@@ -162,6 +162,55 @@ fn headless_max_inner_turns_preserve_trajectory_truth() {
             .as_str()
             .is_none_or(|id| id != "mock-repeat-read-1-129")
     }));
+
+    let streamed_terminals = completed_tools
+        .iter()
+        .map(|event| {
+            (
+                event["payload"]["id"]
+                    .as_str()
+                    .expect("streamed terminal id")
+                    .to_string(),
+                event["payload"]["status"]
+                    .as_str()
+                    .expect("streamed terminal status")
+                    .to_string(),
+                event["payload"]["kind"]
+                    .as_str()
+                    .expect("streamed terminal kind")
+                    .to_string(),
+                event["payload"]["exit_code"]
+                    .as_i64()
+                    .expect("streamed terminal exit code"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let persisted_terminals = tool_messages
+        .iter()
+        .map(|record| {
+            (
+                record["message"]["tool_call_id"]
+                    .as_str()
+                    .expect("persisted terminal id")
+                    .to_string(),
+                record["message"]["status"]
+                    .as_str()
+                    .expect("persisted terminal status")
+                    .to_string(),
+                record["message"]["kind"]
+                    .as_str()
+                    .expect("persisted terminal kind")
+                    .to_string(),
+                record["message"]["exit_code"]
+                    .as_i64()
+                    .expect("persisted terminal exit code"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        streamed_terminals, persisted_terminals,
+        "streamed and persisted terminal projections must match in order"
+    );
 }
 
 #[test]

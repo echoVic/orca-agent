@@ -90,6 +90,12 @@ flattened tool-terminal records without inventing an unadmitted 129th call. The
 fixture and contract use the existing controller, JSONL sink, and SessionWriter
 owners; no second trajectory source or protocol shape was added.
 
+The follow-up headless projection contract now compares the ordered streamed and
+persisted terminal tuples (`id`, `status`, `kind`, `exit_code`) for every one of
+those 128 calls. The real-binary boundary test therefore verifies not only
+counts and ids but also that the event and resume projections describe the same
+terminal outcomes.
+
 Earlier v0.2.56 kept the executable as a thin parser and forwarding layer while
 `orca-runtime` and `orca-tui` took ownership of configuration, launch, update,
 history, trust, workflow, protocol, and worker behavior. Stateless JSONL turns
