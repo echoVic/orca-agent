@@ -277,9 +277,16 @@ fn append_note_with_cancel_before_write(
         file.flush()
             .map_err(|error| format!("failed to flush memory: {error}"))?;
         if cancel.is_cancelled() {
-            file.set_len(original_len)
+            drop(file);
+            let rollback = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|error| format!("failed to open memory rollback: {error}"))?;
+            rollback
+                .set_len(original_len)
                 .map_err(|error| format!("failed to roll back memory: {error}"))?;
-            file.flush()
+            rollback
+                .sync_data()
                 .map_err(|error| format!("failed to flush memory rollback: {error}"))?;
             return Ok(false);
         }
