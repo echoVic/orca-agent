@@ -341,6 +341,22 @@ mod tests {
     }
 
     #[test]
+    fn decodes_kitty_ctrl_slash_sequence() {
+        let mut adapter = InputAdapter::default();
+        let events = decode(b"\x1b[47;5u")
+            .into_iter()
+            .filter_map(|event| adapter.adapt(event))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            [Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::CONTROL,
+            ))]
+        );
+    }
+
+    #[test]
     fn unknown_syntax_does_not_prime_the_next_key_as_alt() {
         let mut adapter = InputAdapter::default();
         let adapted = decode(b"\x1b]777;late\x07\r")

@@ -161,6 +161,116 @@ fn tui_restart_recovers_history_from_the_runtime_snapshot() {
     assert_eq!(status.code(), Some(130), "resumed TUI exited with {status}");
 }
 
+#[test]
+fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "main pty seed")
+        .expect("spawn parent TUI in PTY");
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "parent TUI did not complete before Side opened",
+    );
+
+    // The slash command opens the empty Side composer. The shortcut resolver is
+    // covered separately; this synthetic PTY does not emulate Kitty negotiation.
+    process
+        .write(b"/side\r")
+        .expect("open Side with slash command");
+    receive_until(
+        &process,
+        &mut output,
+        "Ctrl+/ to switch",
+        Duration::from_secs(5),
+        "TUI did not open Side",
+    );
+    process
+        .write(b"mock_history_echo\r")
+        .expect("submit Side question");
+    receive_until(
+        &process,
+        &mut output,
+        "Mock history users: main pty seed | mock_history_echo",
+        Duration::from_secs(10),
+        "Side did not inherit the parent cutover context",
+    );
+
+    // Toggling back must restore the parent projection. A parent history echo
+    // must not contain the Side-only prompt.
+    process
+        .write(b"\x1b[47;5u")
+        .expect("return to parent with Ctrl+/");
+    let parent_toggle_start = output.len();
+    receive_until_after(
+        &process,
+        &mut output,
+        "Main · Side available",
+        parent_toggle_start,
+        Duration::from_secs(5),
+        "TUI did not restore the parent while retaining Side",
+    );
+    let parent_echo_start = output.len();
+    process
+        .write(b"mock_history_echo\r")
+        .expect("submit parent history check");
+    receive_until(
+        &process,
+        &mut output,
+        "Mock history users: main pty seed | mock_history_echo",
+        Duration::from_secs(10),
+        "parent did not resume after Side toggle",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output[parent_echo_start..])
+            .contains("main pty seed | mock_history_echo | mock_history_echo"),
+        "Side prompt leaked into the parent transcript"
+    );
+
+    // Return to Side and close it. Ctrl+C owns Side cleanup and must not
+    // interrupt or close the parent.
+    let side_toggle_start = output.len();
+    process.write(b"\x1b[47;5u").expect("return to Side");
+    receive_until_after(
+        &process,
+        &mut output,
+        "Side from",
+        side_toggle_start,
+        Duration::from_secs(5),
+        "TUI did not reactivate Side",
+    );
+    process.write(&[0x03]).expect("close Side with Ctrl+C");
+    std::thread::sleep(Duration::from_millis(250));
+    process.drain_output(&mut output);
+    let parent_after_close_start = output.len();
+    process
+        .write(b"mock_history_echo\r")
+        .expect("submit after closing Side");
+    receive_until(
+        &process,
+        &mut output,
+        "Mock history users: main pty seed | mock_history_echo | mock_history_echo",
+        Duration::from_secs(10),
+        "closing Side did not restore the parent",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output[parent_after_close_start..])
+            .contains("main pty seed | mock_history_echo | mock_history_echo | mock_history_echo"),
+        "Side prompt leaked into the parent after close"
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+
+    let session_files = count_history_files(&home.path().join("sessions"));
+    assert_eq!(session_files, 1, "Side must not create a durable session");
+}
+
 struct PtyProcess {
     child: Option<Child>,
     writer: Option<File>,
@@ -428,6 +538,28 @@ fn receive_until(
     }
 }
 
+fn receive_until_after(
+    process: &PtyProcess,
+    output: &mut Vec<u8>,
+    expected: &str,
+    start: usize,
+    timeout: Duration,
+    failure: &str,
+) {
+    let deadline = Instant::now() + timeout;
+    while !contains_rendered_text(&output[start..], expected) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{failure}; output={}",
+            String::from_utf8_lossy(output)
+        );
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+}
+
 fn contains_rendered_text(output: &[u8], expected: &str) -> bool {
     let rendered = String::from_utf8_lossy(output);
     let mut cursor = 0;
@@ -438,6 +570,25 @@ fn contains_rendered_text(output: &[u8], expected: &str) -> bool {
         cursor += offset + token.len();
     }
     true
+}
+
+fn count_history_files(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                count_history_files(&path)
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                1
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 fn open_pty(columns: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
