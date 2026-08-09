@@ -3,7 +3,7 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-09
+Last updated: 2026-08-10
 Current baseline: v0.3.12 adds runtime-owned Side Conversations and strengthens
 TUI response projection boundaries. This builds on v0.3.8's remaining-context
 visibility, one-to-one

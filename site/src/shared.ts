@@ -9,7 +9,7 @@ export const releaseVersion = "v0.3.12";
 export const releases = [
   {
     version: "v0.3.12",
-    date: "2026-08-09",
+    date: "2026-08-10",
     url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.12",
   },
   {
