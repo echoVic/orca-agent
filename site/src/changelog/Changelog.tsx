@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.11":
+        "Strengthens the reliability boundary across headless, TUI, MCP, server, and automatic-memory workflows. Headless max-turn trajectories now preserve terminal truth and compare streamed projections with persisted records; terminal waiters cancel and join cleanly; MCP SSE elicitation validates requests and terminal IDs, cancels in-flight response posts, and covers decline, malformed, and wire cancellation paths; inherited network grants ask once and persist the retry; JSONL tool approvals remain runtime-owned; automatic memory writes are lock-governed and cancellation-safe; and the cross-surface contract fixtures now use deterministic local resources.",
       "v0.3.10":
         "Makes TUI interaction lifecycle runtime-owned end to end. Approvals, user input, cancellation, terminal settlement, and replay now use one typed surface rail instead of parallel client state. Goal tool Allow and Deny settle durably with exact usage; Deny pauses without executing the tool, and explicit resume starts a fresh fenced run. Session browsing ignores symlinks, FIFOs, devices, and other non-regular transcript entries, preventing special files from stalling the picker or transcript reader.",
       "v0.3.9":
@@ -578,6 +580,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.11":
+        "增强 headless、TUI、MCP、server 与自动 memory 工作流之间的可靠性边界。headless max-turn trajectory 现在保留 terminal truth，并比较 streamed projection 与持久化记录；terminal waiter 会在取消时可靠 join；MCP SSE elicitation 会校验 request 和 terminal id，取消 in-flight response POST，并覆盖 decline、malformed 与 wire cancellation；继承的 network grant 会只询问一次并持久化 retry；JSONL tool approval 继续由 runtime 统一管理；自动 memory 写入受锁保护且可安全取消；跨 surface contract fixture 也改用确定性的本地资源。",
       "v0.3.10":
         "TUI 交互生命周期现在端到端归 runtime 所有。审批、用户输入、取消、终态结算与 replay 统一通过一条 typed surface rail，不再维护并行的客户端状态。Goal 工具 Allow 与 Deny 会持久、精确地结算 usage；Deny 不执行工具并暂停 Goal，显式 resume 则启动新的 fenced run。会话浏览会忽略符号链接、FIFO、设备及其他非普通 transcript 文件，避免特殊文件卡住 picker 或历史读取。",
       "v0.3.9":
