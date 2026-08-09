@@ -14,6 +14,7 @@ use orca_core::provider_types::ProviderStep;
 use orca_platform::PlatformError;
 use orca_platform::fs::ExclusiveFileLock;
 use orca_provider::{self, ProviderConfig};
+use tempfile::NamedTempFile;
 
 const MEMORY_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -239,6 +240,15 @@ fn append_note(path: &Path, note: &str) -> Result<(), String> {
 }
 
 fn append_note_with_cancel(path: &Path, note: &str, cancel: &CancelToken) -> Result<bool, String> {
+    append_note_with_cancel_before_write(path, note, cancel, || {})
+}
+
+fn append_note_with_cancel_before_write(
+    path: &Path,
+    note: &str,
+    cancel: &CancelToken,
+    before_write: impl FnOnce(),
+) -> Result<bool, String> {
     let note = note.trim();
     if note.is_empty() {
         return Err("memory note cannot be empty".to_string());
@@ -249,27 +259,56 @@ fn append_note_with_cancel(path: &Path, note: &str, cancel: &CancelToken) -> Res
     if cancel.is_cancelled() {
         return Ok(false);
     }
-    let created = !path.exists();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("failed to open memory file: {error}"))?;
-    if cancel.is_cancelled() {
-        if created
-            && file
-                .metadata()
-                .map(|metadata| metadata.len() == 0)
-                .unwrap_or(false)
-        {
-            drop(file);
-            let _ = fs::remove_file(path);
+    if path.exists() {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|error| format!("failed to open memory file: {error}"))?;
+        let original_len = file
+            .metadata()
+            .map_err(|error| format!("failed to inspect memory file: {error}"))?
+            .len();
+        if cancel.is_cancelled() {
+            return Ok(false);
         }
+        before_write();
+        writeln!(file, "- {note}").map_err(|error| format!("failed to write memory: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("failed to flush memory: {error}"))?;
+        if cancel.is_cancelled() {
+            file.set_len(original_len)
+                .map_err(|error| format!("failed to roll back memory: {error}"))?;
+            file.flush()
+                .map_err(|error| format!("failed to flush memory rollback: {error}"))?;
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = NamedTempFile::new_in(parent)
+        .map_err(|error| format!("failed to stage memory file: {error}"))?;
+    if cancel.is_cancelled() {
         return Ok(false);
     }
+    before_write();
     writeln!(file, "- {note}").map_err(|error| format!("failed to write memory: {error}"))?;
     file.flush()
         .map_err(|error| format!("failed to flush memory: {error}"))?;
+    if cancel.is_cancelled() {
+        return Ok(false);
+    }
+    let persisted = file
+        .persist(path)
+        .map_err(|error| format!("failed to publish memory file: {error}"))?;
+    if cancel.is_cancelled() {
+        drop(persisted);
+        fs::remove_file(path).map_err(|error| format!("failed to roll back memory: {error}"))?;
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -529,6 +568,39 @@ mod tests {
         assert!(!writer.join().unwrap());
         drop(lock);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancellation_after_final_check_does_not_create_memory_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("memory.md");
+        let cancel = CancelToken::new();
+
+        let written =
+            append_note_with_cancel_before_write(&path, "cancelled note", &cancel, || {
+                cancel.cancel()
+            })
+            .unwrap();
+
+        assert!(!written);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancellation_after_final_check_rolls_back_existing_memory_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("memory.md");
+        fs::write(&path, "- existing note\n").unwrap();
+        let cancel = CancelToken::new();
+
+        let written =
+            append_note_with_cancel_before_write(&path, "cancelled note", &cancel, || {
+                cancel.cancel()
+            })
+            .unwrap();
+
+        assert!(!written);
+        assert_eq!(fs::read_to_string(path).unwrap(), "- existing note\n");
     }
 
     #[test]
