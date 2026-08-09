@@ -606,11 +606,7 @@ impl JsonlSurfaceAdapter {
                 SurfaceCapability::ManageThreadSettings,
                 SurfaceCapability::RespondGrantedInteraction,
             ]),
-            interaction_capabilities: BTreeSet::from([
-                SurfaceInteractionKind::PermissionRequest,
-                SurfaceInteractionKind::UserInput,
-                SurfaceInteractionKind::McpElicitation,
-            ]),
+            interaction_capabilities: jsonl_turn_interaction_capabilities(),
         }) {
             AttachResult::FreshAttached { attachment } => attachment,
             _ => return Err(io::Error::other("JSONL runtime surface attach failed")),
@@ -719,11 +715,7 @@ impl JsonlSurfaceAdapter {
                 SurfaceCapability::ControlBoundOperation,
                 SurfaceCapability::RespondGrantedInteraction,
             ]),
-            interaction_capabilities: BTreeSet::from([
-                SurfaceInteractionKind::PermissionRequest,
-                SurfaceInteractionKind::UserInput,
-                SurfaceInteractionKind::McpElicitation,
-            ]),
+            interaction_capabilities: jsonl_turn_interaction_capabilities(),
         }) {
             AttachResult::FreshAttached { attachment } => attachment,
             _ => {
@@ -2895,6 +2887,15 @@ fn runtime_host_error(error: RuntimeHostError) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+fn jsonl_turn_interaction_capabilities() -> BTreeSet<SurfaceInteractionKind> {
+    BTreeSet::from([
+        SurfaceInteractionKind::ToolApproval,
+        SurfaceInteractionKind::PermissionRequest,
+        SurfaceInteractionKind::UserInput,
+        SurfaceInteractionKind::McpElicitation,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -2919,6 +2920,14 @@ mod tests {
     use crate::thread::RuntimeThread;
 
     const PROJECTION_FAILURE: &str = "injected JSONL projection disconnect";
+
+    #[test]
+    fn server_turn_attachments_route_tool_approval() {
+        assert!(
+            jsonl_turn_interaction_capabilities().contains(&SurfaceInteractionKind::ToolApproval),
+            "server turn attachments must route tool approvals through JSONL"
+        );
+    }
 
     struct CancelAwareExecutor {
         entered: SyncSender<()>,

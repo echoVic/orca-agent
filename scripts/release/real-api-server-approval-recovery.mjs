@@ -172,12 +172,44 @@ async function runReal(args) {
     if (resolved.requestId !== permission.requestId) {
       throw new Error(`server permission response identity mismatch: ${JSON.stringify(resolved)}`);
     }
-    const terminal = await first.readUntil((event) => {
-      if (event.id === "turn" && event.event === "permission_request") {
-        throw new Error(`server emitted unexpected second permission request: ${JSON.stringify(event)}`);
+    let terminal;
+    for (;;) {
+      const next = await first.readUntil(
+        (event) =>
+          (event.id === "turn" && event.event === "permission_request") ||
+          (event.id === "turn" && event.event === "turn_completed"),
+        args.timeoutMs,
+        "server turn terminal",
+      );
+      if (next.event === "turn_completed") {
+        terminal = next;
+        break;
       }
-      return event.id === "turn" && event.event === "turn_completed";
-    }, args.timeoutMs, "server turn terminal");
+      const toolApproval = [...first.events]
+        .reverse()
+        .find((event) => event.id === "turn" && event.event === "tool_requested");
+      if (toolApproval?.tool !== "write_file" || !next.requestId) {
+        throw new Error(`server tool approval owner mismatch: tool=${JSON.stringify(toolApproval)} permission=${JSON.stringify(next)}`);
+      }
+      first.send({
+        id: "tool-approval",
+        method: "permission/respond",
+        params: {
+          requestId: next.requestId,
+          decision: "allow",
+          scope: "turn",
+          permissions: next.permissions,
+        },
+      });
+      const toolResolved = await first.readUntil(
+        (event) => event.id === "tool-approval" && event.event === "permission_resolved",
+        args.timeoutMs,
+        "server tool approval response",
+      );
+      if (toolResolved.requestId !== next.requestId) {
+        throw new Error(`server tool approval response identity mismatch: ${JSON.stringify(toolResolved)}`);
+      }
+    }
     const durableOutput = existsSync(outputFile) ? readFileSync(outputFile, "utf8") : null;
     if (terminal.status !== "success" || durableOutput !== token) {
       throw new Error(
