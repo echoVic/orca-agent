@@ -3469,6 +3469,7 @@ impl AppState {
                         item,
                         ChatMessage::Reasoning(_)
                             | ChatMessage::Assistant(_)
+                            | ChatMessage::AssistantChunk { .. }
                             | ChatMessage::ProposedPlan(_)
                     );
                 index += 1;
@@ -3476,6 +3477,9 @@ impl AppState {
             });
         }
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
+        // Streaming markdown may still hold an unfinished partial line from the
+        // content being replaced; drop it so the completed response renders alone.
+        self.reset_assistant_stream();
         if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
             self.push_message(ChatMessage::Reasoning(reasoning.to_string()));
         }
@@ -5353,6 +5357,72 @@ mod tests {
             Some(ChatMessage::Assistant(text)) if text == "second\n"
         ));
         assert_eq!(state.message_revisions[0], frozen_revision);
+    }
+
+    #[test]
+    fn reconcile_assistant_response_replaces_frozen_chunks_and_open_tail() {
+        let mut state = state();
+        state.push_message(ChatMessage::User("prompt".to_string()));
+        state.update(TuiEvent::MessageDelta("first paragraph\n\n".to_string()));
+        state.update(TuiEvent::MessageDelta("second paragraph".to_string()));
+        state.update(TuiEvent::ReasoningDelta("streamed thinking".to_string()));
+        assert!(matches!(
+            state.messages.as_slice(),
+            [
+                ChatMessage::User(_),
+                ChatMessage::AssistantChunk { .. },
+                ChatMessage::Assistant(_),
+                ChatMessage::Reasoning(_),
+            ]
+        ));
+
+        state.update(TuiEvent::AssistantResponseCompleted(
+            Some("full answer\n\n".to_string()),
+            Some("full reasoning".to_string()),
+        ));
+
+        // Frozen chunks and the open tail are both replaced by the completed
+        // response instead of being left to duplicate it.
+        assert!(matches!(
+            state.messages.as_slice(),
+            [
+                ChatMessage::User(_),
+                ChatMessage::Reasoning(reasoning),
+                ChatMessage::AssistantChunk {
+                    text,
+                    trailing_blank: true,
+                },
+            ] if reasoning == "full reasoning" && text == "full answer\n\n"
+        ));
+    }
+
+    #[test]
+    fn reconcile_assistant_response_drops_pending_partial_line() {
+        let mut state = state();
+        state.push_message(ChatMessage::User("prompt".to_string()));
+        // The stream ends mid-line: the assembler holds "stale tail" without any
+        // newline, so it has not been rendered as a message yet.
+        state.update(TuiEvent::MessageDelta("first paragraph\n\n".to_string()));
+        state.update(TuiEvent::MessageDelta("stale tail".to_string()));
+        assert!(matches!(
+            state.messages.as_slice(),
+            [ChatMessage::User(_), ChatMessage::AssistantChunk { .. }]
+        ));
+
+        state.update(TuiEvent::AssistantResponseCompleted(
+            Some("full answer\n\n".to_string()),
+            Some("full reasoning".to_string()),
+        ));
+
+        // The held partial line must not bleed into the completed response.
+        assert!(matches!(
+            state.messages.as_slice(),
+            [
+                ChatMessage::User(_),
+                ChatMessage::Reasoning(reasoning),
+                ChatMessage::AssistantChunk { text, .. },
+            ] if reasoning == "full reasoning" && text == "full answer\n\n"
+        ));
     }
 
     fn assistant_projection_text(messages: &[ChatMessage]) -> String {

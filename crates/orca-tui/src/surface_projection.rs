@@ -1377,12 +1377,6 @@ fn response_matches_streamed_items<'a>(
     response: &SurfaceCompletedModelResponse,
     streams: impl Iterator<Item = &'a SurfaceAssistantStream>,
 ) -> bool {
-    let streams = streams
-        .filter(|stream| {
-            stream.turn_id == response.turn_id
-                && stream.state != SurfaceAssistantStreamState::Discarded
-        })
-        .collect::<Vec<_>>();
     let expected = [
         response
             .message_item
@@ -1400,6 +1394,19 @@ fn response_matches_streamed_items<'a>(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
+    // Only streams that back this response's own items count. A logical turn can
+    // span several provider responses (tool rounds plus the final answer) that
+    // share one turn_id, so matching by turn_id alone would mix in streams from
+    // earlier responses and misjudge a streamed response as unstreamed.
+    let streams = streams
+        .filter(|stream| {
+            stream.turn_id == response.turn_id
+                && stream.state != SurfaceAssistantStreamState::Discarded
+                && expected.iter().any(|(item_id, channel, _)| {
+                    &stream.item_id == *item_id && stream.channel == *channel
+                })
+        })
+        .collect::<Vec<_>>();
 
     streams.len() == expected.len()
         && expected.iter().all(|(item_id, channel, text)| {
@@ -1447,6 +1454,75 @@ mod tests {
             thread_owner_epoch: ThreadOwnerEpoch::new(1),
             operation_id: SurfaceOperationId::try_from_bytes(uuid_v7_bytes(seed)).unwrap(),
             generation_id: SurfaceGenerationId::new(u64::from(seed)),
+        }
+    }
+
+    /// Wrap a completed response as a `ResponseCompleted` envelope with a
+    /// deterministic identity derived from `seed`.
+    fn response_completed_event_envelope(
+        fence: &SurfaceOperationFence,
+        turn_id: &SurfaceTurnId,
+        reasoning: Option<(SurfaceItemId, &str)>,
+        message: Option<(SurfaceItemId, &str)>,
+        seed: u8,
+    ) -> SurfaceEventEnvelope {
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(2).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(seed + 2)).unwrap(),
+        };
+        SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(seed)).unwrap(),
+            commit_class,
+            scope: SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            event: SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted {
+                response: SurfaceCompletedModelResponse {
+                    response_id: UuidV7::try_from_bytes(uuid_v7_bytes(seed + 1)).unwrap(),
+                    turn_id: turn_id.clone(),
+                    message_item: message.map(|(id, text)| SurfaceAssistantMessageItem {
+                        id,
+                        turn_id: turn_id.clone(),
+                        text: DisplayText::new(text),
+                        pinned: false,
+                    }),
+                    reasoning_item: reasoning.map(|(id, text)| SurfaceAssistantReasoningItem {
+                        id,
+                        turn_id: turn_id.clone(),
+                        summary: DisplayText::new(""),
+                        content: DisplayText::new(text),
+                        pinned: false,
+                    }),
+                    plan_item: None,
+                    tool_calls: Vec::new(),
+                },
+            }),
+        }
+    }
+
+    /// Build a commit batch carrying `events` (sharing the first event's commit
+    /// class) and advancing the cursor from `before` to `after`.
+    fn commit_batch_with_events(
+        before: SurfaceCursor,
+        after: SurfaceCursor,
+        events: Vec<SurfaceEventEnvelope>,
+        digest_seed: u8,
+    ) -> SurfaceCommitBatch {
+        let event_count = events.len();
+        let commit_class = events
+            .first()
+            .expect("commit batch needs at least one event")
+            .commit_class
+            .clone();
+        SurfaceCommitBatch {
+            cursor_before: before,
+            cursor_after: after,
+            commit_class,
+            event_count: u32::try_from(event_count).unwrap(),
+            batch_digest: Sha256Digest::new([digest_seed; 32]),
+            events: NonEmptyVec::try_new(events).unwrap(),
         }
     }
 
@@ -1651,6 +1727,173 @@ mod tests {
                 .values()
                 .all(|stream| stream.state == SurfaceAssistantStreamState::Completed)
         );
+    }
+
+    #[test]
+    fn completed_response_ignores_streams_from_earlier_responses_of_same_turn() {
+        let fence = operation_fence(22);
+        let turn_id = SurfaceTurnId::new();
+        let earlier_reasoning_id = SurfaceItemId::new();
+        let earlier_message_id = SurfaceItemId::new();
+        let final_message_id = SurfaceItemId::new();
+        let earlier_reasoning = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(23))
+                .expect("earlier reasoning stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: earlier_reasoning_id.clone(),
+            channel: AssistantChannel::Reasoning,
+            next_offset: ByteOffset::new(7),
+            text: DisplayText::new("tool round thinking"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let earlier_message = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(24))
+                .expect("earlier message stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: earlier_message_id.clone(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(6),
+            text: DisplayText::new("checking docs"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let mut projection = TuiSurfaceProjection::from_snapshot(
+            cursor(0, 1),
+            &[earlier_reasoning, earlier_message],
+        );
+
+        // Response 1 (a tool round) completes: its streams are marked Completed
+        // and remain in the projection; nothing is reprojected because the
+        // response was streamed.
+        let first_response = response_completed_event_envelope(
+            &fence,
+            &turn_id,
+            Some((earlier_reasoning_id, "tool round thinking")),
+            Some((earlier_message_id, "checking docs")),
+            26,
+        );
+        let first_batch = commit_batch_with_events(cursor(0, 1), cursor(1, 2), vec![first_response], 2);
+        assert!(projection.reduce_typed_batch(&first_batch).unwrap().is_empty());
+        assert!(
+            projection
+                .assistant_streams
+                .values()
+                .all(|stream| stream.state == SurfaceAssistantStreamState::Completed)
+        );
+
+        // Response 2 (the final answer) streams a message item in the same turn
+        // and then completes. Its own stream backs the item, so the full-response
+        // event must not fire even though the earlier streams are still present.
+        let final_message = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(25))
+                .expect("final message stream id"),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: final_message_id.clone(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(12),
+            text: DisplayText::new("final answer"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let opened = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(29)).unwrap(),
+            commit_class: CommitClass::Recorded {
+                thread_owner_epoch: ThreadOwnerEpoch::new(1),
+                durable_revision: DurableRevision::try_new(2).unwrap(),
+                commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(30)).unwrap(),
+            },
+            scope: SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            event: SurfaceEvent::Assistant(AssistantPatch::StreamOpened {
+                stream: final_message,
+            }),
+        };
+        let second_response = response_completed_event_envelope(
+            &fence,
+            &turn_id,
+            None,
+            Some((final_message_id, "final answer")),
+            31,
+        );
+        let second_batch = commit_batch_with_events(
+            cursor(1, 2),
+            cursor(2, 3),
+            vec![opened, second_response],
+            3,
+        );
+        assert!(projection.reduce_typed_batch(&second_batch).unwrap().is_empty());
+        assert!(
+            projection
+                .assistant_streams
+                .values()
+                .all(|stream| stream.state == SurfaceAssistantStreamState::Completed)
+        );
+    }
+
+    #[test]
+    fn unstreamed_completed_response_still_emits_full_response_event() {
+        let fence = operation_fence(42);
+        let turn_id = SurfaceTurnId::new();
+        let message_id = SurfaceItemId::new();
+        let mut projection = TuiSurfaceProjection::from_snapshot(cursor(0, 1), &[]);
+
+        // No stream ever backed this response's item (e.g. a resumed or cached
+        // response with no deltas), so the full-response event must fire for the
+        // TUI to render the completed content.
+        let event = response_completed_event_envelope(
+            &fence,
+            &turn_id,
+            None,
+            Some((message_id, "completed answer")),
+            43,
+        );
+        let batch = commit_batch_with_events(cursor(0, 1), cursor(1, 2), vec![event], 2);
+        assert!(matches!(
+            projection.reduce_typed_batch(&batch).unwrap().as_slice(),
+            [TuiEvent::AssistantResponseCompleted(Some(message), None)]
+                if message == "completed answer"
+        ));
+    }
+
+    #[test]
+    fn completed_response_without_items_ignores_earlier_streams_of_same_turn() {
+        let fence = operation_fence(32);
+        let turn_id = SurfaceTurnId::new();
+        let earlier_streams = [
+            SurfaceAssistantStream {
+                stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(33))
+                    .expect("earlier reasoning stream id"),
+                fence: fence.clone(),
+                turn_id: turn_id.clone(),
+                item_id: SurfaceItemId::new(),
+                channel: AssistantChannel::Reasoning,
+                next_offset: ByteOffset::new(7),
+                text: DisplayText::new("tool round thinking"),
+                state: SurfaceAssistantStreamState::Completed,
+            },
+            SurfaceAssistantStream {
+                stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(34))
+                    .expect("earlier message stream id"),
+                fence: fence.clone(),
+                turn_id: turn_id.clone(),
+                item_id: SurfaceItemId::new(),
+                channel: AssistantChannel::Message,
+                next_offset: ByteOffset::new(6),
+                text: DisplayText::new("checking docs"),
+                state: SurfaceAssistantStreamState::Completed,
+            },
+        ];
+        let event = response_completed_event_envelope(&fence, &turn_id, None, None, 36);
+        let batch = commit_batch_with_events(cursor(0, 1), cursor(1, 2), vec![event], 3);
+        let mut projection =
+            TuiSurfaceProjection::from_snapshot(cursor(0, 1), &earlier_streams);
+
+        // A response with no items has nothing to reproject, so the full-response
+        // event must not fire merely because unrelated same-turn streams exist.
+        assert!(projection.reduce_typed_batch(&batch).unwrap().is_empty());
     }
 
     #[test]
