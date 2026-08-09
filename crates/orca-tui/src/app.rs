@@ -8233,6 +8233,7 @@ fn hosted_tui_controller_loop(
                 let mut side_config = config.lock().unwrap().clone();
                 side_config.history_mode = HistoryMode::Disabled;
                 side_config.auto_memory = false;
+                side_config.approval_mode = orca_core::approval_types::ApprovalMode::Plan;
                 let started =
                     match host.start_side_thread(&parent, side_config.clone(), "Side conversation")
                     {

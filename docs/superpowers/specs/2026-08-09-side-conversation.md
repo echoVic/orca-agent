@@ -26,8 +26,9 @@ Orca adopts Codex's persistent-in-view switching and lifecycle fencing, plus
 Claude/Grok's explicit side-question boundary and non-main transcript. Unlike
 Claude/Grok's one-shot-only path, Orca keeps the child available for follow-up
 turns while it is visible; it remains process-local and disposable. Side tool
-use is non-mutating by default and every mutation still passes normal runtime
-permission checks.
+use is read-only. Mutation requests are refused in the Side and must be
+submitted from the main conversation, so a running parent and Side cannot race
+on workspace, git, permission, configuration, goal, or memory state.
 
 Side Conversation adds a temporary child surface that can be opened while the
 main thread is idle, running, waiting for approval, or waiting for user input.
@@ -45,8 +46,8 @@ main thread remains the source of truth for the main task and continues to run.
 - Inherited conversation context copied at the fork boundary, followed by a
   runtime-owned side boundary instruction. Inherited messages are reference
   context; only prompts submitted after the boundary are active instructions.
-- TUI actions for `/side [question]`, a configurable global toggle shortcut
-  (default `Ctrl+/`), and explicit close/cancel (`Ctrl+C` while Side is active).
+- TUI actions for `/side [question]`, the fixed `Ctrl+/` toggle shortcut, and
+  explicit close/cancel (`Ctrl+C` while Side is active).
 - A Side-only transcript view and footer status showing its parent and the
   parent's latest actionable state (`needs input`, `needs approval`,
   `running`, `finished`, `failed`, `interrupted`, or `closed`).
@@ -98,10 +99,9 @@ main thread remains the source of truth for the main task and continues to run.
 
 - `/side` opens an empty Side composer. `/side Explain the last tool error`
   opens Side and submits that question after the boundary is installed.
-- `Ctrl+/` toggles between the parent and its Side when one exists. The key is
-  configurable through the existing shortcut/keymap mechanism and is shown in
-  the footer; it is not overloaded onto interrupt (`Ctrl+C`) or search
-  (`Ctrl+F`).
+- `Ctrl+/` toggles between the parent and its Side when one exists. The fixed
+  shortcut is shown in the footer; it is not overloaded onto interrupt
+  (`Ctrl+C`) or search (`Ctrl+F`).
 - Side footer: `Side from main · main needs approval · Ctrl+/ to switch · Ctrl+C to close`.
   Parent footer while a Side exists: `Ctrl+/ for side`.
 - While a Side child is attached, Side disables destructive/navigation commands

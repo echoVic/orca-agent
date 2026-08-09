@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.12":
+        "Adds runtime-owned Side Conversations for quick questions without disturbing the main task. /side creates a separate disposable child from an atomic parent snapshot; Ctrl+/ switches between parent and Side while the parent keeps running, and Ctrl+C closes and joins only the Side. Side history, memory, goals, and transcript output never merge into the durable parent. TUI response projection also fences provider responses by turn and item identity so older or partial streams cannot overwrite the current response.",
       "v0.3.11":
         "Strengthens the reliability boundary across headless, TUI, MCP, server, and automatic-memory workflows. Headless max-turn trajectories now preserve terminal truth and compare streamed projections with persisted records; terminal waiters cancel and join cleanly; MCP SSE elicitation validates requests and terminal IDs, cancels in-flight response posts, and covers decline, malformed, and wire cancellation paths; inherited network grants ask once and persist the retry; JSONL tool approvals remain runtime-owned; automatic memory writes are lock-governed and cancellation-safe; and the cross-surface contract fixtures now use deterministic local resources.",
       "v0.3.10":
@@ -580,6 +582,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.12":
+        "新增 runtime-owned Side Conversation，用来临时提问而不打断主任务。/side 会从父会话的原子快照创建独立、可丢弃的 child；Ctrl+/ 在父会话与 Side 之间切换，父任务仍可继续运行，Ctrl+C 只关闭并回收 Side。Side 的历史、memory、Goal 和 transcript 都不会合并回持久化父会话。TUI response projection 也会按 turn 与 item identity 隔离 provider response，避免旧流或部分流覆盖当前回复。",
       "v0.3.11":
         "增强 headless、TUI、MCP、server 与自动 memory 工作流之间的可靠性边界。headless max-turn trajectory 现在保留 terminal truth，并比较 streamed projection 与持久化记录；terminal waiter 会在取消时可靠 join；MCP SSE elicitation 会校验 request 和 terminal id，取消 in-flight response POST，并覆盖 decline、malformed 与 wire cancellation；继承的 network grant 会只询问一次并持久化 retry；JSONL tool approval 继续由 runtime 统一管理；自动 memory 写入受锁保护且可安全取消；跨 surface contract fixture 也改用确定性的本地资源。",
       "v0.3.10":

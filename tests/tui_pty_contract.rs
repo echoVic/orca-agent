@@ -217,10 +217,11 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     process
         .write(b"mock_history_echo\r")
         .expect("submit parent history check");
-    receive_until(
+    receive_until_after(
         &process,
         &mut output,
         "Mock history users: main pty seed | mock_history_echo",
+        parent_echo_start,
         Duration::from_secs(10),
         "parent did not resume after Side toggle",
     );
@@ -249,10 +250,11 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     process
         .write(b"mock_history_echo\r")
         .expect("submit after closing Side");
-    receive_until(
+    receive_until_after(
         &process,
         &mut output,
         "Mock history users: main pty seed | mock_history_echo | mock_history_echo",
+        parent_after_close_start,
         Duration::from_secs(10),
         "closing Side did not restore the parent",
     );

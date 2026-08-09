@@ -3,8 +3,10 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-08
-Current baseline: v0.3.8 adds remaining-context visibility, one-to-one
+Last updated: 2026-08-09
+Current baseline: v0.3.12 adds runtime-owned Side Conversations and strengthens
+TUI response projection boundaries. This builds on v0.3.8's remaining-context
+visibility, one-to-one
 compaction replay, pending-steer recovery, durable paged subagent results,
 proactive background-task completion notices, stdio MCP reconnect, stale
 JSONL event-sequence writer rejection, and run-level workflow token budgets.
@@ -95,6 +97,24 @@ persisted terminal tuples (`id`, `status`, `kind`, `exit_code`) for every one of
 those 128 calls. The real-binary boundary test therefore verifies not only
 counts and ids but also that the event and resume projections describe the same
 terminal outcomes.
+
+The 2026-08-09 Side Conversation slice adds one runtime-owned, process-local
+`EphemeralAttached` child created from an atomic parent snapshot. `/side` opens
+the separate transcript, `Ctrl+/` switches between child and parent without
+stopping the parent's work, and `Ctrl+C` performs a bounded child shutdown and
+join before restoring the parent. Side history, goals, memory, settings, and
+tool results never merge into or create a durable parent session. Side runs in
+Plan/read-only mode, so it cannot race a running parent with workspace or git
+mutations; mutation requests must be performed from main. Parent events remain
+observable as typed status while Side is visible, navigation is rejected until
+the attached child is closed, and controller shutdown always settles the child
+before the parent. A PTY contract exercises open, independent response,
+toggle, close, continued parent input, and the single durable-session boundary.
+
+The same release fences TUI provider-response projection by logical turn,
+response item id, and channel. Reconciliation removes incomplete assistant and
+reasoning tails before replay, preventing an older response or abandoned stream
+from replacing the active response after hydration.
 
 Earlier v0.2.56 kept the executable as a thin parser and forwarding layer while
 `orca-runtime` and `orca-tui` took ownership of configuration, launch, update,
