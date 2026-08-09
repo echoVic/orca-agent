@@ -83,8 +83,10 @@ fn shutdown_attached_side_on_controller_exit(side: HostedSideParent) {
     // Always settle/join the child first, even when it is the visible
     // projection, then release the parent. No actor may be left behind on
     // TUI exit or allowed to publish late events.
-    let _ = side.side_thread.shutdown();
-    let _ = side.thread.shutdown();
+    let _ = side
+        .side_thread
+        .shutdown_with_timeout(Duration::from_secs(5));
+    let _ = side.thread.shutdown_with_timeout(Duration::from_secs(5));
 }
 
 #[derive(Default)]

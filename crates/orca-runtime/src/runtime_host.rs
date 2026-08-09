@@ -51086,11 +51086,13 @@ mod tests {
             ),
         };
         let responder = std::thread::spawn(move || {
-            if let Some(ThreadCommand::ShutdownThread {
+            while let Some(ThreadCommand::ShutdownThread {
                 reply: Some(reply), ..
             }) = command_rx.blocking_recv()
             {
-                let _ = reply.send(ThreadShutdownAck::Retry);
+                if reply.send(ThreadShutdownAck::Retry).is_err() {
+                    break;
+                }
             }
         });
         let started = Instant::now();
@@ -51104,6 +51106,7 @@ mod tests {
             RuntimeHostError::ThreadShutdownTimedOut { thread_id }
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+        drop(handle);
         responder.join().expect("retry responder");
     }
 }
