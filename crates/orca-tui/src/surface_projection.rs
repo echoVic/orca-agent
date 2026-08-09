@@ -1773,8 +1773,14 @@ mod tests {
             Some((earlier_message_id, "checking docs")),
             26,
         );
-        let first_batch = commit_batch_with_events(cursor(0, 1), cursor(1, 2), vec![first_response], 2);
-        assert!(projection.reduce_typed_batch(&first_batch).unwrap().is_empty());
+        let first_batch =
+            commit_batch_with_events(cursor(0, 1), cursor(1, 2), vec![first_response], 2);
+        assert!(
+            projection
+                .reduce_typed_batch(&first_batch)
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             projection
                 .assistant_streams
@@ -1818,13 +1824,14 @@ mod tests {
             Some((final_message_id, "final answer")),
             31,
         );
-        let second_batch = commit_batch_with_events(
-            cursor(1, 2),
-            cursor(2, 3),
-            vec![opened, second_response],
-            3,
+        let second_batch =
+            commit_batch_with_events(cursor(1, 2), cursor(2, 3), vec![opened, second_response], 3);
+        assert!(
+            projection
+                .reduce_typed_batch(&second_batch)
+                .unwrap()
+                .is_empty()
         );
-        assert!(projection.reduce_typed_batch(&second_batch).unwrap().is_empty());
         assert!(
             projection
                 .assistant_streams
@@ -1888,8 +1895,7 @@ mod tests {
         ];
         let event = response_completed_event_envelope(&fence, &turn_id, None, None, 36);
         let batch = commit_batch_with_events(cursor(0, 1), cursor(1, 2), vec![event], 3);
-        let mut projection =
-            TuiSurfaceProjection::from_snapshot(cursor(0, 1), &earlier_streams);
+        let mut projection = TuiSurfaceProjection::from_snapshot(cursor(0, 1), &earlier_streams);
 
         // A response with no items has nothing to reproject, so the full-response
         // event must not fire merely because unrelated same-turn streams exist.
