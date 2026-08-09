@@ -3462,6 +3462,39 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
     let home_path = home.path();
     let workspace = home_path.join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test server");
+    let port = listener.local_addr().expect("server addr").port();
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        listener.set_nonblocking(true)?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "timed out waiting for proxied retry",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut line = String::new();
+        while reader.read_line(&mut line)? != 0 {
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            line.clear();
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 18\r\n\r\nsession-network-ok")?;
+        Ok(())
+    });
     std::fs::write(
         home_path.join("config.toml"),
         "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"seed.orca.invalid\" = \"allow\"\n",
@@ -3503,7 +3536,7 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         let stdin = child.stdin_mut();
         let request = command_exec_request(
             "cmd-request",
-            "curl --noproxy '' -sS -D - -o /dev/null http://api.example.com/ || true",
+            &format!("curl --noproxy '' --max-time 2 -sS http://127.0.0.1:{port}/ || true"),
             "exit 0",
             json!({"threadId": thread_id, "permissionProfile": "net", "timeoutMs": 5000}),
         );
@@ -3521,7 +3554,7 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         .to_string();
     assert_eq!(permission_request["threadId"], thread_id);
     assert_eq!(
-        permission_request["permissions"]["network"]["domains"]["api.example.com"],
+        permission_request["permissions"]["network"]["domains"]["127.0.0.1"],
         "allow"
     );
 
@@ -3529,13 +3562,20 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         let stdin = child.stdin_mut();
         writeln!(
             stdin,
-            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":null,"network":{{"enabled":true,"domains":{{"api.example.com":"allow"}}}}}}}}}}"#,
+            r#"{{"id":"permission-response","method":"permission/respond","params":{{"requestId":"{}","decision":"allow","scope":"session","permissions":{{"fileSystem":null,"network":{{"enabled":true,"domains":{{"127.0.0.1":"allow"}}}}}}}}}}"#,
             request_id,
         )
         .expect("write permission/respond");
         stdin.flush().expect("flush permission/respond");
     }
     child.expect_event("permission-response", "permission_resolved");
+    server
+        .join()
+        .expect("local test server joined")
+        .expect("local test server completed");
+    let retried = child.expect_event("cmd-request", "command_exec_completed");
+    assert_eq!(retried["exitCode"], 0);
+    assert_eq!(retried["stdout"], "session-network-ok");
 
     {
         let stdin = child.stdin_mut();
@@ -3549,7 +3589,7 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
     }
     let read = child.expect_event("read", "thread_read");
     assert_eq!(read["networkDomainPermissionCount"], 1);
-    assert_eq!(read["networkDomainPermissions"]["api.example.com"], "allow");
+    assert_eq!(read["networkDomainPermissions"]["127.0.0.1"], "allow");
 
     {
         let stdin = child.stdin_mut();
@@ -3568,10 +3608,7 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         .find(|thread| thread["threadId"] == thread_id)
         .expect("listed thread");
     assert_eq!(listed["networkDomainPermissionCount"], 1);
-    assert_eq!(
-        listed["networkDomainPermissions"]["api.example.com"],
-        "allow"
-    );
+    assert_eq!(listed["networkDomainPermissions"]["127.0.0.1"], "allow");
 
     {
         let stdin = child.stdin_mut();
@@ -3584,16 +3621,32 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
         writeln!(stdin, "{request}").expect("write command/exec");
         stdin.flush().expect("flush command/exec");
     }
-    let completed = child.expect_event("cmd", "command_exec_completed");
-    child.close_stdin();
-    assert!(
-        completed["stdout"]
-            .as_str()
-            .expect("stdout")
-            .contains("x-proxy-error: blocked-by-allowlist"),
-        "stdout should include session network grant proxy diagnostic: {completed:?}"
+    let blocked_request = child.expect_event("permission-command-cmd", "permission_request");
+    assert_eq!(
+        blocked_request["permissions"]["network"]["domains"]["blocked.orca.invalid"],
+        "allow"
     );
-    assert_eq!(completed["exitCode"], 0);
+    let blocked_request_id = blocked_request["requestId"]
+        .as_str()
+        .expect("blocked permission request id")
+        .to_string();
+    {
+        let stdin = child.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"permission-deny","method":"permission/respond","params":{{"requestId":"{}","decision":"deny","scope":"turn","permissions":{{"fileSystem":null,"network":{{"enabled":true,"domains":{{"blocked.orca.invalid":"allow"}}}}}}}}}}"#,
+            blocked_request_id,
+        )
+        .expect("write permission/respond deny");
+        stdin.flush().expect("flush permission/respond deny");
+    }
+    child.expect_event("permission-deny", "permission_resolved");
+    let error = child.expect_event("cmd", "error");
+    child.close_stdin();
+    assert_eq!(
+        error["message"],
+        format!("command/exec permission denied: {blocked_request_id}")
+    );
 
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
