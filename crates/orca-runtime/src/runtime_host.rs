@@ -51066,4 +51066,44 @@ mod tests {
         parent.shutdown().expect("close parent conversation");
         host.shutdown().expect("shutdown runtime host");
     }
+
+    #[test]
+    fn thread_shutdown_timeout_is_typed_and_bounded() {
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(1);
+        let raw_thread_id = uuid::Uuid::now_v7();
+        let thread_id = raw_thread_id.to_string();
+        let handle = RuntimeThreadHandle {
+            thread_id: thread_id.clone(),
+            session_id: None,
+            parent_thread_id: None,
+            startup_warnings: Arc::new(Vec::new()),
+            task_registry: TaskRegistry::new(thread_id.clone()),
+            mcp_registry: McpRegistry::default(),
+            command_tx,
+            surface: unavailable_surface_handle(
+                surface::HostIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("host incarnation"),
+            ),
+        };
+        let responder = std::thread::spawn(move || {
+            if let Some(ThreadCommand::ShutdownThread {
+                reply: Some(reply), ..
+            }) = command_rx.blocking_recv()
+            {
+                let _ = reply.send(ThreadShutdownAck::Retry);
+            }
+        });
+        let started = Instant::now();
+
+        let error = handle
+            .shutdown_with_timeout(Duration::from_millis(30))
+            .expect_err("persistent retry must time out");
+
+        assert_eq!(
+            error,
+            RuntimeHostError::ThreadShutdownTimedOut { thread_id }
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        responder.join().expect("retry responder");
+    }
 }

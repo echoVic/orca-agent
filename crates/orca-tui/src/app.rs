@@ -78,6 +78,15 @@ struct HostedSideParent {
     parent_title: String,
 }
 
+fn shutdown_attached_side_on_controller_exit(side: HostedSideParent) {
+    // The controller owns both actors while the attached child exists.
+    // Always settle/join the child first, even when it is the visible
+    // projection, then release the parent. No actor may be left behind on
+    // TUI exit or allowed to publish late events.
+    let _ = side.side_thread.shutdown();
+    let _ = side.thread.shutdown();
+}
+
 #[derive(Default)]
 struct AttachmentRouting {
     active: Option<SessionAttachmentId>,
@@ -4953,6 +4962,47 @@ done
     }
 
     #[test]
+    fn controller_exit_joins_visible_side_before_releasing_parent() {
+        with_orca_home(|_| {
+            let config = test_config(HistoryMode::Disabled);
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let parent = host
+                .handle()
+                .start_thread(config.clone(), "main conversation")
+                .expect("parent thread");
+            let side = host
+                .handle()
+                .start_side_thread(&parent, config.clone(), "Side conversation")
+                .expect("side thread");
+            let parent_probe = parent.clone();
+            let side_probe = side.clone();
+            let (parent_event_tx, _parent_event_rx) = mpsc::unbounded();
+            let (side_event_tx, _side_event_rx) = mpsc::unbounded();
+
+            shutdown_attached_side_on_controller_exit(HostedSideParent {
+                thread: parent,
+                event_tx: parent_event_tx,
+                attachment: SessionAttachmentId::new(1),
+                side_thread: side,
+                side_event_tx,
+                side_attachment: SessionAttachmentId::new(2),
+                side_config: Arc::new(Mutex::new(config)),
+                parent_title: "main conversation".to_string(),
+            });
+
+            assert!(
+                !side_probe.is_available(),
+                "Side actor must be joined first"
+            );
+            assert!(
+                !parent_probe.is_available(),
+                "parent actor must also be joined"
+            );
+            host.shutdown().expect("runtime host shutdown");
+        });
+    }
+
+    #[test]
     fn running_background_shortcut_dispatches_action_and_returns_to_idle_without_cancelling() {
         let (mut state, action_rx) = test_state();
         state.status = AppStatus::Running;
@@ -9067,12 +9117,7 @@ fn hosted_tui_controller_loop(
     }
 
     if let Some(side) = side_parent {
-        // The controller owns both actors while the attached child exists.
-        // Always settle/join the child first, even when it is the visible
-        // projection, then release the parent. No actor may be left behind on
-        // TUI exit or allowed to publish late events.
-        let _ = side.side_thread.shutdown();
-        let _ = side.thread.shutdown();
+        shutdown_attached_side_on_controller_exit(side);
     } else if let Some(runtime_thread) = thread {
         let _ = runtime_thread.shutdown();
     }
