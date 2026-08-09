@@ -8852,6 +8852,38 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
 
     let resolved = child.expect_event("permission-response", "permission_resolved");
     assert_eq!(resolved["strictAutoReview"], true);
+    let completed_request_permissions = child.expect_event("turn", "tool_completed");
+    assert_eq!(completed_request_permissions["tool"], "request_permissions");
+    let output: Value = serde_json::from_str(
+        completed_request_permissions["output"]
+            .as_str()
+            .expect("permission output"),
+    )
+    .expect("permission output json");
+    assert_eq!(output["strictAutoReview"], true);
+    let tool_approval = child.expect_event("turn", "permission_request");
+    assert_eq!(tool_approval["reason"], "bash requested shell");
+    assert_eq!(tool_approval["permissions"], json!({}));
+    let tool_approval_id = tool_approval["requestId"]
+        .as_str()
+        .expect("tool approval request id");
+    {
+        let stdin = child.stdin_mut();
+        let request = json!({
+            "id": "tool-approval-response",
+            "method": "permission/respond",
+            "params": {
+                "requestId": tool_approval_id,
+                "decision": "deny"
+            }
+        });
+        writeln!(stdin, "{request}").expect("write tool approval denial");
+        stdin.flush().expect("flush tool approval denial");
+    }
+    let tool_approval_resolved =
+        child.expect_event("tool-approval-response", "permission_resolved");
+    assert_eq!(tool_approval_resolved["requestId"], tool_approval_id);
+    assert_eq!(tool_approval_resolved["decision"], "deny");
     let events = child.drain_events_until_event("turn", "turn_completed");
     assert_eq!(
         events
@@ -8860,17 +8892,6 @@ fn server_mode_request_permissions_propagates_strict_auto_review() {
             .expect("turn status"),
         "approval_required"
     );
-    let completed_request_permissions = events
-        .iter()
-        .find(|event| event["event"] == "tool_completed" && event["tool"] == "request_permissions")
-        .expect("request_permissions tool_completed");
-    let output: Value = serde_json::from_str(
-        completed_request_permissions["output"]
-            .as_str()
-            .expect("permission output"),
-    )
-    .expect("permission output json");
-    assert_eq!(output["strictAutoReview"], true);
     assert!(!output_file.exists());
 
     child.close_stdin();
@@ -8959,6 +8980,29 @@ fn server_mode_request_permissions_strict_auto_review_prompts_subsequent_command
     }
 
     let _resolved = child.expect_event("permission-response", "permission_resolved");
+    let tool_approval = child.expect_event("turn", "permission_request");
+    assert_eq!(tool_approval["reason"], "bash requested shell");
+    assert_eq!(tool_approval["permissions"], json!({}));
+    let tool_approval_id = tool_approval["requestId"]
+        .as_str()
+        .expect("tool approval request id");
+    {
+        let stdin = child.stdin_mut();
+        let request = json!({
+            "id": "tool-approval-response",
+            "method": "permission/respond",
+            "params": {
+                "requestId": tool_approval_id,
+                "decision": "deny"
+            }
+        });
+        writeln!(stdin, "{request}").expect("write tool approval denial");
+        stdin.flush().expect("flush tool approval denial");
+    }
+    let tool_approval_resolved =
+        child.expect_event("tool-approval-response", "permission_resolved");
+    assert_eq!(tool_approval_resolved["requestId"], tool_approval_id);
+    assert_eq!(tool_approval_resolved["decision"], "deny");
     let completed = child.expect_event("turn", "turn_completed");
     assert_eq!(completed["status"], "approval_required");
     assert!(

@@ -2295,6 +2295,9 @@ done
                 }
             };
             first
+                .set_nonblocking(false)
+                .expect("set elicitation SSE call blocking");
+            first
                 .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("set first SSE read timeout");
             let request = read_http_request(&mut first);
@@ -2325,6 +2328,9 @@ done
                     Err(error) => panic!("accept SSE elicitation response: {error}"),
                 }
             };
+            response
+                .set_nonblocking(false)
+                .expect("set elicitation SSE response blocking");
             let response_request = read_http_request(&mut response);
             assert!(response_request.contains(r#""id":"prompt-1""#));
             assert!(response_request.contains(r#""action":"accept""#));
