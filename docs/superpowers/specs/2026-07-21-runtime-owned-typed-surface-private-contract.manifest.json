@@ -3829,9 +3829,9 @@
       "StartSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/slash_command_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:541",
+        "crates/orca-tui/src/slash_command_actions.rs:187",
+        "crates/orca-tui/src/app.rs:8203"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::StartSideConversation{prompt}",
@@ -3852,9 +3852,9 @@
       "ToggleSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/global_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:544",
+        "crates/orca-tui/src/global_actions.rs:52",
+        "crates/orca-tui/src/app.rs:8323"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ToggleSideConversation",
@@ -3875,9 +3875,9 @@
       "CloseSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs",
-        "crates/orca-tui/src/global_actions.rs",
-        "crates/orca-tui/src/app.rs"
+        "crates/orca-tui/src/types.rs:545",
+        "crates/orca-tui/src/global_actions.rs:25",
+        "crates/orca-tui/src/app.rs:8374"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::CloseSideConversation",
@@ -7051,7 +7051,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 53 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 33 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 36 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

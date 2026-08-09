@@ -675,7 +675,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval:user_action.route", 2],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval_option:approval_allowlist.insert", 2],
   ["crates/orca-tui/src/approval_mode_actions.rs:cycle_approval_mode:user_action.route", 1],
-  ["crates/orca-tui/src/global_actions.rs:handle_global_shortcut:user_action.route", 2],
+  ["crates/orca-tui/src/global_actions.rs:handle_global_shortcut:user_action.route", 4],
   ["crates/orca-tui/src/idle_navigation_actions.rs:handle_idle_navigation_shortcut:user_action.route", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:user_action.route", 2],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:input_history.record", 1],
@@ -689,7 +689,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/session_picker_actions.rs:dispatch_selected_resume:user_action.route", 1],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:user_action.route", 1],
-  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:user_action.route", 10],
+  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:user_action.route", 12],
   ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:input_history.record", 1],
   ["crates/orca-tui/src/slash_menu_actions.rs:handle_slash_menu_key:user_action.route", 1],
   ["crates/orca-tui/src/status_key_actions.rs:handle_recovery_prompt_key:user_action.route", 1],
@@ -1293,11 +1293,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 33 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 36 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 33,
-          "current_tui_user_actions must contain 33 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 36,
+          "current_tui_user_actions must contain 36 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

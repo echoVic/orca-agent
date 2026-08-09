@@ -538,12 +538,12 @@ pub enum TuiMemoryScope {
 
 #[derive(Debug, Clone)]
 pub enum UserAction {
-    NewSession,
     StartSideConversation {
         prompt: Option<String>,
     },
     ToggleSideConversation,
     CloseSideConversation,
+    NewSession,
     ForkCurrentSession {
         title: Option<String>,
     },
