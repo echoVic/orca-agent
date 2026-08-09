@@ -70,6 +70,10 @@ filter = "binary(=session_server_contract)"
 threads-required = 2
 
 [[profile.ci.overrides]]
+filter = "binary(=agent_loop_contract) & test(=headless_max_inner_turns_preserve_trajectory_truth)"
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
 filter = "package(=orca-runtime) & test(/^acp::supervisor::tests::/)"
 threads-required = 2
 

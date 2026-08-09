@@ -261,6 +261,7 @@ fn append_note_with_cancel_before_write(
     }
     if path.exists() {
         let mut file = OpenOptions::new()
+            .write(true)
             .append(true)
             .open(path)
             .map_err(|error| format!("failed to open memory file: {error}"))?;
