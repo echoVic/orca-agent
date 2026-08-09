@@ -8367,10 +8367,10 @@ fn hosted_tui_controller_loop(
                         routing.active = Some(session_attachment);
                         routing.parent_while_side = Some(side.attachment);
                     }
+                    let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
                     if side_active {
                         deliver_pending_parent_interactions(&attachment_routing, &event_tx);
                     }
-                    let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
                     let title = if side_active {
                         "main conversation"
                     } else {
@@ -8430,8 +8430,8 @@ fn hosted_tui_controller_loop(
                         routing.active = Some(session_attachment);
                         routing.parent_while_side = None;
                     }
-                    deliver_pending_parent_interactions(&attachment_routing, &event_tx);
                     let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
+                    deliver_pending_parent_interactions(&attachment_routing, &event_tx);
                     let _ = event_tx.send(TuiEvent::SideConversationChanged {
                         active: false,
                         available: false,
