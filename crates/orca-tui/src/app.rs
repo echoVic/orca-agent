@@ -93,6 +93,17 @@ fn shutdown_attached_side_on_controller_exit(side: HostedSideParent) {
 struct AttachmentRouting {
     active: Option<SessionAttachmentId>,
     parent_while_side: Option<SessionAttachmentId>,
+    pending_parent_interactions: Vec<TuiEvent>,
+}
+
+fn is_tui_interaction_event(event: &TuiEvent) -> bool {
+    matches!(
+        event,
+        TuiEvent::ApprovalNeeded { .. }
+            | TuiEvent::PermissionApprovalNeeded { .. }
+            | TuiEvent::UserInputRequested { .. }
+            | TuiEvent::McpElicitationRequested { .. }
+    )
 }
 
 fn accept_attached_tui_event(
@@ -146,15 +157,18 @@ fn spawn_attached_event_sender_with_routing(
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
                 if let Some(routing) = routing.as_ref()
-                    && let Some(status) = routing
-                        .lock()
-                        .ok()
-                        .and_then(|routing| {
-                            (routing.parent_while_side == Some(attachment)
-                                && routing.active != Some(attachment))
-                            .then(|| side_parent_status_for_event(&event))
-                        })
-                        .flatten()
+                    && let Some(status) = routing.lock().ok().and_then(|mut routing| {
+                        if routing.parent_while_side == Some(attachment)
+                            && routing.active != Some(attachment)
+                        {
+                            if is_tui_interaction_event(&event) {
+                                routing.pending_parent_interactions.push(event.clone());
+                            }
+                            side_parent_status_for_event(&event)
+                        } else {
+                            None
+                        }
+                    })
                 {
                     let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
                     continue;
@@ -188,6 +202,19 @@ fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn deliver_pending_parent_interactions(
+    routing: &Arc<Mutex<AttachmentRouting>>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) {
+    let pending = routing
+        .lock()
+        .map(|mut routing| std::mem::take(&mut routing.pending_parent_interactions))
+        .unwrap_or_default();
+    for event in pending {
+        let _ = event_tx.send(event);
     }
 }
 
@@ -8120,6 +8147,7 @@ fn hosted_tui_controller_loop(
     let attachment_routing = Arc::new(Mutex::new(AttachmentRouting {
         active: Some(session_attachment),
         parent_while_side: None,
+        pending_parent_interactions: Vec::new(),
     }));
     let mut event_tx = spawn_attached_event_sender_with_routing(
         root_event_tx.clone(),
@@ -8339,6 +8367,9 @@ fn hosted_tui_controller_loop(
                         routing.active = Some(session_attachment);
                         routing.parent_while_side = Some(side.attachment);
                     }
+                    if side_active {
+                        deliver_pending_parent_interactions(&attachment_routing, &event_tx);
+                    }
                     let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
                     let title = if side_active {
                         "main conversation"
@@ -8399,6 +8430,7 @@ fn hosted_tui_controller_loop(
                         routing.active = Some(session_attachment);
                         routing.parent_while_side = None;
                     }
+                    deliver_pending_parent_interactions(&attachment_routing, &event_tx);
                     let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
                     let _ = event_tx.send(TuiEvent::SideConversationChanged {
                         active: false,
