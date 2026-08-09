@@ -22,5 +22,5 @@ cancellation or headless trajectory assertions.
 - [x] Run formatter, diff check, focused package tests, and the full workspace
   gate.
 - [x] Review the complete diff and commit one semantic repair.
-- [ ] Fast-forward the repair into `main`, push, and require fresh Runtime
+- [x] Fast-forward the repair into `main`, push, and require fresh Runtime
   Surface, Pages, and native Windows success before tagging.
