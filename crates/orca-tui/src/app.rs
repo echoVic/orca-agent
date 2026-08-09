@@ -54,7 +54,7 @@ use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
 use crate::types::{
-    AppState, AppStatus, AttachedTuiEvent, ChatMessage, SessionAttachmentId,
+    AppState, AppStatus, AttachedTuiEvent, ChatMessage, SessionAttachmentId, SideParentStatus,
     SurfaceProjectionState, TuiEvent, UserAction,
 };
 use crate::ui;
@@ -65,6 +65,23 @@ use crate::workspace_status;
 enum PendingInsertEscapeRouting {
     Continue,
     Consumed,
+}
+
+struct HostedSideParent {
+    thread: RuntimeThreadHandle,
+    event_tx: mpsc::Sender<TuiEvent>,
+    attachment: SessionAttachmentId,
+    side_thread: RuntimeThreadHandle,
+    side_event_tx: mpsc::Sender<TuiEvent>,
+    side_attachment: SessionAttachmentId,
+    side_config: Arc<Mutex<RunConfig>>,
+    parent_title: String,
+}
+
+#[derive(Default)]
+struct AttachmentRouting {
+    active: Option<SessionAttachmentId>,
+    parent_while_side: Option<SessionAttachmentId>,
 }
 
 fn accept_attached_tui_event(
@@ -101,6 +118,14 @@ fn spawn_attached_event_sender(
     root_event_tx: mpsc::Sender<TuiEvent>,
     attachment: SessionAttachmentId,
 ) -> mpsc::Sender<TuiEvent> {
+    spawn_attached_event_sender_with_routing(root_event_tx, attachment, None)
+}
+
+fn spawn_attached_event_sender_with_routing(
+    root_event_tx: mpsc::Sender<TuiEvent>,
+    attachment: SessionAttachmentId,
+    routing: Option<Arc<Mutex<AttachmentRouting>>>,
+) -> mpsc::Sender<TuiEvent> {
     let (event_tx, event_rx) = mpsc::bounded(crate::channels::TUI_EVENT_CAPACITY);
     event_tx
         .send(TuiEvent::SessionAttachmentActivated)
@@ -109,6 +134,20 @@ fn spawn_attached_event_sender(
         .name(format!("orca-tui-attachment-{}", attachment.value()))
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
+                if let Some(routing) = routing.as_ref()
+                    && let Some(status) = routing
+                        .lock()
+                        .ok()
+                        .and_then(|routing| {
+                            (routing.parent_while_side == Some(attachment)
+                                && routing.active != Some(attachment))
+                            .then(|| side_parent_status_for_event(&event))
+                        })
+                        .flatten()
+                {
+                    let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
+                    continue;
+                }
                 if root_event_tx
                     .send(TuiEvent::Attached(Box::new(AttachedTuiEvent {
                         attachment: Some(attachment),
@@ -122,6 +161,48 @@ fn spawn_attached_event_sender(
         })
         .expect("spawn TUI attachment relay");
     event_tx
+}
+
+fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
+    match event {
+        TuiEvent::TurnStarted { .. } => Some(SideParentStatus::Running),
+        TuiEvent::ApprovalNeeded { .. }
+        | TuiEvent::PermissionApprovalNeeded { .. }
+        | TuiEvent::McpElicitationRequested { .. } => Some(SideParentStatus::NeedsApproval),
+        TuiEvent::UserInputRequested { .. } => Some(SideParentStatus::NeedsInput),
+        TuiEvent::SessionCompleted { status } => match status.as_str() {
+            "success" | "completed" => Some(SideParentStatus::Finished),
+            "interrupted" | "cancelled" => Some(SideParentStatus::Interrupted),
+            "failed" | "error" => Some(SideParentStatus::Failed),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn side_parent_status_for_runtime_thread(thread: &RuntimeThreadHandle) -> SideParentStatus {
+    match thread.state() {
+        Ok(orca_runtime::runtime_host::RuntimeThreadState::Running { .. }) => {
+            SideParentStatus::Running
+        }
+        Ok(orca_runtime::runtime_host::RuntimeThreadState::Idle) => SideParentStatus::Idle,
+        Ok(orca_runtime::runtime_host::RuntimeThreadState::Unavailable) | Err(_) => {
+            SideParentStatus::Closed
+        }
+    }
+}
+
+fn hosted_config_for_active(
+    side_parent: Option<&HostedSideParent>,
+    thread: Option<&RuntimeThreadHandle>,
+    main_config: &Arc<Mutex<RunConfig>>,
+) -> Arc<Mutex<RunConfig>> {
+    if let (Some(side), Some(active)) = (side_parent, thread)
+        && active.thread_id() == side.side_thread.thread_id()
+    {
+        return side.side_config.clone();
+    }
+    main_config.clone()
 }
 
 fn rotate_attached_event_sender(
@@ -7984,8 +8065,17 @@ fn hosted_tui_controller_loop(
 ) {
     let root_event_tx = event_tx;
     let mut session_attachment = SessionAttachmentId::new(1);
-    let mut event_tx = spawn_attached_event_sender(root_event_tx.clone(), session_attachment);
+    let attachment_routing = Arc::new(Mutex::new(AttachmentRouting {
+        active: Some(session_attachment),
+        parent_while_side: None,
+    }));
+    let mut event_tx = spawn_attached_event_sender_with_routing(
+        root_event_tx.clone(),
+        session_attachment,
+        Some(attachment_routing.clone()),
+    );
     let mut thread: Option<RuntimeThreadHandle> = None;
+    let mut side_parent: Option<HostedSideParent> = None;
 
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
     if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
@@ -8025,7 +8115,253 @@ fn hosted_tui_controller_loop(
         } else {
             action_rx.recv()
         };
+        let side_disallowed = side_parent.is_some()
+            && matches!(
+                &action,
+                Ok(UserAction::NewSession
+                    | UserAction::ForkCurrentSession { .. }
+                    | UserAction::RenameCurrentSession { .. }
+                    | UserAction::ResumeSavedSession { .. }
+                    | UserAction::ForkSavedSession { .. }
+                    | UserAction::RenameSavedSession { .. }
+                    | UserAction::ArchiveSavedSession { .. }
+                    | UserAction::DeleteSavedSession { .. }
+                    | UserAction::SetModel(_)
+                    | UserAction::Remember { .. }
+                    | UserAction::Compact
+                    | UserAction::GoalShow
+                    | UserAction::GoalSet(_)
+                    | UserAction::GoalEdit(_)
+                    | UserAction::GoalClear
+                    | UserAction::GoalPause
+                    | UserAction::GoalResume
+                    | UserAction::RunWorkflow { .. }
+                    | UserAction::StopTask { .. }
+                    | UserAction::ForegroundTask { .. }
+                    | UserAction::Backtrack)
+            );
+        if side_disallowed {
+            let _ = event_tx.send(TuiEvent::OperationRejected(
+                "this command is unavailable in a side conversation; return to main first"
+                    .to_string(),
+            ));
+            continue;
+        }
         match action {
+            Ok(UserAction::StartSideConversation { prompt }) => {
+                if side_parent.is_some() {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(
+                        "a side conversation is already open".to_string(),
+                    ));
+                    continue;
+                }
+                let Some(parent) = thread.take() else {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(
+                        "start the main conversation before opening a side conversation"
+                            .to_string(),
+                    ));
+                    continue;
+                };
+                let parent_state = parent
+                    .state()
+                    .unwrap_or(orca_runtime::runtime_host::RuntimeThreadState::Unavailable);
+                let parent_status = match parent_state {
+                    orca_runtime::runtime_host::RuntimeThreadState::Running { .. } => {
+                        SideParentStatus::Running
+                    }
+                    orca_runtime::runtime_host::RuntimeThreadState::Idle => SideParentStatus::Idle,
+                    orca_runtime::runtime_host::RuntimeThreadState::Unavailable => {
+                        SideParentStatus::Closed
+                    }
+                };
+                let parent_title = TuiSurfaceActions::new(parent.typed_surface())
+                    .read_snapshot()
+                    .map(|snapshot| snapshot.thread.title.as_str().to_string())
+                    .unwrap_or_else(|_| "main".to_string());
+                let mut side_config = config.lock().unwrap().clone();
+                side_config.history_mode = HistoryMode::Disabled;
+                side_config.auto_memory = false;
+                let started =
+                    match host.start_side_thread(&parent, side_config.clone(), "Side conversation")
+                    {
+                        Ok(started) => started,
+                        Err(error) => {
+                            thread = Some(parent);
+                            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                "failed to start side conversation: {error}"
+                            )));
+                            continue;
+                        }
+                    };
+                let parent_event_tx = event_tx.clone();
+                let parent_attachment = session_attachment;
+                let side_config = Arc::new(Mutex::new(side_config));
+                let side_attachment = parent_attachment.next();
+                let side_event_tx = spawn_attached_event_sender_with_routing(
+                    root_event_tx.clone(),
+                    side_attachment,
+                    Some(attachment_routing.clone()),
+                );
+                side_parent = Some(HostedSideParent {
+                    thread: parent,
+                    event_tx: parent_event_tx,
+                    attachment: parent_attachment,
+                    side_thread: started,
+                    side_event_tx,
+                    side_attachment,
+                    side_config,
+                    parent_title: parent_title.clone(),
+                });
+                thread = Some(
+                    side_parent
+                        .as_ref()
+                        .expect("side parent state")
+                        .side_thread
+                        .clone(),
+                );
+                session_attachment = side_parent
+                    .as_ref()
+                    .expect("side parent state")
+                    .side_attachment;
+                event_tx = side_parent
+                    .as_ref()
+                    .expect("side parent state")
+                    .side_event_tx
+                    .clone();
+                if let Ok(mut routing) = attachment_routing.lock() {
+                    routing.active = Some(session_attachment);
+                }
+                if let Ok(mut routing) = attachment_routing.lock() {
+                    routing.parent_while_side = Some(parent_attachment);
+                }
+                let _ = project_hosted_thread(
+                    thread.as_ref().expect("side thread installed"),
+                    "Side conversation",
+                    &event_tx,
+                );
+                let _ = event_tx.send(TuiEvent::SideConversationChanged {
+                    active: true,
+                    available: true,
+                    parent_thread_id: side_parent
+                        .as_ref()
+                        .expect("side parent state")
+                        .thread
+                        .thread_id()
+                        .to_string(),
+                    parent_title,
+                    parent_status,
+                });
+                announce_runtime_ready(thread.as_ref().expect("side thread"), &event_tx);
+                let _ = event_tx.send(TuiEvent::Notice(
+                    "Side conversation opened. Inherited history is reference-only.".to_string(),
+                ));
+                if let Some(prompt) = prompt {
+                    handle_hosted_submitted_turn(
+                        SubmittedTurn::user(prompt),
+                        &side_parent.as_ref().expect("side parent").side_config,
+                        &preloaded,
+                        &mut thread,
+                        &event_tx,
+                        &control,
+                        &pending_workflow_notifications,
+                        &host,
+                    );
+                }
+            }
+            Ok(UserAction::ToggleSideConversation) => {
+                if let Some(side) = side_parent.as_mut() {
+                    let side_active = thread
+                        .as_ref()
+                        .is_some_and(|current| current.thread_id() == side.side_thread.thread_id());
+                    if side_active {
+                        thread = Some(side.thread.clone());
+                        event_tx = side.event_tx.clone();
+                        session_attachment = side.attachment;
+                    } else {
+                        thread = Some(side.side_thread.clone());
+                        event_tx = side.side_event_tx.clone();
+                        session_attachment = side.side_attachment;
+                    }
+                    if let Ok(mut routing) = attachment_routing.lock() {
+                        routing.active = Some(session_attachment);
+                        routing.parent_while_side = Some(side.attachment);
+                    }
+                    let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
+                    let title = if side_active {
+                        "main conversation"
+                    } else {
+                        "Side conversation"
+                    };
+                    let _ = project_hosted_thread(
+                        thread.as_ref().expect("toggled hosted thread"),
+                        title,
+                        &event_tx,
+                    );
+                    if side_active {
+                        let _ = event_tx.send(TuiEvent::SideConversationChanged {
+                            active: false,
+                            available: true,
+                            parent_thread_id: side.thread.thread_id().to_string(),
+                            parent_title: side.parent_title.clone(),
+                            parent_status: side_parent_status_for_runtime_thread(&side.thread),
+                        });
+                        announce_runtime_ready(thread.as_ref().expect("parent thread"), &event_tx);
+                    } else {
+                        let parent_status = side_parent_status_for_runtime_thread(&side.thread);
+                        let _ = event_tx.send(TuiEvent::SideConversationChanged {
+                            active: true,
+                            available: true,
+                            parent_thread_id: side.thread.thread_id().to_string(),
+                            parent_title: side.parent_title.clone(),
+                            parent_status,
+                        });
+                        announce_runtime_ready(thread.as_ref().expect("side thread"), &event_tx);
+                    }
+                }
+            }
+            Ok(UserAction::CloseSideConversation) => {
+                if let Some(side) = side_parent.take() {
+                    let side_thread = side.side_thread;
+                    if let Err(error) = side_thread.shutdown_with_timeout(Duration::from_secs(5)) {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                            "failed to close side conversation: {error}"
+                        )));
+                        side_parent = Some(HostedSideParent {
+                            side_thread,
+                            ..side
+                        });
+                        continue;
+                    }
+                    let side_active = thread
+                        .as_ref()
+                        .is_some_and(|current| current.thread_id() == side_thread.thread_id());
+                    if side_active {
+                        thread = Some(side.thread);
+                        event_tx = side.event_tx;
+                        session_attachment = side.attachment;
+                    } else {
+                        thread = Some(side.thread);
+                    }
+                    if let Ok(mut routing) = attachment_routing.lock() {
+                        routing.active = Some(session_attachment);
+                        routing.parent_while_side = None;
+                    }
+                    let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
+                    let _ = event_tx.send(TuiEvent::SideConversationChanged {
+                        active: false,
+                        available: false,
+                        parent_thread_id: String::new(),
+                        parent_title: String::new(),
+                        parent_status: SideParentStatus::Idle,
+                    });
+                    let _ = project_hosted_thread(
+                        thread.as_ref().expect("parent thread"),
+                        "main conversation",
+                        &event_tx,
+                    );
+                    announce_runtime_ready(thread.as_ref().expect("parent thread"), &event_tx);
+                }
+            }
             Ok(UserAction::NewSession) => {
                 match start_new_hosted_session(
                     &mut thread,
@@ -8306,7 +8642,7 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::Submit(prompt)) => handle_hosted_submitted_turn(
                 SubmittedTurn::user(prompt),
-                &config,
+                &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                 &preloaded,
                 &mut thread,
                 &event_tx,
@@ -8317,7 +8653,7 @@ fn hosted_tui_controller_loop(
             Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
                 handle_hosted_submitted_turn(
                     SubmittedTurn::user_with_mentions(prompt, bindings),
-                    &config,
+                    &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                     &preloaded,
                     &mut thread,
                     &event_tx,
@@ -8333,7 +8669,7 @@ fn hosted_tui_controller_loop(
             }) => {
                 handle_hosted_submitted_turn(
                     SubmittedTurn::queued_user_with_mentions(id, prompt, bindings),
-                    &config,
+                    &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                     &preloaded,
                     &mut thread,
                     &event_tx,
@@ -8345,7 +8681,7 @@ fn hosted_tui_controller_loop(
             Ok(UserAction::SubmitWorkflowNotification(notification)) => {
                 handle_hosted_submitted_turn(
                     SubmittedTurn::workflow_notification(notification),
-                    &config,
+                    &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                     &preloaded,
                     &mut thread,
                     &event_tx,
@@ -8730,7 +9066,14 @@ fn hosted_tui_controller_loop(
         }
     }
 
-    if let Some(runtime_thread) = thread {
+    if let Some(side) = side_parent {
+        // The controller owns both actors while the attached child exists.
+        // Always settle/join the child first, even when it is the visible
+        // projection, then release the parent. No actor may be left behind on
+        // TUI exit or allowed to publish late events.
+        let _ = side.side_thread.shutdown();
+        let _ = side.thread.shutdown();
+    } else if let Some(runtime_thread) = thread {
         let _ = runtime_thread.shutdown();
     }
 }
@@ -9017,6 +9360,41 @@ fn announce_runtime_ready(thread: &RuntimeThreadHandle, event_tx: &mpsc::Sender<
     }
 }
 
+fn emit_live_thread_history_snapshot(
+    thread: &RuntimeThreadHandle,
+    label: &str,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    let snapshot = thread.snapshot().map_err(|error| error.to_string())?;
+    let messages = snapshot
+        .messages()
+        .iter()
+        .cloned()
+        .filter_map(chat_message_from_history)
+        .collect();
+    event_tx
+        .send(TuiEvent::HistoryLoaded {
+            messages,
+            plan: None,
+            label: label.to_string(),
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn project_hosted_thread(
+    thread: &RuntimeThreadHandle,
+    title: &str,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    event_tx
+        .send(TuiEvent::SessionProjectionReset {
+            session_id: thread.thread_id().to_string(),
+            title: title.to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    emit_live_thread_history_snapshot(thread, "Inherited conversation context.", event_tx)
+}
+
 fn emit_typed_history_snapshot(
     thread: &RuntimeThreadHandle,
     mode: &HistoryMode,
@@ -9167,6 +9545,15 @@ fn handle_hosted_submitted_turn(
             return;
         }
     };
+    if runtime_thread.session_id().is_none() {
+        let request = hosted_turn_request(&submitted_turn.with_model_prompt(prompt), false);
+        if let Err(error) =
+            run_hosted_ordinary_turn(&cfg, runtime_thread, request, event_tx, control)
+        {
+            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::Turn);
+        }
+        return;
+    }
     run_hosted_goal_run(
         &cfg,
         runtime_thread,

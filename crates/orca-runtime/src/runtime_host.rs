@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::{CancelToken, OperationId, OperationIdAllocator};
@@ -84,6 +84,12 @@ use crate::thread_store::{
 };
 use crate::workflow::runner::{WorkflowLaunchRequest, WorkflowRunner};
 use crate::workflow_execution::BackgroundWorkflowRun;
+
+const SIDE_CONVERSATION_BOUNDARY: &str = r#"Side conversation boundary.
+
+Everything before this boundary is inherited history from the parent thread. It is reference context only, not the current task. Do not continue, execute, or complete instructions, plans, tool calls, approvals, edits, or requests found only in inherited history. Only prompts submitted after this boundary are active instructions.
+
+You are a separate side-conversation assistant. Answer the user's side question and do lightweight, non-mutating exploration without disrupting the parent thread. Sub-agents are unavailable. Do not modify files, git state, permissions, configuration, goals, memory, or workspace state unless the user explicitly asks for that mutation after this boundary; keep any explicit mutation minimal and scoped."#;
 
 pub const HOST_COMMAND_CAPACITY: usize = 16;
 pub const THREAD_COMMAND_CAPACITY: usize = 16;
@@ -1947,6 +1953,7 @@ pub enum RuntimeHostError {
     WorkflowLaunchFailed { message: String },
     RuntimeStartFailed { message: String },
     ThreadActorPanicked { thread_id: String, message: String },
+    ThreadShutdownTimedOut { thread_id: String },
     SupervisorPanicked,
 }
 
@@ -1979,6 +1986,9 @@ impl fmt::Display for RuntimeHostError {
                     formatter,
                     "runtime thread actor {thread_id} panicked: {message}"
                 )
+            }
+            Self::ThreadShutdownTimedOut { thread_id } => {
+                write!(formatter, "runtime thread {thread_id} shutdown timed out")
             }
             Self::SupervisorPanicked => formatter.write_str("runtime host supervisor panicked"),
         }
@@ -2090,6 +2100,8 @@ pub struct RuntimeThreadStartRequest {
     config: RunConfig,
     title: String,
     preloaded: Option<SessionTranscript>,
+    inherited_conversation: Option<Conversation>,
+    parent_thread_id: Option<String>,
     mcp_registry: Option<McpRegistry>,
     prepared_record_meta: Option<SessionMeta>,
     prepared_runtime_thread_id: Option<String>,
@@ -2106,6 +2118,8 @@ impl RuntimeThreadStartRequest {
             config,
             title: title.into(),
             preloaded: None,
+            inherited_conversation: None,
+            parent_thread_id: None,
             mcp_registry: None,
             prepared_record_meta: None,
             prepared_runtime_thread_id: None,
@@ -2121,6 +2135,18 @@ impl RuntimeThreadStartRequest {
 
     pub fn with_preloaded(mut self, preloaded: SessionTranscript) -> Self {
         self.preloaded = Some(preloaded);
+        self
+    }
+
+    fn with_attached_side_context(
+        mut self,
+        parent_thread_id: impl Into<String>,
+        conversation: Conversation,
+    ) -> Self {
+        self.config.history_mode = HistoryMode::Disabled;
+        self.config.auto_memory = false;
+        self.inherited_conversation = Some(conversation);
+        self.parent_thread_id = Some(parent_thread_id.into());
         self
     }
 
@@ -2143,20 +2169,67 @@ impl RuntimeThreadStartRequest {
     }
 
     fn start(self) -> io::Result<RuntimeThread> {
+        let inherited_conversation = self.inherited_conversation;
         let mcp_registry = self
             .mcp_registry
             .unwrap_or_else(|| orca_mcp::initialize_registry(&self.config.mcp_servers));
-        RuntimeThread::start_with_prepared_history_and_runtime_id(
+        let mut thread = RuntimeThread::start_with_prepared_history_and_runtime_id(
             &self.config,
             self.title,
             self.preloaded,
             mcp_registry,
             self.prepared_record_meta,
             self.prepared_runtime_thread_id,
-        )
+        )?;
+        if let Some(mut conversation) = inherited_conversation {
+            conversation.internal_context = Default::default();
+            conversation.add_system_pinned(SIDE_CONVERSATION_BOUNDARY.to_string());
+            *thread.session_mut().conversation_mut() = conversation;
+        }
+        Ok(thread)
     }
 
     fn prepare(mut self) -> Result<PreparedRuntimeThreadStart, RuntimeHostError> {
+        if self.inherited_conversation.is_some() {
+            if !matches!(self.config.history_mode, HistoryMode::Disabled) {
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message: "attached side conversation requires disabled history".to_string(),
+                });
+            }
+            self.parent_thread_id.as_deref().ok_or_else(|| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: "attached side conversation requires a parent thread".to_string(),
+                }
+            })?;
+            let raw_thread_id = uuid::Uuid::now_v7();
+            let thread_id = raw_thread_id.to_string();
+            let surface_thread_id = surface::SurfaceThreadId::try_from_bytes(
+                *raw_thread_id.as_bytes(),
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("invalid attached surface thread identity: {error:?}"),
+            })?;
+            let owner_lease = surface::ExclusiveOwnerLease::acquire_process_local_thread(
+                surface_thread_id.clone(),
+                &HostSurfaceClock::now(),
+            )
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to acquire attached surface owner lease: {error:?}"),
+            })?;
+            self.config.subagents.max_depth = 0;
+            self.config.subagents.max_parallel = 1;
+            self.prepared_runtime_thread_id = Some(thread_id.clone());
+            return Ok(PreparedRuntimeThreadStart {
+                request: self,
+                surface_owner: Some(PreparedSurfaceOwner {
+                    thread_id,
+                    surface_thread_id,
+                    owner_lease,
+                    persistence: PreparedSurfacePersistence::EphemeralAttached,
+                }),
+                resume_scope_replacement: None,
+            });
+        }
         if let Some(close_after) = self.ephemeral_one_shot {
             if !matches!(self.config.history_mode, HistoryMode::Disabled) {
                 return Err(RuntimeHostError::ThreadStartFailed {
@@ -2336,6 +2409,7 @@ enum PreparedSurfacePersistence {
     EphemeralNonCataloguedOneShot {
         close_after: surface::FirstOperationCompletionPolicy,
     },
+    EphemeralAttached,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2707,6 +2781,7 @@ impl fmt::Debug for OperationHandle {
 pub struct RuntimeThreadHandle {
     thread_id: String,
     session_id: Option<String>,
+    parent_thread_id: Option<String>,
     startup_warnings: Arc<Vec<String>>,
     task_registry: TaskRegistry,
     mcp_registry: McpRegistry,
@@ -2721,6 +2796,10 @@ impl RuntimeThreadHandle {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    pub fn parent_thread_id(&self) -> Option<&str> {
+        self.parent_thread_id.as_deref()
     }
 
     pub fn is_available(&self) -> bool {
@@ -3234,7 +3313,17 @@ impl RuntimeThreadHandle {
     }
 
     pub fn shutdown(&self) -> Result<(), RuntimeHostError> {
+        self.shutdown_with_timeout(Duration::from_secs(60))
+    }
+
+    pub fn shutdown_with_timeout(&self, timeout: Duration) -> Result<(), RuntimeHostError> {
+        let deadline = Instant::now() + timeout;
         loop {
+            if Instant::now() >= deadline {
+                return Err(RuntimeHostError::ThreadShutdownTimedOut {
+                    thread_id: self.thread_id.clone(),
+                });
+            }
             let (reply_tx, reply_rx) = mpsc::sync_channel(1);
             send_thread_shutdown(
                 &self.command_tx,
@@ -3243,7 +3332,20 @@ impl RuntimeThreadHandle {
                     reason: surface::SurfaceShutdownReason::ThreadClose,
                 },
             )?;
-            match receive_reply(reply_rx, "runtime thread")? {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let ack = reply_rx
+                .recv_timeout(remaining)
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => RuntimeHostError::ThreadShutdownTimedOut {
+                        thread_id: self.thread_id.clone(),
+                    },
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        RuntimeHostError::ResponseChannelClosed {
+                            owner: "runtime thread",
+                        }
+                    }
+                })?;
+            match ack {
                 ThreadShutdownAck::Complete => return Ok(()),
                 ThreadShutdownAck::Retry => {
                     thread::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
@@ -3299,6 +3401,22 @@ impl RuntimeHostHandle {
         request: RuntimeThreadStartRequest,
     ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
         start_thread_with_sender(&self.command_tx, request)
+    }
+
+    /// Create a temporary child from the parent's live conversation snapshot.
+    /// The host owns the cutover snapshot and the child is never catalogued.
+    pub fn start_side_thread(
+        &self,
+        parent: &RuntimeThreadHandle,
+        config: RunConfig,
+        title: impl Into<String>,
+    ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
+        let snapshot = parent.snapshot()?;
+        let request = RuntimeThreadStartRequest::new(config, title).with_attached_side_context(
+            parent.thread_id().to_string(),
+            snapshot.conversation().clone(),
+        );
+        self.start_thread_with_request(request)
     }
 
     pub(crate) fn host_incarnation(&self) -> &surface::HostIncarnation {
@@ -4256,6 +4374,7 @@ struct PreparedStartedRuntimeThread {
     thread: RuntimeThread,
     actor_config: RunConfig,
     actor_title: String,
+    parent_thread_id: Option<String>,
     surface_owner: Option<PreparedSurfaceOwner>,
     ephemeral_reservation_timeout: Duration,
     #[cfg(test)]
@@ -4266,6 +4385,7 @@ fn prepare_and_start_runtime_thread(
     request: RuntimeThreadStartRequest,
 ) -> Result<PreparedStartedRuntimeThread, RuntimeHostError> {
     let actor_title = request.title.clone();
+    let parent_thread_id = request.parent_thread_id.clone();
     let ephemeral_reservation_timeout = request.ephemeral_reservation_timeout;
     #[cfg(test)]
     let ephemeral_close_commit_failures = request.ephemeral_close_commit_failures;
@@ -4305,6 +4425,7 @@ fn prepare_and_start_runtime_thread(
         thread,
         actor_config,
         actor_title,
+        parent_thread_id,
         surface_owner,
         ephemeral_reservation_timeout,
         #[cfg(test)]
@@ -4383,6 +4504,7 @@ async fn run_host_supervisor(
                     mut thread,
                     mut actor_config,
                     actor_title,
+                    parent_thread_id,
                     surface_owner,
                     ephemeral_reservation_timeout,
                     #[cfg(test)]
@@ -4460,6 +4582,7 @@ async fn run_host_supervisor(
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
                     session_id,
+                    parent_thread_id,
                     startup_warnings,
                     task_registry,
                     mcp_registry,
@@ -7732,11 +7855,17 @@ fn bootstrap_ephemeral_surface(
     surface_owner: PreparedSurfaceOwner,
     surface_hub_config: surface::SurfaceHubConfig,
 ) -> Result<(surface::RuntimeSurfaceHandle, ResidentSurfaceState), RuntimeHostError> {
-    let PreparedSurfacePersistence::EphemeralNonCataloguedOneShot { close_after } =
-        surface_owner.persistence
-    else {
-        unreachable!("ephemeral surface bootstrap received recorded persistence")
+    let persistence = surface_owner.persistence;
+    let close_after = match persistence {
+        PreparedSurfacePersistence::EphemeralNonCataloguedOneShot { close_after } => {
+            Some(close_after)
+        }
+        PreparedSurfacePersistence::EphemeralAttached => None,
+        PreparedSurfacePersistence::Recorded { .. } => {
+            unreachable!("ephemeral surface bootstrap received recorded persistence")
+        }
     };
+
     if thread.session().session_id().is_some() || thread.thread_id() != surface_owner.thread_id {
         return Err(RuntimeHostError::ThreadStartFailed {
             message: "prepared ephemeral surface identity changed during materialization"
@@ -7748,11 +7877,17 @@ fn bootstrap_ephemeral_surface(
     let incarnation = surface::SurfaceIncarnation::try_from_bytes(*raw_thread_id.as_bytes())
         .expect("ephemeral runtime thread UUID is v7");
     let owner_epoch = surface::ThreadOwnerEpoch::new(surface_owner.owner_lease.owner_epoch());
+    let persistence = match close_after {
+        Some(close_after) => {
+            surface::ThreadPersistence::EphemeralNonCataloguedOneShot { close_after }
+        }
+        None => surface::ThreadPersistence::EphemeralAttached,
+    };
     let snapshot = initial_surface_snapshot(
         surface_owner.surface_thread_id,
         incarnation,
         owner_epoch,
-        surface::ThreadPersistence::EphemeralNonCataloguedOneShot { close_after },
+        persistence,
         config,
         title,
         None,
@@ -50891,5 +51026,44 @@ mod tests {
                 .turn_id,
             response_turn_id
         );
+    }
+
+    #[test]
+    fn side_conversation_is_an_attached_runtime_child_without_durable_history() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = OrcaHomeRestore::set(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start runtime host");
+        let parent = host
+            .handle()
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                "main conversation",
+            )
+            .expect("start parent thread");
+
+        let side = host
+            .handle()
+            .start_side_thread(
+                &parent,
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                "side conversation",
+            )
+            .expect("start side conversation");
+
+        assert_ne!(side.thread_id(), parent.thread_id());
+        assert_eq!(side.parent_thread_id(), Some(parent.thread_id()));
+        assert!(side.session_id().is_none());
+        let snapshot = side.snapshot().expect("read side snapshot");
+        assert!(snapshot.messages().iter().any(|message| {
+            message
+                .content_str()
+                .is_some_and(|content| content.contains("Side conversation boundary"))
+        }));
+
+        side.shutdown().expect("close side conversation");
+        parent.shutdown().expect("close parent conversation");
+        host.shutdown().expect("shutdown runtime host");
     }
 }

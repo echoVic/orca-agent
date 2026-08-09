@@ -169,6 +169,24 @@ pub(crate) fn handle_slash_command(
                 ));
             }
         }
+        SlashCommand::Side(prompt) => {
+            if state.side_conversation_available() && !state.side_conversation_active() {
+                let _ = action_tx.send(UserAction::ToggleSideConversation);
+            } else if state.side_conversation_active() {
+                state.push_message(ChatMessage::Error(
+                    "already in a side conversation; use Ctrl+C to close it".to_string(),
+                ));
+            } else if matches!(state.status, AppStatus::Setup | AppStatus::SessionPicker) {
+                state.push_message(ChatMessage::Error(
+                    "start the main conversation before opening a side conversation".to_string(),
+                ));
+            } else {
+                if prompt.is_some() {
+                    state.enter_running();
+                }
+                let _ = action_tx.send(UserAction::StartSideConversation { prompt });
+            }
+        }
         SlashCommand::Rename(None) => return Some(SlashOutcome::Prefill("/rename ".to_string())),
         SlashCommand::Rename(Some(title)) => {
             state.enter_running();

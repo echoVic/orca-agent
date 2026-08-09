@@ -3029,6 +3029,25 @@ fn workspace_status_spans(
 }
 
 fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+    if state.side_conversation_active()
+        && let Some(side) = state.side_conversation.as_ref()
+    {
+        let label = format!(
+            " Side from main · {} · Ctrl+/ to switch · Ctrl+C to close",
+            side.parent_status.label()
+        );
+        return Line::from(Span::styled(
+            truncate_to_display_width(&label, width),
+            Style::default().fg(theme.plan_mode),
+        ));
+    }
+    if state.side_conversation_available() {
+        let label = " Main · Side available · Ctrl+/ to switch";
+        return Line::from(Span::styled(
+            truncate_to_display_width(label, width),
+            Style::default().fg(theme.plan_mode),
+        ));
+    }
     let separator = "  ·  ";
     let mode_prefix = separator;
     let mode_value = state.approval_mode.as_str();

@@ -65,6 +65,7 @@ impl KeyBinding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GlobalShortcut {
     Cancel,
+    ToggleSideConversation,
     OpenTranscriptSearch,
     ToggleShortcuts,
     ScrollBottom,
@@ -122,6 +123,10 @@ const GLOBAL_BINDINGS: &[(GlobalShortcut, KeyBinding)] = &[
     (
         GlobalShortcut::OpenTranscriptSearch,
         KeyBinding::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+    ),
+    (
+        GlobalShortcut::ToggleSideConversation,
+        KeyBinding::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
     ),
     (
         GlobalShortcut::ToggleShortcuts,
@@ -392,6 +397,11 @@ pub fn shortcut_lines(scopes: &[ShortcutScope]) -> Vec<Line<'static>> {
 }
 
 pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
+    ShortcutHint {
+        scope: ShortcutScope::Global,
+        keys: "ctrl+/",
+        action: "open or return from side conversation",
+    },
     ShortcutHint {
         scope: ShortcutScope::Global,
         keys: "ctrl+f",
@@ -721,6 +731,14 @@ mod tests {
                 key(KeyCode::Char('k'), KeyModifiers::CONTROL)
             ),
             Some(ShortcutAction::Global(GlobalShortcut::ToggleShortcuts))
+        );
+    }
+
+    #[test]
+    fn ctrl_slash_toggles_side_conversation() {
+        assert_eq!(
+            global_shortcut(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL,)),
+            Some(GlobalShortcut::ToggleSideConversation)
         );
     }
 

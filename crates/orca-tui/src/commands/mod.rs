@@ -5,6 +5,7 @@ pub enum SlashCommand {
     Compact,
     Resume,
     Fork(Option<String>),
+    Side(Option<String>),
     Rename(Option<String>),
     Status,
     Copy(Option<String>),
@@ -105,6 +106,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         "compact" => no_arguments(parts).then_some(SlashCommand::Compact),
         "resume" => no_arguments(parts).then_some(SlashCommand::Resume),
         "fork" => Some(SlashCommand::Fork(optional_argument(parts))),
+        "side" => Some(SlashCommand::Side(optional_argument(parts))),
         "rename" => Some(SlashCommand::Rename(optional_argument(parts))),
         "status" => no_arguments(parts).then_some(SlashCommand::Status),
         "copy" => Some(SlashCommand::Copy(optional_argument(parts))),
@@ -163,6 +165,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/compact", "Compress conversation context"),
         ("/resume", "Resume a saved conversation"),
         ("/fork", "Fork this conversation"),
+        ("/side", "Ask without disrupting the main conversation"),
         ("/rename", "Rename this conversation"),
         ("/status", "Show session status"),
         ("/copy", "Copy an assistant response"),
@@ -649,6 +652,17 @@ mod tests {
         assert!(validate_model("deepseek-v4-pro").is_ok());
         assert!(validate_model("deepseek-reasoner").is_err());
         assert!(validate_model("bogus-model").is_err());
+    }
+
+    #[test]
+    fn parse_side_conversation_with_optional_question() {
+        assert_eq!(parse("/side"), Some(SlashCommand::Side(None)));
+        assert_eq!(
+            parse("/side compare the two approaches"),
+            Some(SlashCommand::Side(Some(
+                "compare the two approaches".to_string()
+            )))
+        );
     }
 }
 use std::path::Path;

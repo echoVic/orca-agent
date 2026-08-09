@@ -21,6 +21,10 @@ where
 {
     match shortcut {
         GlobalShortcut::Cancel => {
+            if state.side_conversation_active() {
+                let _ = action_tx.send(UserAction::CloseSideConversation);
+                return Ok(GlobalShortcutFlow::Continue);
+            }
             if matches!(
                 state.status,
                 AppStatus::Running
@@ -43,6 +47,9 @@ where
             state.last_ctrl_c = Some(now);
             state.push_message(ChatMessage::System("Press Ctrl+C again to quit.".into()));
             state.scroll_to_bottom();
+        }
+        GlobalShortcut::ToggleSideConversation => {
+            let _ = action_tx.send(UserAction::ToggleSideConversation);
         }
         GlobalShortcut::OpenTranscriptSearch => {
             state.open_transcript_search();
@@ -72,7 +79,7 @@ mod tests {
 
     use super::handle_global_shortcut;
     use crate::shortcuts::GlobalShortcut;
-    use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
+    use crate::types::{AppState, AppStatus, ChatMessage, SideParentStatus, TuiEvent, UserAction};
 
     #[test]
     fn cancel_interrupts_while_context_is_compacting() {
@@ -136,6 +143,35 @@ mod tests {
 
         assert!(matches!(second, super::GlobalShortcutFlow::Exit(130)));
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Cancel)));
+    }
+
+    #[test]
+    fn ctrl_c_closes_side_without_interrupting_parent() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.update(TuiEvent::SideConversationChanged {
+            active: true,
+            available: true,
+            parent_thread_id: "parent".to_string(),
+            parent_title: "main".to_string(),
+            parent_status: SideParentStatus::Running,
+        });
+
+        let flow =
+            handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &action_tx, || Ok(()))
+                .expect("close side");
+
+        assert!(matches!(flow, super::GlobalShortcutFlow::Continue));
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::CloseSideConversation)
+        ));
+        assert!(state.last_ctrl_c.is_none());
     }
 
     #[test]

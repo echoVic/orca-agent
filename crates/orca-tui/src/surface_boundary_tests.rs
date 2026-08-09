@@ -6,7 +6,10 @@ use crate::types::UserAction;
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 33] = [
+const CURRENT_ACTIONS: [(&str, &str); 36] = [
+    ("StartSideConversation", "host_session_lifecycle_mutation"),
+    ("ToggleSideConversation", "host_session_lifecycle_mutation"),
+    ("CloseSideConversation", "host_session_lifecycle_mutation"),
     ("NewSession", "host_session_lifecycle_mutation"),
     ("ForkCurrentSession", "host_session_lifecycle_mutation"),
     ("RenameCurrentSession", "host_store_mutation"),
@@ -47,6 +50,9 @@ const FUTURE_ACTIONS: [&str; 0] = [];
 fn current_user_action_name(action: &UserAction) -> &'static str {
     match action {
         UserAction::NewSession => "NewSession",
+        UserAction::StartSideConversation { .. } => "StartSideConversation",
+        UserAction::ToggleSideConversation => "ToggleSideConversation",
+        UserAction::CloseSideConversation => "CloseSideConversation",
         UserAction::ForkCurrentSession { .. } => "ForkCurrentSession",
         UserAction::RenameCurrentSession { .. } => "RenameCurrentSession",
         UserAction::ResumeSavedSession { .. } => "ResumeSavedSession",

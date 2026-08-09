@@ -341,6 +341,14 @@ pub enum TuiEvent {
     Attached(Box<AttachedTuiEvent>),
     #[doc(hidden)]
     SessionAttachmentActivated,
+    SideConversationChanged {
+        active: bool,
+        available: bool,
+        parent_thread_id: String,
+        parent_title: String,
+        parent_status: SideParentStatus,
+    },
+    SideParentStatusChanged(SideParentStatus),
     #[doc(hidden)]
     SurfaceProjectionSynced(Box<SurfaceProjectionState>),
     TurnStarted {
@@ -531,6 +539,11 @@ pub enum TuiMemoryScope {
 #[derive(Debug, Clone)]
 pub enum UserAction {
     NewSession,
+    StartSideConversation {
+        prompt: Option<String>,
+    },
+    ToggleSideConversation,
+    CloseSideConversation,
     ForkCurrentSession {
         title: Option<String>,
     },
@@ -619,6 +632,40 @@ pub enum AppStatus {
     Compacting,
     WaitingApproval,
     WaitingUserInput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SideParentStatus {
+    Idle,
+    Running,
+    NeedsApproval,
+    NeedsInput,
+    Finished,
+    Failed,
+    Interrupted,
+    Closed,
+}
+
+impl SideParentStatus {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "main idle",
+            Self::Running => "main running",
+            Self::NeedsApproval => "main needs approval",
+            Self::NeedsInput => "main needs input",
+            Self::Finished => "main finished",
+            Self::Failed => "main failed",
+            Self::Interrupted => "main interrupted",
+            Self::Closed => "main closed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SideConversationUiState {
+    pub(crate) parent_thread_id: String,
+    pub(crate) parent_title: String,
+    pub(crate) parent_status: SideParentStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -917,6 +964,8 @@ pub struct AppState {
     pub cwd: String,
     pub current_session_id: Option<String>,
     pub current_session_title: Option<String>,
+    pub(crate) side_conversation: Option<SideConversationUiState>,
+    pub(crate) side_conversation_visible: bool,
     pub(crate) active_session_attachment: Option<SessionAttachmentId>,
     pub(crate) workspace_git: Option<GitIdentity>,
     #[allow(dead_code)]
@@ -1062,6 +1111,14 @@ impl ScrollAmount for i32 {
 }
 
 impl AppState {
+    pub(crate) fn side_conversation_active(&self) -> bool {
+        self.side_conversation_visible
+    }
+
+    pub(crate) fn side_conversation_available(&self) -> bool {
+        self.side_conversation.is_some()
+    }
+
     pub fn new(
         event_tx: mpsc::Sender<UserAction>,
         app_version: String,
@@ -1092,6 +1149,8 @@ impl AppState {
             cwd,
             current_session_id: None,
             current_session_title: None,
+            side_conversation: None,
+            side_conversation_visible: false,
             active_session_attachment: None,
             workspace_git: None,
             event_tx,
@@ -2668,6 +2727,29 @@ impl AppState {
                 eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }
             TuiEvent::SessionAttachmentActivated => {}
+            TuiEvent::SideConversationChanged {
+                active,
+                available,
+                parent_thread_id,
+                parent_title,
+                parent_status,
+            } => {
+                if available {
+                    self.side_conversation = Some(SideConversationUiState {
+                        parent_thread_id,
+                        parent_title,
+                        parent_status,
+                    });
+                } else {
+                    self.side_conversation = None;
+                }
+                self.side_conversation_visible = active;
+            }
+            TuiEvent::SideParentStatusChanged(status) => {
+                if let Some(side) = self.side_conversation.as_mut() {
+                    side.parent_status = status;
+                }
+            }
             TuiEvent::SurfaceProjectionSynced(projection) => {
                 self.apply_surface_projection_state(*projection);
             }
