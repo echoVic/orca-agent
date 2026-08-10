@@ -76,6 +76,18 @@ fn saved_conversation_text(home: &Path) -> String {
         .join("\n")
 }
 
+fn session_id_from_home(home: &Path) -> String {
+    let documents = session_documents(home);
+    assert_eq!(documents.len(), 1, "exactly one session document expected");
+    documents[0]
+        .1
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("session metadata with session id")
+        .to_string()
+}
+
 #[test]
 fn history_subcommand_is_not_exposed() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
@@ -190,6 +202,151 @@ fn exec_resume_injects_prior_conversation() {
         .expect("assistant message");
     let text = message["payload"]["text"].as_str().unwrap_or_default();
     assert!(text.contains("first prompt | mock_history_echo"));
+}
+
+#[test]
+fn exec_resume_subcommand_continues_session_by_id() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "first prompt"])
+        .output()
+        .expect("run first orca");
+    assert_eq!(first.status.code(), Some(0));
+
+    let session_id = session_id_from_home(home.path());
+
+    let resumed = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "resume",
+            &session_id,
+            "mock_history_echo",
+        ])
+        .output()
+        .expect("run resumed orca");
+
+    assert_eq!(resumed.status.code(), Some(0));
+    let events = parse_jsonl(&resumed.stdout);
+    let message = events
+        .iter()
+        .find(|event| event["type"] == "assistant.message.delta")
+        .expect("assistant message");
+    let text = message["payload"]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("first prompt | mock_history_echo"));
+}
+
+#[test]
+fn exec_resume_subcommand_last_continues_latest() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "first prompt"])
+        .output()
+        .expect("run first orca");
+    assert_eq!(first.status.code(), Some(0));
+
+    let resumed = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "resume",
+            "--last",
+            "mock_history_echo",
+        ])
+        .output()
+        .expect("run resumed orca");
+
+    assert_eq!(resumed.status.code(), Some(0));
+    let events = parse_jsonl(&resumed.stdout);
+    let message = events
+        .iter()
+        .find(|event| event["type"] == "assistant.message.delta")
+        .expect("assistant message");
+    let text = message["payload"]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("first prompt | mock_history_echo"));
+}
+
+#[test]
+fn exec_resume_after_budget_exhaustion_recounts_budget_scope() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "--max-budget",
+            "0.000001",
+            "mock_usage",
+        ])
+        .output()
+        .expect("run budget-limited orca");
+    assert_eq!(
+        first.status.code(),
+        Some(4),
+        "budget exhaustion is typed, not a generic failure"
+    );
+
+    let session_id = session_id_from_home(home.path());
+
+    // The resumed invocation owns a fresh budget scope: the previous run's
+    // ceiling does not leak into the continuation, while the session and its
+    // prior consumption records stay durable.
+    let resumed = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "resume",
+            &session_id,
+            "mock_usage",
+        ])
+        .output()
+        .expect("run resumed orca");
+    assert_eq!(resumed.status.code(), Some(0));
+
+    let documents = session_documents(home.path());
+    assert_eq!(
+        documents.len(),
+        1,
+        "resume appends to the session, never forks"
+    );
+    let records = &documents[0].1;
+    let meta_records = records
+        .iter()
+        .filter(|record| record["type"] == "session.meta")
+        .collect::<Vec<_>>();
+    assert_eq!(meta_records.len(), 1, "one durable session identity");
+    assert_eq!(
+        meta_records[0]["session_id"].as_str(),
+        Some(session_id.as_str()),
+        "resumed session keeps its identity"
+    );
+    let user_messages = records
+        .iter()
+        .filter(|record| {
+            record["type"] == "conversation.message" && record["message"]["role"] == "user"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_messages.len(),
+        2,
+        "the exhausted run's accepted input and the continuation input both persist"
+    );
 }
 
 #[test]
@@ -519,6 +676,159 @@ fn exec_fork_creates_child_with_parent_metadata() {
     let child_text = serde_json::to_string(child_records).expect("serialize child records");
     assert!(child_text.contains("fork parent prompt"));
     assert!(child_text.contains("mock_history_echo"));
+}
+
+#[test]
+fn exec_resume_at_restores_conversation_to_message_boundary() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "first prompt"])
+        .output()
+        .expect("run first orca");
+    assert_eq!(first.status.code(), Some(0));
+    let session_id = session_id_from_home(home.path());
+
+    let appended = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "resume",
+            &session_id,
+            "second prompt",
+        ])
+        .output()
+        .expect("append second prompt");
+    assert_eq!(appended.status.code(), Some(0));
+
+    let records = &session_documents(home.path())[0].1;
+    let first_user_id = records
+        .iter()
+        .find(|record| {
+            record["type"] == "conversation.message"
+                && record["message"]["role"] == "user"
+                && record["message"]["content"] == "first prompt"
+        })
+        .and_then(|record| record["id"].as_str())
+        .expect("first user message item id")
+        .to_string();
+
+    let resumed = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "resume",
+            &session_id,
+            "--resume-at",
+            &first_user_id,
+            "mock_history_echo",
+        ])
+        .output()
+        .expect("resume at boundary");
+
+    assert_eq!(resumed.status.code(), Some(0));
+    let events = parse_jsonl(&resumed.stdout);
+    let message = events
+        .iter()
+        .find(|event| event["type"] == "assistant.message.delta")
+        .expect("assistant message");
+    let text = message["payload"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("first prompt"),
+        "boundary keeps messages at or before it"
+    );
+    assert!(
+        !text.contains("second prompt"),
+        "boundary drops messages after it: {text}"
+    );
+}
+
+#[test]
+fn exec_resume_at_rejects_unknown_boundary() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "first prompt"])
+        .output()
+        .expect("run first orca");
+    assert_eq!(first.status.code(), Some(0));
+    let session_id = session_id_from_home(home.path());
+
+    let resumed = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "resume",
+            &session_id,
+            "--resume-at",
+            "item_00000000-0000-0000-0000-000000000000",
+            "mock_history_echo",
+        ])
+        .output()
+        .expect("resume at unknown boundary");
+
+    assert_eq!(resumed.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("no saved message matches"),
+        "unknown boundary must fail closed: {stderr}"
+    );
+}
+
+#[test]
+fn budget_exhausted_session_persists_typed_checkpoint() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "--max-budget",
+            "0.000001",
+            "mock_usage",
+        ])
+        .output()
+        .expect("run budget-limited orca");
+    assert_eq!(first.status.code(), Some(4));
+
+    let records = &session_documents(home.path())[0].1;
+    let checkpoint = records
+        .iter()
+        .find(|record| record["type"] == "session.checkpoint")
+        .expect("typed checkpoint on budget exhaustion");
+    assert_eq!(checkpoint["status"], "budget_exhausted");
+    assert_eq!(checkpoint["reason"], "cost_budget_exhausted");
+    assert_eq!(checkpoint["resumable"], true);
+    assert_eq!(
+        checkpoint["budget_consumed"]["input_tokens"], 120,
+        "checkpoint records the consumption that exhausted the budget"
+    );
+    let checkpoint_index = records
+        .iter()
+        .position(|record| record["type"] == "session.checkpoint")
+        .expect("checkpoint index");
+    let completed_index = records
+        .iter()
+        .position(|record| record["type"] == "session.completed")
+        .expect("completed index");
+    assert!(
+        checkpoint_index > completed_index,
+        "checkpoint lands after the budget terminal and before the projection flush"
+    );
 }
 
 fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {

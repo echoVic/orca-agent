@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.13":
+        "Makes headless resume a first-class CLI capability. orca exec resume <SESSION_ID> continues a saved session with a fresh budget scope, resume --last picks the most recent session, and --resume-at <MESSAGE_ID> restores only up to a durable message boundary. session.completed now carries the durable session_id, text-mode exits print the exact resume command, and a budget-exhausted run persists a typed session.checkpoint (status, reason, budget consumed, last committed message, task plan, resumable) before the terminal projection — uncommitted tool calls remain indeterminate on restore, so Orca promises resumable, not exactly-once, execution.",
       "v0.3.12":
         "Adds runtime-owned Side Conversations for quick questions without disturbing the main task. /side creates a separate disposable child from an atomic parent snapshot; Ctrl+/ switches between parent and Side while the parent keeps running, and Ctrl+C closes and joins only the Side. Side history, memory, goals, and transcript output never merge into the durable parent. TUI response projection also fences provider responses by turn and item identity so older or partial streams cannot overwrite the current response.",
       "v0.3.11":
@@ -582,6 +584,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.13":
+        "让 headless resume 成为一等 CLI 能力。orca exec resume <SESSION_ID> 以全新预算范围继续保存的会话，resume --last 恢复最近会话，--resume-at <MESSAGE_ID> 只恢复到持久化消息边界为止。session.completed 现在携带持久的 session_id，文本模式退出时打印确切的 resume 命令，预算耗尽的运行会在 terminal projection 之前持久化类型化 session.checkpoint（status、reason、已消耗预算、最后提交消息、任务计划、resumable）。恢复时未提交的工具调用仍标记为 indeterminate——Orca 承诺可恢复，而非 exactly-once 执行。",
       "v0.3.12":
         "新增 runtime-owned Side Conversation，用来临时提问而不打断主任务。/side 会从父会话的原子快照创建独立、可丢弃的 child；Ctrl+/ 在父会话与 Side 之间切换，父任务仍可继续运行，Ctrl+C 只关闭并回收 Side。Side 的历史、memory、Goal 和 transcript 都不会合并回持久化父会话。TUI response projection 也会按 turn 与 item identity 隔离 provider response，避免旧流或部分流覆盖当前回复。",
       "v0.3.11":

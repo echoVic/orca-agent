@@ -27,8 +27,8 @@ use super::types::{
 };
 use super::writer::{
     acquire_file_lock, conversation_record_from_semantic_event, open_regular_history_file,
-    read_history_lines, read_records, read_session_meta, read_transcript, rewrite_records_unlocked,
-    write_durable_record,
+    read_history_lines, read_records, read_session_meta, read_transcript, read_transcript_until,
+    rewrite_records_unlocked, write_durable_record,
 };
 use super::{LiveThread, ORCA_HOME_ENV};
 
@@ -313,6 +313,14 @@ impl JsonlThreadStore {
         load_session(selector)
     }
 
+    pub fn load_session_until(
+        &self,
+        selector: &str,
+        boundary_message_id: &str,
+    ) -> io::Result<SessionTranscript> {
+        load_session_until(selector, boundary_message_id)
+    }
+
     pub fn search_sessions(
         &self,
         query: &str,
@@ -518,6 +526,30 @@ pub fn load_session(selector: &str) -> io::Result<SessionTranscript> {
     };
 
     read_transcript(&path)
+}
+
+/// Like [`load_session`], but restores only the message log up to the
+/// persisted conversation item id `boundary_message_id` (inclusive).
+pub fn load_session_until(
+    selector: &str,
+    boundary_message_id: &str,
+) -> io::Result<SessionTranscript> {
+    let path = if is_latest_selector(selector) {
+        list_sessions(1)?
+            .into_iter()
+            .next()
+            .map(|s| s.path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no saved sessions"))?
+    } else {
+        find_session_path(selector, true)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no saved session matches '{selector}'"),
+            )
+        })?
+    };
+
+    read_transcript_until(&path, boundary_message_id)
 }
 
 pub(crate) fn summarize_session_with_archive_flag(

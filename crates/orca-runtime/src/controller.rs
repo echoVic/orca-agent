@@ -761,7 +761,7 @@ impl ThreadTurnCompletion {
             task.emit_all(events, sink)?;
         }
         if request.emit_session_completed() {
-            sink.emit(events.session_completed(self.status))?;
+            sink.emit(events.session_completed(self.status, session.session_id()))?;
         }
         Ok(self.status)
     }
@@ -1134,6 +1134,15 @@ fn run_inner<W: io::Write>(
     shutdown?;
     if config.desktop_notifications {
         let _ = crate::notify::notify("Orca", &format!("Session {}", status.as_str()));
+    }
+    if config.output_format == OutputFormat::Text
+        && status != RunStatus::Success
+        && let Some(session_id) = thread.session_id()
+    {
+        writeln!(
+            writer,
+            "To continue this session, run: orca exec resume {session_id}"
+        )?;
     }
     Ok(status)
 }

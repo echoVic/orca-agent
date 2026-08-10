@@ -53,6 +53,9 @@ export DEEPSEEK_API_KEY=sk-...
 orca                                      # open the TUI
 orca exec "fix the failing test"          # run headlessly
 orca exec --verifier "cargo test" "fix it" # verify before finishing
+orca exec resume SESSION_ID "continue"    # resume a headless session
+orca exec resume --last "continue"        # resume the most recent session
+orca exec resume SID --resume-at MID "continue"  # resume up to a message boundary
 orca --mode=acp                           # connect an ACP client
 orca --resume [SESSION_ID]                # resume a saved conversation
 orca --fork SESSION_ID                    # fork a saved conversation
@@ -85,7 +88,8 @@ sandbox permissions.
 - Gates risky actions with `suggest`, sandboxed `auto-edit`, full-access
   `full-auto`, and read-only `plan` modes, plus per-folder trust.
 - Saves local conversations with `--resume` for continuation and `--fork` for
-  branching.
+  branching; `orca exec resume <SESSION_ID>` restores a headless session with a
+  fresh budget scope, and headless exits print the exact resume command.
 - Runs persistent goals without a fixed turn ceiling, plus subagents and
   JavaScript workflows for longer tasks that need continuation or parallel work.
 - Loads project instructions, skills, plugins, custom tools, MCP tools, and MCP

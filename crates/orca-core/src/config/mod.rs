@@ -127,6 +127,13 @@ pub enum HistoryMode {
     Record,
     Disabled,
     Resume(String),
+    /// Continue a saved conversation but restore only the message log up to a
+    /// durable message boundary (`resume_at` is a persisted conversation item
+    /// id). Messages after the boundary are not replayed to the model.
+    ResumeAt {
+        selector: String,
+        resume_at: String,
+    },
     Fork(String),
 }
 
@@ -813,6 +820,7 @@ fn history_posture(history_mode: &HistoryMode) -> &'static str {
         HistoryMode::Record => "recording",
         HistoryMode::Disabled => "disabled",
         HistoryMode::Resume(_) => "resume",
+        HistoryMode::ResumeAt { .. } => "resume-at",
         HistoryMode::Fork(_) => "fork",
     }
 }

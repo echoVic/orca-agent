@@ -51,6 +51,9 @@ export DEEPSEEK_API_KEY=sk-...
 orca                                      # 打开 TUI
 orca exec "修复失败的测试"                 # 无界面运行
 orca exec --verifier "cargo test" "修复它" # 完成前执行验证
+orca exec resume SESSION_ID "继续"        # 恢复无界面会话
+orca exec resume --last "继续"            # 恢复最近的会话
+orca exec resume SID --resume-at MID "继续"  # 恢复到消息边界为止
 orca --mode=acp                           # 连接 ACP 客户端
 orca --resume [SESSION_ID]                # 恢复保存的会话
 orca --fork SESSION_ID                    # 分叉保存的会话

@@ -731,7 +731,7 @@ pub(crate) fn goal_usage_delta(
     }
 }
 
-fn plan_snapshot(conversation: &orca_core::conversation::Conversation) -> Option<&str> {
+pub(crate) fn plan_snapshot(conversation: &orca_core::conversation::Conversation) -> Option<&str> {
     conversation
         .internal_context
         .get(orca_core::conversation::PLAN_CONTEXT_FRAGMENT_ID)

@@ -194,6 +194,27 @@ pub(crate) enum SessionRecord {
         explanation: Option<String>,
         plan: Vec<PlanItem>,
     },
+    /// Typed soft-landing checkpoint written when a session stops against a
+    /// resumable terminal (for example `budget_exhausted`). It records the
+    /// durable boundary a continuation should resume from and the budget
+    /// consumed up to that point; it is audit data, not execution state.
+    #[serde(rename = "session.checkpoint")]
+    Checkpoint(SessionCheckpointRecord),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionCheckpointRecord {
+    pub session_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub budget_consumed: UsageTotals,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_committed_message_id: Option<String>,
+    pub resumable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_plan: Option<String>,
+    pub recorded_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
