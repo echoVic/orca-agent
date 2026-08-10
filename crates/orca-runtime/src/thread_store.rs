@@ -28,15 +28,16 @@ pub(crate) use projection::{
 pub use session_index::SessionSummaryPage;
 pub(crate) use types::{ManualCompactionDurableSnapshot, StoredConversationRecord};
 pub use types::{
-    SessionMeta, SessionSummary, SessionTranscript, SortDirection, StoredThreadItem,
-    StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
-    StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
-    ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
-    TurnItemsView,
+    SessionCheckpointRecord, SessionMeta, SessionSummary, SessionTranscript, SortDirection,
+    StoredThreadItem, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
+    StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn,
+    StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
+    ThreadSortKey, ThreadStore, TurnItemsView,
 };
 pub use writer::SessionWriter;
 pub(crate) use writer::{
     read_latest_context_tokens, read_manual_compaction_snapshot, redact_sensitive_text,
+    truncate_transcript_at_boundary,
 };
 
 pub(crate) fn resume_conversation(

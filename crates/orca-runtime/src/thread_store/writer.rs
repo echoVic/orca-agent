@@ -343,7 +343,64 @@ pub(crate) fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
 }
 
 pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
+    transcript_from_records(path, read_records(path)?)
+}
+
+/// Read a transcript but restore only the message log up to the persisted
+/// conversation item id `boundary_message_id` (inclusive). Records after the
+/// boundary — including uncommitted tool calls — are not replayed.
+pub(crate) fn read_transcript_until(
+    path: &Path,
+    boundary_message_id: &str,
+) -> io::Result<SessionTranscript> {
     let records = read_records(path)?;
+    transcript_from_records(
+        path,
+        truncate_records_at_boundary(records, boundary_message_id)?,
+    )
+}
+
+/// Keep records through the last `conversation.message` whose item id matches
+/// `boundary_message_id`; drop everything after it.
+pub(crate) fn truncate_records_at_boundary(
+    records: Vec<SessionRecord>,
+    boundary_message_id: &str,
+) -> io::Result<Vec<SessionRecord>> {
+    let mut boundary_index = None;
+    for (index, record) in records.iter().enumerate() {
+        if let SessionRecord::Message { id: Some(id), .. } = record
+            && id.as_str() == boundary_message_id
+        {
+            boundary_index = Some(index);
+        }
+    }
+    let Some(boundary_index) = boundary_index else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no saved message matches '{boundary_message_id}'"),
+        ));
+    };
+    Ok(records.into_iter().take(boundary_index + 1).collect())
+}
+
+/// Apply a message boundary to an already-loaded transcript by re-reading the
+/// records from its durable path, so preloaded transcripts honor the boundary
+/// exactly like freshly loaded ones.
+pub(crate) fn truncate_transcript_at_boundary(
+    transcript: &SessionTranscript,
+    boundary_message_id: &str,
+) -> io::Result<SessionTranscript> {
+    let records = read_records(&transcript.path)?;
+    transcript_from_records(
+        &transcript.path,
+        truncate_records_at_boundary(records, boundary_message_id)?,
+    )
+}
+
+pub(crate) fn transcript_from_records(
+    path: &Path,
+    records: Vec<SessionRecord>,
+) -> io::Result<SessionTranscript> {
     let mut meta = None;
     let mut messages = Vec::new();
     let mut compactions = Vec::new();
@@ -435,6 +492,7 @@ pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
                     last_plan = Some((explanation, plan));
                 }
             }
+            SessionRecord::Checkpoint(_) => {}
         }
     }
 
@@ -562,6 +620,16 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
             }
             for item in plan {
                 redact_string_in_place(&mut item.step);
+            }
+        }
+        SessionRecord::Checkpoint(record) => {
+            redact_string_in_place(&mut record.session_id);
+            redact_string_in_place(&mut record.status);
+            if let Some(reason) = &mut record.reason {
+                redact_string_in_place(reason);
+            }
+            if let Some(task_plan) = &mut record.task_plan {
+                redact_string_in_place(task_plan);
             }
         }
     }
@@ -1014,6 +1082,13 @@ impl SessionWriter {
                 error: error.map(str::to_string),
             },
         )
+    }
+
+    pub(crate) fn append_checkpoint(
+        &mut self,
+        checkpoint: super::types::SessionCheckpointRecord,
+    ) -> io::Result<()> {
+        write_record(&self.path, &SessionRecord::Checkpoint(checkpoint))
     }
 
     pub fn append_background_task_provider_response(

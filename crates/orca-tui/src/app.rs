@@ -8161,7 +8161,9 @@ fn hosted_tui_controller_loop(
     if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
         let cfg = config.lock().unwrap().clone();
         let selector = match &startup_history_mode {
-            HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
+            HistoryMode::Resume(selector)
+            | HistoryMode::ResumeAt { selector, .. }
+            | HistoryMode::Fork(selector) => selector,
             HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
         };
         let title = format!("Restored session {selector}");
@@ -9363,7 +9365,9 @@ fn switch_saved_hosted_session(
 ) -> Result<HistoryMode, String> {
     ensure_current_session_switchable(thread.as_ref())?;
     let selector = match &mode {
-        HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => selector,
+        HistoryMode::Resume(selector)
+        | HistoryMode::ResumeAt { selector, .. }
+        | HistoryMode::Fork(selector) => selector,
         HistoryMode::Record | HistoryMode::Disabled => {
             return Err("saved-session switch requires resume or fork mode".to_string());
         }
@@ -9372,6 +9376,7 @@ fn switch_saved_hosted_session(
         .map_err(|error| format!("failed to load saved conversation: {error}"))?;
     let switch_title = title.unwrap_or_else(|| match mode {
         HistoryMode::Resume(_) => transcript.meta.title.clone(),
+        HistoryMode::ResumeAt { .. } => transcript.meta.title.clone(),
         HistoryMode::Fork(_) => format!("Fork of {}", transcript.meta.title),
         HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
     });

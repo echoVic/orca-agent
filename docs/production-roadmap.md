@@ -4,6 +4,45 @@
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
 Last updated: 2026-08-10
+
+The 2026-08-10 headless resume slice makes "restore a headless execution" a
+first-class CLI capability, following Codex's `exec resume` design while keeping
+Orca's typed termination and durable session identity. `orca exec` now accepts
+a `resume` subcommand: `orca exec resume <SESSION_ID> [PROMPT]...` continues
+the saved conversation by id, prefix, or `latest`, and
+`orca exec resume --last [PROMPT]...` picks the most recent recorded session.
+The shared run options (`--provider`, `--output-format`, `--cwd`, `--mode`,
+`--model`, `--api-key`, `--base-url`, `--verifier`, `--max-budget`) are global
+flags that apply in either position, and combining the subcommand with
+`--resume`/`--fork`/`--continue` is rejected. The original session record is
+immutable: resume appends to the same transcript with a fresh budget scope, so
+the previous run's consumption records stay durable while the new invocation
+owns its own `max_budget` accounting. On headless exit, `session.completed`
+now carries the durable `session_id` when history was recorded (JSONL mode),
+and text mode prints `To continue this session, run: orca exec resume
+<session-id>` for every non-success terminal — so a budget-exhausted run (exit
+code 4, `status=budget_exhausted`) is visibly distinct from a failure and tells
+the caller exactly how to continue. This changes no persisted transcript
+schema and no server protocol.
+
+The same line adds Claude Code's message-boundary restore: `--resume-at
+<MESSAGE_ID>` (on both the `resume` subcommand and `--resume`/`--continue`)
+restores the conversation only up to a persisted conversation item id — the
+durable boundary — so a later prompt cannot replay uncommitted work past a
+chosen point; unknown boundaries fail closed. It also adds Grok-style budget
+scope separation at the checkpoint level: when a headless session stops at
+`budget_exhausted`, the runtime persists a typed `session.checkpoint` record
+(status, reason like `max_inner_turns`/`cost_budget_exhausted`, aggregate
+budget consumed, the last committed message id, the current task plan, and
+`resumable: true`) before the terminal projection, so the resume command can
+start from the last committed boundary with a new budget. Uncommitted tool
+calls are still distinguished on restore via the existing indeterminate
+compatibility repair — Orca promises resumable, not exactly-once, execution.
+Conversation rewind is supported through `--resume-at`; file rewind is
+explicitly not promised because Orca does not snapshot external workspace
+state (Grok's principle: only restore durable facts, never pretend external
+side effects are rewindable).
+
 Current baseline: v0.3.12 adds runtime-owned Side Conversations and strengthens
 TUI response projection boundaries. This builds on v0.3.8's remaining-context
 visibility, one-to-one
@@ -1131,6 +1170,112 @@ verified before the next phase starts.
 
 ### Current Refactor Priorities
 
+#### Evidence-Based Roadmap Reconsideration (2026-08-10)
+
+This is the current planning baseline. It is based on a fresh inspection of the
+source tree, git history, roadmap, and the 2026-08-03 architecture review. It
+supersedes the ordering in the historical inventory below; completed work is
+recorded as evidence, not repeated as future work.
+
+#### Evidence: What Is Already Done
+
+The first review tier is complete: `GoalActor::request` has a bounded
+`recv_timeout` (`crates/orca-runtime/src/goal_actor.rs:1636`), supervisor store
+access is moved behind `spawn_blocking`, streaming reduction appends with
+`push_str` (`crates/orca-runtime/src/runtime_surface/reducer.rs:3678`), the
+unused `orca-provider` dependency is gone from `orca-tui`, and usage projection
+assigns values by event ordinal (`crates/orca-runtime/src/runtime_surface/commit.rs:3722`).
+
+The v0.3.1 defect tier is also closed: the session lifecycle contract was
+fixed (`959adeedf`), and the runtime-surface validator is executed by
+`.github/workflows/runtime-contract.yml`. The larger architecture tier is
+mostly closed: production `lib.rs` files no longer use source-layout
+`include_str!` assertions (the remaining embeddings are workflow/host assets
+and surface-manifest fixtures), `unstable_surface` is closed behind curated
+exports, provider no longer depends on tools, and MCP registry ownership is in
+runtime (`b81c4d413`).
+
+ThreadActor has started the intended split. The four existing controllers under
+`crates/orca-runtime/src/runtime_actor/` (`background`, `capability`, `commit`,
+and `goal`) total 2,834 lines. This is meaningful progress, but it is not the
+end state.
+
+#### Evidence: What Is Still Open
+
+1. **ThreadActor is still a god object.** At the audited `HEAD`,
+   `crates/orca-runtime/src/runtime_host.rs` is 51,113 lines. Its
+   `impl ThreadActor` spans lines 13,438-37,114, contains 254 methods, and the
+   actor graph still carries eight pending state-machine categories. The four
+   controller extractions did not reduce the main implementation to the
+   approximately 8,000-line target. Every new feature therefore continues to
+   increase the largest structural risk in the repository.
+2. **P1.4 task supervision is not implemented.** `TaskRegistry::new_persistent`
+   (`crates/orca-runtime/src/tasks.rs:286`) provides cross-process record
+   persistence and interrupted-task recovery, but there is no cross-process
+   lease, fencing token, stale-owner takeover, or task-wide publication
+   contract. Detached-worker ownership remains ambiguous at exactly the point
+   where stop, reattach, and crash recovery must be authoritative.
+3. **TUI/runtime protocol drift remains unsliced.** `crates/orca-tui/src/app.rs`
+   is 10,186 lines and `surface_projection.rs` is 2,281 lines. Renderer-owned
+   orchestration and projection duplication remain in the code even though the
+   roadmap matrix has mentioned their convergence in several places.
+4. **P2.4 context/cache identity is not a release slice.** DeepSeek usage
+   already parses `prompt_cache_hit_tokens` (`crates/orca-provider/src/deepseek_http.rs:192`),
+   but deterministic cache-critical prefixes (stable system prompt, tool
+   schema, and conversation-prefix ordering), fork isolation, and explicit
+   checkpoints are not yet specified as one independently verifiable change.
+5. **The pending-store deletion gate has not passed.**
+   `RuntimePendingInteractionStore` remains as a source-compatible shim. Its
+   retirement spec requires the legacy Goal path to disappear, server and CLI
+   callers to stop compiling against it, and durable broker recovery evidence;
+   the implementation plan being checked off does not itself satisfy those
+   gates.
+6. **Five linked branches are cleanup candidates, not new work.**
+   `codex/auto-memory-governance`, `codex/headless-trajectory-truth`,
+   `codex/mcp-sse-elicitation`, `codex/network-ask-on-block`, and
+   `feat/side-conversation` are not ancestors of `main`; their changes have
+   corresponding rebased commits on `main` (for example `97fa233c4`,
+   `565b4be92`, `fd75c85bc`, `c69a8a263`, and `8a7ae4584`). They should be
+   removed only after a provenance check confirms each branch has no unique
+   uncommitted work or unreplayed patch.
+
+#### Reordered Release Slices
+
+Each row is an independent, behaviorally verifiable patch release. The order
+follows the project decision priority: lifecycle and ownership, TUI reliability,
+architecture boundaries, DeepSeek-native value, compatibility migration, slice
+size, then short-term implementation cost.
+
+| Order | Slice | Priority class | User value | Acceptance evidence |
+|------:|-------|----------------|------------|---------------------|
+| 1 | **P1.4 task supervision completion**: add `TaskRegistry` lease/fencing/stale-owner takeover and task-wide publication | Lifecycle / ownership | Background subagents can be stopped, reaped, reattached, and recovered after process failure without a detached owner | Cross-process PTY contract, crash-recovery test, stale-commit rejection, and focused/full task-lifecycle gates |
+| 2 | **ThreadActor split completion**: finish the four existing controller seams and reduce the main impl toward ~8k lines | Architecture boundary | Future runtime features become cheaper to change and less likely to regress lifecycle behavior | Behavior tests and focused runtime suites; do not make source shape the acceptance oracle |
+| 3 | **TUI/runtime protocol convergence**: extract renderer-owned orchestration and make runtime surface state the single projection source | Architecture boundary | Fewer TUI regressions and one authoritative rendering/lifecycle state | Real TUI PTY contracts plus the runtime-surface contract validator in CI |
+| 4 | **P2.4 context/cache identity**: deterministic cache-critical prefixes, fork-state isolation, and explicit checkpoints | DeepSeek-native | Stable long sessions can realize prompt-cache savings instead of invalidating the prefix on incidental reorderings | Two real DeepSeek API requests with the same prefix and observed `prompt_cache_hit_tokens`, plus fork/checkpoint behavior tests |
+| 5 | **Pending-store deletion gate**: remove the compatibility shim and legacy Goal path only after its stated migration gates pass | Compatibility migration | Eliminate the second interaction fact source without stranding existing callers | Gate each requirement in `docs/superpowers/specs/2026-08-08-runtime-pending-store-retirement.md` and run `cargo-semver-checks` |
+| 6 | **Compaction completion and remote-compaction evaluation**: finish `RuntimeCompactionPolicy`, then drive remote work from real waiting behavior | DeepSeek-native | Long conversations retain usable context without silently dropping state | Long-context real-API smoke, interruption/recovery checks, and focused/full compaction gates |
+| 7 | **Repository cleanup**: remove the five superseded linked branches and integration residue | Hygiene | One clear source of truth for maintainers and release automation | `git merge-base`, patch/provenance checks, clean worktrees, and branch/worktree verification |
+
+#### Why This Differs From the Previous Roadmap
+
+- ThreadActor moves from the old third tier to the front because the evidence
+  calls it Critical and every additional feature is still paying its cost.
+- P2.4 cache identity moves into the first four slices because it is the rare
+  DeepSeek-native capability with direct user cost impact and a concrete real
+  API verifier.
+- Pending-store retirement becomes an explicit acceptance slice rather than a
+  vague later cleanup; a defined deletion gate is only useful when the roadmap
+  schedules its verification.
+- Worktree cleanup is now explicit and provenance-first: no branch is deleted
+  merely because it is not an ancestor, and no unrelated user work is reset or
+  merged into the release path.
+
+Execution of slice 1 starts from a freshly fetched `main` in
+`.worktrees/p1-4-task-supervision` after its Spec Gate and implementation plan.
+This documentation update does not claim that slice 1 has begun.
+
+#### Historical Refactor Inventory (Superseded)
+
 The July 2026 Codex and package 3 reference pass ranks the remaining
 architecture work as follows. Codex is the stronger reference for ownership:
 core thread/session code runs turns against a frozen `TurnContext` plus
@@ -1142,8 +1287,8 @@ MCP elicitation queue are good interaction references, but its broad
 `ToolUseContext` and app-state-coupled orchestration should not be copied into
 Orca.
 
-The July 11 ownership and recovery pass supersedes the older priority labels
-below. The full evidence and dependency graph are recorded in
+At the time, the July 11 ownership and recovery pass superseded the older
+priority labels below. The full evidence and dependency graph are recorded in
 [`docs/reports/2026-07-11-codex-package3-runtime-refactor.md`](reports/2026-07-11-codex-package3-runtime-refactor.md).
 The immediate sequence is:
 
@@ -1161,11 +1306,12 @@ The immediate sequence is:
    sequencer, then add the interaction broker, tool runtime, and fenced task
    supervisor before attempting true workflow/subagent/goal resume.
 
-The detailed inventory that follows remains useful implementation history, but
-new releases should be ranked against this ownership sequence rather than by
-how many additional call-surface bundles they extract.
+The detailed inventory that follows remains useful implementation history. New
+releases now use the evidence-based sequence above rather than counting
+additional call-surface bundles.
 
-The deeper July 9 reference pass changes the next refactor order:
+The deeper July 9 reference pass recorded the following refactor order at that
+checkpoint:
 
 1. **P0: Stop treating call-surface grouping as the main work once the current
    tool-turn context family is finished.** The normal, subagent batch, and
@@ -2225,7 +2371,7 @@ instruction and capability system.
 
 ---
 
-## July 12 Priority Matrix
+## Historical July 12 Priority Matrix (Superseded)
 
 | Priority | Item | Why Now | Risk |
 |----------|------|---------|------|

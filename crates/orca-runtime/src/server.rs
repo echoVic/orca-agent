@@ -342,9 +342,10 @@ pub fn thread_run_config(config: &RunConfig) -> RunConfig {
     run_config.output_format = OutputFormat::Jsonl;
     run_config.history_mode = match run_config.history_mode {
         HistoryMode::Record => HistoryMode::Record,
-        HistoryMode::Disabled | HistoryMode::Resume(_) | HistoryMode::Fork(_) => {
-            HistoryMode::Disabled
-        }
+        HistoryMode::Disabled
+        | HistoryMode::Resume(_)
+        | HistoryMode::ResumeAt { .. }
+        | HistoryMode::Fork(_) => HistoryMode::Disabled,
     };
     run_config.show_session_picker = false;
     run_config.desktop_notifications = false;

@@ -2288,7 +2288,7 @@ impl RuntimeThreadStartRequest {
                 self.prepared_record_meta = Some(meta);
                 (thread_id, path)
             }
-            HistoryMode::Resume(selector) => {
+            HistoryMode::Resume(selector) | HistoryMode::ResumeAt { selector, .. } => {
                 let transcript = match self.preloaded.take() {
                     Some(transcript) => transcript,
                     None => SessionStore::new()
@@ -2363,7 +2363,10 @@ impl RuntimeThreadStartRequest {
             message: format!("failed to acquire typed surface owner lease: {error:?}"),
         })?;
         let resume_scope_replacement = (self.replace_resume_scope
-            && matches!(self.config.history_mode, HistoryMode::Resume(_)))
+            && matches!(
+                self.config.history_mode,
+                HistoryMode::Resume(_) | HistoryMode::ResumeAt { .. }
+            ))
         .then(|| ResumeScopeReplacement {
             runtime_workspace_roots: self
                 .config
@@ -35094,7 +35097,10 @@ impl ThreadActor {
                                     {
                                         observe_runtime_event(
                                             active.request.event_observer().as_deref(),
-                                            result.state.events.session_completed(status),
+                                            result.state.events.session_completed(
+                                                status,
+                                                result.state.thread.session().session_id(),
+                                            ),
                                         );
                                     }
                                     self.state = Some(result.state);
@@ -35495,7 +35501,10 @@ impl ThreadActor {
             }) => {
                 observe_runtime_event(
                     active.request.event_observer().as_deref(),
-                    result.state.events.session_completed(status),
+                    result
+                        .state
+                        .events
+                        .session_completed(status, result.state.thread.session().session_id()),
                 );
                 OperationOutcome::Completed(status)
             }
@@ -37488,8 +37497,45 @@ fn run_headless_session(
     ) {
         sink.emit(events.error(&format!("session_end hook failed: {error}")))?;
     }
-    if matches!(outcome, ThreadOperationOutcome::Completed { .. }) {
-        sink.emit(events.session_completed(status))?;
+    if let ThreadOperationOutcome::Completed {
+        end_reason,
+        background_workflows: _,
+        ..
+    } = &outcome
+    {
+        // Soft landing: a budget-exhausted headless session persists a typed
+        // checkpoint before the terminal projection, so the caller can resume
+        // from the last committed boundary with a fresh budget scope.
+        if status == RunStatus::BudgetExhausted
+            && let Some(session_id) = thread.session().session_id().map(str::to_string)
+        {
+            let checkpoint = {
+                let session = thread.session();
+                let last_committed_message_id =
+                    session.conversation_records().and_then(|records| {
+                        records.iter().rev().find_map(|record| {
+                            record.item_id.as_ref().map(|id| id.as_str().to_string())
+                        })
+                    });
+                crate::thread_store::SessionCheckpointRecord {
+                    session_id,
+                    status: status.as_str().to_string(),
+                    reason: Some(end_reason.as_str().to_string()),
+                    budget_consumed: session.aggregate_usage_totals(),
+                    last_committed_message_id,
+                    resumable: true,
+                    task_plan: crate::thread::plan_snapshot(session.conversation())
+                        .map(str::to_string),
+                    recorded_at: chrono::Utc::now(),
+                }
+            };
+            if let Some(writer) = thread.session_mut().writer_mut()
+                && let Err(error) = writer.append_checkpoint(checkpoint)
+            {
+                eprintln!("orca: warning: failed to record session checkpoint: {error}");
+            }
+        }
+        sink.emit(events.session_completed(status, thread.session().session_id()))?;
     }
     Ok(outcome)
 }
@@ -37663,7 +37709,7 @@ fn run_provider_background_task(
         }
         observe_runtime_event(
             context.observer.as_deref(),
-            events.session_completed(status),
+            events.session_completed(status, None),
         );
     }
 }

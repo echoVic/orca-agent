@@ -19,6 +19,7 @@ pub struct ExecCommandRequest {
     pub verifier: Option<String>,
     pub max_budget: Option<f64>,
     pub resume: Option<String>,
+    pub resume_at: Option<String>,
     pub fork: Option<String>,
     pub continue_latest: bool,
     pub no_history: bool,
@@ -55,6 +56,14 @@ pub fn run_with_stdin(
         eprintln!("orca: --resume, --fork, and --continue are mutually exclusive");
         return 1;
     }
+    if request.resume_at.is_some() && request.fork.is_some() {
+        eprintln!("orca: --resume-at cannot be combined with --fork");
+        return 1;
+    }
+    if request.resume_at.is_some() && request.resume.is_none() && !request.continue_latest {
+        eprintln!("orca: --resume-at requires --resume, --continue, or the resume subcommand");
+        return 1;
+    }
 
     let prompt = match resolve_prompt(request.prompt, stdin_is_terminal, stdin) {
         Ok(prompt) => prompt,
@@ -78,6 +87,7 @@ pub fn run_with_stdin(
         request.resume,
         request.fork,
         request.continue_latest,
+        request.resume_at,
         fallback,
     );
     let mut config_request = RunConfigRequest::new(request.app_version, config_cwd);
@@ -164,10 +174,26 @@ pub(crate) fn resolve_history_mode(
     resume: Option<String>,
     fork: Option<String>,
     continue_latest: bool,
+    resume_at: Option<String>,
     fallback: HistoryMode,
 ) -> HistoryMode {
     if let Some(selector) = fork {
         HistoryMode::Fork(selector)
+    } else if let Some(resume_at) = resume_at {
+        let selector = resume.or_else(|| {
+            if continue_latest {
+                Some("latest".to_string())
+            } else {
+                None
+            }
+        });
+        match selector {
+            Some(selector) => HistoryMode::ResumeAt {
+                selector,
+                resume_at,
+            },
+            None => fallback,
+        }
     } else if let Some(selector) = resume.or_else(|| {
         if continue_latest {
             Some("latest".to_string())

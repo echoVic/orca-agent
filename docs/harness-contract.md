@@ -162,6 +162,45 @@ The final `session.completed` event contains one of:
 - `verification_failed`
 - `budget_exhausted`
 
+When the run recorded history, the same event also carries the durable
+`session_id` (the id a subsequent `orca exec resume <session_id>` accepts), so
+a harness can continue a budget-exhausted or failed session without parsing the
+transcript. In text mode, a non-success exit prints the exact resume command:
+
+```text
+To continue this session, run: orca exec resume <session-id>
+```
+
+A resumed run appends to the original transcript and owns a fresh budget scope:
+the previous invocation's `max_budget` ceiling does not carry over, while its
+usage records remain durable.
+
+To restore only the durable message boundary, pass `--resume-at <MESSAGE_ID>`
+(a persisted conversation item id) to the `resume` subcommand or to
+`--resume`/`--continue`. Messages after the boundary — including uncommitted
+tool calls — are not replayed to the model, and an unknown boundary fails
+closed before the provider is called:
+
+```text
+orca exec resume <session-id> --resume-at <message-id> "continue"
+```
+
+When a headless session stops at `budget_exhausted`, the runtime also appends
+a typed `session.checkpoint` record to the transcript before the terminal
+projection:
+
+```json
+{"type":"session.checkpoint","session_id":"...","status":"budget_exhausted",
+ "reason":"max_inner_turns","budget_consumed":{"input_tokens":120,...},
+ "last_committed_message_id":"item_...","resumable":true,
+ "task_plan":"...","recorded_at":"..."}
+```
+
+The checkpoint is audit data — execution always resumes from the transcript's
+committed messages, and uncommitted side effects are never claimed as
+exactly-once (restore repairs them as indeterminate). File rewind is not
+promised: Orca does not snapshot external workspace state.
+
 ## Exit Codes
 
 - `0`: success

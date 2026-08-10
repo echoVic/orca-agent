@@ -70,42 +70,53 @@ enum Command {
 }
 
 #[derive(Debug, Parser)]
+#[command(
+    override_usage = "orca exec [OPTIONS] [PROMPT]...\n       orca exec [OPTIONS] <COMMAND> [ARGS]"
+)]
 struct ExecArgs {
+    /// Resume a saved conversation as a non-interactive session.
+    #[command(subcommand)]
+    command: Option<ExecCommand>,
+
     /// Output format: text (human-readable) or jsonl (machine-readable).
-    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text, global = true)]
     output_format: OutputFormatArg,
 
     /// Workspace directory.
-    #[arg(long)]
+    #[arg(long, global = true)]
     cwd: Option<PathBuf>,
 
     /// Approval policy for tool actions.
-    #[arg(long = "mode", alias = "approval-mode", value_enum)]
+    #[arg(long = "mode", alias = "approval-mode", value_enum, global = true)]
     approval_mode: Option<ApprovalMode>,
 
     /// Model to use (overrides config file and DEEPSEEK_MODEL env).
-    #[arg(long)]
+    #[arg(long, global = true)]
     model: Option<String>,
 
     /// API key to use (overrides config file and ORCA_API_KEY env).
-    #[arg(long)]
+    #[arg(long, global = true)]
     api_key: Option<String>,
 
     /// API base URL (overrides config file and DEEPSEEK_BASE_URL env).
-    #[arg(long)]
+    #[arg(long, global = true)]
     base_url: Option<String>,
 
     /// Optional verifier command to run after completion.
-    #[arg(long)]
+    #[arg(long, global = true)]
     verifier: Option<String>,
 
     /// Maximum estimated USD budget for this run.
-    #[arg(long)]
+    #[arg(long, global = true)]
     max_budget: Option<f64>,
 
     /// Resume a saved conversation by ID, prefix, or 'latest'.
     #[arg(long)]
     resume: Option<String>,
+
+    /// Restore the resumed conversation only up to this persisted message id.
+    #[arg(long = "resume-at", value_name = "MESSAGE_ID")]
+    resume_at: Option<String>,
 
     /// Fork a saved conversation by ID, prefix, or 'latest'.
     #[arg(long, alias = "fork-session")]
@@ -124,8 +135,32 @@ struct ExecArgs {
     save_history: bool,
 
     /// Provider implementation (internal, for testing).
-    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true)]
+    #[arg(long, value_enum, default_value_t = ProviderKind::DeepSeek, hide = true, global = true)]
     provider: ProviderKind,
+
+    /// Prompt to execute.
+    prompt: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ExecCommand {
+    /// Resume a saved conversation by ID, prefix, or 'latest'.
+    Resume(ExecResumeArgs),
+}
+
+#[derive(Debug, Parser)]
+struct ExecResumeArgs {
+    /// Session id, prefix, or 'latest' to resume. Omit with --last to pick the most recent.
+    #[arg(value_name = "SESSION_ID", required_unless_present = "last")]
+    session_id: Option<String>,
+
+    /// Continue the most recent recorded session.
+    #[arg(long)]
+    last: bool,
+
+    /// Restore the resumed conversation only up to this persisted message id.
+    #[arg(long = "resume-at", value_name = "MESSAGE_ID")]
+    resume_at: Option<String>,
 
     /// Prompt to execute.
     prompt: Vec<String>,
@@ -399,26 +434,76 @@ impl From<OutputFormatArg> for OutputFormat {
     }
 }
 
-impl From<ExecArgs> for orca_runtime::command::exec::ExecCommandRequest {
-    fn from(args: ExecArgs) -> Self {
-        Self {
+impl ExecArgs {
+    fn into_request(self) -> Result<orca_runtime::command::exec::ExecCommandRequest, String> {
+        let (resume, continue_latest, resume_at, prompt) = match self.command {
+            Some(ExecCommand::Resume(resume_args)) => {
+                if self.resume.is_some() || self.fork.is_some() || self.continue_latest {
+                    return Err(
+                        "the 'resume' subcommand cannot be combined with --resume/--fork/--continue"
+                            .to_string(),
+                    );
+                }
+                if self.no_history {
+                    return Err(
+                        "the 'resume' subcommand cannot be combined with --no-history".to_string(),
+                    );
+                }
+                // When --last is used without an explicit prompt, clap cannot
+                // express the conditional positional meaning, so the first
+                // positional is reinterpreted as the prompt (Codex-style).
+                let (selector, prompt) = if resume_args.last && resume_args.prompt.is_empty() {
+                    (None, resume_args.session_id.into_iter().collect())
+                } else {
+                    (resume_args.session_id, resume_args.prompt)
+                };
+                let selector = selector.or_else(|| resume_args.last.then(|| "latest".to_string()));
+                return Ok(orca_runtime::command::exec::ExecCommandRequest {
+                    app_version: env!("CARGO_PKG_VERSION").to_string(),
+                    output_format: self.output_format.into(),
+                    cwd: self.cwd,
+                    approval_mode: self.approval_mode,
+                    model: self.model,
+                    api_key: self.api_key,
+                    base_url: self.base_url,
+                    verifier: self.verifier,
+                    max_budget: self.max_budget,
+                    resume: selector,
+                    resume_at: resume_args.resume_at,
+                    fork: None,
+                    continue_latest: false,
+                    no_history: false,
+                    save_history: false,
+                    provider: self.provider,
+                    prompt,
+                });
+            }
+            None => (
+                self.resume,
+                self.continue_latest,
+                self.resume_at,
+                self.prompt,
+            ),
+        };
+        Ok(orca_runtime::command::exec::ExecCommandRequest {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            output_format: args.output_format.into(),
-            cwd: args.cwd,
-            approval_mode: args.approval_mode,
-            model: args.model,
-            api_key: args.api_key,
-            base_url: args.base_url,
-            verifier: args.verifier,
-            max_budget: args.max_budget,
-            resume: args.resume,
-            fork: args.fork,
-            continue_latest: args.continue_latest,
-            no_history: args.no_history,
-            save_history: args.save_history,
-            provider: args.provider,
-            prompt: args.prompt,
-        }
+            output_format: self.output_format.into(),
+            cwd: self.cwd,
+            approval_mode: self.approval_mode,
+            model: self.model,
+            api_key: self.api_key,
+            base_url: self.base_url,
+            verifier: self.verifier,
+            max_budget: self.max_budget,
+            resume,
+            resume_at,
+            fork: self.fork,
+            continue_latest,
+            no_history: self.no_history,
+            save_history: self.save_history,
+            provider: self.provider,
+            prompt,
+        })
     }
 }
 
@@ -491,7 +576,13 @@ pub fn run() -> i32 {
     }
 
     match cli.command {
-        Some(Command::Exec(args)) => orca_runtime::command::exec::run(args.into()),
+        Some(Command::Exec(args)) => match args.into_request() {
+            Ok(request) => orca_runtime::command::exec::run(request),
+            Err(message) => {
+                eprintln!("orca: {message}");
+                1
+            }
+        },
         Some(Command::Workflow(args)) => orca_runtime::workflow::command::run(args.into()),
         Some(Command::Trust(args)) => orca_runtime::command::trust::run(args.into()),
         Some(Command::SubagentWorker(args)) => {
@@ -538,5 +629,121 @@ fn protocol_request(
         model: cli.model,
         api_key: cli.api_key,
         base_url: cli.base_url,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_exec(args: &[&str]) -> ExecArgs {
+        let mut argv = vec!["orca", "exec"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv) {
+            Ok(cli) => match cli.command {
+                Some(Command::Exec(args)) => args,
+                other => panic!("expected exec command, got {other:?}"),
+            },
+            Err(error) => panic!("parse failed: {error}"),
+        }
+    }
+
+    #[test]
+    fn exec_resume_subcommand_parses_session_id_and_prompt() {
+        let args = parse_exec(&[
+            "resume",
+            "a11864d0",
+            "--output-format",
+            "jsonl",
+            "continue the work",
+        ]);
+        let request = args.into_request().expect("request");
+        assert_eq!(request.resume.as_deref(), Some("a11864d0"));
+        assert!(!request.continue_latest);
+        assert_eq!(request.prompt, ["continue the work"]);
+    }
+
+    #[test]
+    fn exec_resume_subcommand_last_parses_without_session_id() {
+        let args = parse_exec(&["resume", "--last", "keep going"]);
+        let request = args.into_request().expect("request");
+        assert_eq!(request.resume.as_deref(), Some("latest"));
+        assert_eq!(request.prompt, ["keep going"]);
+    }
+
+    #[test]
+    fn exec_resume_subcommand_requires_session_id_or_last() {
+        let error = Cli::try_parse_from(["orca", "exec", "resume"])
+            .expect_err("resume without selector must fail");
+        assert!(error.to_string().contains("SESSION_ID"));
+    }
+
+    #[test]
+    fn exec_prompt_positional_still_parses_without_subcommand() {
+        let args = parse_exec(&["inspect", "the", "repo"]);
+        let request = args.into_request().expect("request");
+        assert!(request.resume.is_none());
+        assert_eq!(request.prompt, ["inspect", "the", "repo"]);
+    }
+
+    #[test]
+    fn exec_resume_flag_still_parses() {
+        let args = parse_exec(&["--resume", "latest", "inspect the repo"]);
+        let request = args.into_request().expect("request");
+        assert_eq!(request.resume.as_deref(), Some("latest"));
+        assert_eq!(request.prompt, ["inspect the repo"]);
+    }
+
+    #[test]
+    fn exec_resume_subcommand_rejects_combined_resume_flag() {
+        let args = parse_exec(&["--resume", "old-id", "resume", "new-id", "prompt"]);
+        let error = args.into_request().expect_err("combined resume must fail");
+        assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn exec_resume_subcommand_rejects_no_history() {
+        let args = parse_exec(&["--no-history", "resume", "--last", "prompt"]);
+        let error = args
+            .into_request()
+            .expect_err("no-history resume must fail");
+        assert!(error.contains("--no-history"));
+    }
+
+    #[test]
+    fn exec_resume_subcommand_forwards_budget_scope_options() {
+        let args = parse_exec(&["resume", "--last", "--max-budget", "1.5", "prompt"]);
+        let request = args.into_request().expect("request");
+        assert_eq!(request.max_budget, Some(1.5));
+        assert_eq!(request.prompt, ["prompt"]);
+    }
+
+    #[test]
+    fn exec_resume_subcommand_forwards_message_boundary() {
+        let args = parse_exec(&[
+            "resume",
+            "a11864d0",
+            "--resume-at",
+            "item_019f1234",
+            "continue",
+        ]);
+        let request = args.into_request().expect("request");
+        assert_eq!(request.resume.as_deref(), Some("a11864d0"));
+        assert_eq!(request.resume_at.as_deref(), Some("item_019f1234"));
+        assert_eq!(request.prompt, ["continue"]);
+    }
+
+    #[test]
+    fn exec_resume_flag_forwards_message_boundary() {
+        let args = parse_exec(&[
+            "--resume",
+            "latest",
+            "--resume-at",
+            "item_019f1234",
+            "continue",
+        ]);
+        let request = args.into_request().expect("request");
+        assert_eq!(request.resume.as_deref(), Some("latest"));
+        assert_eq!(request.resume_at.as_deref(), Some("item_019f1234"));
     }
 }

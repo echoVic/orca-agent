@@ -256,13 +256,34 @@ impl InteractiveSession {
                 conv.strip_legacy_summary_messages();
                 (conv, Some(transcript))
             }
+            HistoryMode::ResumeAt {
+                selector,
+                resume_at,
+            } => {
+                let transcript = match preloaded {
+                    Some(t) => t,
+                    None => store.load_session(selector)?,
+                };
+                // Restore only the durable message boundary: records after the
+                // requested conversation item id (including uncommitted tool
+                // calls) are not replayed to the model.
+                let transcript =
+                    crate::thread_store::truncate_transcript_at_boundary(&transcript, resume_at)?;
+                let mut conv = store.resume_conversation(&transcript, system_prompt);
+                conv.strip_legacy_pinned_volatile();
+                conv.strip_legacy_summary_messages();
+                (conv, Some(transcript))
+            }
             HistoryMode::Record | HistoryMode::Disabled => {
                 let mut conversation = Conversation::new();
                 conversation.add_system(system_prompt);
                 (conversation, None)
             }
         };
-        let usage_baseline = if matches!(config.history_mode, HistoryMode::Resume(_)) {
+        let usage_baseline = if matches!(
+            config.history_mode,
+            HistoryMode::Resume(_) | HistoryMode::ResumeAt { .. }
+        ) {
             loaded_transcript
                 .as_ref()
                 .and_then(|transcript| transcript.usage)
@@ -270,7 +291,10 @@ impl InteractiveSession {
         } else {
             UsageTotals::default()
         };
-        let next_event_seq = if matches!(config.history_mode, HistoryMode::Resume(_)) {
+        let next_event_seq = if matches!(
+            config.history_mode,
+            HistoryMode::Resume(_) | HistoryMode::ResumeAt { .. }
+        ) {
             loaded_transcript
                 .as_ref()
                 .map(|transcript| transcript.next_event_seq)
@@ -285,7 +309,7 @@ impl InteractiveSession {
             // Resume continues the original thread: keep its session id and
             // append future items to the existing transcript file. Only Fork
             // mints a new session id.
-            HistoryMode::Resume(_) => match loaded_transcript {
+            HistoryMode::Resume(_) | HistoryMode::ResumeAt { .. } => match loaded_transcript {
                 Some(transcript) => {
                     let thread_session_id = transcript.meta.session_id.clone();
                     match SessionWriter::append_to_existing(transcript.path) {

@@ -443,10 +443,143 @@ fn exec_stops_when_usage_exceeds_max_budget() {
     );
 }
 
+#[test]
+fn session_completed_carries_durable_session_id_when_history_is_recorded() {
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--save-history",
+            "--provider",
+            "mock",
+            "mock_usage",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    let events = parse_jsonl(&output.stdout);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "session.completed");
+    let session_id = terminal["payload"]["session_id"]
+        .as_str()
+        .expect("durable session id in terminal event");
+    assert!(!session_id.is_empty());
+
+    let documents = session_documents(home.path());
+    assert_eq!(documents.len(), 1);
+    let meta = documents[0]
+        .1
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .expect("session metadata");
+    assert_eq!(meta["session_id"].as_str(), Some(session_id));
+}
+
+#[test]
+fn session_completed_omits_session_id_when_history_is_disabled() {
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "mock_usage",
+        ])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    let events = parse_jsonl(&output.stdout);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "session.completed");
+    assert!(terminal["payload"]["session_id"].is_null());
+}
+
+#[test]
+fn budget_exhausted_text_mode_prints_resume_hint_with_session_id() {
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "mock_repeat_read 256"])
+        .output()
+        .expect("run max-turn fixture");
+
+    assert_eq!(output.status.code(), Some(4));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let documents = session_documents(home.path());
+    assert_eq!(documents.len(), 1);
+    let session_id = documents[0]
+        .1
+        .iter()
+        .find(|record| record["type"] == "session.meta")
+        .and_then(|record| record["session_id"].as_str())
+        .expect("session metadata")
+        .to_string();
+    assert!(
+        stdout.contains(&format!(
+            "To continue this session, run: orca exec resume {session_id}"
+        )),
+        "headless exit must surface the exact resume command"
+    );
+}
+
+#[test]
+fn successful_text_mode_does_not_print_resume_hint() {
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args(["exec", "--provider", "mock", "mock_usage"])
+        .output()
+        .expect("run orca");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("To continue this session, run:"),
+        "successful runs do not print a resume hint"
+    );
+}
+
 fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
     String::from_utf8_lossy(stdout)
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
+        .collect()
+}
+
+fn session_documents(home: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<Value>)> {
+    fn collect(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, files);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(&home.join("sessions"), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let records = std::fs::read_to_string(&path)
+                .expect("read saved conversation")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("valid saved conversation record"))
+                .collect();
+            (path, records)
+        })
         .collect()
 }
 

@@ -85,6 +85,7 @@ pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfi
         request.resume,
         request.fork,
         request.continue_latest,
+        None,
         HistoryMode::Record,
     );
     let mut config_request = RunConfigRequest::new(request.app_version, cwd.clone());

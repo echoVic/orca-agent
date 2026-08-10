@@ -1199,13 +1199,14 @@ impl EventFactory {
         )
     }
 
-    pub fn session_completed(&mut self, status: RunStatus) -> EventDraft {
-        self.make(
-            EventType::SessionCompleted,
-            json!({
-                "status": status
-            }),
-        )
+    pub fn session_completed(&mut self, status: RunStatus, session_id: Option<&str>) -> EventDraft {
+        let mut payload = json!({
+            "status": status
+        });
+        if let Some(session_id) = session_id {
+            payload["session_id"] = json!(session_id);
+        }
+        self.make(EventType::SessionCompleted, payload)
     }
 
     fn make(&mut self, event_type: EventType, payload: Value) -> EventDraft {
@@ -1361,6 +1362,19 @@ mod tests {
         assert_eq!(e.payload["approval_mode"], "read-only");
         assert_eq!(e.payload["provider"], "mock");
         assert!(e.payload["verifier"].is_null());
+    }
+
+    #[test]
+    fn session_completed_payload_carries_durable_session_id_when_present() {
+        let mut f = EventFactory::new("run-1".to_string());
+
+        let with_session = f.session_completed(RunStatus::BudgetExhausted, Some("session-9"));
+        assert_eq!(with_session.payload["status"], "budget_exhausted");
+        assert_eq!(with_session.payload["session_id"], "session-9");
+
+        let without_session = f.session_completed(RunStatus::Success, None);
+        assert_eq!(without_session.payload["status"], "success");
+        assert!(without_session.payload["session_id"].is_null());
     }
 
     #[test]
