@@ -200,6 +200,8 @@ pub(crate) enum SessionRecord {
     /// consumed up to that point; it is audit data, not execution state.
     #[serde(rename = "session.checkpoint")]
     Checkpoint(SessionCheckpointRecord),
+    #[serde(rename = "provider.prompt_cache_checkpoint")]
+    PromptCacheCheckpoint(SessionPromptCacheCheckpointRecord),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -214,6 +216,13 @@ pub struct SessionCheckpointRecord {
     pub resumable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_plan: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SessionPromptCacheCheckpointRecord {
+    pub turn_id: TurnId,
+    pub checkpoint: orca_provider::prompt_cache::PromptCacheCheckpoint,
     pub recorded_at: DateTime<Utc>,
 }
 

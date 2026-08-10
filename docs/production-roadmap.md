@@ -43,6 +43,19 @@ explicitly not promised because Orca does not snapshot external workspace
 state (Grok's principle: only restore durable facts, never pretend external
 side effects are rewindable).
 
+The 2026-08-10 P2.4 prompt-cache identity slice now canonicalizes DeepSeek
+plain and beta-strict tool payloads by name before the 128-tool cap, and derives
+a versioned, domain-separated SHA-256 checkpoint from the actual lowered
+messages, primary tool payload, endpoint, model, and reasoning mode. Runtime
+history appends the content-free `provider.prompt_cache_checkpoint` record only
+for real DeepSeek turns immediately before dispatch; transcript restoration and
+fork initialization ignore it. Focused provider/runtime tests cover permutation,
+prefix extension, changed system/tools, serialization privacy, round-trip
+recovery, and fork isolation. The latest credential-gated verifier completed
+two real requests with `second cache_tokens=1024` (the first also reported
+`cache_tokens=1024` because the remote prefix was already warm), confirming a
+non-zero DeepSeek cache hit without exposing credentials.
+
 Current baseline: v0.3.12 adds runtime-owned Side Conversations and strengthens
 TUI response projection boundaries. This builds on v0.3.8's remaining-context
 visibility, one-to-one

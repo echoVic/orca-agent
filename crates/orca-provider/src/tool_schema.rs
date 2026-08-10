@@ -9,7 +9,12 @@ pub struct ProviderToolDefinition {
 }
 
 pub fn deepseek_tools_schema(definitions: &[ProviderToolDefinition]) -> Vec<Value> {
-    definitions.iter().map(deepseek_tool_schema).collect()
+    let mut tools = definitions
+        .iter()
+        .map(deepseek_tool_schema)
+        .collect::<Vec<_>>();
+    sort_tools_by_name(&mut tools);
+    tools
 }
 
 pub fn deepseek_strict_tools_schema_for_endpoint(
@@ -24,26 +29,34 @@ pub fn deepseek_strict_tools_schema_for_endpoint(
         return None;
     }
 
-    Some(
-        definitions
-            .iter()
-            .map(|definition| {
-                let mut tool = deepseek_tool_schema(definition);
-                if definition.strict_capable {
-                    let function = tool["function"]
-                        .as_object_mut()
-                        .expect("provider-generated function object");
-                    require_all_properties(
-                        function
-                            .get_mut("parameters")
-                            .expect("provider-generated parameters"),
-                    );
-                    function.insert("strict".to_string(), Value::Bool(true));
-                }
-                tool
-            })
-            .collect(),
-    )
+    let mut tools = definitions
+        .iter()
+        .map(|definition| {
+            let mut tool = deepseek_tool_schema(definition);
+            if definition.strict_capable {
+                let function = tool["function"]
+                    .as_object_mut()
+                    .expect("provider-generated function object");
+                require_all_properties(
+                    function
+                        .get_mut("parameters")
+                        .expect("provider-generated parameters"),
+                );
+                function.insert("strict".to_string(), Value::Bool(true));
+            }
+            tool
+        })
+        .collect::<Vec<_>>();
+    sort_tools_by_name(&mut tools);
+    Some(tools)
+}
+
+fn sort_tools_by_name(tools: &mut [Value]) {
+    tools.sort_by(|left, right| {
+        left["function"]["name"]
+            .as_str()
+            .cmp(&right["function"]["name"].as_str())
+    });
 }
 
 fn deepseek_tool_schema(definition: &ProviderToolDefinition) -> Value {
@@ -128,6 +141,20 @@ mod tests {
         }
     }
 
+    fn named_definition(name: &str, strict_capable: bool) -> ProviderToolDefinition {
+        ProviderToolDefinition {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            }),
+            strict_capable,
+        }
+    }
+
     #[test]
     fn base_lowering_is_deterministic_and_omits_strict() {
         let definitions = vec![definition(true)];
@@ -168,6 +195,34 @@ mod tests {
         assert_eq!(
             tools[0]["function"]["parameters"]["properties"]["nullable_nested"]["required"],
             json!(["name"])
+        );
+    }
+
+    #[test]
+    fn tool_definition_order_does_not_change_plain_payload() {
+        let alpha = named_definition("alpha", false);
+        let zeta = named_definition("zeta", false);
+
+        assert_eq!(
+            deepseek_tools_schema(&[alpha.clone(), zeta.clone()]),
+            deepseek_tools_schema(&[zeta, alpha])
+        );
+    }
+
+    #[test]
+    fn tool_definition_order_does_not_change_strict_payload() {
+        let alpha = named_definition("alpha", true);
+        let zeta = named_definition("zeta", true);
+
+        assert_eq!(
+            deepseek_strict_tools_schema_for_endpoint(
+                &[alpha.clone(), zeta.clone()],
+                "https://api.deepseek.com/beta",
+            ),
+            deepseek_strict_tools_schema_for_endpoint(
+                &[zeta, alpha],
+                "https://api.deepseek.com/beta",
+            )
         );
     }
 }

@@ -13,8 +13,8 @@ use crate::ProviderConfig;
 use crate::context::render_internal_context;
 use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema};
 
-const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+pub(crate) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_CHAT_MAX_TOKENS: u32 = 384_000;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
@@ -265,11 +265,9 @@ async fn request_chat_streaming(
 
     let messages = conversation_to_api_messages(conversation);
     let definitions = config.tools_override.as_deref().unwrap_or(&[]);
-    let tools = deepseek_tools_schema(definitions);
-    let tools = cap_tools_for_deepseek(tools);
-    let strict_tools = deepseek_strict_tools_schema_for_endpoint(definitions, base_url)
-        .map(cap_tools_for_deepseek);
-    let strict_applied = strict_tools.is_some();
+    let tools = cap_tools_for_deepseek(deepseek_tools_schema(definitions));
+    let strict_applied = deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
+    let primary_tools = deepseek_primary_request_tools(config);
 
     let mut request = ChatRequest {
         model: model.to_string(),
@@ -279,7 +277,7 @@ async fn request_chat_streaming(
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),
-        tools: Some(strict_tools.unwrap_or_else(|| tools.clone())),
+        tools: Some(primary_tools),
         max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
         reasoning_effort: Some(config.reasoning_effort),
     };
@@ -465,11 +463,9 @@ fn request_chat(
 
     let messages = conversation_to_api_messages(conversation);
     let definitions = config.tools_override.as_deref().unwrap_or(&[]);
-    let tools = deepseek_tools_schema(definitions);
-    let tools = cap_tools_for_deepseek(tools);
-    let strict_tools = deepseek_strict_tools_schema_for_endpoint(definitions, base_url)
-        .map(cap_tools_for_deepseek);
-    let strict_applied = strict_tools.is_some();
+    let tools = cap_tools_for_deepseek(deepseek_tools_schema(definitions));
+    let strict_applied = deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
+    let primary_tools = deepseek_primary_request_tools(config);
 
     let mut request = ChatRequest {
         model: model.to_string(),
@@ -477,7 +473,7 @@ fn request_chat(
         thinking: ThinkingConfig::default(),
         stream: false,
         stream_options: None,
-        tools: Some(strict_tools.unwrap_or_else(|| tools.clone())),
+        tools: Some(primary_tools),
         max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
         reasoning_effort: Some(config.reasoning_effort),
     };
@@ -632,6 +628,17 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> ToolRequest {
         target: None,
         raw_arguments: Some(tc.function.arguments.clone()),
     }
+}
+
+/// Returns the tool list in the primary preflight request. The beta strict
+/// payload may fall back to the plain list after a server-side HTTP 400.
+pub(crate) fn deepseek_primary_request_tools(config: &ProviderConfig) -> Vec<Value> {
+    let definitions = config.tools_override.as_deref().unwrap_or(&[]);
+    let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+    let plain = cap_tools_for_deepseek(deepseek_tools_schema(definitions));
+    deepseek_strict_tools_schema_for_endpoint(definitions, base_url)
+        .map(cap_tools_for_deepseek)
+        .unwrap_or(plain)
 }
 
 fn cap_tools_for_deepseek(mut tools: Vec<Value>) -> Vec<Value> {
@@ -2493,5 +2500,60 @@ mod tests {
             capped[DEEPSEEK_MAX_TOOLS - 1]["function"]["name"],
             "tool_127"
         );
+    }
+
+    #[test]
+    fn primary_tool_payload_sorts_before_capping_for_plain_and_strict_requests() {
+        let definitions = (0..(DEEPSEEK_MAX_TOOLS + 5))
+            .rev()
+            .map(|index| crate::tool_schema::ProviderToolDefinition {
+                name: format!("tool_{index:03}"),
+                description: "test".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                strict_capable: true,
+            })
+            .collect::<Vec<_>>();
+        let mut permuted = definitions.clone();
+        permuted.reverse();
+
+        let plain = ProviderConfig {
+            api_key: None,
+            base_url: Some("https://api.deepseek.com".to_string()),
+            model: None,
+            reasoning_effort: Default::default(),
+            tools_override: Some(definitions.clone()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let permuted_plain = ProviderConfig {
+            tools_override: Some(permuted.clone()),
+            ..plain.clone()
+        };
+        let plain_tools = deepseek_primary_request_tools(&plain);
+        assert_eq!(plain_tools, deepseek_primary_request_tools(&permuted_plain));
+        assert_eq!(plain_tools.len(), DEEPSEEK_MAX_TOOLS);
+        assert_eq!(plain_tools[0]["function"]["name"], "tool_000");
+        assert_eq!(plain_tools[127]["function"]["name"], "tool_127");
+
+        let strict = ProviderConfig {
+            base_url: Some("https://api.deepseek.com/beta".to_string()),
+            ..plain
+        };
+        let permuted_strict = ProviderConfig {
+            tools_override: Some(permuted),
+            ..strict.clone()
+        };
+        let strict_tools = deepseek_primary_request_tools(&strict);
+        assert_eq!(
+            strict_tools,
+            deepseek_primary_request_tools(&permuted_strict)
+        );
+        assert_eq!(strict_tools.len(), DEEPSEEK_MAX_TOOLS);
+        assert_eq!(strict_tools[0]["function"]["name"], "tool_000");
+        assert_eq!(strict_tools[127]["function"]["name"], "tool_127");
+        assert_eq!(strict_tools[0]["function"]["strict"], true);
     }
 }

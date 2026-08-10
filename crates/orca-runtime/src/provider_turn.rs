@@ -358,6 +358,22 @@ impl RuntimeProviderTurnStep {
             &model_conversation,
             input.runtime_system_messages,
         );
+        if input.provider == ProviderKind::DeepSeek
+            && let Some(writer) = history_writer.as_deref_mut()
+        {
+            let checkpoint = orca_provider::prompt_cache::checkpoint_for_deepseek_request(
+                &model_conversation,
+                input.provider_config,
+            )
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to calculate DeepSeek prompt-cache checkpoint: {error}"),
+                )
+            })?;
+            writer
+                .append_prompt_cache_checkpoint(input.turn_context.turn_id.clone(), checkpoint)?;
+        }
         let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
         let mut stream = orca_provider::start_streaming(
             input.provider,

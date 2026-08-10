@@ -741,6 +741,8 @@ mod tests {
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::task_types::TaskStatus;
+    use orca_core::thread_identity::TurnId;
+    use orca_provider::prompt_cache::PromptCacheCheckpoint;
     use tempfile::tempdir;
 
     use super::*;
@@ -800,6 +802,63 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn fork_writer_does_not_copy_parent_prompt_cache_checkpoint() {
+        with_orca_home(|home| {
+            let mut parent = history::SessionWriter::start(
+                home,
+                "deepseek",
+                Some("deepseek-v4-flash".to_string()),
+                "parent",
+            )
+            .expect("parent writer");
+            let turn_id = TurnId::new();
+            parent.enter_turn(turn_id.clone());
+            parent
+                .append_message(&Message::user("parent message".to_string()))
+                .expect("parent message");
+            parent
+                .append_prompt_cache_checkpoint(
+                    turn_id,
+                    PromptCacheCheckpoint {
+                        version: 1,
+                        scope_sha256: "a".repeat(64),
+                        message_prefix_sha256: "b".repeat(64),
+                        message_count: 1,
+                        tool_schema_sha256: "c".repeat(64),
+                        tool_count: 0,
+                    },
+                )
+                .expect("parent checkpoint");
+            let parent_id = history::load_session("latest")
+                .expect("load parent")
+                .meta
+                .session_id;
+            let parent_transcript = history::load_session(&parent_id).expect("reload parent");
+            assert!(
+                std::fs::read_to_string(parent.path())
+                    .expect("read parent JSONL")
+                    .contains("\"type\":\"provider.prompt_cache_checkpoint\"")
+            );
+
+            let mut inherited_conversation = Conversation::new();
+            inherited_conversation.messages = parent_transcript.messages;
+            let store = SessionStore::new();
+            let meta = store.create_fork_meta(
+                home,
+                "deepseek",
+                Some("deepseek-v4-flash".to_string()),
+                "child",
+                parent_id,
+            );
+            let child = start_writer_with_messages(&store, meta, &inherited_conversation)
+                .expect("child writer");
+
+            let child_jsonl = std::fs::read_to_string(child.path()).expect("read child JSONL");
+            assert!(!child_jsonl.contains("\"type\":\"provider.prompt_cache_checkpoint\""));
+        });
     }
 
     #[test]

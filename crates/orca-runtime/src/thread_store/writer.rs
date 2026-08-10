@@ -492,7 +492,7 @@ pub(crate) fn transcript_from_records(
                     last_plan = Some((explanation, plan));
                 }
             }
-            SessionRecord::Checkpoint(_) => {}
+            SessionRecord::Checkpoint(_) | SessionRecord::PromptCacheCheckpoint(_) => {}
         }
     }
 
@@ -632,6 +632,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
                 redact_string_in_place(task_plan);
             }
         }
+        SessionRecord::PromptCacheCheckpoint(_) => {}
     }
     redacted
 }
@@ -1091,6 +1092,23 @@ impl SessionWriter {
         write_record(&self.path, &SessionRecord::Checkpoint(checkpoint))
     }
 
+    pub fn append_prompt_cache_checkpoint(
+        &mut self,
+        turn_id: orca_core::thread_identity::TurnId,
+        checkpoint: orca_provider::prompt_cache::PromptCacheCheckpoint,
+    ) -> io::Result<()> {
+        write_record(
+            &self.path,
+            &SessionRecord::PromptCacheCheckpoint(
+                super::types::SessionPromptCacheCheckpointRecord {
+                    turn_id,
+                    checkpoint,
+                    recorded_at: Utc::now(),
+                },
+            ),
+        )
+    }
+
     pub fn append_background_task_provider_response(
         &mut self,
         task_id: &str,
@@ -1325,7 +1343,9 @@ mod tests {
     use super::*;
     use orca_core::approval_rules::PermissionRules;
     use orca_core::event_schema::{EVENT_SCHEMA_VERSION, EventType};
+    use orca_core::thread_identity::TurnId;
     use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
+    use orca_provider::prompt_cache::PromptCacheCheckpoint;
     use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1353,6 +1373,49 @@ mod tests {
             expected.estimated_cost_usd,
             actual.estimated_cost_usd
         );
+    }
+
+    #[test]
+    fn prompt_cache_checkpoint_record_round_trips_without_changing_transcript() {
+        let (_directory, path, mut writer) = new_transcript();
+        let turn_id = TurnId::new();
+        writer.enter_turn(turn_id.clone());
+        writer
+            .append_message(&Message::user("visible message".to_string()))
+            .expect("write conversation message");
+        writer
+            .append_usage(usage(11, 3, 7, 0.01))
+            .expect("write usage");
+        writer.complete("success").expect("write completion");
+        let before = read_transcript(&path).expect("read baseline transcript");
+
+        writer
+            .append_prompt_cache_checkpoint(
+                turn_id,
+                PromptCacheCheckpoint {
+                    version: 1,
+                    scope_sha256: "a".repeat(64),
+                    message_prefix_sha256: "b".repeat(64),
+                    message_count: 1,
+                    tool_schema_sha256: "c".repeat(64),
+                    tool_count: 0,
+                },
+            )
+            .expect("append cache checkpoint");
+
+        let raw = fs::read_to_string(&path).expect("read JSONL");
+        assert!(raw.contains("\"type\":\"provider.prompt_cache_checkpoint\""));
+        let records = read_records(&path).expect("read checkpoint record");
+        assert!(records.iter().any(|record| {
+            matches!(record, SessionRecord::PromptCacheCheckpoint(record)
+                if record.checkpoint.message_count == 1 && record.checkpoint.tool_count == 0)
+        }));
+
+        let after = read_transcript(&path).expect("read transcript with checkpoint");
+        assert_eq!(after.messages.len(), before.messages.len());
+        assert_eq!(after.usage, before.usage);
+        assert_eq!(after.completion_status, before.completion_status);
+        assert_eq!(after.completion_error, before.completion_error);
     }
 
     #[cfg(unix)]
