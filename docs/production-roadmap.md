@@ -56,8 +56,10 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.3.12 adds runtime-owned Side Conversations and strengthens
-TUI response projection boundaries. This builds on v0.3.8's remaining-context
+Current baseline: v0.3.13 makes headless resume a first-class CLI capability with
+`orca exec resume`, durable session identity on exit, message-boundary restore,
+and typed budget checkpoints. This builds on v0.3.12's runtime-owned Side
+Conversations. Prior releases added v0.3.8's remaining-context
 visibility, one-to-one
 compaction replay, pending-steer recovery, durable paged subagent results,
 proactive background-task completion notices, stdio MCP reconnect, stale
