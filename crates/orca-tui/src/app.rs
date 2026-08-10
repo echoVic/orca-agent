@@ -23,6 +23,12 @@ use orca_runtime::runtime_host::{
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::agent_runtime::TuiAgentRuntime;
+#[cfg(test)]
+use crate::attachment_routing::reduce_attached_tui_event;
+use crate::attachment_routing::{
+    AttachmentRouting, accept_attached_tui_event, spawn_attached_event_sender,
+    spawn_attached_event_sender_with_routing,
+};
 use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
     foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
@@ -53,8 +59,10 @@ use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
+#[cfg(test)]
+use crate::types::AttachedTuiEvent;
 use crate::types::{
-    AppState, AppStatus, AttachedTuiEvent, ChatMessage, SessionAttachmentId, SideParentStatus,
+    AppState, AppStatus, ChatMessage, SessionAttachmentId, SideParentStatus,
     SurfaceProjectionState, TuiEvent, UserAction,
 };
 use crate::ui;
@@ -89,135 +97,6 @@ fn shutdown_attached_side_on_controller_exit(side: HostedSideParent) {
     let _ = side.thread.shutdown_with_timeout(Duration::from_secs(5));
 }
 
-#[derive(Default)]
-struct AttachmentRouting {
-    active: Option<SessionAttachmentId>,
-    parent_while_side: Option<SessionAttachmentId>,
-    pending_parent_interactions: Vec<TuiEvent>,
-}
-
-fn is_tui_interaction_event(event: &TuiEvent) -> bool {
-    matches!(
-        event,
-        TuiEvent::ApprovalNeeded { .. }
-            | TuiEvent::PermissionApprovalNeeded { .. }
-            | TuiEvent::UserInputRequested { .. }
-            | TuiEvent::McpElicitationRequested { .. }
-    )
-}
-
-fn accept_attached_tui_event(
-    state: &mut AppState,
-    event: TuiEvent,
-) -> Result<Option<TuiEvent>, ()> {
-    let TuiEvent::Attached(attached) = event else {
-        return Ok(Some(event));
-    };
-    let AttachedTuiEvent { attachment, event } = *attached;
-    if matches!(event, TuiEvent::SessionAttachmentActivated) {
-        state.active_session_attachment = attachment;
-        return Ok(None);
-    }
-    if attachment.is_some() && attachment != state.active_session_attachment {
-        return Err(());
-    }
-    Ok(Some(event))
-}
-
-#[cfg(test)]
-fn reduce_attached_tui_event(state: &mut AppState, event: AttachedTuiEvent) -> bool {
-    match accept_attached_tui_event(state, TuiEvent::Attached(Box::new(event))) {
-        Ok(Some(event)) => {
-            state.update(event);
-            true
-        }
-        Ok(None) => true,
-        Err(()) => false,
-    }
-}
-
-fn spawn_attached_event_sender(
-    root_event_tx: mpsc::Sender<TuiEvent>,
-    attachment: SessionAttachmentId,
-) -> mpsc::Sender<TuiEvent> {
-    spawn_attached_event_sender_with_routing(root_event_tx, attachment, None)
-}
-
-fn spawn_attached_event_sender_with_routing(
-    root_event_tx: mpsc::Sender<TuiEvent>,
-    attachment: SessionAttachmentId,
-    routing: Option<Arc<Mutex<AttachmentRouting>>>,
-) -> mpsc::Sender<TuiEvent> {
-    let (event_tx, event_rx) = mpsc::bounded(crate::channels::TUI_EVENT_CAPACITY);
-    event_tx
-        .send(TuiEvent::SessionAttachmentActivated)
-        .expect("new attachment relay has a live receiver");
-    std::thread::Builder::new()
-        .name(format!("orca-tui-attachment-{}", attachment.value()))
-        .spawn(move || {
-            while let Ok(event) = event_rx.recv() {
-                if let Some(routing) = routing.as_ref()
-                    && let Some(status) = routing.lock().ok().and_then(|mut routing| {
-                        if routing.parent_while_side == Some(attachment)
-                            && routing.active != Some(attachment)
-                        {
-                            if is_tui_interaction_event(&event) {
-                                routing.pending_parent_interactions.push(event.clone());
-                            }
-                            side_parent_status_for_event(&event)
-                        } else {
-                            None
-                        }
-                    })
-                {
-                    let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
-                    continue;
-                }
-                if root_event_tx
-                    .send(TuiEvent::Attached(Box::new(AttachedTuiEvent {
-                        attachment: Some(attachment),
-                        event,
-                    })))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .expect("spawn TUI attachment relay");
-    event_tx
-}
-
-fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
-    match event {
-        TuiEvent::TurnStarted { .. } => Some(SideParentStatus::Running),
-        TuiEvent::ApprovalNeeded { .. }
-        | TuiEvent::PermissionApprovalNeeded { .. }
-        | TuiEvent::McpElicitationRequested { .. } => Some(SideParentStatus::NeedsApproval),
-        TuiEvent::UserInputRequested { .. } => Some(SideParentStatus::NeedsInput),
-        TuiEvent::SessionCompleted { status } => match status.as_str() {
-            "success" | "completed" => Some(SideParentStatus::Finished),
-            "interrupted" | "cancelled" => Some(SideParentStatus::Interrupted),
-            "failed" | "error" => Some(SideParentStatus::Failed),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn deliver_pending_parent_interactions(
-    routing: &Arc<Mutex<AttachmentRouting>>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) {
-    let pending = routing
-        .lock()
-        .map(|mut routing| std::mem::take(&mut routing.pending_parent_interactions))
-        .unwrap_or_default();
-    for event in pending {
-        let _ = event_tx.send(event);
-    }
-}
-
 fn side_parent_status_for_runtime_thread(thread: &RuntimeThreadHandle) -> SideParentStatus {
     match thread.state() {
         Ok(orca_runtime::runtime_host::RuntimeThreadState::Running { .. }) => {
@@ -247,9 +126,21 @@ fn rotate_attached_event_sender(
     root_event_tx: &mpsc::Sender<TuiEvent>,
     attachment: &mut SessionAttachmentId,
     event_tx: &mut mpsc::Sender<TuiEvent>,
+    routing: Option<&Arc<Mutex<AttachmentRouting>>>,
 ) {
     *attachment = attachment.next();
-    *event_tx = spawn_attached_event_sender(root_event_tx.clone(), *attachment);
+    *event_tx = match routing {
+        Some(routing) => {
+            let event_tx = spawn_attached_event_sender_with_routing(
+                root_event_tx.clone(),
+                *attachment,
+                Some(routing.clone()),
+            );
+            AttachmentRouting::switch_attachment(routing, root_event_tx, *attachment, None, false);
+            event_tx
+        }
+        None => spawn_attached_event_sender(root_event_tx.clone(), *attachment),
+    };
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3281,7 +3172,7 @@ done
         ));
 
         let stale_event_tx = event_tx.clone();
-        rotate_attached_event_sender(&root_event_tx, &mut attachment, &mut event_tx);
+        rotate_attached_event_sender(&root_event_tx, &mut attachment, &mut event_tx, None);
         let activated_b = receive_attached();
         assert_eq!(activated_b.attachment, Some(SessionAttachmentId::new(2)));
         assert!(matches!(
@@ -3311,6 +3202,80 @@ done
                     TuiEvent::MessageDelta(text) if text == "from-b"
                 )
         }));
+    }
+
+    #[test]
+    fn routed_rotation_replays_hidden_parent_interaction_after_side_return() {
+        let (root_event_tx, root_event_rx) = mpsc::unbounded();
+        let mut parent_attachment = SessionAttachmentId::new(1);
+        let routing = Arc::new(Mutex::new(AttachmentRouting::new(parent_attachment)));
+        let mut parent_event_tx = spawn_attached_event_sender_with_routing(
+            root_event_tx.clone(),
+            parent_attachment,
+            Some(routing.clone()),
+        );
+        AttachmentRouting::switch_attachment(
+            &routing,
+            &root_event_tx,
+            parent_attachment,
+            None,
+            false,
+        );
+        let _ = root_event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        rotate_attached_event_sender(
+            &root_event_tx,
+            &mut parent_attachment,
+            &mut parent_event_tx,
+            Some(&routing),
+        );
+        let _ = root_event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let side_attachment = parent_attachment.next();
+        let _side_event_tx = spawn_attached_event_sender_with_routing(
+            root_event_tx.clone(),
+            side_attachment,
+            Some(routing.clone()),
+        );
+        AttachmentRouting::switch_attachment(
+            &routing,
+            &root_event_tx,
+            side_attachment,
+            Some(parent_attachment),
+            false,
+        );
+        let _ = root_event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        parent_event_tx
+            .send(TuiEvent::ApprovalNeeded {
+                key: interaction_key(TuiInteractionKind::Approval, "rotated-parent"),
+                tool: "bash".to_string(),
+                target: None,
+                preview: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            root_event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TuiEvent::SideParentStatusChanged(SideParentStatus::NeedsApproval)
+        ));
+
+        AttachmentRouting::switch_attachment(
+            &routing,
+            &root_event_tx,
+            parent_attachment,
+            Some(parent_attachment),
+            true,
+        );
+        let _ = root_event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            root_event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TuiEvent::Attached(attached)
+                if attached.attachment == Some(parent_attachment)
+                    && matches!(
+                        &attached.event,
+                        TuiEvent::ApprovalNeeded { key, .. }
+                            if key.request_id == "rotated-parent"
+                    )
+        ));
     }
 
     #[test]
@@ -8145,15 +8110,18 @@ fn hosted_tui_controller_loop(
 ) {
     let root_event_tx = event_tx;
     let mut session_attachment = SessionAttachmentId::new(1);
-    let attachment_routing = Arc::new(Mutex::new(AttachmentRouting {
-        active: Some(session_attachment),
-        parent_while_side: None,
-        pending_parent_interactions: Vec::new(),
-    }));
+    let attachment_routing = Arc::new(Mutex::new(AttachmentRouting::new(session_attachment)));
     let mut event_tx = spawn_attached_event_sender_with_routing(
         root_event_tx.clone(),
         session_attachment,
         Some(attachment_routing.clone()),
+    );
+    AttachmentRouting::switch_attachment(
+        &attachment_routing,
+        &root_event_tx,
+        session_attachment,
+        None,
+        false,
     );
     let mut thread: Option<RuntimeThreadHandle> = None;
     let mut side_parent: Option<HostedSideParent> = None;
@@ -8312,12 +8280,13 @@ fn hosted_tui_controller_loop(
                     .expect("side parent state")
                     .side_event_tx
                     .clone();
-                if let Ok(mut routing) = attachment_routing.lock() {
-                    routing.active = Some(session_attachment);
-                }
-                if let Ok(mut routing) = attachment_routing.lock() {
-                    routing.parent_while_side = Some(parent_attachment);
-                }
+                AttachmentRouting::switch_attachment(
+                    &attachment_routing,
+                    &root_event_tx,
+                    session_attachment,
+                    Some(parent_attachment),
+                    false,
+                );
                 let _ = project_hosted_thread(
                     thread.as_ref().expect("side thread installed"),
                     "Side conversation",
@@ -8366,14 +8335,13 @@ fn hosted_tui_controller_loop(
                         event_tx = side.side_event_tx.clone();
                         session_attachment = side.side_attachment;
                     }
-                    if let Ok(mut routing) = attachment_routing.lock() {
-                        routing.active = Some(session_attachment);
-                        routing.parent_while_side = Some(side.attachment);
-                    }
-                    let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
-                    if side_active {
-                        deliver_pending_parent_interactions(&attachment_routing, &event_tx);
-                    }
+                    AttachmentRouting::switch_attachment(
+                        &attachment_routing,
+                        &root_event_tx,
+                        session_attachment,
+                        Some(side.attachment),
+                        side_active,
+                    );
                     let title = if side_active {
                         "main conversation"
                     } else {
@@ -8429,12 +8397,13 @@ fn hosted_tui_controller_loop(
                     } else {
                         thread = Some(side.thread);
                     }
-                    if let Ok(mut routing) = attachment_routing.lock() {
-                        routing.active = Some(session_attachment);
-                        routing.parent_while_side = None;
-                    }
-                    let _ = event_tx.send(TuiEvent::SessionAttachmentActivated);
-                    deliver_pending_parent_interactions(&attachment_routing, &event_tx);
+                    AttachmentRouting::switch_attachment(
+                        &attachment_routing,
+                        &root_event_tx,
+                        session_attachment,
+                        None,
+                        true,
+                    );
                     let _ = event_tx.send(TuiEvent::SideConversationChanged {
                         active: false,
                         available: false,
@@ -8463,6 +8432,7 @@ fn hosted_tui_controller_loop(
                             &root_event_tx,
                             &mut session_attachment,
                             &mut event_tx,
+                            Some(&attachment_routing),
                         );
                         announce_runtime_ready(
                             thread.as_ref().expect("new hosted thread"),
@@ -8489,6 +8459,7 @@ fn hosted_tui_controller_loop(
                             &root_event_tx,
                             &mut session_attachment,
                             &mut event_tx,
+                            Some(&attachment_routing),
                         );
                         let _ = event_tx.send(TuiEvent::SessionProjectionReset {
                             session_id: session_id.clone(),
@@ -8561,6 +8532,7 @@ fn hosted_tui_controller_loop(
                             &root_event_tx,
                             &mut session_attachment,
                             &mut event_tx,
+                            Some(&attachment_routing),
                         );
                         if let Some(runtime_thread) = thread.as_ref() {
                             let session_id = runtime_thread
@@ -8602,6 +8574,7 @@ fn hosted_tui_controller_loop(
                             &root_event_tx,
                             &mut session_attachment,
                             &mut event_tx,
+                            Some(&attachment_routing),
                         );
                         if let Some(runtime_thread) = thread.as_ref() {
                             let session_id = runtime_thread

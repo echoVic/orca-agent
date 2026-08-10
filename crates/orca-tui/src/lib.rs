@@ -4,6 +4,7 @@ pub mod app;
 mod approval_actions;
 mod approval_dialog_actions;
 mod approval_mode_actions;
+mod attachment_routing;
 mod background_approval;
 mod background_tasks;
 pub mod bridge;
