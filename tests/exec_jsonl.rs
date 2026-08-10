@@ -505,9 +505,16 @@ fn budget_exhausted_text_mode_prints_resume_hint_with_session_id() {
     let home = TempDir::new().expect("temporary ORCA_HOME");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
-        .args(["exec", "--provider", "mock", "mock_repeat_read 256"])
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "--max-budget",
+            "0.000001",
+            "mock_usage",
+        ])
         .output()
-        .expect("run max-turn fixture");
+        .expect("run budget-limited fixture");
 
     assert_eq!(output.status.code(), Some(4));
     let stdout = String::from_utf8_lossy(&output.stdout);
