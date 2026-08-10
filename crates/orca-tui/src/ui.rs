@@ -7249,6 +7249,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         };
 
         assert_eq!(
@@ -7304,6 +7305,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7388,6 +7390,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7495,6 +7498,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         };
 
         assert_eq!(task_type_label(&task), "session");
@@ -7535,6 +7539,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         };
 
         assert!(task_detail_label(&task).starts_with("backgrounded • elapsed "));
@@ -7574,6 +7579,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         };
 
         assert_eq!(
@@ -7618,6 +7624,7 @@ mod tests {
             error: Some("model timed out".to_string()),
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7669,6 +7676,7 @@ mod tests {
             error: Some("first failure\nsecond failure\nthird failure\nfourth failure".to_string()),
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7721,6 +7729,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         };
 
         assert_eq!(workflow_metadata_row_count(&task), 3);
@@ -7762,6 +7771,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7813,6 +7823,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7875,6 +7886,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -7931,6 +7943,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
@@ -8001,6 +8014,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }
     }
 

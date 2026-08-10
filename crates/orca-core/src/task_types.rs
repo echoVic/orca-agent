@@ -161,6 +161,8 @@ pub struct BackgroundTaskSummary {
     pub retry_count: u32,
     #[serde(default)]
     pub output_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_revision: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

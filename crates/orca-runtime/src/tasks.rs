@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,9 +39,52 @@ use crate::thread_store::redact_sensitive_text;
 #[cfg(test)]
 static TYPED_PROVIDER_OUTCOME_WRITE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
+const TASK_LEASE_DURATION_MS: i64 = 30_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskLease {
+    task_id: String,
+    owner_id: String,
+    epoch: u64,
+    expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskLeaseError {
+    Held {
+        owner_id: String,
+        expires_at_ms: i64,
+    },
+    Fenced,
+    NotFound,
+    Terminal,
+    Persistence(String),
+}
+
+impl fmt::Display for TaskLeaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Held {
+                owner_id,
+                expires_at_ms,
+            } => write!(
+                formatter,
+                "task lease is held by {owner_id} until {expires_at_ms}"
+            ),
+            Self::Fenced => formatter.write_str("task lease is no longer current"),
+            Self::NotFound => formatter.write_str("task was not found"),
+            Self::Terminal => formatter.write_str("task is already terminal"),
+            Self::Persistence(error) => write!(formatter, "task persistence failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TaskLeaseError {}
+
 #[derive(Clone, Debug)]
 pub struct TaskRegistry {
     session_id: String,
+    owner_id: String,
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
     cancelled_roots: Arc<Mutex<HashSet<String>>>,
     typed_provider_outcomes: Arc<Mutex<HashMap<String, DurableTypedProviderOutcome>>>,
@@ -120,6 +164,11 @@ pub struct TaskRecord {
     pub output_truncated: bool,
     pub worker_pid: Option<u32>,
     pub command: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_epoch: u64,
+    pub lease_expires_at_ms: Option<i64>,
+    pub stop_requested: bool,
+    pub publication_revision: u64,
     pub control: TaskControl,
 }
 
@@ -185,6 +234,8 @@ struct PersistedTaskRecord {
     pending_tool_call: Option<PendingToolCallSummary>,
     #[serde(default)]
     pending_provider_response: Option<serde_json::Value>,
+    #[serde(default)]
+    pending_tool_approval_response: Option<bool>,
     workflow_run_id: Option<String>,
     phase_count: Option<usize>,
     workflow_progress: Option<WorkflowTaskProgress>,
@@ -217,6 +268,16 @@ struct PersistedTaskRecord {
     worker_pid: Option<u32>,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    lease_owner: Option<String>,
+    #[serde(default)]
+    lease_epoch: u64,
+    #[serde(default)]
+    lease_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    stop_requested: bool,
+    #[serde(default)]
+    publication_revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +333,7 @@ impl TaskRegistry {
     pub fn new(session_id: String) -> Self {
         Self {
             session_id,
+            owner_id: uuid::Uuid::new_v4().to_string(),
             inner: Arc::new(Mutex::new(HashMap::new())),
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
@@ -315,6 +377,7 @@ impl TaskRegistry {
         drop(_session_lock);
         Ok(Self {
             session_id,
+            owner_id: uuid::Uuid::new_v4().to_string(),
             inner: Arc::new(Mutex::new(records)),
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
@@ -397,6 +460,170 @@ impl TaskRegistry {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub fn acquire_task_lease(&self, id: &str) -> Result<TaskLease, TaskLeaseError> {
+        let owner_id = self.owner_id.clone();
+        self.mutate_task_for_lease(id, move |record| {
+            if is_terminal(record.status) {
+                return Err(TaskLeaseError::Terminal);
+            }
+            let now = now_ms();
+            if let (Some(current_owner), Some(expires_at_ms)) =
+                (&record.lease_owner, record.lease_expires_at_ms)
+                && current_owner != &owner_id
+                && expires_at_ms > now
+            {
+                return Err(TaskLeaseError::Held {
+                    owner_id: current_owner.clone(),
+                    expires_at_ms,
+                });
+            }
+            record.lease_epoch = record.lease_epoch.saturating_add(1).max(1);
+            let expires_at_ms = now.saturating_add(TASK_LEASE_DURATION_MS);
+            record.lease_owner = Some(owner_id.clone());
+            record.lease_expires_at_ms = Some(expires_at_ms);
+            record.publication_revision = record.publication_revision.saturating_add(1);
+            Ok(TaskLease {
+                task_id: record.id.clone(),
+                owner_id: owner_id.clone(),
+                epoch: record.lease_epoch,
+                expires_at_ms,
+            })
+        })
+    }
+
+    pub fn mark_running_with_lease(
+        &self,
+        lease: &TaskLease,
+        id: &str,
+    ) -> Result<(), TaskLeaseError> {
+        let owner_id = self.owner_id.clone();
+        self.mutate_task_for_lease(id, |record| {
+            validate_task_lease(record, lease, &owner_id)?;
+            if record.stop_requested {
+                return Err(TaskLeaseError::Fenced);
+            }
+            record.status = TaskStatus::Running;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = None;
+            record.control.pause.store(false, Ordering::Release);
+            record.publication_revision = record.publication_revision.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    pub fn renew_task_lease(&self, lease: &TaskLease, id: &str) -> Result<(), TaskLeaseError> {
+        let owner_id = self.owner_id.clone();
+        self.mutate_task_for_lease(id, |record| {
+            validate_task_lease(record, lease, &owner_id)?;
+            record.lease_expires_at_ms = Some(now_ms().saturating_add(TASK_LEASE_DURATION_MS));
+            record.publication_revision = record.publication_revision.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    pub fn complete_with_usage_and_lease(
+        &self,
+        lease: &TaskLease,
+        id: &str,
+        result: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), TaskLeaseError> {
+        self.update_task_with_lease(lease, id, |record| {
+            record.status = TaskStatus::Completed;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.result = Some(result);
+            record.error = None;
+            record.usage = usage;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+        })
+    }
+
+    pub fn fail_with_usage_and_lease(
+        &self,
+        lease: &TaskLease,
+        id: &str,
+        error: String,
+        usage: Option<UsageTotals>,
+    ) -> Result<(), TaskLeaseError> {
+        self.update_task_with_lease(lease, id, |record| {
+            record.status = TaskStatus::Failed;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.error = Some(error);
+            record.result = None;
+            record.usage = usage;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+        })
+    }
+
+    fn update_task_with_lease<F>(
+        &self,
+        lease: &TaskLease,
+        id: &str,
+        update: F,
+    ) -> Result<(), TaskLeaseError>
+    where
+        F: FnOnce(&mut TaskRecord),
+    {
+        let owner_id = self.owner_id.clone();
+        self.mutate_task_for_lease(id, |record| {
+            validate_task_lease(record, lease, &owner_id)?;
+            if is_terminal(record.status) || record.stop_requested {
+                return Err(TaskLeaseError::Fenced);
+            }
+            update(record);
+            record.publication_revision = record.publication_revision.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    fn mutate_task_for_lease<R, F>(&self, id: &str, mutate: F) -> Result<R, TaskLeaseError>
+    where
+        F: FnOnce(&mut TaskRecord) -> Result<R, TaskLeaseError>,
+    {
+        if let Some(persistence) = &self.persistence {
+            let (result, record) = persistence.mutate_current_task(id, mutate)?;
+            self.install_persisted_task(id, record)?;
+            return Ok(result);
+        }
+        self.with_tasks(|tasks| {
+            let record = tasks.get_mut(id).ok_or(TaskLeaseError::NotFound)?;
+            mutate(record)
+        })
+        .map_err(|_| TaskLeaseError::Persistence("task registry lock poisoned".to_string()))?
+    }
+
+    fn install_persisted_task(
+        &self,
+        id: &str,
+        mut record: TaskRecord,
+    ) -> Result<(), TaskLeaseError> {
+        self.with_tasks(|tasks| {
+            if let Some(current) = tasks.get(id) {
+                record.control = current.control.clone();
+            }
+            tasks.insert(id.to_string(), record);
+        })
+        .map_err(|_| TaskLeaseError::Persistence("task registry lock poisoned".to_string()))
     }
 
     pub(crate) fn record_typed_provider_outcome(
@@ -522,6 +749,11 @@ impl TaskRegistry {
             output_truncated: false,
             worker_pid: None,
             command: None,
+            lease_owner: None,
+            lease_epoch: 0,
+            lease_expires_at_ms: None,
+            stop_requested: false,
+            publication_revision: 0,
             control,
         };
 
@@ -604,6 +836,11 @@ impl TaskRegistry {
             output_truncated: false,
             worker_pid: None,
             command: None,
+            lease_owner: None,
+            lease_epoch: 0,
+            lease_expires_at_ms: None,
+            stop_requested: false,
+            publication_revision: 0,
             control,
         };
 
@@ -693,6 +930,11 @@ impl TaskRegistry {
             output_truncated: false,
             worker_pid: None,
             command: None,
+            lease_owner: None,
+            lease_epoch: 0,
+            lease_expires_at_ms: None,
+            stop_requested: false,
+            publication_revision: 0,
             control,
         };
 
@@ -749,6 +991,11 @@ impl TaskRegistry {
             output_truncated: false,
             worker_pid: None,
             command: Some(command),
+            lease_owner: None,
+            lease_epoch: 0,
+            lease_expires_at_ms: None,
+            stop_requested: false,
+            publication_revision: 0,
             control,
         };
 
@@ -763,6 +1010,7 @@ impl TaskRegistry {
     }
 
     pub fn list(&self) -> Vec<BackgroundTaskSummary> {
+        let _ = self.refresh_session_from_persistence();
         let mut summaries = self
             .with_tasks(|tasks| tasks.values().map(task_summary).collect::<Vec<_>>())
             .expect("task registry lock poisoned");
@@ -783,6 +1031,13 @@ impl TaskRegistry {
     }
 
     pub fn summary(&self, id: &str) -> Option<BackgroundTaskSummary> {
+        if self.persistence.is_some() {
+            return self
+                .refresh_task_from_persistence(id)
+                .ok()
+                .flatten()
+                .map(|record| task_summary(&record));
+        }
         self.get(id).map(|record| task_summary(&record))
     }
 
@@ -987,10 +1242,7 @@ impl TaskRegistry {
         update: MainSessionTerminalUpdate,
         usage: Option<UsageTotals>,
     ) -> Result<TaskTerminalTransition, String> {
-        self.with_tasks(|tasks| {
-            let record = tasks
-                .get_mut(id)
-                .ok_or_else(|| format!("task '{id}' not found"))?;
+        self.mutate_task(id, |record| {
             if record.task_type != TaskType::MainSession {
                 return Err(
                     "apply_main_session_terminal_update requires a main session task".to_string(),
@@ -1003,7 +1255,7 @@ impl TaskRegistry {
                 ));
             }
 
-            if record.control.cancel.is_cancelled() {
+            if record.stop_requested || record.control.cancel.is_cancelled() {
                 record.status = TaskStatus::Stopped;
                 record.result = Some("cancelled".to_string());
                 record.error = None;
@@ -1058,10 +1310,8 @@ impl TaskRegistry {
             let transition = TaskTerminalTransition {
                 is_backgrounded: record.is_backgrounded,
             };
-            self.persist_current_task(tasks, id)?;
-            Ok(transition)
+            Ok((transition, true))
         })
-        .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
     pub fn mark_worker_spawned(&self, id: &str, pid: u32) -> Result<(), String> {
@@ -1347,65 +1597,62 @@ impl TaskRegistry {
         request_id: &str,
         approved: bool,
     ) -> Result<String, String> {
-        self.with_tasks(|tasks| {
-            let mut matching_task_ids = tasks
-                .iter()
-                .filter(|(_, record)| {
-                    record.status == TaskStatus::ApprovalRequired
-                        && record
-                            .pending_tool_call
-                            .as_ref()
-                            .is_some_and(|pending_tool_call| pending_tool_call.id == request_id)
-                })
-                .map(|(task_id, _)| task_id.clone());
-            let Some(task_id) = matching_task_ids.next() else {
-                return Err(format!("pending approval request '{request_id}' not found"));
-            };
-            if matching_task_ids.next().is_some() {
-                return Err(format!(
-                    "pending approval request '{request_id}' matched multiple tasks"
-                ));
-            }
-            let record = tasks
-                .get_mut(&task_id)
-                .ok_or_else(|| format!("task '{task_id}' not found"))?;
+        self.refresh_session_from_persistence()?;
+        let task_id = self
+            .with_tasks(|tasks| {
+                let mut matching_task_ids = tasks
+                    .iter()
+                    .filter(|(_, record)| {
+                        record.status == TaskStatus::ApprovalRequired
+                            && record
+                                .pending_tool_call
+                                .as_ref()
+                                .is_some_and(|pending_tool_call| pending_tool_call.id == request_id)
+                    })
+                    .map(|(task_id, _)| task_id.clone());
+                let Some(task_id) = matching_task_ids.next() else {
+                    return Err(format!("pending approval request '{request_id}' not found"));
+                };
+                if matching_task_ids.next().is_some() {
+                    return Err(format!(
+                        "pending approval request '{request_id}' matched multiple tasks"
+                    ));
+                }
+                Ok(task_id)
+            })
+            .map_err(|_| "task registry lock poisoned".to_string())??;
+        self.update_task(&task_id, |record| {
             if record.pending_tool_approval_response.is_some() {
                 return Err(format!(
                     "pending approval request '{request_id}' already has a response"
                 ));
             }
             record.pending_tool_approval_response = Some(approved);
-            Ok(task_id)
-        })
-        .map_err(|_| "task registry lock poisoned".to_string())?
+            Ok(())
+        })?;
+        Ok(task_id)
     }
 
     pub fn take_pending_tool_approval_response(&self, id: &str) -> Result<Option<bool>, String> {
-        self.with_tasks(|tasks| {
-            let record = tasks
-                .get_mut(id)
-                .ok_or_else(|| format!("task '{id}' not found"))?;
-            Ok(record.pending_tool_approval_response.take())
+        self.mutate_task(id, |record| {
+            let response = record.pending_tool_approval_response.take();
+            Ok((response, response.is_some()))
         })
-        .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
     pub fn take_approved_pending_provider_response(
         &self,
         id: &str,
     ) -> Result<Option<RuntimeModelResponse>, String> {
-        self.with_tasks(|tasks| {
-            let record = tasks
-                .get_mut(id)
-                .ok_or_else(|| format!("task '{id}' not found"))?;
+        self.mutate_task(id, |record| {
             if record.status != TaskStatus::ApprovalRequired
                 || record.pending_tool_approval_response != Some(true)
             {
-                return Ok(None);
+                return Ok((None, false));
             }
 
             let Some(response) = record.pending_provider_response.take() else {
-                return Ok(None);
+                return Ok((None, false));
             };
 
             record.status = TaskStatus::Running;
@@ -1421,10 +1668,8 @@ impl TaskRegistry {
             record.worker_pid = None;
             record.last_activity_at_ms = Some(now_ms());
             record.control.pause.store(false, Ordering::Release);
-            self.persist_current_task(tasks, id)?;
-            Ok(Some(response))
+            Ok((Some(response), true))
         })
-        .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
     pub fn finish_denied_pending_tool_approval(&self, id: &str) -> Result<bool, String> {
@@ -1488,31 +1733,32 @@ impl TaskRegistry {
     }
 
     pub fn request_stop(&self, id: &str) -> Result<(), String> {
+        let stopped_record = self.mark_stop_requested_record(id)?;
         let target = self
             .with_tasks(|tasks| {
-                let record = tasks
-                    .get(id)
-                    .ok_or_else(|| format!("task '{id}' not found"))?;
-                if is_terminal(record.status) {
-                    return Err(task_state_error("request_stop", record.status));
-                }
-                let Some(pid) = (record.task_type == TaskType::Subagent)
-                    .then_some(record.worker_pid)
+                let Some(pid) = (stopped_record.task_type == TaskType::Subagent)
+                    .then_some(stopped_record.worker_pid)
                     .flatten()
                 else {
                     return Ok(TaskStopTarget::InProcess);
                 };
-                let worker = Arc::clone(&record.control.worker);
-                let agent_id = record.id.clone();
+                let worker = tasks
+                    .get(id)
+                    .map(|record| Arc::clone(&record.control.worker))
+                    .ok_or_else(|| format!("task '{id}' not found"))?;
+                let agent_id = stopped_record.id.clone();
                 let mut slot = worker
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(owned_worker) = slot.take() {
-                    drop(slot);
-                    return Ok(TaskStopTarget::Owned {
-                        worker,
-                        owned_worker,
-                    });
+                    if owned_worker.child.id() == pid {
+                        drop(slot);
+                        return Ok(TaskStopTarget::Owned {
+                            worker,
+                            owned_worker,
+                        });
+                    }
+                    *slot = Some(owned_worker);
                 }
                 drop(slot);
                 if pid == 0 {
@@ -1525,25 +1771,10 @@ impl TaskRegistry {
         if let TaskStopTarget::Recovered { pid, agent_id } = &target {
             match verify_recovered_worker(*pid, agent_id)? {
                 RecoveredWorkerState::Missing | RecoveredWorkerState::Replaced => {
-                    self.mark_stop_requested(id)?;
                     return self.stop(id, "Task stopped; worker already exited".to_string());
                 }
                 RecoveredWorkerState::Matches => {}
             }
-        }
-
-        if let Err(error) = self.mark_stop_requested(id) {
-            if let TaskStopTarget::Owned {
-                worker,
-                owned_worker,
-            } = target
-            {
-                let mut slot = worker
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *slot = Some(owned_worker);
-            }
-            return Err(error);
         }
 
         match target {
@@ -1634,12 +1865,11 @@ impl TaskRegistry {
     }
 
     pub fn signal_stop_tree(&self, root_id: &str) -> Result<Vec<String>, String> {
-        let mut cancelled_roots = self
-            .cancelled_roots
+        self.cancelled_roots
             .lock()
-            .map_err(|_| "cancelled task roots lock poisoned".to_string())?;
-        cancelled_roots.insert(root_id.to_string());
-        let result = self
+            .map_err(|_| "cancelled task roots lock poisoned".to_string())?
+            .insert(root_id.to_string());
+        let mut targets = self
             .with_tasks(|tasks| {
                 let mut targets = tasks
                     .values()
@@ -1652,34 +1882,36 @@ impl TaskRegistry {
                     .collect::<Vec<_>>();
                 targets
                     .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-                for (_, task_id) in &targets {
-                    let record = tasks
-                        .get_mut(task_id)
-                        .expect("tree target remains registered");
-                    record.status = TaskStatus::Stopping;
-                    if record.started_at_ms.is_none() {
-                        record.started_at_ms = Some(now_ms());
-                    }
-                    record.control.cancel.cancel();
-                }
-                targets.into_iter().map(|(_, task_id)| task_id).collect()
+                targets
             })
-            .map_err(|_| "task registry lock poisoned".to_string());
-        drop(cancelled_roots);
-        result
+            .map_err(|_| "task registry lock poisoned".to_string())?;
+        let mut signalled = Vec::with_capacity(targets.len());
+        for (_, task_id) in targets.drain(..) {
+            self.mark_stop_requested(&task_id)?;
+            signalled.push(task_id);
+        }
+        Ok(signalled)
     }
 
     fn mark_stop_requested(&self, id: &str) -> Result<(), String> {
-        self.update_task(id, |record| {
+        self.mark_stop_requested_record(id).map(|_| ())
+    }
+
+    fn mark_stop_requested_record(&self, id: &str) -> Result<TaskRecord, String> {
+        self.mutate_task(id, |record| {
             if is_terminal(record.status) {
                 return Err(task_state_error("request_stop", record.status));
             }
             record.status = TaskStatus::Stopping;
+            record.stop_requested = true;
+            record.lease_epoch = record.lease_epoch.saturating_add(1);
+            record.lease_owner = None;
+            record.lease_expires_at_ms = None;
             if record.started_at_ms.is_none() {
                 record.started_at_ms = Some(now_ms());
             }
             record.control.cancel.cancel();
-            Ok(())
+            Ok((record.clone(), true))
         })
     }
 
@@ -1723,18 +1955,43 @@ impl TaskRegistry {
         .unwrap_or(false)
     }
 
-    fn update_task<F>(&self, id: &str, update: F) -> Result<(), String>
+    fn mutate_task<R, F>(&self, id: &str, mutate: F) -> Result<R, String>
     where
-        F: FnOnce(&mut TaskRecord) -> Result<(), String>,
+        F: FnOnce(&mut TaskRecord) -> Result<(R, bool), String>,
     {
+        if let Some(persistence) = &self.persistence {
+            let (result, record) = persistence
+                .mutate_current_task(id, |record| {
+                    let (result, changed) = mutate(record).map_err(TaskLeaseError::Persistence)?;
+                    if changed {
+                        record.publication_revision = record.publication_revision.saturating_add(1);
+                    }
+                    Ok(result)
+                })
+                .map_err(|error| error.to_string())?;
+            self.install_persisted_task(id, record)
+                .map_err(|error| error.to_string())?;
+            return Ok(result);
+        }
         self.with_tasks(|tasks| {
             let record = tasks
                 .get_mut(id)
                 .ok_or_else(|| format!("task '{id}' not found"))?;
-            update(record)?;
-            self.persist_current_task(tasks, id)
+            let (result, changed) = mutate(record)?;
+            if changed {
+                record.publication_revision = record.publication_revision.saturating_add(1);
+                self.persist_current_task(tasks, id)?;
+            }
+            Ok(result)
         })
         .map_err(|_| "task registry lock poisoned".to_string())?
+    }
+
+    fn update_task<F>(&self, id: &str, update: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut TaskRecord) -> Result<(), String>,
+    {
+        self.mutate_task(id, |record| update(record).map(|()| ((), true)))
     }
 
     fn insert_task(&self, id: String, record: TaskRecord) -> Result<(), String> {
@@ -1777,7 +2034,7 @@ impl TaskRegistry {
                 if let Some(current) = tasks.get(&id) {
                     record.control = current.control.clone();
                 }
-                tasks.entry(id).or_insert(record);
+                tasks.insert(id, record);
             }
         })
         .map_err(|_| "task registry lock poisoned".to_string())
@@ -1828,14 +2085,48 @@ impl TaskPersistence {
     fn write_current_task(&self, record: &TaskRecord) -> io::Result<()> {
         let _index_lock =
             ExclusiveFileLock::acquire(&self.index_lock_path()).map_err(io::Error::other)?;
-        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(&self.session_id))
-            .map_err(io::Error::other)?;
-        let (mut records, _) = self.read_session_records(&self.session_id)?;
-        records.insert(record.id.clone(), record.clone());
-        self.write_session_records_unlocked(&self.session_id, &records)?;
         let mut index = self.load_index()?;
-        index.insert(record.id.clone(), self.session_id.clone());
+        let session_id = index
+            .get(&record.id)
+            .cloned()
+            .unwrap_or_else(|| self.session_id.clone());
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(&session_id))
+            .map_err(io::Error::other)?;
+        let (mut records, _) = self.read_session_records(&session_id)?;
+        records.insert(record.id.clone(), record.clone());
+        self.write_session_records_unlocked(&session_id, &records)?;
+        index.insert(record.id.clone(), session_id);
         self.write_index(&index)
+    }
+
+    fn mutate_current_task<R, F>(
+        &self,
+        id: &str,
+        mutate: F,
+    ) -> Result<(R, TaskRecord), TaskLeaseError>
+    where
+        F: FnOnce(&mut TaskRecord) -> Result<R, TaskLeaseError>,
+    {
+        let _index_lock = ExclusiveFileLock::acquire(&self.index_lock_path())
+            .map_err(|error| TaskLeaseError::Persistence(error.to_string()))?;
+        let index = self
+            .load_index()
+            .map_err(|error| TaskLeaseError::Persistence(error.to_string()))?;
+        let session_id = index
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| self.session_id.clone());
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(&session_id))
+            .map_err(|error| TaskLeaseError::Persistence(error.to_string()))?;
+        let mut records = self
+            .load_session_records_unlocked(&session_id)
+            .map_err(|error| TaskLeaseError::Persistence(error.to_string()))?;
+        let record = records.get_mut(id).ok_or(TaskLeaseError::NotFound)?;
+        let result = mutate(record)?;
+        let committed = record.clone();
+        self.write_session_records_unlocked(&session_id, &records)
+            .map_err(|error| TaskLeaseError::Persistence(error.to_string()))?;
+        Ok((result, committed))
     }
 
     fn load_record_by_id(
@@ -2053,7 +2344,7 @@ impl PersistedTaskRecord {
             agent_type: self.agent_type,
             tool: self.tool,
             pending_tool_call: self.pending_tool_call,
-            pending_tool_approval_response: None,
+            pending_tool_approval_response: self.pending_tool_approval_response,
             pending_provider_response: None,
             workflow_run_id: self.workflow_run_id,
             phase_count: self.phase_count,
@@ -2074,6 +2365,11 @@ impl PersistedTaskRecord {
             output_truncated: self.output_truncated,
             worker_pid: self.worker_pid,
             command: self.command,
+            lease_owner: self.lease_owner,
+            lease_epoch: self.lease_epoch,
+            lease_expires_at_ms: self.lease_expires_at_ms,
+            stop_requested: self.stop_requested,
+            publication_revision: self.publication_revision,
             control: new_task_control(),
         };
         match pending_provider_response {
@@ -2113,6 +2409,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             agent_type: record.agent_type.clone(),
             tool: record.tool.clone(),
             pending_tool_call: record.pending_tool_call.clone(),
+            pending_tool_approval_response: record.pending_tool_approval_response,
             pending_provider_response: record.pending_provider_response.as_ref().and_then(
                 |response| serde_json::to_value(PersistedProviderResponse::from(response)).ok(),
             ),
@@ -2135,6 +2432,11 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             output_truncated: record.output_truncated,
             worker_pid: record.worker_pid,
             command: record.command.clone(),
+            lease_owner: record.lease_owner.clone(),
+            lease_epoch: record.lease_epoch,
+            lease_expires_at_ms: record.lease_expires_at_ms,
+            stop_requested: record.stop_requested,
+            publication_revision: record.publication_revision,
         }
     }
 }
@@ -2304,10 +2606,9 @@ fn spawn_worker_reaper(
                 {
                     return;
                 }
-                let _ = registry.fail(
-                    &task_id,
-                    "async subagent worker exited without a terminal task update".to_string(),
-                );
+                // The worker owns terminal publication through its durable lease. The
+                // parent only refreshes its local view here, so a stale reaper cannot
+                // overwrite a newer owner after recovery or takeover.
                 return;
             }
             thread::sleep(Duration::from_millis(50));
@@ -2348,6 +2649,7 @@ fn task_summary(record: &TaskRecord) -> BackgroundTaskSummary {
         error: record.error.clone(),
         retry_count: record.retry_count,
         output_truncated: record.output_truncated,
+        publication_revision: Some(record.publication_revision),
     }
 }
 
@@ -2557,6 +2859,24 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn validate_task_lease(
+    record: &TaskRecord,
+    lease: &TaskLease,
+    owner_id: &str,
+) -> Result<(), TaskLeaseError> {
+    if lease.task_id != record.id
+        || lease.owner_id != owner_id
+        || record.lease_owner.as_deref() != Some(owner_id)
+        || record.lease_epoch != lease.epoch
+        || record
+            .lease_expires_at_ms
+            .is_none_or(|expires_at_ms| expires_at_ms <= now_ms())
+    {
+        return Err(TaskLeaseError::Fenced);
+    }
+    Ok(())
 }
 
 fn is_terminal(status: TaskStatus) -> bool {
@@ -2880,6 +3200,147 @@ mod tests {
         assert_eq!(recovered.error, None);
         assert_eq!(recovered.worker_pid, Some(12345));
         assert_eq!(recovered.completed_at_ms, None);
+    }
+
+    #[test]
+    fn persistent_task_lease_rejects_second_live_owner_and_publishes_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let owner = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = owner.create_subagent("durable task".to_string(), None);
+
+        let lease = owner.acquire_task_lease(&task.id).unwrap();
+        owner.mark_running_with_lease(&lease, &task.id).unwrap();
+
+        let observer =
+            TaskRegistry::new_persistent_attached("session-1".to_string(), root).unwrap();
+        assert!(matches!(
+            observer.acquire_task_lease(&task.id),
+            Err(TaskLeaseError::Held { .. })
+        ));
+        assert_eq!(
+            owner.summary(&task.id).unwrap().publication_revision,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn stale_task_lease_cannot_publish_terminal_state_after_takeover() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let first = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = first.create_subagent("durable task".to_string(), None);
+        let stale_lease = first.acquire_task_lease(&task.id).unwrap();
+
+        first
+            .mutate_task_for_lease(&task.id, |record| {
+                record.lease_expires_at_ms = Some(0);
+                Ok(())
+            })
+            .unwrap();
+        let replacement =
+            TaskRegistry::new_persistent_attached("session-1".to_string(), root).unwrap();
+        let current_lease = replacement.acquire_task_lease(&task.id).unwrap();
+        assert!(current_lease.epoch > stale_lease.epoch);
+
+        assert_eq!(
+            first
+                .complete_with_usage_and_lease(&stale_lease, &task.id, "stale".to_string(), None)
+                .unwrap_err(),
+            TaskLeaseError::Fenced
+        );
+        assert_eq!(
+            replacement.get(&task.id).unwrap().status,
+            TaskStatus::Queued
+        );
+    }
+
+    #[test]
+    fn same_owner_reacquire_after_expiry_fences_its_old_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("session-1".to_string(), temp.path().join("tasks"))
+                .unwrap();
+        let task = registry.create_subagent("durable task".to_string(), None);
+        let old_lease = registry.acquire_task_lease(&task.id).unwrap();
+        registry
+            .mutate_task_for_lease(&task.id, |record| {
+                record.lease_expires_at_ms = Some(0);
+                Ok(())
+            })
+            .unwrap();
+
+        let current_lease = registry.acquire_task_lease(&task.id).unwrap();
+        assert!(current_lease.epoch > old_lease.epoch);
+        assert_eq!(
+            registry
+                .complete_with_usage_and_lease(&old_lease, &task.id, "late".to_string(), None)
+                .unwrap_err(),
+            TaskLeaseError::Fenced
+        );
+    }
+
+    #[test]
+    fn stop_request_revokes_the_current_task_lease_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("session-1".to_string(), temp.path().join("tasks"))
+                .unwrap();
+        let task = registry.create_subagent("stoppable task".to_string(), None);
+        let lease = registry.acquire_task_lease(&task.id).unwrap();
+
+        registry.request_stop(&task.id).unwrap();
+
+        let record = registry.get(&task.id).unwrap();
+        assert!(record.lease_epoch > lease.epoch);
+        assert!(record.stop_requested);
+        assert_eq!(record.lease_owner, None);
+        assert_eq!(
+            registry
+                .complete_with_usage_and_lease(&lease, &task.id, "late".to_string(), None)
+                .unwrap_err(),
+            TaskLeaseError::Fenced
+        );
+    }
+
+    #[test]
+    fn persistent_list_refreshes_tasks_published_by_attached_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let observer = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let worker = TaskRegistry::new_persistent_attached("session-1".to_string(), root).unwrap();
+        let task = worker.create_subagent("published by worker".to_string(), None);
+
+        assert_eq!(
+            observer
+                .list()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec![task.id]
+        );
+    }
+
+    #[test]
+    fn persistent_summary_refreshes_a_terminal_update_from_another_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let owner = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = owner.create_subagent("published by worker".to_string(), None);
+        let observer =
+            TaskRegistry::new_persistent_attached("session-1".to_string(), root).unwrap();
+        assert_eq!(
+            observer.summary(&task.id).unwrap().status,
+            TaskStatus::Queued
+        );
+
+        owner
+            .complete(&task.id, "completed elsewhere".to_string())
+            .unwrap();
+
+        let summary = observer.summary(&task.id).unwrap();
+        assert_eq!(summary.status, TaskStatus::Completed);
+        assert_eq!(summary.publication_revision, Some(1));
     }
 
     #[test]
@@ -3456,6 +3917,12 @@ mod tests {
         reloaded
             .submit_pending_tool_approval_response(&task.id, true)
             .unwrap();
+        let approved = reloaded
+            .get(&task.id)
+            .expect("approved persistent task record");
+        assert_eq!(approved.status, TaskStatus::ApprovalRequired);
+        assert_eq!(approved.pending_tool_approval_response, Some(true));
+        assert!(approved.pending_provider_response.is_some());
         let continuation = take_approved_background_turn_continuation(&reloaded, &task.id)
             .unwrap()
             .expect("approved background continuation after reload");
@@ -3722,8 +4189,8 @@ mod tests {
         worker.mark_running(&grandchild.id).unwrap();
         assert_eq!(owner.get(&child.id).unwrap().status, TaskStatus::Running);
         assert!(
-            owner.list().iter().all(|task| task.id != grandchild.id),
-            "the owner has not loaded the worker-created grandchild yet"
+            owner.list().iter().any(|task| task.id == grandchild.id),
+            "task-wide publication did not expose the worker-created grandchild"
         );
 
         let stopped = owner.request_stop_tree(&root.id).unwrap();

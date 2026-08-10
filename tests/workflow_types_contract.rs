@@ -130,6 +130,7 @@ fn background_task_summary_matches_sdk_names() {
         error: None,
         retry_count: 0,
         output_truncated: false,
+        publication_revision: None,
     };
 
     let value = serde_json::to_value(summary).unwrap();

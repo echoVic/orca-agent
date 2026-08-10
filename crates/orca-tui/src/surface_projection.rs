@@ -1030,6 +1030,7 @@ pub(crate) fn workflow_task_summaries(
                 error: task.error.as_ref().map(|value| value.as_str().to_string()),
                 retry_count: task.retry_count,
                 output_truncated: task.output_truncated,
+                publication_revision: None,
             }
         })
         .collect()

@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -122,7 +124,36 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         Ok(registry) => registry,
         Err(_) => return 1,
     };
-    let _ = task_registry.mark_running(&agent_id);
+    let lease = match task_registry.acquire_task_lease(&agent_id) {
+        Ok(lease) => lease,
+        Err(_) => return 1,
+    };
+    if task_registry
+        .mark_running_with_lease(&lease, &agent_id)
+        .is_err()
+    {
+        return 1;
+    }
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat_registry = task_registry.clone();
+    let heartbeat_lease = lease.clone();
+    let heartbeat_stop_signal = heartbeat_stop.clone();
+    let heartbeat_agent_id = agent_id.clone();
+    std::thread::spawn(move || {
+        while !heartbeat_stop_signal.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_secs(5));
+            if heartbeat_stop_signal.load(Ordering::Acquire) {
+                break;
+            }
+            if heartbeat_registry
+                .renew_task_lease(&heartbeat_lease, &heartbeat_agent_id)
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let stop_heartbeat = || heartbeat_stop.store(true, Ordering::Release);
     let instructions = instructions::load_for_cwd_or_default(&cwd);
     let memory = memory::load_for_cwd(&cwd);
     let hooks = HookRunner::new(config.hooks.clone());
@@ -183,8 +214,9 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             append_worktree_outcome(&mut error, worktree.as_ref());
             let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
             let error = async_subagent_result_payload(error, Some(failed_task.payload()));
+            stop_heartbeat();
             if task_registry
-                .fail_with_usage(&agent_id, error, usage)
+                .fail_with_usage_and_lease(&lease, &agent_id, error, usage)
                 .is_ok()
             {
                 return 1;
@@ -193,8 +225,9 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         }
         append_worktree_outcome(&mut output, worktree.as_ref());
         let output = async_subagent_result_payload(output, Some(completed_task.payload()));
+        stop_heartbeat();
         if task_registry
-            .complete_with_usage(&agent_id, output, usage)
+            .complete_with_usage_and_lease(&lease, &agent_id, output, usage)
             .is_ok()
         {
             return 0;
@@ -206,8 +239,9 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
         append_worktree_outcome(&mut error, worktree.as_ref());
         let error = async_subagent_result_payload(error, Some(completed_task.payload()));
+        stop_heartbeat();
         if task_registry
-            .fail_with_usage(&agent_id, error, usage)
+            .fail_with_usage_and_lease(&lease, &agent_id, error, usage)
             .is_ok()
         {
             return 1;

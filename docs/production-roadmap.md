@@ -1209,12 +1209,15 @@ end state.
    controller extractions did not reduce the main implementation to the
    approximately 8,000-line target. Every new feature therefore continues to
    increase the largest structural risk in the repository.
-2. **P1.4 task supervision is not implemented.** `TaskRegistry::new_persistent`
-   (`crates/orca-runtime/src/tasks.rs:286`) provides cross-process record
-   persistence and interrupted-task recovery, but there is no cross-process
-   lease, fencing token, stale-owner takeover, or task-wide publication
-   contract. Detached-worker ownership remains ambiguous at exactly the point
-   where stop, reattach, and crash recovery must be authoritative.
+2. **P1.4 task supervision is implemented in the current slice.** Persistent
+   `TaskRegistry` records now carry an owner lease, monotonically increasing
+   fencing epoch, expiry, durable stop request, and publication revision.
+   Lease acquisition, renewal, and worker terminal writes reload the indexed
+   session under `ExclusiveFileLock`; stale owners are fenced after takeover.
+   Async workers renew their lease while active, reapers only refresh local
+   state, and persistent `list()` refreshes the complete session snapshot.
+   The focused task lifecycle and recovered-worker tests cover these claims;
+   the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift remains unsliced.** `crates/orca-tui/src/app.rs`
    is 10,186 lines and `surface_projection.rs` is 2,281 lines. Renderer-owned
    orchestration and projection duplication remain in the code even though the
@@ -1270,9 +1273,10 @@ size, then short-term implementation cost.
   merely because it is not an ancestor, and no unrelated user work is reset or
   merged into the release path.
 
-Execution of slice 1 starts from a freshly fetched `main` in
+Slice 1 is implemented from a freshly fetched `main` in
 `.worktrees/p1-4-task-supervision` after its Spec Gate and implementation plan.
-This documentation update does not claim that slice 1 has begun.
+Its remaining release evidence is recorded in that plan before the next slice
+starts.
 
 #### Historical Refactor Inventory (Superseded)
 

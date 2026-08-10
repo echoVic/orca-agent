@@ -4578,6 +4578,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }
     }
 
@@ -6485,6 +6486,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         }];
         state.workflow_panel.selected = 9;
 
@@ -6617,6 +6619,7 @@ mod tests {
                 error: None,
                 retry_count: 0,
                 output_truncated: false,
+                publication_revision: None,
             }],
         });
         state.update(TuiEvent::WorkflowNotification {
@@ -6936,6 +6939,7 @@ mod tests {
                 error: None,
                 retry_count: 0,
                 output_truncated: false,
+                publication_revision: None,
             }],
         });
 
@@ -7056,6 +7060,7 @@ mod tests {
                 error: None,
                 retry_count: 0,
                 output_truncated: false,
+                publication_revision: None,
             }],
         });
 

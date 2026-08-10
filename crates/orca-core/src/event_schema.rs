@@ -1532,6 +1532,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         };
 
         let event = f.workflow_tasks_updated(&[task]);
@@ -1582,6 +1583,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         };
 
         let event = f.task_status_updated(&task);

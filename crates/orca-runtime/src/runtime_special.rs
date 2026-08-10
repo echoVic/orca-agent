@@ -878,6 +878,7 @@ mod tests {
             error: None,
             retry_count: 0,
             output_truncated: false,
+            publication_revision: None,
         };
 
         let summary = task_summary_json(task);
