@@ -273,6 +273,211 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     assert_eq!(session_files, 1, "Side must not create a durable session");
 }
 
+// Regression: switching panes must not blank the transcript. The existing
+// coverage always submits a fresh prompt after each toggle, which forces a
+// re-render and hides whether the toggle itself left the pane empty. This test
+// toggles and then inspects the screen WITHOUT submitting anything.
+#[test]
+fn tui_side_toggle_keeps_transcripts_visible_without_resubmitting() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "main pty seed")
+        .expect("spawn parent TUI in PTY");
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        Duration::from_secs(10),
+        "parent TUI did not complete before Side opened",
+    );
+
+    // Open Side and echo the inherited history so the Side transcript carries a
+    // marker distinct from the parent.
+    process
+        .write(b"/side\r")
+        .expect("open Side with slash command");
+    receive_until(
+        &process,
+        &mut output,
+        "Ctrl+/ to switch",
+        Duration::from_secs(5),
+        "TUI did not open Side",
+    );
+    process
+        .write(b"mock_history_echo\r")
+        .expect("submit Side question");
+    receive_until(
+        &process,
+        &mut output,
+        "Mock history users: main pty seed | mock_history_echo",
+        Duration::from_secs(10),
+        "Side did not inherit the parent cutover context",
+    );
+
+    // Toggle back to the parent. Do NOT submit anything. The parent transcript
+    // (its seed prompt) must remain on the reconstructed screen after the switch.
+    process
+        .write(b"\x1b[47;5u")
+        .expect("return to parent with Ctrl+/");
+    receive_until(
+        &process,
+        &mut output,
+        "Main · Side available",
+        Duration::from_secs(5),
+        "TUI did not restore the parent status line",
+    );
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "> main pty seed",
+        "parent transcript went blank after toggling back without resubmitting",
+    );
+
+    // Toggle to Side again. Its inherited echo must remain on the reconstructed
+    // screen after the switch, again without submitting.
+    process.write(b"\x1b[47;5u").expect("return to Side");
+    receive_until(
+        &process,
+        &mut output,
+        "Side from",
+        Duration::from_secs(5),
+        "TUI did not reactivate the Side status line",
+    );
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Mock history users: main pty seed | mock_history_echo",
+        "side transcript went blank after toggling back without resubmitting",
+    );
+
+    process.write(&[0x03]).expect("close Side with Ctrl+C");
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+// Reconstructs the on-screen terminal grid from the full PTY byte stream and
+// asserts `expected` is visible. Incremental renderers only emit cells that
+// change between frames, so a switch that leaves the top rows untouched will
+// not re-print them — checking only the post-switch delta would miss content
+// that is genuinely on screen. Rebuilding the grid reflects what the user sees.
+fn assert_screen_shows(
+    process: &PtyProcess,
+    output: &mut Vec<u8>,
+    expected: &str,
+    failure: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if screen_contains(output, expected) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "{failure}; reconstructed screen=\n{}",
+                reconstruct_screen(output)
+            );
+        }
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+}
+
+fn screen_contains(output: &[u8], expected: &str) -> bool {
+    let screen = reconstruct_screen(output);
+    let mut cursor = 0;
+    for token in expected.split_whitespace() {
+        let Some(offset) = screen[cursor..].find(token) else {
+            return false;
+        };
+        cursor += offset + token.len();
+    }
+    true
+}
+
+// Minimal ANSI interpreter: honours cursor positioning (CSI row;col H) and the
+// erase-screen (CSI 2 J) sequence, dropping other CSI/OSC controls. Enough to
+// materialize the visible grid our TUI paints.
+fn reconstruct_screen(output: &[u8]) -> String {
+    use std::collections::BTreeMap;
+    let text = String::from_utf8_lossy(output);
+    let mut grid: BTreeMap<(usize, usize), char> = BTreeMap::new();
+    let (mut row, mut col) = (1usize, 1usize);
+    let bytes: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == '\u{1b}' {
+            // OSC: ESC ] ... (BEL | ESC \)
+            if bytes.get(i + 1) == Some(&']') {
+                i += 2;
+                while i < bytes.len() && bytes[i] != '\u{07}' && bytes[i] != '\u{1b}' {
+                    i += 1;
+                }
+                if bytes.get(i) == Some(&'\u{1b}') {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            // CSI: ESC [ params final
+            if bytes.get(i + 1) == Some(&'[') {
+                let mut j = i + 2;
+                let mut params = String::new();
+                while j < bytes.len() && !bytes[j].is_ascii_alphabetic() {
+                    params.push(bytes[j]);
+                    j += 1;
+                }
+                let final_byte = bytes.get(j).copied().unwrap_or(' ');
+                match final_byte {
+                    'H' | 'f' => {
+                        let mut parts = params.split(';');
+                        row = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
+                        col = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
+                    }
+                    'J' => {
+                        if params == "2" {
+                            grid.clear();
+                        }
+                    }
+                    _ => {}
+                }
+                i = j + 1;
+                continue;
+            }
+            i += 2;
+            continue;
+        }
+        match ch {
+            '\n' => {
+                row += 1;
+                col = 1;
+            }
+            '\r' => col = 1,
+            _ => {
+                grid.insert((row, col), ch);
+                col += 1;
+            }
+        }
+        i += 1;
+    }
+    let max_row = grid.keys().map(|(r, _)| *r).max().unwrap_or(0);
+    let mut lines = Vec::new();
+    for r in 1..=max_row {
+        let cols: Vec<usize> = grid.range((r, 0)..(r + 1, 0)).map(|((_, c), _)| *c).collect();
+        let max_col = cols.iter().copied().max().unwrap_or(0);
+        let line: String = (1..=max_col)
+            .map(|c| grid.get(&(r, c)).copied().unwrap_or(' '))
+            .collect();
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
 struct PtyProcess {
     child: Option<Child>,
     writer: Option<File>,

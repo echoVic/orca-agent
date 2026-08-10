@@ -2811,7 +2811,6 @@ impl AppState {
                 }
                 self.push_message(ChatMessage::System(label));
                 self.finalized_count = self.messages.len();
-                self.flushed_count = self.messages.len();
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::TurnStarted { .. } => {
@@ -4423,7 +4422,10 @@ mod tests {
                 && label == "Resumed saved conversation."
         ));
         assert_eq!(state.finalized_count, state.messages.len());
-        assert_eq!(state.flushed_count, state.messages.len());
+        // `flushed_count` must stay 0 in the fullscreen TUI: it counts messages
+        // omitted from the live renderer, so setting it to the message count made
+        // `live_start` skip the whole transcript and blanked the pane on switch.
+        assert_eq!(state.flushed_count, 0);
         assert_eq!(
             state.current_plan.as_ref().unwrap().0.as_deref(),
             Some("resume plan")
