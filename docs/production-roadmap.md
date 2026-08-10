@@ -1299,6 +1299,13 @@ Slice 1 is implemented from a freshly fetched `main` in
 Its remaining release evidence is recorded in that plan before the next slice
 starts.
 
+The 2026-08-10 compaction evaluation closes slice 6 without adding a second
+agent loop: the production remote-summary compactor passed a real DeepSeek
+long-context smoke (34 messages to 9 and 4,992 to 1,216 wire tokens), while
+focused runtime/provider gates cover waiting, cancellation, persistence, and
+recovery. The reproducible evidence is in
+`docs/reports/2026-08-10-compaction-remote-evaluation.md`.
+
 #### Historical Refactor Inventory (Superseded)
 
 The July 2026 Codex and package 3 reference pass ranks the remaining
