@@ -105,6 +105,14 @@ durable broker recovery evidence passes the deletion gate. A Rust deprecation
 attribute is deferred to a separately versioned API migration because it is a
 semver minor change.
 
+The 2026-08-10 pending-store gate audit confirms the first two ownership and
+recovery conditions, but does not delete the shim: legacy
+`HostedTurnRequest`/Goal continuation workers are still production paths used
+by TUI, ACP, and controller code, and `cargo-semver-checks` is unavailable in
+the current environment. The audit and exact next-window commands are recorded
+in `docs/reports/2026-08-10-pending-store-deletion-gate.md`; no compatibility
+API removal is claimed until those conditions are closed in a major migration.
+
 The 2026-08-08 Goal interaction-settlement slice keeps TUI approval semantics
 typed across the runtime-to-Goal boundary. Allow executes the approved tool and
 settles the operation and outer turn once. Deny persists `ApprovalRequired`,
