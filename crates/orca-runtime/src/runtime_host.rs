@@ -77,6 +77,12 @@ use crate::runtime_actor::goal::{
 use crate::runtime_surface as surface;
 use crate::tasks::{DurableTypedProviderOutcome, MainSessionTerminalUpdate, TaskRegistry};
 use crate::thread::RuntimeThread;
+
+#[path = "runtime_actor/thread_state.rs"]
+mod thread_state;
+use thread_state::{
+    retain_recovered_background_approvals, RuntimeUsageLedger, ThreadActorState,
+};
 use crate::thread_store::{
     SessionMeta, SessionStore, SessionTranscript, SortDirection, StoredThreadItemPage,
     StoredThreadProjection, StoredThreadSearchPage, StoredThreadSummaryPage, StoredThreadTurnPage,
@@ -11298,11 +11304,6 @@ impl GoalRecoverySurfaceCommit for PendingSurfaceAdmissionTerminal {
     }
 }
 
-struct ThreadActorState {
-    thread: RuntimeThread,
-    events: EventFactory,
-}
-
 struct ActiveOperation {
     operation_id: OperationId,
     runtime_task_id: Option<String>,
@@ -11610,35 +11611,6 @@ struct WorkflowBackgroundTaskContext {
     task_registry: TaskRegistry,
     observer: Option<Arc<dyn EventObserver>>,
     events: EventFactory,
-}
-
-#[derive(Clone, Debug)]
-struct RuntimeUsageLedger {
-    totals: Arc<Mutex<UsageTotals>>,
-}
-
-impl RuntimeUsageLedger {
-    fn new(totals: UsageTotals) -> Self {
-        Self {
-            totals: Arc::new(Mutex::new(totals)),
-        }
-    }
-
-    fn add(&self, usage: UsageTotals) -> UsageTotals {
-        let mut totals = self
-            .totals
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *totals = add_usage_totals(*totals, usage);
-        *totals
-    }
-
-    fn totals(&self) -> UsageTotals {
-        *self
-            .totals
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 }
 
 enum GoalSurfaceCommand {
@@ -30974,20 +30946,11 @@ impl ThreadActor {
         ephemeral_reservation_timeout: Duration,
         #[cfg(test)] ephemeral_close_commit_failures: usize,
     ) -> Self {
-        let usage_ledger = RuntimeUsageLedger::new(thread.session().aggregate_usage_totals());
-        let events = thread.event_factory();
+        let (state, usage_ledger) = ThreadActorState::new(thread);
         let mut background_controller = BackgroundOperationController::new(background_capacity);
-        for (operation_id, pending) in resident_surface
-            .as_ref()
-            .map(|resident| {
-                recovered_background_approval_resolutions(resident.coordinator.state().snapshot())
-            })
-            .unwrap_or_default()
-        {
-            background_controller.retain_approval_resolution(operation_id, pending);
-        }
+        retain_recovered_background_approvals(&mut background_controller, resident_surface.as_ref());
         Self {
-            state: Some(ThreadActorState { thread, events }),
+            state: Some(state),
             config,
             handle,
             executor,
@@ -37970,15 +37933,6 @@ fn usage_totals_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
         output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
         cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens),
         estimated_cost_usd: (after.estimated_cost_usd - before.estimated_cost_usd).max(0.0),
-    }
-}
-
-fn add_usage_totals(left: UsageTotals, right: UsageTotals) -> UsageTotals {
-    UsageTotals {
-        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
-        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
-        cache_tokens: left.cache_tokens.saturating_add(right.cache_tokens),
-        estimated_cost_usd: left.estimated_cost_usd + right.estimated_cost_usd,
     }
 }
 
