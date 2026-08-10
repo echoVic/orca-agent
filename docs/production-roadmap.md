@@ -1306,6 +1306,12 @@ focused runtime/provider gates cover waiting, cancellation, persistence, and
 recovery. The reproducible evidence is in
 `docs/reports/2026-08-10-compaction-remote-evaluation.md`.
 
+These reliability slices ship together in v0.3.14. The release includes the
+cross-process task lease/fencing boundary, ThreadActor state ownership
+extraction, centralized TUI attachment routing, DeepSeek cache-prefix identity,
+and the remote-compaction verifier. Pending-store API removal is deliberately
+excluded until its documented legacy Goal and semver gates pass.
+
 #### Historical Refactor Inventory (Superseded)
 
 The July 2026 Codex and package 3 reference pass ranks the remaining

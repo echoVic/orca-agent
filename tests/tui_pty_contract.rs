@@ -363,12 +363,7 @@ fn tui_side_toggle_keeps_transcripts_visible_without_resubmitting() {
 // change between frames, so a switch that leaves the top rows untouched will
 // not re-print them — checking only the post-switch delta would miss content
 // that is genuinely on screen. Rebuilding the grid reflects what the user sees.
-fn assert_screen_shows(
-    process: &PtyProcess,
-    output: &mut Vec<u8>,
-    expected: &str,
-    failure: &str,
-) {
+fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &str, failure: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if screen_contains(output, expected) {
@@ -436,8 +431,16 @@ fn reconstruct_screen(output: &[u8]) -> String {
                 match final_byte {
                     'H' | 'f' => {
                         let mut parts = params.split(';');
-                        row = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
-                        col = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
+                        row = parts
+                            .next()
+                            .and_then(|p| p.parse().ok())
+                            .unwrap_or(1)
+                            .max(1);
+                        col = parts
+                            .next()
+                            .and_then(|p| p.parse().ok())
+                            .unwrap_or(1)
+                            .max(1);
                     }
                     'J' => {
                         if params == "2" {
@@ -468,7 +471,10 @@ fn reconstruct_screen(output: &[u8]) -> String {
     let max_row = grid.keys().map(|(r, _)| *r).max().unwrap_or(0);
     let mut lines = Vec::new();
     for r in 1..=max_row {
-        let cols: Vec<usize> = grid.range((r, 0)..(r + 1, 0)).map(|((_, c), _)| *c).collect();
+        let cols: Vec<usize> = grid
+            .range((r, 0)..(r + 1, 0))
+            .map(|((_, c), _)| *c)
+            .collect();
         let max_col = cols.iter().copied().max().unwrap_or(0);
         let line: String = (1..=max_col)
             .map(|c| grid.get(&(r, c)).copied().unwrap_or(' '))

@@ -619,7 +619,12 @@ impl TaskRegistry {
     ) -> Result<(), TaskLeaseError> {
         self.with_tasks(|tasks| {
             if let Some(current) = tasks.get(id) {
+                let cancel_requested =
+                    record.stop_requested || record.control.cancel.is_cancelled();
                 record.control = current.control.clone();
+                if cancel_requested {
+                    record.control.cancel.cancel();
+                }
             }
             tasks.insert(id.to_string(), record);
         })
@@ -3294,6 +3299,7 @@ mod tests {
         let record = registry.get(&task.id).unwrap();
         assert!(record.lease_epoch > lease.epoch);
         assert!(record.stop_requested);
+        assert!(record.control.cancel.is_cancelled());
         assert_eq!(record.lease_owner, None);
         assert_eq!(
             registry

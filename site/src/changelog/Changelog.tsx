@@ -76,6 +76,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.14":
+        "Makes long-running background work safer across process boundaries. Durable task leases, fencing epochs, stale-owner takeover, and publication revisions prevent an expired worker from overwriting a newer result, while task status refreshes from the persisted record. TUI parent/Side attachment events now pass through one routing authority with FIFO interaction replay. DeepSeek requests gain deterministic tool ordering and explicit cache-prefix checkpoints, and a real-API compaction smoke verifies remote summaries retain the current request while reducing wire context pressure.",
       "v0.3.13":
         "Makes headless resume a first-class CLI capability. orca exec resume <SESSION_ID> continues a saved session with a fresh budget scope, resume --last picks the most recent session, and --resume-at <MESSAGE_ID> restores only up to a durable message boundary. session.completed now carries the durable session_id, text-mode exits print the exact resume command, and a budget-exhausted run persists a typed session.checkpoint (status, reason, budget consumed, last committed message, task plan, resumable) before the terminal projection — uncommitted tool calls remain indeterminate on restore, so Orca promises resumable, not exactly-once, execution.",
       "v0.3.12":
@@ -584,6 +586,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.14":
+        "增强跨进程后台任务的可靠性。持久化 task lease、fencing epoch、陈旧 owner 接管和 publication revision 会阻止过期 worker 覆盖新结果，task status 也会从持久记录刷新。TUI 父会话与 Side 的 attachment 事件统一通过唯一 routing authority，并按 FIFO 重放交互。DeepSeek 请求获得确定性的工具排序和显式 cache-prefix checkpoint；真实 API compaction smoke 证明远程摘要会保留当前请求，同时显著降低 wire context 压力。",
       "v0.3.13":
         "让 headless resume 成为一等 CLI 能力。orca exec resume <SESSION_ID> 以全新预算范围继续保存的会话，resume --last 恢复最近会话，--resume-at <MESSAGE_ID> 只恢复到持久化消息边界为止。session.completed 现在携带持久的 session_id，文本模式退出时打印确切的 resume 命令，预算耗尽的运行会在 terminal projection 之前持久化类型化 session.checkpoint（status、reason、已消耗预算、最后提交消息、任务计划、resumable）。恢复时未提交的工具调用仍标记为 indeterminate——Orca 承诺可恢复，而非 exactly-once 执行。",
       "v0.3.12":

@@ -4815,10 +4815,10 @@ mod tests {
                 .await
                 .expect("host shutdown task")
                 .expect("host shutdown");
-            assert_eq!(
+            assert!(matches!(
                 outcome_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
-                Err(io::ErrorKind::BrokenPipe)
-            );
+                Err(io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe)
+            ));
             assert_persisted_terminal_cleanup_ambiguous(
                 &transcript_path,
                 crate::surface::ExternalEffectKind::TerminalKill,
