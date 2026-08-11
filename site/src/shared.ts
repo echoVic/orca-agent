@@ -4,9 +4,15 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.14";
+export const releaseVersion = "v0.3.15";
 
 export const releases = [
+  {
+    version: "v0.3.15",
+    date: "2026-08-12",
+    title: "High-parallelism test reliability, fenced goal schema initialization",
+    body: "Eliminates the high-parallelism test hangs and flaky failures under --test-threads=16, fences goal schema initialization against concurrent opens, and makes default-parallelism local verification reliable again.",
+  },
   {
     version: "v0.3.14",
     date: "2026-08-10",

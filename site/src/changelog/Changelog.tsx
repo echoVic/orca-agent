@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.15":
+        "Eliminates the high-parallelism test hangs and flaky failures under cargo test --test-threads=16. The test harness now uses thread-local per-test homes instead of mutating ORCA_HOME, and RuntimeHost installs the calling test's home on all of its threads, so hosted tests resolve one consistent private home with no env-lock deadlocks. GoalStore schema initialization is fenced behind a cross-process sibling lock with WAL set once at init, so concurrent opens no longer race DDL. The typed-provider-outcome failure injection is session-keyed, and load-sensitive tests poll instead of racing a 20 ms budget.",
       "v0.3.14":
         "Makes long-running background work safer across process boundaries. Durable task leases, fencing epochs, stale-owner takeover, and publication revisions prevent an expired worker from overwriting a newer result, while task status refreshes from the persisted record. TUI parent/Side attachment events now pass through one routing authority with FIFO interaction replay. DeepSeek requests gain deterministic tool ordering and explicit cache-prefix checkpoints, and a real-API compaction smoke verifies remote summaries retain the current request while reducing wire context pressure.",
       "v0.3.13":
@@ -590,6 +592,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.15":
+        "消除 cargo test --test-threads=16 下的高并行测试挂起与偶发失败。测试框架改用线程本地私有 home，不再修改 ORCA_HOME 环境变量；RuntimeHost 会把调用方测试的 home 安装到其全部线程，hosted 测试全程解析同一个私有 home，不再有 env 锁死锁。GoalStore schema 初始化由同目录跨进程文件锁保护，WAL 只在初始化时设置一次，并发打开不再竞争 DDL。typed-provider-outcome 失败注入按 session 隔离，负载敏感的测试改为轮询而非竞速 20ms 预算。",
       "v0.3.14":
         "增强跨进程后台任务的可靠性。持久化 task lease、fencing epoch、陈旧 owner 接管和 publication revision 会阻止过期 worker 覆盖新结果，task status 也会从持久记录刷新。TUI 父会话与 Side 的 attachment 事件统一通过唯一 routing authority，并按 FIFO 重放交互。DeepSeek 请求获得确定性的工具排序和显式 cache-prefix checkpoint；真实 API compaction smoke 证明远程摘要会保留当前请求，同时显著降低 wire context 压力。",
       "v0.3.13":
