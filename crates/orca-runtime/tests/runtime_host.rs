@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use orca_core::approval_types::{
@@ -702,6 +702,7 @@ fn wait_until_true(flag: &AtomicBool, message: &str) {
 }
 
 fn test_config(cwd: PathBuf) -> RunConfig {
+    let _ = isolated_orca_home();
     RunConfig {
         app_version: "test".to_string(),
         prompt: String::new(),
@@ -3495,30 +3496,30 @@ fn wait_until_task_status(
 }
 
 static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+static ORCA_HOME_TEST_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn isolated_orca_home() -> &'static std::path::Path {
+    ORCA_HOME_TEST_HOME
+        .get_or_init(|| {
+            let home = tempfile::tempdir().expect("create process-wide test ORCA_HOME");
+            // Every runtime_host test constructs its RunConfig through test_config,
+            // so initialization completes before that test can resolve task storage.
+            unsafe {
+                std::env::set_var("ORCA_HOME", home.path());
+            }
+            home
+        })
+        .path()
+}
 
 fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-    // edition 2024: set_var/remove_var are unsafe; serialize via lock like
-    // orca-tui's test_support::lock_process_env.
+    // Serialize tests that intentionally share config/SQLite state. ORCA_HOME
+    // itself remains stable for the lifetime of this test process so unrelated
+    // parallel registries never retain a path that another test deletes.
     let _guard = ORCA_HOME_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let home = tempfile::tempdir().unwrap();
-    let previous = std::env::var_os("ORCA_HOME");
-    unsafe {
-        std::env::set_var("ORCA_HOME", home.path());
-    }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(home.path())));
-    unsafe {
-        if let Some(previous) = previous {
-            std::env::set_var("ORCA_HOME", previous);
-        } else {
-            std::env::remove_var("ORCA_HOME");
-        }
-    }
-    match result {
-        Ok(result) => result,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
+    f(isolated_orca_home())
 }
 
 #[test]

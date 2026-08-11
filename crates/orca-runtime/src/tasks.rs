@@ -50,6 +50,14 @@ pub struct TaskLease {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkerExitFence {
+    worker_pid: u32,
+    adoption_revision: u64,
+    lease_owner: Option<String>,
+    lease_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskLeaseError {
     Held {
         owner_id: String,
@@ -333,7 +341,7 @@ impl TaskRegistry {
     pub fn new(session_id: String) -> Self {
         Self {
             session_id,
-            owner_id: uuid::Uuid::new_v4().to_string(),
+            owner_id: new_task_lease_owner_id(std::process::id()),
             inner: Arc::new(Mutex::new(HashMap::new())),
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
@@ -377,7 +385,7 @@ impl TaskRegistry {
         drop(_session_lock);
         Ok(Self {
             session_id,
-            owner_id: uuid::Uuid::new_v4().to_string(),
+            owner_id: new_task_lease_owner_id(std::process::id()),
             inner: Arc::new(Mutex::new(records)),
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
@@ -1386,6 +1394,10 @@ impl TaskRegistry {
                     .get(id)
                     .expect("validated task record")
                     .completed_at_ms;
+                let previous_publication_revision = tasks
+                    .get(id)
+                    .expect("validated task record")
+                    .publication_revision;
                 let record = tasks.get_mut(id).expect("validated task record");
                 record.worker_pid = Some(pid);
                 record.status = TaskStatus::Running;
@@ -1393,23 +1405,26 @@ impl TaskRegistry {
                     record.started_at_ms = Some(now_ms());
                 }
                 record.completed_at_ms = None;
+                record.publication_revision = record.publication_revision.saturating_add(1);
+                let adoption_revision = record.publication_revision;
                 if let Err(error) = self.persist_current_task(tasks, id) {
                     let record = tasks.get_mut(id).expect("validated task record");
                     record.worker_pid = previous_pid;
                     record.status = previous_status;
                     record.started_at_ms = previous_started_at;
                     record.completed_at_ms = previous_completed_at;
+                    record.publication_revision = previous_publication_revision;
                     return Err(error);
                 }
                 *slot = owned_worker.take();
                 drop(slot);
-                Ok(worker)
+                Ok((worker, adoption_revision))
             })
             .map_err(|_| "task registry lock poisoned".to_string())?;
 
         match worker {
-            Ok(worker) => {
-                spawn_worker_reaper(self.clone(), id.to_string(), worker);
+            Ok((worker, adoption_revision)) => {
+                spawn_worker_reaper(self.clone(), id.to_string(), pid, adoption_revision, worker);
                 Ok(())
             }
             Err(error) => {
@@ -2011,20 +2026,103 @@ impl TaskRegistry {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(self.get(id));
         };
-        let Some(mut record) = persistence
+        let Some(record) = persistence
             .load_record_by_id(id, self.recover_persisted_active_tasks, &self.session_id)
             .map_err(|error| error.to_string())?
         else {
             return Ok(None);
         };
-        self.with_tasks(|tasks| {
-            if let Some(current) = tasks.get(id) {
-                record.control = current.control.clone();
+        self.install_persisted_task(id, record)
+            .map_err(|error| error.to_string())?;
+        self.with_tasks(|tasks| tasks.get(id).cloned())
+            .map_err(|_| "task registry lock poisoned".to_string())
+    }
+
+    fn worker_exit_fence(
+        &self,
+        id: &str,
+        worker_pid: u32,
+        adoption_revision: u64,
+    ) -> Result<Option<WorkerExitFence>, String> {
+        let record = if self.persistence.is_some() {
+            self.refresh_task_from_persistence(id)?
+        } else {
+            self.get(id)
+        };
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if is_terminal(record.status) || record.worker_pid != Some(worker_pid) {
+            return Ok(None);
+        }
+        if let Some(lease_owner) = record.lease_owner.clone() {
+            if record
+                .lease_expires_at_ms
+                .is_none_or(|expires_at_ms| expires_at_ms <= now_ms())
+                || task_lease_owner_pid(&lease_owner) != Some(worker_pid)
+            {
+                return Ok(None);
             }
-            tasks.insert(id.to_string(), record.clone());
+            return Ok(Some(WorkerExitFence {
+                worker_pid,
+                adoption_revision,
+                lease_owner: Some(lease_owner),
+                lease_epoch: record.lease_epoch,
+            }));
+        }
+        if record.publication_revision != adoption_revision {
+            return Ok(None);
+        }
+        Ok(Some(WorkerExitFence {
+            worker_pid,
+            adoption_revision,
+            lease_owner: None,
+            lease_epoch: record.lease_epoch,
+        }))
+    }
+
+    fn fail_worker_exit_if_current(
+        &self,
+        id: &str,
+        fence: &WorkerExitFence,
+    ) -> Result<bool, String> {
+        self.mutate_task(id, |record| {
+            if is_terminal(record.status) || record.worker_pid != Some(fence.worker_pid) {
+                return Ok((false, false));
+            }
+            let lease_is_current = match fence.lease_owner.as_deref() {
+                Some(lease_owner) => {
+                    record.lease_owner.as_deref() == Some(lease_owner)
+                        && record.lease_epoch == fence.lease_epoch
+                        && record
+                            .lease_expires_at_ms
+                            .is_some_and(|expires_at_ms| expires_at_ms > now_ms())
+                }
+                None => {
+                    record.lease_owner.is_none()
+                        && record.lease_epoch == fence.lease_epoch
+                        && record.publication_revision == fence.adoption_revision
+                }
+            };
+            if !lease_is_current {
+                return Ok((false, false));
+            }
+            record.status = TaskStatus::Failed;
+            if record.started_at_ms.is_none() {
+                record.started_at_ms = Some(now_ms());
+            }
+            record.completed_at_ms = Some(now_ms());
+            record.error =
+                Some("async subagent worker exited without a terminal task update".to_string());
+            record.result = None;
+            record.tool = None;
+            record.pending_tool_call = None;
+            record.pending_tool_approval_response = None;
+            record.pending_provider_response = None;
+            record.worker_pid = None;
+            record.control.pause.store(false, Ordering::Release);
+            Ok((true, true))
         })
-        .map_err(|_| "task registry lock poisoned".to_string())?;
-        Ok(Some(record))
     }
 
     fn refresh_session_from_persistence(&self) -> Result<(), String> {
@@ -2574,6 +2672,8 @@ fn new_task_control() -> TaskControl {
 fn spawn_worker_reaper(
     registry: TaskRegistry,
     task_id: String,
+    worker_pid: u32,
+    adoption_revision: u64,
     worker: Arc<Mutex<Option<OwnedWorker>>>,
 ) {
     thread::spawn(move || {
@@ -2611,9 +2711,11 @@ fn spawn_worker_reaper(
                 {
                     return;
                 }
-                // The worker owns terminal publication through its durable lease. The
-                // parent only refreshes its local view here, so a stale reaper cannot
-                // overwrite a newer owner after recovery or takeover.
+                if let Ok(Some(fence)) =
+                    registry.worker_exit_fence(&task_id, worker_pid, adoption_revision)
+                {
+                    let _ = registry.fail_worker_exit_if_current(&task_id, &fence);
+                }
                 return;
             }
             thread::sleep(Duration::from_millis(50));
@@ -2837,6 +2939,18 @@ fn terminate_recovered_worker(_pid: u32, _agent_id: &str) -> Result<(), String> 
 
 fn new_task_id() -> String {
     format!("task-{}", uuid::Uuid::new_v4())
+}
+
+fn new_task_lease_owner_id(process_id: u32) -> String {
+    format!("pid:{process_id}:{}", uuid::Uuid::new_v4())
+}
+
+fn task_lease_owner_pid(owner_id: &str) -> Option<u32> {
+    let (prefix, suffix) = owner_id.split_once(':')?;
+    if prefix != "pid" {
+        return None;
+    }
+    suffix.split_once(':')?.0.parse().ok()
 }
 
 fn task_depth_below(
@@ -3307,6 +3421,26 @@ mod tests {
                 .unwrap_err(),
             TaskLeaseError::Fenced
         );
+    }
+
+    #[test]
+    fn refreshed_durable_stop_cancels_the_existing_local_control_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let observer =
+            TaskRegistry::new_persistent("session-stop-refresh".to_string(), root.clone()).unwrap();
+        let task = observer.create_subagent("stoppable task".to_string(), None);
+        let local_cancel = observer.get(&task.id).expect("local task").control.cancel;
+        let controller =
+            TaskRegistry::new_persistent_attached("session-stop-refresh".to_string(), root)
+                .unwrap();
+
+        controller.request_stop(&task.id).unwrap();
+        assert!(!local_cancel.is_cancelled());
+
+        let refreshed = observer.summary(&task.id).expect("refreshed task");
+        assert_eq!(refreshed.status, TaskStatus::Stopping);
+        assert!(local_cancel.is_cancelled());
     }
 
     #[test]
@@ -4435,6 +4569,129 @@ while :; do :; done
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaper_fails_current_worker_that_exits_without_terminal_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let parent =
+            TaskRegistry::new_persistent("session-reaper-failure".to_string(), root.clone())
+                .unwrap();
+        let task = parent.create_subagent("crashing async work".to_string(), None);
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn crashing worker fixture");
+        let child_pid = child.id();
+        parent.adopt_subagent_worker(&task.id, child).unwrap();
+
+        let mut worker =
+            TaskRegistry::new_persistent_attached("session-reaper-failure".to_string(), root)
+                .unwrap();
+        worker.owner_id = new_task_lease_owner_id(child_pid);
+        let lease = worker.acquire_task_lease(&task.id).unwrap();
+        worker.mark_running_with_lease(&lease, &task.id).unwrap();
+        let child_pid = i32::try_from(child_pid).expect("child PID fits pid_t");
+        assert_eq!(unsafe { libc::kill(child_pid, libc::SIGKILL) }, 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let record = parent.get(&task.id).expect("parent task");
+            if record.status == TaskStatus::Failed {
+                assert_eq!(
+                    record.error.as_deref(),
+                    Some("async subagent worker exited without a terminal task update")
+                );
+                assert_eq!(record.worker_pid, None);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker exit did not publish a fenced failure: {record:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_worker_exit_fence_cannot_overwrite_takeover_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let parent =
+            TaskRegistry::new_persistent("session-reaper-takeover".to_string(), root.clone())
+                .unwrap();
+        let task = parent.create_subagent("recoverable async work".to_string(), None);
+        parent.mark_worker_spawned(&task.id, 4242).unwrap();
+        let mut worker = TaskRegistry::new_persistent_attached(
+            "session-reaper-takeover".to_string(),
+            root.clone(),
+        )
+        .unwrap();
+        worker.owner_id = new_task_lease_owner_id(4242);
+        let old_lease = worker.acquire_task_lease(&task.id).unwrap();
+        worker
+            .mark_running_with_lease(&old_lease, &task.id)
+            .unwrap();
+        let stale_fence = parent
+            .worker_exit_fence(&task.id, 4242, 0)
+            .unwrap()
+            .expect("current worker exit fence");
+
+        worker
+            .mutate_task_for_lease(&task.id, |record| {
+                record.lease_expires_at_ms = Some(0);
+                Ok(())
+            })
+            .unwrap();
+        let recovery =
+            TaskRegistry::new_persistent_attached("session-reaper-takeover".to_string(), root)
+                .unwrap();
+        let takeover_lease = recovery.acquire_task_lease(&task.id).unwrap();
+        recovery
+            .complete_with_usage_and_lease(
+                &takeover_lease,
+                &task.id,
+                "recovered result".to_string(),
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            !parent
+                .fail_worker_exit_if_current(&task.id, &stale_fence)
+                .unwrap()
+        );
+        let terminal = parent.summary(&task.id).expect("takeover terminal");
+        assert_eq!(terminal.status, TaskStatus::Completed);
+        assert_eq!(terminal.result.as_deref(), Some("recovered result"));
+    }
+
+    #[test]
+    fn takeover_lease_cannot_be_mistaken_for_exited_worker_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let parent =
+            TaskRegistry::new_persistent("session-reaper-preempted".to_string(), root.clone())
+                .unwrap();
+        let task = parent.create_subagent("preempted async work".to_string(), None);
+        parent.mark_worker_spawned(&task.id, 4242).unwrap();
+        let recovery =
+            TaskRegistry::new_persistent_attached("session-reaper-preempted".to_string(), root)
+                .unwrap();
+        let takeover_lease = recovery.acquire_task_lease(&task.id).unwrap();
+        recovery
+            .mark_running_with_lease(&takeover_lease, &task.id)
+            .unwrap();
+
+        assert_eq!(parent.worker_exit_fence(&task.id, 4242, 0).unwrap(), None);
+        assert_eq!(
+            parent.summary(&task.id).expect("recovered task").status,
+            TaskStatus::Running
+        );
     }
 
     #[cfg(unix)]
