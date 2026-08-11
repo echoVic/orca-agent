@@ -71,28 +71,23 @@ mod tests {
 
     #[test]
     fn session_store_boundary_creates_loadable_jsonl_thread() {
-        let _guard = history::lock_test_env();
-        let home = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("ORCA_HOME", home.path());
-        }
         let cwd = tempfile::tempdir().unwrap();
+        // Synchronous store work only; the redirect is a thread-local home
+        // override (never the environment) and restores on panic. The old
+        // remove_var here poisoned ORCA_HOME for every later test.
+        history::with_redirected_orca_home("thread-store-boundary", |_home| {
+            let store = SessionStore::new();
+            let thread = store
+                .create_live_thread(cwd.path(), "deepseek", Some("model-a".to_string()), "hello")
+                .unwrap();
+            let thread_id = thread.thread_id().to_string();
+            drop(thread);
 
-        let store = SessionStore::new();
-        let thread = store
-            .create_live_thread(cwd.path(), "deepseek", Some("model-a".to_string()), "hello")
-            .unwrap();
-        let thread_id = thread.thread_id().to_string();
-        drop(thread);
-
-        let loaded = store.load_session(&thread_id).unwrap();
-        assert_eq!(loaded.meta.session_id, thread_id);
-        assert_eq!(loaded.meta.provider, "deepseek");
-        assert_eq!(loaded.meta.model.as_deref(), Some("model-a"));
-
-        unsafe {
-            std::env::remove_var("ORCA_HOME");
-        }
+            let loaded = store.load_session(&thread_id).unwrap();
+            assert_eq!(loaded.meta.session_id, thread_id);
+            assert_eq!(loaded.meta.provider, "deepseek");
+            assert_eq!(loaded.meta.model.as_deref(), Some("model-a"));
+        });
     }
 
     #[test]

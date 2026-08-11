@@ -3639,16 +3639,39 @@ impl RuntimeHost {
         let (command_tx, command_rx) = tokio_mpsc::channel(HOST_COMMAND_CAPACITY);
         let supervisor_command_tx = command_tx.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        // Under test, a host started inside a `with_test_orca_home` /
+        // `redirect_test_orca_home` scope must keep resolving that private
+        // home on all of its threads (supervisor, tokio workers, blocking
+        // pool) for its whole lifetime. Capture the caller's override here
+        // and install it on every runtime thread; `ORCA_HOME` itself is
+        // never mutated.
+        #[cfg(test)]
+        let host_test_home = crate::history::current_test_orca_home();
+        #[cfg(not(test))]
+        #[allow(unused_variables)]
+        let host_test_home: Option<std::path::PathBuf> = None;
         let supervisor = thread::Builder::new()
             .name("orca-runtime-host".to_string())
             .spawn(move || {
-                let runtime = Builder::new_multi_thread()
+                #[cfg(test)]
+                crate::history::set_host_orca_home(host_test_home.clone());
+                let mut runtime_builder = Builder::new_multi_thread();
+                runtime_builder
                     .enable_all()
-                    .thread_name("orca-runtime-worker")
-                    .build()
-                    .map_err(|error| RuntimeHostError::RuntimeStartFailed {
-                        message: error.to_string(),
+                    .thread_name("orca-runtime-worker");
+                #[cfg(test)]
+                {
+                    let host_test_home = host_test_home.clone();
+                    runtime_builder.on_thread_start(move || {
+                        crate::history::set_host_orca_home(host_test_home.clone());
                     });
+                }
+                let runtime =
+                    runtime_builder
+                        .build()
+                        .map_err(|error| RuntimeHostError::RuntimeStartFailed {
+                            message: error.to_string(),
+                        });
                 match runtime {
                     Ok(runtime) => {
                         let _ = ready_tx.send(Ok(()));
@@ -38025,7 +38048,6 @@ mod tests {
     use orca_core::provider_types::{ProviderResponse, ProviderStep};
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
-    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -38051,25 +38073,6 @@ mod tests {
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-    struct OrcaHomeRestore(Option<OsString>);
-
-    impl OrcaHomeRestore {
-        fn set(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("ORCA_HOME");
-            unsafe { std::env::set_var("ORCA_HOME", path) };
-            Self(previous)
-        }
-    }
-
-    impl Drop for OrcaHomeRestore {
-        fn drop(&mut self) {
-            match self.0.as_ref() {
-                Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-                None => unsafe { std::env::remove_var("ORCA_HOME") },
-            }
-        }
-    }
-
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
     }
@@ -38079,9 +38082,12 @@ mod tests {
     fn session_listing_does_not_block_host_supervisor() {
         use std::ffi::CString;
 
+        // Needs a private home: the FIFO fixture must sit in an otherwise
+        // empty sessions directory (the assertion expects an empty listing),
+        // and a lingering FIFO must never be left in the shared home.
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let _home = OrcaHomeRestore::set(home.path());
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let sessions = home.path().join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         let fifo = sessions.join("blocked-session.jsonl");
@@ -38133,7 +38139,7 @@ mod tests {
     fn goal_store_wait_does_not_block_thread_actor() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let _home = OrcaHomeRestore::set(home.path());
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host
@@ -39744,6 +39750,7 @@ mod tests {
         host: RuntimeHost,
         thread: RuntimeThreadHandle,
         _home: tempfile::TempDir,
+        _home_guard: crate::history::TestOrcaHomeGuard,
         cwd: tempfile::TempDir,
         transcript_path: PathBuf,
         workflow_operation_id: surface::SurfaceOperationId,
@@ -39758,7 +39765,7 @@ mod tests {
         checkpoint_failures: usize,
     ) -> WorkflowCancelShutdownFixture {
         let home = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let workflow_dir = cwd.path().join(".orca").join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
@@ -39867,6 +39874,7 @@ mod tests {
             host,
             thread,
             _home: home,
+            _home_guard: _home,
             cwd,
             transcript_path,
             workflow_operation_id,
@@ -40469,8 +40477,7 @@ mod tests {
         }
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let workflow_dir = cwd.path().join(".orca").join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
@@ -40547,10 +40554,6 @@ mod tests {
             shutdown_started.elapsed() < Duration::from_secs(3),
             "workflow completion recovery must not keep HostShutdown pending forever"
         );
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
@@ -40560,8 +40563,7 @@ mod tests {
         }
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let workflow_dir = cwd.path().join(".orca").join("workflows");
         std::fs::create_dir_all(&workflow_dir).unwrap();
@@ -40695,10 +40697,6 @@ mod tests {
                 .send(())
                 .expect("release foreground after failed assertion");
             let _ = host.shutdown();
-            match previous_home {
-                Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-                None => unsafe { std::env::remove_var("ORCA_HOME") },
-            }
             panic!("prepared workflow cancellation was not retried");
         }
         let recovered_control = recovered_control.expect("checked recovered workflow control");
@@ -40767,10 +40765,6 @@ mod tests {
 
         host.shutdown()
             .expect("shutdown workflow cancel retry host");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
@@ -40779,7 +40773,6 @@ mod tests {
             return;
         }
         let _env = crate::history::lock_test_env();
-        let previous_home = std::env::var_os("ORCA_HOME");
         let fixture = checkpoint_failed_workflow_cancel_with_active_foreground(2);
         let shutdown_started = Instant::now();
         fixture
@@ -40816,10 +40809,6 @@ mod tests {
                 .count(),
             1
         );
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
@@ -40828,7 +40817,6 @@ mod tests {
             return;
         }
         let _env = crate::history::lock_test_env();
-        let previous_home = std::env::var_os("ORCA_HOME");
         let fixture = checkpoint_failed_workflow_cancel_with_active_foreground(100);
         let session_id = fixture.thread.thread_id().to_string();
         let resume_cwd = fixture.cwd.path().to_path_buf();
@@ -40934,10 +40922,6 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown cold recovery runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
@@ -44042,7 +44026,12 @@ mod tests {
                 )
                 .expect("transfer provider outcome persistence retry operation"),
         );
-        TaskRegistry::inject_typed_provider_outcome_write_failures(3);
+        TaskRegistry::inject_typed_provider_outcome_write_failures(
+            &thread
+                .session_id()
+                .expect("recorded thread has a session id"),
+            3,
+        );
 
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         loop {
@@ -48189,10 +48178,22 @@ mod tests {
         );
         drop(origin_subscription);
 
-        let pending = thread
-            .surface_actor_probe_for_test(operation_id.clone())
-            .expect("probe retained capability-loss transition")
-            .pending_capability_loss;
+        // The actor processes the detach and the injected commit failure on
+        // its own scheduling; under heavy test parallelism the first probe
+        // may race it, so poll briefly for the retained transition.
+        let pending_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let pending = loop {
+            match thread.surface_actor_probe_for_test(operation_id.clone()) {
+                Ok(probe) if probe.pending_capability_loss.is_some() => {
+                    break probe.pending_capability_loss;
+                }
+                Ok(_) if Instant::now() < pending_deadline => {
+                    std::thread::yield_now();
+                }
+                Ok(probe) => break probe.pending_capability_loss,
+                Err(error) => panic!("probe retained capability-loss transition failed: {error}"),
+            }
+        };
         let traffic_deadline = Instant::now() + Duration::from_millis(250);
         while Instant::now() < traffic_deadline {
             let (reply_tx, _reply_rx) = mpsc::sync_channel(1);
@@ -48952,8 +48953,7 @@ mod tests {
     fn surface_goal_update_tool_is_verified_before_terminal_wake() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalUpdateExecutor))
             .expect("start Goal tool runtime");
@@ -49137,18 +49137,13 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown resumed Goal runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn surface_goal_max_inner_continuation_is_durable_before_successor_execution() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
             calls: AtomicUsize::new(0),
@@ -49383,18 +49378,13 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown resumed continued Goal runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn surface_goal_plan_only_progress_continues_without_a_synthetic_gap() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let executor = Arc::new(SurfaceGoalPlanThenUpdateExecutor {
             calls: AtomicUsize::new(0),
@@ -49503,18 +49493,13 @@ mod tests {
         );
         host.shutdown()
             .expect("shutdown plan-progress Goal runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn surface_goal_cost_budget_exhaustion_is_usage_limited_not_failed() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalCostBudgetExecutor))
             .expect("start cost-budget Goal runtime");
@@ -49588,17 +49573,13 @@ mod tests {
             })
         ));
         host.shutdown().expect("shutdown cost-budget Goal runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn surface_goal_tool_approval_settles_allow_once() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let _home = OrcaHomeRestore::set(home.path());
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let marker_path = std::fs::canonicalize(cwd.path())
             .unwrap()
@@ -49704,7 +49685,7 @@ mod tests {
     fn surface_goal_approval_denial_pauses_and_resumes_fresh() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let _home = OrcaHomeRestore::set(home.path());
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let marker_path = std::fs::canonicalize(cwd.path())
             .unwrap()
@@ -49934,8 +49915,7 @@ mod tests {
     fn prepared_surface_goal_continuation_recovers_without_reexecuting_successor() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
             calls: AtomicUsize::new(0),
@@ -50108,18 +50088,11 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown restarted Goal continuation runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn unappended_surface_goal_continuation_terminalizes_live_and_restarts_exactly() {
         let _env = crate::history::lock_test_env();
-        let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
         let cwd = tempfile::tempdir().unwrap();
         let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
             calls: AtomicUsize::new(0),
@@ -50254,18 +50227,13 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown restarted Goal recovery runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn surface_goal_store_finish_failure_terminalizes_live_and_restarts_exactly() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
             calls: AtomicUsize::new(0),
@@ -50391,18 +50359,13 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown restarted Goal store-failure runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn surface_goal_recovery_admission_repair_failure_shutdown_is_bounded_and_restart_exact() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
             calls: AtomicUsize::new(0),
@@ -50530,18 +50493,13 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown restarted bounded Goal recovery runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn surface_goal_writer_finish_failure_after_admission_terminalizes_live() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let executor = Arc::new(SurfaceGoalContinueThenUpdateExecutor {
             calls: AtomicUsize::new(0),
@@ -50634,18 +50592,13 @@ mod tests {
         );
         host.shutdown()
             .expect("shutdown Goal writer-failure runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn surface_goal_terminal_checkpoint_failure_recovers_exact_verified_batch() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let previous_home = std::env::var_os("ORCA_HOME");
-        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalUpdateExecutor))
             .expect("start Goal checkpoint runtime");
@@ -50904,17 +50857,13 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown recovered Goal checkpoint runtime");
-        match previous_home {
-            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-            None => unsafe { std::env::remove_var("ORCA_HOME") },
-        }
     }
 
     #[test]
     fn resumed_legacy_usage_restores_latest_provider_context() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let _home = OrcaHomeRestore::set(home.path());
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
 
         let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
@@ -51044,7 +50993,7 @@ mod tests {
     fn side_conversation_is_an_attached_runtime_child_without_durable_history() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let _home = OrcaHomeRestore::set(home.path());
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start runtime host");
         let parent = host

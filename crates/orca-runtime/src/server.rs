@@ -8236,25 +8236,15 @@ rl.on("line", (line) => {
     }
 
     fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        // Exclusive never-removed subdirectory of the process-wide isolated
-        // home; ORCA_HOME points at it only inside the serialized closure and
-        // is restored afterwards. The subdirectory is never removed, so any
-        // test that reads ORCA_HOME during the window still resolves a live
-        // directory, and a test that corrupts its own home never affects
-        // others.
+        // Provide an exclusive never-removed subdirectory of the process-wide
+        // isolated home for repository/trust fixtures, and resolve ORCA_HOME
+        // to it for this thread and any host spawned inside the closure.
+        // `ORCA_HOME` itself is never mutated: the override is a thread-local
+        // that concurrent tests, background hosts, and server threads cannot
+        // observe, so they always resolve the process-wide home.
         let _guard = crate::history::lock_test_env();
         let home = crate::history::isolated_test_orca_home_subdir("with-orca-home");
-        unsafe {
-            std::env::set_var("ORCA_HOME", &home);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&home)));
-        unsafe {
-            std::env::set_var("ORCA_HOME", crate::history::isolated_test_orca_home());
-        }
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
+        crate::history::with_test_orca_home(&home, f)
     }
 
     fn trust_test_folder(home: &std::path::Path, folder: &std::path::Path) {

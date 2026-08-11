@@ -4,8 +4,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -37,7 +35,9 @@ use crate::model_response::RuntimeModelResponse;
 use crate::thread_store::redact_sensitive_text;
 
 #[cfg(test)]
-static TYPED_PROVIDER_OUTCOME_WRITE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static TYPED_PROVIDER_OUTCOME_WRITE_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
 
 const TASK_LEASE_DURATION_MS: i64 = 30_000;
 
@@ -333,9 +333,16 @@ enum PersistedProviderStep {
 }
 
 impl TaskRegistry {
+    /// Injects `count` typed-provider-outcome persistence failures for
+    /// `session_id` only, so parallel tests never consume each other's
+    /// injection budget.
     #[cfg(test)]
-    pub(crate) fn inject_typed_provider_outcome_write_failures(count: usize) {
-        TYPED_PROVIDER_OUTCOME_WRITE_FAILURES.store(count, Ordering::SeqCst);
+    pub(crate) fn inject_typed_provider_outcome_write_failures(session_id: &str, count: usize) {
+        TYPED_PROVIDER_OUTCOME_WRITE_FAILURES
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id.to_string(), count);
     }
 
     pub fn new(session_id: String) -> Self {
@@ -2344,15 +2351,22 @@ impl TaskPersistence {
         outcomes: &HashMap<String, DurableTypedProviderOutcome>,
     ) -> io::Result<()> {
         #[cfg(test)]
-        if TYPED_PROVIDER_OUTCOME_WRITE_FAILURES
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
         {
-            return Err(io::Error::other(
-                "injected typed provider outcome persistence failure",
-            ));
+            let mut failures = TYPED_PROVIDER_OUTCOME_WRITE_FAILURES
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let remaining = failures.get_mut(session_id);
+            if let Some(remaining) = remaining {
+                if *remaining > 1 {
+                    *remaining -= 1;
+                } else {
+                    failures.remove(session_id);
+                }
+                return Err(io::Error::other(
+                    "injected typed provider outcome persistence failure",
+                ));
+            }
         }
         let persisted = outcomes
             .iter()
@@ -3121,7 +3135,11 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
 }
 
 fn task_sessions_root() -> Option<PathBuf> {
-    std::env::var_os("ORCA_HOME")
+    #[cfg(test)]
+    let test_home = crate::history::read_test_orca_home();
+    #[cfg(not(test))]
+    let test_home = std::env::var_os("ORCA_HOME");
+    test_home
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
         .map(|home| home.join("task-sessions"))
@@ -3499,15 +3517,10 @@ mod tests {
 
     #[test]
     fn cwd_constructor_migrates_legacy_project_task_sessions_to_orca_home() {
-        let _guard = crate::history::lock_test_env();
-        let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("ORCA_HOME");
-        unsafe {
-            std::env::set_var("ORCA_HOME", home.path());
-        }
-
-        let result = std::panic::catch_unwind(|| {
+        // Synchronous registry work only; the exclusive redirect serializes
+        // the env switch against every other test and restores on panic.
+        crate::history::with_redirected_orca_home("task-migration", |home| {
             let legacy_root = cwd.path().join(".orca").join("task-sessions");
             let legacy =
                 TaskRegistry::new_persistent("legacy-session".to_string(), legacy_root).unwrap();
@@ -3524,50 +3537,24 @@ mod tests {
             assert_eq!(recovered.status, TaskStatus::Completed);
             assert_eq!(recovered.result.as_deref(), Some("legacy result"));
             assert!(
-                home.path()
-                    .join("task-sessions")
-                    .join("task-index.json")
-                    .exists(),
+                home.join("task-sessions").join("task-index.json").exists(),
                 "migrated task index should be written under ORCA_HOME"
             );
         });
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var("ORCA_HOME", previous);
-            } else {
-                std::env::remove_var("ORCA_HOME");
-            }
-        }
-        result.unwrap();
     }
 
     #[test]
     fn cwd_constructor_persists_new_tasks_under_orca_home_without_project_storage() {
-        let _guard = crate::history::lock_test_env();
-        let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("ORCA_HOME");
-        unsafe {
-            std::env::set_var("ORCA_HOME", home.path());
-        }
-
-        let result = std::panic::catch_unwind(|| {
+        // Synchronous registry work only; the exclusive redirect serializes
+        // the env switch against every other test and restores on panic.
+        crate::history::with_redirected_orca_home("task-persist", |home| {
             let registry = TaskRegistry::new_for_cwd("new-session".to_string(), cwd.path());
             registry.create_subagent("new async task".to_string(), Some("general".to_string()));
 
-            assert!(home.path().join("task-sessions/task-index.json").exists());
+            assert!(home.join("task-sessions/task-index.json").exists());
             assert!(!cwd.path().join(".orca/task-sessions").exists());
         });
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var("ORCA_HOME", previous);
-            } else {
-                std::env::remove_var("ORCA_HOME");
-            }
-        }
-        result.unwrap();
     }
 
     #[test]

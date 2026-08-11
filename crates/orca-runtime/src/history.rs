@@ -24,6 +24,14 @@ pub use crate::thread_store::{
 
 const SESSION_SCHEMA_VERSION: u32 = 1;
 
+/// Serializes tests that deliberately share process-wide state (the session
+/// index, the task registry index, recorded sessions under the process-wide
+/// isolated home). This is the v0.3.14 serialization behavior: the shared
+/// index stores are safe under serial execution, so tests that touch them
+/// hold this mutex for their whole body. Home resolution itself never takes
+/// this lock (see [`read_test_orca_home`] and [`with_test_orca_home`]), so a
+/// test holding it while waiting for its own host threads can never deadlock
+/// against them.
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -39,43 +47,124 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
     recover_test_lock(&TEST_ENV_LOCK)
 }
 
+// Per-test `ORCA_HOME` overrides live in `orca_core::config::folder_trust`
+// (thread-local, never the environment) so that folder-trust and workflow
+// script resolution observe the same private home as sessions, goals, and
+// task sessions. Hosts spawned inside a test-home scope capture it
+// (`current_test_orca_home`) and install it on all their worker threads via
+// `set_host_orca_home`.
+
+#[cfg(test)]
+pub(crate) fn current_test_orca_home() -> Option<std::path::PathBuf> {
+    orca_core::config::folder_trust::current_test_orca_home()
+}
+
+/// Installs `home` as the `ORCA_HOME` override for the calling thread (a
+/// host supervisor or worker thread). `None` restores environment-based
+/// resolution.
+#[cfg(test)]
+pub(crate) fn set_host_orca_home(home: Option<std::path::PathBuf>) {
+    orca_core::config::folder_trust::install_host_orca_home(home);
+}
+
+/// Runs `body` with `ORCA_HOME` resolving to `home` for the calling thread
+/// and for any host spawned inside the closure, then restores the previous
+/// resolution — even when `body` panics. `ORCA_HOME` itself is never
+/// mutated: the override is a thread-local that other tests cannot observe,
+/// so concurrent tests, background hosts, and server threads always resolve
+/// the process-wide home and never see a half-switched value.
+#[cfg(test)]
+pub(crate) fn with_test_orca_home<T>(
+    home: &std::path::Path,
+    body: impl FnOnce(&std::path::Path) -> T,
+) -> T {
+    let previous = current_test_orca_home();
+    orca_core::config::folder_trust::install_test_orca_home(Some(home.to_path_buf()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(home)));
+    orca_core::config::folder_trust::install_test_orca_home(previous);
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Guard returned by [`redirect_test_orca_home`]; restores the previous
+/// per-test home override on drop.
+#[cfg(test)]
+pub(crate) struct TestOrcaHomeGuard {
+    previous: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for TestOrcaHomeGuard {
+    fn drop(&mut self) {
+        orca_core::config::folder_trust::install_test_orca_home(self.previous.take());
+    }
+}
+
+/// Redirects `ORCA_HOME` resolution to `home` for the calling thread until
+/// the returned guard drops (the guard restores the previous override).
+/// Unlike [`with_test_orca_home`], the caller keeps the override alive
+/// across statements, which tests with multi-phase bodies (host setup,
+/// assertions, resume) need. The redirect is a thread-local and is invisible
+/// to every other test.
+#[cfg(test)]
+pub(crate) fn redirect_test_orca_home(home: &std::path::Path) -> TestOrcaHomeGuard {
+    let previous = current_test_orca_home();
+    orca_core::config::folder_trust::install_test_orca_home(Some(home.to_path_buf()));
+    TestOrcaHomeGuard { previous }
+}
+
+/// Reads `ORCA_HOME` safely under test. The resolution order is: this
+/// thread's host-home override (installed on host worker threads), this
+/// thread's test-home override (inside a `with_test_orca_home` /
+/// `redirect_test_orca_home` scope), then the process-wide `ORCA_HOME`
+/// variable. No lock is taken: the variable is only ever set to the
+/// process-wide isolated home, so reads never observe a half-switched value.
+#[cfg(test)]
+pub(crate) fn read_test_orca_home() -> Option<std::ffi::OsString> {
+    orca_core::config::folder_trust::current_orca_home_override()
+        .map(Into::into)
+        .or_else(|| std::env::var_os("ORCA_HOME"))
+}
+
 /// One process-wide temporary `ORCA_HOME` for the whole lib test binary. The
 /// real user home may be in use by live `orca` processes, so every lib test
 /// resolves `ORCA_HOME` to this isolated directory instead. It is created
-/// once, set once, and never removed while the test process runs.
+/// once and never removed while the test process runs; this function does not
+/// touch the environment.
 #[cfg(test)]
-pub(crate) fn isolated_test_orca_home() -> &'static std::path::Path {
+pub(crate) fn isolated_test_orca_home_dir() -> &'static std::path::Path {
     use std::sync::OnceLock;
 
     static ORCA_HOME_TEST_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
-    ORCA_HOME_TEST_HOME
-        .get_or_init(|| {
-            let home = tempfile::tempdir().expect("create process-wide test ORCA_HOME");
-            // edition 2024: set_var is unsafe.
-            unsafe {
-                std::env::set_var("ORCA_HOME", home.path());
-            }
-            home
-        })
-        .path()
+    let home = ORCA_HOME_TEST_HOME
+        .get_or_init(|| tempfile::tempdir().expect("create process-wide test ORCA_HOME"));
+    home.path()
 }
 
-/// Ensures the process-wide isolated ORCA_HOME is active for the calling test.
-/// Recovery children receive an explicit fixture ORCA_HOME on their command
-/// line (a plain temp dir outside the isolated home); that explicit home is
-/// preserved. A with-orca-home subdirectory left over from a concurrent test
-/// is replaced by the process-wide home so recorded-surface tests never run
-/// against another test's scratch directory.
+/// Re-applies `ORCA_HOME` to the process-wide isolated home and returns it.
+/// Safe to call from anywhere: nothing else ever mutates the variable (all
+/// per-test homes are thread-local overrides), so this is idempotent.
+#[cfg(test)]
+pub(crate) fn isolated_test_orca_home() -> &'static std::path::Path {
+    let home = isolated_test_orca_home_dir();
+    // edition 2024: set_var is unsafe.
+    unsafe {
+        std::env::set_var("ORCA_HOME", home);
+    }
+    home
+}
+
+/// Ensures the process-wide isolated ORCA_HOME directory exists for tests
+/// that run without any explicit home. The variable is stable for the whole
+/// test process (per-test homes are thread-local), so a claim simply
+/// re-applies the same value. Recovery children receive an explicit fixture
+/// ORCA_HOME on their command line and keep it.
 #[cfg(test)]
 pub(crate) fn claim_isolated_test_orca_home_if_unset() -> bool {
-    if let Some(home) = std::env::var_os("ORCA_HOME") {
-        let home = PathBuf::from(home);
-        if !home
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("with-orca-home"))
-        {
-            return false;
-        }
+    if std::env::var_os("ORCA_HOME").is_some() {
+        return false;
     }
     let _ = isolated_test_orca_home();
     true
@@ -83,20 +172,34 @@ pub(crate) fn claim_isolated_test_orca_home_if_unset() -> bool {
 
 /// Reserves a unique subdirectory inside the process-wide isolated home for a
 /// test that needs an exclusive empty home (for example to create a repository
-/// or write trust receipts). The subdirectory is never removed, so tests that
-/// read `ORCA_HOME` concurrently keep a live path.
+/// or write trust receipts). The subdirectory is never removed and is never
+/// exported through `ORCA_HOME`: tests that only need a private fixture
+/// directory receive it as an explicit path and leave the environment alone.
+/// Allocation is atomic (a process-wide counter), so concurrent tests never
+/// receive the same subdirectory.
 #[cfg(test)]
 pub(crate) fn isolated_test_orca_home_subdir(label: &str) -> std::path::PathBuf {
-    let home = isolated_test_orca_home();
-    let mut counter = 0usize;
-    loop {
-        let candidate = home.join(format!("{label}-{}-{}", std::process::id(), counter));
-        if !candidate.exists() {
-            std::fs::create_dir_all(&candidate).expect("create isolated test home subdir");
-            return candidate;
-        }
-        counter += 1;
-    }
+    static SUBDIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let home = isolated_test_orca_home_dir();
+    let sequence = SUBDIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let candidate = home.join(format!("{label}-{}-{}", std::process::id(), sequence));
+    std::fs::create_dir_all(&candidate).expect("create isolated test home subdir");
+    candidate
+}
+
+/// Reserves an exclusive never-removed subdirectory of the process-wide
+/// isolated home and runs `body` with `ORCA_HOME` resolving to it for the
+/// calling thread (and any host spawned inside), restoring the previous
+/// resolution afterwards — even on panic. Use this for tests whose fixture
+/// must be visible through the home itself (a broken legacy goal file, a
+/// transcript directory replaced with a file, task-registry migrations).
+#[cfg(test)]
+pub(crate) fn with_redirected_orca_home<T>(
+    label: &str,
+    body: impl FnOnce(&std::path::Path) -> T,
+) -> T {
+    let home = isolated_test_orca_home_subdir(label);
+    with_test_orca_home(&home, body)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -385,32 +488,19 @@ fn title_from_prompt(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thread_store::ORCA_HOME_ENV;
     use orca_core::approval_types::ActionKind;
     use orca_core::conversation::RawToolCall;
     use orca_core::event_schema::{
         EVENT_SEQUENCE_RESERVATION_SIZE, EventEnvelope, EventPublicationStore, EventType,
     };
 
-    /// Points ORCA_HOME at an exclusive never-removed subdirectory of the
-    /// process-wide isolated home for the duration of `body`, then returns it
-    /// to the process-wide home. The env lock serializes these tests against
-    /// each other; other tests always resolve a live directory because the
-    /// subdirectory is never removed.
+    /// Points ORCA_HOME resolution at an exclusive never-removed subdirectory
+    /// of the process-wide isolated home for the duration of `body`. The
+    /// override is a thread-local (never the environment), so concurrent
+    /// tests keep resolving the process-wide home.
     fn with_isolated_home<T>(body: impl FnOnce() -> T) -> T {
-        let _guard = lock_test_env();
         let home = isolated_test_orca_home_subdir("history-test");
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, &home);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, isolated_test_orca_home());
-        }
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
+        super::with_test_orca_home(&home, |_| body())
     }
     use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_core::thread_identity::TurnId;

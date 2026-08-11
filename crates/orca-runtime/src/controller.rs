@@ -1509,28 +1509,6 @@ mod tests {
         }
     }
 
-    fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        // Exclusive never-removed subdirectory of the process-wide isolated
-        // home; ORCA_HOME points at it only inside the serialized closure and
-        // is restored afterwards. The subdirectory is never removed, so any
-        // test that reads ORCA_HOME during the window still resolves a live
-        // directory, and a test that corrupts its own home (for example a
-        // broken legacy goal file) never affects others.
-        let _guard = crate::history::lock_test_env();
-        let home = crate::history::isolated_test_orca_home_subdir("with-orca-home");
-        unsafe {
-            std::env::set_var("ORCA_HOME", &home);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&home)));
-        unsafe {
-            std::env::set_var("ORCA_HOME", crate::history::isolated_test_orca_home());
-        }
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-
     #[test]
     fn headless_controller_propagates_borrowed_writer_failure() {
         struct BrokenWriter;
@@ -1548,137 +1526,129 @@ mod tests {
             }
         }
 
-        with_orca_home(|_| {
-            let mut config = config(SubagentConfig::default());
-            config.prompt = "inspect repo".to_string();
-            config.output_format = OutputFormat::Jsonl;
-            let error = run_inner(config, BrokenWriter, ControllerRunOptions::default())
-                .expect_err("borrowed writer failure");
+        let mut config = config(SubagentConfig::default());
+        config.prompt = "inspect repo".to_string();
+        config.output_format = OutputFormat::Jsonl;
+        let error = run_inner(config, BrokenWriter, ControllerRunOptions::default())
+            .expect_err("borrowed writer failure");
 
-            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-            assert_eq!(error.to_string(), "borrowed writer disconnected");
-        });
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "borrowed writer disconnected");
     }
 
     #[test]
     fn headless_controller_emits_one_contiguous_session_lifecycle() {
-        with_orca_home(|_| {
-            let mut config = config(SubagentConfig::default());
-            config.prompt = "inspect repo".to_string();
-            config.output_format = OutputFormat::Jsonl;
-            let mut output = Vec::new();
+        let mut config = config(SubagentConfig::default());
+        config.prompt = "inspect repo".to_string();
+        config.output_format = OutputFormat::Jsonl;
+        let mut output = Vec::new();
 
-            let status = run_inner(config, &mut output, ControllerRunOptions::default())
-                .expect("headless controller run");
+        let status = run_inner(config, &mut output, ControllerRunOptions::default())
+            .expect("headless controller run");
 
-            assert_eq!(status, RunStatus::Success);
-            let events = String::from_utf8(output)
-                .expect("utf8 events")
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json event"))
-                .collect::<Vec<_>>();
-            assert_eq!(events.first().unwrap()["type"], "session.started");
-            assert_eq!(events.last().unwrap()["type"], "session.completed");
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event["type"] == "session.started")
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event["type"] == "session.completed")
-                    .count(),
-                1
-            );
-            for (sequence, event) in events.iter().enumerate() {
-                assert_eq!(event["seq"], sequence);
-                assert_eq!(event["run_id"], events[0]["run_id"]);
-            }
-        });
+        assert_eq!(status, RunStatus::Success);
+        let events = String::from_utf8(output)
+            .expect("utf8 events")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json event"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.first().unwrap()["type"], "session.started");
+        assert_eq!(events.last().unwrap()["type"], "session.completed");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "session.started")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "session.completed")
+                .count(),
+            1
+        );
+        for (sequence, event) in events.iter().enumerate() {
+            assert_eq!(event["seq"], sequence);
+            assert_eq!(event["run_id"], events[0]["run_id"]);
+        }
     }
 
     #[test]
     fn root_turn_refreshes_plan_mode_context_after_runtime_mode_changes() {
-        with_orca_home(|_| {
-            let mut config = config(SubagentConfig::default());
-            config.history_mode = HistoryMode::Disabled;
-            let mut thread = RuntimeThread::start(&config, "dynamic plan context").expect("thread");
+        let mut config = config(SubagentConfig::default());
+        config.history_mode = HistoryMode::Disabled;
+        let mut thread = RuntimeThread::start(&config, "dynamic plan context").expect("thread");
 
-            config.approval_mode = ApprovalMode::Plan;
+        config.approval_mode = ApprovalMode::Plan;
+        thread
+            .run_request(
+                &config,
+                &ThreadTurnRequest::new("inspect the implementation"),
+                Vec::new(),
+            )
+            .expect("plan turn");
+        let plan_context = thread
+            .session()
+            .conversation()
+            .internal_context
+            .get(orca_core::conversation::MODE_CONTEXT_FRAGMENT_ID)
+            .expect("plan mode context");
+        assert!(plan_context.content.contains("[Mode context]"));
+        assert!(
+            plan_context
+                .content
+                .contains("exactly one `<proposed_plan>` block")
+        );
+
+        config.approval_mode = ApprovalMode::AutoEdit;
+        thread
+            .run_request(
+                &config,
+                &ThreadTurnRequest::new("implement the approved plan"),
+                Vec::new(),
+            )
+            .expect("implementation turn");
+        assert!(
             thread
-                .run_request(
-                    &config,
-                    &ThreadTurnRequest::new("inspect the implementation"),
-                    Vec::new(),
-                )
-                .expect("plan turn");
-            let plan_context = thread
                 .session()
                 .conversation()
                 .internal_context
                 .get(orca_core::conversation::MODE_CONTEXT_FRAGMENT_ID)
-                .expect("plan mode context");
-            assert!(plan_context.content.contains("[Mode context]"));
-            assert!(
-                plan_context
-                    .content
-                    .contains("exactly one `<proposed_plan>` block")
-            );
-
-            config.approval_mode = ApprovalMode::AutoEdit;
-            thread
-                .run_request(
-                    &config,
-                    &ThreadTurnRequest::new("implement the approved plan"),
-                    Vec::new(),
-                )
-                .expect("implementation turn");
-            assert!(
-                thread
-                    .session()
-                    .conversation()
-                    .internal_context
-                    .get(orca_core::conversation::MODE_CONTEXT_FRAGMENT_ID)
-                    .is_none()
-            );
-        });
+                .is_none()
+        );
     }
 
     fn assert_controller_failure_persists_error(use_event_factory: bool) {
-        with_orca_home(|_| {
-            let mut config = config(SubagentConfig::default());
-            config.history_mode = HistoryMode::Record;
-            config.output_format = OutputFormat::Jsonl;
-            let mut thread = RuntimeThread::start(&config, "provider failure").expect("thread");
-            let thread_id = thread.thread_id().to_string();
-            let request = ThreadTurnRequest::new("mock_provider_error");
-            let mut output = Vec::new();
+        let mut config = config(SubagentConfig::default());
+        config.history_mode = HistoryMode::Record;
+        config.output_format = OutputFormat::Jsonl;
+        let mut thread = RuntimeThread::start(&config, "provider failure").expect("thread");
+        let thread_id = thread.thread_id().to_string();
+        let request = ThreadTurnRequest::new("mock_provider_error");
+        let mut output = Vec::new();
 
-            let status = if use_event_factory {
-                let mut events = EventFactory::new(thread_id.clone());
-                thread.run_request_with_event_factory(&config, &request, &mut output, &mut events)
-            } else {
-                thread.run_request(&config, &request, &mut output)
-            }
-            .expect("provider failure completes the turn");
+        let status = if use_event_factory {
+            let mut events = EventFactory::new(thread_id.clone());
+            thread.run_request_with_event_factory(&config, &request, &mut output, &mut events)
+        } else {
+            thread.run_request(&config, &request, &mut output)
+        }
+        .expect("provider failure completes the turn");
 
-            assert_eq!(status, RunStatus::Failed);
-            assert_eq!(
-                thread.session().completion_error(),
-                Some("mock provider error: api_key=super-secret")
-            );
-            let transcript =
-                crate::history::load_session(&thread_id).expect("failed session transcript");
-            assert_eq!(
-                transcript.completion_error.as_deref(),
-                Some("mock provider error: api_key=<redacted>")
-            );
-            let persisted = std::fs::read_to_string(&transcript.path).expect("session JSONL");
-            assert!(!persisted.contains("super-secret"));
-        });
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(
+            thread.session().completion_error(),
+            Some("mock provider error: api_key=super-secret")
+        );
+        let transcript =
+            crate::history::load_session(&thread_id).expect("failed session transcript");
+        assert_eq!(
+            transcript.completion_error.as_deref(),
+            Some("mock provider error: api_key=<redacted>")
+        );
+        let persisted = std::fs::read_to_string(&transcript.path).expect("session JSONL");
+        assert!(!persisted.contains("super-secret"));
     }
 
     #[test]
@@ -1693,50 +1663,52 @@ mod tests {
 
     #[test]
     fn hosted_turn_persists_one_user_record_for_one_admitted_prompt() {
-        with_orca_home(|_| {
-            let mut config = config(SubagentConfig::default());
-            config.history_mode = HistoryMode::Record;
-            config.output_format = OutputFormat::Jsonl;
-            let mut thread = RuntimeThread::start(&config, "canonical user turn").expect("thread");
-            let request = ThreadTurnRequest::new("persist this prompt once");
-            let turn_id = request.turn_id().clone();
+        let mut config = config(SubagentConfig::default());
+        config.history_mode = HistoryMode::Record;
+        config.output_format = OutputFormat::Jsonl;
+        let mut thread = RuntimeThread::start(&config, "canonical user turn").expect("thread");
+        let request = ThreadTurnRequest::new("persist this prompt once");
+        let turn_id = request.turn_id().clone();
 
-            thread
-                .run_request(&config, &request, Vec::new())
-                .expect("run hosted turn");
+        thread
+            .run_request(&config, &request, Vec::new())
+            .expect("run hosted turn");
 
-            let records = thread
-                .session()
-                .conversation_records()
-                .expect("recorded conversation ledger");
-            let projected = crate::thread_store::conversation_records_to_thread_items(
-                thread.thread_id(),
-                &records,
-                None,
-                usize::MAX,
-            )
-            .expect("project recorded conversation ledger");
-            let user_records = projected
-                .iter()
-                .filter(|record| {
-                    record.item["role"] == "user"
-                        && record.item["content"] == "persist this prompt once"
-                })
-                .collect::<Vec<_>>();
+        let records = thread
+            .session()
+            .conversation_records()
+            .expect("recorded conversation ledger");
+        let projected = crate::thread_store::conversation_records_to_thread_items(
+            thread.thread_id(),
+            &records,
+            None,
+            usize::MAX,
+        )
+        .expect("project recorded conversation ledger");
+        let user_records = projected
+            .iter()
+            .filter(|record| {
+                record.item["role"] == "user"
+                    && record.item["content"] == "persist this prompt once"
+            })
+            .collect::<Vec<_>>();
 
-            assert_eq!(
-                user_records.len(),
-                1,
-                "one admitted prompt must have one durable user item: {user_records:#?}"
-            );
-            assert_eq!(user_records[0].turn_id, turn_id.as_str());
-            assert!(user_records[0].item_id.starts_with("item_"));
-        });
+        assert_eq!(
+            user_records.len(),
+            1,
+            "one admitted prompt must have one durable user item: {user_records:#?}"
+        );
+        assert_eq!(user_records[0].turn_id, turn_id.as_str());
+        assert!(user_records[0].item_id.starts_with("item_"));
     }
 
     #[test]
     fn hosted_turn_does_not_commit_user_prompt_when_history_append_fails() {
-        with_orca_home(|_| {
+        // This test replaces the transcript directory with a file, which
+        // would corrupt the shared process-wide home; it needs the redirect
+        // to a private home. The turn executes on this thread, so holding the
+        // exclusive env lock cannot deadlock any background host.
+        crate::history::with_redirected_orca_home("failed-user-admission", |_| {
             let mut config = config(SubagentConfig::default());
             config.history_mode = HistoryMode::Record;
             config.output_format = OutputFormat::Jsonl;
@@ -1839,89 +1811,95 @@ mod tests {
 
     #[test]
     fn hosted_goal_tool_rejects_unverified_terminal_update_through_runtime_context() {
-        with_orca_home(|_| {
-            let mut config = config(SubagentConfig::default());
-            config.history_mode = HistoryMode::Record;
-            config.output_format = OutputFormat::Jsonl;
-            config.approval_mode = ApprovalMode::FullAuto;
-            let mut thread = RuntimeThread::start(&config, "hosted goal tool").expect("thread");
-            let session_id = thread
-                .session()
-                .session_id()
-                .expect("recorded session id")
-                .to_string();
-            let store = crate::goal_store::GoalStore::load_default().expect("goal store");
+        // The goal created directly on the shared process-wide store would be
+        // recovered as interrupted by a concurrent opener; keep a private
+        // goal store for the duration (a thread-local override, invisible to
+        // other tests). The turn executes on this thread, so the override is
+        // visible to every goal store read it performs.
+        let _home = crate::history::redirect_test_orca_home(
+            &crate::history::isolated_test_orca_home_subdir("hosted-goal-private"),
+        );
+        let mut config = config(SubagentConfig::default());
+        config.history_mode = HistoryMode::Record;
+        config.output_format = OutputFormat::Jsonl;
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "hosted goal tool").expect("thread");
+        let session_id = thread
+            .session()
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+        let store = crate::goal_store::GoalStore::load_default().expect("goal store");
+        store
+            .create_goal(crate::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "finish the hosted goal".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .expect("active goal");
+
+        let progress = ThreadTurnRequest::new("establish live goal progress")
+            .with_tool_mode(ThreadTurnToolMode::Goal)
+            .with_continuation(tool_continuation(tool_types::ToolRequest {
+                id: "goal-progress-1".to_string(),
+                name: tool_types::ToolName::TaskList,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            }));
+        assert_eq!(
+            thread
+                .run_request(&config, &progress, Vec::new())
+                .expect("run non-goal progress tool"),
+            RunStatus::Success
+        );
+
+        let update = ThreadTurnRequest::new("complete the hosted goal")
+            .with_tool_mode(ThreadTurnToolMode::Goal)
+            .with_continuation(tool_continuation(tool_types::ToolRequest {
+                id: "goal-update-1".to_string(),
+                name: tool_types::ToolName::UpdateGoal,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(r#"{"status":"complete"}"#.to_string()),
+            }));
+        let status = thread
+            .run_request(&config, &update, Vec::new())
+            .expect("run hosted goal update");
+
+        assert_eq!(
+            status,
+            RunStatus::Success,
+            "hosted goal messages: {:#?}",
+            thread.session().conversation().messages
+        );
+        assert_eq!(
             store
-                .create_goal(crate::goal_store::CreateGoalInput {
-                    session_id: session_id.clone(),
-                    objective: "finish the hosted goal".to_string(),
-                    token_budget: None,
-                    now: 1,
+                .project_thread_goal(&session_id)
+                .expect("load persisted goal")
+                .expect("persisted goal")
+                .status,
+            orca_core::goal_types::ThreadGoalStatus::Active
+        );
+        assert!(
+            thread
+                .session()
+                .conversation()
+                .messages
+                .iter()
+                .any(|message| {
+                    matches!(
+                        message,
+                        Message::Tool {
+                            tool_call_id,
+                            terminal: Some(terminal),
+                            ..
+                        } if tool_call_id == "goal-update-1"
+                            && terminal.status == tool_types::ToolStatus::Failed
+                    )
                 })
-                .expect("active goal");
-
-            let progress = ThreadTurnRequest::new("establish live goal progress")
-                .with_tool_mode(ThreadTurnToolMode::Goal)
-                .with_continuation(tool_continuation(tool_types::ToolRequest {
-                    id: "goal-progress-1".to_string(),
-                    name: tool_types::ToolName::TaskList,
-                    action: ActionKind::Read,
-                    target: None,
-                    raw_arguments: Some("{}".to_string()),
-                }));
-            assert_eq!(
-                thread
-                    .run_request(&config, &progress, Vec::new())
-                    .expect("run non-goal progress tool"),
-                RunStatus::Success
-            );
-
-            let update = ThreadTurnRequest::new("complete the hosted goal")
-                .with_tool_mode(ThreadTurnToolMode::Goal)
-                .with_continuation(tool_continuation(tool_types::ToolRequest {
-                    id: "goal-update-1".to_string(),
-                    name: tool_types::ToolName::UpdateGoal,
-                    action: ActionKind::Read,
-                    target: None,
-                    raw_arguments: Some(r#"{"status":"complete"}"#.to_string()),
-                }));
-            let status = thread
-                .run_request(&config, &update, Vec::new())
-                .expect("run hosted goal update");
-
-            assert_eq!(
-                status,
-                RunStatus::Success,
-                "hosted goal messages: {:#?}",
-                thread.session().conversation().messages
-            );
-            assert_eq!(
-                store
-                    .project_thread_goal(&session_id)
-                    .expect("load persisted goal")
-                    .expect("persisted goal")
-                    .status,
-                orca_core::goal_types::ThreadGoalStatus::Active
-            );
-            assert!(
-                thread
-                    .session()
-                    .conversation()
-                    .messages
-                    .iter()
-                    .any(|message| {
-                        matches!(
-                            message,
-                            Message::Tool {
-                                tool_call_id,
-                                terminal: Some(terminal),
-                                ..
-                            } if tool_call_id == "goal-update-1"
-                                && terminal.status == tool_types::ToolStatus::Failed
-                        )
-                    })
-            );
-        });
+        );
     }
 
     #[test]
@@ -1975,72 +1953,82 @@ mod tests {
 
     #[test]
     fn hosted_goal_tool_invalid_update_remains_model_recoverable() {
-        with_orca_home(|_| {
-            let mut config = config(SubagentConfig::default());
-            config.history_mode = HistoryMode::Record;
-            config.output_format = OutputFormat::Jsonl;
-            config.approval_mode = ApprovalMode::FullAuto;
-            let mut thread = RuntimeThread::start(&config, "invalid goal update").expect("thread");
-            let session_id = thread.session().session_id().unwrap().to_string();
-            let store = crate::goal_store::GoalStore::load_default().unwrap();
+        // The goal created directly on the shared process-wide store would be
+        // recovered as interrupted by a concurrent opener; keep a private
+        // goal store for the duration (a thread-local override, invisible to
+        // other tests). The turn executes on this thread, so the override is
+        // visible to every goal store read it performs.
+        let _home = crate::history::redirect_test_orca_home(
+            &crate::history::isolated_test_orca_home_subdir("hosted-goal-private"),
+        );
+        let mut config = config(SubagentConfig::default());
+        config.history_mode = HistoryMode::Record;
+        config.output_format = OutputFormat::Jsonl;
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "invalid goal update").expect("thread");
+        let session_id = thread.session().session_id().unwrap().to_string();
+        let store = crate::goal_store::GoalStore::load_default().unwrap();
+        store
+            .create_goal(crate::goal_store::CreateGoalInput {
+                session_id: session_id.clone(),
+                objective: "keep correcting the goal update".to_string(),
+                token_budget: None,
+                now: 1,
+            })
+            .unwrap();
+        let request = ThreadTurnRequest::new("reject invalid goal update")
+            .with_tool_mode(ThreadTurnToolMode::Goal)
+            .with_continuation(tool_continuation(tool_types::ToolRequest {
+                id: "goal-update-invalid".to_string(),
+                name: tool_types::ToolName::UpdateGoal,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(r#"{"status":"paused"}"#.to_string()),
+            }));
+
+        let status = thread
+            .run_request(&config, &request, Vec::new())
+            .expect("run invalid goal update");
+        let messages = &thread.session().conversation().messages;
+        let result_index = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    Message::Tool {
+                        tool_call_id,
+                        terminal: Some(terminal),
+                        ..
+                    } if tool_call_id == "goal-update-invalid"
+                        && terminal.status == tool_types::ToolStatus::Failed
+                )
+            })
+            .expect("failed goal tool result");
+
+        assert_eq!(status, RunStatus::Success);
+        assert_eq!(
             store
-                .create_goal(crate::goal_store::CreateGoalInput {
-                    session_id: session_id.clone(),
-                    objective: "keep correcting the goal update".to_string(),
-                    token_budget: None,
-                    now: 1,
-                })
-                .unwrap();
-            let request = ThreadTurnRequest::new("reject invalid goal update")
-                .with_tool_mode(ThreadTurnToolMode::Goal)
-                .with_continuation(tool_continuation(tool_types::ToolRequest {
-                    id: "goal-update-invalid".to_string(),
-                    name: tool_types::ToolName::UpdateGoal,
-                    action: ActionKind::Read,
-                    target: None,
-                    raw_arguments: Some(r#"{"status":"paused"}"#.to_string()),
-                }));
-
-            let status = thread
-                .run_request(&config, &request, Vec::new())
-                .expect("run invalid goal update");
-            let messages = &thread.session().conversation().messages;
-            let result_index = messages
+                .project_thread_goal(&session_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            orca_core::goal_types::ThreadGoalStatus::Active
+        );
+        assert!(
+            messages[result_index + 1..]
                 .iter()
-                .position(|message| {
-                    matches!(
-                        message,
-                        Message::Tool {
-                            tool_call_id,
-                            terminal: Some(terminal),
-                            ..
-                        } if tool_call_id == "goal-update-invalid"
-                            && terminal.status == tool_types::ToolStatus::Failed
-                    )
-                })
-                .expect("failed goal tool result");
-
-            assert_eq!(status, RunStatus::Success);
-            assert_eq!(
-                store
-                    .project_thread_goal(&session_id)
-                    .unwrap()
-                    .unwrap()
-                    .status,
-                orca_core::goal_types::ThreadGoalStatus::Active
-            );
-            assert!(
-                messages[result_index + 1..]
-                    .iter()
-                    .any(|message| matches!(message, Message::Assistant { .. })),
-                "invalid goal arguments must allow another model sample: {messages:#?}"
-            );
-        });
+                .any(|message| matches!(message, Message::Assistant { .. })),
+            "invalid goal arguments must allow another model sample: {messages:#?}"
+        );
     }
 
     #[test]
     fn hosted_goal_tool_store_failure_stops_failed_turn() {
-        with_orca_home(|home| {
+        // The broken legacy goal fixture must be visible to the goal store
+        // through `ORCA_HOME` itself, so this test redirects the variable
+        // under the exclusive env lock. The turn executes on this thread, so
+        // the exclusive lock cannot deadlock any background host.
+        crate::history::with_redirected_orca_home("broken-goal-store", |home| {
             let mut config = config(SubagentConfig::default());
             config.history_mode = HistoryMode::Record;
             config.output_format = OutputFormat::Jsonl;

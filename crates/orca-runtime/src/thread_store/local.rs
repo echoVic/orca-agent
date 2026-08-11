@@ -12,6 +12,9 @@ use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::tool_types::truncate_output;
 use orca_platform::process::ProcessJob;
 
+use super::LiveThread;
+#[cfg(not(test))]
+use super::ORCA_HOME_ENV;
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
@@ -30,7 +33,6 @@ use super::writer::{
     read_history_lines, read_records, read_session_meta, read_transcript, read_transcript_until,
     rewrite_records_unlocked, write_durable_record,
 };
-use super::{LiveThread, ORCA_HOME_ENV};
 
 #[derive(Clone, Debug, Default)]
 pub struct JsonlThreadStore;
@@ -915,7 +917,14 @@ pub(crate) fn archive_dir() -> PathBuf {
 }
 
 pub(crate) fn orca_home() -> PathBuf {
-    std::env::var_os(ORCA_HOME_ENV)
+    // Under test, resolve through the thread-local per-test home override
+    // (host threads, then the calling test thread), falling back to the
+    // process-wide ORCA_HOME variable; the environment is never redirected.
+    #[cfg(test)]
+    let test_home = crate::history::read_test_orca_home();
+    #[cfg(not(test))]
+    let test_home = std::env::var_os(ORCA_HOME_ENV);
+    test_home
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
         .unwrap_or_else(|| std::env::temp_dir().join("orca"))

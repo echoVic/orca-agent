@@ -8,6 +8,7 @@
 //! The store is a small TOML file under the config dir (`ORCA_HOME` or
 //! `~/.orca`). Trust decisions are keyed by canonicalized absolute path.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,46 @@ use serde::{Deserialize, Serialize};
 
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 const TRUST_FILE: &str = "folder_trust.toml";
+
+// Test-support override machinery. The orca-runtime test harness installs
+// per-thread `ORCA_HOME` overrides here instead of mutating the environment
+// (the process-wide `ORCA_HOME` stays on the isolated test home), so a test
+// and the hosts it spawns resolve a private home while every other test
+// keeps resolving the process-wide one. Production code never installs
+// these; resolution mirrors `orca_runtime::history::read_test_orca_home`
+// (host override, then test override, then the environment).
+thread_local! {
+    static TEST_ORCA_HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static HOST_ORCA_HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+#[doc(hidden)]
+pub fn install_test_orca_home(home: Option<PathBuf>) {
+    TEST_ORCA_HOME.with(|cell| *cell.borrow_mut() = home);
+}
+
+#[doc(hidden)]
+pub fn install_host_orca_home(home: Option<PathBuf>) {
+    HOST_ORCA_HOME.with(|cell| *cell.borrow_mut() = home);
+}
+
+#[doc(hidden)]
+pub fn current_test_orca_home() -> Option<PathBuf> {
+    TEST_ORCA_HOME.with(|cell| cell.borrow().clone())
+}
+
+/// The effective per-thread override (host override first, then test
+/// override), as consulted by `config_dir` and the orca-runtime test harness.
+#[doc(hidden)]
+pub fn current_orca_home_override() -> Option<PathBuf> {
+    test_home_override()
+}
+
+fn test_home_override() -> Option<PathBuf> {
+    HOST_ORCA_HOME
+        .with(|cell| cell.borrow().clone())
+        .or_else(|| TEST_ORCA_HOME.with(|cell| cell.borrow().clone()))
+}
 
 /// Trust state for a single directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,10 +81,11 @@ struct TrustEntry {
 }
 
 /// Resolve the user-owned Orca configuration directory. Project-local files
-/// must never influence this location.
+/// must never influence this location. Under test, a per-thread override
+/// installed by the orca-runtime harness wins over the environment.
 pub fn config_dir() -> Option<PathBuf> {
-    std::env::var_os(ORCA_HOME_ENV)
-        .map(PathBuf::from)
+    test_home_override()
+        .or_else(|| std::env::var_os(ORCA_HOME_ENV).map(PathBuf::from))
         .or_else(|| dirs::home_dir().map(|h| h.join(".orca")))
 }
 

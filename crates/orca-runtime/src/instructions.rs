@@ -101,7 +101,11 @@ fn load_for_cwd_with_home(
 }
 
 fn orca_home() -> Option<PathBuf> {
-    std::env::var_os(ORCA_HOME_ENV)
+    #[cfg(test)]
+    let test_home = crate::history::read_test_orca_home();
+    #[cfg(not(test))]
+    let test_home = std::env::var_os(ORCA_HOME_ENV);
+    test_home
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))
 }

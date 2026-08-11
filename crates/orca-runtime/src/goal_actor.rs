@@ -3114,7 +3114,22 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap()
             .unwrap();
-        assert_eq!(handle.latest_active().unwrap(), None);
+        // The actor has finished the delayed command; poll until it reports
+        // an idle actor instead of racing its 20 ms request budget against
+        // the scheduler under heavy test parallelism.
+        let idle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match handle.latest_active() {
+                Ok(None) => break,
+                Ok(Some(_)) => panic!("goal actor reported an active goal after the delay"),
+                Err(GoalActorError::Timeout { .. })
+                    if std::time::Instant::now() < idle_deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("goal actor idle probe failed: {error:?}"),
+            }
+        }
 
         handle.shutdown().unwrap();
         join.join().unwrap();

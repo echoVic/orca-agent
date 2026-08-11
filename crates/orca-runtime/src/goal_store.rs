@@ -5497,9 +5497,16 @@ fn legacy_state(goal: &ThreadGoal) -> GoalState {
 }
 
 fn orca_home() -> PathBuf {
-    if let Ok(value) = std::env::var("ORCA_HOME")
-        && !value.trim().is_empty()
-    {
+    // Under test, resolve through the thread-local per-test home override
+    // (host threads, then the calling test thread), falling back to the
+    // process-wide ORCA_HOME variable; the environment is never redirected.
+    #[cfg(test)]
+    let test_home = crate::history::read_test_orca_home();
+    #[cfg(not(test))]
+    let test_home = std::env::var("ORCA_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    if let Some(value) = test_home {
         return PathBuf::from(value);
     }
     dirs::home_dir()
@@ -5513,7 +5520,6 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
 
     use orca_core::goal_runtime::{
         EvidenceItem, GoalPauseReason, GoalRequestedState, GoalRunId, GoalState, GoalTurnOrigin,

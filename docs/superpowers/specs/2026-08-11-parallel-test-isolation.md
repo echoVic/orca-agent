@@ -134,23 +134,73 @@ opener are unchanged. Test-support helper is `#[cfg(test)]` only.
 5. `cargo fmt --all -- --check` and `git diff --check` are clean.
 6. No new global mutex serializes the lib suite; parallel execution is still
    genuinely parallel (spot-check with `--test-threads=8` timing).
+7. `cargo test -p orca-runtime --lib --locked -- --test-threads=16` completes
+   without hangs on consecutive runs (previously a subset of `runtime_host`
+   surface tests stalled in an unbounded `wait_operation_terminal`).
 
-## Known Limit: High-Parallelism Test Hangs (Separate Slice)
+## Test-Environment Home Override Design (High-Parallelism Hang Fix)
 
-Under `cargo test --test-threads=16` a small set of `runtime_host` surface
-tests (`older_incomplete_background_completion_cannot_orphan_a_new_transfer`,
-`terminal_interactions_scrub_private_resident_state_before_waiter_wake`,
-`unavailable_responder_is_one_atomic_batch_and_append_failure_is_invisible`,
-and a few others) can stall in an unbounded `wait_operation_terminal`. This
-predates this slice: the v0.3.13 baseline shows the same stalls under the same
-command, while the CI profile (2 threads, retries) never triggers them.
+Under `cargo test --test-threads=16` a subset of `runtime_host` surface tests
+stalled in an unbounded `wait_operation_terminal` / `host.shutdown()`.
+Sample/lsof evidence showed the test thread parked in `wait_operation_terminal`
+recv while the host thread parked in tokio: the stall was a test-env lock
+deadlock, not host starvation. The deadlock chain:
 
-The root cause is a test-level unbounded wait on a background operation whose
-host thread is starved by high parallelism, not the goal-store or ORCA_HOME
-changes in this slice. A follow-up slice should (a) give the affected test
-helpers a bounded wait (e.g. `SURFACE_TEST_TIMEOUT`) so a stall becomes a
-visible failure, and (b) investigate the host-side starvation if the bounded
-wait still fires under high parallelism.
+1. `with_orca_home` (controller/session/server) redirected `ORCA_HOME` to a
+   per-test temp dir and held the **exclusive** test-env lock for the whole
+   closure.
+2. Server/`handle_line` and surface tests run their turns on background host
+   worker threads. Every `orca_home()` read in the test build went through
+   `read_test_orca_home()`, which took the shared **read** lock.
+3. A worker blocked on the read lock while the closure (holding the write
+   lock) waited for the worker's terminal → deadlock. The v0.3.13 baseline
+   shows the same stalls, so this predates the slice; the fix lands here.
+
+The redesign that removes the deadlock, the writer-preference starvation, and
+the cross-test home races:
+
+- `ORCA_HOME` is set **once** to a process-wide isolated home
+  (`isolated_test_orca_home_dir`, created once, never removed) and is
+  otherwise never mutated. All lib tests resolve the same live directory, so
+  session/goal/task data (keyed by session or task identity) coexists safely.
+- Per-test private homes are **thread-local overrides** installed in
+  `orca_core::config::folder_trust` (`install_test_orca_home` /
+  `install_host_orca_home`). `config_dir()`, `is_trusted()`, `orca_home()`
+  (all four runtime read points), and workflow-script resolution consult the
+  override first, so folder trust and workflow launch see the same private
+  home as sessions, goals, and task sessions — without ever mutating the
+  environment.
+- `with_orca_home` (controller/session/server) and
+  `with_redirected_orca_home` scope the calling thread's override
+  (`with_test_orca_home` / `redirect_test_orca_home` guard, panic-safe).
+  Hosts started inside such a scope capture the caller's override at
+  `RuntimeHost::start_inner` and install it on the supervisor thread, the
+  tokio worker threads, and the blocking pool (`Builder::on_thread_start`
+  covers blocking threads too), so a host keeps resolving its private home
+  for its whole lifetime while every other test resolves the process-wide
+  home.
+- `lock_test_env()` remains a plain mutex that serializes tests sharing
+  process-wide state (the session index, task registry index); home reads
+  never take it, so a test holding it while waiting for its own host threads
+  can never deadlock against them.
+- Tests that need a private home (surface goal tests, workflow fixtures,
+  sandbox/`handle_line` tests, the FIFO `session_listing` test, task registry
+  migrations) use never-removed unique subdirectories allocated by an atomic
+  counter (`isolated_test_orca_home_subdir`) or per-test temp dirs under the
+  redirect guard. This also removed `remove_var` poisons that left `ORCA_HOME`
+  unset (falling back to the real `~/.orca`) and temp-dir deletion races
+  where a concurrent reader resolved a deleted directory.
+- Global test injections that can cross tests are keyed by session
+  (`TYPED_PROVIDER_OUTCOME_WRITE_FAILURES`) so parallel tests never consume
+  each other's injection budget, and two load-sensitive tests now poll for
+  actor state instead of racing a 20 ms budget (`goal_actor_request_times_out_
+  with_typed_error`) or an immediate probe (`capability_loss_append_failure_
+  retries_under_sustained_command_traffic`).
+
+Remaining shared-state hotspots are serialized by the goal-store
+`initialize_schema_fenced` cross-process lock, the task-registry index lock,
+and the `lock_test_env` mutex; nothing holds the write side of any env lock
+across hosted work, and the environment variable is never redirected.
 
 ## Rollback And Deletion
 
