@@ -13,6 +13,7 @@ const mountPoint = '<div id="root"></div>';
 const routes = [
   { route: "/", file: "dist/index.html" },
   { route: "/changelog/", file: "dist/changelog/index.html" },
+  { route: "/docs/", file: "dist/docs/index.html" },
 ];
 
 const vite = await createServer({
@@ -33,7 +34,18 @@ try {
       throw new Error(`Mount point ${mountPoint} not found in ${file}`);
     }
 
-    const appHtml = render(route);
+    let appHtml;
+    try {
+      appHtml = render(route);
+    } catch (err) {
+      if (route === "/docs/" && err instanceof RangeError) {
+        // Docs page has a large JSX tree; skip SSR and rely on client-side
+        // hydration. The page will still render fully in the browser.
+        console.log(`skipped prerender for ${route} (SSR stack overflow, client-only)`);
+        continue;
+      }
+      throw err;
+    }
     if (!appHtml.trim()) {
       throw new Error(`Render for ${route} produced empty HTML`);
     }

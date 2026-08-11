@@ -5,19 +5,28 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build && node scripts/prerender.mjs",
+    "build": "tsc --noEmit && vite build && node --stack-size=8192 scripts/prerender.mjs",
     "prerender": "node scripts/prerender.mjs",
     "check:seo": "node scripts/check-seo.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mdx-js/react": "^3.1.1",
+    "@mdx-js/rollup": "^3.1.1",
     "@vitejs/plugin-react": "5.2.0",
+    "github-slugger": "^2.0.0",
+    "highlight.js": "^11.11.1",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1",
+    "remark-slug": "^7.0.1",
     "typescript": "^5.9.3",
     "vite": "7.3.5"
   },
   "devDependencies": {
+    "@mermaid-js/mermaid-cli": "^11.16.0",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2"
   },

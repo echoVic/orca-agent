@@ -1,0 +1,408 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# JSONL Output
+
+
+Orca emits structured JSONL (JSON Lines) event streams during `orca exec` sessions. Each line is a self-contained JSON object describing a single event. This page covers all event types, their schemas, and how to query them with `jq`.
+
+## Event Types
+
+### Complete Event Table
+
+| Event Type | Description | When Emitted |
+|-----------|-------------|-------------|
+| `session_start` | Session initialization | Once at the beginning |
+| `session_complete` | Session end (success, failure, or budget) | Once at the end |
+| `turn_start` | Beginning of an agent turn | Before each model call |
+| `turn_complete` | End of an agent turn | After each model call + tool execution |
+| `tool_call` | Agent requests a tool | When model emits a tool call |
+| `tool_result` | Tool execution completes | After each tool execution |
+| `approval_request` | Approval dialog needed | When approval is required |
+| `approval_resolved` | Approval decision made | After user approves/denies |
+| `context_compact` | Context compaction triggered | When context is compacted |
+| `verifier_start` | Verifier begins execution | Before verification command |
+| `verifier_complete` | Verifier finishes | After verification command |
+| `budget_warning` | Budget threshold reached | When 80% of budget used |
+| `budget_exhausted` | Budget fully consumed | When budget gates trigger |
+| `error` | Error event | On any error |
+| `model_info` | Model metadata | At session start |
+
+### Event Schemas
+
+#### `session_start`
+
+```json
+{
+  "type": "session_start",
+  "session_id": 42,
+  "timestamp": "2026-08-10T14:32:00Z",
+  "model": "deepseek-v4-flash",
+  "prompt": "Fix the failing test in src/auth/__tests__/login.test.ts",
+  "cwd": "/project/my-app",
+  "approval_mode": "auto-edit",
+  "max_turns": 50,
+  "max_cost_usd": 5.00
+}
+```
+
+#### `session_complete`
+
+```json
+{
+  "type": "session_complete",
+  "session_id": 42,
+  "timestamp": "2026-08-10T14:35:12Z",
+  "status": "success",
+  "exit_code": 0,
+  "total_turns": 15,
+  "total_tokens_input": 620000,
+  "total_tokens_output": 34000,
+  "total_cost_usd": 0.42,
+  "duration_ms": 192000,
+  "verifier_status": "passed",
+  "verifier_output": "Tests: 12 passed, 0 failed"
+}
+```
+
+#### `turn_start`
+
+```json
+{
+  "type": "turn_start",
+  "session_id": 42,
+  "turn": 5,
+  "timestamp": "2026-08-10T14:33:02Z",
+  "context_tokens": 412000
+}
+```
+
+#### `turn_complete`
+
+```json
+{
+  "type": "turn_complete",
+  "session_id": 42,
+  "turn": 5,
+  "timestamp": "2026-08-10T14:33:08Z",
+  "input_tokens": 412000,
+  "output_tokens": 12000,
+  "reasoning_tokens": 8500,
+  "tool_call_tokens": 1200,
+  "result_tokens": 2300,
+  "cache_hit_rate": 0.62,
+  "processing_time_ms": 6000,
+  "cost_usd": 0.09
+}
+```
+
+#### `tool_call`
+
+```json
+{
+  "type": "tool_call",
+  "session_id": 42,
+  "turn": 5,
+  "tool_name": "write_file",
+  "tool_id": "call_abc123",
+  "arguments": {
+    "path": "src/auth/login.ts",
+    "content": "..."
+  },
+  "timestamp": "2026-08-10T14:33:03Z"
+}
+```
+
+#### `tool_result`
+
+```json
+{
+  "type": "tool_result",
+  "session_id": 42,
+  "turn": 5,
+  "tool_id": "call_abc123",
+  "tool_name": "write_file",
+  "status": "success",
+  "timestamp": "2026-08-10T14:33:03Z",
+  "duration_ms": 45,
+  "result": {
+    "bytes_written": 2048,
+    "lines_added": 12,
+    "lines_removed": 3,
+    "file_created": false
+  }
+}
+```
+
+#### `verifier_complete`
+
+```json
+{
+  "type": "verifier_complete",
+  "session_id": 42,
+  "timestamp": "2026-08-10T14:35:10Z",
+  "command": "npm test",
+  "status": "passed",
+  "exit_code": 0,
+  "duration_ms": 45000,
+  "stdout": "Tests: 12 passed, 0 failed",
+  "stderr": "",
+  "error_output": null
+}
+```
+
+#### `budget_warning`
+
+```json
+{
+  "type": "budget_warning",
+  "session_id": 42,
+  "timestamp": "2026-08-10T14:34:30Z",
+  "budget_type": "cost",
+  "used_usd": 4.20,
+  "max_usd": 5.00,
+  "percent_used": 84.0,
+  "remaining_turns": 8
+}
+```
+
+#### `error`
+
+```json
+{
+  "type": "error",
+  "session_id": 42,
+  "turn": 5,
+  "timestamp": "2026-08-10T14:33:05Z",
+  "error_type": "api_rate_limit",
+  "message": "Rate limit exceeded. Retrying in 2s...",
+  "retry_count": 1,
+  "will_retry": true
+}
+```
+
+---
+
+## Output Configuration
+
+### Enabling JSONL
+
+JSONL output is enabled by default for `orca exec`:
+
+```bash
+# Default — JSONL on stdout
+orca exec "Fix the bug"
+
+# Write to file instead
+orca exec "Fix the bug" --output report.jsonl
+
+# Disable JSONL (silent mode)
+orca exec "Fix the bug" --no-jsonl
+
+# Both stdout and file
+orca exec "Fix the bug" --output report.jsonl --verbose
+```
+
+### Output Format
+
+Each line is a complete, parseable JSON object:
+
+```
+{"type":"session_start","session_id":42,...}
+{"type":"turn_start","session_id":42,"turn":1,...}
+{"type":"tool_call","session_id":42,"turn":1,"tool_name":"read_file",...}
+{"type":"tool_result","session_id":42,"turn":1,"tool_name":"read_file","status":"success",...}
+{"type":"turn_complete","session_id":42,"turn":1,...}
+...
+{"type":"session_complete","session_id":42,"status":"success",...}
+```
+
+---
+
+## jq Recipes
+
+### Cost Analysis
+
+#### Total Cost per Session
+
+```bash
+jq -r 'select(.type=="session_complete") | "Session \(.session_id): $\(.total_cost_usd)"' report.jsonl
+```
+
+#### Cost Per Turn
+
+```bash
+jq -r 'select(.type=="turn_complete") | "Turn \(.turn): $\(.cost_usd)"' report.jsonl
+```
+
+#### Average Cost Per Turn
+
+```bash
+jq -r '[.[] | select(.type=="turn_complete") | .cost_usd] | {total: add, avg: (add / length), max: max, min: min}' report.jsonl
+```
+
+#### Cost by Tool Type
+
+```bash
+jq -r '
+  [.[] | select(.type=="tool_result" and .status=="success")]
+  | group_by(.tool_name)
+  | map({tool: .[0].tool_name, count: length})
+  | sort_by(-.count)
+' report.jsonl
+```
+
+### Tool Call Analysis
+
+#### All Tool Calls
+
+```bash
+jq -r 'select(.type=="tool_call") | "\(.tool_name)()" | .arguments | fromjson | keys | join(", ")' report.jsonl
+```
+
+#### Tool Call Frequency
+
+```bash
+jq -r '[.[] | select(.type=="tool_call") | .tool_name] | group_by(.) | map({tool: .[0], count: length}) | sort_by(-.count)' report.jsonl
+```
+
+#### Failed Tool Calls
+
+```bash
+jq -r 'select(.type=="tool_result" and .status!="success") | "FAILED: \(.tool_name) — \(.result.error // "unknown")"' report.jsonl
+```
+
+#### Tool Call Timeline
+
+```bash
+jq -r 'select(.type=="tool_call") | "\(.timestamp) | Turn \(.turn) | \(.tool_name)"' report.jsonl
+```
+
+### Verifier Analysis
+
+#### Verifier Results
+
+```bash
+jq -r 'select(.type=="verifier_complete") | "Status: \(.status) | Exit: \(.exit_code) | Duration: \(.duration_ms)ms"' report.jsonl
+```
+
+#### Verifier Failures
+
+```bash
+jq -r 'select(.type=="verifier_complete" and .status!="passed") | "FAILED: \(.command)\nOutput: \(.error_output)"' report.jsonl
+```
+
+#### Verifier Output Summary
+
+```bash
+jq -r 'select(.type=="verifier_complete") | "\(.status | ascii_upcase): \(.command)"' report.jsonl
+```
+
+### Session Analysis
+
+#### Session Summary
+
+```bash
+jq -r '
+  [.[] | select(.type=="session_start" or .type=="session_complete")]
+  | {
+      id: .[0].session_id,
+      model: .[0].model,
+      prompt: .[0].prompt,
+      status: .[1].status,
+      turns: .[1].total_turns,
+      cost: "$\(.[1].total_cost_usd)",
+      duration: "\(.[1].duration_ms / 1000)s"
+    }
+' report.jsonl
+```
+
+#### Budget Usage
+
+```bash
+jq -r 'select(.type=="budget_warning" or .type=="budget_exhausted") | "\(.type): \(.budget_type) = \(.used_usd) / \(.max_usd)"' report.jsonl
+```
+
+#### Context Compaction Events
+
+```bash
+jq -r 'select(.type=="context_compact") | "Compaction: \(.turns_compacted) turns removed, \(.tokens_saved) tokens saved"' report.jsonl
+```
+
+#### Error Summary
+
+```bash
+jq -r '[.[] | select(.type=="error")] | group_by(.error_type) | map({type: .[0].error_type, count: length, message: .[0].message})' report.jsonl
+```
+
+---
+
+## Multi-Session Analysis
+
+### Combine Multiple Reports
+
+```bash
+# Combine all JSONL reports
+cat *.jsonl | jq -r 'select(.type=="session_complete") | "\(.status): $\(.total_cost_usd) | \(.total_turns) turns | \(.total_tokens_input + .total_tokens_output) tokens"'
+```
+
+### Aggregate Statistics
+
+```bash
+# Cost summary across all sessions
+cat *.jsonl | jq -r '
+  [.[] | select(.type=="session_complete")]
+  | {
+      total_sessions: length,
+      successful: [.[] | select(.status=="success")] | length,
+      failed: [.[] | select(.status!="success")] | length,
+      total_cost: (map(.total_cost_usd) | add),
+      total_turns: (map(.total_turns) | add),
+      avg_cost: (map(.total_cost_usd) | add / length)
+    }
+'
+```
+
+### Tool Usage Heatmap
+
+```bash
+# Find which tools are used most
+cat *.jsonl | jq -r '
+  [.[] | select(.type=="tool_call") | .tool_name]
+  | group_by(.)
+  | map({tool: .[0], count: length})
+  | sort_by(-.count)
+'
+```
+
+---
+
+## Integration with Monitoring Systems
+
+### Send Events to Elasticsearch
+
+```bash
+orca exec "Task" --output - | jq -c '.' | while read line; do
+  curl -XPOST localhost:9200/orca-events/_doc -d "$line"
+done
+```
+
+### Send to Grafana Loki
+
+```bash
+orca exec "Task" --output - | jq -c '{stream: {job: "orca"}, values: [[(.timestamp | sub("Z"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime * 1000), (. | tostring)]]}' | \
+  curl -XPOST localhost:3100/loki/api/v1/push -d @-
+```
+
+### Alert on Verifier Failures
+
+```bash
+orca exec "Task" --output report.jsonl
+
+if jq -e 'select(.type=="verifier_complete" and .status!="passed")' report.jsonl > /dev/null; then
+  echo "🚨 Verifier failed!"
+  jq -r 'select(.type=="verifier_complete") | "Output: \(.error_output)"' report.jsonl
+  # Send to Slack, PagerDuty, etc.
+fi
+```
+
+> **Tip:** JSONL events are designed for programmatic consumption. For human-readable output, use `orca sessions show` or the TUI's session history view.

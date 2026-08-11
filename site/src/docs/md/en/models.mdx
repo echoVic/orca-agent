@@ -1,0 +1,248 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# Models
+
+
+Orca supports DeepSeek's V4 model family with two variants optimized for different use cases. This page covers model selection, reasoning effort levels, and cost/speed tradeoffs.
+
+## Available Models
+
+### Model Comparison Table
+
+| Property | deepseek-v4-flash | deepseek-v4-pro |
+|----------|-------------------|-----------------|
+| **Primary use case** | Quick edits, search, simple refactors | Architecture, complex debugging, multi-file changes |
+| **Context window** | 1M tokens | 1M tokens |
+| **Max output tokens** | 8K | 8K |
+| **Reasoning** | Enabled (lighter) | Enabled (deeper) |
+| **Tool use** | Yes (all tools) | Yes (all tools) |
+| **Input cost** | ~$0.001 / 1K tokens | ~$0.004 / 1K tokens |
+| **Output cost** | ~$0.002 / 1K tokens | ~$0.010 / 1K tokens |
+| **Speed** | ~30 tok/s (reasoning) | ~15 tok/s (reasoning) |
+| **First token** | ~2s | ~4s |
+| **MMLU (benchmark)** | 78.2% | 85.7% |
+| **HumanEval (coding)** | 82.1% | 89.3% |
+| **SWE-Bench (agent)** | 52.4% | 64.8% |
+
+### When to Use Each Model
+
+
+<Tabs>
+<Tab label={"deepseek-v4-flash"}>
+
+
+Choose `deepseek-v4-flash` when:
+
+- **Editing existing code** — small to medium changes across 1–5 files
+- **Searching and understanding** — finding functions, tracing call paths, explaining code
+- **Running tests and fixings** — test-driven development with quick iteration
+- **Batch refactors** — applying consistent patterns across many files
+- **Scripting and automation** — `orca exec` in CI pipelines
+- **Quick prototyping** — scaffolding components, writing boilerplate
+
+```bash
+# Default behavior — flash model
+orca "Add a loading spinner to the dashboard"
+
+# Explicit flash
+orca --model deepseek-v4-flash "Fix the import order in all files"
+
+# Headless with flash
+orca exec "Add error boundaries to React components" --model deepseek-v4-flash
+```
+
+
+</Tab>
+<Tab label={"deepseek-v4-pro"}>
+
+
+Choose `deepseek-v4-pro` when:
+
+- **Architectural design** — designing systems, choosing patterns, planning migrations
+- **Complex debugging** — multi-step root cause analysis across many files
+- **Legacy code understanding** — navigating unfamiliar codebases with deep interdependencies
+- **Performance optimization** — identifying bottlenecks and proposing optimizations
+- **Security auditing** — analyzing code for vulnerabilities with deep reasoning
+- **Multi-file refactoring** — reorganizing project structure with many interdependent changes
+- **Test generation** — writing comprehensive test suites with edge case coverage
+- **Onboarding** — understanding a new codebase and generating documentation
+
+```bash
+# Pro model for complex debugging
+orca --model deepseek-v4-pro "Debug the race condition in the WebSocket reconnection logic"
+
+# Pro model for architecture
+orca --model deepseek-v4-pro "Design a migration strategy from REST to GraphQL for this codebase"
+
+# Pro with high reasoning effort
+orca --model deepseek-v4-pro --reasoning-effort high "Refactor the entire data layer to support multi-tenancy"
+```
+
+
+</Tab>
+</Tabs>
+
+### Decision Tree
+
+```
+Is the task:
+├── Simple / mechanical? (search, edit, format)
+│   └── deepseek-v4-flash
+├── Moderate complexity? (multi-file change, test writing)
+│   ├── < 10 files → deepseek-v4-flash
+│   └── > 10 files → deepseek-v4-pro
+├── Complex / creative? (architecture, debugging, design)
+│   └── deepseek-v4-pro
+└── Unsure?
+    └── Start with flash, upgrade to pro if the agent struggles
+```
+
+---
+
+## Reasoning Effort Levels
+
+Both V4 models support three reasoning effort levels that control how much thinking the model does before producing output.
+
+### Reasoning Effort Table
+
+| Level | Description | Use When | Relative Cost | Relative Speed |
+|-------|-------------|----------|---------------|----------------|
+| `low` | Minimal reasoning, fast responses | Search, simple edits, formatting | 0.5× | 2× faster |
+| `medium` | Balanced reasoning (default) | Most tasks | 1.0× | Baseline |
+| `high` | Deep reasoning, thorough analysis | Complex planning, debugging, architecture | 2.0× | 2× slower |
+
+### How Reasoning Works
+
+Reasoning is the model's internal chain-of-thought process:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Reasoning Process                          │
+│                                                             │
+│  Input:  [context + user message]                           │
+│                                                             │
+│  Model:  [reasoning tokens...]                              │
+│          "I need to find the login handler..."               │
+│          "It's in src/auth/login.ts..."                     │
+│          "I should check the test too..."                   │
+│          "Found it! Now I'll propose the fix."              │
+│                                                             │
+│  Output: [tool calls / text response]                       │
+│                                                             │
+│  ┌─────────┬──────────┬──────────┐                          │
+│  │   low   │  medium  │   high   │                          │
+│  │ ~50 tok │ ~200 tok │ ~500 tok │                          │
+│  └─────────┴──────────┴──────────┘                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Setting Reasoning Effort
+
+#### CLI Flag
+
+```bash
+# Low effort for quick search
+orca --reasoning-effort low "Find all instances of deprecated API"
+
+# Medium (default) for most tasks
+orca --reasoning-effort medium "Add caching to the API layer"
+
+# High effort for complex architecture
+orca --model deepseek-v4-pro --reasoning-effort high "Redesign the state management layer"
+```
+
+#### Config File
+
+```toml
+[agent]
+reasoning_effort = "medium"  # default for all sessions
+```
+
+#### Per-Turn via Slash Command
+
+Within the TUI, you can change reasoning mid-session:
+
+```
+/reasoning high
+```
+
+### Reasoning Cost Tradeoff
+
+| Effort Level | Example Task | Tokens Used | Cost (flash) | Cost (pro) | Time |
+|-------------|-------------|-------------|-------------|-----------|------|
+| `low` | Find file | 50K | $0.05 | $0.20 | 2s |
+| `medium` | Refactor 3 files | 200K | $0.20 | $0.80 | 8s |
+| `high` | Design system | 500K | $0.50 | $2.00 | 20s |
+
+> **Tip:** Start with `medium`. Use `low` for quick searches and `high` only when the task genuinely benefits from deep analysis. The model will still produce correct results at `low` effort — it just won't explore as many alternatives.
+
+---
+
+## Model Switching During Sessions
+
+You can switch models mid-session. Orca handles the transition gracefully:
+
+
+<Steps>
+<Step>
+
+The **current context** is preserved and sent to the new model
+
+</Step>
+<Step>
+
+The **reasoning effort** resets to the configured default for the new model
+
+</Step>
+<Step>
+
+**Token accounting** continues from the session's existing budget
+
+</Step>
+</Steps>
+
+
+```bash
+# In TUI, switch models with:
+/model deepseek-v4-pro
+# or
+/model deepseek-v4-flash
+```
+
+> **Note:** When switching models, the prefix cache breaks (different model = different cache key). The first turn after a switch will be slower as the context is processed fresh.
+
+---
+
+## Cost Optimization Tips
+
+### 1. Start with flash
+
+For 80% of tasks, `deepseek-v4-flash` is the right choice. Only upgrade to `pro` when you hit a complexity wall.
+
+### 2. Use reasoning effort strategically
+
+- `low` for search/navigation (50% cost savings)
+- `medium` for most tasks
+- `high` for architecture/debugging (2× cost, but better results)
+
+### 3. Leverage prefix cache
+
+Keep the same session running to benefit from caching. Starting a new session loses cache hits.
+
+### 4. Set budget gates
+
+```bash
+orca exec "Refactor the API" --max-cost 2.00 --max-turns 15
+```
+
+### 5. Use `orca exec` for batch tasks
+
+Headless execution avoids TUI overhead and is slightly faster per turn.
+
+### 6. Monitor cost in real-time
+
+The TUI shows cost per turn and total session cost:
+
+```
+Turn 5 cost: $0.08 | Session total: $0.42 | Budget: $10.00
+```

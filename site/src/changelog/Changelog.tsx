@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import {
-  type Locale,
-  type SeoEntry,
-  applySeoHead,
-  canonicalOrigin,
-  detectInitialLocale,
-  links,
-  localeStorageKey,
-  releaseVersion,
-  releases,
+    type Locale,
+    type SeoEntry,
+    applySeoHead,
+    canonicalOrigin,
+    detectInitialLocale,
+    links,
+    localeStorageKey,
+    releaseVersion,
+    releases,
 } from "../shared";
 
 const canonicalUrl = `${canonicalOrigin}/changelog/`;
@@ -43,6 +43,8 @@ const copy = {
     },
     nav: {
       home: "Home",
+      docs: "Docs",
+      changelog: "Changelog",
       install: "Install",
       github: "GitHub",
     },
@@ -553,6 +555,8 @@ const copy = {
     },
     nav: {
       home: "首页",
+      docs: "文档",
+      changelog: "更新日志",
       install: "安装",
       github: "GitHub",
     },
@@ -1076,6 +1080,7 @@ function Changelog() {
         <div className="nav-actions">
           <nav aria-label="Main navigation">
             <a href={links.home}>{t.nav.home}</a>
+            <a href={links.docs}>{t.nav.docs}</a>
             <a href={`${links.home}#install`}>{t.nav.install}</a>
             <a className="nav-cta" href={links.github} rel="noreferrer">
               {t.nav.github}

@@ -1,0 +1,385 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# Agent Loop
+
+
+Orca processes every user request through a structured seven-phase turn lifecycle. Understanding this loop helps you diagnose issues, tune performance, and get the most out of each interaction.
+
+## Turn Lifecycle
+
+Each "turn" in Orca is a complete cycle from user input to tool execution to result presentation. The phases execute sequentially within a single turn, with the loop repeating until the task is complete or a budget gate is hit.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Agent Turn Lifecycle                       │
+│                                                                 │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐          │
+│  │ 1. Context  │──▶│ 2. Provider │──▶│ 3. Tool     │          │
+│  │    Assembly │   │    Call     │   │   Dispatch  │          │
+│  └─────────────┘   └─────────────┘   └─────────────┘          │
+│         ▲                                 │                    │
+│         │                                 ▼                    │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐          │
+│  │ 6. Result   │◀──│ 5. Execution │◀──│ 4. Approval │          │
+│  │  Integration│   │  Settlement  │   │    Check    │          │
+│  └─────────────┘   └─────────────┘   └─────────────┘          │
+│         │                                 │                    │
+│         ▼                                 │                    │
+│  ┌─────────────┐                          │                    │
+│  │ 7. Turn     │◀─────────────────────────┘                    │
+│  │    Close    │                                               │
+│  └─────────────┘                                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+<div class="docs-diagram">
+
+![Orca Agent Turn Lifecycle — flowchart showing 7 phases with approval gate, cache check, and context compaction.](/docs-assets/diagram-agent-loop.svg)
+
+</div>
+
+### Phase 1: Context Assembly
+
+Before every model call, Orca assembles the full context window:
+
+
+<Steps>
+<Step>
+
+**System prompt** — fixed instructions defining the agent's personality, tool schema, and safety rules
+
+</Step>
+<Step>
+
+**Project context** — repository structure, key files, git status, and relevant code snippets
+
+</Step>
+<Step>
+
+**Recent conversation** — the last N turns of user/assistant exchange
+
+</Step>
+<Step>
+
+**Per-turn scratch** — intermediate results, tool outputs, and reasoning artifacts from the current turn
+
+</Step>
+</Steps>
+
+
+Orchestration:
+```text
+context = [system_prompt] + [project_context] + [recent_turns] + [current_turn_scratch]
+```
+
+The runtime also checks context size at this phase and triggers compaction if the window exceeds 85% of the 1M token limit.
+
+### Phase 2: Provider Call
+
+Orca sends the assembled context to the DeepSeek API with:
+
+- **Model ID** — from config or CLI flag
+- **Temperature** — controls output randomness
+- **Reasoning effort** — thinking depth (`low`, `medium`, `high`)
+- **Tool schema** — the set of available tools (file edit, shell, grep, glob, etc.)
+
+The model responds with a stream of:
+- **Reasoning tokens** — internal chain-of-thought (not shown to user by default)
+- **Tool calls** — structured requests to use tools
+- **Text responses** — natural language output
+
+### Phase 3: Tool Dispatch
+
+When the model emits tool calls, Orca's runtime:
+
+
+<Steps>
+<Step>
+
+**Validates** each call against the tool schema (correct arguments, valid paths, etc.)
+
+</Step>
+<Step>
+
+**Routes** calls to the appropriate tool handler (file system, shell, search, MCP)
+
+</Step>
+<Step>
+
+**Checks** safety rules (blocked commands, dangerous patterns)
+
+</Step>
+<Step>
+
+**Queues** calls for batch execution where possible
+
+</Step>
+</Steps>
+
+
+Orla supports **parallel tool execution** — if the model issues multiple independent tool calls, they execute concurrently.
+
+### Phase 4: Approval Check
+
+Before executing any tool call, Orca checks the approval policy:
+
+| Approval Mode | What gets checked |
+|---------------|-------------------|
+| `plan` | **Everything** — each tool call requires manual approval |
+| `suggest` | Shell commands, deletes, network calls |
+| `auto-edit` | Only destructive shell commands (`rm`, `curl`, etc.) |
+| `full-auto` | **Nothing** — all calls auto-approved |
+
+If approval is required:
+- The TUI displays an approval dialog with the command, affected files, and risk assessment
+- The agent **continues planning** while waiting — it can issue more tool calls or text responses
+- If the user denies, the tool call is marked as "denied" and the model is notified
+
+### Phase 5: Execution Settlement
+
+Once approved (or auto-approved), tools execute:
+
+
+<Steps>
+<Step>
+
+**File operations** — read, write, edit, move, delete
+
+</Step>
+<Step>
+
+**Shell commands** — run in a sandboxed subprocess with timeout
+
+</Step>
+<Step>
+
+**Search tools** — grep, glob, semantic code search
+
+</Step>
+<Step>
+
+**MCP tools** — calls to configured MCP servers
+
+</Step>
+</Steps>
+
+
+Each execution produces a **result object** containing:
+- `status`: `success` | `error` | `timeout`
+- `stdout` / `stderr`: command output
+- `artifacts`: list of changed files, created files, etc.
+- `duration_ms`: execution time
+
+### Phase 6: Result Integration
+
+Results are fed back into the context window for the next model call:
+
+
+<Steps>
+<Step>
+
+**Tool results** are appended to the conversation history
+
+</Step>
+<Step>
+
+**Status information** is highlighted (success = green, error = red)
+
+</Step>
+<Step>
+
+**File change events** are tracked for the project context
+
+</Step>
+<Step>
+
+**Safety violations** are logged and may trigger mode escalation
+
+</Step>
+</Steps>
+
+
+The model now sees the results of its tool calls and can decide on the next action.
+
+### Phase 7: Turn Close
+
+A turn closes when:
+
+- The model produces a **final text response** (no pending tool calls)
+- The user **interrupts** with a new message
+- A **budget gate** is hit (max turns, max cost, or timeout)
+- An **unrecoverable error** occurs
+
+At turn close:
+1. The full turn is **persisted** to the session database
+2. Token usage is **accounted** against budget gates
+3. The TUI updates to show the final state
+4. If in `orca exec` mode, the exit code is determined
+
+---
+
+## Cancellation and Ownership
+
+### Graceful Cancellation
+
+Users can cancel an in-progress turn with `Ctrl+C`. This triggers:
+
+
+<Steps>
+<Step>
+
+**Immediate** halt of any running shell commands
+
+</Step>
+<Step>
+
+**Preservation** of all completed tool results in the session
+
+</Step>
+<Step>
+
+**Context preservation** — the model can resume from the last state
+
+</Step>
+<Step>
+
+**Budget accounting** — tokens used so far are counted against the budget
+
+</Step>
+</Steps>
+
+
+### Ownership Model
+
+The **runtime owns execution**, not the model. This means:
+
+- The model **cannot** directly execute shell or write files — it only emits tool calls
+- The runtime **validates and gates** every action before execution
+- On cancellation, the runtime can safely halt all sub-processes
+- The model never sees raw shell output without runtime mediation
+
+This separation is critical for safety and enables features like:
+- Non-blocking approval dialogs
+- Parallel tool execution
+- Sandboxed shell access
+- Audit logging of all operations
+
+---
+
+## Retry and Error Recovery
+
+### Automatic Retries
+
+Orca automatically retries certain failures:
+
+| Error Type | Retry Behavior | Max Retries |
+|------------|---------------|-------------|
+| API rate limit | Exponential backoff | 3 |
+| API timeout | Linear backoff | 2 |
+| Transient network error | Immediate retry | 2 |
+| Tool execution timeout | Extend timeout by 50% | 1 |
+| File I/O error | Retry with fresh handle | 1 |
+
+### Error Escalation
+
+When automatic retries are exhausted:
+
+
+<Steps>
+<Step title={"**Non-critical errors** (e"}>
+
+g., a grep that found nothing) — the model sees the error and adapts its plan
+
+</Step>
+<Step title={"**Critical errors** (e"}>
+
+g., disk full, permission denied) — the turn enters a "blocked" state
+
+</Step>
+<Step>
+
+**The model** can propose workarounds or request user help
+
+</Step>
+<Step>
+
+**The user** can cancel, modify the approach, or fix the underlying issue
+
+</Step>
+</Steps>
+
+
+### Recovery Example
+
+```
+Model: [calls write_file("src/config/app.rs")]
+Runtime: Permission denied — src/config/ is read-only
+Runtime: [error: EACCES]
+
+Model: Let me try an alternative approach.
+Model: [calls shell("mkdir -p src/config && cp /tmp/app.rs src/config/app.rs")]
+Runtime: [success] → 0 bytes written
+```
+
+---
+
+## Context Compaction
+
+When the context window approaches the 1M token limit (typically at 85% threshold), Orca triggers **automatic compaction**:
+
+### Compaction Rules
+
+
+<Steps>
+<Step>
+
+**Keep system prompt** — always preserved
+
+</Step>
+<Step>
+
+**Keep project context** — latest file tree and key artifacts preserved
+
+</Step>
+<Step>
+
+**Keep recent turns** — last 10 turns preserved verbatim
+
+</Step>
+<Step>
+
+**Summarize older turns** — turns 11–20 are condensed into a summary
+
+</Step>
+<Step>
+
+**Discard scratch** — intermediate reasoning and duplicate tool results are removed
+
+</Step>
+<Step>
+
+**Preserve prefix cache** — the byte-aligned prefix is maintained for cache hits
+
+</Step>
+</Steps>
+
+
+### What Gets Compressed
+
+| Element | Compaction Strategy |
+|---------|-------------------|
+| Old user messages | Summarized into key points |
+| Old assistant responses | Summarized into decisions and actions |
+| Tool results | Only status and key output preserved |
+| Reasoning traces | Discarded entirely |
+| File contents | Latest version kept, older versions dropped |
+
+### Compaction Transparency
+
+Orca logs compaction events and shows a compacted-turn indicator in the TUI:
+
+```
+[compact] Turn 1-10 compressed (was 450K tokens, now 80K tokens)
+```
+
+> **Tip:** If you see frequent compactions, consider narrowing your task or starting a new session. Compaction preserves information but can reduce the model's ability to reference very early context.

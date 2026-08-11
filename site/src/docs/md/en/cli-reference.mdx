@@ -1,0 +1,174 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# CLI Reference
+
+
+Orca has two top-level commands: `orca` (interactive TUI) and `orca exec` (headless). This page documents every flag, exit code, and configuration precedence rule.
+
+## Commands Overview
+
+| Command | Purpose |
+|---------|---------|
+| `orca` | Launch the interactive terminal UI |
+| `orca exec <prompt>` | Run a headless one-shot session |
+| `orca config` | Inspect and modify configuration |
+| `orca doctor` | Run environment diagnostics |
+| `orca sessions` | List, resume, and manage sessions |
+
+---
+
+## `orca` (Interactive TUI)
+
+### Flags
+
+| Flag | Shorthand | Type | Default | Description |
+|------|-----------|------|---------|-------------|
+| `--model <name>` | `-m` | string | `deepseek-v4-flash` | Model ID to use |
+| `--approval <mode>` | `-a` | enum | `suggest` | Approval mode (`plan`, `suggest`, `auto-edit`, `full-auto`) |
+| `--max-turns <n>` | | int | `100` | Maximum turns per session |
+| `--max-cost <usd>` | | float | `10.00` | Maximum token cost in USD |
+| `--resume <id>` | `-r` | string | — | Resume an existing session by ID |
+| `--fork <spec>` | | string | — | Fork from a session checkpoint (`<session-id>:<turn-id>`) |
+| `--workflow <path>` | `-w` | string | — | Load a workflow YAML file |
+| `--goal <path>` | `-g` | string | — | Load a goal YAML file |
+| `--cwd <path>` | | string | `.` | Working directory for the agent |
+| `--temperature <n>` | | float | `0.7` | Sampling temperature (0.0–2.0) |
+| `--reasoning-effort <level>` | | enum | `medium` | Reasoning effort (`low`, `medium`, `high`) |
+| `--verbose` | `-v` | bool | `false` | Show debug logging |
+| `--version` | | bool | — | Print version and exit |
+| `--help` | `-h` | bool | — | Print help and exit |
+
+### Examples
+
+```bash
+# Start a new session in the current directory
+orca
+
+# Resume session 42 with high reasoning effort
+orca --resume 42 --reasoning-effort high
+
+# Fork from turn 17 of session 42, using pro model
+orca --fork 42:turn-17 --model deepseek-v4-pro
+
+# Run with full auto-approval (use with caution)
+orca --approval full-auto
+```
+
+---
+
+## `orca exec` (Headless)
+
+### Flags
+
+| Flag | Shorthand | Type | Default | Description |
+|------|-----------|------|---------|-------------|
+| `<prompt>` | | positional | **(required)** | Task description for the agent |
+| `--model <name>` | `-m` | string | `deepseek-v4-flash` | Model ID |
+| `--verifier <cmd>` | `-v` | string | — | Shell command to verify the result |
+| `--max-turns <n>` | | int | `50` | Maximum turns |
+| `--max-cost <usd>` | | float | `5.00` | Maximum cost |
+| `--approval <mode>` | `-a` | enum | `auto-edit` | Approval mode (headless defaults to `auto-edit`) |
+| `--output <path>` | `-o` | string | stdout | Write JSONL events to file |
+| `--jsonl` | | bool | `true` | Emit JSONL events on stdout |
+| `--temperature <n>` | | float | `0.7` | Sampling temperature |
+| `--reasoning-effort <level>` | | enum | `medium` | Reasoning effort |
+| `--cwd <path>` | | string | `.` | Working directory |
+| `--resume <id>` | `-r` | string | — | Resume an existing exec session |
+| `--help` | `-h` | bool | — | Print help |
+
+### Examples
+
+```bash
+# Simple one-shot
+orca exec "Add a dark mode toggle to the settings page"
+
+# With verifier
+orca exec \
+  "Fix all TypeScript errors in src/" \
+  --verifier "npx tsc --noEmit"
+
+# With budget and output file
+orca exec \
+  "Refactor the auth module to use JWT" \
+  --max-turns 25 \
+  --max-cost 4.00 \
+  --output ./reports/auth-refactor.jsonl
+```
+
+### `orca exec resume`
+
+Resume a previously failed or budget-exhausted exec session:
+
+```bash
+orca exec resume <session-id>
+
+# With overrides
+orca exec resume <session-id> --max-turns 10 --max-cost 2.00
+```
+
+---
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — agent completed the task and verifier passed (if set) |
+| `1` | General error — check stderr for details |
+| `2` | Budget exhausted — maximum turns or cost reached without completion |
+| `3` | Verifier failed — agent finished but the verification command returned non-zero |
+| `4` | Approval denied — user rejected a tool call in a non-interactive context |
+| `5` | Model error — API rate limit, invalid response, or provider outage |
+| `6` | Configuration error — missing API key, invalid model, etc. |
+| `7` | Session error — corrupted state, failed to load session |
+
+---
+
+## Configuration Priority
+
+Orca resolves configuration in this order (highest priority first):
+
+| Priority | Source | Example |
+|----------|--------|---------|
+| 1 (highest) | CLI flags | `--model deepseek-v4-pro` |
+| 2 | Environment variables | `ORCA_MODEL=deepseek-v4-pro` |
+| 3 | Project config (`.orca/config.toml`) | Per-project settings |
+| 4 | Global config (`~/.config/orca/config.toml`) | User defaults |
+| 5 (lowest) | Built-in defaults | Hardcoded fallback values |
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `DEEPSEEK_API_KEY` | API key for DeepSeek |
+| `ORCA_MODEL` | Default model ID |
+| `ORCA_APPROVAL` | Default approval mode |
+| `ORCA_MAX_TURNS` | Default max turns |
+| `ORCA_MAX_COST` | Default max cost |
+| `ORCA_CONFIG_PATH` | Override config file location |
+| `ORCA_LOG_LEVEL` | Logging level (`trace`, `debug`, `info`, `warn`, `error`) |
+
+---
+
+## `orca config` Subcommands
+
+| Command | Description |
+|---------|-------------|
+| `orca config show` | Display resolved configuration |
+| `orca config set <key> <value>` | Set a config value |
+| `orca config get <key>` | Get a config value |
+| `orca config unset <key>` | Remove a config key |
+| `orca config validate` | Validate configuration and report errors |
+| `orca config path` | Print the config file path |
+
+---
+
+## `orca sessions` Subcommands
+
+| Command | Description |
+|---------|-------------|
+| `orca sessions list` | List all sessions with IDs, status, and last activity |
+| `orca sessions show <id>` | Show session details (turns, tokens, cost) |
+| `orca sessions resume <id>` | Resume a session in TUI mode |
+| `orca sessions fork <id>:<turn>` | Fork from a specific turn |
+| `orca sessions delete <id>` | Permanently delete a session |
+| `orca sessions export <id>` | Export session as JSON |

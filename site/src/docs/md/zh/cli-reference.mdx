@@ -1,0 +1,174 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# CLI 参考
+
+
+Orca 有两个顶级命令：`orca`（交互式 TUI）和 `orca exec`（无头模式）。本页记录了所有标志、退出码和配置优先级规则。
+
+## 命令概览
+
+| 命令 | 用途 |
+|------|------|
+| `orca` | 启动交互式终端界面 |
+| `orca exec <prompt>` | 运行无头单次会话 |
+| `orca config` | 检查和修改配置 |
+| `orca doctor` | 运行环境诊断 |
+| `orca sessions` | 列出、恢复和管理会话 |
+
+---
+
+## `orca`（交互式 TUI）
+
+### 标志
+
+| 标志 | 缩写 | 类型 | 默认值 | 描述 |
+|------|------|------|--------|------|
+| `--model <name>` | `-m` | string | `deepseek-v4-flash` | 使用的模型 ID |
+| `--approval <mode>` | `-a` | enum | `suggest` | 审批模式（`plan`、`suggest`、`auto-edit`、`full-auto`） |
+| `--max-turns <n>` | | int | `100` | 每次会话最大回合数 |
+| `--max-cost <usd>` | | float | `10.00` | 最大 token 费用（美元） |
+| `--resume <id>` | `-r` | string | — | 按 ID 恢复现有会话 |
+| `--fork <spec>` | | string | — | 从会话检查点分叉（`<session-id>:<turn-id>`） |
+| `--workflow <path>` | `-w` | string | — | 加载工作流 YAML 文件 |
+| `--goal <path>` | `-g` | string | — | 加载目标 YAML 文件 |
+| `--cwd <path>` | | string | `.` | 智能体的工作目录 |
+| `--temperature <n>` | | float | `0.7` | 采样温度（0.0–2.0） |
+| `--reasoning-effort <level>` | | enum | `medium` | 推理努力（`low`、`medium`、`high`） |
+| `--verbose` | `-v` | bool | `false` | 显示调试日志 |
+| `--version` | | bool | — | 打印版本并退出 |
+| `--help` | `-h` | bool | — | 打印帮助并退出 |
+
+### 示例
+
+```bash
+# 在当前目录启动新会话
+orca
+
+# 以高推理努力恢复会话 42
+orca --resume 42 --reasoning-effort high
+
+# 使用 pro 模型从回合 17 分叉
+orca --fork 42:turn-17 --model deepseek-v4-pro
+
+# 以完全自动审批模式运行（谨慎使用）
+orca --approval full-auto
+```
+
+---
+
+## `orca exec`（无头模式）
+
+### 标志
+
+| 标志 | 缩写 | 类型 | 默认值 | 描述 |
+|------|------|------|--------|------|
+| `<prompt>` | | positional | **（必填）** | 智能体的任务描述 |
+| `--model <name>` | `-m` | string | `deepseek-v4-flash` | 模型 ID |
+| `--verifier <cmd>` | `-v` | string | — | 用于验证结果的 Shell 命令 |
+| `--max-turns <n>` | | int | `50` | 最大回合数 |
+| `--max-cost <usd>` | | float | `5.00` | 最大费用 |
+| `--approval <mode>` | `-a` | enum | `auto-edit` | 审批模式（无头模式默认为 `auto-edit`） |
+| `--output <path>` | `-o` | string | stdout | 将 JSONL 事件写入文件 |
+| `--jsonl` | | bool | `true` | 在标准输出上发出 JSONL 事件 |
+| `--temperature <n>` | | float | `0.7` | 采样温度 |
+| `--reasoning-effort <level>` | | enum | `medium` | 推理努力 |
+| `--cwd <path>` | | string | `.` | 工作目录 |
+| `--resume <id>` | `-r` | string | — | 恢复现有 exec 会话 |
+| `--help` | `-h` | bool | — | 打印帮助 |
+
+### 示例
+
+```bash
+# 简单单次执行
+orca exec "给设置页面添加深色模式切换"
+
+# 带验证器
+orca exec \
+  "修复 src/ 中所有 TypeScript 错误" \
+  --verifier "npx tsc --noEmit"
+
+# 带预算和输出文件
+orca exec \
+  "重构认证模块以使用 JWT" \
+  --max-turns 25 \
+  --max-cost 4.00 \
+  --output ./reports/auth-refactor.jsonl
+```
+
+### `orca exec resume`
+
+恢复之前失败或预算耗尽的 exec 会话：
+
+```bash
+orca exec resume <session-id>
+
+# 带覆盖参数
+orca exec resume <session-id> --max-turns 10 --max-cost 2.00
+```
+
+---
+
+## 退出码
+
+| 代码 | 含义 |
+|------|------|
+| `0` | 成功——智能体完成任务且验证器通过（如已设置） |
+| `1` | 通用错误——查看 stderr 了解详情 |
+| `2` | 预算耗尽——达到最大回合数或费用但未完成 |
+| `3` | 验证器失败——智能体完成但验证命令返回非零 |
+| `4` | 审批被拒绝——在非交互上下文中用户拒绝了工具调用 |
+| `5` | 模型错误——API 速率限制、无效响应或提供商服务中断 |
+| `6` | 配置错误——缺少 API 密钥、模型无效等 |
+| `7` | 会话错误——状态损坏、加载会话失败 |
+
+---
+
+## 配置优先级
+
+Orca 按以下顺序解析配置（优先级从高到低）：
+
+| 优先级 | 来源 | 示例 |
+|--------|------|------|
+| 1（最高） | CLI 标志 | `--model deepseek-v4-pro` |
+| 2 | 环境变量 | `ORCA_MODEL=deepseek-v4-pro` |
+| 3 | 项目配置（`.orca/config.toml`） | 项目级设置 |
+| 4 | 全局配置（`~/.config/orca/config.toml`） | 用户默认值 |
+| 5（最低） | 内置默认值 | 硬编码的回退值 |
+
+### 环境变量
+
+| 变量 | 描述 |
+|------|------|
+| `DEEPSEEK_API_KEY` | DeepSeek 的 API 密钥 |
+| `ORCA_MODEL` | 默认模型 ID |
+| `ORCA_APPROVAL` | 默认审批模式 |
+| `ORCA_MAX_TURNS` | 默认最大回合数 |
+| `ORCA_MAX_COST` | 默认最大费用 |
+| `ORCA_CONFIG_PATH` | 覆盖配置文件位置 |
+| `ORCA_LOG_LEVEL` | 日志级别（`trace`、`debug`、`info`、`warn`、`error`） |
+
+---
+
+## `orca config` 子命令
+
+| 命令 | 描述 |
+|------|------|
+| `orca config show` | 显示已解析的配置 |
+| `orca config set <key> <value>` | 设置配置值 |
+| `orca config get <key>` | 获取配置值 |
+| `orca config unset <key>` | 移除配置键 |
+| `orca config validate` | 验证配置并报告错误 |
+| `orca config path` | 打印配置文件路径 |
+
+---
+
+## `orca sessions` 子命令
+
+| 命令 | 描述 |
+|------|------|
+| `orca sessions list` | 列出所有会话，包括 ID、状态和最后活动时间 |
+| `orca sessions show <id>` | 显示会话详情（回合数、token、费用） |
+| `orca sessions resume <id>` | 以 TUI 模式恢复会话 |
+| `orca sessions fork <id>:<turn>` | 从特定回合分叉 |
+| `orca sessions delete <id>` | 永久删除会话 |
+| `orca sessions export <id>` | 将会话导出为 JSON |

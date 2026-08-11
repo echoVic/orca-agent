@@ -1,0 +1,321 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# orca exec resume
+
+
+When an `orca exec` session ends without completing — due to budget exhaustion, verifier failure, or other interruptions — `orca exec resume` lets you pick up where you left off. This page covers when to resume, how the resume syntax works, and how budget checkpoints operate.
+
+## When to Resume
+
+### Budget Exhaustion
+
+The most common resume scenario. The agent ran out of turns or cost before completing the task.
+
+```bash
+# First run — budget exhausted
+orca exec "Migrate the entire codebase to TypeScript" --max-turns 30
+
+# Output:
+# Turn 30: Budget exhausted (30/30 turns used)
+# Status: PARTIAL — 12/47 files converted
+# Exit code: 2
+
+# Resume with extended budget
+orca exec resume <session-id> --max-turns 30 --max-cost 5.00
+
+# Output:
+# Resuming session 42 (partial)
+# Progress: 12/47 files converted
+# Continuing from turn 31...
+```
+
+### Verifier Failed
+
+The agent completed its work but the verification command returned non-zero.
+
+```bash
+# First run — verifier failed
+orca exec "Fix the authentication module" --verifier "npm test"
+
+# Output:
+# Agent completed work (15 turns)
+# Verifier: npm test → 3 tests failing
+# Exit code: 3
+
+# Resume — the agent will see the test failures and fix them
+orca exec resume <session-id>
+
+# Output:
+# Resuming session 43 (verifier failed)
+# The agent sees the test output and tries to fix the remaining failures
+```
+
+### Incremental Tasks
+
+Break large tasks into smaller, resumable chunks.
+
+```bash
+# Phase 1
+orca exec "Convert src/auth/ to TypeScript" --verifier "npx tsc --noEmit"
+
+# Phase 2
+orca exec resume <session-id> --prompt "Now convert src/api/"
+
+# Phase 3
+orca exec resume <session-id> --prompt "Now convert src/utils/"
+```
+
+---
+
+## Resume Syntax
+
+### Basic Resume
+
+```bash
+orca exec resume <session-id>
+```
+
+### Resume with Overrides
+
+```bash
+# Override budget
+orca exec resume <session-id> --max-turns 20 --max-cost 3.00
+
+# Override model
+orca exec resume <session-id> --model deepseek-v4-pro
+
+# Override verifier
+orca exec resume <session-id> --verifier "npm run test:ci"
+
+# Provide new instructions
+orca exec resume <session-id> --prompt "Also fix the edge case in the token refresh logic"
+```
+
+### Resume from a Checkpoint
+
+```bash
+# Resume from a specific turn (not just the last one)
+orca exec resume <session-id>:turn-17
+
+# Resume with a new prompt from checkpoint
+orca exec resume <session-id>:turn-17 --prompt "Try an alternative approach"
+```
+
+### Resume Options
+
+| Option | Description |
+|--------|-------------|
+| `--max-turns` | Override max turns for the resumed session |
+| `--max-cost` | Override max cost |
+| `--model` | Switch models for the resumed session |
+| `--verifier` | Set or change the verifier command |
+| `--prompt` | Add new instructions (appended to existing context) |
+| `--reasoning-effort` | Change reasoning effort |
+| `--output` | Specify output file for JSONL events |
+
+---
+
+## Budget Checkpoints
+
+### How Budget is Tracked
+
+Orca tracks budget as a cumulative counter across all resume operations:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Budget Checkpoint System                       │
+│                                                                 │
+│  Run 1:  max_turns=30, max_cost=$5.00                          │
+│          Used: 25 turns, $4.20                                  │
+│          Status: BUDGET EXHAUSTED                              │
+│                                                                 │
+│  Budget checkpoint:                                             │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Session ID: 42                                         │    │
+│  │  Turns used: 25                                         │    │
+│  │  Cost used: $4.20                                       │    │
+│  │  Files changed: 12                                      │    │
+│  │  Last turn ID: 25                                       │    │
+│  │  Verifier status: not run (budget exhausted)            │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  Resume 1: max_turns=30, max_cost=$5.00 (NEW BUDGET)           │
+│           Used: 15 turns, $2.10                                │
+│           Status: COMPLETE + VERIFIER PASSED                   │
+│                                                                 │
+│  Final budget:                                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Total turns: 25 + 15 = 40                             │    │
+│  │  Total cost: $4.20 + $2.10 = $6.30                     │    │
+│  │  Note: Each resume gets its OWN budget, not a shared    │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Budget Calculation
+
+Each `orca exec resume` call gets its **own independent budget**:
+
+```
+Total Cost = Σ (cost of each run)
+Total Turns = Σ (turns of each run)
+```
+
+The budget doesn't carry over — each resume starts fresh with the new budget limits.
+
+### Setting Cumulative Budget
+
+To enforce a total budget across all resume operations, use the `--total-budget` flag:
+
+```bash
+# First run
+orca exec "Refactor the data layer" \
+  --max-turns 30 \
+  --max-cost 5.00 \
+  --total-max-cost 10.00 \  # Cumulative budget across all resumes
+  --total-max-turns 80
+
+# Resume — the cumulative budget is enforced
+orca exec resume <session-id>
+# The agent can use up to $10 and 80 turns TOTAL across all runs
+```
+
+### Budget Exceeded Across Resumes
+
+If the cumulative budget is exceeded:
+
+```bash
+# After 3 resumes, total cost reaches $10.00
+orca exec resume <session-id>
+# Output:
+# Cumulative budget exceeded: $10.00 / $10.00
+# No more budget available for this session
+# Final status: PARTIAL — 35/47 files converted
+```
+
+---
+
+## Resume Workflow Patterns
+
+### Pattern 1: Progressive Refactoring
+
+```bash
+# Start with the most critical files
+orca exec "Refactor src/auth/ to use async/await" --verifier "npm test -- auth"
+
+# Resume for the next batch
+orca exec resume <id> --prompt "Now refactor src/api/" --verifier "npm test -- api"
+
+# Resume for the final batch
+orca exec resume <id> --prompt "Now refactor src/data/" --verifier "npm test -- data"
+
+# Final verification
+orca exec resume <id> --prompt "Run the full test suite" --verifier "npm test"
+```
+
+### Pattern 2: Fix and Verify Loop
+
+```bash
+# Initial fix
+orca exec "Fix all TypeScript errors" --verifier "npx tsc --noEmit"
+
+# If verifier fails, resume to fix remaining errors
+orca exec resume <id>
+# Agent sees the TypeScript errors and fixes them
+# Verifier runs again
+```
+
+### Pattern 3: Budget-Sized Chunks
+
+```bash
+# Process one module at a time
+for module in auth api data utils ui; do
+  orca exec "Add unit tests to src/$module/" \
+    --max-turns 10 \
+    --max-cost 1.00 \
+    --verifier "npm test -- $module"
+done
+
+# Then cross-reference for integration issues
+orca exec "Check for integration issues between auth, api, and data modules"
+```
+
+### Pattern 4: Long-Running CI Pipeline
+
+```bash
+#!/usr/bin/env bash
+# Full pipeline with resume support
+
+SESSION_FILE=".orca-session-id"
+
+if [ -f "$SESSION_FILE" ]; then
+  echo "Resuming previous session..."
+  orca exec resume "$(cat "$SESSION_FILE")" \
+    --max-turns 20 \
+    --max-cost 3.00 \
+    --verifier "npm run ci"
+else
+  echo "Starting new session..."
+  orca exec "Full automated code review and fix" \
+    --max-turns 30 \
+    --max-cost 5.00 \
+    --verifier "npm run ci" \
+    --output orca-report.jsonl
+  echo $? > "$SESSION_FILE"
+fi
+
+# Clean up on success
+if [ $? -eq 0 ]; then
+  rm -f "$SESSION_FILE"
+fi
+```
+
+---
+
+## Troubleshooting Resume
+
+### Resume Fails with "Session Not Found"
+
+```bash
+# List available sessions
+orca sessions list
+
+# Find the correct session ID
+# Use the session ID from the previous run's output
+```
+
+### Resume Starts Fresh Instead of Continuing
+
+This can happen if:
+- The session database was corrupted
+- The context was compacted too aggressively
+- The model was changed (cache reset)
+
+Solution:
+```bash
+# Fork from a specific checkpoint
+orca exec resume <id>:turn-20 --prompt "Continue from this point"
+```
+
+### Verifier Not Re-running on Resume
+
+By default, the verifier runs after each resume. To skip it:
+
+```bash
+orca exec resume <id> --no-verifier
+```
+
+### Checking Resume History
+
+```bash
+orca sessions show <id>
+
+# Output:
+# Session: 42
+# Runs: 3
+#   Run 1: turns 1-30, $2.14, status: BUDGET_EXHAUSTED
+#   Run 2: turns 31-45, $1.50, status: VERIFIER_FAILED
+#   Run 3: turns 46-60, $1.20, status: SUCCESS
+# Total: 60 turns, $4.84
+```

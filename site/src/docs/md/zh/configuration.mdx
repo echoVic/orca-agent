@@ -1,0 +1,254 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# 配置说明
+
+
+Orca 使用分层配置系统，支持 TOML 文件、环境变量和 CLI 标志。本页涵盖所有可配置选项及示例。
+
+## 配置文件位置
+
+Orca 按以下顺序在这些位置查找配置：
+
+1. **项目级**：当前工作目录中的 `.orca/config.toml`
+2. **全局**：`~/.config/orca/config.toml`（Windows 上为 `%APPDATA%/orca/config.toml`）
+
+使用 `orca config path` 查看解析后的路径。
+
+---
+
+## TOML 参考
+
+### 完整示例
+
+```toml
+# ~/.config/orca/config.toml
+
+[api]
+key = "sk-xxxxxxxxxxxxxxxxxxxx"
+base_url = "https://api.deepseek.com/v1"
+timeout_seconds = 60
+max_retries = 3
+
+[model]
+default = "deepseek-v4-flash"
+# 按任务选择模型
+# flash 用于快速编辑，pro 用于复杂规划
+
+[approval]
+mode = "suggest"           # plan | suggest | auto-edit | full-auto
+require_confirmation_for = ["delete", "rm", "curl"]
+trust_folders = [
+    "src/components/ui",    # 自动批准此文件夹中的编辑
+    "src/utils",
+]
+
+[agent]
+max_turns = 100
+max_cost_usd = 10.00
+temperature = 0.7
+reasoning_effort = "medium"
+context_compaction_threshold = 0.85  # 上下文达到 85% 时压缩
+
+[safety]
+block_commands = [
+    "rm -rf /",
+    "sudo ",
+    "> /dev/sda",
+]
+allowlist_mode = false
+allowlist_commands = []
+
+[mcp]
+enabled = true
+
+# MCP 服务器配置
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+env = {}
+
+[[mcp.servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
+
+[output]
+jsonl = true
+event_log_path = "~/.local/share/orca/events"
+max_events_per_session = 10000
+
+[session]
+storage_path = "~/.local/share/orca/sessions"
+max_sessions = 50
+auto_resume_last = false
+```
+
+---
+
+## 模型默认值
+
+| 设置 | 默认值 | 描述 |
+|------|--------|------|
+| `model.default` | `deepseek-v4-flash` | 未提供 `--model` 标志时使用的模型 |
+| `model.temperature` | `0.7` | 控制随机性。越低越确定性，越高越有创造性 |
+| `model.reasoning_effort` | `medium` | 思考深度。`low` 用于快速任务，`high` 用于复杂规划 |
+
+### 模型选择指南
+
+| 模型 | 适用场景 | 费用 | 速度 |
+|------|----------|------|------|
+| `deepseek-v4-flash` | 快速编辑、搜索、简单重构 | 低（约 $0.001/1K tokens） | 快（约 30 tok/s） |
+| `deepseek-v4-pro` | 架构设计、复杂调试、多文件变更 | 中（约 $0.004/1K tokens） | 中（约 15 tok/s） |
+
+> **提示：** 大多数任务从 `deepseek-v4-flash` 开始。当智能体需要跨文件推理或设计新系统时切换到 `deepseek-v4-pro`。
+
+---
+
+## 审批默认值
+
+### 审批模式
+
+<Callout type="info">
+
+| 模式 | 行为 | |------|------| | `plan` | 智能体仅生成计划——从不执行工具。你手动批准每个步骤。 | | `suggest` | 智能体建议工具调用。你在执行前批准。（TUI 默认） | | `auto-edit` | 智能体自动批准文件编辑和读取。Shell 命令需要批准。（exec 默认） | | `full-auto` | 智能体自主执行所有操作。仅在可信环境中使用。 |
+
+</Callout>
+
+### 配置审批
+
+```toml
+[approval]
+mode = "suggest"
+
+# 要求对这些命令模式进行显式批准
+require_confirmation_for = ["delete", "rm ", "curl ", "wget"]
+
+# 自动批准这些文件夹内的所有编辑
+trust_folders = [
+    "src/components/",
+    "src/utils/",
+]
+```
+
+---
+
+## 安全设置
+
+Orca 的安全层在执行之前拦截工具调用。根据你的风险承受能力进行配置。
+
+```toml
+[safety]
+# 阻止匹配这些模式的命令（正则表达式）
+block_commands = [
+    "rm -rf /",
+    "sudo ",
+    "mkfs",
+    "dd if=",
+    "> /dev/sd",
+]
+
+# 启用白名单模式：仅允许列出的命令
+allowlist_mode = false
+allowlist_commands = []
+```
+
+> **注意：** 安全规则使用完整命令字符串的子串匹配。请具体指定以避免误报。
+
+---
+
+## MCP 服务器配置
+
+配置 MCP（模型上下文协议）服务器，让 Orca 能够访问外部工具和数据源。
+
+### 示例：Filesystem MCP
+
+```toml
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = [
+    "-y",
+    "@modelcontextprotocol/server-filesystem",
+    "/absolute/path/to/your/project"
+]
+```
+
+### 示例：带环境变量的自定义 MCP 服务器
+
+```toml
+[[mcp.servers]]
+name = "internal-docs"
+command = "node"
+args = ["/path/to/mcp-server/build/index.js"]
+env = {
+    API_KEY = "${MY_API_KEY}",
+    ENDPOINT = "https://docs.internal.corp"
+}
+```
+
+### 示例：多个服务器
+
+```toml
+[[mcp.servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
+
+[[mcp.servers]]
+name = "postgres"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-postgres", "postgresql://user:pass@localhost:5432/mydb"]
+
+[[mcp.servers]]
+name = "slack"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-slack"]
+env = { SLACK_BOT_TOKEN = "${SLACK_BOT_TOKEN}" }
+```
+
+### MCP 设置
+
+```toml
+[mcp]
+enabled = true
+connection_timeout_ms = 5000
+max_servers = 10
+health_check_interval_s = 60
+```
+
+---
+
+## 验证和检查命令
+
+| 命令 | 描述 |
+|------|------|
+| `orca config show` | 显示完全解析的配置及来源 |
+| `orca config validate` | 检查错误、缺失值和类型不匹配 |
+| `orca config get <key>` | 打印单个配置值（例如 `orca config get model.default`） |
+| `orca config set <key> <value>` | 设置值（例如 `orca config set approval.mode auto-edit`） |
+| `orca doctor` | 完整环境诊断，包括网络、API 和 MCP 健康状况 |
+
+### `orca config show` 输出示例
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  配置来源解析                                                    │
+├──────────────────────────────────────────────────────────────────┤
+│  model.default                                                    │
+│    cli:     (未设置)                                              │
+│    env:     (未设置)                                              │
+│    project: (未设置)                                              │
+│    global:  deepseek-v4-flash  ← 激活                           │
+│    builtin: deepseek-v4-flash                                     │
+│                                                                   │
+│  approval.mode                                                    │
+│    cli:     (未设置)                                              │
+│    env:     (未设置)                                              │
+│    project: suggest  ← 激活  (.orca/config.toml)                 │
+│    global:  suggest                                               │
+│    builtin: suggest                                               │
+└──────────────────────────────────────────────────────────────────┘
+```

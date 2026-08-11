@@ -1,0 +1,125 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# Overview
+
+
+Orca is a **DeepSeek-native terminal coding agent** built from the ground up in Rust. Unlike wrapper agents that layer on top of generic chat interfaces, Orca is designed end-to-end for code: its prompts, tool protocol, interaction model, and state management are all purpose-built for software engineering tasks.
+
+## What is Orca?
+
+Orca is a terminal-based agent that understands your codebase, plans multi-step changes, executes tools, and verifies results — all through a single Rust binary. It speaks DeepSeek's native tool-use protocol, giving it direct access to file operations, shell execution, search, and structured reasoning without intermediate abstractions.
+
+Orca ships in three interaction surfaces:
+
+| Surface | Description | Best For |
+|---------|-------------|----------|
+| **TUI** | Full-screen terminal UI with chat, file tree, and approval dialogs | Interactive development sessions |
+| **Headless CLI** | Non-interactive `orca exec` command for scripting and CI | Automated pipelines, batch refactors |
+| **External protocols** | MCP server, JSONL event streaming, and programmatic APIs | Toolchain integration, custom frontends |
+
+## Key Architectural Decisions
+
+### DeepSeek-native prompts
+
+Orca uses DeepSeek's native tool-use schema rather than a generic function-calling wrapper. This means:
+
+- The model sees a tool set designed specifically for coding (file editing, shell, grep, glob, diagnostics)
+- Tool calls are streamed incrementally — the model can issue multiple tool calls in a single reasoning turn
+- The system prompt and tool descriptions are optimized for DeepSeek's reasoning strengths
+
+### Single Rust binary
+
+Orca compiles to a single ~15MB statically-linked binary. There is no runtime to install, no Python virtual environment, no Node.js dependency. This makes deployment trivial:
+
+```bash
+# One command on any platform
+curl -fsSL https://orca.ai/install.sh | sh
+```
+
+### Local-first, resumable
+
+Orca stores session state as plain SQLite databases on your local machine. Every conversation, tool call, and result is persisted. You can resume any session, fork from a checkpoint, or review past decisions — even weeks later.
+
+```bash
+# Resume yesterday's session
+orca --resume 42
+
+# Fork from a specific turn
+orca --fork 42:turn-17
+```
+
+### Approval-aware
+
+<Callout type="danger">
+
+Orca implements a four-mode approval lattice (`plan` → `suggest` → `auto-edit` → `full-auto`) that lets you trade autonomy for control. You can set approval at the project level, per-folder, or per-session. The agent will never execute a destructive operation without explicit approval — and approval dialogs are non-blocking, so the agent continues planning while you decide.
+
+</Callout>
+
+### Runtime-owned interaction
+
+<Callout type="danger">
+
+Orca's runtime owns all interaction with the model. The model never directly executes shell commands or writes files. Instead:
+
+</Callout>
+
+
+<Steps>
+<Step>
+
+The model emits a structured tool call
+
+</Step>
+<Step>
+
+The runtime validates the call against safety rules (e.g., "no `rm -rf /`")
+
+</Step>
+<Step>
+
+The runtime presents an approval dialog (in applicable modes)
+
+</Step>
+<Step>
+
+The runtime executes the tool and returns the result to the model
+
+</Step>
+</Steps>
+
+
+This separation ensures that even if the model produces unsafe output, the runtime acts as a safety gate.
+
+### Persistent goals & workflows
+
+Orca supports **goals** (single-shot objectives with budget gates and verifiers) and **workflows** (multi-step procedures with branching, context channels, and error recovery). Both are stored as versioned YAML and can be shared across sessions, teams, and repositories.
+
+```yaml
+# goal: Fix flaky test suite
+objective: Eliminate all flaky tests in src/__tests__/
+budget:
+  max_turns: 30
+  max_cost_usd: 5.00
+verifier:
+  type: command
+  run: npm test -- --flaky 2>&1 | grep -c "passing"
+  expect_stdout: "0"
+```
+
+## When to Use Orca
+
+| Scenario | Why Orca fits |
+|----------|---------------|
+| Large-scale refactors | Context window + goal mode with verifier gates |
+| New feature development | TUI mode with @-mention search and side conversations |
+| Code review automation | `orca exec` with JSONL output for CI integration |
+| Multi-repo debugging | MCP integration + persistent session state |
+| Teaching code patterns | Skill plugins with structured guidance |
+
+## What's Next
+
+- Read the [Quickstart](quickstart.md) to get up and running
+- Explore the [Agent Loop](agent-loop.md) to understand how turns work
+- Configure your environment in [Configuration](configuration.md)
+- Check the [CLI Reference](cli-reference.md) for command details

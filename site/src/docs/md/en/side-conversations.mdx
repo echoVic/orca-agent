@@ -1,0 +1,311 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# Side Conversations
+
+
+Side conversations let you have parallel discussions with the agent without consuming the main context window. Think of them as separate threads that share the same project context but have independent conversation histories.
+
+## What Are Side Conversations?
+
+### Behavior
+
+Side conversations are independent chat threads within a session:
+
+| Property | Main Session | Side Conversation |
+|----------|-------------|-------------------|
+| Context window | Full 1M tokens | Full 1M tokens (separate) |
+| Conversation history | Main thread only | Side thread only |
+| Project context | Shared | Shared (same project) |
+| Tool access | Full | Full |
+| Budget | Main budget (shared) | Shares main budget |
+| Storage | Persisted | Persisted |
+
+### Key Behaviors
+
+
+<Steps>
+<Step title={"**Independent context**"}>
+
+Each side conversation has its own 1M-token context window
+
+</Step>
+<Step title={"**Shared project context**"}>
+
+File tree, git status, and config are shared across all threads
+
+</Step>
+<Step title={"**Promote to main**"}>
+
+Side conversations can be merged into the main thread
+
+</Step>
+<Step title={"**Disposable**"}>
+
+Side conversations can be discarded without affecting the main thread
+
+</Step>
+<Step title={"**Session restore**"}>
+
+Side conversations are restored when resuming a session
+
+</Step>
+</Steps>
+
+
+### Thread Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Session: 42                                   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Main Thread                                            │    │
+│  │  Context: [System][Project][Main History]                │    │
+│  │                                                         │    │
+│  │  "Fix the login bug"                                    │    │
+│  │  → Main conversation continues...                       │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Side Thread 1: "Debug caching"                         │    │
+│  │  Context: [System][Project][Side 1 History]              │    │
+│  │                                                         │    │
+│  │  → Independent debugging of Redis cache invalidation     │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Side Thread 2: "Explore refactoring"                   │    │
+│  │  Context: [System][Project][Side 2 History]              │    │
+│  │                                                         │    │
+│  │  → Alternative approach for the data layer              │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  Shared: Project file tree, git status, config, MCP servers    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Creating and Managing Side Conversations
+
+### Shortcut Table
+
+| Action | Shortcut | Description |
+|--------|----------|-------------|
+| New side conversation | `Ctrl+T` | Create a new side thread |
+| Switch to thread | `Ctrl+Tab` | Cycle through threads |
+| Thread picker | `Ctrl+Shift+T` | Open thread picker |
+| Promote to main | `/promote` | Merge side thread into main |
+| Close thread | `Ctrl+W` | Close current side thread |
+| Rename thread | `/rename-thread <name>` | Rename the current side thread |
+
+### Creating a Side Conversation
+
+#### Method 1: Keyboard Shortcut
+
+Press `Ctrl+T` to create a new side conversation. A new input area opens with an empty context window.
+
+#### Method 2: Slash Command
+
+```
+/side Debug the caching layer
+```
+
+This creates a side conversation named "Debug the caching layer" and switches to it.
+
+#### Method 3: Thread Picker
+
+Press `Ctrl+Shift+T` to open the thread picker, then press `N` to create a new thread.
+
+### Switching Between Threads
+
+Press `Ctrl+Tab` to cycle through open threads. The thread indicator in the status bar shows the current thread:
+
+```
+[Main] [Debug caching] [Explore refactoring]   ← 3 threads open
+```
+
+### Promoting a Side Conversation
+
+When a side conversation reaches a conclusion, you can promote it to the main thread:
+
+```
+/promote
+```
+
+This:
+1. Copies all messages and tool results from the side thread to the main thread
+2. Merges the context (deduplicating shared project context)
+3. Closes the side thread
+4. Returns to the main thread
+
+> **Note:** Promotion is one-way — the main thread absorbs the side thread's content. You cannot "un-promote."
+
+### Closing a Side Conversation
+
+```
+Ctrl+W
+```
+
+Or from the thread picker, select the thread and press `D`.
+
+Closing a side conversation:
+- Preserves the thread in the session database (restored on resume)
+- Frees its context window for new side conversations
+- Does NOT affect the main thread
+
+---
+
+## Use Cases
+
+### 1. Investigating Tangents
+
+```
+Main: "Fix the login token expiry bug"
+
+Side: "While investigating, I noticed the caching layer seems
+      slow. Let me profile Redis separately."
+
+→ Main continues with the login fix
+→ Side independently profiles Redis performance
+→ Side result: "Redis cache miss rate is 15% for user sessions"
+→ Promote → "By the way, Redis cache is also slow"
+```
+
+### 2. Exploring Alternatives
+
+```
+Main: "Implement the feature using REST"
+
+Side: "What if we used GraphQL instead? Let me prototype both."
+
+→ Main builds the REST version
+→ Side prototypes a GraphQL version
+→ Compare approaches side by side
+```
+
+### 3. Isolating Debugging
+
+```
+Main: "Add user registration feature"
+
+Side: "The WebSocket connection keeps dropping. Let me debug
+      the reconnection logic without interrupting the main work."
+
+→ Main continues with the registration flow
+Side independently debugs WebSocket reconnection
+→ Side produces a fix without blocking main
+```
+
+### 4. Research and Learning
+
+```
+Main: "Refactor the payment module"
+
+Side: "Let me research the Stripe API best practices first."
+
+→ Side reads Stripe docs, loads examples
+→ Side produces a summary for the main thread
+→ Main uses the research to implement the refactor
+```
+
+### 5. Code Review Preparation
+
+```
+Main: "Working on feature X"
+
+Side: "Let me prepare the code review comments for the PR."
+
+→ Side reviews the changes, prepares feedback
+→ Main continues development
+→ Side produces review summary
+```
+
+### 6. Parallel Refactoring
+
+```
+Main: "Refactor the data access layer"
+
+Side: "I'll simultaneously refactor the validation layer
+      since it depends on the data layer changes."
+
+→ Both threads refactor in parallel
+→ Promote both when complete
+```
+
+---
+
+## Thread Picker
+
+### Accessing the Picker
+
+Press `Ctrl+Shift+T` or type `/threads`.
+
+### Picker Layout
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Thread Picker                                                 │
+│                                                                 │
+│  🔍 Filter: [type to filter...]                                 │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  ⭐  Main Thread                          42 turns       │    │
+│  │      Fix the login token expiry bug                     │    │
+│  │                                                         │    │
+│  │    Side: Debug caching                     8 turns        │    │
+│  │      Redis cache profiling                              │    │
+│  │                                                         │    │
+│  │    Side: Explore GraphQL                   3 turns        │    │
+│  │      Alternative API design                             │    │
+│  │                                                         │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  [N] New  [Enter] Switch  [P] Promote  [D] Close  [Esc] Close   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `↑` / `k` | Move up |
+| `↓` / `j` | Move down |
+| `Enter` | Switch to selected thread |
+| `N` | Create new side thread |
+| `P` | Promote side thread to main |
+| `D` | Close selected thread |
+| `R` | Rename selected thread |
+| `Esc` | Close picker |
+
+---
+
+## Interaction Between Threads
+
+### Context Sharing
+
+All threads within a session share:
+
+- **Project file tree** — always up-to-date across all threads
+- **Git status** — changes made in one thread are visible to others
+- **MCP connections** — shared tool connections
+- **Config and settings** — applied uniformly
+
+### Tool Result Visibility
+
+Tools executed in one thread are **visible** to other threads through the shared project context:
+
+- File edits in Thread A are immediately visible in Thread B's file tree
+- Shell commands in Thread A have side effects visible to Thread B
+- However, tool **results** (stdout, reasoning) are thread-local and not shared
+
+### Budget Sharing
+
+All threads share the same session budget:
+
+- `max_turns` is shared across all threads
+- `max_cost` is shared across all threads
+- Each turn (in any thread) counts against the shared budget
+
+> **Tip:** Use side conversations sparingly — each thread consumes turns and cost from the shared budget. For long-running parallel work, consider using separate `orca exec` sessions.

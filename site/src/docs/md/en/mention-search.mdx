@@ -1,0 +1,277 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# Mention Search
+
+
+Orca's `@` mention system lets you inject specific content into the context window with a few keystrokes. This page covers the mention picker, search syntax, and all the types of content you can mention.
+
+## The @ Mention Picker
+
+### Opening the Picker
+
+Type `@` in the TUI input area to open the mention picker:
+
+```
+> Add error handling @
+                     ─────────────────────────────
+                     │  📁 Files                  │
+                     │  @src/auth/login.ts         │
+                     │  @src/components/           │
+                     │  @tests/integration/       │
+                     │                             │
+                     │  🛠️ Skills                 │
+                     │  @skill:testing            │
+                     │  @skill:refactoring        │
+                     │                             │
+                     │  🔌 MCP Resources          │
+                     │  @mcp:github:list-repos    │
+                     │  @mcp:postgres:query       │
+                     │                             │
+                     │  🌐 URLs                    │
+                     │  @url:https://docs...      │
+                     ─────────────────────────────
+```
+
+### Navigating the Picker
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move between categories and items |
+| `Enter` | Select the highlighted mention |
+| `Tab` | Move between categories |
+| `Backspace` | Remove the current mention |
+| `Esc` | Close the picker |
+| Type more | Filter items by name |
+
+---
+
+## What You Can @ Mention
+
+### 1. File Search
+
+Reference specific files or directories by path.
+
+#### Syntax
+
+```
+@path/to/file.ts         → Mention a single file
+@path/to/directory/      → Mention all files in a directory
+@path/to/directory/**    → Mention files recursively
+```
+
+#### Examples
+
+```
+@src/auth/login.ts            # Load the login handler
+@src/components/              # Load all component files (up to 20)
+@src/hooks/**                 # Load all custom hooks recursively
+@tests/e2e/registration.test.ts  # Load a specific test
+```
+
+#### Behavior
+
+- **Single file**: Full content is injected into context
+- **Directory**: Up to 20 files are loaded (sorted by relevance)
+- **Recursive**: All matching files are loaded (respects depth limits)
+- **File size limit**: Individual files over 100KB are truncated with a note
+- **Multiple mentions**: You can mention multiple files in one message
+
+### 2. Skill Injection
+
+Load structured skill instructions into the context.
+
+#### Syntax
+
+```
+@skill:<skill-name>
+```
+
+#### Available Skills
+
+| Skill Name | Description |
+|------------|-------------|
+| `@skill:testing` | Best practices for writing tests with Orca |
+| `@skill:refactoring` | Patterns for safe and systematic refactoring |
+| `@skill:code-review` | Structured code review guidance |
+| `@skill:debugging` | Systematic debugging methodology |
+| `@skill:performance` | Performance optimization patterns |
+| `@skill:security` | Security audit checklist |
+| `@skill:documentation` | Documentation generation guidance |
+| `@skill:api-design` | API design best practices |
+| `@skill:database` | Database schema and query optimization |
+| `@skill:react` | React-specific patterns and anti-patterns |
+| `@skill:typescript` | TypeScript best practices and patterns |
+
+#### Examples
+
+```
+@skill:testing Write unit tests for the authentication module
+@skill:refactoring Help me break this 500-line function into smaller pieces
+@skill:security Review the payment processing code for vulnerabilities
+```
+
+> **Tip:** Skills inject instructions, not execution. They guide the agent's behavior but don't add new tools.
+
+### 3. MCP Browsing
+
+Browse and invoke tools from configured MCP servers.
+
+#### Syntax
+
+```
+@mcp:<server-name>:<tool-name>
+```
+
+#### Examples
+
+```
+@mcp:github:list-repos List all repositories in the org
+@mcp:postgres:query Show the top 5 customers by revenue
+@mcp:slack:send-message Send a summary to the #dev channel
+@mcp:docs:search Search the internal documentation for "OAuth 2.0"
+```
+
+#### Behavior
+
+- The picker shows available MCP servers and their tools
+- Selecting a tool injects its schema and recent results into context
+- The agent can then use the tool in subsequent turns
+
+### 4. URL Injection
+
+Fetch and inject content from URLs into the context.
+
+#### Syntax
+
+```
+@url:<url>
+```
+
+#### Examples
+
+```
+@url:https://docs.deepseek.com/api-reference Show me the API response format
+@url:https://github.com/example/repo/issues/42 Help me fix this issue
+@url:https://mdn.io/fetch Explain how fetch() works
+```
+
+#### Behavior
+
+- Orca fetches the URL content (HTML is converted to markdown)
+- The content is injected as context for the current turn
+- External URLs are fetched securely with a 10-second timeout
+- Content over 50KB is summarized automatically
+
+---
+
+## Search Syntax
+
+### Filtering in the Picker
+
+As you type after `@`, the picker filters results:
+
+```
+@src/auth      → Files matching "src/auth"
+@skill:test    → Skills matching "test"
+@mcp:gh        → MCP servers matching "gh"
+@url:docs      → URLs in history matching "docs"
+```
+
+### Wildcard Search
+
+```
+@*.ts          → All TypeScript files in the project
+@src/**/*.test → All test files under src/
+@**/config*    → All config files anywhere
+```
+
+### Exact Match
+
+```
+@src/auth/login.ts        → Exact file path
+@skill:testing            → Exact skill name
+```
+
+---
+
+## Explicit Skill Syntax ($ Prefix)
+
+For skill-only injection without the picker, use the `$` prefix:
+
+```
+$testing Write comprehensive tests for the payment module
+$refactoring Extract the validation logic into a separate module
+$security Audit the authentication flow for vulnerabilities
+```
+
+The `$` prefix is a shorthand that:
+- Skips the picker (faster for known skill names)
+- Immediately injects the skill content
+- Can be combined with `@` mentions
+
+```
+$testing @src/auth/login.ts Write tests for this file using testing best practices
+```
+
+### Skill Loading Order
+
+When multiple skills are mentioned, they load in order:
+
+```
+$testing $refactoring @src/auth/login.ts
+→ Loads testing skill
+→ Loads refactoring skill
+→ Loads the file content
+→ Combines all three into the system prompt
+```
+
+The skills are merged with later skills overriding earlier ones in case of conflicts.
+
+---
+
+## Advanced Usage
+
+### Combining Multiple Mentions
+
+```
+@src/auth/login.ts @src/auth/token.ts $testing
+→ Inject login.ts
+→ Inject token.ts
+→ Inject testing skill
+→ Agent writes tests for both files
+```
+
+### Mentioning from Search Results
+
+When Orca performs a code search, results become mentionable:
+
+```
+> Find the function that validates JWT tokens
+
+[Agent searches and finds:]
+  src/auth/jwt.ts:42  validateToken()
+  src/auth/middleware.ts:18  authenticateRequest()
+
+> @src/auth/jwt.ts Help me refactor this function
+```
+
+### Dynamic Mention Discovery
+
+The mention picker updates in real-time as Orca discovers new files, skills, and MCP tools during a session:
+
+```
+> @
+  [New items appear as Orca explores the codebase]
+```
+
+### Mention Limits
+
+| Limit | Value | Notes |
+|-------|-------|-------|
+| Max file mentions per message | 10 | More than 10 → only first 10 loaded |
+| Max skill mentions per message | 3 | More than 3 → later skills ignored |
+| Max MCP tool mentions | 5 | More than 5 → only first 5 loaded |
+| Max URL mentions | 3 | More than 3 → only first 3 fetched |
+| Max total context from mentions | 200K tokens | Auto-truncated if exceeded |
+
+> **Tip:** For large codebases, use specific file paths rather than broad directory mentions. This keeps the context focused and saves tokens for reasoning.

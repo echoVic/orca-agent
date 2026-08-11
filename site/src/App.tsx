@@ -64,6 +64,7 @@ const copy = {
       capabilities: "Capabilities",
       workflow: "Workflow",
       faq: "FAQ",
+      docs: "Docs",
       install: "Install",
       changelog: "Changelog",
       github: "GitHub",
@@ -337,6 +338,7 @@ const copy = {
       capabilities: "能力",
       workflow: "工作流",
       faq: "FAQ",
+      docs: "文档",
       install: "安装",
       changelog: "更新日志",
       github: "GitHub",
@@ -1060,6 +1062,7 @@ function App() {
             <a href="#capabilities">{t.nav.capabilities}</a>
             <a href="#workflow">{t.nav.workflow}</a>
             <a href="#faq">{t.nav.faq}</a>
+            <a href={links.docs}>{t.nav.docs}</a>
             <a href="#install">{t.nav.install}</a>
             <a href={links.changelog}>{t.nav.changelog}</a>
             <a className="nav-cta" href={links.github} rel="noreferrer">

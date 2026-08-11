@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { renderToString } from "react-dom/server";
 import App from "./App";
 import Changelog from "./changelog/Changelog";
+import Docs from "./docs/Docs";
 
 /**
  * Server entry used only at build time by scripts/prerender.mjs.
@@ -12,7 +13,14 @@ import Changelog from "./changelog/Changelog";
  * a useEffect/handler, so renderToString never touches the DOM.
  */
 export function render(route: string): string {
-  const Component = route === "/changelog/" ? Changelog : App;
+  let Component;
+  if (route === "/changelog/") {
+    Component = Changelog;
+  } else if (route === "/docs/") {
+    Component = Docs;
+  } else {
+    Component = App;
+  }
   return renderToString(
     <StrictMode>
       <Component />

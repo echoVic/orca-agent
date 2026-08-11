@@ -1,0 +1,375 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# Goal Mode
+
+
+Goal mode lets you define structured, budget-gated objectives for Orca to pursue. A goal is a declarative specification of what you want to achieve, with built-in budget controls and verification. This page covers what goal mode is, how to use goal commands, and how operation fences work.
+
+## What is Goal Mode?
+
+### Concept
+
+A **goal** is a YAML-defined objective that Orca pursues autonomously. Goals go beyond simple prompts — they include explicit budget gates, success criteria, and operational constraints.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Goal Mode Concept                             │
+│                                                                 │
+│  Prompt Mode (basic):                                          │
+│    "Fix the login bug"                                         │
+│    → Agent works until done or budget exhausted               │
+│    → No explicit success criteria                             │
+│                                                                 │
+│  Goal Mode (structured):                                       │
+│    Goal: {                                                     │
+│      objective: "Fix the login token expiry bug",              │
+│      budget: { max_turns: 20, max_cost: $3.00 },              │
+│      verifier: "npm test -- login",                            │
+│      success_criteria: [                                       │
+│        "All login tests pass",                                 │
+│        "Token expiry is checked before refresh",               │
+│        "No regressions in related tests"                       │
+│      ]                                                          │
+│    }                                                           │
+│    → Agent pursues the objective within budget                 │
+│    → Verifier validates success                               │
+│    → Operation fences prevent scope creep                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### When to Use Goal Mode
+
+| Scenario | Why Goal Mode |
+|----------|---------------|
+| Multi-step refactoring | Budget gates prevent runaway changes |
+| Bug fix campaigns | Success criteria ensure complete resolution |
+| CI automation | Declarative goals are easier to version and review |
+| Complex debugging | Structured approach with verifiable checkpoints |
+| Repetitive tasks | Goals can be saved and re-run |
+| Team collaboration | Goals serve as clear task specifications |
+
+---
+
+## Goal Definition
+
+### Structure
+
+```yaml
+# goals/fix-login-bug.yaml
+
+objective: "Fix the login token expiry validation bug"
+
+description: |
+  The login module fails to validate token expiry before generating
+  refresh tokens. This allows expired tokens to be used indefinitely.
+
+budget:
+  max_turns: 25
+  max_cost_usd: 4.00
+  max_duration_minutes: 15
+
+verifier:
+  type: command
+  run: "npm test -- --testPathPattern=login"
+  expect: "exit_code == 0"
+
+success_criteria:
+  - "Token expiry is checked in validateToken()"
+  - "Expired tokens are rejected with 401"
+  - "All existing login tests pass"
+  - "No regressions in auth module tests"
+
+fences:
+  # Prevent scope creep
+  max_files_changed: 10
+  forbid_new_files: false
+  forbid_removals: false
+  require_approval_for: ["delete", "rm "]
+
+context:
+  # Provide context for the agent
+  files:
+    - src/auth/token.ts
+    - src/auth/login.ts
+    - src/auth/__tests__/login.test.ts
+  search_terms:
+    - "validateToken"
+    - "token expiry"
+    - "jwt expiration"
+
+on_failure:
+  strategy: "retry_with_feedback"
+  max_retries: 2
+  fallback: "escalate"
+```
+
+### Goal Fields Reference
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `objective` | string | ✅ | One-sentence objective |
+| `description` | string | | Detailed context and background |
+| `budget.max_turns` | int | ✅ | Maximum agent turns |
+| `budget.max_cost_usd` | float | ✅ | Maximum token cost |
+| `budget.max_duration_minutes` | int | | Maximum wall-clock time |
+| `verifier.type` | enum | ✅ | Verification type (`command`, `test_suite`, `custom`) |
+| `verifier.run` | string | ✅ | Verification command |
+| `verifier.expect` | string | | Expected result expression |
+| `success_criteria` | string[] | | Human-readable success criteria |
+| `fences.max_files_changed` | int | | Limit number of changed files |
+| `fences.forbid_new_files` | bool | | Block creation of new files |
+| `fences.forbid_removals` | bool | | Block file deletion |
+| `fences.require_approval_for` | string[] | | Patterns requiring approval |
+| `context.files` | string[] | | Files to prioritize in context |
+| `context.search_terms` | string[] | | Terms to search for at start |
+| `on_failure.strategy` | enum | | Failure strategy (`retry`, `escalate`, `stop`) |
+| `on_failure.max_retries` | int | | Maximum retry attempts |
+
+---
+
+## Goal Commands
+
+### Creating and Running Goals
+
+```bash
+# Run a goal from a YAML file
+orca goal run goals/fix-login-bug.yaml
+
+# Run with overrides
+orca goal run goals/fix-login-bug.yaml --max-turns 30 --max-cost 5.00
+
+# Run in headless mode
+orca exec --goal goals/fix-login-bug.yaml
+
+# Run with inline goal
+orca goal run --objective "Add dark mode toggle" --verifier "npm test" --max-turns 15
+```
+
+### Goal Status Commands
+
+| Command | Description |
+|---------|-------------|
+| `orca goal run <file>` | Run a goal from YAML file |
+| `orca goal status <session-id>` | Check goal progress |
+| `orca goal list` | List all saved goals |
+| `orca goal save <name>` | Save current session as a goal template |
+| `orca goal validate <file>` | Validate a goal YAML file |
+| `orca goal export <session-id>` | Export completed goal as YAML |
+
+### Goal in TUI
+
+```
+/goal run goals/fix-login-bug.yaml
+/goal status
+/goal validate
+```
+
+---
+
+## Operation Fences
+
+### What Are Operation Fences?
+
+Operation fences are **enforced constraints** that prevent the agent from straying beyond the goal's scope. They act as guardrails during execution.
+
+### Fence Types
+
+#### File Change Limits
+
+```yaml
+fences:
+  # Maximum number of files that can be changed
+  max_files_changed: 10
+
+  # Maximum number of new files that can be created
+  max_new_files: 3
+
+  # Maximum number of lines changed across all files
+  max_lines_changed: 500
+```
+
+When a fence is hit:
+1. The agent is notified of the constraint
+2. The agent must ask for an exception or narrow its approach
+3. If in plan mode, the agent proposes a solution within the fence
+4. If in suggest mode, the user can approve an exception
+
+#### Operation Bans
+
+```yaml
+fences:
+  # Forbid specific operations
+  forbid_new_files: true
+  forbid_removals: true
+  forbid_shell: ["curl", "wget"]
+  forbid_patterns:
+    - "console.log"
+    - "TODO"
+```
+
+#### Approval Requirements
+
+```yaml
+fences:
+  # Require explicit approval for high-risk operations
+  require_approval_for:
+    - "delete"
+    - "rm "
+    - "DROP"
+    - "sudo "
+
+  # Or require approval for ALL shell commands
+  require_approval_shell: true
+```
+
+#### Budget Hard Limits
+
+```yaml
+fences:
+  # Hard stop regardless of remaining budget
+  hard_max_turns: 30
+  hard_max_cost_usd: 5.00
+  hard_timeout_minutes: 20
+```
+
+### Fence Enforcement Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Fence Enforcement                             │
+│                                                                 │
+│  Agent: [attempts to modify src/auth/login.ts]                  │
+│                                                                 │
+│  Runtime checks:                                                │
+│  1. max_files_changed: 10/10 → HIT                              │
+│  2. forbid_new_files: false → OK                                │
+│  3. require_approval_for: ["delete"] → OK (edit, not delete)    │
+│                                                                 │
+│  Result: FENCE HIT — file change limit reached                 │
+│                                                                 │
+│  Agent: "I've reached the file change limit of 10.              │
+│          I need to modify 3 more files to complete the task.   │
+│          Should I request an exception?"                        │
+│                                                                 │
+│  Options:                                                       │
+│  [Request exception] [Narrow scope] [Abort]                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Failure Strategies
+
+### Retry with Feedback
+
+```yaml
+on_failure:
+  strategy: "retry_with_feedback"
+  max_retries: 2
+```
+
+When the verifier fails:
+1. The agent sees the verifier output
+2. The agent retries with the failure context
+3. After max retries, escalates
+
+### Escalation
+
+```yaml
+on_failure:
+  strategy: "escalate"
+  max_retries: 1
+  fallback: "pause_for_human"
+```
+
+After exhausting retries:
+1. In TUI mode: Pause and show a summary for human review
+2. In exec mode: Exit with code 3 and write a detailed report
+
+### Stop and Report
+
+```yaml
+on_failure:
+  strategy: "stop_and_report"
+```
+
+Immediately stops on verifier failure and generates a report.
+
+---
+
+## Goal Templates
+
+### Bug Fix Template
+
+```yaml
+# templates/bug-fix.yaml
+objective: "Fix the reported bug: {{ bug_description }}"
+budget:
+  max_turns: 20
+  max_cost_usd: 3.00
+verifier:
+  run: "npm test -- --testPathPattern={{ affected_module }}"
+  expect: "exit_code == 0"
+fences:
+  max_files_changed: 5
+  forbid_removals: true
+on_failure:
+  strategy: "retry_with_feedback"
+  max_retries: 2
+```
+
+### Feature Implementation Template
+
+```yaml
+# templates/feature.yaml
+objective: "Implement: {{ feature_description }}"
+budget:
+  max_turns: 40
+  max_cost_usd: 8.00
+verifier:
+  run: "npm test && npm run build"
+  expect: "exit_code == 0"
+fences:
+  max_files_changed: 20
+  max_new_files: 10
+on_failure:
+  strategy: "retry_with_feedback"
+  max_retries: 1
+```
+
+### Refactoring Template
+
+```yaml
+# templates/refactor.yaml
+objective: "Refactor: {{ refactor_description }}"
+budget:
+  max_turns: 30
+  max_cost_usd: 5.00
+verifier:
+  run: "npm test && npx tsc --noEmit && npx eslint"
+  expect: "exit_code == 0"
+fences:
+  max_files_changed: 30
+  forbid_new_files: false
+  forbid_removals: true
+on_failure:
+  strategy: "retry_with_feedback"
+  max_retries: 2
+```
+
+---
+
+## Goal Mode vs. Prompt Mode
+
+| Feature | Prompt Mode | Goal Mode |
+|---------|------------|-----------|
+| Scope control | None | Operation fences |
+| Budget gating | Basic turns/cost | Multi-dimensional (turns, cost, duration) |
+| Verification | Optional verifier | Built-in verifier gate |
+| Success criteria | Implicit | Explicit and shareable |
+| Failure handling | Manual | Configurable strategy |
+| Reusability | No | Goals can be saved and re-run |
+| Collaboration | Conversational | Declarative spec |
+| Version control | Conversational history | YAML in git |

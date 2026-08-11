@@ -1,0 +1,182 @@
+import { Callout, Steps, Step, Tabs, Tab, Kbd } from "../../mdx-components";
+
+# 快速上手
+
+通过五个步骤启动 Orca。
+
+## 前置条件
+
+- **macOS 12+**、**Linux (glibc 2.31+)** 或 **Windows 10+**
+- **DeepSeek API 密钥**（在 [platform.deepseek.com](https://platform.deepseek.com) 获取）
+- **4GB+ 内存** 和 **500MB+ 磁盘空间**
+
+<Callout type="info" title="小贴士">
+  Orca 会自动检测你的操作系统和架构。同一份二进制文件可在
+  macOS（Apple Silicon 与 Intel）、Linux（x86_64 与 aarch64）以及 Windows 上运行。
+</Callout>
+
+---
+
+## 安装 Orca
+
+<Tabs>
+<Tab label="npm（推荐）">
+
+```bash
+npm install -g @orcla/cli
+```
+
+</Tab>
+<Tab label="原生安装器（Linux/macOS）">
+
+```bash
+curl -fsSL https://orca.ai/install.sh | sh
+```
+
+安装器会检测你的操作系统和架构，下载最新二进制文件，并将其放入 `/usr/local/bin`。
+
+</Tab>
+<Tab label="PowerShell（Windows）">
+
+```powershell
+powershell -c "irm https://orca.ai/install.ps1 | iex"
+```
+
+</Tab>
+</Tabs>
+
+### 验证安装
+
+```bash
+orca --version
+# orca 1.0.0 (rustc 1.82.0, aarch64-apple-darwin)
+```
+
+---
+
+## 配置 API 密钥
+
+Orca 从环境变量或配置文件中读取 API 密钥。
+
+<Tabs>
+<Tab label="环境变量（推荐）">
+
+```bash
+export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxxxxxx"
+
+# 添加到 Shell 配置文件以持久化
+echo 'export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxxxxxx"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+</Tab>
+<Tab label="配置文件">
+
+```bash
+orca config set api.key "sk-xxxxxxxxxxxxxxxxxxxx"
+```
+
+</Tab>
+</Tabs>
+
+<Callout type="warning" title="安全提示">
+  Orca 将密钥以明文存储在 `~/.config/orca/config.toml` 中。生产环境建议使用环境变量或密钥管理器。
+</Callout>
+
+---
+
+## 启动 TUI
+
+```bash
+# 在当前目录启动
+orca
+
+# 在特定项目目录启动
+orca /path/to/your/project
+
+# 使用特定模型启动
+orca --model deepseek-v4-pro
+```
+
+TUI 打开后：
+
+<Steps>
+<Step title="输入你的目标">
+  在输入区域输入目标——例如：`给设置页面添加深色模式切换`
+</Step>
+<Step title="提及文件和资源">
+  按 <Kbd>@</Kbd> 提及文件、技能或 MCP 资源。按 <Kbd>/</Kbd> 查看会话命令。
+</Step>
+<Step title="切换面板">
+  按 <Kbd>Tab</Kbd> 在聊天、文件树和审批面板之间切换。
+</Step>
+</Steps>
+
+<Callout type="info">
+  TUI 显示三个主要面板：**聊天与智能体输出**、**文件树** 和 **审批**。
+  所有工具结果和推理都会实时显示在聊天面板中。
+</Callout>
+
+---
+
+## 无头运行（CI / 脚本）
+
+对于非交互式使用，使用 `orca exec`：
+
+```bash
+# 单次执行
+orca exec "修复 src/auth/__tests__/login.test.ts 中的失败测试"
+
+# 带验证器命令
+orca exec \
+  "为注册表单添加输入验证" \
+  --verifier "npm test -- --testPathPattern=registration"
+
+# 带预算门控
+orca exec \
+  "重构支付模块以使用 async/await" \
+  --max-turns 20 \
+  --max-cost 3.00
+
+# 恢复之前的 exec 会话
+orca exec resume <session-id>
+```
+
+<Callout type="success" title="退出码说明">
+  `orca exec` 成功时退出码为 `0`，失败时为非零。它在标准输出上发出 JSONL
+  事件供程序化消费。
+</Callout>
+
+---
+
+## 验证一切正常
+
+运行内置诊断：
+
+```bash
+orca doctor
+```
+
+预期输出：
+
+```
+✅ 二进制文件：orca 1.0.0
+✅ API 密钥：已配置 (sk-xxxx...xxxx)
+✅ 模型：deepseek-v4-flash (默认)
+✅ 网络：可达 (api.deepseek.com: 443)
+✅ 配置：~/.config/orca/config.toml (有效)
+✅ 会话：~/.local/share/orca/ (3 个会话)
+✅ MCP：已配置 0 个服务器
+```
+
+<Callout type="danger" title="检查失败？">
+  如果任何检查失败，运行 `orca config validate` 获取详细错误信息和修复步骤。
+</Callout>
+
+---
+
+## 接下来的步骤
+
+- 阅读 [CLI 参考](cli-reference.md) 了解所有可用命令和标志
+- 在 [配置说明](configuration.md) 中设置模型选择、审批模式和 MCP 服务器
+- 理解 [Agent 循环](agent-loop.md) 充分利用每个回合

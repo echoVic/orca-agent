@@ -1,0 +1,225 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# orca exec resume
+
+
+当 `orca exec` 会话因预算耗尽、验证器失败或其他中断而未完成时，`orca exec resume` 允许你从上次中断处继续。本页涵盖何时恢复、恢复语法和预算检查点的工作方式。
+
+## 何时恢复
+
+### 预算耗尽
+
+最常见的恢复场景。智能体在完成任务之前用完了回合数或费用。
+
+```bash
+# 首次运行——预算耗尽
+orca exec "将整个代码库迁移到 TypeScript" --max-turns 30
+
+# 输出：
+# 回合 30：预算已耗尽（已使用 30/30 回合）
+# 状态：PARTIAL — 12/47 个文件已转换
+# 退出码：2
+
+# 使用扩展的预算恢复
+orca exec resume <session-id> --max-turns 30 --max-cost 5.00
+
+# 输出：
+# 正在恢复会话 42（部分完成）
+# 进度：12/47 个文件已转换
+# 从第 31 回合继续...
+```
+
+### 验证器失败
+
+智能体完成了工作但验证命令返回非零。
+
+```bash
+# 首次运行——验证器失败
+orca exec "修复认证模块" --verifier "npm test"
+
+# 输出：
+# 智能体完成工作（15 回合）
+# 验证器：npm test → 3 个测试失败
+# 退出码：3
+
+# 恢复——智能体看到测试输出并修复它们
+orca exec resume <session-id>
+```
+
+### 增量任务
+
+将大型任务拆分为可恢复的较小块。
+
+```bash
+# 阶段 1
+orca exec "转换 src/auth/ 为 TypeScript" --verifier "npx tsc --noEmit"
+
+# 阶段 2
+orca exec resume <session-id> --prompt "现在转换 src/api/"
+
+# 阶段 3
+orca exec resume <session-id> --prompt "现在转换 src/utils/"
+```
+
+---
+
+## 恢复语法
+
+### 基本恢复
+
+```bash
+orca exec resume <session-id>
+```
+
+### 带覆盖参数的恢复
+
+```bash
+# 覆盖预算
+orca exec resume <session-id> --max-turns 20 --max-cost 3.00
+
+# 覆盖模型
+orca exec resume <session-id> --model deepseek-v4-pro
+
+# 覆盖验证器
+orca exec resume <session-id> --verifier "npm run test:ci"
+
+# 提供新指令
+orca exec resume <session-id> --prompt "同时修复 token 刷新逻辑中的边界情况"
+```
+
+### 从检查点恢复
+
+```bash
+# 从特定回合恢复（不仅仅是最后一个）
+orca exec resume <session-id>:turn-17
+
+# 带新提示从检查点恢复
+orca exec resume <session-id>:turn-17 --prompt "尝试替代方法"
+```
+
+---
+
+## 预算检查点
+
+### 预算如何追踪
+
+Orca 将预算作为累积计数器跟踪，跨越所有恢复操作：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    预算检查点系统                                │
+│                                                                 │
+│  运行 1：  max_turns=30, max_cost=$5.00                        │
+│           已使用：25 回合，$4.20                                │
+│           状态：BUDGET EXHAUSTED                                │
+│                                                                 │
+│  预算检查点：                                                   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  会话 ID：42                                            │    │
+│  │  使用的回合数：25                                        │    │
+│  │  使用的费用：$4.20                                      │    │
+│  │  已更改的文件：12                                        │    │
+│  │  最后的回合 ID：25                                       │    │
+│  │  验证器状态：未运行（预算耗尽）                          │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  恢复 1：max_turns=30, max_cost=$5.00（新预算）                 │
+│           已使用：15 回合，$2.10                                │
+│           状态：COMPLETE + 验证器通过                          │
+│                                                                 │
+│  最终预算：                                                     │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  总回合数：25 + 15 = 40                                 │    │
+│  │  总费用：$4.20 + $2.10 = $6.30                          │    │
+│  │  注意：每次恢复获得自己的预算，而非共享                  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 预算计算
+
+每次 `orca exec resume` 调用获得**自己的独立预算**：
+
+```
+总费用 = Σ（每次运行的费用）
+总回合数 = Σ（每次运行的回合数）
+```
+
+预算不会延续——每次恢复以新的预算限制重新开始。
+
+### 设置累积预算
+
+要在所有恢复操作中强制执行总预算，请使用 `--total-budget` 标志：
+
+```bash
+# 首次运行
+orca exec "重构数据层" \
+  --max-turns 30 \
+  --max-cost 5.00 \
+  --total-max-cost 10.00 \  # 所有恢复的累积预算
+  --total-max-turns 80
+
+# 恢复——强制执行累积预算
+orca exec resume <session-id>
+```
+
+---
+
+## 恢复工作流模式
+
+### 模式 1：渐进式重构
+
+```bash
+# 从最关键的文件开始
+orca exec "重构 src/auth/ 以使用 async/await" --verifier "npm test -- auth"
+
+# 为下一个批次恢复
+orca exec resume <id> --prompt "现在重构 src/api/" --verifier "npm test -- api"
+
+# 为最终批次恢复
+orca exec resume <id> --prompt "现在重构 src/data/" --verifier "npm test -- data"
+
+# 最终验证
+orca exec resume <id> --prompt "运行完整测试套件" --verifier "npm test"
+```
+
+### 模式 2：修复和验证循环
+
+```bash
+# 初始修复
+orca exec "修复所有 TypeScript 错误" --verifier "npx tsc --noEmit"
+
+# 验证器失败时，恢复以修复剩余错误
+orca exec resume <id>
+```
+
+### 模式 3：CI 中的长运行管道
+
+```bash
+#!/usr/bin/env bash
+# 带恢复支持的完整管道
+
+SESSION_FILE=".orca-session-id"
+
+if [ -f "$SESSION_FILE" ]; then
+  echo "恢复之前的会话..."
+  orca exec resume "$(cat "$SESSION_FILE")" \
+    --max-turns 20 \
+    --max-cost 3.00 \
+    --verifier "npm run ci"
+else
+  echo "开始新会话..."
+  orca exec "完整自动化代码审查和修复" \
+    --max-turns 30 \
+    --max-cost 5.00 \
+    --verifier "npm run ci" \
+    --output orca-report.jsonl
+  echo $? > "$SESSION_FILE"
+fi
+
+# 成功时清理
+if [ $? -eq 0 ]; then
+  rm -f "$SESSION_FILE"
+fi
+```

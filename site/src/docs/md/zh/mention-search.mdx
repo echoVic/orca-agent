@@ -1,0 +1,203 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# Mention 搜索
+
+
+Orca 的 `@` 提及系统让你可以用几个键击将特定内容注入上下文窗口。本页涵盖提及选择器、搜索语法和你可以提及的所有内容类型。
+
+## @ 提及选择器
+
+### 打开选择器
+
+在 TUI 输入区域输入 `@` 以打开提及选择器：
+
+```
+> 添加错误处理 @
+                     ─────────────────────────────
+                     │  📁 文件                    │
+                     │  @src/auth/login.ts         │
+                     │  @src/components/           │
+                     │  @tests/integration/       │
+                     │                             │
+                     │  🛠️ 技能                   │
+                     │  @skill:testing            │
+                     │  @skill:refactoring        │
+                     │                             │
+                     │  🔌 MCP 资源              │
+                     │  @mcp:github:list-repos    │
+                     │  @mcp:postgres:query       │
+                     │                             │
+                     │  🌐 URL                    │
+                     │  @url:https://docs...      │
+                     ─────────────────────────────
+```
+
+### 导航选择器
+
+| 键 | 操作 |
+|----|------|
+| `↑` / `↓` | 在类别和项目之间移动 |
+| `Enter` | 选择高亮的提及 |
+| `Tab` | 在类别之间移动 |
+| `Backspace` | 移除当前提及 |
+| `Esc` | 关闭选择器 |
+| 输入更多内容 | 按名称过滤项目 |
+
+---
+
+## 你可以 @ 提及的内容
+
+### 1. 文件搜索
+
+按路径引用特定文件或目录。
+
+#### 语法
+
+```
+@path/to/file.ts         → 提及单个文件
+@path/to/directory/      → 提及目录中的所有文件
+@path/to/directory/**    → 递归提及文件
+```
+
+#### 示例
+
+```
+@src/auth/login.ts            # 加载登录处理器
+@src/components/              # 加载所有组件文件（最多 20 个）
+@src/hooks/**                 # 递归加载所有自定义 hooks
+@tests/e2e/registration.test.ts  # 加载特定测试
+```
+
+#### 行为
+
+- **单个文件**：完整内容注入上下文
+- **目录**：最多加载 20 个文件（按相关性排序）
+- **递归**：加载所有匹配文件（遵循深度限制）
+- **文件大小限制**：超过 100KB 的单个文件会被截断并附带说明
+- **多个提及**：你可以在一条消息中提及多个文件
+
+### 2. 技能注入
+
+将结构化技能指令加载到上下文中。
+
+#### 语法
+
+```
+@skill:<skill-name>
+```
+
+#### 可用技能
+
+| 技能名称 | 描述 |
+|----------|------|
+| `@skill:testing` | 使用 Orca 编写测试的最佳实践 |
+| `@skill:refactoring` | 安全和系统化重构的模式 |
+| `@skill:code-review` | 结构化代码审查指南 |
+| `@skill:debugging` | 系统化调试方法论 |
+| `@skill:performance` | 性能优化模式 |
+| `@skill:security` | 安全审计清单 |
+| `@skill:documentation` | 文档生成指南 |
+| `@skill:api-design` | API 设计最佳实践 |
+| `@skill:database` | 数据库 schema 和查询优化 |
+| `@skill:react` | React 特定模式和反模式 |
+| `@skill:typescript` | TypeScript 最佳实践和模式 |
+
+### 3. MCP 浏览
+
+浏览和调用已配置 MCP 服务器的工具。
+
+#### 语法
+
+```
+@mcp:<server-name>:<tool-name>
+```
+
+#### 示例
+
+```
+@mcp:github:list-repos 列出组织中的所有仓库
+@mcp:postgres:query 显示按收入排名的前 5 名客户
+@mcp:slack:send-message 将摘要发送到 #dev 频道
+```
+
+### 4. URL 注入
+
+从 URL 获取内容并注入上下文。
+
+#### 语法
+
+```
+@url:<url>
+```
+
+#### 示例
+
+```
+@url:https://docs.deepseek.com/api-reference 向我展示 API 响应格式
+@url:https://github.com/example/repo/issues/42 帮我修复这个问题
+```
+
+---
+
+## 搜索语法
+
+### 在选择器中过滤
+
+当你在 `@` 后输入内容时，选择器过滤结果：
+
+```
+@src/auth      → 匹配 "src/auth" 的文件
+@skill:test    → 匹配 "test" 的技能
+@mcp:gh        → 匹配 "gh" 的 MCP 服务器
+```
+
+### 通配符搜索
+
+```
+@*.ts          → 项目中所有 TypeScript 文件
+@src/**/*.test → src/ 下的所有测试文件
+@**/config*    → 任何位置的所有配置文件
+```
+
+---
+
+## 显式技能语法（$ 前缀）
+
+使用 `$` 前缀可跳过选择器直接注入技能：
+
+```
+$testing 为认证模块编写单元测试
+$refactoring 将验证逻辑提取到单独的模块中
+$security 审计认证流程的漏洞
+```
+
+`$` 前缀的作用是：
+- 跳过选择器（对于已知技能名称更快）
+- 立即注入技能内容
+- 可以与 `@` 提及组合使用
+
+---
+
+## 高级用法
+
+### 组合多个提及
+
+```
+@src/auth/login.ts @src/auth/token.ts $testing
+→ 注入 login.ts
+→ 注入 token.ts
+→ 注入 testing 技能
+→ 智能体为两个文件编写测试
+```
+
+### 提及限制
+
+| 限制 | 值 | 说明 |
+|------|-----|------|
+| 每条消息最大文件提及数 | 10 | 超过 10 个仅加载前 10 个 |
+| 每条消息最大技能提及数 | 3 | 超过 3 个忽略后面的 |
+| 最大 MCP 工具提及数 | 5 | 超过 5 个仅加载前 5 个 |
+| 最大 URL 提及数 | 3 | 超过 3 个仅获取前 3 个 |
+| 提及的最大上下文总量 | 200K tokens | 超出时自动截断 |
+
+> **提示：** 对于大型代码库，使用具体文件路径而非广泛的目录提及。这使上下文保持聚焦并节省 token 用于推理。

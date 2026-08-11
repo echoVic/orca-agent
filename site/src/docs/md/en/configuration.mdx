@@ -1,0 +1,254 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# Configuration
+
+
+Orca uses a layered configuration system with TOML files, environment variables, and CLI flags. This page covers all configurable options with examples.
+
+## Config File Location
+
+Orca looks for configuration in these locations, in order:
+
+1. **Project-level**: `.orca/config.toml` in the current working directory
+2. **Global**: `~/.config/orca/config.toml` (or `%APPDATA%/orca/config.toml` on Windows)
+
+Use `orca config path` to see the resolved path.
+
+---
+
+## TOML Reference
+
+### Complete Example
+
+```toml
+# ~/.config/orca/config.toml
+
+[api]
+key = "sk-xxxxxxxxxxxxxxxxxxxx"
+base_url = "https://api.deepseek.com/v1"
+timeout_seconds = 60
+max_retries = 3
+
+[model]
+default = "deepseek-v4-flash"
+# Per-task model selection
+# flash for quick edits, pro for complex planning
+
+[approval]
+mode = "suggest"           # plan | suggest | auto-edit | full-auto
+require_confirmation_for = ["delete", "rm", "curl"]
+trust_folders = [
+    "src/components/ui",    # auto-approve edits in this folder
+    "src/utils",
+]
+
+[agent]
+max_turns = 100
+max_cost_usd = 10.00
+temperature = 0.7
+reasoning_effort = "medium"
+context_compaction_threshold = 0.85  # compact when context is 85% full
+
+[safety]
+block_commands = [
+    "rm -rf /",
+    "sudo ",
+    "> /dev/sda",
+]
+allowlist_mode = false
+allowlist_commands = []
+
+[mcp]
+enabled = true
+
+# MCP server configurations
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+env = {}
+
+[[mcp.servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
+
+[output]
+jsonl = true
+event_log_path = "~/.local/share/orca/events"
+max_events_per_session = 10000
+
+[session]
+storage_path = "~/.local/share/orca/sessions"
+max_sessions = 50
+auto_resume_last = false
+```
+
+---
+
+## Model Defaults
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `model.default` | `deepseek-v4-flash` | Model used when no `--model` flag is provided |
+| `model.temperature` | `0.7` | Controls randomness. Lower = more deterministic, higher = more creative |
+| `model.reasoning_effort` | `medium` | Thinking depth. `low` for quick tasks, `high` for complex planning |
+
+### Model Selection Guide
+
+| Model | Best For | Cost | Speed |
+|-------|----------|------|-------|
+| `deepseek-v4-flash` | Quick edits, search, simple refactors | Low (~$0.001/1K tokens) | Fast (~30 tok/s) |
+| `deepseek-v4-pro` | Architecture design, complex debugging, multi-file changes | Medium (~$0.004/1K tokens) | Moderate (~15 tok/s) |
+
+> **Tip:** Start with `deepseek-v4-flash` for most tasks. Switch to `deepseek-v4-pro` when the agent needs to reason across many files or design new systems.
+
+---
+
+## Approval Defaults
+
+### Approval Modes
+
+<Callout type="danger">
+
+| Mode | Behavior | |------|----------| | `plan` | Agent only produces plans — never executes tools. You approve each step manually. | | `suggest` | Agent suggests tool calls. You approve before execution. (Default for TUI) | | `auto-edit` | Agent auto-approves file edits and reads. Shell commands require approval. (Default for exec) | | `full-auto` | Agent executes everything autonomously. Use only in trusted environments. |
+
+</Callout>
+
+### Configuring Approval
+
+```toml
+[approval]
+mode = "suggest"
+
+# Require explicit approval for these command patterns
+require_confirmation_for = ["delete", "rm ", "curl ", "wget"]
+
+# Auto-approve all edits within these folders
+trust_folders = [
+    "src/components/",
+    "src/utils/",
+]
+```
+
+---
+
+## Safety Settings
+
+Orca's safety layer intercepts tool calls before execution. Configure it to match your risk tolerance.
+
+```toml
+[safety]
+# Block commands matching these patterns (regex)
+block_commands = [
+    "rm -rf /",
+    "sudo ",
+    "mkfs",
+    "dd if=",
+    "> /dev/sd",
+]
+
+# Enable allowlist mode: only allow listed commands
+allowlist_mode = false
+allowlist_commands = []
+```
+
+> **Note:** Safety rules use substring matching on the full command string. Be specific to avoid false positives.
+
+---
+
+## MCP Server Configuration
+
+Configure MCP (Model Context Protocol) servers to give Orca access to external tools and data sources.
+
+### Example: Filesystem MCP
+
+```toml
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = [
+    "-y",
+    "@modelcontextprotocol/server-filesystem",
+    "/absolute/path/to/your/project"
+]
+```
+
+### Example: Custom MCP Server with Environment Variables
+
+```toml
+[[mcp.servers]]
+name = "internal-docs"
+command = "node"
+args = ["/path/to/mcp-server/build/index.js"]
+env = {
+    API_KEY = "${MY_API_KEY}",
+    ENDPOINT = "https://docs.internal.corp"
+}
+```
+
+### Example: Multiple Servers
+
+```toml
+[[mcp.servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
+
+[[mcp.servers]]
+name = "postgres"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-postgres", "postgresql://user:pass@localhost:5432/mydb"]
+
+[[mcp.servers]]
+name = "slack"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-slack"]
+env = { SLACK_BOT_TOKEN = "${SLACK_BOT_TOKEN}" }
+```
+
+### MCP Settings
+
+```toml
+[mcp]
+enabled = true
+connection_timeout_ms = 5000
+max_servers = 10
+health_check_interval_s = 60
+```
+
+---
+
+## Validation and Inspection Commands
+
+| Command | Description |
+|---------|-------------|
+| `orca config show` | Display the fully resolved configuration with sources |
+| `orca config validate` | Check for errors, missing values, and type mismatches |
+| `orca config get <key>` | Print a single config value (e.g., `orca config get model.default`) |
+| `orca config set <key> <value>` | Set a value (e.g., `orca config set approval.mode auto-edit`) |
+| `orca doctor` | Full environment diagnostics including network, API, and MCP health |
+
+### `orca config show` Output Example
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Config Source Resolution                                        │
+├──────────────────────────────────────────────────────────────────┤
+│  model.default                                                    │
+│    cli:     (not set)                                             │
+│    env:     (not set)                                             │
+│    project: (not set)                                             │
+│    global:  deepseek-v4-flash  ← active                          │
+│    builtin: deepseek-v4-flash                                     │
+│                                                                   │
+│  approval.mode                                                    │
+│    cli:     (not set)                                             │
+│    env:     (not set)                                             │
+│    project: suggest  ← active  (.orca/config.toml)               │
+│    global:  suggest                                               │
+│    builtin: suggest                                               │
+└──────────────────────────────────────────────────────────────────┘
+```

@@ -1,0 +1,218 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# JSONL 输出
+
+
+Orca 在 `orca exec` 会话期间发出结构化的 JSONL（JSON 行）事件流。每一行都是一个自包含的 JSON 对象，描述单个事件。本页涵盖所有事件类型、它们的模式，以及如何使用 `jq` 查询它们。
+
+## 事件类型
+
+### 完整事件表
+
+| 事件类型 | 描述 | 何时发出 |
+|----------|------|----------|
+| `session_start` | 会话初始化 | 开始时一次 |
+| `session_complete` | 会话结束（成功、失败或预算） | 结束时一次 |
+| `turn_start` | 智能体回合开始 | 每次模型调用之前 |
+| `turn_complete` | 智能体回合结束 | 每次模型调用 + 工具执行之后 |
+| `tool_call` | 智能体请求工具 | 当模型发出工具调用时 |
+| `tool_result` | 工具执行完成 | 每次工具执行之后 |
+| `context_compact` | 触发上下文压缩 | 上下文被压缩时 |
+| `verifier_start` | 验证器开始执行 | 验证命令之前 |
+| `verifier_complete` | 验证器完成 | 验证命令之后 |
+| `budget_warning` | 预算阈值达到 | 80% 预算使用时 |
+| `budget_exhausted` | 预算完全消耗 | 预算门控触发时 |
+| `error` | 错误事件 | 出现任何错误时 |
+
+### 事件模式示例
+
+#### `session_start`
+
+```json
+{
+  "type": "session_start",
+  "session_id": 42,
+  "timestamp": "2026-08-10T14:32:00Z",
+  "model": "deepseek-v4-flash",
+  "prompt": "修复 src/auth/__tests__/login.test.ts 中的失败测试",
+  "cwd": "/project/my-app",
+  "approval_mode": "auto-edit",
+  "max_turns": 50,
+  "max_cost_usd": 5.00
+}
+```
+
+#### `session_complete`
+
+```json
+{
+  "type": "session_complete",
+  "session_id": 42,
+  "timestamp": "2026-08-10T14:35:12Z",
+  "status": "success",
+  "exit_code": 0,
+  "total_turns": 15,
+  "total_tokens_input": 620000,
+  "total_tokens_output": 34000,
+  "total_cost_usd": 0.42,
+  "duration_ms": 192000,
+  "verifier_status": "passed",
+  "verifier_output": "测试：12 通过，0 失败"
+}
+```
+
+#### `tool_call`
+
+```json
+{
+  "type": "tool_call",
+  "session_id": 42,
+  "turn": 5,
+  "tool_name": "write_file",
+  "tool_id": "call_abc123",
+  "arguments": {
+    "path": "src/auth/login.ts",
+    "content": "..."
+  },
+  "timestamp": "2026-08-10T14:33:03Z"
+}
+```
+
+#### `tool_result`
+
+```json
+{
+  "type": "tool_result",
+  "session_id": 42,
+  "turn": 5,
+  "tool_id": "call_abc123",
+  "tool_name": "write_file",
+  "status": "success",
+  "timestamp": "2026-08-10T14:33:03Z",
+  "duration_ms": 45,
+  "result": {
+    "bytes_written": 2048,
+    "lines_added": 12,
+    "lines_removed": 3,
+    "file_created": false
+  }
+}
+```
+
+---
+
+## 输出配置
+
+### 启用 JSONL
+
+JSONL 输出在 `orca exec` 中默认启用：
+
+```bash
+# 默认——标准输出上的 JSONL
+orca exec "修复 bug"
+
+# 改为写入文件
+orca exec "修复 bug" --output report.jsonl
+
+# 禁用 JSONL（静默模式）
+orca exec "修复 bug" --no-jsonl
+```
+
+---
+
+## jq 配方
+
+### 成本分析
+
+#### 每次回合的成本
+
+```bash
+jq -r 'select(.type=="turn_complete") | "回合 \(.turn): $\(.cost_usd)"' report.jsonl
+```
+
+#### 按工具类型的成本
+
+```bash
+jq -r '
+  [.[] | select(.type=="tool_result" and .status=="success")]
+  | group_by(.tool_name)
+  | map({tool: .[0].tool_name, count: length})
+  | sort_by(-.count)
+' report.jsonl
+```
+
+### 工具调用分析
+
+#### 所有工具调用
+
+```bash
+jq -r 'select(.type=="tool_call") | "\(.tool_name)()"' report.jsonl
+```
+
+#### 失败的工具调用
+
+```bash
+jq -r 'select(.type=="tool_result" and .status!="success") | "失败：\(.tool_name)"' report.jsonl
+```
+
+### 验证器分析
+
+#### 验证器结果
+
+```bash
+jq -r 'select(.type=="verifier_complete") | "状态：\(.status) | 退出码：\(.exit_code) | 持续时间：\(.duration_ms)ms"' report.jsonl
+```
+
+#### 验证器失败
+
+```bash
+jq -r 'select(.type=="verifier_complete" and .status!="passed") | "失败：\(.command)\n输出：\(.error_output)"' report.jsonl
+```
+
+### 会话分析
+
+#### 会话摘要
+
+```bash
+jq -r '
+  [.[] | select(.type=="session_start" or .type=="session_complete")]
+  | {
+      id: .[0].session_id,
+      model: .[0].model,
+      status: .[1].status,
+      turns: .[1].total_turns,
+      cost: "$\(.[1].total_cost_usd)"
+    }
+' report.jsonl
+```
+
+#### 错误摘要
+
+```bash
+jq -r '[.[] | select(.type=="error")] | group_by(.error_type) | map({type: .[0].error_type, count: length})' report.jsonl
+```
+
+---
+
+## 与监控系统集成
+
+### 发送事件到 Elasticsearch
+
+```bash
+orca exec "任务" --output - | jq -c '.' | while read line; do
+  curl -XPOST localhost:9200/orca-events/_doc -d "$line"
+done
+```
+
+### 验证器失败时告警
+
+```bash
+orca exec "任务" --output report.jsonl
+
+if jq -e 'select(.type=="verifier_complete" and .status!="passed")' report.jsonl > /dev/null; then
+  echo "🚨 验证器失败！"
+  jq -r 'select(.type=="verifier_complete") | "输出：\(.error_output)"' report.jsonl
+fi
+```
+
+> **提示：** JSONL 事件专为程序化消费而设计。如需人类可读的输出，请使用 `orca sessions show` 或 TUI 的会话历史视图。

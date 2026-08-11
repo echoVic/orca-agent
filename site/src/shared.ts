@@ -1178,6 +1178,7 @@ export const links = {
   deepseekCodingAgent: "/deepseek-coding-agent/",
   githubWorkflows: "/github/",
   mcp: "/mcp/",
+  docs: "/docs/",
 } as const;
 
 export function detectInitialLocale(): Locale {

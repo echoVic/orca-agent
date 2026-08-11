@@ -1,0 +1,410 @@
+import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+
+# MCP Integration
+
+
+The Model Context Protocol (MCP) lets Orca connect to external tools and data sources. This page covers configuring MCP servers, tool naming and discovery, resources and prompts, and a table of popular MCP servers.
+
+<div class="docs-diagram">
+
+![MCP integration architecture — Orca's MCP Tool Router routes stdio/SSE transports to filesystem, GitHub, and browser MCP servers, with JSON-RPC results merged back into the agent loop.](/docs-assets/diagram-mcp.svg)
+
+</div>
+
+## Configuring MCP Servers
+
+### TOML Configuration
+
+Add MCP servers to your Orca config in the `[[mcp.servers]]` section:
+
+```toml
+# ~/.config/orca/config.toml
+
+[mcp]
+enabled = true
+connection_timeout_ms = 5000
+max_servers = 10
+
+# Filesystem server (required for file access)
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = [
+    "-y",
+    "@modelcontextprotocol/server-filesystem",
+    "/absolute/path/to/allowed/directory"
+]
+env = {}
+
+# GitHub server
+[[mcp.servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
+
+# PostgreSQL server
+[[mcp.servers]]
+name = "postgres"
+command = "npx"
+args = [
+    "-y",
+    "@modelcontextprotocol/server-postgres",
+    "postgresql://user:password@localhost:5432/mydb"
+]
+
+# Custom internal server
+[[mcp.servers]]
+name = "internal-docs"
+command = "node"
+args = ["/path/to/internal-mcp-server/build/index.js"]
+env = {
+    API_KEY = "${INTERNAL_API_KEY}",
+    ENDPOINT = "https://docs.internal.corp"
+}
+```
+
+### MCP Settings Reference
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `mcp.enabled` | bool | `true` | Enable MCP integration |
+| `mcp.connection_timeout_ms` | int | `5000` | Connection timeout per server |
+| `mcp.max_servers` | int | `10` | Maximum number of MCP servers |
+| `mcp.health_check_interval_s` | int | `60` | Health check interval |
+| `mcp.reconnect_on_failure` | bool | `true` | Auto-reconnect on connection failure |
+
+### Server Configuration Reference
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | ✅ | Unique server identifier |
+| `command` | string | ✅ | Command to start the server |
+| `args` | string[] | ✅ | Arguments for the command |
+| `env` | table | | Environment variables |
+| `working_directory` | string | | Server working directory |
+| `disabled` | bool | | Temporarily disable the server |
+| `priority` | int | | Priority for tool naming (lower = higher priority) |
+
+### Environment Variable Interpolation
+
+Use `${VAR_NAME}` to interpolate environment variables:
+
+```toml
+env = {
+  GITHUB_TOKEN = "${GITHUB_TOKEN}",
+  API_BASE = "${API_BASE_URL:-https://api.default.com}"
+}
+```
+
+The `${VAR:-default}` syntax provides fallbacks for missing variables.
+
+---
+
+## Tool Naming and Discovery
+
+### How MCP Tools Are Exposed
+
+Each MCP server exposes tools that Orca makes available to the agent. Tools are namespaced by server name:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Tool Naming Convention                         │
+│                                                                 │
+│  Server: "github"                                               │
+│  Tools:                                                         │
+│    github:list_repositories                                     │
+│    github:create_pull_request                                   │
+│    github:get_issue                                             │
+│                                                                 │
+│  Server: "postgres"                                            │
+│  Tools:                                                         │
+│    postgres:query                                               │
+│    postgres:list_tables                                         │
+│    postgres:describe_table                                      │
+│                                                                 │
+│  Server: "filesystem"                                           │
+│  Tools:                                                         │
+│    filesystem:read_file                                         │
+│    filesystem:write_file                                        │
+│    filesystem:list_directory                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Tool Discovery
+
+Orca discovers MCP tools at startup:
+
+```bash
+# Check discovered tools
+orca mcp list-tools
+
+# Output:
+# ✅ github (connected)
+#   - github:list_repositories
+#   - github:create_pull_request
+#   - github:get_issue
+#
+# ✅ postgres (connected)
+#   - postgres:query
+#   - postgres:list_tables
+#   - postgres:describe_table
+#
+# ⚠️ internal-docs (connection failed)
+#   - Will retry in 30s
+```
+
+### Tool in Action
+
+Once configured, the agent can use MCP tools directly:
+
+```
+You: List all open pull requests in the main branch
+
+Orca: [calls github:list_repositories → calls github:list_pull_requests]
+      Found 3 open PRs:
+      1. #142 - Fix auth bug (auth-team, 2 days ago)
+      2. #138 - Add dark mode (ui-team, 5 days ago)
+      3. #135 - Refactor payment (payments-team, 1 week ago)
+```
+
+### Priority and Name Conflicts
+
+When multiple servers expose tools with similar names, Orca resolves conflicts using priority:
+
+```toml
+# Higher priority (lower number) wins
+[[mcp.servers]]
+name = "my-corp-tools"
+priority = 1  # Highest priority
+
+[[mcp.servers]]
+name = "github"
+priority = 5  # Lower priority
+```
+
+In case of name conflicts, both tools remain available but are distinguished by their full namespaced names.
+
+---
+
+## MCP Resources and Prompts
+
+### MCP Resources
+
+MCP servers can expose **resources** — data that can be injected into the context:
+
+```
+@mcp:github:repository_readme   → Injects repo README
+@mcp:postgres:table_schema      → Injects table schema
+@mcp:docs:api_specification      → Injects API docs
+```
+
+Resources are like read-only context injection, triggered by `@` mentions:
+
+```
+@mcp:github:repo_issues List the open issues for this repo
+```
+
+### MCP Prompts
+
+MCP servers can also expose **prompts** — pre-defined interaction patterns:
+
+```
+/mcp:github:review_pr <pr-number>   → Reviews a PR using the GitHub API
+/mcp:postgres:schema_review         → Reviews database schema
+/mcp:docs:generate_api_doc          → Generates API documentation
+```
+
+Prompts are like slash commands that orchestrate MCP tools with specific workflows.
+
+### Listing Resources and Prompts
+
+```bash
+# List MCP resources
+orca mcp list-resources
+
+# Output:
+# github:repository_readme
+# github:file_content
+# postgres:table_schema
+# docs:api_specification
+# docs:changelog
+
+# List MCP prompts
+orca mcp list-prompts
+
+# Output:
+# github:review_pr
+# github:create_issue
+# postgres:schema_review
+# docs:generate_api_doc
+```
+
+---
+
+## Popular MCP Servers
+
+### Server Directory
+
+| Server | Package | Tools | Use Case |
+|--------|---------|-------|----------|
+| **Filesystem** | `@modelcontextprotocol/server-filesystem` | read, write, list, search | File access within allowed directories |
+| **GitHub** | `@modelcontextprotocol/server-github` | repos, PRs, issues, files | GitHub automation |
+| **GitLab** | `@modelcontextprotocol/server-gitlab` | repos, MRs, issues | GitLab automation |
+| **PostgreSQL** | `@modelcontextprotocol/server-postgres` | query, schema, tables | PostgreSQL database access |
+| **MySQL** | `@modelcontextprotocol/server-mysql` | query, schema, tables | MySQL database access |
+| **Slack** | `@modelcontextprotocol/server-slack` | messages, channels, files | Slack integration |
+| **Linear** | `@modelcontextprotocol/server-linear` | issues, cycles, teams | Linear project management |
+| **Jira** | `@modelcontextprotocol/server-jira` | issues, boards, sprints | Jira integration |
+| **Sentry** | `@modelcontextprotocol/server-sentry` | errors, issues, releases | Error monitoring |
+| **Datadog** | `@modelcontextprotocol/server-datadog` | metrics, logs, traces | Infrastructure monitoring |
+| **Docker** | `@modelcontextprotocol/server-docker` | containers, images, logs | Docker management |
+| **Kubernetes** | `@modelcontextprotocol/server-k8s` | pods, services, deployments | K8s management |
+| **Figma** | `@modelcontextprotocol/server-figma` | designs, components | Design access |
+| **Google Drive** | `@modelcontextprotocol/server-gdrive` | files, folders, search | Google Drive access |
+| **Notion** | `@modelcontextprotocol/server-notion` | pages, databases, blocks | Notion integration |
+| **Memory** | `@modelcontextprotocol/server-memory` | store, retrieve, search | Persistent memory |
+| **Fetch** | `@modelcontextprotocol/server-fetch` | fetch, search | Web content retrieval |
+| **Search** | `@modelcontextprotocol/server-search` | web search, news | Web search |
+
+### Popular Server Configurations
+
+#### GitHub MCP
+
+```toml
+[[mcp.servers]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
+```
+
+#### PostgreSQL MCP
+
+```toml
+[[mcp.servers]]
+name = "postgres"
+command = "npx"
+args = [
+    "-y",
+    "@modelcontextprotocol/server-postgres",
+    "postgresql://user:pass@host:5432/dbname"
+]
+```
+
+#### Memory MCP (Persistent Knowledge)
+
+```toml
+[[mcp.servers]]
+name = "memory"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+env = { MEMORY_FILE = "~/.orca-memory.json" }
+```
+
+#### Fetch MCP (Web Content)
+
+```toml
+[[mcp.servers]]
+name = "fetch"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-fetch"]
+```
+
+### MCP Server Best Practices
+
+
+<Steps>
+<Step title={"**Start with essential servers**"}>
+
+Filesystem, one database, and one communication tool
+
+</Step>
+<Step title={"**Limit concurrent servers**"}>
+
+More than 5–6 servers can slow down the agent
+
+</Step>
+<Step title={"**Use environment variables**"}>
+
+Never hardcode API keys in config
+
+</Step>
+<Step title={"**Set connection timeouts**"}>
+
+Prevent zombie servers from blocking the agent
+
+</Step>
+<Step title={"**Health checks**"}>
+
+Orca automatically monitors server health and shows status in `orca doctor`
+
+</Step>
+<Step title={"**Disable unused servers**"}>
+
+Comment out or set `disabled = true` for servers you don't need
+
+</Step>
+</Steps>
+
+
+---
+
+## Troubleshooting MCP
+
+### Connection Failures
+
+```bash
+# Diagnose MCP issues
+orca mcp diagnose
+
+# Output:
+# ✅ filesystem: connected
+# ✅ github: connected
+# ⚠️ postgres: connection timeout (5000ms)
+#   → Check if PostgreSQL is running
+#   → Verify connection string
+# ❌ internal-docs: command not found
+#   → Check the command path
+```
+
+### Server Not Responding
+
+```bash
+# Restart a specific server
+orca mcp restart github
+
+# Restart all servers
+orca mcp restart --all
+```
+
+### Tool Not Showing Up
+
+```bash
+# Verify server is connected
+orca mcp status
+
+# List all tools
+orca mcp list-tools
+
+# Check server logs
+orca mcp logs --server github
+```
+
+### Config Validation
+
+```bash
+# Validate MCP configuration
+orca config validate
+
+# Test each server
+orca mcp test github
+# Output:
+# Testing github...
+#   Connection: ✅
+#   Tools: 12 discovered
+#   Resources: 5 discovered
+#   Prompts: 3 discovered
+#   Status: READY
+```
