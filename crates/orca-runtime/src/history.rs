@@ -39,6 +39,66 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
     recover_test_lock(&TEST_ENV_LOCK)
 }
 
+/// One process-wide temporary `ORCA_HOME` for the whole lib test binary. The
+/// real user home may be in use by live `orca` processes, so every lib test
+/// resolves `ORCA_HOME` to this isolated directory instead. It is created
+/// once, set once, and never removed while the test process runs.
+#[cfg(test)]
+pub(crate) fn isolated_test_orca_home() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+
+    static ORCA_HOME_TEST_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    ORCA_HOME_TEST_HOME
+        .get_or_init(|| {
+            let home = tempfile::tempdir().expect("create process-wide test ORCA_HOME");
+            // edition 2024: set_var is unsafe.
+            unsafe {
+                std::env::set_var("ORCA_HOME", home.path());
+            }
+            home
+        })
+        .path()
+}
+
+/// Ensures the process-wide isolated ORCA_HOME is active for the calling test.
+/// Recovery children receive an explicit fixture ORCA_HOME on their command
+/// line (a plain temp dir outside the isolated home); that explicit home is
+/// preserved. A with-orca-home subdirectory left over from a concurrent test
+/// is replaced by the process-wide home so recorded-surface tests never run
+/// against another test's scratch directory.
+#[cfg(test)]
+pub(crate) fn claim_isolated_test_orca_home_if_unset() -> bool {
+    if let Some(home) = std::env::var_os("ORCA_HOME") {
+        let home = PathBuf::from(home);
+        if !home
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("with-orca-home"))
+        {
+            return false;
+        }
+    }
+    let _ = isolated_test_orca_home();
+    true
+}
+
+/// Reserves a unique subdirectory inside the process-wide isolated home for a
+/// test that needs an exclusive empty home (for example to create a repository
+/// or write trust receipts). The subdirectory is never removed, so tests that
+/// read `ORCA_HOME` concurrently keep a live path.
+#[cfg(test)]
+pub(crate) fn isolated_test_orca_home_subdir(label: &str) -> std::path::PathBuf {
+    let home = isolated_test_orca_home();
+    let mut counter = 0usize;
+    loop {
+        let candidate = home.join(format!("{label}-{}-{}", std::process::id(), counter));
+        if !candidate.exists() {
+            std::fs::create_dir_all(&candidate).expect("create isolated test home subdir");
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompactionRecord {
     pub collapsed_at: DateTime<Utc>,
@@ -331,6 +391,27 @@ mod tests {
     use orca_core::event_schema::{
         EVENT_SEQUENCE_RESERVATION_SIZE, EventEnvelope, EventPublicationStore, EventType,
     };
+
+    /// Points ORCA_HOME at an exclusive never-removed subdirectory of the
+    /// process-wide isolated home for the duration of `body`, then returns it
+    /// to the process-wide home. The env lock serializes these tests against
+    /// each other; other tests always resolve a live directory because the
+    /// subdirectory is never removed.
+    fn with_isolated_home<T>(body: impl FnOnce() -> T) -> T {
+        let _guard = lock_test_env();
+        let home = isolated_test_orca_home_subdir("history-test");
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, &home);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, isolated_test_orca_home());
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
     use orca_core::plan_types::{PlanItem, PlanStatus};
     use orca_core::thread_identity::TurnId;
     use orca_core::tool_types::{
@@ -360,14 +441,7 @@ mod tests {
 
     #[test]
     fn writer_persists_compaction_records() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "compact me")?;
             writer.append_compaction(42, 7)?;
@@ -379,28 +453,13 @@ mod tests {
             assert_eq!(transcript.summaries.len(), 1);
             assert_eq!(transcript.summaries[0].summary, "important facts");
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("compaction record persisted");
     }
 
     #[test]
     fn event_publication_state_survives_rewrite_compression_and_restore() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let writer = SessionWriter::start(&cwd, "mock", None, "durable sequence")?;
             let session_id = load_session("latest")?.meta.session_id;
@@ -450,28 +509,13 @@ mod tests {
             assert_eq!(restored.next_event_seq, EVENT_SEQUENCE_RESERVATION_SIZE);
             assert_eq!(restored.semantic_events, [semantic_event]);
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("event publication state survived rewrite, compression, and restore");
     }
 
     #[test]
     fn writer_round_trips_pinned_messages() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "remember")?;
             writer.enter_turn(TurnId::new());
@@ -484,28 +528,13 @@ mod tests {
                 Message::User { content, .. } if content == "pinned constraint"
             ));
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("pinned message round-tripped");
     }
 
     #[test]
     fn writer_redacts_secrets_before_persisting_transcript() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let prompt_secret = "sk-test-redaction-title-1234567890";
             let env_secret = "sk-test-redaction-env-1234567890";
@@ -590,28 +619,13 @@ mod tests {
             assert!(rendered_loaded.contains("<redacted>"));
 
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("session transcript secrets redacted");
     }
 
     #[test]
     fn plan_state_round_trips_through_session() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "plan test")?;
             writer.append_plan_state(
@@ -638,28 +652,13 @@ mod tests {
             assert_eq!(plan[0].step, "Step 1");
             assert_eq!(plan[1].status, PlanStatus::InProgress);
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("plan state round-tripped");
     }
 
     #[test]
     fn all_completed_plan_restores_as_none() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "done plan")?;
             writer.append_plan_state(
@@ -681,28 +680,13 @@ mod tests {
                 "all-completed plan should restore as None"
             );
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("all-completed plan cleared");
     }
 
     #[test]
     fn empty_plan_restores_as_none() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "empty plan")?;
             writer.append_plan_state(None, vec![])?;
@@ -712,28 +696,13 @@ mod tests {
                 "empty plan should restore as None"
             );
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("empty plan cleared");
     }
 
     #[test]
     fn session_without_plan_loads_normally() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let _writer = SessionWriter::start(&cwd, "mock", None, "no plan")?;
             let transcript = load_session("latest")?;
@@ -743,28 +712,13 @@ mod tests {
             );
             assert_eq!(transcript.meta.title, "no plan");
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("session without plan loaded");
     }
 
     #[test]
     fn resume_restores_rolling_summary_from_last_context_summary_record() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "rolling summary")?;
             writer.append_summary(10, 5, "first summary")?;
@@ -788,28 +742,13 @@ mod tests {
                 "later summary records should resume as append-only deltas"
             );
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("rolling summary restored from history");
     }
 
     #[test]
     fn resume_without_summaries_has_no_rolling_summary() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let _writer = SessionWriter::start(&cwd, "mock", None, "no summaries")?;
             let transcript = load_session("latest")?;
@@ -820,28 +759,13 @@ mod tests {
                 "no summary records means no rolling_summary"
             );
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("no rolling summary without records");
     }
 
     #[test]
     fn resume_preserves_manual_compaction_marker_and_pinned_hook_context() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "manual snapshot")?;
             let operation_id = crate::runtime_surface::SurfaceOperationId::try_from_bytes(
@@ -881,28 +805,13 @@ mod tests {
                     && tail == "tail"
             ));
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("manual compaction system context resumes");
     }
 
     #[test]
     fn resume_repairs_incomplete_assistant_tool_call_turns() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let meta = create_meta(&cwd, "mock", None, "bad tool boundary");
             let session_id = meta.session_id.clone();
@@ -949,28 +858,13 @@ mod tests {
                 "resume repair must not rewrite the source JSONL"
             );
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("resume repaired real JSONL without rewriting it");
     }
 
     #[test]
     fn legacy_tool_result_metadata_without_new_terminal_fields_remains_readable() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let meta = create_meta(&cwd, "mock", None, "legacy tool metadata");
             let session_id = meta.session_id.clone();
@@ -1004,28 +898,13 @@ mod tests {
                         && terminal.source == ToolTerminalSource::Observed
             ));
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("legacy tool terminal metadata remained readable");
     }
 
     #[test]
     fn legacy_tool_result_metadata_without_status_becomes_indeterminate_repair() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let meta = create_meta(&cwd, "mock", None, "legacy partial tool metadata");
             let session_id = meta.session_id.clone();
@@ -1058,15 +937,7 @@ mod tests {
                         && terminal.source == ToolTerminalSource::CompatibilityRepair
             ));
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("legacy status-less tool diagnostics were repaired conservatively");
     }
 
@@ -1114,14 +985,7 @@ mod tests {
 
     #[test]
     fn load_session_preserves_latest_completion_status_and_redacted_error() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "failed turn")?;
             writer.complete_with_error(
@@ -1136,28 +1000,13 @@ mod tests {
                 Some("DeepSeek provider error: api_key=<redacted>")
             );
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("completion status and error restored from history");
     }
 
     #[test]
     fn resume_prefers_persisted_summary_state_over_legacy_summary_list() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "summary state")?;
             writer.append_summary(10, 5, "legacy baseline")?;
@@ -1182,28 +1031,13 @@ mod tests {
             assert_eq!(conv.summary.deltas, vec!["fresh delta".to_string()]);
             assert_eq!(conv.rolling_summary.as_deref(), Some("new delta"));
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("summary state restored from history");
     }
 
     #[test]
     fn resume_replays_compaction_records_to_drop_collapsed_messages() {
-        let _guard = lock_test_env();
-        let home = tempfile::tempdir().expect("temp home");
-        let previous = std::env::var_os(ORCA_HOME_ENV);
-        unsafe {
-            std::env::set_var(ORCA_HOME_ENV, home.path());
-        }
-
-        let result = (|| {
+        let result = with_isolated_home(|| {
             let cwd = std::env::current_dir()?;
             let mut writer = SessionWriter::start(&cwd, "mock", None, "compacted resume")?;
             writer.append_message(&Message::system("old system".to_string()))?;
@@ -1255,15 +1089,7 @@ mod tests {
             assert!(rendered.contains("new prompt after compaction"));
             assert_eq!(conv.summary.baseline.as_deref(), Some("summary baseline"));
             Ok::<(), io::Error>(())
-        })();
-
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(ORCA_HOME_ENV, previous);
-            } else {
-                std::env::remove_var(ORCA_HOME_ENV);
-            }
-        }
+        });
         result.expect("compacted messages filtered on resume");
     }
 

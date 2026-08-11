@@ -810,6 +810,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_config(cwd: PathBuf) -> RunConfig {
+        // Every test resolves ORCA_HOME to the process-wide isolated home so
+        // parallel tests never contend with live `orca` processes or each
+        // other's deleted temp dirs; an explicitly provided home (recovery
+        // child fixture) is preserved.
+        let _ = crate::history::claim_isolated_test_orca_home_if_unset();
         RunConfig {
             app_version: "test".to_string(),
             prompt: String::new(),
@@ -1103,24 +1108,12 @@ mod tests {
     }
 
     fn with_orca_home<T>(f: impl FnOnce() -> T) -> T {
+        // ORCA_HOME stays on the process-wide isolated home (never removed)
+        // so concurrent tests always resolve a live directory; the env lock
+        // serializes tests that deliberately share config/SQLite state.
         let _guard = crate::history::lock_test_env();
-        let home = tempfile::tempdir().expect("temp ORCA_HOME");
-        let previous = std::env::var_os("ORCA_HOME");
-        unsafe {
-            std::env::set_var("ORCA_HOME", home.path());
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var("ORCA_HOME", previous);
-            } else {
-                std::env::remove_var("ORCA_HOME");
-            }
-        }
-        match result {
-            Ok(value) => value,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
+        let _ = crate::history::isolated_test_orca_home();
+        f()
     }
 
     #[test]

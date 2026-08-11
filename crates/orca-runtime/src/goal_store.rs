@@ -20,6 +20,7 @@ use crate::runtime_surface::{
     GenerationAttempt, OperationKind, OperationPhase, OperationRecord,
     SurfaceGoalGenerationIdentity, SurfaceOperationId,
 };
+use orca_platform::fs::ExclusiveFileLock;
 
 const SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILENAME: &str = "goals.sqlite3";
@@ -442,11 +443,23 @@ impl GoalStore {
             fs::create_dir_all(parent)?;
         }
         let store = Self { path };
-        store.initialize_schema()?;
+        store.initialize_schema_fenced()?;
         if let Some(legacy_path) = legacy_path.as_deref() {
             store.migrate_legacy_once(legacy_path)?;
         }
         Ok(store)
+    }
+
+    /// Initializes the schema under a sibling cross-process lock so concurrent
+    /// openers of the same database serialize the DDL critical section instead
+    /// of racing each other with `Immediate` transactions. DDL is idempotent
+    /// (`IF NOT EXISTS`), so every opener passes through the same fenced path
+    /// and the lock is held only for the short initialization.
+    fn initialize_schema_fenced(&self) -> Result<(), GoalStoreError> {
+        let lock_path = self.path.with_extension("sqlite3.lock");
+        let _guard = ExclusiveFileLock::acquire(&lock_path)
+            .map_err(|error| GoalStoreError::Io(io::Error::other(error)))?;
+        self.initialize_schema()
     }
 
     pub fn path(&self) -> &Path {
@@ -3866,6 +3879,9 @@ impl GoalStore {
 
     fn initialize_schema(&self) -> Result<(), GoalStoreError> {
         let mut connection = self.connection()?;
+        // WAL is a persistent database property; set it once here so ordinary
+        // per-operation connections never contend on the pragma lock.
+        connection.pragma_update(None, "journal_mode", "WAL")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS goal_meta (
@@ -4190,7 +4206,6 @@ impl GoalStore {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
         Ok(connection)
     }
 }
@@ -5498,6 +5513,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
     use orca_core::goal_runtime::{
         EvidenceItem, GoalPauseReason, GoalRequestedState, GoalRunId, GoalState, GoalTurnOrigin,
@@ -5517,6 +5533,77 @@ mod tests {
                 now: 100,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn concurrent_opens_initialize_one_complete_schema() {
+        let directory = tempdir().expect("temp goal directory");
+        let path = directory.path().join("goals.sqlite3");
+        let workers = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                GoalStore::open(&path).expect("concurrent goal store open")
+            }));
+        }
+        for handle in handles {
+            let opened = handle.join().expect("concurrent goal store open worker");
+            assert_eq!(
+                opened.schema_version().expect("schema version"),
+                4,
+                "every concurrent open sees the complete schema"
+            );
+        }
+        let store = GoalStore::open(&path).expect("final goal store open");
+        assert_eq!(store.schema_version().expect("schema version"), 4);
+        store
+            .create_goal(CreateGoalInput {
+                session_id: "concurrent-open".to_string(),
+                objective: "verify schema after concurrent opens".to_string(),
+                token_budget: Some(10),
+                now: 1,
+            })
+            .expect("create goal after concurrent opens");
+    }
+
+    #[test]
+    fn open_waits_for_concurrent_schema_initialization_instead_of_failing() {
+        let directory = tempdir().expect("temp goal directory");
+        let path = directory.path().join("goals.sqlite3");
+        let workers = 32;
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        let mut handles = Vec::new();
+        for worker in 0..workers {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let opened = GoalStore::open(&path);
+                if let Ok(store) = opened.as_ref() {
+                    let _ = store.schema_version();
+                    let _ = store.create_goal(CreateGoalInput {
+                        session_id: format!("concurrent-worker-{worker}"),
+                        objective: "verify concurrent open writes".to_string(),
+                        token_budget: Some(10),
+                        now: worker as i64,
+                    });
+                }
+                opened
+            }));
+        }
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("open worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            workers,
+            "all concurrent opens must succeed once initialization is fenced"
+        );
     }
 
     fn surface_context(

@@ -2186,18 +2186,28 @@ impl TaskPersistence {
     }
 
     fn write_current_task(&self, record: &TaskRecord) -> io::Result<()> {
-        let _index_lock =
-            ExclusiveFileLock::acquire(&self.index_lock_path()).map_err(io::Error::other)?;
-        let mut index = self.load_index()?;
+        // The index maps a task id to its owning session and is written with
+        // atomic replacement; readers never observe a partial file. The
+        // session lock serializes the record file write. The global index
+        // lock is taken only when the task is not yet indexed (creation), so
+        // concurrent updates of already-indexed tasks never queue on it.
+        let index = self.load_index()?;
         let session_id = index
             .get(&record.id)
             .cloned()
             .unwrap_or_else(|| self.session_id.clone());
+        let already_indexed = index.contains_key(&record.id);
         let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(&session_id))
             .map_err(io::Error::other)?;
         let (mut records, _) = self.read_session_records(&session_id)?;
         records.insert(record.id.clone(), record.clone());
         self.write_session_records_unlocked(&session_id, &records)?;
+        if already_indexed {
+            return Ok(());
+        }
+        let _index_lock =
+            ExclusiveFileLock::acquire(&self.index_lock_path()).map_err(io::Error::other)?;
+        let mut index = self.load_index()?;
         index.insert(record.id.clone(), session_id);
         self.write_index(&index)
     }
@@ -2210,8 +2220,12 @@ impl TaskPersistence {
     where
         F: FnOnce(&mut TaskRecord) -> Result<R, TaskLeaseError>,
     {
-        let _index_lock = ExclusiveFileLock::acquire(&self.index_lock_path())
-            .map_err(|error| TaskLeaseError::Persistence(error.to_string()))?;
+        // The index maps a task id to its owning session. It is written with
+        // atomic replacement and read here without the index lock: the
+        // session lock below is what serializes the actual record file write,
+        // and index readers never observe a partially written file. Holding
+        // the global index lock on every mutation would serialize all task
+        // writes across every session.
         let index = self
             .load_index()
             .map_err(|error| TaskLeaseError::Persistence(error.to_string()))?;

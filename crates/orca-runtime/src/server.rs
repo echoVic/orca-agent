@@ -7946,6 +7946,11 @@ rl.on("line", (line) => {
     }
 
     fn test_run_config() -> RunConfig {
+        // Every test resolves ORCA_HOME to the process-wide isolated home so
+        // parallel tests never contend with live `orca` processes or each
+        // other's deleted temp dirs; an explicitly provided home (recovery
+        // child fixture) is preserved.
+        let _ = crate::history::claim_isolated_test_orca_home_if_unset();
         RunConfig {
             app_version: "0.0.0-test".to_string(),
             prompt: String::new(),
@@ -8231,21 +8236,25 @@ rl.on("line", (line) => {
     }
 
     fn with_orca_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        // Exclusive never-removed subdirectory of the process-wide isolated
+        // home; ORCA_HOME points at it only inside the serialized closure and
+        // is restored afterwards. The subdirectory is never removed, so any
+        // test that reads ORCA_HOME during the window still resolves a live
+        // directory, and a test that corrupts its own home never affects
+        // others.
         let _guard = crate::history::lock_test_env();
-        let home = tempdir().expect("temp home");
-        let previous = std::env::var_os("ORCA_HOME");
+        let home = crate::history::isolated_test_orca_home_subdir("with-orca-home");
         unsafe {
-            std::env::set_var("ORCA_HOME", home.path());
+            std::env::set_var("ORCA_HOME", &home);
         }
-        let result = f(home.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&home)));
         unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var("ORCA_HOME", previous);
-            } else {
-                std::env::remove_var("ORCA_HOME");
-            }
+            std::env::set_var("ORCA_HOME", crate::history::isolated_test_orca_home());
         }
-        result
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn trust_test_folder(home: &std::path::Path, folder: &std::path::Path) {

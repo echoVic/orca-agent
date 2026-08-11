@@ -39437,6 +39437,11 @@ mod tests {
     }
 
     fn surface_test_config(cwd: PathBuf, history_mode: HistoryMode) -> RunConfig {
+        // Every recorded-surface test resolves ORCA_HOME to the process-wide
+        // isolated home so parallel tests never contend with live `orca`
+        // processes or each other's deleted temp dirs; an explicitly provided
+        // home (recovery child fixture) is preserved.
+        let _ = crate::history::claim_isolated_test_orca_home_if_unset();
         RunConfig {
             app_version: "test".to_string(),
             prompt: String::new(),
