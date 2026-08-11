@@ -7,12 +7,18 @@
       "unix_shell_spawn",
       "(?:std::process::)?(?:Command|ProcessCommand)::new\\(\"(?:sh|bash)\"\\)"
     ],
-    ["unix_std_api", "std::os::unix::"],
+    [
+      "unix_std_api",
+      "std::os::unix::"
+    ],
     [
       "unix_libc_process",
       "libc::(?:flock|kill|killpg|setsid|setpgid|fcntl|SIGTERM|SIGKILL|LOCK_EX|LOCK_NB|LOCK_UN|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW)"
     ],
-    ["unix_flock_ffi", "fn (?:owner_)?flock\\(fd: i32, operation: i32\\)"],
+    [
+      "unix_flock_ffi",
+      "fn (?:owner_)?flock\\(fd: i32, operation: i32\\)"
+    ],
     [
       "non_unix_lock_stub",
       "#\\[cfg\\(not\\(unix\\)\\)\\][\\s\\S]{0,160}?fn (?:try_lock_runtime_file|try_lock_exclusive|unlock_exclusive|lock_file_impl|unlock_file_impl)\\b"
@@ -182,7 +188,7 @@
       "task-test-shells",
       "crates/orca-runtime/src/tasks.rs",
       "unix_shell_spawn",
-      6,
+      7,
       "windows-test-portability"
     ],
     [
@@ -372,6 +378,13 @@
       "tests/tool_contract.rs",
       "unix_std_api",
       1,
+      "windows-test-portability"
+    ],
+    [
+      "task-test-unix-libc-process",
+      "crates/orca-runtime/src/tasks.rs",
+      "unix_libc_process",
+      2,
       "windows-test-portability"
     ]
   ]
