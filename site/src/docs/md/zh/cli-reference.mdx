@@ -24,7 +24,7 @@ Orca 有两个顶级命令：`orca`（交互式 TUI）和 `orca exec`（无头�
 | 标志 | 缩写 | 类型 | 默认值 | 描述 |
 |------|------|------|--------|------|
 | `--model <name>` | `-m` | string | `deepseek-v4-flash` | 使用的模型 ID |
-| `--approval <mode>` | `-a` | enum | `suggest` | 审批模式（`plan`、`suggest`、`auto-edit`、`full-auto`） |
+| `--approval <mode>` | `-a` | enum | `auto-edit` | 审批模式（`plan`、`suggest`、`auto-edit`、`full-auto`） |
 | `--max-turns <n>` | | int | `100` | 每次会话最大回合数 |
 | `--max-cost <usd>` | | float | `10.00` | 最大 token 费用（美元） |
 | `--resume <id>` | `-r` | string | — | 按 ID 恢复现有会话 |

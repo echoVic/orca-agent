@@ -137,7 +137,7 @@ Change approval mode during a session:
 
 ```toml
 [approval]
-mode = "suggest"
+mode = "auto-edit"
 ```
 
 ### Environment Variable
@@ -179,7 +179,7 @@ config/orca/config.toml`)
 </Step>
 <Step>
 
-Default (`suggest` for TUI, `auto-edit` for exec)
+Default (`auto-edit` for both TUI and exec)
 
 </Step>
 </Steps>
@@ -195,7 +195,7 @@ Orla supports granular approval control based on file location. You can designat
 
 ```toml
 [approval]
-mode = "suggest"
+mode = "auto-edit"
 
 # Auto-approve all edits within these folders
 trust_folders = [

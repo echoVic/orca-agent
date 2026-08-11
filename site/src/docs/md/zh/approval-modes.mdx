@@ -144,7 +144,7 @@ orca --approval full-auto
 
 ```toml
 [approval]
-mode = "suggest"
+mode = "auto-edit"
 ```
 
 
@@ -193,7 +193,7 @@ config/orca/config.toml`）
 </Step>
 <Step>
 
-默认值（TUI 为 `suggest`，exec 为 `auto-edit`）
+默认值（TUI 和 exec 均为 `auto-edit`）
 
 </Step>
 </Steps>
@@ -209,7 +209,7 @@ Orca 支持基于文件位置的细粒度审批控制。你可以指定文件夹
 
 ```toml
 [approval]
-mode = "suggest"
+mode = "auto-edit"
 
 # 自动批准这些文件夹内的所有编辑
 trust_folders = [
