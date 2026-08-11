@@ -12,6 +12,7 @@ export const releases = [
     date: "2026-08-12",
     title: "High-parallelism test reliability, fenced goal schema initialization",
     body: "Eliminates the high-parallelism test hangs and flaky failures under --test-threads=16, fences goal schema initialization against concurrent opens, and makes default-parallelism local verification reliable again.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.15",
   },
   {
     version: "v0.3.14",
