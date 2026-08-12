@@ -1255,10 +1255,13 @@ end state.
    state, and persistent `list()` refreshes the complete session snapshot.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
-3. **TUI/runtime protocol drift remains unsliced.** `crates/orca-tui/src/app.rs`
-   is 10,186 lines and `surface_projection.rs` is 2,281 lines. Renderer-owned
-   orchestration and projection duplication remain in the code even though the
-   roadmap matrix has mentioned their convergence in several places.
+3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
+   stream has extracted eight modules so far (insert-escape, presentation,
+   input-wake, workspace-config, scrollback, exit-policy, hosted-side,
+   workflow-panel); `app.rs` is down from 10,186 to 9,764 lines and
+   `types.rs` from 9,442 to 9,243. Renderer-owned orchestration and
+   projection duplication (`surface_projection.rs`, 2,282 lines) remain the
+   open core of this matrix row.
 4. **P2.4 context/cache identity is not a release slice.** DeepSeek usage
    already parses `prompt_cache_hit_tokens` (`crates/orca-provider/src/deepseek_http.rs:192`),
    but deterministic cache-critical prefixes (stable system prompt, tool
