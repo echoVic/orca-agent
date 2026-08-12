@@ -87,3 +87,13 @@ Move the workspace-config category (`mention_search_roots`,
 `crates/orca-tui/src/workspace_config.rs`. The edit-highlight polling
 pair stays (thin AppState delegates, not orchestration). Pure relocation;
 same acceptance as slices 1-3.
+
+## Slice 5: Terminal Scrollback Clear Extraction
+
+### Scope
+
+Move `clear_terminal_scrollback_with` and `clear_terminal_scrollback`
+(app.rs:757-800) into `crates/orca-tui/src/scrollback.rs` (the
+`InlineTerminal` alias import moves along from presentation.rs usage —
+import only, the alias stays in presentation.rs). Pure relocation; same
+acceptance as slices 1-4.
