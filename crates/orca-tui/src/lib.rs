@@ -67,6 +67,7 @@ pub mod vim;
 mod vim_command;
 mod workflow_notifications;
 mod workflow_panel_actions;
+mod workspace_config;
 mod workspace_status;
 
 pub use app::run_tui;

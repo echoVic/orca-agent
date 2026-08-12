@@ -75,6 +75,10 @@ use crate::types::{
 };
 use crate::ui;
 use crate::vim::{PendingInsertEscapeFlow, VimState};
+use crate::workspace_config::{
+    configure_and_preload_tui_state, configure_tui_syntax_state, mention_search_roots,
+    syntax_workspace_root,
+};
 use crate::workspace_status;
 
 use crate::presentation::{
@@ -748,51 +752,6 @@ fn poll_edit_highlight(state: &mut AppState, scheduler: &mut FrameScheduler) -> 
 
 fn edit_highlight_animation_active(state: &AppState) -> bool {
     state.edit_highlight_needs_tick()
-}
-
-fn mention_search_roots(config: &RunConfig, workspace_fallback: &Path) -> Vec<PathBuf> {
-    config
-        .runtime_workspace_roots
-        .as_ref()
-        .filter(|roots| !roots.is_empty())
-        .cloned()
-        .unwrap_or_else(|| {
-            vec![
-                config
-                    .cwd
-                    .clone()
-                    .unwrap_or_else(|| workspace_fallback.into()),
-            ]
-        })
-}
-
-fn syntax_workspace_root(config: &RunConfig) -> PathBuf {
-    config
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-}
-
-fn configure_tui_syntax_state(
-    state: &mut AppState,
-    workspace_root: PathBuf,
-    syntax_theme: crate::syntax_highlight::SyntaxTheme,
-    syntax_color_level: crate::terminal_capabilities::TerminalColorLevel,
-) {
-    state.configure_syntax_highlighting(workspace_root, syntax_theme, syntax_color_level);
-}
-
-fn configure_and_preload_tui_state(
-    state: &mut AppState,
-    workspace_root: PathBuf,
-    syntax_theme: crate::syntax_highlight::SyntaxTheme,
-    syntax_color_level: crate::terminal_capabilities::TerminalColorLevel,
-    messages: impl IntoIterator<Item = ChatMessage>,
-) {
-    configure_tui_syntax_state(state, workspace_root, syntax_theme, syntax_color_level);
-    for message in messages {
-        state.push_message(message);
-    }
 }
 
 fn clear_terminal_scrollback_with<T>(
