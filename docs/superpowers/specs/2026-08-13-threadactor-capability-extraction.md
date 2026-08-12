@@ -141,20 +141,23 @@ until each slice's oracle passes.
 
 ### Scope
 
-Move the capability commit settlement orchestration out of `ThreadActor`
-into `runtime_actor::capability` as one `SurfaceCapabilitySettlement`
-struct owning `&mut` access to the capability controller and the surface
-coordinator:
+Move the capability commit settlement ORCHESTRATION out of `ThreadActor`
+into `runtime_actor::capability`:
 
-- `retry_surface_capability_transition`
-- `apply_surface_capability_commit` (returns the optional
-  `RuntimeActorEffect` reply for the actor to apply — actor-effect
-  application stays in the actor)
-- `apply_deferred_surface_capability_settlement` (deferred variants call
-  the eight actor flows through a new
-  `DeferredCapabilitySettlementDispatcher` trait implemented by
-  `ThreadActor`, breaking the callback cycle)
-- `settle_surface_capability_transitions_for_shutdown`
+- `apply_capability_commit(capability, coordinator, effect)` returns a
+  typed `CapabilityCommitStep` (`Retained` / `Deferred` / `Finished`) that
+  carries the optional `RuntimeActorEffect` reply and, for the deferred
+  case, the owned `PendingSurfaceCapabilitySettlement` + call id.
+- The actor's `apply_surface_capability_commit` matches the step: apply the
+  reply, run the deferred settlement (its own flows), then the
+  `has_transition` check — the callback cycle is broken by returning owned
+  data instead of calling back (a dispatcher trait was considered and
+  rejected: it cannot compile because the actor's settle flows need
+  `&mut self` while the orchestration holds `&mut` into its fields).
+- `retry_surface_capability_transition` and
+  `settle_surface_capability_transitions_for_shutdown` stay thin actor
+  loops delegating to `retry_transition_effect` (already in capability.rs)
+  and the moved apply step.
 
 ### Non-Goals
 
@@ -164,11 +167,11 @@ coordinator:
 
 ### Ownership
 
-- `runtime_actor::capability` owns settlement orchestration; `ThreadActor`
-  keeps command dispatch and the actor-owned settle flows, exposed through
-  the dispatcher trait.
-- The trait methods are typed (no dynamic dispatch objects); one
-  implementation exists.
+- `runtime_actor::capability` owns the commit/resolve/retain/step
+  sequencing; `ThreadActor` keeps command dispatch, the deferred-settlement
+  match, and the actor-owned settle flows.
+- `CapabilityCommitStep` is a typed enum (no dynamic dispatch); the actor
+  is its only consumer.
 
 ### Acceptance
 
