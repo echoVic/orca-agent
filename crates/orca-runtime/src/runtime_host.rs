@@ -18034,83 +18034,9 @@ impl ThreadActor {
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        let waiter_result = match settlement {
-            surface::AcpWriteTextFileSettlement::Completed
-                if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
-            {
-                let result = surface::CapabilityCallResult::WriteTextFileAcknowledged;
-                let canonical =
-                    serde_json::to_vec(&result).expect("write capability result is serializable");
-                call.state = surface::SurfaceCapabilityCallState::Completed {
-                    response_digest: surface_sha256(&canonical),
-                    result,
-                };
-                Ok(())
-            }
-            surface::AcpWriteTextFileSettlement::RemoteError { code, message }
-                if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
-            {
-                let code = surface::AcpCapabilityIdentifier::try_new(code).unwrap_or_else(|_| {
-                    surface::AcpCapabilityIdentifier::try_new("unknown")
-                        .expect("fixed capability error code is bounded")
-                });
-                let message = surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
-                    surface::SafeDiagnosticText::try_new(
-                        "ACP write request returned an invalid remote diagnostic",
-                    )
-                    .expect("fixed capability diagnostic is bounded")
-                });
-                let waiter_error = format!("ACP write request failed: {}", message.as_str());
-                let result = surface::CapabilityCallResult::RemoteError {
-                    code,
-                    message: message.clone(),
-                };
-                let canonical = serde_json::to_vec(&result)
-                    .expect("bounded capability error result is serializable");
-                call.state = surface::SurfaceCapabilityCallState::Completed {
-                    response_digest: surface_sha256(&canonical),
-                    result,
-                };
-                Err(io::Error::other(waiter_error))
-            }
-            surface::AcpWriteTextFileSettlement::FailedBeforeWrite { message }
-                if call.state == surface::SurfaceCapabilityCallState::Prepared =>
-            {
-                let diagnostic =
-                    surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
-                        surface::SafeDiagnosticText::try_new(
-                            "ACP write failed before delivery with an invalid diagnostic",
-                        )
-                        .expect("fixed capability diagnostic is bounded")
-                    });
-                let waiter_error = diagnostic.as_str().to_string();
-                call.state =
-                    surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic };
-                Err(io::Error::new(io::ErrorKind::NotConnected, waiter_error))
-            }
-            surface::AcpWriteTextFileSettlement::ExternalEffectAmbiguous { message }
-                if matches!(
-                    call.state,
-                    surface::SurfaceCapabilityCallState::DeliveryPossible
-                        | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse
-                ) =>
-            {
-                let diagnostic =
-                    surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
-                        surface::SafeDiagnosticText::try_new(
-                            "ACP file write effect was ambiguous with an invalid diagnostic",
-                        )
-                        .expect("fixed capability diagnostic is bounded")
-                    });
-                let waiter_error = diagnostic.as_str().to_string();
-                call.state = surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous {
-                    effect_kind: surface::ExternalEffectKind::FileWrite,
-                    error: diagnostic,
-                };
-                Err(io::Error::other(waiter_error))
-            }
-            _ => return Err(surface::SurfaceClientCommandError::Unauthorized),
-        };
+        let waiter_result = crate::runtime_actor::capability::settle_acp_write_text_file_call(
+            &mut call, settlement,
+        )?;
         let fence = call.fence.clone();
         let batch = if matches!(
             &call.state,
