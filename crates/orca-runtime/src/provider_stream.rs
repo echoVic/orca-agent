@@ -25,6 +25,10 @@ pub struct SuspendedOperationHandle {
     pub(crate) journal_path: std::path::PathBuf,
     pub(crate) operation_id: String,
     pub(crate) spec: orca_core::budget::BudgetSpec,
+    /// The controller's usage at suspension, so the completion path resumes
+    /// accounting from the exact point the loop stopped (turns, tools, cost,
+    /// and wall time) instead of a fresh zero-usage controller.
+    pub(crate) usage: orca_core::budget::BudgetUsage,
 }
 
 pub struct RuntimeProviderSuspension {

@@ -37647,36 +37647,54 @@ fn run_headless_session(
 }
 
 /// Settles a suspended provider exchange against the operation's journal:
-/// the provider-reported usage is recorded (cost + wall time) and the
-/// operation terminal commits once. ApprovalRequired stays non-terminal.
+/// accounting resumes from the exact usage snapshot taken at suspension,
+/// provider cost and wall time are recorded, and the terminal derives from
+/// the controller AFTER accounting — an over-budget exchange commits a
+/// non-resumable Stopped terminal, never a success. ApprovalRequired stays
+/// non-terminal unless the exchange exhausted the budget (a parked operation
+/// whose budget is gone must surface the stop instead of parking forever).
 fn settle_suspended_operation(
     handle: &crate::provider_stream::SuspendedOperationHandle,
     response: &crate::model_response::RuntimeModelResponse,
     model: Option<&str>,
     status: RunStatus,
     error: Option<&str>,
-) {
-    let Ok(mut operation) = crate::operation_context::OperationContext::reopen(
+) -> io::Result<()> {
+    let mut operation = crate::operation_context::OperationContext::reopen(
         handle.journal_path.clone(),
         handle.spec,
         &handle.operation_id,
-    ) else {
-        return;
-    };
+    )?;
+    // Resume accounting from the suspension snapshot: turns, tools, cost,
+    // and wall time continue exactly where the loop stopped.
+    operation.controller.restore_usage(handle.usage);
+
     let usage = provider_response_usage_totals(&response.response, model);
+    let mut budget_stop = None;
     if let Some(usage) = usage {
         let spent = crate::cost::usd_to_micros(usage.estimated_cost_usd);
         let recorded = operation.controller.usage().cost_usd_micros;
         let delta = spent.saturating_sub(recorded);
-        if delta > 0 {
-            // Cost exhaustion latches the controller; the next admission
-            // surfaces it as a typed stop.
-            let _ = operation.record_cost_usd_micros(delta);
+        if delta > 0
+            && let Err(stop) = operation.record_cost_usd_micros(delta)
+        {
+            budget_stop = Some(stop);
         }
     }
-    let _ = operation.sync_wall_time();
-    if status == RunStatus::ApprovalRequired {
-        return;
+    if budget_stop.is_none()
+        && let Err(stop) = operation.sync_wall_time()
+    {
+        budget_stop = Some(stop);
+    }
+    if status == RunStatus::ApprovalRequired && budget_stop.is_none() {
+        return Ok(());
+    }
+    if let Some(_stop) = budget_stop {
+        // The exchange exceeded the budget: a non-resumable Stopped terminal
+        // (no durable conversation boundary exists in the background path).
+        let checkpoint_id = format!("{}-budget-stop", handle.operation_id);
+        operation.commit_non_resumable_budget_stop(&handle.operation_id, &checkpoint_id)?;
+        return Ok(());
     }
     let terminal = match status {
         RunStatus::Success => orca_core::budget::OperationTerminal::Completed {
@@ -37691,7 +37709,8 @@ fn settle_suspended_operation(
             message: error.unwrap_or_default().to_string(),
         },
     };
-    let _ = operation.commit_terminal(&handle.operation_id, terminal);
+    operation.commit_terminal(&handle.operation_id, terminal)?;
+    Ok(())
 }
 
 fn run_provider_background_task(
@@ -37774,14 +37793,15 @@ fn run_provider_background_task(
     // the operation stays parked for approval and may resume).
     if let Some(handle) = suspension.operation()
         && let Some(response) = response.as_ref()
-    {
-        settle_suspended_operation(
+        && let Err(settle_error) = settle_suspended_operation(
             handle,
             response,
             context.model.as_deref(),
             status,
             error.as_deref(),
-        );
+        )
+    {
+        eprintln!("orca: warning: failed to settle suspended operation: {settle_error}");
     }
 
     if let Some(surface_outcome) = context.surface_outcome {
@@ -51303,5 +51323,158 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(handle);
         responder.join().expect("retry responder");
+    }
+
+    #[test]
+    fn suspended_exchange_resumes_accounting_from_snapshot_and_stops_over_budget() {
+        use crate::provider_stream::SuspendedOperationHandle;
+        use orca_core::budget::{BudgetSpec, BudgetUsage};
+        use orca_core::provider_types::Usage;
+
+        // A suspended exchange whose provider cost, added to the suspension
+        // snapshot, stays inside the budget resumes accounting from the
+        // snapshot: the Completed terminal must carry the PRE-suspension
+        // turns and the merged cost, not a fresh zero-usage controller.
+        let spec = BudgetSpec {
+            max_cost_usd_micros: Some(100_000),
+            ..BudgetSpec::default()
+        };
+        let mut operation =
+            crate::operation_context::OperationContext::for_tests(spec, "op-settle-under");
+        operation.controller.restore_usage(BudgetUsage {
+            turns: 3,
+            tool_calls: 1,
+            cost_usd_micros: 4_000,
+            wall_time_ms: 0,
+        });
+        let handle = SuspendedOperationHandle {
+            journal_path: operation.journal.path().to_path_buf(),
+            operation_id: operation.journal.operation_id().to_string(),
+            spec,
+            usage: operation.controller.usage(),
+        };
+        drop(operation);
+        let response = RuntimeModelResponse::new(
+            ProviderResponse {
+                steps: Vec::new(),
+                assistant_content: Some("finished".to_string()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                // V4-Flash pricing: 100k in + 10k out = 14,000 + 2,800 micros.
+                usage: Some(Usage {
+                    input_tokens: 100_000,
+                    output_tokens: 10_000,
+                    cache_tokens: 0,
+                }),
+            },
+            orca_core::thread_identity::TurnId::new(),
+        );
+        settle_suspended_operation(
+            &handle,
+            &response,
+            Some("deepseek-v4-flash"),
+            RunStatus::Success,
+            None,
+        )
+        .expect("under-budget settle succeeds");
+        let reopened = crate::operation_context::OperationContext::reopen(
+            handle.journal_path,
+            spec,
+            &handle.operation_id,
+        )
+        .expect("journal reopens");
+        let terminal = reopened
+            .journal
+            .committed()
+            .iter()
+            .find_map(|record| match record {
+                crate::execution_journal::JournalRecord::OperationTerminal { terminal, .. } => {
+                    Some(terminal)
+                }
+                _ => None,
+            })
+            .expect("settled terminal");
+        let orca_core::budget::OperationTerminal::Completed { usage } = terminal else {
+            panic!("under-budget settle must commit Completed, got {terminal:?}");
+        };
+        assert_eq!(usage.turns, 3, "accounting resumed from the snapshot");
+        assert_eq!(
+            usage.tool_calls, 1,
+            "tool accounting resumed from the snapshot"
+        );
+        assert_eq!(
+            usage.cost_usd_micros, 16_800,
+            "the provider-reported total for the exchange is charged exactly once"
+        );
+
+        // The same exchange against a budget the snapshot + delta exceeds
+        // commits a NON-resumable Stopped terminal: the background completion
+        // path has no durable conversation boundary, and a crash must never
+        // leave a resumable terminal without one.
+        let strict_spec = BudgetSpec {
+            max_cost_usd_micros: Some(5_000),
+            ..BudgetSpec::default()
+        };
+        let mut operation =
+            crate::operation_context::OperationContext::for_tests(strict_spec, "op-settle-over");
+        operation.controller.restore_usage(BudgetUsage {
+            turns: 1,
+            tool_calls: 0,
+            cost_usd_micros: 4_000,
+            wall_time_ms: 0,
+        });
+        let handle = SuspendedOperationHandle {
+            journal_path: operation.journal.path().to_path_buf(),
+            operation_id: operation.journal.operation_id().to_string(),
+            spec: strict_spec,
+            usage: operation.controller.usage(),
+        };
+        drop(operation);
+        settle_suspended_operation(
+            &handle,
+            &response,
+            Some("deepseek-v4-flash"),
+            RunStatus::Success,
+            None,
+        )
+        .expect("over-budget settle still commits its journal record");
+        let reopened = crate::operation_context::OperationContext::reopen(
+            handle.journal_path,
+            strict_spec,
+            &handle.operation_id,
+        )
+        .expect("journal reopens");
+        let terminal = reopened
+            .journal
+            .committed()
+            .iter()
+            .find_map(|record| match record {
+                crate::execution_journal::JournalRecord::OperationTerminal { terminal, .. } => {
+                    Some(terminal)
+                }
+                _ => None,
+            })
+            .expect("settled terminal");
+        let orca_core::budget::OperationTerminal::Stopped {
+            reason,
+            checkpoint_id,
+            resumable,
+            ..
+        } = terminal
+        else {
+            panic!("over-budget settle must commit Stopped, got {terminal:?}");
+        };
+        assert!(
+            matches!(reason, orca_core::budget::StopReason::CostBudget { .. }),
+            "the cost dimension is the exhausted one, got {reason:?}"
+        );
+        assert!(
+            !checkpoint_id.is_empty(),
+            "the stop carries its journal checkpoint id"
+        );
+        assert!(
+            !resumable,
+            "no durable conversation boundary exists in the background path"
+        );
     }
 }

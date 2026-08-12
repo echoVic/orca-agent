@@ -837,3 +837,46 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
 }
+
+#[test]
+fn turn_budget_exhausted_session_writes_distinct_checkpoint_reason() {
+    let home = TempDir::new().expect("temp home");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--provider",
+            "mock",
+            "--max-turns",
+            "1",
+            "mock_repeat_read 2",
+        ])
+        .output()
+        .expect("run turn-limited orca");
+    assert_eq!(first.status.code(), Some(4));
+
+    let records = &session_documents(home.path())[0].1;
+    let checkpoint = records
+        .iter()
+        .find(|record| record["type"] == "session.checkpoint")
+        .expect("typed checkpoint on turn budget exhaustion");
+    assert_eq!(checkpoint["status"], "budget_exhausted");
+    assert_eq!(
+        checkpoint["reason"], "turn_budget_exhausted",
+        "the turn dimension carries its own reason instead of masquerading as cost exhaustion"
+    );
+    assert_eq!(checkpoint["resumable"], true);
+    let checkpoint_index = records
+        .iter()
+        .position(|record| record["type"] == "session.checkpoint")
+        .expect("checkpoint index");
+    let completed_index = records
+        .iter()
+        .position(|record| record["type"] == "session.completed")
+        .expect("completed index");
+    assert!(
+        checkpoint_index < completed_index,
+        "the resume boundary (session checkpoint) lands BEFORE the terminal"
+    );
+}

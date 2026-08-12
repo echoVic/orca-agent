@@ -404,5 +404,13 @@ fn headless_budget_stop_skips_verifier_and_keeps_stopped_terminal() {
         "terminal must stay the typed Stopped terminal"
     );
     let stopped = &terminals[0]["payload"]["terminal"]["stopped"];
-    assert!(stopped["resumable"] == true);
+    // Stateless run (jsonl without --save-history): no durable conversation
+    // boundary exists, so the stop must never claim resumability.
+    assert!(stopped["resumable"] == false);
+    assert!(
+        stopped["checkpoint_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "the stop still carries its checkpoint id"
+    );
 }

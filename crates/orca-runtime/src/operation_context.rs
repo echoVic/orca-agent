@@ -189,11 +189,12 @@ impl OperationContext {
 
     /// Commits a budget stop with the real resume boundary, in this order:
     /// the session checkpoint (carrying the durable last-committed message
-    /// id) is written first, then the operation journal's checkpoint and
-    /// terminal. A crash after this returns can never leave a resumable
-    /// terminal without a durable conversation boundary to resume from.
-    /// Without a session writer (stateless operation) the journal still
-    /// records the checkpoint, but no message boundary exists.
+    /// id and the real stop reason) is written first, then the operation
+    /// journal's checkpoint and terminal. A crash after this returns can
+    /// never leave a resumable terminal without a durable conversation
+    /// boundary to resume from. Without a session writer (stateless
+    /// operation) the stop is committed NON-resumable: no durable
+    /// conversation boundary exists to resume from.
     pub(crate) fn commit_budget_stop_with_boundary(
         &mut self,
         turn_id: &str,
@@ -201,18 +202,19 @@ impl OperationContext {
         mut session_writer: Option<&mut crate::thread_store::SessionWriter>,
         budget_consumed: &orca_core::cost_types::UsageTotals,
         task_plan: Option<&str>,
+        stop: BudgetStop,
     ) -> io::Result<OperationTerminal> {
         let checkpoint_id = format!("{events_run_id}-budget-stop");
         // 1. The session/conversation checkpoint with the real durable
         //    message boundary comes first; the resume boundary must exist
         //    before any terminal claims resumability.
-        let message_id = if let Some(writer) = session_writer.as_deref_mut() {
+        if let Some(writer) = session_writer.as_deref_mut() {
             let checkpoint = crate::thread_store::SessionCheckpointRecord {
                 session_id: writer
                     .session_id()
                     .unwrap_or_else(|| events_run_id.to_string()),
                 status: "budget_exhausted".to_string(),
-                reason: Some("cost_budget_exhausted".to_string()),
+                reason: Some(session_checkpoint_reason(&stop).to_string()),
                 budget_consumed: budget_consumed.clone(),
                 last_committed_message_id: writer.last_committed_message_id(),
                 resumable: true,
@@ -220,13 +222,56 @@ impl OperationContext {
                 recorded_at: chrono::Utc::now(),
             };
             writer.append_checkpoint(checkpoint)?;
-            writer.last_committed_message_id()
+            let message_id = writer.last_committed_message_id();
+            // 2. The operation journal's checkpoint references the durable
+            //    boundary, then the terminal follows.
+            self.commit_budget_stop(turn_id, &checkpoint_id, message_id.as_deref())
         } else {
-            None
-        };
-        // 2. The operation journal's checkpoint references the durable
-        //    boundary, then the terminal follows.
-        self.commit_budget_stop(turn_id, &checkpoint_id, message_id.as_deref())
+            // Stateless: no durable conversation boundary exists, so the
+            // stop must never claim resumability.
+            self.commit_non_resumable_budget_stop(turn_id, &checkpoint_id)
+        }
+    }
+
+    /// Commits a NON-resumable budget stop: the journal records a checkpoint
+    /// with no message boundary and the Stopped terminal stays
+    /// `resumable: false` (the controller never records the checkpoint, so
+    /// no resume boundary is ever claimed). Used for stateless operations
+    /// and suspended exchanges that exceeded their budget without a durable
+    /// conversation boundary.
+    pub(crate) fn commit_non_resumable_budget_stop(
+        &mut self,
+        turn_id: &str,
+        checkpoint_id: &str,
+    ) -> io::Result<OperationTerminal> {
+        self.journal
+            .append_durable(JournalRecord::CheckpointCreated {
+                operation_id: self.journal.operation_id().to_string(),
+                turn_id: turn_id.to_string(),
+                ordinal: 0,
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                checkpoint_id: checkpoint_id.to_string(),
+                message_id: None,
+            })?;
+        // The journal fact carries the checkpoint id; the terminal keeps it
+        // but NEVER claims resumability (the controller recorded no resume
+        // boundary, so `resumable` stays false).
+        let mut terminal = self.controller.terminal();
+        if let OperationTerminal::Stopped {
+            checkpoint_id: id, ..
+        } = &mut terminal
+        {
+            *id = checkpoint_id.to_string();
+        }
+        self.journal
+            .append_durable(JournalRecord::OperationTerminal {
+                operation_id: self.journal.operation_id().to_string(),
+                turn_id: turn_id.to_string(),
+                ordinal: 0,
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                terminal: terminal.clone(),
+            })?;
+        Ok(terminal)
     }
 
     /// Appends the `operation.terminal` record once, when the loop exits
@@ -265,6 +310,19 @@ impl OperationContext {
     }
 }
 
+/// The session checkpoint reason string: the legacy cost string stays
+/// byte-stable for history consumers; every other dimension carries its own
+/// distinct reason instead of masquerading as cost exhaustion.
+fn session_checkpoint_reason(stop: &BudgetStop) -> &'static str {
+    use orca_core::budget::StopReason;
+    match stop.reason {
+        StopReason::CostBudget { .. } => "cost_budget_exhausted",
+        StopReason::TurnBudget { .. } => "turn_budget_exhausted",
+        StopReason::ToolCallBudget { .. } => "tool_call_budget_exhausted",
+        StopReason::WallTimeBudget { .. } => "wall_time_budget_exhausted",
+    }
+}
+
 fn journal_path(operation_id: &str, persistent: bool) -> PathBuf {
     let stem = operation_id
         .chars()
@@ -295,6 +353,56 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::*;
     use orca_core::budget::StopReason;
+
+    #[test]
+    fn stateless_budget_stop_commits_non_resumable_terminal_without_boundary() {
+        let mut context = OperationContext::for_tests(
+            BudgetSpec {
+                max_turns: Some(1),
+                ..BudgetSpec::default()
+            },
+            "op-stateless",
+        );
+        context
+            .admit_turn("turn-1")
+            .expect("journal ok")
+            .expect("admitted");
+        let stop = context.controller.admit_turn().expect_err("exhausted");
+        let budget_consumed = orca_core::cost_types::UsageTotals {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_tokens: 0,
+            estimated_cost_usd: 0.0,
+        };
+        let terminal = context
+            .commit_budget_stop_with_boundary(
+                "turn-1",
+                "run-stateless",
+                None,
+                &budget_consumed,
+                None,
+                stop,
+            )
+            .expect("stop committed");
+        match terminal {
+            OperationTerminal::Stopped {
+                checkpoint_id,
+                resumable,
+                ..
+            } => {
+                assert!(!resumable, "stateless stop must never claim resumability");
+                assert!(
+                    !checkpoint_id.is_empty(),
+                    "the stop still carries its journal checkpoint id"
+                );
+            }
+            other => panic!("expected Stopped terminal, got {other:?}"),
+        }
+        // The journal recorded a checkpoint with no message boundary and the
+        // non-resumable terminal.
+        assert!(context.journal.last_checkpoint().is_some());
+        assert!(context.journal.has_terminal());
+    }
 
     #[test]
     fn open_stamps_operation_started_once() {

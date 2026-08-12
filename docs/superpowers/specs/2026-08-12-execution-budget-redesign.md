@@ -212,3 +212,93 @@ typed terminal (Tasks 5–6), resume/goals/children become budget-correct
 and docs are deleted (Task 10). Obsolete 128-turn fixtures are removed only
 after replacement tests pass. No compatibility shim keeps `max_budget_usd` or
 `BudgetExhausted` alive in production paths.
+
+## Review Round 3 Addendum: Suspension, Stateless Stops, and Lease Settlement
+
+Classification: boundary defects found while re-reviewing the round-2 fixes.
+Each closes a case where a terminal could misreport the durable state.
+
+1. **Suspended exchange resumes accounting from its snapshot.** The
+   suspended-provider completion path reopens the journal with a fresh
+   controller, so pre-suspension turns, tool calls, and cost were forgotten and
+   the exchange total could be undercounted. `SuspendedOperationHandle` now
+   carries the controller `usage` at suspension and `BudgetController::
+   restore_usage` restores it before the provider cost/wall-time delta is
+   recorded. Verified by
+   `runtime_host::tests::suspended_exchange_resumes_accounting_from_snapshot_and_stops_over_budget`.
+
+2. **An over-budget suspended exchange commits a non-resumable Stopped
+   terminal.** The background completion path has no durable conversation
+   boundary, so a success terminal for an over-budget exchange was a lie, and a
+   resumable stop would have claimed a boundary that does not exist.
+   `settle_suspended_operation` derives the terminal from the controller AFTER
+   accounting: over-budget commits `commit_non_resumable_budget_stop`
+   (checkpoint recorded with no message id, terminal `resumable: false`) and
+   failures now propagate as `io::Result` instead of being silently dropped.
+   `ApprovalRequired` without a budget stop still stays parked; approval plus
+   an exhausted budget surfaces the stop instead of parking forever. Verified
+   by the same runtime_host test.
+
+3. **Stateless budget stops are never resumable.** With no session writer there
+   is no durable message boundary; `commit_budget_stop_with_boundary` now
+   commits the non-resumable path for stateless operations (the terminal still
+   carries its journal checkpoint id). Verified by
+   `operation_context::tests::stateless_budget_stop_commits_non_resumable_terminal_without_boundary`
+   and `tests/agent_loop_contract.rs::headless_budget_stop_skips_verifier_and_keeps_stopped_terminal`
+   (resumable false, checkpoint id present).
+
+4. **Session checkpoint reason is dimension-specific.** Turn, tool-call, and
+   wall-time stops each write their own reason
+   (`turn_budget_exhausted`, `tool_call_budget_exhausted`,
+   `wall_time_budget_exhausted`) instead of masquerading as cost exhaustion;
+   the cost string stays byte-stable for existing history consumers. Verified
+   by `tests/history_contract.rs::turn_budget_exhausted_session_writes_distinct_checkpoint_reason`.
+
+5. **Batch children partition the configured spec evenly.** The first child
+   lease can no longer monopolize the parent's finite remainder:
+   `divide_spec_across_children` shares each bounded dimension (floored at one;
+   unlimited stays unlimited) before leasing, and the controller still
+   intersects with actual remaining capacity, so children can never double
+   spend. Verified by
+   `tool_turn::tests::batch_child_spec_partitions_finite_dimensions_and_keeps_unlimited`.
+
+6. **Lease refusal settles in journal order.** When the parent refuses a batch
+   child lease, settlement order is: granted leases, then every admitted batch
+   tool as cancelled (`tool.completed` durable), then the conversation, then
+   the session boundary, then the journal checkpoint + terminal — a checkpoint
+   can never precede open tool settlement. A refused single-subagent lease is a
+   typed budget stop, never a silent fallback to an unbounded child.
+
+7. **Child receipts survive persistence failures.**
+   `run_subagent_batch_tool_turn` returns the child usage receipts alongside
+   its `io::Result`, so the parent still charges exactly what each completed
+   child consumed when the event stream fails after terminals are recorded.
+   Verified by
+   `subagent_execution::tests::batch_persistence_failure_preserves_completed_child_receipts`.
+
+8. **Tool settlement carries the committed outcome.** Conversation tool
+   settlement reads both the committed status label and the committed terminal
+   error; the journal never disagrees with the conversation about a tool's
+   outcome and never hardcodes success.
+
+Compatibility: no CLI, JSONL envelope, or persisted-format shape changes; the
+round only corrects terminal facts (reason strings add new dimension-specific
+values, resumability becomes truthful). Normal, cancellation, rejection,
+timeout, retry, disconnect, and restart semantics are unchanged from the
+redesign contract.
+
+Acceptance: the five named tests pass plus the full focused gate below:
+
+```bash
+cargo test --test execution_budget_contract --locked
+cargo test --test agent_loop_contract --locked -- --test-threads=1
+cargo test --test history_contract --locked -- --test-threads=1
+cargo test --test exec_jsonl --locked -- --test-threads=1
+cargo test -p orca-runtime --test budget_lease_contract --locked -- --test-threads=1
+cargo test -p orca-runtime --test budget_resume_contract --locked -- --test-threads=1
+cargo test -p orca-runtime --test operation_terminal_contract --locked
+cargo test -p orca-runtime --test execution_journal --locked -- --test-threads=1
+cargo test -p orca-runtime --lib -- operation_context::tests::stateless_budget_stop \
+  runtime_host::tests::suspended_exchange tool_turn::tests::batch_child_spec \
+  subagent_execution::tests::batch_persistence
+```

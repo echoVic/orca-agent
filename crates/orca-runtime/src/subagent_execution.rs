@@ -168,7 +168,10 @@ pub(crate) fn record_subagent_batch_results(
 
 pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
     context: RuntimeSubagentBatchToolTurnContext<'_, W>,
-) -> io::Result<(ToolTurnOutcome, Vec<Option<orca_core::budget::BudgetUsage>>)> {
+) -> (
+    io::Result<ToolTurnOutcome>,
+    Vec<Option<orca_core::budget::BudgetUsage>>,
+) {
     let RuntimeSubagentBatchToolTurnContext {
         request,
         io,
@@ -224,27 +227,32 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         &child_budgets,
     );
 
-    let record_outcome = record_subagent_batch_results(
+    let receipts = execution.child_budget_usage;
+    let record_outcome = match record_subagent_batch_results(
         conversation,
         history_writer,
         execution.results,
         emit_deltas,
-    )?;
+    ) {
+        Ok(record_outcome) => record_outcome,
+        // Child receipts survive persistence failures: the parent still
+        // charges exactly what each child consumed.
+        Err(error) => return (Err(error), receipts),
+    };
     if let Some(error) = execution.event_error {
-        return Err(error);
+        return (Err(error), receipts);
     }
 
-    let receipts = execution.child_budget_usage;
     match record_outcome {
-        SubagentBatchRecordOutcome::Continue => Ok((ToolTurnOutcome::Continue, receipts)),
-        SubagentBatchRecordOutcome::Return { status, error } => Ok((
-            ToolTurnOutcome::Return {
+        SubagentBatchRecordOutcome::Continue => (Ok(ToolTurnOutcome::Continue), receipts),
+        SubagentBatchRecordOutcome::Return { status, error } => (
+            Ok(ToolTurnOutcome::Return {
                 status,
                 error,
                 terminal: None,
-            },
+            }),
             receipts,
-        )),
+        ),
     }
 }
 
@@ -1013,7 +1021,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-batch-turn".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
-        let (outcome, _receipts) =
+        let (batch_result, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
@@ -1043,8 +1051,8 @@ mod tests {
                     workflow_ipc: None,
                 },
                 child_executor: fake_child_executor::<std::io::Sink>,
-            })
-            .expect("run subagent batch tool turn");
+            });
+        let outcome = batch_result.expect("run subagent batch tool turn");
 
         assert!(matches!(outcome, ToolTurnOutcome::Continue));
         assert_eq!(conversation.messages.len(), 2);
@@ -1185,7 +1193,7 @@ mod tests {
         let mut conversation = orca_core::conversation::Conversation::new();
         let started = Instant::now();
 
-        let (outcome, _receipts) =
+        let (batch_result, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
@@ -1215,8 +1223,8 @@ mod tests {
                     workflow_ipc: None,
                 },
                 child_executor: cancelling_child_executor::<std::io::Sink>,
-            })
-            .expect("cancel subagent batch");
+            });
+        let outcome = batch_result.expect("cancel subagent batch");
 
         assert!(started.elapsed() < platform_test_deadline(2, 4));
         assert!(matches!(
@@ -1258,8 +1266,8 @@ mod tests {
         let mut conversation = orca_core::conversation::Conversation::new();
         let started = Instant::now();
 
-        let error =
-            match super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
+        let (batch_result, _receipts) =
+            super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
                     cwd: cwd.path(),
@@ -1288,10 +1296,11 @@ mod tests {
                     workflow_ipc: None,
                 },
                 child_executor: delayed_child_executor::<std::io::Sink>,
-            }) {
-                Err(error) => error,
-                Ok(_) => panic!("third event flush should fail after recording terminals"),
-            };
+            });
+        let error = match batch_result {
+            Err(error) => error,
+            Ok(_) => panic!("third event flush should fail after recording terminals"),
+        };
 
         assert!(error.to_string().contains("event consumer disconnected"));
         assert!(started.elapsed() >= Duration::from_millis(200));
@@ -1332,7 +1341,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-batch-panic".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
-        let (outcome, _receipts) =
+        let (batch_result, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
@@ -1362,8 +1371,8 @@ mod tests {
                     workflow_ipc: None,
                 },
                 child_executor: panic_child_executor::<std::io::Sink>,
-            })
-            .expect("panic must become a terminal result");
+            });
+        let outcome = batch_result.expect("panic must become a terminal result");
 
         assert!(matches!(
             outcome,
@@ -1595,7 +1604,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-batch-cancelled".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
-        let (outcome, _receipts) =
+        let (batch_result, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
@@ -1625,8 +1634,8 @@ mod tests {
                     workflow_ipc: None,
                 },
                 child_executor: cancelled_child_executor::<std::io::Sink>,
-            })
-            .expect("run cancelled subagent batch");
+            });
+        let outcome = batch_result.expect("run cancelled subagent batch");
 
         assert!(matches!(
             outcome,
@@ -1936,5 +1945,114 @@ mod tests {
             result.error.as_deref(),
             Some("Subagent status: Cancelled\n\nchild turn cancelled")
         );
+    }
+
+    fn receipt_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("finished".to_string()),
+            error: None,
+            budget_usage: Some(orca_core::budget::BudgetUsage {
+                turns: 2,
+                tool_calls: 3,
+                cost_usd_micros: 700,
+                wall_time_ms: 0,
+            }),
+        })
+    }
+
+    #[test]
+    fn batch_persistence_failure_preserves_completed_child_receipts() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_parallel = 2;
+        let config = config(subagents);
+        let mut events = EventFactory::new("subagent-batch-receipt-survival".to_string());
+        let mut sink = EventSink::new(FailThirdFlush::default(), OutputFormat::Text);
+        let requests = vec![subagent_request("first"), subagent_request("second")];
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-batch-receipt-survival".to_string());
+        let mut conversation = orca_core::conversation::Conversation::new();
+
+        let (batch_result, receipts) =
+            super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
+                request: super::RuntimeSubagentBatchToolTurnRequest {
+                    config: &config,
+                    cwd: cwd.path(),
+                    tool_requests: &requests,
+                    subagent_depth: 0,
+                    child_budgets: Vec::new(),
+                    emit_deltas: true,
+                },
+                io: super::RuntimeSubagentBatchToolTurnIo {
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: None,
+                    cost_tracker: &mut cost_tracker,
+                },
+                services: super::RuntimeSubagentBatchToolTurnServices {
+                    instructions: &instructions,
+                    memory: &memory,
+                    mcp_registry: &mcp_registry,
+                    hooks: &hooks,
+                },
+                runtime: super::RuntimeSubagentBatchToolTurnRuntime {
+                    cancel: &cancel,
+                    task_registry: &task_registry,
+                    root_task_id: None,
+                    workflow_ipc: None,
+                },
+                child_executor: receipt_child_executor::<std::io::Sink>,
+            });
+        let error = match batch_result {
+            Err(error) => error,
+            Ok(_) => panic!("third event flush should fail after recording terminals"),
+        };
+        assert!(error.to_string().contains("event consumer disconnected"));
+        assert_eq!(
+            receipts.len(),
+            2,
+            "the receipt vector survives the persistence failure"
+        );
+        assert_eq!(
+            receipts[0],
+            Some(orca_core::budget::BudgetUsage {
+                turns: 2,
+                tool_calls: 3,
+                cost_usd_micros: 700,
+                wall_time_ms: 0,
+            }),
+            "the completed child's consumed usage reaches the parent even when persistence fails"
+        );
+        assert_eq!(
+            receipts[1], None,
+            "a child that never started has no receipt"
+        );
+        assert!(matches!(
+            &conversation.messages[0],
+            orca_core::conversation::Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == tool_types::ToolStatus::Completed
+        ));
+        assert!(matches!(
+            &conversation.messages[1],
+            orca_core::conversation::Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == tool_types::ToolStatus::Failed
+                && terminal.started == tool_types::ToolInvocationStarted::No
+        ));
     }
 }

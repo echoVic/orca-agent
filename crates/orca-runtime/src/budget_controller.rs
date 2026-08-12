@@ -76,6 +76,13 @@ impl BudgetController {
         self.usage
     }
 
+    /// Restores accounting state for a resumed controller (the suspended
+    /// provider completion path). Wall time keeps the snapshot value and
+    /// continues accumulating from the restore point via `sync_wall_time`.
+    pub(crate) fn restore_usage(&mut self, usage: BudgetUsage) {
+        self.usage = usage;
+    }
+
     pub fn is_unlimited(&self) -> bool {
         self.spec.is_unlimited()
     }

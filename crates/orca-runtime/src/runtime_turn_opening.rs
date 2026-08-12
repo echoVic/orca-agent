@@ -71,6 +71,7 @@ impl RuntimeTurnOpeningStep {
                 input.history_writer.as_deref_mut(),
                 &input.cost_tracker.totals(),
                 None,
+                stop,
             )?;
             let result = AgentLoopResult::budget_stop(terminal, stop);
             if let Some(error) = result.error.as_deref()

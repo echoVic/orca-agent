@@ -73,6 +73,12 @@ threads-required = 2
 filter = "binary(=agent_loop_contract) & test(=headless_max_inner_turns_preserve_trajectory_truth)"
 slow-timeout = { period = "120s", terminate-after = 2 }
 
+# The unlimited 257-turn mock run is a real end-to-end loop exercise; in
+# debug builds it legitimately takes minutes (measured ~214s locally).
+[[profile.ci.overrides]]
+filter = "binary(=agent_loop_contract) & test(=headless_unlimited_run_completes_128_tool_cycles)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & test(/^acp::supervisor::tests::/)"
 threads-required = 2

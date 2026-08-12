@@ -428,6 +428,7 @@ impl RuntimeProviderTurnStep {
                             journal_path: input.operation.journal.path().to_path_buf(),
                             operation_id: input.operation.journal.operation_id().to_string(),
                             spec: *input.operation.controller.spec(),
+                            usage: input.operation.controller.usage(),
                         },
                     ),
                 ));
@@ -495,6 +496,7 @@ impl RuntimeProviderTurnStep {
                 history_writer.as_deref_mut(),
                 &cost_tracker.totals(),
                 None,
+                stop,
             )?;
             return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
                 status: RunStatus::Failed,
