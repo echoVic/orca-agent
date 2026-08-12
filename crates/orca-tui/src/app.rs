@@ -41,6 +41,7 @@ use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{
     make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
 };
+use crate::exit_policy::{exit_resume_hint, exit_session_id};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::input_event_actions::{
@@ -159,24 +160,6 @@ fn rotate_attached_event_sender(
 struct TuiExit {
     code: i32,
     session_id: Option<String>,
-}
-
-fn exit_resume_hint(session_id: Option<&str>) -> Option<String> {
-    session_id.map(|session_id| format!("Resume this session with:\norca --resume {session_id}\n"))
-}
-
-fn exit_session_id(
-    active_session_id: Option<String>,
-    history_mode: &HistoryMode,
-) -> Option<String> {
-    if let HistoryMode::Resume(selector) = history_mode {
-        RuntimeSurfaceHostHandle::load_saved_session(selector)
-            .ok()
-            .map(|transcript| transcript.meta.session_id)
-            .or(active_session_id)
-    } else {
-        active_session_id
-    }
 }
 
 pub fn run_tui(config: RunConfig) -> i32 {

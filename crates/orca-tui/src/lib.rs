@@ -19,6 +19,7 @@ pub mod diff;
 mod diff_highlight;
 mod display_text;
 mod edit_highlight_worker;
+mod exit_policy;
 mod frame_scheduler;
 mod global_actions;
 mod hosted_runtime;
