@@ -281,16 +281,21 @@ Round-3 re-investigation status (fresh runs with temporary diagnostics):
 
 - acp: the full-60s stall did NOT reproduce in 10 additional default-
   parallelism runs (0/10; previously 1/8 under the release-build load). It
-  reproduced once more on 2026-08-13 with decisive new evidence: the
-  `orca-runtime-worker` thread panicked inside the multi-terminal executor
-  (outcome send after the test's 60s deadline), and the test-side
-  `outcome_rx.recv_timeout(TEST_TIMEOUT)` elapsed first — so the executor's
-  terminal-create capability flow was BUSY past 60s under contention (the
-  worker panic is a consequence, not the cause). The stall therefore lives
-  in the runtime-host surface capability settlement path under load — the
-  same region the ThreadActor capability extraction (roadmap slice 2) is
-  now refactoring. CI stays mitigated by the nextest `threads-required = 2`
-  override; root-causing continues alongside that refactor.
+  reproduced again on 2026-08-13 WITH a full-thread-stack capture
+  (`sample`, temporary instrumentation) — decisive evidence:
+  `concurrent_terminals_from_one_tool_keep_cleanup_identity_exact` timed
+  out in its terminal/kill|release read loop after both terminal/create
+  round-trips completed, while EVERY worker thread was idle/parked and the
+  host thread was parked: no thread was busy, and no cleanup frame was ever
+  delivered to the client. The stall is therefore a MESSAGE-DELIVERY GAP in
+  the terminal-cleanup lane (the executor's close() output never reaching
+  the connection task's client write), not a busy-wait, lock contention, or
+  worker death (an earlier round's worker panic at the outcome send was a
+  consequence of the test-side deadline firing first). Next trace step:
+  follow `TerminalHandle::close()` -> AcpClientBridge cleanup lane ->
+  `run_connection` select to find the silent drop point, then pin it with a
+  RED test that forces the cleanup-lane interleaving. CI stays mitigated by
+  the nextest `threads-required = 2` override for `acp::supervisor::tests`.
 - server domain-policy: CORRECTION — the `timeoutMs` guard was not the
   mechanism. With `timeoutMs: 60000` the two tests still failed fast
   (`command_exec_completed` absent, suite finished in ~34s, so the command
