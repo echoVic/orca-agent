@@ -248,3 +248,24 @@ resulting call state), commit-with-retry, retain, and reply application.
 2. Behavioral oracle unchanged (runtime_host 66/66 x 5, lib suite green,
    nextest ci lib gate green, fmt + diff-check clean).
 3. Diff review: relocation plus the call boundary only.
+
+## Slice 5: ACP Terminal Create Settlement State Machine
+
+### Scope
+
+Same pattern as slices 3-4 for the terminal create flow: move the pure
+settlement state machine out of `settle_surface_acp_terminal_create` into
+`settle_acp_terminal_create_call(call, settlement) ->
+Result<AcpTerminalCreateSettleOutcome, SurfaceClientCommandError>` where
+the outcome carries `waiter_result: (io::Result<String>,
+Option<SurfaceRemoteTerminalId>)` — the completed terminal id drives the
+actor's batch choice (completed/ambiguous/plain) unchanged. Rejection
+semantics stay exact (outer Unauthorized for non-matching settlements).
+
+### Acceptance
+
+1. The state machine lives in capability.rs; the actor uses it; compile
+   clean.
+2. Behavioral oracle unchanged (runtime_host 66/66 x 5, lib suite green,
+   nextest ci lib gate green, fmt + diff-check clean).
+3. Diff review: relocation plus the call boundary only.
