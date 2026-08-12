@@ -1469,6 +1469,8 @@ impl RuntimeSurfaceTerminalCreateHandler {
         request: &orca_core::tool_types::ToolRequest,
         terminal_id: String,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        let close_detail = terminal_id.clone();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let mut command = ThreadCommand::SurfaceRequestAcpTerminalCleanup {
             fence: self.fence.clone(),
@@ -1491,12 +1493,15 @@ impl RuntimeSurfaceTerminalCreateHandler {
                 }
             }
         }
-        reply_rx.recv().map_err(|_| {
+        let result = reply_rx.recv().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "runtime capability actor closed before terminal cleanup settlement",
             )
-        })?
+        })?;
+        #[cfg(test)]
+        crate::acp_stall_trace::record("worker_close_return", &close_detail);
+        result
     }
 }
 
@@ -17415,12 +17420,16 @@ impl ThreadActor {
                 );
             }
             PendingSurfaceCapabilitySettlement::DispatchTerminalCleanup { route, dispatch } => {
+                #[cfg(test)]
+                crate::acp_stall_trace::record("actor_dispatch", &format!("{:?}", call_id));
                 self.resident_surface.capability.try_claim_write(call_id);
                 if let Err(error) = self
                     .resident_surface
                     .hub
                     .dispatch_acp_terminal_cleanup(&route, dispatch)
                 {
+                    #[cfg(test)]
+                    crate::acp_stall_trace::record("actor_dispatch_err", &format!("{:?}", call_id));
                     let _ = self.settle_surface_terminal_cleanup_ambiguous(
                         call_id,
                         format!(
@@ -17428,6 +17437,8 @@ impl ThreadActor {
                         ),
                     );
                 }
+                #[cfg(test)]
+                crate::acp_stall_trace::record("actor_dispatch_ok", &format!("{:?}", call_id));
             }
             PendingSurfaceCapabilitySettlement::BeginTerminalRelease {
                 kill_call,
@@ -19070,6 +19081,8 @@ impl ThreadActor {
         capability_revision: surface::CapabilityRevision,
         settlement: surface::AcpTerminalCleanupSettlement,
     ) -> Result<(), surface::SurfaceClientCommandError> {
+        #[cfg(test)]
+        crate::acp_stall_trace::record("actor_settle_start", &format!("{:?}", call_id));
         let call =
             self.authorize_surface_capability_settlement(client, &call_id, capability_revision)?;
         if !matches!(
@@ -19100,7 +19113,9 @@ impl ThreadActor {
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        match settlement {
+        #[cfg(test)]
+        let settle_detail = format!("{:?}", call_id);
+        let result = match settlement {
             surface::AcpTerminalCleanupSettlement::Completed
                 if call.state == surface::SurfaceCapabilityCallState::WrittenAwaitingResponse =>
             {
@@ -19124,7 +19139,10 @@ impl ThreadActor {
                 self.settle_surface_terminal_cleanup_ambiguous(&call_id, message)
             }
             _ => Err(surface::SurfaceClientCommandError::Unauthorized),
-        }
+        };
+        #[cfg(test)]
+        crate::acp_stall_trace::record("actor_settle_finish", &settle_detail);
+        result
     }
 
     fn complete_surface_terminal_cleanup(

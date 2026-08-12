@@ -20,6 +20,8 @@ pub use compaction::{
     TuiAgentProviderErrorAction, TuiAgentTurnCompactionInput, TuiAgentTurnCompactionOutcome,
     TuiAgentTurnCompactionState, handle_tui_agent_provider_error, run_tui_agent_turn_compaction,
 };
+#[cfg(test)]
+mod acp_stall_trace;
 pub mod controller;
 pub mod cost;
 pub mod execution_journal;

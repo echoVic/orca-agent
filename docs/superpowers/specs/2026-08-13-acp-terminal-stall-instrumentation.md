@@ -86,6 +86,20 @@ git diff --check
 # reproduces with ORCA_ACP_STALL_TRACE=1
 ```
 
+## Round 13 Capture Status
+
+The instrumentation landed and is silent without the env guard. Four
+default-parallelism runs with `ORCA_ACP_STALL_TRACE=1` did NOT reproduce
+the acp stall (previous rate ~1/8-1/10), but two NEW runtime_host flakes
+surfaced (recorded in the parallel-test-isolation spec): 
+`host_shutdown_bounds_retained_capability_transition_without_resolving_waiter`
+and `host_shutdown_preprepare_failure_cancels_and_joins_generation_before_returning_error`
+both panicked with `reserve ... RuntimeUnavailable` — the reserve raced the
+host shutdown and the actor dropped the reply (a shutdown-ordering race
+class, not the acp terminal stall). Both are absent from the nextest
+`threads-required = 2` override list. The capture loop continues; the acp
+stall remains the target.
+
 ## Migration And Rollback
 
 The instrumentation is one revertible commit; removing it restores the

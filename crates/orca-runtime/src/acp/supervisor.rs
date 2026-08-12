@@ -1986,6 +1986,8 @@ fn handle_terminal_cleanup_response(routes: &TerminalCleanupRoutes, value: &Valu
     else {
         return false;
     };
+    #[cfg(test)]
+    crate::acp_stall_trace::record("client_response", &request_id.to_string());
     let settlement = if let Some(result) = value.get("result") {
         let valid = match route.kind {
             SurfaceCapabilityCallKind::TerminalKill => {
@@ -3175,6 +3177,7 @@ mod tests {
                 )
             });
             let cleanup = first_result.and(second_result);
+            crate::acp_stall_trace::record("outcome_send", "executor");
             self.outcome_tx
                 .send(
                     cleanup
@@ -4349,11 +4352,15 @@ mod tests {
                     (*terminal_id != released_terminal).then_some((*terminal_id).to_string())
                 })
                 .expect("one killed terminal remains unreleased");
-            assert_eq!(
+            let outcome_result =
                 tokio::task::spawn_blocking(move || outcome_rx.recv_timeout(TEST_TIMEOUT))
                     .await
-                    .expect("multi-terminal outcome task")
-                    .expect("multi-terminal outcome"),
+                    .expect("multi-terminal outcome task");
+            assert_eq!(
+                outcome_result.unwrap_or_else(|_| {
+                    crate::acp_stall_trace::flush_and_print();
+                    panic!("multi-terminal outcome timed out")
+                }),
                 Err(io::ErrorKind::Other)
             );
             assert_persisted_terminal_cleanup_ambiguous(
@@ -6206,7 +6213,28 @@ mod tests {
         let mut line = String::new();
         tokio::time::timeout(TEST_TIMEOUT, reader.read_line(&mut line))
             .await
-            .expect("ACP frame timeout")
+            .unwrap_or_else(|_| {
+                crate::acp_stall_trace::flush_and_print();
+                #[cfg(target_os = "macos")]
+                {
+                    let pid = std::process::id();
+                    let path = format!(
+                        "/tmp/acp-stall-{}-{}.txt",
+                        pid,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    );
+                    let _ = std::process::Command::new("sample")
+                        .arg(pid.to_string())
+                        .arg("1")
+                        .arg("-file")
+                        .arg(&path)
+                        .output();
+                }
+                panic!("ACP frame timeout")
+            })
             .expect("ACP frame read");
         assert!(!line.is_empty(), "ACP connection closed before next frame");
         serde_json::from_str(&line).unwrap()
