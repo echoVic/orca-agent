@@ -1237,7 +1237,15 @@ end state.
    actor graph still carries eight pending state-machine categories. The four
    controller extractions did not reduce the main implementation to the
    approximately 8,000-line target. Every new feature therefore continues to
-   increase the largest structural risk in the repository.
+   increase the largest structural risk in the repository. The 2026-08-13
+   capability extraction series (slices 1-5, spec
+   `docs/superpowers/specs/2026-08-13-threadactor-capability-extraction.md`)
+   moved batch construction, commit settlement sequencing, and the
+   read/write/terminal-create settlement state machines into
+   `runtime_actor::capability` (962 -> ~1,790 lines; the actor shed ~570
+   lines), and the remaining observation/cleanup flows stay in the actor
+   until the broker work gives their lease/waiter state a module owner —
+   a recorded deletion threshold, not an abandoned extraction.
 2. **P1.4 task supervision is implemented in the current slice.** Persistent
    `TaskRegistry` records now carry an owner lease, monotonically increasing
    fencing epoch, expiry, durable stop request, and publication revision.
