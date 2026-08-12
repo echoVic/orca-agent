@@ -296,6 +296,56 @@ All four follow-ups are load-coupled and rare when the machine is not also
 running release builds; they remain open and instrumented-planned rather than
 papered over with threshold changes.
 
+## Round 4 Addendum: Surface `dispatch` Conflates a Full Mailbox With Runtime Death
+
+Classification: boundary defect in the thread surface dispatcher (short spec
+for a diagnosed local defect with production impact).
+
+### Evidence
+
+`ThreadSurfaceDispatcher::dispatch` (runtime_host.rs) is the send path for
+`reserve_operation`, `admit_reserved`, `detach`, and the other surface
+mutations the TUI and JSONL server use. It does
+`command_tx.try_send(...).map_err(|_| RuntimeUnavailable)` — every
+`TrySendError`, including `Full`, becomes `RuntimeUnavailable`. The thread
+command mailbox is bounded (`THREAD_COMMAND_CAPACITY = 16`), so a live but
+busy thread whose queue fills makes the next surface mutation fail with
+`RuntimeUnavailable` — a spurious "runtime is dead" error delivered to the
+user while the runtime is merely busy. The sibling helper `dispatch_required`
+already implements the correct semantics (retry on `Full` with a 1ms backoff;
+fail only on `Closed`), and other ingress paths type `Full` separately
+("runtime interaction mailbox is full"), so this is an inconsistency, not a
+deliberate contract. The observed load flake
+(`foreground_task_checkpoint_failure...`: `reserve foreground retry
+operation: RuntimeUnavailable`) is consistent with this conflation under
+full-suite contention.
+
+### Fix
+
+Extract one shared send helper — retry on `Full` (1ms backoff, the
+`dispatch_required` pattern), return only on `Closed` — and use it in both
+`dispatch` and `dispatch_required`. Backpressure semantics: a live thread
+always drains its mailbox, so waiting is bounded by the thread's own
+progress; a dead thread closes the channel and still fails immediately with
+`RuntimeUnavailable`. No protocol, CLI, or persisted-format change; no new
+lock.
+
+### Acceptance
+
+1. New behavior test
+   `thread_command_dispatch_retries_through_full_mailbox_and_fails_on_closed`:
+   a 1-slot mailbox pre-filled with a command; a concurrent `dispatch`-path
+   send blocks (no `RuntimeUnavailable`) and succeeds once a slot frees;
+   a dropped receiver still yields `RuntimeUnavailable`.
+2. Existing dispatcher tests (`capability_change_wake_is_bounded_outside_full_command_mailbox`
+   and the mailbox-full ingress tests) still pass.
+3. `cargo test -p orca-runtime --lib --locked` at default parallelism green.
+4. `cargo fmt --all -- --check` and `git diff --check` clean.
+
+### Rollback
+
+Reverting restores `try_send`-once semantics; no persisted state is touched.
+
 ### Acceptance
 
 1. `cargo test -p orca-runtime --lib --locked` at default parallelism: zero

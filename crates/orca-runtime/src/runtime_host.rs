@@ -4953,6 +4953,29 @@ struct ThreadSurfaceDispatcher {
     capability_change_tx: tokio_mpsc::Sender<()>,
 }
 
+/// Delivers one thread command with backpressure: a FULL mailbox waits (the
+/// live thread always drains, so the wait is bounded by the thread's own
+/// progress), while a CLOSED mailbox fails immediately — a dead thread must
+/// never masquerade as a busy one, and a busy thread must never masquerade
+/// as a dead one. `dispatch` and `dispatch_required` share this so the TUI
+/// and JSONL surface never observe a spurious `RuntimeUnavailable` under
+/// load.
+fn send_thread_command_retrying_full(
+    command_tx: &tokio_mpsc::Sender<ThreadCommand>,
+    mut command: ThreadCommand,
+) -> Result<(), TrySendError<ThreadCommand>> {
+    loop {
+        match command_tx.try_send(command) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(returned)) => {
+                command = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(closed @ TrySendError::Closed(_)) => return Err(closed),
+        }
+    }
+}
+
 impl ThreadSurfaceDispatcher {
     fn dispatch<T>(
         &self,
@@ -4961,8 +4984,7 @@ impl ThreadSurfaceDispatcher {
         ) -> ThreadCommand,
     ) -> Result<T, surface::SurfaceClientCommandError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.command_tx
-            .try_send(make_command(reply_tx))
+        send_thread_command_retrying_full(&self.command_tx, make_command(reply_tx))
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         reply_rx
             .recv()
@@ -4976,19 +4998,8 @@ impl ThreadSurfaceDispatcher {
         ) -> ThreadCommand,
     ) -> Result<T, surface::SurfaceClientCommandError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        let mut command = make_command(reply_tx);
-        loop {
-            match self.command_tx.try_send(command) {
-                Ok(()) => break,
-                Err(TrySendError::Full(returned)) => {
-                    command = returned;
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(TrySendError::Closed(_)) => {
-                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
-                }
-            }
-        }
+        send_thread_command_retrying_full(&self.command_tx, make_command(reply_tx))
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         reply_rx
             .recv()
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
@@ -48594,6 +48605,60 @@ mod tests {
         assert!(command_rx.try_recv().is_err());
         assert_eq!(capability_change_rx.try_recv(), Ok(()));
         assert!(capability_change_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn thread_command_send_retries_through_full_mailbox_and_fails_on_closed() {
+        let probe_command =
+            |reply: mpsc::SyncSender<SurfaceActorTestProbe>| ThreadCommand::SurfaceActorTestProbe {
+                operation_id: surface::SurfaceOperationId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7"),
+                reply,
+            };
+
+        // Full-then-drain: a live thread's full mailbox must BACKPRESSURE the
+        // surface command (wait for a slot), never masquerade as a dead
+        // runtime via RuntimeUnavailable.
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(1);
+        let (prefill_reply_tx, _prefill_reply_rx) = mpsc::sync_channel(1);
+        command_tx
+            .blocking_send(probe_command(prefill_reply_tx))
+            .expect("fill runtime command mailbox");
+        let sender = command_tx.clone();
+        let (queued_reply_tx, queued_reply_rx) = mpsc::sync_channel(1);
+        let send_thread = std::thread::spawn(move || {
+            send_thread_command_retrying_full(&sender, probe_command(queued_reply_tx))
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !send_thread.is_finished(),
+            "a full mailbox must backpressure the send, not fail it"
+        );
+        let drained = command_rx
+            .blocking_recv()
+            .expect("drain the pre-filled command");
+        assert!(matches!(
+            drained,
+            ThreadCommand::SurfaceActorTestProbe { .. }
+        ));
+        let sent = send_thread.join().expect("backpressured send thread joins");
+        assert!(
+            sent.is_ok(),
+            "the send completes once the mailbox drains a slot"
+        );
+        assert!(queued_reply_rx.try_recv().is_err());
+
+        // Closed: a dead thread still fails immediately with the closed
+        // mailbox (which dispatch surfaces as RuntimeUnavailable).
+        drop(command_rx);
+        let (closed_reply_tx, _closed_reply_rx) = mpsc::sync_channel(1);
+        let closed = send_thread_command_retrying_full(&command_tx, probe_command(closed_reply_tx));
+        assert!(
+            matches!(closed, Err(TrySendError::Closed(_))),
+            "a closed mailbox must surface as closed, got {closed:?}"
+        );
     }
 
     #[test]
