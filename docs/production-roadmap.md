@@ -1270,14 +1270,20 @@ end state.
    callers to stop compiling against it, and durable broker recovery evidence;
    the implementation plan being checked off does not itself satisfy those
    gates.
-6. **Five linked branches are cleanup candidates, not new work.**
-   `codex/auto-memory-governance`, `codex/headless-trajectory-truth`,
-   `codex/mcp-sse-elicitation`, `codex/network-ask-on-block`, and
-   `feat/side-conversation` are not ancestors of `main`; their changes have
-   corresponding rebased commits on `main` (for example `97fa233c4`,
-   `565b4be92`, `fd75c85bc`, `c69a8a263`, and `8a7ae4584`). They should be
-   removed only after a provenance check confirms each branch has no unique
-   uncommitted work or unreplayed patch.
+6. **Repository cleanup (round 19, done).** The five linked cleanup
+   candidates (`codex/auto-memory-governance`, `codex/headless-trajectory-truth`,
+   `codex/mcp-sse-elicitation`, `codex/network-ask-on-block`,
+   `feat/side-conversation`) no longer exist as refs, local or remote, and
+   their replay commits (`97fa233c4`, `565b4be92`, `fd75c85bc`,
+   `c69a8a263`, `8a7ae4584`) are all ancestors of `main` — the work is
+   replayed, nothing to delete. Ten fully-merged slice worktrees and their
+   branches (`compaction-remote-eval`, `integrate-reliability-slices`,
+   `mcp-wire-elicitation`, `p1-4-task-supervision`, `p2-4-cache-identity`,
+   `pending-store-retirement`, `threadactor-split`, `tui-runtime-convergence`,
+   `tui-terminal-wait-cancellation`, `v0.3.14-review-fixes`) were
+   provenance-checked (ahead=0, clean trees) and removed; the two active
+   worktrees (`parallel-test-isolation`, `threadactor-capability-extraction`)
+   remain.
 
 #### Reordered Release Slices
 
