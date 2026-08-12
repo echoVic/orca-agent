@@ -2452,7 +2452,14 @@ mod tests {
     // few seconds to deliver a frame on a loaded machine; a short deadline
     // here flakes (`ACP frame timeout: Elapsed(())`) while genuine failures
     // still surface immediately via EOF/read errors. Hung tests are bounded
-    // by nextest's slow-timeout instead.
+    // by nextest's slow-timeout instead. Windows keeps its reviewed 10s
+    // boundary (validated by scripts/test-validate-windows-platform-
+    // boundaries.mjs for the slow ARM64 runner); non-Windows needs a
+    // larger backstop because plain `cargo test` runs many more tests in
+    // parallel on local developer machines.
+    #[cfg(windows)]
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    #[cfg(not(windows))]
     const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn test_absolute_path(name: &str) -> PathBuf {
