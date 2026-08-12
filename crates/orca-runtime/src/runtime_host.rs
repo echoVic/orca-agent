@@ -19007,6 +19007,8 @@ impl ThreadActor {
                 );
                 return Ok(());
             }
+            #[cfg(test)]
+            crate::acp_stall_trace::record("actor_dispatch", &format!("{:?}", call_id));
             if let Err(error) = self
                 .resident_surface
                 .hub
@@ -19344,6 +19346,8 @@ impl ThreadActor {
             );
             return Ok(());
         }
+        #[cfg(test)]
+        crate::acp_stall_trace::record("actor_dispatch", &format!("{:?}", call_id));
         if let Err(error) = self
             .resident_surface
             .hub

@@ -1660,6 +1660,11 @@ async fn dispatch_terminal_cleanups(
             );
             continue;
         }
+        #[cfg(test)]
+        crate::acp_stall_trace::record(
+            "client_frame_enqueued",
+            &format!("{:?}", request.dispatch.call_id),
+        );
         let write_receipt =
             match facade.enqueue(TransportFrame::new(FrameDirection::AgentToClient, encoded)) {
                 Ok(receipt) => receipt,
@@ -1682,7 +1687,13 @@ async fn dispatch_terminal_cleanups(
                     break;
                 }
             };
-        if let Err(error) = write_receipt.ack().await {
+        let ack_result = write_receipt.ack().await;
+        #[cfg(test)]
+        crate::acp_stall_trace::record(
+            "client_frame_acked",
+            if ack_result.is_ok() { "ok" } else { "err" },
+        );
+        if let Err(error) = ack_result {
             routes
                 .pending
                 .lock()
