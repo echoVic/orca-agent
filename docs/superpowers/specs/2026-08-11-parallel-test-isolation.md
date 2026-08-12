@@ -365,6 +365,15 @@ CI stays mitigated by the nextest `threads-required = 2` override for
   improvement, not a test-only tweak.
 - workflow host: unchanged (single 51.95s observation; 8s guard kept).
 
+- runtime_host shutdown race (NEW, two tests, one run): 
+  `host_shutdown_bounds_retained_capability_transition_without_resolving_waiter`
+  and `host_shutdown_preprepare_failure_cancels_and_joins_generation_before_returning_error`
+  panicked with `reserve ... RuntimeUnavailable` under load — the surface
+  reserve raced the host shutdown and the actor dropped the reply. Neither
+  test is in the nextest `threads-required = 2` override list; candidate
+  mitigation is adding them, and the root-cause is the shutdown-vs-reserve
+  reply-drop ordering.
+
 All four follow-ups are load-coupled and rare when the machine is not also
 running release builds; they remain open and instrumented-planned rather than
 papered over with threshold changes.
