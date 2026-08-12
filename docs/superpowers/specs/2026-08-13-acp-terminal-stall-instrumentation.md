@@ -119,6 +119,19 @@ stall remains the target.
 The instrumentation is one revertible commit; removing it restores the
 current diagnostics-free tests. No persisted state.
 
+## Status: Fixed And Verified (rounds 17-18)
+
+The bounded-retry fix landed (`47b19e880`). Post-fix measurement: 10
+default-parallelism lib runs under induced dual-suite load with the trace
+enabled produced ZERO `ACP frame timeout` (the stall previously
+reproduced in ~1/3 of loaded runs). The remaining load failures belong to
+other documented classes (goal_actor harness backstop, surface-ledger
+checkpoint contention) and do not reproduce under the nextest ci
+profile. The instrumentation stays as permanent env-gated test tooling
+(`ORCA_ACP_STALL_TRACE=1`, silent by default, test-build-only): it
+converted a month-long intermittent stall into one attributed root cause
+and remains the diagnostic path for any future capability-lane regression.
+
 ## Root Cause Confirmed And Fix (round 16)
 
 Evidence (capture3 trace): the failing test's kill A and kill B dispatch

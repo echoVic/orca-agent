@@ -297,6 +297,17 @@ Round-3 re-investigation status (fresh runs with temporary diagnostics):
   RED test that forces the cleanup-lane interleaving. CI stays mitigated by
   the nextest `threads-required = 2` override for `acp::supervisor::tests`.
 
+### RESOLVED (round 16-18): root cause found and fixed
+
+The stall was the ACP cleanup dispatch lane overflowing: the executor's
+concurrent close() calls dispatch two cleanups back-to-back into the
+capacity-1 lane while the client drain polls every 100ms; the second
+try_send hit Full, the actor settled the call ambiguous, and the client
+waited forever for the missing frame. Fixed by a bounded 200ms retry in
+all five hub dispatch lanes (fail-closed after the budget), verified by
+10 loaded runs with zero ACP frame timeouts. Details in
+`docs/superpowers/specs/2026-08-13-acp-terminal-stall-instrumentation.md`.
+
 ### Root Cause Found (round 7)
 
 All five ACP capability dispatch lanes in `runtime_surface::hub`
