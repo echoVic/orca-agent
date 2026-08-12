@@ -49,5 +49,8 @@ its batch construction, verified by the unchanged behavioral oracle.
 - [x] Slice 3: ACP read settlement state machine moved into
   `settle_acp_read_text_file_call` (pure over the call record and the
   settlement payload); actor keeps authorization and commit plumbing.
-- [ ] Slices 4-6: ACP write/terminal create/observation/cleanup flows
-  (the remaining deferred-settlement arms the actor still matches).
+- [x] Slice 4: ACP write settlement state machine moved into
+  `settle_acp_write_text_file_call` (outer Unauthorized rejection
+  preserved, inner waiter-facing result).
+- [ ] Slices 5-6: terminal create/observation/cleanup flows (the
+  remaining deferred-settlement arms the actor still matches).
