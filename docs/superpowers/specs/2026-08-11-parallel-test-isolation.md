@@ -376,6 +376,17 @@ CI stays mitigated by the nextest `threads-required = 2` override for
   improvement, not a test-only tweak.
 - workflow host: unchanged (single 51.95s observation; 8s guard kept).
 
+- goal_actor harness backstop overrun (round 17, dual-suite load only):
+  `goal_actor_request_times_out_with_typed_error` exceeded even its 10s
+  backstop (`idle probe failed: Timeout { timeout: 20ms }`) under the
+  induced dual-suite load — the actor thread was starved past ten
+  seconds. Never observed under the nextest ci profile; the 10s backstop
+  is kept and the observation recorded.
+- surface-ledger checkpoint contention (round 17, dual-suite load only):
+  `older_incomplete_background_completion_cannot_orphan_a_new_transfer`
+  failed with `failed to commit typed provider completion:
+  Ledger(CheckpointFailed)` — the process-shared ORCA_HOME ledger under
+  extreme contention. Never observed under the nextest ci profile.
 - runtime_host shutdown race (NEW, two tests, one run): 
   `host_shutdown_bounds_retained_capability_transition_without_resolving_waiter`
   and `host_shutdown_preprepare_failure_cancels_and_joins_generation_before_returning_error`
