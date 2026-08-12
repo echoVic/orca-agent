@@ -60,6 +60,7 @@ use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::presentation::InlineTerminal;
 use crate::runtime_event_actions::handle_runtime_event;
+use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
 use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::stdio_guard::RetryWriter;
@@ -752,50 +753,6 @@ fn poll_edit_highlight(state: &mut AppState, scheduler: &mut FrameScheduler) -> 
 
 fn edit_highlight_animation_active(state: &AppState) -> bool {
     state.edit_highlight_needs_tick()
-}
-
-fn clear_terminal_scrollback_with<T>(
-    target: &mut T,
-    mut move_home: impl FnMut(&mut T) -> io::Result<()>,
-    mut clear_all: impl FnMut(&mut T) -> io::Result<()>,
-    mut clear_purge: impl FnMut(&mut T) -> io::Result<()>,
-    mut clear_frame: impl FnMut(&mut T) -> io::Result<()>,
-) -> io::Result<()> {
-    move_home(target)?;
-    clear_all(target)?;
-    clear_purge(target)?;
-    clear_frame(target)
-}
-
-/// Erase the native scrollback and on-screen content. Used by the clear-screen shortcut so a
-/// fresh session starts on a clean terminal instead of stacking under the old transcript.
-fn clear_terminal_scrollback(terminal: &mut InlineTerminal) -> io::Result<()> {
-    use crossterm::terminal::{Clear, ClearType};
-    clear_terminal_scrollback_with(
-        terminal,
-        |terminal| {
-            terminal
-                .backend_mut()
-                .inner_mut()
-                .execute(crossterm::cursor::MoveTo(0, 0))?;
-            Ok(())
-        },
-        |terminal| {
-            terminal
-                .backend_mut()
-                .inner_mut()
-                .execute(Clear(ClearType::All))?;
-            Ok(())
-        },
-        |terminal| {
-            terminal
-                .backend_mut()
-                .inner_mut()
-                .execute(Clear(ClearType::Purge))?;
-            Ok(())
-        },
-        Terminal::clear,
-    )
 }
 
 #[cfg(test)]

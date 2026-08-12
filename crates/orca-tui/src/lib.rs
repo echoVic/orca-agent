@@ -40,6 +40,7 @@ mod queued_input;
 mod queued_input_actions;
 mod running_actions;
 mod runtime_event_actions;
+mod scrollback;
 mod selection;
 mod session_picker_actions;
 mod setup_actions;
