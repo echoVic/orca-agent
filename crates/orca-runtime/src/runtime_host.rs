@@ -61,10 +61,10 @@ use crate::runtime_actor::background::{
     BackgroundRetryResolution, ManagedBackgroundTask, ScheduledBackgroundRetry,
 };
 use crate::runtime_actor::capability::{
-    CapabilityCommitEffect, CapabilityReply, PendingSurfaceCapabilitySettlement,
-    PendingSurfaceCapabilityWaiterOutcome, ResidentCapabilityController,
-    ResidentSurfaceCapabilityCall, ResidentSurfaceCapabilityWaiter, ResidentTerminalCleanupLease,
-    RuntimeCapabilityController,
+    CapabilityCommitEffect, CapabilityCommitStep, CapabilityReply,
+    PendingSurfaceCapabilitySettlement, PendingSurfaceCapabilityWaiterOutcome,
+    ResidentCapabilityController, ResidentSurfaceCapabilityCall, ResidentSurfaceCapabilityWaiter,
+    ResidentTerminalCleanupLease, RuntimeCapabilityController,
 };
 use crate::runtime_actor::commit::{
     GoalRecoverySurfaceCommit, ScheduledSurfaceCommit, SurfaceCommitController,
@@ -17322,20 +17322,30 @@ impl ThreadActor {
             .coordinator
             .commit_generation_batch(effect.fence().clone(), effect.batch())
             .is_ok();
-        let call_id = effect.call_id().clone();
-        let resolution = self
-            .resident_surface
-            .capability
-            .resolve_commit_effect(effect, committed);
-        apply_optional_runtime_actor_reply_effect(resolution.reply);
-        if resolution.retained_for_retry {
-            return false;
+        let step = crate::runtime_actor::capability::resolve_capability_commit(
+            &mut self.resident_surface.capability,
+            effect,
+            committed,
+        );
+        match step {
+            CapabilityCommitStep::Retained { reply } => {
+                apply_optional_runtime_actor_reply_effect(reply);
+                false
+            }
+            CapabilityCommitStep::Deferred {
+                call_id,
+                deferred_settlement,
+                reply,
+            } => {
+                apply_optional_runtime_actor_reply_effect(reply);
+                self.apply_deferred_surface_capability_settlement(&call_id, deferred_settlement);
+                !self.resident_surface.capability.has_transition(&call_id)
+            }
+            CapabilityCommitStep::Finished { reply } => {
+                apply_optional_runtime_actor_reply_effect(reply);
+                true
+            }
         }
-        if let Some(deferred_settlement) = resolution.deferred_settlement {
-            self.apply_deferred_surface_capability_settlement(&call_id, deferred_settlement);
-            return !self.resident_surface.capability.has_transition(&call_id);
-        }
-        true
     }
 
     fn apply_deferred_surface_capability_settlement(

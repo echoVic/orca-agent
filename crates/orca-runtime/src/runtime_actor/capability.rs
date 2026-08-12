@@ -1278,3 +1278,53 @@ pub(crate) fn ambiguous_terminal_cleanup_capability_batch(
         snapshot, events, None,
     ))
 }
+
+/// One step of the capability commit settlement sequence, returned by
+/// [`apply_capability_commit`]. The actor matches it instead of the
+/// orchestration calling back into actor-owned flows: `Retained` keeps the
+/// transition for retry, `Deferred` carries the owned deferred settlement
+/// (plus call id) for the actor's settle flows, `Finished` needs no further
+/// work. `reply` is the optional runtime-actor effect the actor applies.
+pub(crate) enum CapabilityCommitStep {
+    Retained {
+        reply: Option<crate::runtime_actor::RuntimeActorEffect>,
+    },
+    Deferred {
+        call_id: surface::SurfaceCapabilityCallId,
+        deferred_settlement: PendingSurfaceCapabilitySettlement,
+        reply: Option<crate::runtime_actor::RuntimeActorEffect>,
+    },
+    Finished {
+        reply: Option<crate::runtime_actor::RuntimeActorEffect>,
+    },
+}
+
+/// Resolves one committed capability transition into a typed step: the
+/// resolution/retain/step sequencing lives here, next to the controller
+/// that owns it. The actor commits the batch through its coordinator (one
+/// thin line — the resident-surface slot wrapper prevents split borrows),
+/// applies the returned reply effect, and for the deferred step runs its
+/// settle flows before the `has_transition` check.
+pub(crate) fn resolve_capability_commit(
+    capability: &mut ResidentCapabilityController,
+    effect: CapabilityCommitEffect,
+    committed: bool,
+) -> CapabilityCommitStep {
+    let call_id = effect.call_id().clone();
+    let resolution = capability.resolve_commit_effect(effect, committed);
+    if resolution.retained_for_retry {
+        return CapabilityCommitStep::Retained {
+            reply: resolution.reply,
+        };
+    }
+    match resolution.deferred_settlement {
+        Some(deferred_settlement) => CapabilityCommitStep::Deferred {
+            call_id,
+            deferred_settlement,
+            reply: resolution.reply,
+        },
+        None => CapabilityCommitStep::Finished {
+            reply: resolution.reply,
+        },
+    }
+}

@@ -144,10 +144,13 @@ until each slice's oracle passes.
 Move the capability commit settlement ORCHESTRATION out of `ThreadActor`
 into `runtime_actor::capability`:
 
-- `apply_capability_commit(capability, coordinator, effect)` returns a
+- `resolve_capability_commit(capability, effect, committed)` returns a
   typed `CapabilityCommitStep` (`Retained` / `Deferred` / `Finished`) that
   carries the optional `RuntimeActorEffect` reply and, for the deferred
-  case, the owned `PendingSurfaceCapabilitySettlement` + call id.
+  case, the owned `PendingSurfaceCapabilitySettlement` + call id. The
+  coordinator commit stays one thin actor line: the resident-surface slot
+  is a newtype wrapper over `Option`, so split mutable borrows of its
+  fields cannot compile.
 - The actor's `apply_surface_capability_commit` matches the step: apply the
   reply, run the deferred settlement (its own flows), then the
   `has_transition` check — the callback cycle is broken by returning owned
