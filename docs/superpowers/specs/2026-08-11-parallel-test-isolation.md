@@ -296,6 +296,54 @@ Round-3 re-investigation status (fresh runs with temporary diagnostics):
   `run_connection` select to find the silent drop point, then pin it with a
   RED test that forces the cleanup-lane interleaving. CI stays mitigated by
   the nextest `threads-required = 2` override for `acp::supervisor::tests`.
+
+### Root Cause Found (round 7)
+
+All five ACP capability dispatch lanes in `runtime_surface::hub`
+(`dispatch_acp_read_text_file`, `dispatch_acp_write_text_file`,
+`dispatch_acp_terminal_create`, `dispatch_acp_terminal_observation`,
+`dispatch_acp_terminal_cleanup`) are `sync_channel(1)` and use `try_send`
+with `Full -> Err(Full)`. When two dispatches land back-to-back faster than
+the client's connection task drains one frame (exactly what full-suite
+contention produces), the second send fails; the actor's bounded retry then
+settles the capability ambiguous and the client NEVER receives the
+kill/release/read/write request. This matches the captured stall precisely
+(test stuck in the cleanup read loop, all threads idle, no frames ever
+delivered). Classification: boundary defect with production impact — a
+slow-but-alive TUI/ACP client can miss terminal cleanup notifications
+whenever it lags one frame behind the runtime.
+
+### Fix status (round 7, three failed hypotheses -> reclassified)
+
+An initial bounded-wait patch was REVERTED: a hub test deliberately pins the
+fail-fast contract (`dispatch returns Err(Full)` when the lane is full, so
+the runtime never queues unboundedly), and an unbounded wait can stall the
+actor thread on a wedged client.
+
+Hypothesis history and evidence:
+
+1. "Busy worker past 60s" — refuted by the full-thread-stack capture: every
+   worker and the host were parked at the timeout.
+2. "Dispatch Full drop" — refuted by instrumented runs: across 10 runs
+   including a failing one, ZERO `DispatchTerminalCleanup` dispatch errors
+   occurred; all cleanup dispatches succeeded.
+3. A second capture showed a DIFFERENT stall phase: all three cleanup
+   frames were delivered and answered, but the executor's `close()`
+   settlement (actor-side completion of the kill capability call) took
+   >60s, so the test's `outcome_rx.recv_timeout` fired first and the
+   worker's outcome send then failed (SendError). No dispatch error there
+   either.
+
+Reclassification per project rules (three failed fix hypotheses): this is
+no longer a local defect; it is a boundary defect in the ACP terminal
+lifecycle under load with at least two distinct stall phases (frame
+delivery stall; actor-side settlement latency). A full Spec Gate is
+required. Instrumentation plan: per-phase timestamps from dispatch ->
+client frame -> client response -> actor settlement -> worker close return
+-> outcome send, printed only when the 60s deadline fires, plus the
+existing stack capture; then a dedicated slice fixes the identified phase.
+CI stays mitigated by the nextest `threads-required = 2` override for
+`acp::supervisor::tests`.
 - server domain-policy: CORRECTION — the `timeoutMs` guard was not the
   mechanism. With `timeoutMs: 60000` the two tests still failed fast
   (`command_exec_completed` absent, suite finished in ~34s, so the command
