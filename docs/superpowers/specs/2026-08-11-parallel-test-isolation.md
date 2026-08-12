@@ -242,10 +242,15 @@ EOF/read errors. Production supervisor code has no such deadline.
 
 ### Fix
 
-1. Raise the acp test-harness liveness backstop from 5s/10s to 60s: frame
-   reads, connection joins, and cancel-arrival checks remain liveness
-   checks; a hung test still fails via the nextest slow-timeout (60s,
-   terminate-after 2) or the deadline assertion itself.
+1. Raise the acp test-harness liveness backstop from 5s to 60s on
+   non-Windows: frame reads, connection joins, and cancel-arrival checks
+   remain liveness checks; a hung test still fails via the nextest
+   slow-timeout (60s, terminate-after 2) or the deadline assertion itself.
+   Windows keeps the reviewed 10s boundary (enforced by
+   scripts/test-validate-windows-platform-boundaries.mjs for the slow
+   ARM64 runner) — the initial round-2 patch collapsed it to 60s and
+   Windows CI rejected the change, so the cfg(windows) 10s constant is
+   restored byte-exact.
 2. `goal_actor_request_times_out_with_typed_error`: one `harness_backstop`
    (10s) replaces the 1s channel receive timeouts, the 200ms elapsed bound,
    and the 1s idle-probe deadline. The 20ms request timeout — the behavior
