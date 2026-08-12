@@ -86,6 +86,20 @@ git diff --check
 # reproduces with ORCA_ACP_STALL_TRACE=1
 ```
 
+## Round 15 Capture Status (attributed leg)
+
+Full-chain trace (fixed instrumentation) attributes the stall: the failing
+test's kill A and release frames are delivered and answered promptly
+(495-711ms, each settled in ~36ms), then `worker_close_return terminal-a`
+fires and — critically — the executor's `outcome_send` fires at the SAME
+711ms with NO third dispatch and NO `worker_close_return terminal-b`.
+The executor's scope join therefore did not wait for close B's settlement:
+close B returned through the only unrecorded path — the
+`cleanup_terminal` early `BrokenPipe` return when the thread command
+channel is closed. A probe was added to that path
+(`worker_close_broken_pipe`) to confirm on the next capture whether the
+actor channel was really closed (actor death/shutdown) at that moment.
+
 ## Round 13 Capture Status
 
 The instrumentation landed and is silent without the env guard. Four

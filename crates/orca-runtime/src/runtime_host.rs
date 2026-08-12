@@ -1486,6 +1486,8 @@ impl RuntimeSurfaceTerminalCreateHandler {
                     std::thread::yield_now();
                 }
                 Err(TrySendError::Closed(_)) => {
+                    #[cfg(test)]
+                    crate::acp_stall_trace::record("worker_close_broken_pipe", &close_detail);
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "runtime capability actor is unavailable",
