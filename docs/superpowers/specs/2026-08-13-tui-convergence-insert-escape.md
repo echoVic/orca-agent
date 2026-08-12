@@ -97,3 +97,12 @@ Move `clear_terminal_scrollback_with` and `clear_terminal_scrollback`
 `InlineTerminal` alias import moves along from presentation.rs usage —
 import only, the alias stays in presentation.rs). Pure relocation; same
 acceptance as slices 1-4.
+
+## Slice 6: Exit Policy Extraction
+
+### Scope
+
+Move `exit_resume_hint` and `exit_session_id` (app.rs:164-181) into
+`crates/orca-tui/src/exit_policy.rs` — the resume-hint formatting and
+saved-session id resolution. Pure relocation; same acceptance as slices
+1-5.
