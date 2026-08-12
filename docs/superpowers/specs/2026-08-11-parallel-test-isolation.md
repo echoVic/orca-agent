@@ -280,11 +280,17 @@ No production code changes; no test semantics change.
 Round-3 re-investigation status (fresh runs with temporary diagnostics):
 
 - acp: the full-60s stall did NOT reproduce in 10 additional default-
-  parallelism runs (0/10; previously 1/8 under the release-build load). The
-  stall is real but load-coupled and rare. Mitigated in CI by the existing
-  nextest `threads-required = 2` override for `acp::supervisor::tests`.
-  Root-causing plan: re-add the temporary `sample`-based thread-stack dump on
-  the frame deadline (macOS) and capture under induced machine load.
+  parallelism runs (0/10; previously 1/8 under the release-build load). It
+  reproduced once more on 2026-08-13 with decisive new evidence: the
+  `orca-runtime-worker` thread panicked inside the multi-terminal executor
+  (outcome send after the test's 60s deadline), and the test-side
+  `outcome_rx.recv_timeout(TEST_TIMEOUT)` elapsed first — so the executor's
+  terminal-create capability flow was BUSY past 60s under contention (the
+  worker panic is a consequence, not the cause). The stall therefore lives
+  in the runtime-host surface capability settlement path under load — the
+  same region the ThreadActor capability extraction (roadmap slice 2) is
+  now refactoring. CI stays mitigated by the nextest `threads-required = 2`
+  override; root-causing continues alongside that refactor.
 - server domain-policy: CORRECTION — the `timeoutMs` guard was not the
   mechanism. With `timeoutMs: 60000` the two tests still failed fast
   (`command_exec_completed` absent, suite finished in ~34s, so the command
