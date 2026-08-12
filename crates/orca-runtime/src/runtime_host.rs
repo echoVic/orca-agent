@@ -9511,7 +9511,7 @@ fn keyed_interaction_response_digest(
     surface::OpaqueToken::new(hasher.finalize().into())
 }
 
-fn surface_sha256(bytes: &[u8]) -> surface::Sha256Digest {
+pub(crate) fn surface_sha256(bytes: &[u8]) -> surface::Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     surface::Sha256Digest::new(hasher.finalize().into())
@@ -17745,129 +17745,11 @@ impl ThreadActor {
                 .then_some(())
                 .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        let accepted_state = match &settlement {
-            surface::AcpReadTextFileSettlement::FailedBeforeWrite { .. } => {
-                call.state == surface::SurfaceCapabilityCallState::Prepared
-            }
-            surface::AcpReadTextFileSettlement::Completed { .. }
-            | surface::AcpReadTextFileSettlement::RemoteError { .. } => matches!(
-                call.state,
-                surface::SurfaceCapabilityCallState::Prepared
-                    | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse
-            ),
-            surface::AcpReadTextFileSettlement::ObservationUnavailable { .. } => matches!(
-                call.state,
-                surface::SurfaceCapabilityCallState::Prepared
-                    | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse
-            ),
-        };
-        if !accepted_state {
-            return Err(surface::SurfaceClientCommandError::Unauthorized);
-        }
-        let physically_written_transition = (call.state
-            == surface::SurfaceCapabilityCallState::Prepared
-            && !matches!(
-                &settlement,
-                surface::AcpReadTextFileSettlement::FailedBeforeWrite { .. }
-            ))
-        .then(|| {
-            let mut written = call.clone();
-            written.state = surface::SurfaceCapabilityCallState::WrittenAwaitingResponse;
-            written
-        });
-        let waiter_result = match settlement {
-            surface::AcpReadTextFileSettlement::Completed { content } => {
-                match surface::AcpCapabilityText::try_new(content) {
-                    Ok(content) => {
-                        let content_digest = surface_sha256(content.as_str().as_bytes());
-                        let result = surface::CapabilityCallResult::ReadTextFile {
-                            content: content.clone(),
-                            content_digest,
-                        };
-                        match serde_json::to_vec(&result) {
-                            Ok(canonical)
-                                if canonical.len() as u64
-                                    <= surface::ACP_CAPABILITY_RESULT_CANONICAL_BYTE_LIMIT =>
-                            {
-                                call.state = surface::SurfaceCapabilityCallState::Completed {
-                                    response_digest: surface_sha256(&canonical),
-                                    result,
-                                };
-                                Ok(content.as_str().to_string())
-                            }
-                            _ => {
-                                let message = "ACP read response exceeded the durable result limit";
-                                call.state =
-                                    surface::SurfaceCapabilityCallState::ObservationUnavailable {
-                                        error: surface::SafeDiagnosticText::try_new(message)
-                                            .expect("fixed capability diagnostic is bounded"),
-                                    };
-                                Err(io::Error::new(io::ErrorKind::InvalidData, message))
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        let message = "ACP read response content was invalid or too large";
-                        call.state = surface::SurfaceCapabilityCallState::ObservationUnavailable {
-                            error: surface::SafeDiagnosticText::try_new(message)
-                                .expect("fixed capability diagnostic is bounded"),
-                        };
-                        Err(io::Error::new(io::ErrorKind::InvalidData, message))
-                    }
-                }
-            }
-            surface::AcpReadTextFileSettlement::FailedBeforeWrite { message } => {
-                let diagnostic =
-                    surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
-                        surface::SafeDiagnosticText::try_new(
-                            "ACP read request failed before write with an invalid diagnostic",
-                        )
-                        .expect("fixed capability diagnostic is bounded")
-                    });
-                let waiter_error = diagnostic.as_str().to_string();
-                call.state =
-                    surface::SurfaceCapabilityCallState::FailedBeforeWrite { error: diagnostic };
-                Err(io::Error::new(io::ErrorKind::NotConnected, waiter_error))
-            }
-            surface::AcpReadTextFileSettlement::RemoteError { code, message } => {
-                let code = surface::AcpCapabilityIdentifier::try_new(code).unwrap_or_else(|_| {
-                    surface::AcpCapabilityIdentifier::try_new("unknown")
-                        .expect("fixed capability error code is bounded")
-                });
-                let message = surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
-                    surface::SafeDiagnosticText::try_new(
-                        "ACP read request returned an invalid remote diagnostic",
-                    )
-                    .expect("fixed capability diagnostic is bounded")
-                });
-                let waiter_error = format!("ACP read request failed: {}", message.as_str());
-                let result = surface::CapabilityCallResult::RemoteError {
-                    code,
-                    message: message.clone(),
-                };
-                let canonical = serde_json::to_vec(&result)
-                    .expect("bounded capability error result is serializable");
-                call.state = surface::SurfaceCapabilityCallState::Completed {
-                    response_digest: surface_sha256(&canonical),
-                    result,
-                };
-                Err(io::Error::other(waiter_error))
-            }
-            surface::AcpReadTextFileSettlement::ObservationUnavailable { message } => {
-                let diagnostic =
-                    surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
-                        surface::SafeDiagnosticText::try_new(
-                            "ACP read response was unavailable with an invalid diagnostic",
-                        )
-                        .expect("fixed capability diagnostic is bounded")
-                    });
-                let waiter_error = diagnostic.as_str().to_string();
-                call.state = surface::SurfaceCapabilityCallState::ObservationUnavailable {
-                    error: diagnostic,
-                };
-                Err(io::Error::new(io::ErrorKind::NotConnected, waiter_error))
-            }
-        };
+        let outcome = crate::runtime_actor::capability::settle_acp_read_text_file_call(
+            &mut call, settlement,
+        )?;
+        let waiter_result = outcome.waiter_result;
+        let physically_written_transition = outcome.physically_written;
         let fence = call.fence.clone();
         let mut transitions = physically_written_transition
             .into_iter()
