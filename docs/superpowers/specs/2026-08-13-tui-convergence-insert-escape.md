@@ -76,3 +76,14 @@ Move the input wake-selection category (`InputWake` enum,
 keep their `#[cfg(test)]` gating inside the new module and stay visible
 to the app.rs tests via the parent import. Same acceptance as slices 1-2
 (orcaui lib + tui_pty_contract + fmt + relocation-only diff).
+
+## Slice 4: Workspace Root And Syntax State Configuration
+
+### Scope
+
+Move the workspace-config category (`mention_search_roots`,
+`syntax_workspace_root`, `configure_tui_syntax_state`,
+`configure_and_preload_tui_state`, app.rs:753-800) into
+`crates/orca-tui/src/workspace_config.rs`. The edit-highlight polling
+pair stays (thin AppState delegates, not orchestration). Pure relocation;
+same acceptance as slices 1-3.
