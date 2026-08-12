@@ -46,5 +46,8 @@ its batch construction, verified by the unchanged behavioral oracle.
   `CapabilityCommitStep` (Retained/Deferred/Finished) breaking the
   callback cycle by returning owned data; the actor keeps the deferred
   dispatch and the coordinator commit line.
-- [ ] Slices 3-6: ACP read/write/terminal create/observation/cleanup flows
-  (the deferred-settlement arms the actor still matches).
+- [x] Slice 3: ACP read settlement state machine moved into
+  `settle_acp_read_text_file_call` (pure over the call record and the
+  settlement payload); actor keeps authorization and commit plumbing.
+- [ ] Slices 4-6: ACP write/terminal create/observation/cleanup flows
+  (the remaining deferred-settlement arms the actor still matches).
