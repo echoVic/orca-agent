@@ -39,8 +39,12 @@ its batch construction, verified by the unchanged behavioral oracle.
   construction in runtime_actor::capability".
 - [x] Rebase onto latest main; re-run the oracle; fast-forward main; push.
 
-## Follow-Up Slices (not in this commit)
+## Follow-Up Slices
 
-- Slice 2: settlement orchestration (`retry/apply/deferred`) behind an
-  injected dispatcher to break the `settle_*` callback cycle.
-- Slices 3-6: ACP read/write/terminal create/observation/cleanup flows.
+- [x] Slice 2: settlement sequencing moved into
+  `runtime_actor::capability::resolve_capability_commit` with a typed
+  `CapabilityCommitStep` (Retained/Deferred/Finished) breaking the
+  callback cycle by returning owned data; the actor keeps the deferred
+  dispatch and the coordinator commit line.
+- [ ] Slices 3-6: ACP read/write/terminal create/observation/cleanup flows
+  (the deferred-settlement arms the actor still matches).
