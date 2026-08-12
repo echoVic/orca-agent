@@ -55,6 +55,7 @@ use crate::insert_escape::{
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::presentation::InlineTerminal;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
@@ -72,6 +73,11 @@ use crate::types::{
 use crate::ui;
 use crate::vim::{PendingInsertEscapeFlow, VimState};
 use crate::workspace_status;
+
+use crate::presentation::{
+    complete_presentation_resume, finish_terminal_presentation, initialize_terminal_presentation,
+    resume_terminal_render, with_terminal_presentation_cleanup,
+};
 
 struct HostedSideParent {
     thread: RuntimeThreadHandle,
@@ -729,64 +735,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     })
 }
 
-fn resume_terminal_render(
-    terminal: &mut InlineTerminal,
-    scheduler: &mut FrameScheduler,
-    presentation: &mut TerminalPresentation,
-) -> io::Result<()> {
-    complete_presentation_resume(
-        terminal,
-        Terminal::clear,
-        |_| presentation.invalidate_title(),
-        |_| scheduler.mark_dirty(),
-    )
-}
-
-fn initialize_terminal_presentation<T>(
-    target: &mut T,
-    write_title: impl FnOnce(&mut T) -> io::Result<()>,
-    draw: impl FnOnce(&mut T) -> io::Result<()>,
-) -> io::Result<()> {
-    write_title(target)?;
-    draw(target)
-}
-
-fn complete_presentation_resume<T>(
-    target: &mut T,
-    clear_terminal: impl FnOnce(&mut T) -> io::Result<()>,
-    invalidate_title: impl FnOnce(&mut T),
-    mark_dirty: impl FnOnce(&mut T),
-) -> io::Result<()> {
-    clear_terminal(target)?;
-    invalidate_title(target);
-    mark_dirty(target);
-    Ok(())
-}
-
-fn finish_terminal_presentation<T>(
-    mut terminal: T,
-    reset_title: impl FnOnce(&mut T) -> io::Result<()>,
-    drop_terminal: impl FnOnce(T),
-    finish_input: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
-    reset_title(&mut terminal)?;
-    drop_terminal(terminal);
-    finish_input()
-}
-
-fn with_terminal_presentation_cleanup<T, R>(
-    mut resource: T,
-    body: impl FnOnce(&mut T) -> io::Result<R>,
-    cleanup: impl FnOnce(T) -> io::Result<()>,
-) -> io::Result<R> {
-    let result = body(&mut resource);
-    let cleanup_result = cleanup(resource);
-    match result {
-        Err(error) => Err(error),
-        Ok(value) => cleanup_result.map(|()| value),
-    }
-}
-
 #[cfg(test)]
 fn receive_input_batch(
     receiver: &mpsc::Receiver<Event>,
@@ -957,8 +905,6 @@ fn configure_and_preload_tui_state(
         state.push_message(message);
     }
 }
-
-type InlineTerminal = Terminal<CapabilityBackend<CrosstermBackend<RetryWriter<std::io::Stdout>>>>;
 
 fn clear_terminal_scrollback_with<T>(
     target: &mut T,
