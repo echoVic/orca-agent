@@ -202,6 +202,93 @@ Remaining shared-state hotspots are serialized by the goal-store
 and the `lock_test_env` mutex; nothing holds the write side of any env lock
 across hosted work, and the environment variable is never redirected.
 
+## Round 2 Addendum: Load-Sensitive Test-Harness Deadlines Under Full-Suite Load
+
+Classification: local defects in the test harness (short spec, per project
+rules for diagnosed local defects).
+
+### Evidence
+
+Three consecutive fresh runs of `cargo test -p orca-runtime --lib --locked`
+at default parallelism (1082-1088 tests each) fail in
+`acp::supervisor::tests::*` with `ACP frame timeout: Elapsed(())` at
+`read_value` (supervisor.rs): 8, 7, then 6 failures. The same tests pass in
+isolation (1/1) and as a group (26/26 in 4.7s). The goal-store/session
+isolation failures this slice targeted are gone. After the first fix below,
+further loaded runs surfaced the same deadline class in three more places:
+
+- `server::tests::command_exec_permission_profile_domain_policy_blocks_*`
+  (2 of 2 domain tests): `command_exec_completed` absent — the 5s
+  `timeoutMs` request guard kills curl before the in-process policy proxy
+  finishes under contention (tests pass in isolation).
+- `goal_actor::tests::goal_actor_request_times_out_with_typed_error`
+  (captured panic): `goal actor idle probe failed: Timeout { timeout: 20ms }`
+  after the 1s idle-probe deadline — the actor thread was starved past the
+  deadline while the 20ms request budget is the behavior under test.
+- `workflow::host::tests::host_cleans_pipe_holding_descendants_after_parent_exit`
+  (observed once): completion took 51.95s against an 8s deadline —
+  UNRESOLVED, see Follow-Ups (the threshold is intentionally left unchanged).
+
+### Root Cause
+
+Harness deadlines sized for low contention. `TEST_TIMEOUT` in the acp tests
+mod (5s non-Windows) is the liveness backstop for ACP frame reads
+(`read_value`), connection joins, and cancel arrival. The tests run an
+in-process ACP server on the same machine as the full parallel suite; at
+12-16 way contention (plus concurrent builds) frame delivery occasionally
+exceeds 5s. These deadlines are hang-detection safety nets, not latency
+assertions: genuine connection failures still surface immediately via
+EOF/read errors. Production supervisor code has no such deadline.
+
+### Fix
+
+1. Raise the acp test-harness liveness backstop from 5s/10s to 60s: frame
+   reads, connection joins, and cancel-arrival checks remain liveness
+   checks; a hung test still fails via the nextest slow-timeout (60s,
+   terminate-after 2) or the deadline assertion itself.
+2. `goal_actor_request_times_out_with_typed_error`: one `harness_backstop`
+   (10s) replaces the 1s channel receive timeouts, the 200ms elapsed bound,
+   and the 1s idle-probe deadline. The 20ms request timeout — the behavior
+   under test — is untouched.
+3. The three `command_exec_permission_profile_domain_policy_*` curl tests
+   raise their `timeoutMs` request guard from 5000 to 60000: the guard is
+   liveness only; the asserted behavior is the policy block header.
+
+No production code changes; no test semantics change.
+
+### Follow-Ups (documented, not fixed this round)
+
+- acp: one run showed a frame read that stalled the FULL 60s
+  (`concurrent_terminals_from_one_tool_keep_cleanup_identity_exact`) — a
+  genuine stall under concurrency, not load latency. Mitigated in CI by the
+  existing nextest `threads-required = 2` override for
+  `acp::supervisor::tests`; root-causing needs stack instrumentation of the
+  stalled in-process server.
+- workflow host: the pipe-holding-descendant cleanup exceeded its 8s
+  deadline once (51.95s ≈ the 30s descendant lifetime plus contention),
+  suggesting the process-group kill occasionally misses the descendant under
+  extreme load. The 8s deadline is kept as the regression guard; if the
+  flake recurs, instrument `kill_process_group` results and the host
+  completion timeline before changing any threshold.
+
+### Acceptance
+
+1. `cargo test -p orca-runtime --lib --locked` at default parallelism: zero
+   failures on two consecutive fresh runs (after the fixes; pre-fix baseline
+   above fails 3/3).
+2. The acp group still passes together; a genuinely broken connection still
+   fails via EOF/read errors (existing acp tests cover connection loss).
+3. `cargo test -p orca-runtime --lib --locked -- --test-threads=16` completes
+   without hangs (spec criterion 7 re-verified).
+4. `cargo nextest run -p orca-runtime --lib --locked --profile ci` zero
+   failures (spec criterion 2 re-verified).
+5. `cargo fmt --all -- --check` and `git diff --check` clean.
+
+### Rollback
+
+Reverting any of the three fixes restores the previous deadlines; no
+persisted state, protocol, or production behavior is affected.
+
 ## Rollback And Deletion
 
 Each change is a small reversible commit. Reverting the goal-store lock

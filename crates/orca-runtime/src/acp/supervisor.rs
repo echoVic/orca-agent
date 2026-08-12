@@ -2446,10 +2446,14 @@ mod tests {
     use crate::runtime_permission::RuntimePermissionRequest;
     use crate::thread::RuntimeThread;
 
-    #[cfg(windows)]
-    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-    #[cfg(not(windows))]
-    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    // Liveness backstop for in-process ACP frame reads, connection joins,
+    // and cancel arrival — NOT a latency assertion. Under full-suite
+    // parallelism the in-process server can legitimately take more than a
+    // few seconds to deliver a frame on a loaded machine; a short deadline
+    // here flakes (`ACP frame timeout: Elapsed(())`) while genuine failures
+    // still surface immediately via EOF/read errors. Hung tests are bounded
+    // by nextest's slow-timeout instead.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)

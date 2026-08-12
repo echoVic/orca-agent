@@ -3100,6 +3100,11 @@ mod tests {
         let (handle, join) = GoalRuntimeHandle::spawn_with_request_timeout_for_test(store, timeout);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (delay_reply_tx, delay_reply_rx) = mpsc::sync_channel(1);
+        // Harness deadlines are liveness backstops for a stuck actor, not
+        // latency assertions: under full-suite parallelism the actor thread
+        // can be starved well past a second, so the backstops are generous
+        // while still bounding a genuinely broken actor.
+        let harness_backstop = std::time::Duration::from_secs(10);
 
         handle
             .sender
@@ -3109,9 +3114,7 @@ mod tests {
                 reply: delay_reply_tx,
             })
             .unwrap();
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        started_rx.recv_timeout(harness_backstop).unwrap();
 
         let started_at = std::time::Instant::now();
         let error = handle.latest_active().unwrap_err();
@@ -3120,18 +3123,18 @@ mod tests {
             GoalActorError::Timeout { timeout: actual } if actual == timeout
         ));
         assert!(
-            started_at.elapsed() < std::time::Duration::from_millis(200),
+            started_at.elapsed() < harness_backstop,
             "goal actor request exceeded its bounded wait"
         );
 
         delay_reply_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(harness_backstop)
             .unwrap()
             .unwrap();
         // The actor has finished the delayed command; poll until it reports
         // an idle actor instead of racing its 20 ms request budget against
         // the scheduler under heavy test parallelism.
-        let idle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let idle_deadline = std::time::Instant::now() + harness_backstop;
         loop {
             match handle.latest_active() {
                 Ok(None) => break,

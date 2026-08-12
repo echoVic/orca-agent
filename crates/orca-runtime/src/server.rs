@@ -4513,7 +4513,11 @@ enabled = true
         let request = test_command_exec_request(
             "cmd-allow",
             &format!("curl --noproxy '' -sS http://127.0.0.1:{port}/"),
-            json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+            // The timeout is a liveness guard, not the behavior under test:
+            // under full-suite parallelism the in-process policy proxy can
+            // legitimately take longer than a few seconds to serve curl, and
+            // a 5s kill removes the completed event these tests assert.
+            json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
         );
         let input = Cursor::new(request.into_bytes());
         let output = SharedVecWriter::default();
@@ -4556,7 +4560,9 @@ enabled = true
         let request = test_command_exec_request(
             "cmd-local-deny",
             &format!("curl --noproxy '' -sS -D - -o /dev/null http://127.0.0.1:{port}/ || true"),
-            json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+            // Liveness guard only (see the allow test above): the asserted
+            // behavior is the policy block header, not the timeout.
+            json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
         );
         let input = Cursor::new(request.into_bytes());
         let output = SharedVecWriter::default();
@@ -4603,7 +4609,9 @@ enabled = true
         let request = test_command_exec_request(
             "cmd-localhost-deny",
             "curl --noproxy '' -sS -D - -o /dev/null http://localhost/ || true",
-            json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+            // Liveness guard only (see the allow test above): the asserted
+            // behavior is the resolved-localhost policy block, not the timeout.
+            json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
         );
         let input = Cursor::new(request.into_bytes());
         let output = SharedVecWriter::default();
