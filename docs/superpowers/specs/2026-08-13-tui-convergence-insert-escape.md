@@ -51,3 +51,16 @@ routing and dispatch. Types stay in `types.rs`.
 ## Rollback
 
 Single revertible commit; no persisted state.
+
+## Slice 2: Terminal Presentation Lifecycle Extraction
+
+### Scope
+
+Move the five terminal-presentation free functions
+(`resume_terminal_render`, `initialize_terminal_presentation`,
+`complete_presentation_resume`, `finish_terminal_presentation`,
+`with_terminal_presentation_cleanup`, app.rs:732-790) into
+`crates/orca-tui/src/presentation.rs`. They are generic over the terminal
+target with no AppState coupling; pure relocation, app.rs imports the
+module. Same acceptance as slice 1 (orca-tui lib + tui_pty_contract +
+fmt + relocation-only diff).
