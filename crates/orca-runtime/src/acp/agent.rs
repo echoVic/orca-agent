@@ -1872,7 +1872,11 @@ fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<StopReason, S
                 },
         } => Ok(StopReason::MaxTurnRequests),
         OperationTerminal::BudgetExhausted { budget } => {
-            Err(format!("ACP budget exhausted: {budget:?}"))
+            // The private stable error name for budget dimensions ACP cannot
+            // represent as a standard StopReason (Subagent/Goal/Workflow/
+            // monetary/tool-call/wall-time budgets); the exact terminal
+            // metadata rides on the Orca surface record.
+            Err(format!("OrcaBudgetExhausted: {budget:?}"))
         }
         OperationTerminal::NotAdmitted {
             reason: NotAdmittedReason::CancelledBeforeAdmission,

@@ -6914,7 +6914,8 @@ OperationTerminal::BudgetExhausted(ModelTokens) -> PromptResponse::MaxTokens
 OperationTerminal::BudgetExhausted(TurnRequests{AgentLoop})
                                            -> PromptResponse::MaxTurnRequests
 OperationTerminal::BudgetExhausted(TurnRequests{Subagent}
-  | GoalTokenBudget | WorkflowTokenBudget | MonetaryBudgetUsdMicros)
+  | GoalTokenBudget | WorkflowTokenBudget | MonetaryBudgetUsdMicros
+  | ToolCalls | WallTimeMs)
                                            -> OrcaSurfaceV1 exact terminal metadata;
                                               StandardOnly OrcaBudgetExhausted
 OperationTerminal::Failed {

@@ -7380,6 +7380,18 @@
       ""
     ],
     [
+      "BudgetExhausted(ToolCalls)",
+      "OrcaBudgetExhausted",
+      "OrcaSurfaceV1 exact terminal metadata",
+      ""
+    ],
+    [
+      "BudgetExhausted(WallTimeMs)",
+      "OrcaBudgetExhausted",
+      "OrcaSurfaceV1 exact terminal metadata",
+      ""
+    ],
+    [
       "BudgetExhausted(MonetaryBudgetUsdMicros)",
       "OrcaBudgetExhausted",
       "OrcaSurfaceV1 exact terminal metadata",
@@ -9662,7 +9674,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "98905848cb51dccd09fd343ea631c2c6d40b3022aa29697bb5ef0b8a3b4c8dfe",
+    "private_contract_sha256": "4b4f5acae8681ee77a0f7602f408ec2e69d9297b71fa6c82455087ec816c3cc5",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",
