@@ -106,3 +106,15 @@ Move `exit_resume_hint` and `exit_session_id` (app.rs:164-181) into
 `crates/orca-tui/src/exit_policy.rs` — the resume-hint formatting and
 saved-session id resolution. Pure relocation; same acceptance as slices
 1-5.
+
+## Slice 7: Hosted Side Parent Extraction
+
+### Scope
+
+Move the hosted-side parent category (`HostedSideParent` struct and the
+four helpers `shutdown_attached_side_on_controller_exit`,
+`side_parent_status_for_runtime_thread`, `hosted_config_for_active`,
+`rotate_attached_event_sender`, app.rs:91-163) into
+`crates/orca-tui/src/hosted_side.rs`, and the `TuiExit` struct into
+`exit_policy.rs` (the exit type belongs with the exit policy). Pure
+relocation; same acceptance as slices 1-6.
