@@ -213,6 +213,34 @@ impl BudgetConfig {
             max_wall_time_ms: spec.max_wall_time_ms,
         }
     }
+
+    /// Validates every present dimension is a positive value. Called after
+    /// CLI/file decoding so an explicit `0` (or a negative/NaN cost) is
+    /// rejected with a clear error instead of being silently dropped or
+    /// panicking in the runtime worker.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(max_turns) = self.max_turns
+            && max_turns == 0
+        {
+            return Err("max_turns must be a positive integer".to_string());
+        }
+        if let Some(max_tool_calls) = self.max_tool_calls
+            && max_tool_calls == 0
+        {
+            return Err("max_tool_calls must be a positive integer".to_string());
+        }
+        if let Some(max_cost_usd_micros) = self.max_cost_usd_micros
+            && max_cost_usd_micros == 0
+        {
+            return Err("max_cost_usd must be a positive amount".to_string());
+        }
+        if let Some(max_wall_time_ms) = self.max_wall_time_ms
+            && max_wall_time_ms == 0
+        {
+            return Err("max_wall_time_secs must be a positive amount".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

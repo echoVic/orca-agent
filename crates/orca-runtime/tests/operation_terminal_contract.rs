@@ -21,16 +21,24 @@ fn agent_loop_budget_stop_carries_typed_terminal() {
             wall_time_ms: 0,
         },
     };
-    let result = AgentLoopResult::budget_stop(stop, "cp-1".to_string());
+    let result = AgentLoopResult::budget_stop(
+        OperationTerminal::Stopped {
+            reason: stop.reason,
+            usage: stop.usage,
+            checkpoint_id: "cp-1".to_string(),
+            resumable: true,
+        },
+        stop,
+    );
 
     // The typed terminal is the fact; legacy status/reason are projections.
-    match result.terminal.as_ref() {
-        Some(OperationTerminal::Stopped {
+    match &result.terminal {
+        OperationTerminal::Stopped {
             reason,
             usage,
             checkpoint_id,
             resumable,
-        }) => {
+        } => {
             assert_eq!(*reason, StopReason::TurnBudget { max_turns: 3 });
             assert_eq!(usage.turns, 3);
             assert_eq!(usage.tool_calls, 2);
@@ -40,15 +48,7 @@ fn agent_loop_budget_stop_carries_typed_terminal() {
         other => panic!("expected typed Stopped terminal, got {other:?}"),
     }
     // Exit code 4 comes from the typed terminal, never from RunStatus.
-    assert_eq!(
-        result
-            .terminal
-            .as_ref()
-            .expect("terminal")
-            .clone()
-            .exit_code(),
-        4
-    );
+    assert_eq!(result.terminal.clone().exit_code(), 4);
 }
 
 #[test]

@@ -727,6 +727,14 @@ pub enum OperationBudget {
         limit: u64,
         observed: u64,
     },
+    ToolCalls {
+        limit: u64,
+        observed: u64,
+    },
+    WallTimeMs {
+        limit: u64,
+        observed: u64,
+    },
     GoalTokenBudget {
         goal_id: SurfaceGoalId,
         limit: i64,

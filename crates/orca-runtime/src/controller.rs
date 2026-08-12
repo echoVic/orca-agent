@@ -743,7 +743,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             usage,
             main_session_task,
             background_workflows,
-            terminal: result.terminal,
+            terminal: Some(result.terminal),
         }))
     }
 }
@@ -756,6 +756,30 @@ impl ThreadTurnCompletion {
         events: &mut EventFactory,
         sink: &mut EventSink<W>,
     ) -> io::Result<RunStatus> {
+        // Legacy statuses that predate typed terminals keep their transcript
+        // status: ApprovalRequired and VerificationFailed are distinct
+        // outcomes with their own exit codes, not generic runtime failures.
+        // Budget stops (and every other terminal) use the typed terminal.
+        if let Some(terminal) = self.terminal.as_ref()
+            && matches!(
+                self.status,
+                RunStatus::ApprovalRequired | RunStatus::VerificationFailed
+            )
+            && !matches!(
+                terminal,
+                orca_core::budget::OperationTerminal::Stopped { .. }
+            )
+        {
+            session.complete_with_error(self.status.as_str(), self.error.as_deref());
+            if let Some(task) = self.main_session_task.as_ref() {
+                task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
+                task.emit_all(events, sink)?;
+            }
+            if request.emit_session_completed() {
+                sink.emit(events.session_completed(self.status, session.session_id()))?;
+            }
+            return Ok(self.status);
+        }
         if let Some(terminal) = self.terminal.as_ref() {
             session.complete_with_terminal(terminal);
         } else {
@@ -2826,6 +2850,7 @@ mod tests {
                 workflow_lifecycle_ingress: None,
                 wait_for_background_workflows: true,
                 root_task_id: None,
+                child_budget: None,
             })
             .unwrap();
 
@@ -2897,6 +2922,7 @@ mod tests {
                     workflow_lifecycle_ingress: None,
                     wait_for_background_workflows: true,
                     root_task_id: None,
+                    child_budget: None,
                 })
                 .expect("dispatch normal call");
 

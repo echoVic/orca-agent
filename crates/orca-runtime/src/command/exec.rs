@@ -69,6 +69,14 @@ pub fn run_with_stdin(
         return 1;
     }
 
+    let budget = match cli_budget(&request) {
+        Ok(budget) => budget,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            return 1;
+        }
+    };
+
     let prompt = match resolve_prompt(request.prompt, stdin_is_terminal, stdin) {
         Ok(prompt) => prompt,
         Err(error) => {
@@ -101,18 +109,7 @@ pub fn run_with_stdin(
     config_request.provider = request.provider;
     config_request.verifier = request.verifier;
     config_request.history_mode = history_mode;
-    config_request.budget = orca_core::config::BudgetConfig {
-        max_turns: request.max_turns,
-        max_tool_calls: request.max_tool_calls,
-        max_cost_usd_micros: request
-            .max_cost_usd
-            .or(request.max_budget)
-            .filter(|usd| usd.is_finite() && *usd > 0.0)
-            .map(|usd| (usd * 1_000_000.0).round() as u64),
-        max_wall_time_ms: request
-            .max_wall_time_secs
-            .map(|secs| secs.saturating_mul(1_000)),
-    };
+    config_request.budget = budget;
     config_request.overrides = ConfigOverrides {
         model: request.model,
         mode: request.approval_mode,
@@ -128,6 +125,35 @@ pub fn run_with_stdin(
             1
         }
     }
+}
+
+/// Converts CLI budget arguments into a `BudgetConfig`. Invalid values
+/// (zero, negative, NaN, or infinite amounts) are rejected with a clear error
+/// instead of being silently dropped into an unlimited budget.
+fn cli_budget(request: &ExecCommandRequest) -> Result<orca_core::config::BudgetConfig, String> {
+    let cost_usd = request
+        .max_cost_usd
+        .or(request.max_budget)
+        .map(|usd| {
+            if usd.is_finite() && usd > 0.0 {
+                Ok((usd * 1_000_000.0).round() as u64)
+            } else {
+                Err(format!(
+                    "--max-cost-usd must be a positive finite amount, got {usd}"
+                ))
+            }
+        })
+        .transpose()?;
+    let budget = orca_core::config::BudgetConfig {
+        max_turns: request.max_turns,
+        max_tool_calls: request.max_tool_calls,
+        max_cost_usd_micros: cost_usd,
+        max_wall_time_ms: request
+            .max_wall_time_secs
+            .map(|secs| secs.saturating_mul(1_000)),
+    };
+    budget.validate()?;
+    Ok(budget)
 }
 
 pub fn resolve_prompt(

@@ -219,6 +219,10 @@ pub struct ExecutionJournal {
 
 impl ExecutionJournal {
     /// Opens (or creates) the journal file and loads committed records.
+    ///
+    /// The file is repaired first: a crash mid-write may have left a partial
+    /// final line, which must be truncated before parsing so reopening never
+    /// fails on a torn record.
     pub fn open(path: PathBuf, operation_id: impl Into<String>) -> io::Result<Self> {
         let operation_id = operation_id.into();
         let mut journal = Self {
@@ -230,7 +234,7 @@ impl ExecutionJournal {
             faults: JournalFaults::default(),
             terminal_appended: false,
         };
-        journal.reload_committed()?;
+        journal.repair_and_reload()?;
         Ok(journal)
     }
 
@@ -313,8 +317,12 @@ impl ExecutionJournal {
             ));
         }
         self.validate_ordering(&record)?;
-        self.next_ordinal += 1;
-        self.pending.push(record);
+        // The journal owns ordinal assignment: builders may pre-create a batch
+        // of records, and each append stamps the next ordinal so a pre-built
+        // batch never produces duplicate ordinals.
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = ordinal.saturating_add(1);
+        self.pending.push(stamp_ordinal(record, ordinal));
         Ok(())
     }
 
@@ -414,6 +422,22 @@ impl ExecutionJournal {
         Ok(())
     }
 
+    fn repair_and_reload(&mut self) -> io::Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        // A crash mid-write can leave a torn final line; truncate it to the
+        // last complete newline before parsing committed records.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        repair_incomplete_final_line(&mut file)?;
+        drop(file);
+        self.reload_committed()
+    }
+
     fn reload_committed(&mut self) -> io::Result<()> {
         if !self.path.exists() {
             return Ok(());
@@ -453,23 +477,150 @@ impl ExecutionJournal {
     }
 }
 
+/// Truncates a torn final line so only complete newline-terminated records
+/// survive. Scans back to the last `\n`; if the file does not end with a
+/// newline, everything after the previous newline is discarded (or the whole
+/// file when no complete record exists).
 fn repair_incomplete_final_line(file: &mut File) -> io::Result<()> {
     let file_len = file.metadata()?.len();
     if file_len == 0 {
         return Ok(());
     }
-    file.seek(SeekFrom::End(-1))?;
-    let mut final_byte = [0; 1];
-    file.read_exact(&mut final_byte)?;
-    if final_byte[0] == b'\n' {
-        file.seek(SeekFrom::End(0))?;
-        return Ok(());
+    // Find the last newline by scanning backwards in chunks.
+    const CHUNK: u64 = 4096;
+    let mut offset = file_len;
+    loop {
+        let start = offset.saturating_sub(CHUNK);
+        let len = offset - start;
+        file.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0_u8; len as usize];
+        file.read_exact(&mut buf)?;
+        if let Some(relative) = buf.iter().rposition(|byte| *byte == b'\n') {
+            let keep_through = start + relative as u64;
+            let new_len = if keep_through + 1 == file_len {
+                file_len
+            } else {
+                keep_through + 1
+            };
+            if new_len != file_len {
+                file.set_len(new_len)?;
+            }
+            file.seek(SeekFrom::End(0))?;
+            return Ok(());
+        }
+        if start == 0 {
+            // No newline anywhere: the file is one torn line (or garbage).
+            file.set_len(0)?;
+            file.seek(SeekFrom::End(0))?;
+            return Ok(());
+        }
+        offset = start;
     }
-    // A partial line means a crash mid-write: truncate it so only complete
-    // records survive.
-    file.set_len(file_len.saturating_sub(1))?;
-    file.seek(SeekFrom::End(0))?;
-    Ok(())
+}
+
+/// Replaces the ordinal on a record with the journal-assigned value.
+fn stamp_ordinal(record: JournalRecord, ordinal: u64) -> JournalRecord {
+    match record {
+        JournalRecord::OperationStarted {
+            operation_id,
+            turn_id,
+            schema_version,
+            started_at_ms,
+            ..
+        } => JournalRecord::OperationStarted {
+            operation_id,
+            turn_id,
+            ordinal,
+            schema_version,
+            started_at_ms,
+        },
+        JournalRecord::TurnStarted {
+            operation_id,
+            turn_id,
+            schema_version,
+            ..
+        } => JournalRecord::TurnStarted {
+            operation_id,
+            turn_id,
+            ordinal,
+            schema_version,
+        },
+        JournalRecord::ModelResponse {
+            operation_id,
+            turn_id,
+            schema_version,
+            response_id,
+            final_message,
+            ..
+        } => JournalRecord::ModelResponse {
+            operation_id,
+            turn_id,
+            ordinal,
+            schema_version,
+            response_id,
+            final_message,
+        },
+        JournalRecord::ToolStarted {
+            operation_id,
+            turn_id,
+            schema_version,
+            tool_call_id,
+            tool_name,
+            ..
+        } => JournalRecord::ToolStarted {
+            operation_id,
+            turn_id,
+            ordinal,
+            schema_version,
+            tool_call_id,
+            tool_name,
+        },
+        JournalRecord::ToolCompleted {
+            operation_id,
+            turn_id,
+            schema_version,
+            tool_call_id,
+            status,
+            error,
+            ..
+        } => JournalRecord::ToolCompleted {
+            operation_id,
+            turn_id,
+            ordinal,
+            schema_version,
+            tool_call_id,
+            status,
+            error,
+        },
+        JournalRecord::CheckpointCreated {
+            operation_id,
+            turn_id,
+            schema_version,
+            checkpoint_id,
+            message_id,
+            ..
+        } => JournalRecord::CheckpointCreated {
+            operation_id,
+            turn_id,
+            ordinal,
+            schema_version,
+            checkpoint_id,
+            message_id,
+        },
+        JournalRecord::OperationTerminal {
+            operation_id,
+            turn_id,
+            schema_version,
+            terminal,
+            ..
+        } => JournalRecord::OperationTerminal {
+            operation_id,
+            turn_id,
+            ordinal,
+            schema_version,
+            terminal,
+        },
+    }
 }
 
 /// Convenience builders used by the agent loop.

@@ -52,6 +52,9 @@ pub(crate) struct RuntimeSubagentBatchToolTurnRequest<'a> {
     pub(crate) tool_requests: &'a [tool_types::ToolRequest],
     pub(crate) subagent_depth: u32,
     pub(crate) emit_deltas: bool,
+    /// Lease-derived budget bound bounding every child in this batch (parent
+    /// remaining minus outstanding reservations).
+    pub(crate) child_budget: Option<orca_core::budget::BudgetSpec>,
 }
 
 pub(crate) struct RuntimeSubagentBatchToolTurnIo<'a, W: io::Write> {
@@ -177,6 +180,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         tool_requests,
         subagent_depth,
         emit_deltas,
+        child_budget,
     } = request;
     let RuntimeSubagentBatchToolTurnIo {
         events,
@@ -215,6 +219,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         root_task_id,
         workflow_ipc,
         child_executor,
+        child_budget.as_ref(),
     );
 
     let record_outcome = record_subagent_batch_results(
@@ -229,9 +234,11 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
 
     match record_outcome {
         SubagentBatchRecordOutcome::Continue => Ok(ToolTurnOutcome::Continue),
-        SubagentBatchRecordOutcome::Return { status, error } => {
-            Ok(ToolTurnOutcome::Return { status, error })
-        }
+        SubagentBatchRecordOutcome::Return { status, error } => Ok(ToolTurnOutcome::Return {
+            status,
+            error,
+            terminal: None,
+        }),
     }
 }
 
@@ -262,7 +269,13 @@ fn execute_subagent_batch(
     root_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
+    child_budget: Option<&orca_core::budget::BudgetSpec>,
 ) -> SubagentBatchExecution {
+    // The parent operation's lease bounds every child in this batch; without
+    // an override the batch falls back to the parent config's budget.
+    let child_config = child_budget
+        .map(|spec| apply_child_budget_spec(config, spec))
+        .unwrap_or_else(|| config.clone());
     let mut results: Vec<Option<(RunStatus, tool_types::ToolResult)>> =
         vec![None; tool_requests.len()];
     let mut runtime_outputs: Vec<Option<RuntimeSubagentCallOutput>> =
@@ -385,7 +398,7 @@ fn execute_subagent_batch(
         let invocation = RuntimeSubagentInvocation::snapshot(
             effective,
             request,
-            config,
+            &child_config,
             cwd,
             instructions,
             memory,
@@ -477,6 +490,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
     event_error: &mut Option<io::Error>,
+    child_budget: Option<&orca_core::budget::BudgetSpec>,
 ) -> io::Result<tool_types::ToolResult> {
     let request = subagent::with_delegation_snapshot(
         subagent::create_subagent_request(tool_request),
@@ -527,7 +541,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         }
         return Ok(launch.result);
     }
-    let child_config = config_for_remaining_subagent_budget(config, cost_tracker);
+    let child_config = config_for_remaining_subagent_budget(config, cost_tracker, child_budget);
     let invocation = RuntimeSubagentInvocation::snapshot(
         tool_request.clone(),
         request,
@@ -563,13 +577,28 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
 fn config_for_remaining_subagent_budget(
     config: &RunConfig,
     cost_tracker: &CostTracker,
+    child_budget: Option<&orca_core::budget::BudgetSpec>,
 ) -> RunConfig {
     let mut child_config = config.clone();
+    if let Some(child_budget) = child_budget {
+        // The parent operation's lease bounds this child precisely (parent
+        // remaining minus outstanding reservations); every dimension comes
+        // from the lease spec.
+        child_config.budget = orca_core::config::BudgetConfig::from_spec(*child_budget);
+        return child_config;
+    }
     if let Some(max_cost_usd_micros) = config.budget.max_cost_usd_micros {
         let spent_micros = crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
         child_config.budget.max_cost_usd_micros =
             Some(max_cost_usd_micros.saturating_sub(spent_micros));
     }
+    child_config
+}
+
+/// Applies a lease-derived budget spec to a child config copy.
+fn apply_child_budget_spec(config: &RunConfig, spec: &orca_core::budget::BudgetSpec) -> RunConfig {
+    let mut child_config = config.clone();
+    child_config.budget = orca_core::config::BudgetConfig::from_spec(*spec);
     child_config
 }
 
@@ -800,7 +829,8 @@ mod tests {
             cache_tokens: 0,
         });
 
-        let child_config = super::config_for_remaining_subagent_budget(&config, &cost_tracker);
+        let child_config =
+            super::config_for_remaining_subagent_budget(&config, &cost_tracker, None);
 
         // 1M flash input tokens ≈ $0.14, leaving ≈ $0.36 of the $0.50 budget.
         let remaining = child_config
@@ -968,6 +998,7 @@ mod tests {
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
+                    child_budget: None,
                     emit_deltas: true,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1135,6 +1166,7 @@ mod tests {
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
+                    child_budget: None,
                     emit_deltas: false,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1207,6 +1239,7 @@ mod tests {
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
+                    child_budget: None,
                     emit_deltas: true,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1280,6 +1313,7 @@ mod tests {
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
+                    child_budget: None,
                     emit_deltas: true,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1415,6 +1449,7 @@ mod tests {
             None,
             remove_worktree_child_executor::<io::Sink>,
             &mut event_error,
+            None,
         )
         .expect("cleanup failure must return a tool terminal");
 
@@ -1488,6 +1523,7 @@ mod tests {
             None,
             panic_child_executor::<io::Sink>,
             &mut event_error,
+            None,
         )
         .expect("panic must become a terminal after worktree cleanup");
 
@@ -1539,6 +1575,7 @@ mod tests {
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
+                    child_budget: None,
                     emit_deltas: true,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1628,6 +1665,7 @@ mod tests {
             None,
             fake_child_executor::<io::Sink>,
             &mut event_error,
+            None,
         )
         .expect("subagent tool");
 
@@ -1677,6 +1715,7 @@ mod tests {
             None,
             unexpected_child_executor::<io::Sink>,
             &mut event_error,
+            None,
         )
         .expect("pre-cancelled subagent tool");
 
@@ -1733,6 +1772,7 @@ mod tests {
             None,
             panic_child_executor::<io::Sink>,
             &mut event_error,
+            None,
         )
         .expect("panicking subagent must return a terminal");
 
@@ -1806,6 +1846,7 @@ mod tests {
             None,
             unexpected_child_executor::<io::Sink>,
             &mut event_error,
+            None,
         )
         .expect("budget-rejected subagent tool");
 
@@ -1855,6 +1896,7 @@ mod tests {
             None,
             cancelled_child_executor::<io::Sink>,
             &mut event_error,
+            None,
         )
         .expect("cancelled subagent tool");
 

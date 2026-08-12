@@ -36,6 +36,7 @@ use crate::memory;
 #[cfg(test)]
 use crate::memory::MemoryBlock;
 use crate::model_response::RuntimeModelResponse;
+use crate::operation_context::OperationContext;
 use crate::provider_stream::RuntimeProviderSuspension;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_directive::conversation_with_runtime_system_messages;
@@ -72,6 +73,7 @@ pub(crate) struct RuntimeTurnProviderCycleStep {
 
 pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
+    pub(crate) operation: &'a mut OperationContext,
     pub(crate) provider: ProviderKind,
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) turn_context: RuntimeTurnContext<'a>,
@@ -81,7 +83,6 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) base_provider_config: &'a ProviderConfig,
     pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
     pub(crate) cost_tracker: &'a mut CostTracker,
-    pub(crate) max_cost_usd_micros: Option<u64>,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) conversation: &'a mut RuntimePreparedConversation<'runtime>,
@@ -94,13 +95,13 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
 
 pub(crate) struct RuntimeProviderTurnInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
+    pub(crate) operation: &'a mut OperationContext,
     pub(crate) provider: ProviderKind,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) provider_config: &'a ProviderConfig,
     pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) hooks: &'a HookRunner,
     pub(crate) cancel: &'a CancelToken,
-    pub(crate) max_cost_usd_micros: Option<u64>,
     /// Full model context window, used as the denominator for the local
     /// `context.updated` observability event emitted after real usage arrives.
     pub(crate) context_window: usize,
@@ -118,6 +119,7 @@ pub(crate) struct RuntimeProviderTurnIo<'a, W: io::Write> {
 pub(crate) struct RuntimeProviderResponseInput<'a, W: io::Write> {
     pub(crate) step_context: RuntimeStepContext<'a>,
     pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
+    pub(crate) operation: &'a mut OperationContext,
     pub(crate) io: RuntimeProviderResponseIo<'a, W>,
 }
 
@@ -155,6 +157,9 @@ pub(crate) enum RuntimeProviderResponseOutcome {
     Return {
         status: RunStatus,
         error: Option<String>,
+        /// Typed operation terminal when the tool turn ended in a budget
+        /// stop (already committed durably by the operation context).
+        terminal: Option<orca_core::budget::OperationTerminal>,
     },
 }
 
@@ -246,6 +251,7 @@ impl RuntimeProviderErrorStep {
                         reason: TurnEndReason::Unclassified,
                         message,
                         max_cost_usd_micros: 0,
+                        terminal: None,
                     },
                 ))
             }
@@ -402,6 +408,7 @@ impl RuntimeProviderTurnStep {
                         reason: TurnEndReason::Unclassified,
                         message: "provider stream disconnected before completion".to_string(),
                         max_cost_usd_micros: 0,
+                        terminal: None,
                     }));
                 }
             }
@@ -421,20 +428,35 @@ impl RuntimeProviderTurnStep {
         };
 
         let mut usage_error = None;
+        let mut budget_stop = None;
         if let Some(usage) = response.usage
             && !usage.is_empty()
         {
-            let totals =
-                match input
-                    .actor
-                    .record_usage(usage, cost_tracker, input.max_cost_usd_micros)
-                {
-                    Ok(totals) => totals,
-                    Err(error) => {
-                        usage_error = Some(error);
-                        cost_tracker.totals()
-                    }
-                };
+            // The operation's controller owns the cost dimension; the legacy
+            // actor-side ceiling check is disabled here so every dimension is
+            // enforced by the one controller (and journaled with the terminal).
+            let totals = match input.actor.record_usage(usage, cost_tracker, None) {
+                Ok(totals) => totals,
+                Err(error) => {
+                    usage_error = Some(error);
+                    cost_tracker.totals()
+                }
+            };
+            let spent_total = crate::cost::usd_to_micros(totals.estimated_cost_usd);
+            let recorded_before = input.operation.controller.usage().cost_usd_micros;
+            let delta = spent_total.saturating_sub(recorded_before);
+            if delta > 0
+                && let Err(stop) = input.operation.record_cost_usd_micros(delta)
+            {
+                budget_stop = Some(stop);
+            }
+            // Wall time is synced after every provider exchange so a
+            // wall-time stop lands promptly, not only at the next turn admit.
+            if budget_stop.is_none()
+                && let Err(stop) = input.operation.sync_wall_time()
+            {
+                budget_stop = Some(stop);
+            }
             if emit_deltas {
                 sink.emit(events.usage_updated(totals))?;
                 if let Some(writer) = history_writer.as_deref_mut() {
@@ -451,6 +473,29 @@ impl RuntimeProviderTurnStep {
 
         if input.cancel.is_cancelled() {
             return cancelled_provider_turn(emit_deltas, events, sink);
+        }
+        if let Some(stop) = budget_stop {
+            // Commit the stop durably before surfacing: `checkpoint.created`
+            // then `operation.terminal`, both flushed to the journal. The
+            // surfaced terminal carries the real checkpoint and resumability.
+            let checkpoint_id = format!("{}-budget-stop", events.run_id());
+            let terminal = input.operation.commit_budget_stop(
+                input.turn_context.turn_id.as_str(),
+                &checkpoint_id,
+                None,
+            )?;
+            return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+                status: RunStatus::Failed,
+                reason: TurnEndReason::CostBudgetExhausted,
+                message: format!(
+                    "budget stopped: {} (turns={}, tool_calls={})",
+                    stop.reason.as_str(),
+                    stop.usage.turns,
+                    stop.usage.tool_calls
+                ),
+                max_cost_usd_micros: 0,
+                terminal: Some(terminal),
+            }));
         }
         if let Some(error) = usage_error {
             return Ok(RuntimeProviderTurnOutput::terminal(error));
@@ -517,6 +562,7 @@ impl RuntimeProviderResponseStep {
         let RuntimeProviderResponseInput {
             step_context,
             sampling_state,
+            operation,
             io,
         } = input;
         let RuntimeProviderResponseIo {
@@ -571,6 +617,7 @@ impl RuntimeProviderResponseStep {
         match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state,
+            operation: Some(operation),
             io: RuntimeToolTurnsIo {
                 events,
                 sink,
@@ -586,9 +633,15 @@ impl RuntimeProviderResponseStep {
             },
         })? {
             ToolTurnOutcome::Continue => Ok(RuntimeProviderResponseOutcome::Continue),
-            ToolTurnOutcome::Return { status, error } => {
-                Ok(RuntimeProviderResponseOutcome::Return { status, error })
-            }
+            ToolTurnOutcome::Return {
+                status,
+                error,
+                terminal,
+            } => Ok(RuntimeProviderResponseOutcome::Return {
+                status,
+                error,
+                terminal,
+            }),
         }
     }
 }
@@ -607,12 +660,17 @@ impl RuntimeProviderResponseResultStep {
             RuntimeProviderResponseOutcome::Success { final_message } => {
                 RuntimeProviderResponseResult::Return(AgentLoopResult::success(final_message))
             }
-            RuntimeProviderResponseOutcome::Return { status, error } => {
-                RuntimeProviderResponseResult::Return(AgentLoopResult::terminal(
-                    status,
-                    TurnEndReason::Unclassified,
-                    error,
-                ))
+            RuntimeProviderResponseOutcome::Return {
+                status,
+                error,
+                terminal,
+            } => {
+                let mut result =
+                    AgentLoopResult::terminal(status, TurnEndReason::Unclassified, error);
+                if let Some(terminal) = terminal {
+                    result.terminal = terminal;
+                }
+                RuntimeProviderResponseResult::Return(result)
             }
         }
     }
@@ -646,13 +704,13 @@ impl RuntimeTurnProviderCycleStep {
                 let (conversation, history_writer) = input.conversation.parts_mut();
                 RuntimeProviderTurnStep::new().run(RuntimeProviderTurnInput {
                     actor: input.actor,
+                    operation: &mut *input.operation,
                     provider: input.provider,
                     runtime_system_messages: input.runtime_system_messages,
                     provider_config: input.turn_provider_config,
                     turn_context: turn_context.clone(),
                     hooks: capabilities.hooks,
                     cancel: capabilities.cancel,
-                    max_cost_usd_micros: input.max_cost_usd_micros,
                     context_window: input.context_config.max_tokens,
                     io: RuntimeProviderTurnIo {
                         conversation,
@@ -738,6 +796,7 @@ impl RuntimeTurnProviderCycleStep {
         let response_input = kernel.provider_response_input(
             step_context,
             input.extensions.registry(),
+            &mut *input.operation,
             input.events,
             input.sink,
             conversation,
@@ -811,6 +870,7 @@ fn cancelled_provider_turn<W: io::Write>(
         reason: TurnEndReason::Cancelled,
         message: "turn cancelled".to_string(),
         max_cost_usd_micros: 0,
+        terminal: None,
     }))
 }
 
@@ -1115,6 +1175,10 @@ mod tests {
         let response = RuntimeProviderTurnStep::new()
             .run(RuntimeProviderTurnInput {
                 actor: &mut actor,
+                operation: &mut crate::operation_context::OperationContext::for_tests(
+                    orca_core::budget::BudgetSpec::default(),
+                    "provider-turn-test",
+                ),
                 provider: ProviderKind::Mock,
                 runtime_system_messages: &[],
                 provider_config: &provider_config,
@@ -1127,7 +1191,6 @@ mod tests {
                 ),
                 hooks: &hooks,
                 cancel: &cancel,
-                max_cost_usd_micros: None,
                 context_window: 1_000_000,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
@@ -1186,6 +1249,10 @@ mod tests {
         let result = RuntimeProviderTurnStep::new()
             .run(RuntimeProviderTurnInput {
                 actor: &mut actor,
+                operation: &mut crate::operation_context::OperationContext::for_tests(
+                    orca_core::budget::BudgetSpec::default(),
+                    "provider-turn-test",
+                ),
                 provider: ProviderKind::Mock,
                 runtime_system_messages: runtime_system_messages.as_slice(),
                 provider_config: &provider_config,
@@ -1198,7 +1265,6 @@ mod tests {
                 ),
                 hooks: &hooks,
                 cancel: &cancel,
-                max_cost_usd_micros: None,
                 context_window: 1_000_000,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
@@ -1307,6 +1373,7 @@ mod tests {
                 reason: TurnEndReason::Unclassified,
                 message: "provider failed".to_string(),
                 max_cost_usd_micros: 0,
+                terminal: None,
             }),
         );
         match failed {
@@ -1371,6 +1438,10 @@ mod tests {
                 RuntimeProviderResponseInput {
                     step_context,
                     sampling_state: &mut sampling_state,
+                    operation: &mut crate::operation_context::OperationContext::for_tests(
+                        orca_core::budget::BudgetSpec::default(),
+                        "provider-response-test",
+                    ),
                     io: RuntimeProviderResponseIo {
                         events: &mut events,
                         sink: &mut sink,
@@ -1460,6 +1531,10 @@ mod tests {
                     RuntimeProviderResponseInput {
                         step_context,
                         sampling_state: &mut sampling_state,
+                        operation: &mut crate::operation_context::OperationContext::for_tests(
+                            orca_core::budget::BudgetSpec::default(),
+                            "provider-response-auto-memory",
+                        ),
                         io: RuntimeProviderResponseIo {
                             events: &mut events,
                             sink: &mut sink,
@@ -1541,6 +1616,10 @@ mod tests {
                 RuntimeProviderResponseInput {
                     step_context,
                     sampling_state: &mut sampling_state,
+                    operation: &mut crate::operation_context::OperationContext::for_tests(
+                        orca_core::budget::BudgetSpec::default(),
+                        "provider-response-test",
+                    ),
                     io: RuntimeProviderResponseIo {
                         events: &mut events,
                         sink: &mut sink,
@@ -1649,6 +1728,10 @@ mod tests {
             .run(
                 RuntimeProviderCycleInput {
                     actor: &mut actor,
+                    operation: &mut crate::operation_context::OperationContext::for_tests(
+                        orca_core::budget::BudgetSpec::default(),
+                        "provider-cycle-test",
+                    ),
                     provider: ProviderKind::DeepSeek,
                     continuation: Some(RuntimeTurnContinuation::from_response(
                         response,
@@ -1679,7 +1762,6 @@ mod tests {
                         None,
                     ),
                     cost_tracker: &mut cost_tracker,
-                    max_cost_usd_micros: None,
                     events: &mut events,
                     sink: &mut sink,
                     conversation: &mut prepared_conversation,
@@ -1722,6 +1804,7 @@ mod tests {
             reason: TurnEndReason::Cancelled,
             message: "turn cancelled".to_string(),
             max_cost_usd_micros: 0,
+            terminal: None,
         });
 
         let error = match output {
@@ -1740,6 +1823,7 @@ mod tests {
             reason: TurnEndReason::Cancelled,
             message: "turn cancelled".to_string(),
             max_cost_usd_micros: 0,
+            terminal: None,
         });
         let mut events = EventFactory::new("provider-turn-result".to_string());
         let mut emitted = Vec::new();
@@ -1793,6 +1877,7 @@ mod tests {
                 reason: TurnEndReason::Unclassified,
                 message: "provider failed".to_string(),
                 max_cost_usd_micros: 0,
+                terminal: None,
             }),
         );
         match failed {
@@ -1830,6 +1915,7 @@ mod tests {
             RuntimeProviderResponseResultStep::new().fold(RuntimeProviderResponseOutcome::Return {
                 status: RunStatus::Cancelled,
                 error: Some("cancelled".to_string()),
+                terminal: None,
             });
         match terminal {
             RuntimeProviderResponseResult::Return(result) => {

@@ -11,6 +11,7 @@ use crate::extension::{
     ExtensionData, ExtensionRegistry, RuntimeExtensionContext, RuntimeExtensionStores,
 };
 use crate::lifecycle::{RuntimeTurnExtensionState, RuntimeTurnLoopRuntime, RuntimeTurnLoopState};
+use crate::operation_context::OperationContext;
 use crate::provider_turn::{RuntimeProviderResponseInput, RuntimeProviderResponseIo};
 use crate::runtime_directive::RuntimeDirectiveState;
 use crate::runtime_state::RuntimeTurnReducer;
@@ -67,6 +68,7 @@ impl<'a> RuntimeTurnKernel<'a> {
         &'response mut self,
         mut step_context: RuntimeStepContext<'response>,
         extension_registry: &'response ExtensionRegistry,
+        operation: &'response mut OperationContext,
         events: &'response mut EventFactory,
         sink: &'response mut EventSink<W>,
         conversation: &'response mut Conversation,
@@ -84,6 +86,7 @@ impl<'a> RuntimeTurnKernel<'a> {
         RuntimeProviderResponseInput {
             step_context,
             sampling_state: &mut self.sampling_state,
+            operation,
             io: RuntimeProviderResponseIo {
                 events,
                 sink,

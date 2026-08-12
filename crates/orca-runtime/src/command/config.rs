@@ -82,19 +82,23 @@ pub fn assemble_run_config(
         permission_rules: file.permissions,
         additional_working_directories: Vec::new(),
         budget: {
-            let mut budget = file.budget;
-            if budget.max_cost_usd_micros.is_none() {
-                budget.max_cost_usd_micros = request.budget.max_cost_usd_micros;
-            }
+            // CLI arguments take precedence over file configuration: the
+            // request budget is the base and file values fill only the
+            // dimensions the caller did not explicitly set.
+            let mut budget = request.budget;
             if budget.max_turns.is_none() {
-                budget.max_turns = request.budget.max_turns;
+                budget.max_turns = file.budget.max_turns;
             }
             if budget.max_tool_calls.is_none() {
-                budget.max_tool_calls = request.budget.max_tool_calls;
+                budget.max_tool_calls = file.budget.max_tool_calls;
+            }
+            if budget.max_cost_usd_micros.is_none() {
+                budget.max_cost_usd_micros = file.budget.max_cost_usd_micros;
             }
             if budget.max_wall_time_ms.is_none() {
-                budget.max_wall_time_ms = request.budget.max_wall_time_ms;
+                budget.max_wall_time_ms = file.budget.max_wall_time_ms;
             }
+            budget.validate()?;
             budget
         },
         mcp_servers: file.mcp_servers,
@@ -187,6 +191,46 @@ mod tests {
         );
         assert!(config.desktop_notifications);
         assert!(config.auto_memory);
+    }
+
+    #[test]
+    fn cli_budget_overrides_file_budget_dimension_wise() {
+        let file = FileConfig {
+            budget: BudgetConfig {
+                max_turns: Some(16),
+                max_cost_usd_micros: Some(1_000_000),
+                ..BudgetConfig::default()
+            },
+            ..FileConfig::default()
+        };
+        let request = RunConfigRequest {
+            // CLI explicitly sets max_turns=8; cost stays from the file.
+            budget: BudgetConfig {
+                max_turns: Some(8),
+                ..BudgetConfig::default()
+            },
+            ..RunConfigRequest::new("0.3.0", PathBuf::from("/workspace"))
+        };
+
+        let config = assemble_run_config(request, file).unwrap();
+        assert_eq!(config.budget.max_turns, Some(8));
+        assert_eq!(config.budget.max_cost_usd_micros, Some(1_000_000));
+        assert_eq!(config.budget.max_tool_calls, None);
+    }
+
+    #[test]
+    fn zero_budget_dimension_is_rejected_with_clear_error() {
+        let request = RunConfigRequest {
+            budget: BudgetConfig {
+                max_turns: Some(0),
+                ..BudgetConfig::default()
+            },
+            ..RunConfigRequest::new("0.3.0", PathBuf::from("/workspace"))
+        };
+
+        let error = assemble_run_config(request, FileConfig::default())
+            .expect_err("zero max_turns must be rejected");
+        assert!(error.contains("max_turns"));
     }
 
     #[test]

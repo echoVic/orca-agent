@@ -21,6 +21,7 @@ use crate::lifecycle::{
     RuntimeUserInputHandler,
 };
 use crate::memory::MemoryBlock;
+use crate::operation_context::OperationContext;
 #[cfg(test)]
 use crate::runtime_readonly_tool_turn::record_readonly_batch_results;
 use crate::runtime_readonly_tool_turn::{
@@ -55,12 +56,16 @@ pub(crate) enum ToolTurnOutcome {
     Return {
         status: RunStatus,
         error: Option<String>,
+        /// Typed operation terminal when this turn ended in a budget stop
+        /// (already committed to the journal by the operation context).
+        terminal: Option<orca_core::budget::OperationTerminal>,
     },
 }
 
 pub(crate) struct RuntimeToolTurnsContext<'a, W: io::Write> {
     pub(crate) step_context: RuntimeStepContext<'a>,
     pub(crate) sampling_state: &'a mut RuntimeSamplingRequestState,
+    pub(crate) operation: Option<&'a mut OperationContext>,
     pub(crate) io: RuntimeToolTurnsIo<'a, W>,
     pub(crate) tool_requests: &'a [ToolRequest],
     pub(crate) executors: RuntimeToolTurnsExecutors,
@@ -105,6 +110,8 @@ pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
     pub(crate) goal_mode: bool,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) root_task_id: Option<&'a str>,
+    /// Lease-derived budget bound for subagent children of this tool call.
+    pub(crate) child_budget: Option<orca_core::budget::BudgetSpec>,
 }
 
 pub(crate) struct RuntimeNormalToolTurnIo<'a, W: io::Write> {
@@ -147,15 +154,21 @@ pub(crate) struct RuntimeNormalToolTurnInteractions<'a> {
 impl ToolTurnOutcome {
     #[cfg(test)]
     pub(crate) fn from_terminal(status: RunStatus, error: Option<String>) -> Self {
-        Self::Return { status, error }
+        Self::Return {
+            status,
+            error,
+            terminal: None,
+        }
     }
 
     pub(crate) fn from_record_outcome(outcome: RuntimeToolResultRecordOutcome) -> Self {
         match outcome {
             RuntimeToolResultRecordOutcome::Continue => Self::Continue,
-            RuntimeToolResultRecordOutcome::Return { status, error } => {
-                Self::Return { status, error }
-            }
+            RuntimeToolResultRecordOutcome::Return { status, error } => Self::Return {
+                status,
+                error,
+                terminal: None,
+            },
         }
     }
 }
@@ -190,6 +203,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let RuntimeToolTurnsContext {
         step_context,
         sampling_state,
+        mut operation,
         io,
         tool_requests,
         executors,
@@ -213,6 +227,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let subagent_depth = step_snapshot.turn_context.subagent_depth;
     let root_task_id = step_snapshot.turn_context.root_task_id;
     let emit_deltas = step_snapshot.turn_context.emit_deltas;
+    let turn_id = step_snapshot.turn_context.turn_id.as_str();
     let provider_response_ingress = step_snapshot.turn_context.provider_response_ingress();
     let workflow_lifecycle_ingress = step_snapshot.turn_context.workflow_lifecycle_ingress();
     let wait_for_background_workflows = step_snapshot.turn_context.wait_for_background_workflows;
@@ -245,6 +260,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             return Ok(ToolTurnOutcome::Return {
                 status: RunStatus::Cancelled,
                 error: Some("tool turn cancelled".to_string()),
+                terminal: None,
             });
         }
         if let Some(result) = reject_disallowed_child_tool(
@@ -277,6 +293,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             let outcome = ToolTurnOutcome::Return {
                 status: RunStatus::Failed,
                 error: Some(result.error.clone().unwrap_or_default()),
+                terminal: None,
             };
             close_unstarted_tool_requests(
                 sampling_state,
@@ -301,7 +318,75 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             break;
         };
 
+        // Admit every tool in this dispatch window against the operation
+        // budget before any of them runs. Already-admitted calls are settled
+        // as cancelled and the stop commits a real checkpoint + terminal to
+        // the journal before surfacing.
+        if let Some(operation) = operation.as_deref_mut() {
+            let window_requests: Vec<&ToolRequest> = match &dispatch {
+                RuntimeToolDispatch::Normal(request) => vec![*request],
+                RuntimeToolDispatch::SubagentBatch(window)
+                | RuntimeToolDispatch::ReadonlyBatch(window) => {
+                    window.tool_requests().iter().collect()
+                }
+            };
+            let mut admitted_ids: Vec<String> = Vec::new();
+            let mut stop = None;
+            for request in window_requests {
+                match operation.admit_tool_call(turn_id, &request.id, request.name.as_str()) {
+                    Ok(Ok(())) => admitted_ids.push(request.id.clone()),
+                    Ok(Err(s)) => {
+                        stop = Some(s);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(stop) = stop {
+                for id in &admitted_ids {
+                    operation.record_tool_completed(
+                        turn_id,
+                        id,
+                        "cancelled",
+                        Some("budget stopped before dispatch".to_string()),
+                    )?;
+                }
+                let checkpoint_id = format!("{}-budget-stop", events.run_id());
+                let terminal = operation.commit_budget_stop(turn_id, &checkpoint_id, None)?;
+                close_unstarted_tool_requests(
+                    sampling_state,
+                    tool_requests,
+                    events,
+                    sink,
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    emit_deltas,
+                    provider_response_ingress,
+                    "an earlier tool dispatch was stopped by the operation budget",
+                )?;
+                return Ok(ToolTurnOutcome::Return {
+                    status: RunStatus::Failed,
+                    error: Some(format!(
+                        "budget stopped: {} (turns={}, tool_calls={})",
+                        stop.reason.as_str(),
+                        stop.usage.turns,
+                        stop.usage.tool_calls
+                    )),
+                    terminal: Some(terminal),
+                });
+            }
+        }
+
         if let RuntimeToolDispatch::SubagentBatch(dispatch_window) = dispatch {
+            // Reserve the batch's child budget from the parent operation so
+            // concurrent children never double-spend it; the effective spec
+            // bounds every child in the batch and settles back afterwards.
+            let mut child_lease = operation.as_deref_mut().and_then(|operation| {
+                operation
+                    .controller
+                    .child_lease(config.budget.to_spec())
+                    .ok()
+            });
             let outcome = run_subagent_batch_tool_turn(RuntimeSubagentBatchToolTurnContext {
                 request: RuntimeSubagentBatchToolTurnRequest {
                     config,
@@ -309,6 +394,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     tool_requests: dispatch_window.tool_requests(),
                     subagent_depth,
                     emit_deltas,
+                    child_budget: child_lease.as_ref().map(|lease| *lease.spec()),
                 },
                 io: RuntimeSubagentBatchToolTurnIo {
                     events,
@@ -335,6 +421,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    settle_child_lease(&mut child_lease, &mut operation);
                     close_unstarted_tool_requests(
                         sampling_state,
                         tool_requests,
@@ -349,7 +436,13 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     return Err(error);
                 }
             };
+            if let Some(operation) = operation.as_deref_mut() {
+                for request in dispatch_window.tool_requests() {
+                    operation.record_tool_completed(turn_id, &request.id, "completed", None)?;
+                }
+            }
             if matches!(outcome, ToolTurnOutcome::Return { .. }) {
+                settle_child_lease(&mut child_lease, &mut operation);
                 close_unstarted_tool_requests(
                     sampling_state,
                     tool_requests,
@@ -363,6 +456,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 )?;
                 return Ok(outcome);
             }
+            settle_child_lease(&mut child_lease, &mut operation);
             continue;
         }
 
@@ -412,6 +506,11 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     return Err(error);
                 }
             };
+            if let Some(operation) = operation.as_deref_mut() {
+                for request in dispatch_window.tool_requests() {
+                    operation.record_tool_completed(turn_id, &request.id, "completed", None)?;
+                }
+            }
             if matches!(outcome, ToolTurnOutcome::Return { .. }) {
                 close_unstarted_tool_requests(
                     sampling_state,
@@ -433,6 +532,20 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             unreachable!("batch dispatches are handled before normal tool dispatch");
         };
 
+        // Reserve the child budget from the parent operation for subagent
+        // children of this tool call; the effective spec bounds the child and
+        // settles back (RAII) once the tool settles.
+        let mut child_lease = if tool_request.name == orca_core::tool_types::ToolName::Subagent {
+            operation.as_deref_mut().and_then(|operation| {
+                operation
+                    .controller
+                    .child_lease(config.budget.to_spec())
+                    .ok()
+            })
+        } else {
+            None
+        };
+
         let execution = run_normal_tool_turn(RuntimeNormalToolTurnContext {
             sampling_state,
             request: RuntimeNormalToolTurnRequest {
@@ -444,6 +557,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 goal_mode: tool_policy.is_goal_mode(),
                 policy,
                 root_task_id,
+                child_budget: child_lease.as_ref().map(|lease| *lease.spec()),
             },
             io: RuntimeNormalToolTurnIo {
                 events,
@@ -482,6 +596,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         let execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
+                settle_child_lease(&mut child_lease, &mut operation);
                 if is_semantic_commit_failure(&error) {
                     return Err(error);
                 }
@@ -520,6 +635,14 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     &result,
                     emit_deltas,
                 )?;
+                if let Some(operation) = operation.as_deref_mut() {
+                    operation.record_tool_completed(
+                        turn_id,
+                        &tool_request.id,
+                        "indeterminate",
+                        Some(result.error.clone().unwrap_or_default()),
+                    )?;
+                }
                 sampling_state.advance_tool_cursor_one(tool_requests.len());
                 close_unstarted_tool_requests(
                     sampling_state,
@@ -537,6 +660,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         };
         sampling_state.advance_tool_cursor_one(tool_requests.len());
         if let Some(error) = execution.event_error {
+            settle_child_lease(&mut child_lease, &mut operation);
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -551,7 +675,11 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             return Err(error);
         }
         let outcome = execution.outcome;
+        if let Some(operation) = operation.as_deref_mut() {
+            operation.record_tool_completed(turn_id, &tool_request.id, "completed", None)?;
+        }
         if matches!(outcome, ToolTurnOutcome::Return { .. }) {
+            settle_child_lease(&mut child_lease, &mut operation);
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -565,9 +693,28 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             )?;
             return Ok(outcome);
         }
+        settle_child_lease(&mut child_lease, &mut operation);
     }
 
     Ok(ToolTurnOutcome::Continue)
+}
+
+/// Settles a child budget lease exactly once: consumed usage merges into the
+/// parent operation and the reservation returns to its pool. Safe to call
+/// repeatedly on every branch exit; only the first call settles.
+fn settle_child_lease(
+    child_lease: &mut Option<crate::budget_controller::BudgetLease>,
+    operation: &mut Option<&mut OperationContext>,
+) {
+    let Some(lease) = child_lease.take() else {
+        return;
+    };
+    let consumed = lease.finish();
+    if let Some(operation) = operation.as_deref_mut() {
+        // Merging past the parent's ceiling latches the parent stop; the
+        // next turn admission surfaces it as a typed terminal.
+        let _ = operation.controller.merge_child_usage(consumed);
+    }
 }
 
 fn close_unstarted_tool_requests<W: io::Write>(
@@ -680,6 +827,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         goal_mode,
         policy,
         root_task_id,
+        child_budget,
     } = request;
     let RuntimeNormalToolTurnExecutors {
         subagent_child_executor,
@@ -736,6 +884,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             outcome: ToolTurnOutcome::Return {
                 status: RunStatus::Failed,
                 error: Some(error),
+                terminal: None,
             },
             event_error,
         });
@@ -743,6 +892,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
         .with_goal_mode(goal_mode)
         .with_root_task_id(root_task_id)
+        .with_child_budget(child_budget)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
             cost_tracker,
@@ -820,6 +970,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         ToolTurnOutcome::Return {
             status: RunStatus::Failed,
             error: Some(error),
+            terminal: None,
         }
     } else {
         let record_outcome = sampling_state.record_normal_tool_result(
@@ -834,6 +985,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             ToolTurnOutcome::Return {
                 status: execution.status,
                 error: execution.result.error.clone(),
+                terminal: None,
             }
         } else {
             ToolTurnOutcome::from_record_outcome(record_outcome)
@@ -1578,6 +1730,7 @@ mod tests {
                 goal_mode: false,
                 policy: &policy,
                 root_task_id: None,
+                child_budget: None,
             },
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,
@@ -1676,6 +1829,7 @@ mod tests {
                 goal_mode: false,
                 policy: &policy,
                 root_task_id: Some(&root.id),
+                child_budget: None,
             },
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,
@@ -2070,6 +2224,7 @@ mod tests {
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2087,7 +2242,11 @@ mod tests {
         .expect("run tool turns");
 
         match outcome {
-            ToolTurnOutcome::Return { status, error } => {
+            ToolTurnOutcome::Return {
+                status,
+                error,
+                terminal: _,
+            } => {
                 assert_eq!(status, RunStatus::Failed);
                 assert_eq!(
                     error.as_deref(),
@@ -2207,6 +2366,7 @@ mod tests {
         let error = match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2313,6 +2473,7 @@ mod tests {
         let error = match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2414,6 +2575,7 @@ mod tests {
         let error = match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2525,6 +2687,7 @@ mod tests {
         let error = match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2634,6 +2797,7 @@ mod tests {
         let error = match run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2746,6 +2910,7 @@ mod tests {
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2851,6 +3016,7 @@ mod tests {
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2975,6 +3141,7 @@ mod tests {
         let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state: &mut sampling_state,
+            operation: None,
             io: RuntimeToolTurnsIo {
                 events: &mut events,
                 sink: &mut sink,
@@ -2992,7 +3159,11 @@ mod tests {
         .expect("run sequential subagent turns");
 
         match outcome {
-            ToolTurnOutcome::Return { status, error } => {
+            ToolTurnOutcome::Return {
+                status,
+                error,
+                terminal: _,
+            } => {
                 assert_eq!(status, RunStatus::Failed);
                 assert!(
                     error
@@ -3042,6 +3213,7 @@ mod tests {
                 goal_mode: false,
                 policy: &policy,
                 root_task_id: None,
+                child_budget: None,
             },
             io: RuntimeNormalToolTurnIo {
                 events: &mut events,
@@ -3102,7 +3274,11 @@ mod tests {
     #[test]
     fn terminal_tool_turn_carries_status_and_optional_error() {
         match terminal_tool_turn(RunStatus::Failed, Some("tool failed".to_string())) {
-            ToolTurnOutcome::Return { status, error } => {
+            ToolTurnOutcome::Return {
+                status,
+                error,
+                terminal: _,
+            } => {
                 assert_eq!(status, RunStatus::Failed);
                 assert_eq!(error.as_deref(), Some("tool failed"));
             }

@@ -341,6 +341,7 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         return Ok(ToolTurnOutcome::Return {
             status: RunStatus::Cancelled,
             error: cancelled_error.or_else(|| Some("read-only tool turn cancelled".to_string())),
+            terminal: None,
         });
     }
     Ok(ToolTurnOutcome::Continue)

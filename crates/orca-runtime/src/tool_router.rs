@@ -66,6 +66,9 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
     pub(crate) wait_for_background_workflows: bool,
     pub(crate) root_task_id: Option<&'a str>,
+    /// Lease-derived budget bound for subagent children of this tool call
+    /// (parent remaining minus outstanding reservations).
+    pub(crate) child_budget: Option<orca_core::budget::BudgetSpec>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +157,7 @@ impl<'a> RuntimeToolRouter<'a> {
             workflow_lifecycle_ingress,
             wait_for_background_workflows,
             root_task_id,
+            child_budget,
         } = context;
 
         let result = match self.runtime.classify_dispatch(execution_request, goal_mode) {
@@ -238,6 +242,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 workflow_ipc,
                 subagent_child_executor,
                 event_error,
+                child_budget.as_ref(),
             ),
             RuntimeSpecialToolDispatch::SubagentStatus => Ok(self
                 .runtime

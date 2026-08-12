@@ -27863,7 +27863,9 @@ impl ThreadActor {
                 }
                 (OperationOutcome::Stopped(terminal), Some(_completed)) => {
                     // The typed terminal owns the budget facts; the surface
-                    // projection derives its budget from the stop reason.
+                    // projection derives its budget from the stop reason with
+                    // the precise dimension (tool calls and wall time are
+                    // never conflated with turn requests or tokens).
                     let budget = match terminal {
                         orca_core::budget::OperationTerminal::Stopped { reason, usage, .. } => {
                             match reason {
@@ -27876,8 +27878,7 @@ impl ThreadActor {
                                 }
                                 orca_core::budget::StopReason::ToolCallBudget {
                                     max_tool_calls,
-                                } => surface::OperationBudget::TurnRequests {
-                                    scope: surface::TurnRequestBudgetScope::AgentLoop,
+                                } => surface::OperationBudget::ToolCalls {
                                     limit: u64::from(*max_tool_calls),
                                     observed: u64::from(usage.tool_calls),
                                 },
@@ -27889,9 +27890,9 @@ impl ThreadActor {
                                 },
                                 orca_core::budget::StopReason::WallTimeBudget {
                                     max_wall_time_ms,
-                                } => surface::OperationBudget::ModelTokens {
-                                    limit: Some(*max_wall_time_ms),
-                                    observed: Some(usage.wall_time_ms),
+                                } => surface::OperationBudget::WallTimeMs {
+                                    limit: *max_wall_time_ms,
+                                    observed: usage.wall_time_ms,
                                 },
                             }
                         }
@@ -37650,7 +37651,23 @@ fn run_headless_session(
             }
         }
         if let Some(terminal) = terminal {
-            sink.emit(events.session_completed_terminal(terminal, thread.session().session_id()))?;
+            // Legacy statuses that predate typed terminals keep their own
+            // session status: approval-required and verification-failed are
+            // distinct outcomes, not generic runtime failures. Typed stops
+            // (and every other terminal) project through the terminal object.
+            if matches!(
+                terminal,
+                orca_core::budget::OperationTerminal::Stopped { .. }
+            ) || !matches!(
+                status,
+                RunStatus::ApprovalRequired | RunStatus::VerificationFailed
+            ) {
+                sink.emit(
+                    events.session_completed_terminal(terminal, thread.session().session_id()),
+                )?;
+            } else {
+                sink.emit(events.session_completed(status, thread.session().session_id()))?;
+            }
         } else {
             sink.emit(events.session_completed(status, thread.session().session_id()))?;
         }

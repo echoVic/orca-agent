@@ -37,6 +37,7 @@ pub mod mentions;
 pub mod model_response;
 pub mod network_proxy;
 pub mod notify;
+pub mod operation_context;
 pub mod protocol;
 pub mod provider_stream;
 pub mod provider_turn;

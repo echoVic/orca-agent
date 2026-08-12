@@ -321,3 +321,85 @@ fn checkpoint_before_terminal_survives_reopen_and_projection() {
         } if checkpoint_id == "cp-durable"
     ));
 }
+
+#[test]
+fn reopen_recovers_from_torn_final_line_mid_write() {
+    let dir = tempdir().expect("tempdir");
+    let path = journal_path(&dir);
+    {
+        let mut journal = ExecutionJournal::open(path.clone(), "op-torn").expect("open journal");
+        journal
+            .append_durable(journal.record_operation_started(1))
+            .expect("operation.started");
+        journal
+            .append_durable(journal.record_turn_started("turn-1"))
+            .expect("turn.started");
+        journal
+            .append_durable(journal.record_tool_started("turn-1", "call-1", "bash"))
+            .expect("tool.started");
+    }
+    // Simulate a crash mid-write: append a partial line with no trailing
+    // newline (a torn serialization of the next record).
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open journal for tearing");
+    use std::io::Write;
+    file.write_all(br#"{"type":"tool.completed","operation_id":"op-torn","turn_id":"turn-1","ordinal":4,"schema_version":1,"tool_call_id":"call-1","status":"comp"#)
+        .expect("write torn line");
+    file.flush().expect("flush torn line");
+    drop(file);
+
+    // Reopen must repair the torn tail and load only complete records.
+    let reopened = ExecutionJournal::open(path, "op-torn").expect("reopen after torn write");
+    assert_eq!(reopened.committed().len(), 3);
+    assert!(
+        reopened
+            .committed()
+            .iter()
+            .all(|record| { !matches!(record, JournalRecord::ToolCompleted { .. }) })
+    );
+    // The unmatched tool start is preserved for indeterminate restore.
+    assert_eq!(reopened.unmatched_tool_starts().len(), 1);
+    // The next append continues after the repaired boundary. The open tool
+    // settles first (ordering rule), then the checkpoint lands on the next
+    // ordinal.
+    let mut journal = reopened;
+    journal
+        .append_durable(journal.record_tool_completed("turn-1", "call-1", "completed", None))
+        .expect("tool completed after repair");
+    journal
+        .append_durable(journal.record_checkpoint("cp-1", Some("item-3".to_string())))
+        .expect("checkpoint after repair");
+    assert_eq!(journal.committed().len(), 5);
+    assert_eq!(journal.committed()[3].ordinal(), 4);
+    assert_eq!(journal.committed()[4].ordinal(), 5);
+}
+
+#[test]
+fn append_stamps_unique_ordinals_for_prebuilt_batches() {
+    let dir = tempdir().expect("tempdir");
+    let mut journal = ExecutionJournal::open(journal_path(&dir), "op-batch").expect("open journal");
+
+    // Build a batch of records before appending any of them; each append must
+    // receive a distinct ordinal even though the builders ran first.
+    let started = journal.record_operation_started(1);
+    let turn = journal.record_turn_started("turn-1");
+    let tool = journal.record_tool_started("turn-1", "call-1", "bash");
+
+    journal.append(started).expect("operation.started");
+    journal.append(turn).expect("turn.started");
+    journal.append(tool).expect("tool.started");
+    journal.flush().expect("flush batch");
+
+    let ordinals = record_ordinals(&journal);
+    assert_eq!(ordinals, vec![1, 2, 3]);
+    assert_eq!(
+        ordinals
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "prebuilt batch records must not share ordinals"
+    );
+}

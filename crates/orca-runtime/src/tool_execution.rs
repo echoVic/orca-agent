@@ -97,6 +97,9 @@ pub(crate) struct ToolExecutionContext<'a> {
     goal_runtime: Option<GoalRuntimeHandle>,
     goal_turn: Option<GoalTurnContext>,
     root_task_id: Option<&'a str>,
+    /// Lease-derived budget bound for subagent children of this tool call
+    /// (parent remaining minus outstanding reservations).
+    child_budget: Option<orca_core::budget::BudgetSpec>,
 }
 
 pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
@@ -194,7 +197,16 @@ impl<'a> ToolExecutionContext<'a> {
             goal_runtime: None,
             goal_turn: None,
             root_task_id: None,
+            child_budget: None,
         }
+    }
+
+    pub(crate) fn with_child_budget(
+        mut self,
+        child_budget: Option<orca_core::budget::BudgetSpec>,
+    ) -> Self {
+        self.child_budget = child_budget;
+        self
     }
 
     pub(crate) fn with_goal_mode(mut self, goal_mode: bool) -> Self {
@@ -502,6 +514,7 @@ impl ToolExecutionActor {
             goal_runtime,
             goal_turn,
             root_task_id,
+            child_budget,
         } = context;
         let instructions = instructions.expect("tool execution instructions");
         let memory = memory.expect("tool execution memory");
@@ -725,6 +738,7 @@ impl ToolExecutionActor {
                 workflow_lifecycle_ingress,
                 wait_for_background_workflows,
                 root_task_id,
+                child_budget,
             },
         ) {
             Ok(output) => output,

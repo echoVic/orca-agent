@@ -83,14 +83,19 @@ pub(crate) fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
 
 #[derive(Clone, Debug)]
 pub struct AgentLoopResult {
+    /// Legacy projection kept for adapters that have not migrated yet; the
+    /// typed [`terminal`](Self::terminal) is the fact and every legacy
+    /// field is derived from it, never reconstructed independently.
     pub status: RunStatus,
+    /// Legacy projection; see [`status`](Self::status).
     pub reason: TurnEndReason,
     pub final_message: Option<String>,
     pub error: Option<String>,
-    /// Typed operation terminal when the loop ended in a budget stop; the
-    /// legacy status/reason pair above stays populated for adapters that have
-    /// not migrated yet (Task 6 completes the migration).
-    pub terminal: Option<orca_core::budget::OperationTerminal>,
+    /// The one typed operation terminal every loop produces. Budget stops
+    /// commit it durably (checkpoint + terminal) before surfacing; every
+    /// other exit derives it from the outcome status, and the operation
+    /// context fills final usage at loop exit.
+    pub terminal: orca_core::budget::OperationTerminal,
 }
 
 pub(crate) enum AgentLoopOutcome {
@@ -105,7 +110,9 @@ impl AgentLoopResult {
             reason: TurnEndReason::Unclassified,
             final_message,
             error: None,
-            terminal: None,
+            terminal: orca_core::budget::OperationTerminal::Completed {
+                usage: orca_core::budget::BudgetUsage::default(),
+            },
         }
     }
 
@@ -119,19 +126,54 @@ impl AgentLoopResult {
         reason: TurnEndReason,
         error: Option<String>,
     ) -> Self {
+        let terminal = Self::terminal_from_status(status, error.as_deref());
         Self {
             status,
             reason,
             final_message: None,
             error,
-            terminal: None,
+            terminal,
+        }
+    }
+
+    /// Derives the typed terminal from the legacy outcome status. This is the
+    /// single reconstruction site for non-budget exits; budget stops always
+    /// carry their committed terminal instead.
+    fn terminal_from_status(
+        status: RunStatus,
+        error: Option<&str>,
+    ) -> orca_core::budget::OperationTerminal {
+        use orca_core::budget::{CancelReason, FailureClass};
+        match status {
+            RunStatus::Success => orca_core::budget::OperationTerminal::Completed {
+                usage: orca_core::budget::BudgetUsage::default(),
+            },
+            RunStatus::Cancelled => orca_core::budget::OperationTerminal::Cancelled {
+                reason: CancelReason::User,
+                checkpoint_id: None,
+            },
+            RunStatus::VerificationFailed => orca_core::budget::OperationTerminal::Failed {
+                class: FailureClass::Verification,
+                message: error.unwrap_or_default().to_string(),
+            },
+            RunStatus::Failed | RunStatus::ApprovalRequired => {
+                orca_core::budget::OperationTerminal::Failed {
+                    class: FailureClass::Runtime,
+                    message: error.unwrap_or_default().to_string(),
+                }
+            }
         }
     }
 
     /// Typed budget stop produced by the operation's `BudgetController`;
-    /// no further provider request is made after this result. The legacy
-    /// status/reason fields are projections; the typed terminal is the fact.
-    pub fn budget_stop(stop: orca_core::budget::BudgetStop, checkpoint_id: String) -> Self {
+    /// no further provider request is made after this result. The terminal
+    /// carries the durable checkpoint committed by the operation context, and
+    /// the legacy status/reason fields are projections; the typed terminal is
+    /// the fact.
+    pub fn budget_stop(
+        terminal: orca_core::budget::OperationTerminal,
+        stop: orca_core::budget::BudgetStop,
+    ) -> Self {
         Self {
             status: RunStatus::Failed,
             reason: TurnEndReason::CostBudgetExhausted,
@@ -142,33 +184,19 @@ impl AgentLoopResult {
                 stop.usage.turns,
                 stop.usage.tool_calls
             )),
-            terminal: Some(orca_core::budget::OperationTerminal::Stopped {
-                reason: stop.reason,
-                usage: stop.usage,
-                checkpoint_id,
-                resumable: true,
-            }),
+            terminal,
         }
     }
 }
 
 impl From<RuntimeTurnStartError> for AgentLoopResult {
     fn from(error: RuntimeTurnStartError) -> Self {
-        // Cost-budget stops produce the typed terminal so adapters never
-        // reconstruct budget facts from constants.
-        let terminal = match error.reason {
-            TurnEndReason::CostBudgetExhausted => {
-                Some(orca_core::budget::OperationTerminal::Stopped {
-                    reason: orca_core::budget::StopReason::CostBudget {
-                        max_cost_usd_micros: error.max_cost_usd_micros,
-                    },
-                    usage: orca_core::budget::BudgetUsage::default(),
-                    checkpoint_id: String::new(),
-                    resumable: false,
-                })
-            }
-            _ => None,
-        };
+        // A terminal already committed to the execution journal (durable
+        // checkpoint + terminal) is the fact; otherwise derive it from the
+        // outcome status. Legacy status/reason are projections of it.
+        let terminal = error
+            .terminal
+            .unwrap_or_else(|| Self::terminal_from_status(error.status, Some(&error.message)));
         let mut result = Self::terminal(error.status, error.reason, Some(error.message));
         result.terminal = terminal;
         result
@@ -312,6 +340,10 @@ pub struct RuntimeTurnStartError {
     /// The cost ceiling (USD micros) that caused a `CostBudgetExhausted`
     /// stop, so adapters never reconstruct limits from constants.
     pub max_cost_usd_micros: u64,
+    /// Typed operation terminal already committed to the execution journal
+    /// (a budget stop with a durable checkpoint). When present it wins over
+    /// any legacy status/reason reconstruction; `None` keeps legacy behavior.
+    pub terminal: Option<orca_core::budget::OperationTerminal>,
 }
 
 pub trait RuntimeWorkflowIpc {
@@ -475,6 +507,7 @@ impl<'a> RuntimeTaskActor<'a> {
                     reason: TurnEndReason::Cancelled,
                     message: "turn cancelled".to_string(),
                     max_cost_usd_micros: 0,
+                    terminal: None,
                 }
             } else {
                 RuntimeTurnStartError {
@@ -482,6 +515,7 @@ impl<'a> RuntimeTaskActor<'a> {
                     reason: TurnEndReason::Unclassified,
                     message: format!("pre_model_call hook failed: {error}"),
                     max_cost_usd_micros: 0,
+                    terminal: None,
                 }
             }
         })
@@ -817,6 +851,7 @@ impl<'a> RuntimeTaskActor<'a> {
                     max_cost_usd_micros as f64 / 1_000_000.0
                 ),
                 max_cost_usd_micros,
+                terminal: None,
             });
         }
         if let Some(max_cost_usd_micros) = max_cost_usd_micros
@@ -1735,6 +1770,7 @@ mod tests {
             reason: TurnEndReason::Unclassified,
             message: "provider failed".to_string(),
             max_cost_usd_micros: 0,
+            terminal: None,
         });
         assert_eq!(from_start.status, RunStatus::Failed);
         assert_eq!(from_start.reason, TurnEndReason::Unclassified);
@@ -1745,6 +1781,7 @@ mod tests {
             reason: TurnEndReason::CostBudgetExhausted,
             message: "budget stopped".to_string(),
             max_cost_usd_micros: 0,
+            terminal: None,
         });
         assert_eq!(cost.reason, TurnEndReason::CostBudgetExhausted);
         assert_ne!(from_start.reason, cost.reason);
@@ -1786,6 +1823,7 @@ mod tests {
                 reason: TurnEndReason::Unclassified,
                 message: "max turns exceeded".to_string(),
                 max_cost_usd_micros: 0,
+                terminal: None,
             }),
         });
         match failed {
@@ -1858,8 +1896,9 @@ mod tests {
         let result = RuntimeTurnOpeningStep::new()
             .open(RuntimeTurnOpeningInput {
                 actor: &mut actor,
-                budget: &mut crate::budget_controller::BudgetController::new(
+                operation: &mut crate::operation_context::OperationContext::for_tests(
                     orca_core::budget::BudgetSpec::default(),
+                    "turn-opening-step",
                 ),
                 provider: ProviderKind::DeepSeek,
                 context_config: &context_config,
@@ -1935,8 +1974,9 @@ mod tests {
         let result = RuntimeTurnOpeningStep::new()
             .open(RuntimeTurnOpeningInput {
                 actor: &mut actor,
-                budget: &mut crate::budget_controller::BudgetController::new(
+                operation: &mut crate::operation_context::OperationContext::for_tests(
                     orca_core::budget::BudgetSpec::default(),
+                    "turn-opening-step",
                 ),
                 provider: ProviderKind::DeepSeek,
                 context_config: &context_config,
@@ -2131,12 +2171,14 @@ mod tests {
             reason: TurnEndReason::Unclassified,
             message: "provider failed".to_string(),
             max_cost_usd_micros: 0,
+            terminal: None,
         };
         let cost = RuntimeTurnStartError {
             status: RunStatus::Failed,
             reason: TurnEndReason::CostBudgetExhausted,
             message: "budget stopped".to_string(),
             max_cost_usd_micros: 0,
+            terminal: None,
         };
 
         assert_eq!(failed.status, cost.status);

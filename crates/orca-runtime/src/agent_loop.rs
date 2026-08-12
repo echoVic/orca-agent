@@ -18,6 +18,7 @@ use crate::runtime_turn_setup::RuntimeTurnSetupStep;
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow_execution::observe_background_workflows;
+use orca_core::budget::OperationTerminal;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
@@ -43,6 +44,7 @@ pub(crate) fn run_agent_loop(
         turn_execution,
     } = loop_context;
     let RuntimeTurnContext {
+        turn_id,
         cwd,
         prompt,
         subagent_depth,
@@ -57,8 +59,16 @@ pub(crate) fn run_agent_loop(
         workflow_ipc,
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
-    // One BudgetController per operation owns all limits for this loop.
-    let mut budget = crate::budget_controller::BudgetController::new(config.budget.to_spec());
+    // One OperationContext per agent loop (root and each child) owns the
+    // BudgetController and the ExecutionJournal for this operation. Recorded
+    // operations persist the journal under ORCA_HOME; stateless operations
+    // (jsonl without --save-history, server submits without history) journal
+    // to the temp directory and never create runtime artifacts in ORCA_HOME.
+    let mut operation = crate::operation_context::OperationContext::open(
+        config.budget.to_spec(),
+        turn_id.as_str(),
+        matches!(config.history_mode, orca_core::config::HistoryMode::Record),
+    )?;
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
         subagent_depth,
@@ -86,17 +96,16 @@ pub(crate) fn run_agent_loop(
     let mut actor = RuntimeTaskActor::new(lifecycle);
     let mut turn_loop_step = RuntimeTurnLoopStep::new();
 
-    run_agent_turn_loop(
+    let mut outcome = run_agent_turn_loop(
         &mut turn_loop_step,
         RuntimeAgentTurnLoopInput {
             actor: &mut actor,
-            budget: &mut budget,
+            operation: &mut operation,
             provider_context: RuntimeTurnProviderContext::new(
                 config.provider,
                 &ctx_config,
                 &provider_config,
                 &config.model,
-                config.budget.max_cost_usd_micros,
             ),
             request: RuntimeTurnRequestContext::new(turn_context),
             deps: turn_deps,
@@ -107,7 +116,21 @@ pub(crate) fn run_agent_loop(
             workflow: RuntimeTurnWorkflowContext::new(background_workflows, workflow_ipc),
         },
         RuntimeTurnLoopExecutors::new(execute_child_agent_loop, execute_child_agent_loop),
-    )
+    )?;
+
+    // The loop always ends with a typed terminal: budget stops already
+    // committed `checkpoint.created` + `operation.terminal` durably before
+    // surfacing, so every other exit appends the terminal once here. The
+    // journal is the source of truth for the operation's terminal fact, and
+    // the `Completed` usage is finalized from the controller before commit.
+    if let AgentLoopOutcome::Completed(result) = &mut outcome {
+        if let OperationTerminal::Completed { usage } = &mut result.terminal {
+            *usage = operation.controller.usage();
+        }
+        operation.commit_terminal(turn_id.as_str(), result.terminal.clone())?;
+    }
+
+    Ok(outcome)
 }
 
 pub(crate) fn execute_child_agent_loop<W: io::Write>(

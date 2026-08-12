@@ -11,6 +11,7 @@ use crate::compaction::RuntimeCompactionStep;
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::lifecycle::{AgentLoopResult, RuntimeTaskActor, RuntimeTurnContext};
+use crate::operation_context::OperationContext;
 use crate::runtime_model_route::{RuntimeModelRouteInput, RuntimeModelRouteStep};
 use crate::runtime_steer::{RuntimeSteerInput, RuntimeSteerStep};
 use crate::runtime_turn_start::{
@@ -22,7 +23,7 @@ pub(crate) struct RuntimeTurnOpeningStep;
 
 pub(crate) struct RuntimeTurnOpeningInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
-    pub(crate) budget: &'a mut crate::budget_controller::BudgetController,
+    pub(crate) operation: &'a mut OperationContext,
     pub(crate) provider: ProviderKind,
     pub(crate) context_config: &'a context::ContextConfig,
     pub(crate) provider_config: &'a ProviderConfig,
@@ -53,15 +54,20 @@ impl RuntimeTurnOpeningStep {
     ) -> io::Result<RuntimeTurnOpeningResult> {
         let turn_context = input.turn_context.clone();
 
-        // The operation's BudgetController admits this turn; on exhaustion the
-        // loop stops with a typed terminal before any provider request. The
-        // previous turn's tools are already settled (the loop only iterates
-        // after a committed tool result), so the stop creates a checkpoint and
-        // returns `OperationTerminal::Stopped` without a new provider request.
-        if let Err(stop) = input.budget.admit_turn() {
+        // The operation's `BudgetController` admits this turn; on exhaustion
+        // the loop stops with a typed terminal before any provider request.
+        // The previous turn's tools are already settled (the loop only
+        // iterates after a committed tool result), so the stop commits a real
+        // `checkpoint.created` to the journal before the terminal is durable,
+        // and the surfaced terminal carries that checkpoint (resumable).
+        if let Err(stop) = input.operation.admit_turn(turn_context.turn_id.as_str())? {
             let checkpoint_id = format!("{}-budget-stop", input.events.run_id());
-            input.budget.record_checkpoint(checkpoint_id.clone());
-            let result = AgentLoopResult::budget_stop(stop, checkpoint_id);
+            let terminal = input.operation.commit_budget_stop(
+                turn_context.turn_id.as_str(),
+                &checkpoint_id,
+                None,
+            )?;
+            let result = AgentLoopResult::budget_stop(terminal, stop);
             if let Some(error) = result.error.as_deref()
                 && turn_context.emit_deltas
             {
@@ -114,7 +120,7 @@ impl RuntimeTurnOpeningStep {
         // Soft-land before a hard budget wall: inject a pinned system reminder
         // when remaining budget crosses configured thresholds. Reminders come
         // from the controller and never mutate usage or success state.
-        if let Some(message) = input.budget.take_pending_soft_landing() {
+        if let Some(message) = input.operation.controller.take_pending_soft_landing() {
             input.conversation.add_system_pinned(message);
         }
         if let Some(message) = input.actor.take_pending_cost_budget_soft_landing() {

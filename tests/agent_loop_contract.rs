@@ -353,3 +353,56 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
         .map(|line| serde_json::from_str(line).expect("valid jsonl line"))
         .collect()
 }
+
+#[test]
+fn headless_budget_stop_skips_verifier_and_keeps_stopped_terminal() {
+    // Real-chain independence: a configured (passing) verifier never runs
+    // against a budget stop, and the typed Stopped terminal survives intact —
+    // verifier outcome and operation terminal stay independently observable.
+    let home = tempdir().expect("temporary ORCA_HOME");
+    std::fs::create_dir_all(home.path()).expect("create ORCA_HOME");
+    std::fs::write(home.path().join("config.toml"), "[budget]\nmax_turns = 1\n")
+        .expect("write budget config");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--verifier",
+            "true",
+            "mock_repeat_read 4",
+        ])
+        .output()
+        .expect("run bounded fixture with verifier");
+
+    // The budget stop keeps exit code 4 and the typed Stopped terminal.
+    assert_eq!(output.status.code(), Some(4));
+    let events = parse_jsonl(&output.stdout);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "verification.started"),
+        "verifier must not run against a budget stop"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "verification.completed"),
+        "verifier must not complete against a budget stop"
+    );
+    let terminals = events
+        .iter()
+        .filter(|event| event["type"] == "session.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0]["payload"]["status"], "budget_exhausted");
+    assert!(
+        terminals[0]["payload"]["terminal"]["stopped"].is_object(),
+        "terminal must stay the typed Stopped terminal"
+    );
+    let stopped = &terminals[0]["payload"]["terminal"]["stopped"];
+    assert!(stopped["resumable"] == true);
+}

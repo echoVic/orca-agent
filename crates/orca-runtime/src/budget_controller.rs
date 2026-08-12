@@ -5,6 +5,7 @@
 //! counters saturate, reminders never mutate usage or success state, and a
 //! `Stopped` terminal is only resumable after a checkpoint is recorded.
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use orca_core::budget::{BudgetSpec, BudgetStop, BudgetUsage, OperationTerminal, StopReason};
@@ -17,6 +18,18 @@ enum TerminalState {
     Stopped(StopReason),
 }
 
+/// Capacity reserved by outstanding child leases. A lease deducts its
+/// effective ceiling here when granted and returns it when settled (consumed
+/// usage reports upward separately via `merge_child_usage`), so concurrent
+/// children can never double-spend the parent's remaining budget.
+#[derive(Debug, Default)]
+pub struct LeaseReservationPool {
+    reserved: BudgetUsage,
+}
+
+/// The pool shared by a controller and every lease it granted.
+type SharedReservations = Arc<Mutex<LeaseReservationPool>>;
+
 pub struct BudgetController {
     spec: BudgetSpec,
     usage: BudgetUsage,
@@ -26,12 +39,22 @@ pub struct BudgetController {
     inner_turn_reminder_index: u32,
     cost_reminder_index: u32,
     pending_soft_landing: Option<String>,
+    reservations: SharedReservations,
 }
 
 impl BudgetController {
+    /// Constructs a controller for the given spec. Invalid dimensions (zero or
+    /// otherwise non-positive) are treated as unlimited instead of panicking:
+    /// config decoding validates and rejects bad values with a clear error
+    /// before the runtime worker runs, and this constructor is a last-resort
+    /// safety net that must never crash the worker.
     pub fn new(spec: BudgetSpec) -> Self {
-        spec.validate()
-            .expect("budget spec must validate before controller construction");
+        let spec = BudgetSpec {
+            max_turns: spec.max_turns.filter(|value| *value > 0),
+            max_tool_calls: spec.max_tool_calls.filter(|value| *value > 0),
+            max_cost_usd_micros: spec.max_cost_usd_micros.filter(|value| *value > 0),
+            max_wall_time_ms: spec.max_wall_time_ms.filter(|value| *value > 0),
+        };
         Self {
             spec,
             usage: BudgetUsage::default(),
@@ -41,6 +64,7 @@ impl BudgetController {
             inner_turn_reminder_index: 0,
             cost_reminder_index: 0,
             pending_soft_landing: None,
+            reservations: Arc::new(Mutex::new(LeaseReservationPool::default())),
         }
     }
 
@@ -60,7 +84,7 @@ impl BudgetController {
     /// the first exhausted dimension a typed [`BudgetStop`] is returned and
     /// the controller latches the stop.
     pub fn admit_turn(&mut self) -> Result<(), BudgetStop> {
-        self.sync_wall_time();
+        self.sync_wall_time_inner();
         if let Some(stop) = self.stop_if_exhausted() {
             return Err(stop);
         }
@@ -69,10 +93,13 @@ impl BudgetController {
         Ok(())
     }
 
-    /// Admit one tool call within the current turn.
+    /// Admit one tool call within the current turn. The turn dimension is not
+    /// a tool constraint: a turn already admitted by [`admit_turn`] may keep
+    /// using tools when `max_turns` is fully consumed (the stop lands at the
+    /// next turn admit instead).
     pub fn admit_tool_call(&mut self) -> Result<(), BudgetStop> {
-        self.sync_wall_time();
-        if let Some(stop) = self.stop_if_exhausted() {
+        self.sync_wall_time_inner();
+        if let Some(stop) = self.stop_if_exhausted_without_turn_dimension() {
             return Err(stop);
         }
         self.usage.add_tool_call();
@@ -81,18 +108,19 @@ impl BudgetController {
 
     /// Record provider cost (USD micros) spent so far.
     pub fn record_cost_usd_micros(&mut self, cost_usd_micros: u64) -> Result<(), BudgetStop> {
-        self.sync_wall_time();
-        if let Some(stop) = self.stop_if_exhausted() {
+        self.sync_wall_time_inner();
+        if let Some(stop) = self.stop_if_exhausted_without_turn_dimension() {
             return Err(stop);
         }
         self.usage.add_cost_usd_micros(cost_usd_micros);
         self.observe_cost_soft_landing();
-        self.stop_if_exhausted().map_or(Ok(()), Err)
+        self.stop_if_exhausted_without_turn_dimension()
+            .map_or(Ok(()), Err)
     }
 
     /// Merge a child lease's consumed usage into this operation.
     pub fn merge_child_usage(&mut self, child_usage: BudgetUsage) -> Result<(), BudgetStop> {
-        self.sync_wall_time();
+        self.sync_wall_time_inner();
         if let Some(stop) = self.stop_if_exhausted() {
             return Err(stop);
         }
@@ -116,20 +144,36 @@ impl BudgetController {
 
     /// Reserve a child budget from this operation's remaining capacity. The
     /// child's effective spec is the intersection of its own limits with what
-    /// the parent has left, so a child can never spend beyond the parent's
-    /// operation. Consumed usage reports back via [`BudgetLease::finish`].
+    /// the parent has left *after* deducting every outstanding reservation,
+    /// so concurrent children can never double-spend the parent's operation.
+    /// The reservation is held for the lease's lifetime and returned when the
+    /// lease settles (RAII via [`BudgetLease::finish`] and `Drop`); consumed
+    /// usage reports back through [`BudgetController::merge_child_usage`].
     pub fn child_lease(&mut self, child_spec: BudgetSpec) -> Result<BudgetLease, BudgetStop> {
         child_spec
             .validate()
             .expect("child budget spec must validate");
-        self.sync_wall_time();
+        self.sync_wall_time_inner();
         if let Some(stop) = self.stop_if_exhausted() {
             return Err(stop);
         }
-        Ok(BudgetLease::new(intersect_specs(
-            self.remaining_spec(),
-            child_spec,
-        )))
+        let reserved = self
+            .reservations
+            .lock()
+            .expect("lease reservation pool")
+            .reserved;
+        let remaining = self.remaining_spec_after(reserved);
+        let effective = intersect_specs(remaining, child_spec);
+        {
+            let mut pool = self.reservations.lock().expect("lease reservation pool");
+            pool.reserved.merge(BudgetUsage {
+                turns: effective.max_turns.unwrap_or(0),
+                tool_calls: effective.max_tool_calls.unwrap_or(0),
+                cost_usd_micros: effective.max_cost_usd_micros.unwrap_or(0),
+                wall_time_ms: effective.max_wall_time_ms.unwrap_or(0),
+            });
+        }
+        Ok(BudgetLease::new(effective, Arc::clone(&self.reservations)))
     }
 
     /// The typed operation terminal. `Completed` is returned while running;
@@ -147,28 +191,52 @@ impl BudgetController {
         }
     }
 
-    /// What this operation still has left, per dimension.
-    fn remaining_spec(&self) -> BudgetSpec {
-        let subtract_turns =
-            |limit: Option<u32>| limit.map(|limit| limit.saturating_sub(self.usage.turns).max(1));
+    /// What this operation still has left, per dimension, after both consumed
+    /// usage and capacity reserved by outstanding child leases.
+    fn remaining_spec_after(&self, reserved: BudgetUsage) -> BudgetSpec {
+        let subtract_turns = |limit: Option<u32>| {
+            limit.map(|limit| {
+                limit
+                    .saturating_sub(self.usage.turns)
+                    .saturating_sub(reserved.turns)
+                    .max(1)
+            })
+        };
         let subtract_tools = |limit: Option<u32>| {
-            limit.map(|limit| limit.saturating_sub(self.usage.tool_calls).max(1))
+            limit.map(|limit| {
+                limit
+                    .saturating_sub(self.usage.tool_calls)
+                    .saturating_sub(reserved.tool_calls)
+                    .max(1)
+            })
         };
         BudgetSpec {
             max_turns: subtract_turns(self.spec.max_turns),
             max_tool_calls: subtract_tools(self.spec.max_tool_calls),
-            max_cost_usd_micros: self
-                .spec
-                .max_cost_usd_micros
-                .map(|limit| limit.saturating_sub(self.usage.cost_usd_micros).max(1)),
-            max_wall_time_ms: self
-                .spec
-                .max_wall_time_ms
-                .map(|limit| limit.saturating_sub(self.usage.wall_time_ms).max(1)),
+            max_cost_usd_micros: self.spec.max_cost_usd_micros.map(|limit| {
+                limit
+                    .saturating_sub(self.usage.cost_usd_micros)
+                    .saturating_sub(reserved.cost_usd_micros)
+                    .max(1)
+            }),
+            max_wall_time_ms: self.spec.max_wall_time_ms.map(|limit| {
+                limit
+                    .saturating_sub(self.usage.wall_time_ms)
+                    .saturating_sub(reserved.wall_time_ms)
+                    .max(1)
+            }),
         }
     }
 
-    fn sync_wall_time(&mut self) {
+    /// Publishes elapsed wall time into usage and stops when the wall-time
+    /// dimension is exhausted. Call after any long-running provider exchange
+    /// so a wall-time stop lands promptly, not only at the next turn admit.
+    pub(crate) fn sync_wall_time(&mut self) -> Result<(), BudgetStop> {
+        self.sync_wall_time_inner();
+        self.stop_if_exhausted().map_or(Ok(()), Err)
+    }
+
+    fn sync_wall_time_inner(&mut self) {
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
         if elapsed_ms > self.usage.wall_time_ms {
             self.usage.wall_time_ms = elapsed_ms;
@@ -178,7 +246,7 @@ impl BudgetController {
     fn stop_if_exhausted(&mut self) -> Option<BudgetStop> {
         let reason = match self.state {
             TerminalState::Stopped(reason) => reason,
-            TerminalState::Running => self.exhausted_dimension()?,
+            TerminalState::Running => self.exhausted_dimension(false)?,
         };
         self.state = TerminalState::Stopped(reason);
         Some(BudgetStop {
@@ -187,8 +255,24 @@ impl BudgetController {
         })
     }
 
-    fn exhausted_dimension(&self) -> Option<StopReason> {
-        if let Some(max_turns) = self.spec.max_turns
+    /// Stop check for in-turn accounting (tool admission, cost recording):
+    /// the turn dimension is never a constraint here because the current turn
+    /// was already admitted; a latched stop still short-circuits.
+    fn stop_if_exhausted_without_turn_dimension(&mut self) -> Option<BudgetStop> {
+        let reason = match self.state {
+            TerminalState::Stopped(reason) => reason,
+            TerminalState::Running => self.exhausted_dimension(true)?,
+        };
+        self.state = TerminalState::Stopped(reason);
+        Some(BudgetStop {
+            reason,
+            usage: self.usage,
+        })
+    }
+
+    fn exhausted_dimension(&self, skip_turn: bool) -> Option<StopReason> {
+        if !skip_turn
+            && let Some(max_turns) = self.spec.max_turns
             && self.usage.turns >= max_turns
         {
             return Some(StopReason::TurnBudget { max_turns });
@@ -249,18 +333,27 @@ impl BudgetController {
 }
 
 /// A reserved slice of the parent operation's budget, passed into child
-/// contexts. Consumed usage reports upward via [`BudgetLease::finish`].
+/// contexts. The reservation is held in the parent's shared pool for the
+/// lease's lifetime and returned exactly once — by [`BudgetLease::finish`]
+/// when the child settles normally, or by `Drop` when it is abandoned — so
+/// concurrent children never double-spend the parent and leaked leases never
+/// permanently drain it. Consumed usage reports upward via
+/// [`BudgetController::merge_child_usage`].
 #[derive(Debug)]
 pub struct BudgetLease {
     effective_spec: BudgetSpec,
     usage: BudgetUsage,
+    reservations: Option<SharedReservations>,
+    settled: bool,
 }
 
 impl BudgetLease {
-    fn new(effective_spec: BudgetSpec) -> Self {
+    fn new(effective_spec: BudgetSpec, reservations: SharedReservations) -> Self {
         Self {
             effective_spec,
             usage: BudgetUsage::default(),
+            reservations: Some(reservations),
+            settled: false,
         }
     }
 
@@ -296,10 +389,43 @@ impl BudgetLease {
         self.stop_if_exhausted().map_or(Ok(()), Err)
     }
 
-    /// Consumed usage receipt for the parent to merge. Unused reservation
-    /// capacity is implicitly returned: only what was consumed is reported.
-    pub fn finish(self) -> BudgetUsage {
+    /// Consumed usage receipt for the parent to merge. Settles the
+    /// reservation exactly once: the reserved ceiling returns to the parent's
+    /// pool (unused capacity is not reported; only consumed usage is), and
+    /// `Drop` afterwards is a no-op.
+    pub fn finish(mut self) -> BudgetUsage {
+        self.settle_reservation();
         self.usage
+    }
+
+    /// Returns the reserved ceiling to the parent's pool. Idempotent: called
+    /// by both `finish` and `Drop`, but only the first call settles.
+    fn settle_reservation(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        if let Some(reservations) = self.reservations.take() {
+            let mut pool = reservations.lock().expect("lease reservation pool");
+            pool.reserved = BudgetUsage {
+                turns: pool
+                    .reserved
+                    .turns
+                    .saturating_sub(self.effective_spec.max_turns.unwrap_or(0)),
+                tool_calls: pool
+                    .reserved
+                    .tool_calls
+                    .saturating_sub(self.effective_spec.max_tool_calls.unwrap_or(0)),
+                cost_usd_micros: pool
+                    .reserved
+                    .cost_usd_micros
+                    .saturating_sub(self.effective_spec.max_cost_usd_micros.unwrap_or(0)),
+                wall_time_ms: pool
+                    .reserved
+                    .wall_time_ms
+                    .saturating_sub(self.effective_spec.max_wall_time_ms.unwrap_or(0)),
+            };
+        }
     }
 
     fn stop_if_exhausted(&self) -> Option<BudgetStop> {
@@ -342,6 +468,14 @@ impl BudgetLease {
     }
 }
 
+impl Drop for BudgetLease {
+    /// A lease that is abandoned (never `finish`ed) still returns its
+    /// reservation so the parent's pool is never permanently drained.
+    fn drop(&mut self) {
+        self.settle_reservation();
+    }
+}
+
 /// Per-dimension intersection of two specs: the tightest bound of both.
 fn intersect_specs(left: BudgetSpec, right: BudgetSpec) -> BudgetSpec {
     fn min_u32(left: Option<u32>, right: Option<u32>) -> Option<u32> {
@@ -372,6 +506,88 @@ mod tests {
 
     fn spec() -> BudgetSpec {
         BudgetSpec::default()
+    }
+
+    #[test]
+    fn concurrent_child_leases_never_double_spend_remaining_budget() {
+        let mut parent = BudgetController::new(BudgetSpec {
+            max_turns: Some(3),
+            ..spec()
+        });
+        parent.admit_turn().expect("parent turn 1");
+
+        // Two outstanding leases: the first reserves the remaining two turns,
+        // so the second can only see one turn left — never the full two.
+        let first = parent
+            .child_lease(BudgetSpec {
+                max_turns: Some(5),
+                ..spec()
+            })
+            .expect("first lease granted");
+        assert_eq!(first.spec().max_turns, Some(2));
+
+        let second = parent
+            .child_lease(BudgetSpec {
+                max_turns: Some(5),
+                ..spec()
+            })
+            .expect("second lease granted");
+        assert_eq!(second.spec().max_turns, Some(1));
+    }
+
+    #[test]
+    fn settled_lease_returns_reservation_for_later_children() {
+        let mut parent = BudgetController::new(BudgetSpec {
+            max_turns: Some(3),
+            ..spec()
+        });
+        parent.admit_turn().expect("parent turn 1");
+
+        let first = parent
+            .child_lease(BudgetSpec {
+                max_turns: Some(5),
+                ..spec()
+            })
+            .expect("first lease granted");
+        assert_eq!(first.spec().max_turns, Some(2));
+        // Settle without consuming: the full reservation returns.
+        let _consumed = first.finish();
+
+        let second = parent
+            .child_lease(BudgetSpec {
+                max_turns: Some(5),
+                ..spec()
+            })
+            .expect("second lease granted");
+        assert_eq!(second.spec().max_turns, Some(2));
+    }
+
+    #[test]
+    fn dropped_lease_returns_reservation_exactly_once() {
+        let mut parent = BudgetController::new(BudgetSpec {
+            max_turns: Some(3),
+            ..spec()
+        });
+        parent.admit_turn().expect("parent turn 1");
+
+        // Abandoned without finish: Drop returns the reservation.
+        {
+            let abandoned = parent
+                .child_lease(BudgetSpec {
+                    max_turns: Some(5),
+                    ..spec()
+                })
+                .expect("abandoned lease granted");
+            assert_eq!(abandoned.spec().max_turns, Some(2));
+        }
+
+        let later = parent
+            .child_lease(BudgetSpec {
+                max_turns: Some(5),
+                ..spec()
+            })
+            .expect("later lease granted");
+        assert_eq!(later.spec().max_turns, Some(2));
     }
 
     #[test]
@@ -599,13 +815,20 @@ mod tests {
     }
 
     #[test]
-    fn zero_dimensions_are_rejected_at_construction() {
-        let result = std::panic::catch_unwind(|| {
-            BudgetController::new(BudgetSpec {
-                max_turns: Some(0),
-                ..spec()
-            })
+    fn zero_dimensions_normalize_to_unlimited_instead_of_panicking() {
+        // The controller is a last-resort safety net: a zero dimension from a
+        // buggy caller must not crash the runtime worker. Config decoding
+        // rejects zeros with a clear error before this point.
+        let controller = BudgetController::new(BudgetSpec {
+            max_turns: Some(0),
+            max_tool_calls: Some(0),
+            max_cost_usd_micros: Some(0),
+            max_wall_time_ms: Some(0),
         });
-        assert!(result.is_err());
+        assert!(controller.is_unlimited());
+        let mut controller = controller;
+        controller
+            .admit_turn()
+            .expect("normalized unlimited admits");
     }
 }

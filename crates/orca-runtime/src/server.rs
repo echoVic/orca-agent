@@ -742,7 +742,23 @@ struct LockedServerWriter<W: Write> {
 
 impl<W: Write> Write for LockedServerWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.lock().map_err(lock_error)?.write(buf)
+        // Write the entire buffer under a single lock acquisition. The inner
+        // writer may return a partial write, and `write_all` on the caller
+        // side would otherwise re-enter `write` (re-acquiring the lock) and
+        // let another thread's JSON interleave inside one logical line.
+        let mut inner = self.inner.lock().map_err(lock_error)?;
+        let mut written = 0;
+        while written < buf.len() {
+            let n = inner.write(&buf[written..])?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "locked server writer made no progress",
+                ));
+            }
+            written += n;
+        }
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {

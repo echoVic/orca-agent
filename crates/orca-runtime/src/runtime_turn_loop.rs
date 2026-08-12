@@ -11,6 +11,7 @@ use crate::agent_child::ChildAgentExecutor;
 use crate::lifecycle::{
     AgentLoopOutcome, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnDeps, RuntimeTurnLoopState,
 };
+use crate::operation_context::OperationContext;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_iteration::{
     RuntimeTurnIterationInput, RuntimeTurnIterationResult, RuntimeTurnIterationStep,
@@ -39,7 +40,6 @@ pub(crate) struct RuntimeTurnProviderContext<'a> {
     pub(crate) context_config: &'a context::ContextConfig,
     pub(crate) provider_config: &'a ProviderConfig,
     pub(crate) model: &'a ModelSelection,
-    pub(crate) max_cost_usd_micros: Option<u64>,
 }
 
 pub(crate) struct RuntimeTurnRequestContext<'a> {
@@ -55,7 +55,7 @@ pub(crate) struct RuntimeTurnPolicyContext<'a> {
 
 pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
-    pub(crate) budget: &'a mut crate::budget_controller::BudgetController,
+    pub(crate) operation: &'a mut OperationContext,
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
     pub(crate) request: RuntimeTurnRequestContext<'a>,
     pub(crate) deps: RuntimeTurnDeps<'a>,
@@ -68,7 +68,7 @@ pub(crate) struct RuntimeAgentTurnLoopInput<'a, 'runtime, W: io::Write> {
 
 pub(crate) struct RuntimeTurnLoopInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
-    pub(crate) budget: &'a mut crate::budget_controller::BudgetController,
+    pub(crate) operation: &'a mut OperationContext,
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
     pub(crate) request: RuntimeTurnRequestContext<'a>,
     pub(crate) deps: RuntimeTurnDeps<'a>,
@@ -88,7 +88,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         actor: &'a mut RuntimeTaskActor<'runtime>,
-        budget: &'a mut crate::budget_controller::BudgetController,
+        operation: &'a mut OperationContext,
         provider_context: RuntimeTurnProviderContext<'a>,
         request: RuntimeTurnRequestContext<'a>,
         deps: RuntimeTurnDeps<'a>,
@@ -100,7 +100,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
     ) -> Self {
         Self {
             actor,
-            budget,
+            operation,
             provider_context,
             request,
             deps,
@@ -123,13 +123,12 @@ impl<'a, 'runtime, W: io::Write> RuntimeTurnLoopInput<'a, 'runtime, W> {
         );
         RuntimeTurnIterationInput {
             actor: &mut *self.actor,
-            budget: &mut *self.budget,
+            operation: &mut *self.operation,
             provider_context: RuntimeTurnProviderContext::new(
                 self.provider_context.provider,
                 self.provider_context.context_config,
                 self.provider_context.provider_config,
                 self.provider_context.model,
-                self.provider_context.max_cost_usd_micros,
             ),
             request: self.request.for_iteration(),
             deps: self.deps,
@@ -169,14 +168,12 @@ impl<'a> RuntimeTurnProviderContext<'a> {
         context_config: &'a context::ContextConfig,
         provider_config: &'a ProviderConfig,
         model: &'a ModelSelection,
-        max_cost_usd_micros: Option<u64>,
     ) -> Self {
         Self {
             provider,
             context_config,
             provider_config,
             model,
-            max_cost_usd_micros,
         }
     }
 }
@@ -276,7 +273,7 @@ impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {
     fn into_turn_loop_input(self) -> RuntimeTurnLoopInput<'a, 'runtime, W> {
         RuntimeTurnLoopInput::new(
             self.actor,
-            self.budget,
+            self.operation,
             self.provider_context,
             self.request,
             self.deps,
@@ -416,15 +413,15 @@ mod tests {
         };
         let mut input = RuntimeTurnLoopInput {
             actor: &mut actor,
-            budget: &mut crate::budget_controller::BudgetController::new(
+            operation: &mut crate::operation_context::OperationContext::for_tests(
                 orca_core::budget::BudgetSpec::default(),
+                "turn-loop-input-test",
             ),
             provider_context: RuntimeTurnProviderContext::new(
                 ProviderKind::DeepSeek,
                 &context_config,
                 &provider_config,
                 &config.model,
-                None,
             ),
             request: RuntimeTurnRequestContext::new(
                 RuntimeTurnContext::new(cwd.path(), "continue", 0, true, &subagent_type)
