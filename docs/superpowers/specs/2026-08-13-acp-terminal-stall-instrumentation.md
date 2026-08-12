@@ -118,3 +118,30 @@ stall remains the target.
 
 The instrumentation is one revertible commit; removing it restores the
 current diagnostics-free tests. No persisted state.
+
+## Root Cause Confirmed And Fix (round 16)
+
+Evidence (capture3 trace): the failing test's kill A and kill B dispatch
+back-to-back at 0ms/34ms (the executor closes both terminals CONCURRENTLY
+in scoped threads). Kill A's frame is enqueued at 34ms; kill B's dispatch
+has NO frame and NO error event — the capacity-1 dispatch lane's
+`try_send` hit `Full` because the client drain polls every 100ms, the
+actor settled the call ambiguous, close B returned, the executor sent its
+outcome, and the client waited forever for a frame that will never come.
+The round-7 "dispatch Full" hypothesis was right; its evidence loop simply
+never coincided with a stall run, and the round-7 unbounded-wait fix was
+correctly rejected for stalling the actor on a wedged client.
+
+Fix: bounded retry in the hub dispatch sends (all five lanes): retry
+`Full` with a 5ms backoff for up to 200ms (two full client drain poll
+intervals), then fail closed into the existing ambiguous settlement. A
+live client always drains within its poll interval, so the budget covers
+the race; a wedged client still fails observably instead of blocking the
+actor unboundedly. The existing fail-fast contract test still passes (the
+budget exhausts and returns `Full`).
+
+Acceptance: a new hub test — a 1-slot lane whose receiver drains after
+50ms: the second dispatch succeeds via the retry instead of failing; the
+existing contract test still returns `Full` after the budget; the
+behavioral oracle (runtime_host 66/66 x 5, lib suite, nextest ci) stays
+green.
