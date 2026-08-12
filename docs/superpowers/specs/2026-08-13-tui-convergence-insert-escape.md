@@ -136,3 +136,21 @@ The exported `scanTuiMutation*` helpers dump the current inventory for
 regeneration. Slices 2 and 5 missed this step and red-lined CI on main
 until the dedicated fix (see
 `2026-08-13-ci-surface-contract-baseline-drift.md`).
+
+## Slice 8: Workflow Panel And Background Approval Routing Extraction
+
+### Scope
+
+Move the workflow-panel AppState methods (`show_workflows`, `show_agents`,
+`select_previous_workflow_task`, `select_next_workflow_task`,
+`open_selected_background_approval_dialog`, `push_pending_workflow_notification`,
+`show_conversation`, `apply_workflow_tasks_update`) and their exclusive
+helpers (`push_pending_workflow_notification_unique`,
+`sort_workflow_tasks_for_panel`, the three `is_*_main_session` predicates,
+`workflow_task_panel_group`, `workflow_task_activity_ms`) out of
+`types.rs` into `crates/orca-tui/src/workflow_panel.rs`. Relocation only:
+the two private methods become `pub(crate)` (Rust method privacy is scoped
+to the impl block's module); `types.rs` imports back the two helpers it
+still uses. Same acceptance as slices 1-7 plus both surface-contract
+validators (baseline-maintenance step). Full spec:
+`2026-08-13-tui-convergence-workflow-panel.md`.
