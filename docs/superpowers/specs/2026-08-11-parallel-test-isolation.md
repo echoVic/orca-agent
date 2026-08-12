@@ -258,18 +258,38 @@ No production code changes; no test semantics change.
 
 ### Follow-Ups (documented, not fixed this round)
 
-- acp: one run showed a frame read that stalled the FULL 60s
-  (`concurrent_terminals_from_one_tool_keep_cleanup_identity_exact`) — a
-  genuine stall under concurrency, not load latency. Mitigated in CI by the
-  existing nextest `threads-required = 2` override for
-  `acp::supervisor::tests`; root-causing needs stack instrumentation of the
-  stalled in-process server.
-- workflow host: the pipe-holding-descendant cleanup exceeded its 8s
-  deadline once (51.95s ≈ the 30s descendant lifetime plus contention),
-  suggesting the process-group kill occasionally misses the descendant under
-  extreme load. The 8s deadline is kept as the regression guard; if the
-  flake recurs, instrument `kill_process_group` results and the host
-  completion timeline before changing any threshold.
+Round-3 re-investigation status (fresh runs with temporary diagnostics):
+
+- acp: the full-60s stall did NOT reproduce in 10 additional default-
+  parallelism runs (0/10; previously 1/8 under the release-build load). The
+  stall is real but load-coupled and rare. Mitigated in CI by the existing
+  nextest `threads-required = 2` override for `acp::supervisor::tests`.
+  Root-causing plan: re-add the temporary `sample`-based thread-stack dump on
+  the frame deadline (macOS) and capture under induced machine load.
+- server domain-policy: CORRECTION — the `timeoutMs` guard was not the
+  mechanism. With `timeoutMs: 60000` the two tests still failed fast
+  (`command_exec_completed` absent, suite finished in ~34s, so the command
+  was never killed by the timeout) during the same high-load window; they did
+  NOT reproduce in the following 6 runs once the external build load ended.
+  The `timeoutMs` raise is retained as liveness hardening. Next capture step:
+  the temporary event-dump panic (removed after diagnosis) showed the raw
+  JSONL; reproduce under induced load to see whether the server emitted an
+  error event or nothing for the command.
+- runtime_host (NEW observation, single occurrence):
+  `foreground_task_checkpoint_failure_remains_actor_owned_until_committed`
+  panicked with `reserve foreground retry operation: RuntimeUnavailable`
+  (runtime_host.rs:43438) under the same high-load window. The reserve path
+  maps both a full host command channel and a closed reply channel to
+  `RuntimeUnavailable`; distinguishing `TrySendError::Full` (load) from
+  `Disconnected` (host death) at the mapping site is the next diagnostic
+  step. If it is queue-full under load, the surface command path needs a
+  bounded-wait send instead of `try_send` — a production reliability
+  improvement, not a test-only tweak.
+- workflow host: unchanged (single 51.95s observation; 8s guard kept).
+
+All four follow-ups are load-coupled and rare when the machine is not also
+running release builds; they remain open and instrumented-planned rather than
+papered over with threshold changes.
 
 ### Acceptance
 
