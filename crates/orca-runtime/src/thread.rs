@@ -226,6 +226,7 @@ impl RuntimeThread {
         binding: Option<&GoalRuntimeBinding>,
         status: RunStatus,
         end_reason: crate::lifecycle::TurnEndReason,
+        terminal: Option<orca_core::budget::OperationTerminal>,
         usage: orca_core::goal_runtime::GoalUsage,
         mut events: Option<&mut EventFactory>,
         observer: Option<&dyn orca_core::event_sink::EventObserver>,
@@ -240,15 +241,21 @@ impl RuntimeThread {
             self.thread_extensions.remove::<GoalRuntimeBinding>();
             return Ok(());
         };
-        let goal_status = match status {
-            RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
-            RunStatus::Cancelled => orca_core::goal_runtime::GoalTurnStatus::Cancelled,
-            RunStatus::ApprovalRequired => {
-                orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
-            }
-            RunStatus::BudgetExhausted => orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted,
-            RunStatus::Failed | RunStatus::VerificationFailed => {
-                orca_core::goal_runtime::GoalTurnStatus::Failed
+        let goal_status = if matches!(
+            terminal,
+            Some(orca_core::budget::OperationTerminal::Stopped { .. })
+        ) {
+            orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted
+        } else {
+            match status {
+                RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
+                RunStatus::Cancelled => orca_core::goal_runtime::GoalTurnStatus::Cancelled,
+                RunStatus::ApprovalRequired => {
+                    orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
+                }
+                RunStatus::Failed | RunStatus::VerificationFailed => {
+                    orca_core::goal_runtime::GoalTurnStatus::Failed
+                }
             }
         };
         let previous_state = binding
@@ -260,6 +267,7 @@ impl RuntimeThread {
             &turn.session_id,
             goal_status,
             end_reason,
+            terminal,
             usage.clone(),
             evidence.tool_count,
             evidence.model_response_count,
@@ -529,6 +537,7 @@ impl RuntimeThread {
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
+            None,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             None,
             None,
@@ -566,6 +575,7 @@ impl RuntimeThread {
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
+            None,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             None,
             None,
@@ -622,6 +632,7 @@ impl RuntimeThread {
             binding.as_ref(),
             result.as_ref().copied().unwrap_or(RunStatus::Failed),
             crate::lifecycle::TurnEndReason::Unclassified,
+            None,
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             Some(events),
             observer,
@@ -684,6 +695,10 @@ impl RuntimeThread {
                     crate::lifecycle::TurnEndReason::Unclassified
                 }
                 Err(_) => crate::lifecycle::TurnEndReason::Unclassified,
+            },
+            match &result {
+                Ok(ThreadTurnOutcome::Completed { terminal, .. }) => terminal.clone(),
+                _ => None,
             },
             goal_usage_delta(usage_before, self.session.aggregate_usage_totals()),
             Some(events),
@@ -838,7 +853,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: Default::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: Default::default(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
@@ -1156,6 +1171,7 @@ mod tests {
                     Some(&binding),
                     RunStatus::Success,
                     crate::lifecycle::TurnEndReason::Unclassified,
+                    None,
                     orca_core::goal_runtime::GoalUsage::default(),
                     None,
                     None,
@@ -1173,6 +1189,7 @@ mod tests {
                     Some(&binding),
                     RunStatus::Success,
                     crate::lifecycle::TurnEndReason::Unclassified,
+                    None,
                     orca_core::goal_runtime::GoalUsage::default(),
                     None,
                     None,

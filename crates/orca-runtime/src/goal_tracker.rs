@@ -13,7 +13,7 @@ pub(crate) const SAME_GAP_STREAK_LIMIT: u32 = 3;
 pub(crate) const NO_SUBSTANTIVE_PROGRESS_GAP_FINGERPRINT: &str =
     "outer_turn:no_substantive_progress";
 /// Independent safety net beside the same-gap streak: auto-continuing after
-/// MaxInnerTurns without completing forever would otherwise spin a goal that
+/// Repeated budget stops without completing forever would otherwise spin a goal that
 /// keeps producing activity but never finishes.
 pub(crate) const MAX_CONSECUTIVE_INNER_TURN_CONTINUATIONS: u32 = 8;
 
@@ -37,6 +37,8 @@ fn streak_from_history(fingerprints: &[Option<String>]) -> (Option<String>, u32)
 pub struct GoalTurnResult {
     pub status: GoalTurnStatus,
     pub end_reason: TurnEndReason,
+    /// Typed operation terminal; the authoritative fact for budget stops.
+    pub terminal: Option<orca_core::budget::OperationTerminal>,
     pub usage: GoalUsage,
     pub gaps: Vec<GoalGap>,
     pub evidence_count: usize,
@@ -47,6 +49,7 @@ impl GoalTurnResult {
         Self {
             status: GoalTurnStatus::Success,
             end_reason: TurnEndReason::Unclassified,
+            terminal: None,
             usage: GoalUsage::default(),
             gaps: Vec::new(),
             evidence_count: 0,
@@ -64,10 +67,22 @@ impl GoalTurnResult {
         Self {
             status: GoalTurnStatus::BudgetExhausted,
             end_reason,
+            terminal: None,
             usage: GoalUsage::default(),
             gaps: Vec::new(),
             evidence_count: 0,
         }
+    }
+
+    /// A typed budget stop that created a resumable checkpoint.
+    fn is_resumable_budget_stop(&self) -> bool {
+        matches!(
+            self.terminal,
+            Some(orca_core::budget::OperationTerminal::Stopped {
+                resumable: true,
+                ..
+            })
+        )
     }
 }
 
@@ -122,6 +137,20 @@ impl GoalTracker {
             same_gap_streak: 0,
             consecutive_inner_turn_budget_exhaustions: 0,
         }
+    }
+
+    /// Remaining cumulative budget for the next continuation. `None` when the
+    /// goal is unbounded; a continuation may only obtain a lease up to this
+    /// remaining amount, and zero remaining disables continuation.
+    pub fn remaining_budget(&self) -> Option<i64> {
+        self.token_budget
+            .map(|budget| budget.saturating_sub(self.usage.charged_tokens()))
+    }
+
+    /// True when the Goal's cumulative budget is exhausted and automatic
+    /// continuation must be disabled.
+    pub fn budget_exhausted(&self) -> bool {
+        self.remaining_budget() == Some(0)
     }
 
     pub fn from_record(record: &GoalRecord) -> Self {
@@ -309,9 +338,9 @@ impl GoalTracker {
             GoalTurnStatus::Success => {
                 self.consecutive_inner_turn_budget_exhaustions = 0;
             }
-            GoalTurnStatus::BudgetExhausted
-                if result.end_reason == TurnEndReason::MaxInnerTurns =>
-            {
+            // A typed budget stop with a committed checkpoint is resumable and
+            // counts toward the consecutive-interruption safety net.
+            GoalTurnStatus::BudgetExhausted if result.is_resumable_budget_stop() => {
                 self.consecutive_inner_turn_budget_exhaustions = self
                     .consecutive_inner_turn_budget_exhaustions
                     .saturating_add(1);
@@ -322,20 +351,20 @@ impl GoalTracker {
                     return Ok(self.pause(
                         GoalPauseReason::NoProgress,
                         format!(
-                            "inner-turn budget exhausted for {} consecutive outer turns without completion",
+                            "budget stopped for {} consecutive outer turns without completion",
                             self.consecutive_inner_turn_budget_exhaustions
                         ),
                     ));
                 }
                 // Resumable: fall through into progress/gap accounting.
             }
-            GoalTurnStatus::BudgetExhausted
-                if result.end_reason == TurnEndReason::CostBudgetExhausted =>
-            {
+            // Non-resumable budget stops (no checkpoint or a cost wall) pause
+            // as a usage limit.
+            GoalTurnStatus::BudgetExhausted => {
                 self.pending_intent = None;
                 return Ok(self.pause(
                     GoalPauseReason::UsageLimit,
-                    "goal outer turn ended because the cost budget was exhausted".to_string(),
+                    "goal outer turn ended because the operation budget was exhausted".to_string(),
                 ));
             }
             other => {
@@ -532,13 +561,19 @@ mod tests {
     }
 
     #[test]
-    fn max_inner_turns_budget_exhaustion_can_continue() {
+    fn resumable_budget_stop_can_continue() {
         let mut tracker = GoalTracker::new(GoalId::new(), None);
         tracker.begin_outer_turn(GoalTurnOrigin::User).unwrap();
         let action = tracker
             .finish_outer_turn(GoalTurnResult {
                 status: GoalTurnStatus::BudgetExhausted,
-                end_reason: TurnEndReason::MaxInnerTurns,
+                end_reason: TurnEndReason::Unclassified,
+                terminal: Some(orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::TurnBudget { max_turns: 3 },
+                    usage: orca_core::budget::BudgetUsage::default(),
+                    checkpoint_id: "cp-1".to_string(),
+                    resumable: true,
+                }),
                 usage: GoalUsage::default(),
                 gaps: Vec::new(),
                 evidence_count: 3,
@@ -558,9 +593,21 @@ mod tests {
         let mut tracker = GoalTracker::new(GoalId::new(), None);
         tracker.begin_outer_turn(GoalTurnOrigin::User).unwrap();
         let action = tracker
-            .finish_outer_turn(GoalTurnResult::budget_exhausted(
-                TurnEndReason::CostBudgetExhausted,
-            ))
+            .finish_outer_turn(GoalTurnResult {
+                status: GoalTurnStatus::BudgetExhausted,
+                end_reason: TurnEndReason::CostBudgetExhausted,
+                terminal: Some(orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::CostBudget {
+                        max_cost_usd_micros: 1_000_000,
+                    },
+                    usage: orca_core::budget::BudgetUsage::default(),
+                    checkpoint_id: String::new(),
+                    resumable: false,
+                }),
+                usage: GoalUsage::default(),
+                gaps: Vec::new(),
+                evidence_count: 0,
+            })
             .unwrap();
         assert!(matches!(
             action,
@@ -579,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn eight_consecutive_max_inner_turns_pauses_as_no_progress() {
+    fn eight_consecutive_budget_stops_pause_as_no_progress() {
         let mut tracker = GoalTracker::new(GoalId::new(), None);
         for attempt in 1..=MAX_CONSECUTIVE_INNER_TURN_CONTINUATIONS {
             tracker
@@ -588,7 +635,13 @@ mod tests {
             let action = tracker
                 .finish_outer_turn(GoalTurnResult {
                     status: GoalTurnStatus::BudgetExhausted,
-                    end_reason: TurnEndReason::MaxInnerTurns,
+                    end_reason: TurnEndReason::Unclassified,
+                    terminal: Some(orca_core::budget::OperationTerminal::Stopped {
+                        reason: orca_core::budget::StopReason::TurnBudget { max_turns: 3 },
+                        usage: orca_core::budget::BudgetUsage::default(),
+                        checkpoint_id: format!("cp-{attempt}"),
+                        resumable: true,
+                    }),
                     usage: GoalUsage::default(),
                     gaps: Vec::new(),
                     evidence_count: 2,

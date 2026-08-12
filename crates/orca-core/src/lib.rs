@@ -1,5 +1,6 @@
 pub mod approval_rules;
 pub mod approval_types;
+pub mod budget;
 pub mod cancel;
 pub mod config;
 pub mod conversation;

@@ -22,6 +22,14 @@ ORCA_LOCAL_MUSL_BIN = str(
     / "target/x86_64-unknown-linux-musl/release/orca"
 )
 
+#: Env vars controlling the execution budget; unset means unlimited.
+BUDGET_ENV = {
+    "max-turns": "ORCA_MAX_TURNS",
+    "max-tool-calls": "ORCA_MAX_TOOL_CALLS",
+    "max-cost-usd": "ORCA_MAX_COST_USD",
+    "max-wall-time-secs": "ORCA_MAX_WALL_TIME_SECS",
+}
+
 
 def _load_api_key() -> str:
     """Read DEEPSEEK_API_KEY from ~/.orca/auth.json, fall back to env."""
@@ -31,6 +39,24 @@ def _load_api_key() -> str:
         if key := data.get("DEEPSEEK_API_KEY"):
             return key
     return os.environ.get("ORCA_API_KEY", "")
+
+
+def _terminal_summary(events: list[dict]) -> dict:
+    """Extract terminal metadata from the streamed JSONL projection.
+
+    The terminal is the typed object on the final `session.completed` event;
+    adapters never reconstruct budget facts from constants.
+    """
+    for event in reversed(events):
+        if event.get("type") != "session.completed":
+            continue
+        payload = event.get("payload", {})
+        return {
+            "status": payload.get("status"),
+            "terminal": payload.get("terminal"),
+            "session_id": payload.get("session_id"),
+        }
+    return {"status": None, "terminal": None, "session_id": None}
 
 
 class OrcaInstalledAgent(BaseInstalledAgent):
@@ -76,18 +102,61 @@ class OrcaInstalledAgent(BaseInstalledAgent):
             "ORCA_MODEL": os.environ.get("ORCA_MODEL", "deepseek-v4-flash"),
         }
 
+        budget_flags = []
+        for arg, var in BUDGET_ENV.items():
+            if (value := os.environ.get(var)) is not None:
+                budget_flags.append(f" --{arg} {shlex.quote(value)}")
+
         cmd = (
             f"orca exec"
             f" --mode full-auto"
             f" --output-format jsonl"
+            f"{''.join(budget_flags)}"
             f" {shlex.quote(instruction)}"
         )
 
-        result = await self.exec_as_agent(environment, command=cmd, env=env)
-        output = result.stdout if result else ""
         logs_dir = Path(self.logs_dir)
         logs_dir.mkdir(parents=True, exist_ok=True)
-        (logs_dir / "trajectory.jsonl").write_text(output, encoding="utf-8")
+        metadata = {
+            "binary": self.version() or "unknown",
+            "budget": {
+                key: os.environ.get(var)
+                for key, var in BUDGET_ENV.items()
+                if os.environ.get(var) is not None
+            },
+            "exit_code": None,
+            "terminal": None,
+            "trajectory_persisted": True,
+            "verifier_result": None,
+        }
+        result = None
+        try:
+            result = await self.exec_as_agent(environment, command=cmd, env=env)
+            if result is not None:
+                metadata["exit_code"] = getattr(result, "exit_code", None)
+        except Exception as error:  # noqa: BLE001 - persist everything on failure
+            metadata["error"] = str(error)
+            raise
+        finally:
+            # Always persist stdout, stderr, exit code, terminal metadata, and
+            # the raw trajectory on every exit path (including non-zero exits).
+            output = result.stdout if result is not None else ""
+            stderr = result.stderr if result is not None else ""
+            (logs_dir / "trajectory.jsonl").write_text(output, encoding="utf-8")
+            (logs_dir / "stderr.txt").write_text(stderr or "", encoding="utf-8")
+            try:
+                events = [
+                    json.loads(line)
+                    for line in output.splitlines()
+                    if line.strip().startswith("{")
+                ]
+                metadata["terminal"] = _terminal_summary(events)
+            except json.JSONDecodeError:
+                metadata["terminal"] = {"status": None, "terminal": None}
+            (logs_dir / "execution_metadata.json").write_text(
+                json.dumps(metadata, indent=2),
+                encoding="utf-8",
+            )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         pass

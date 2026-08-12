@@ -156,8 +156,10 @@ unbounded retry.
 Every outer turn is classified before continuation:
 
 - `Advanced`: a successful turn
-- `Interrupted`: `BudgetExhausted` caused by `MaxInnerTurns`; work may resume
-- `Blocked`: cost exhaustion, failure, cancellation, approval, or verification failure
+- `Interrupted`: a typed budget stop with a committed checkpoint
+  (`OperationTerminal::Stopped { resumable: true }`); work may resume
+- `Blocked`: a non-resumable budget stop, failure, cancellation, approval, or
+  verification failure
 
 The continuation gate rejects `Blocked` and admits `Advanced` or `Interrupted`
 only when all of these are also true:
@@ -182,8 +184,8 @@ side-effecting tool call or a changed structured task plan is substantive
 progress and creates a durable `NULL` barrier in gap history. Model replies and
 read-only exploration remain observable activity but do not clear the gap
 streak. Three consecutive eligible turns with the same normalized model-fixable
-gap pause as `NoProgress`, including `MaxInnerTurns` continuations. An
-independent cap pauses after eight consecutive `MaxInnerTurns` outer turns even
+gap pause as `NoProgress`, including resumable budget-stop continuations. An
+independent cap pauses after eight consecutive budget-stop outer turns even
 when intermediate progress is reported. Token deltas and continuation counts
 remain accounting and observability data, not proof of progress.
 

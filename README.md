@@ -90,7 +90,13 @@ sandbox permissions.
 - Saves local conversations with `--resume` for continuation and `--fork` for
   branching; `orca exec resume <SESSION_ID>` restores a headless session with a
   fresh budget scope, and headless exits print the exact resume command.
-- Runs persistent goals without a fixed turn ceiling, plus subagents and
+- Runs with no implicit turn ceiling; optional `[budget]` limits
+  (`--max-turns`, `--max-tool-calls`, `--max-cost-usd`,
+  `--max-wall-time-secs`) bound an operation explicitly, and budget stops
+  settle the current tool, create a checkpoint, and exit 4 with a typed
+  terminal in the JSONL stream.
+- Runs persistent goals without a fixed turn ceiling (a cumulative Goal token
+  budget disables automatic continuation when exhausted), plus subagents and
   JavaScript workflows for longer tasks that need continuation or parallel work.
 - Loads project instructions, skills, plugins, custom tools, MCP tools, and MCP
   resources after the workspace is trusted.

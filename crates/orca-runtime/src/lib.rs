@@ -4,15 +4,16 @@ pub mod agent_common;
 pub mod agent_loop;
 pub mod approval_resolution;
 pub mod background_turn;
+pub mod budget_controller;
 mod budget_soft_landing;
-mod child_agent_entrypoints;
-mod child_agent_loop_runner;
-mod child_agent_loop_setup;
-mod child_agent_provider_turn;
-mod child_agent_response_folding;
+pub mod child_agent_entrypoints;
+pub mod child_agent_loop_runner;
+pub mod child_agent_loop_setup;
+pub mod child_agent_provider_turn;
+pub mod child_agent_response_folding;
 #[cfg(test)]
 mod child_agent_tests;
-mod child_agent_types;
+pub mod child_agent_types;
 pub mod command;
 pub mod compaction;
 pub use compaction::{
@@ -21,6 +22,7 @@ pub use compaction::{
 };
 pub mod controller;
 pub mod cost;
+pub mod execution_journal;
 pub mod extension;
 pub mod goal_actor;
 pub mod goal_store;

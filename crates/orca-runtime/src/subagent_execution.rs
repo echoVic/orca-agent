@@ -105,7 +105,7 @@ pub(crate) fn should_run_subagent_batch(
     tool_request.name == tool_types::ToolName::Subagent
         && subagent_depth < config.subagents.max_depth
         && config.subagents.max_parallel > 1
-        && config.max_budget_usd.is_none()
+        && config.budget.max_cost_usd_micros.is_none()
         && is_batchable_subagent_request(tool_request)
 }
 
@@ -498,8 +498,8 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         return Ok(tool_types::ToolResult::failed(tool_request, error, None));
     }
 
-    if request.mode == SubagentMode::Async && config.max_budget_usd.is_some() {
-        let error = "async subagents are unavailable while max_budget_usd is active; use sync mode so usage can be admitted and reconciled in the parent turn";
+    if request.mode == SubagentMode::Async && config.budget.max_cost_usd_micros.is_some() {
+        let error = "async subagents are unavailable while a cost budget is active; use sync mode so usage can be admitted and reconciled in the parent turn";
         emit_rejected_subagent_lifecycle(
             events,
             sink,
@@ -565,9 +565,10 @@ fn config_for_remaining_subagent_budget(
     cost_tracker: &CostTracker,
 ) -> RunConfig {
     let mut child_config = config.clone();
-    if let Some(max_budget) = config.max_budget_usd {
-        child_config.max_budget_usd =
-            Some((max_budget - cost_tracker.totals().estimated_cost_usd).max(0.0));
+    if let Some(max_cost_usd_micros) = config.budget.max_cost_usd_micros {
+        let spent_micros = crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
+        child_config.budget.max_cost_usd_micros =
+            Some(max_cost_usd_micros.saturating_sub(spent_micros));
     }
     child_config
 }
@@ -694,7 +695,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: Default::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: orca_core::config::BudgetConfig::default(),
             mcp_servers: Vec::new(),
             external_tools: Vec::new(),
             hooks: Vec::new(),
@@ -782,7 +783,7 @@ mod tests {
             ..SubagentConfig::default()
         };
         let mut config = config(subagents);
-        config.max_budget_usd = Some(1.0);
+        config.budget.max_cost_usd_micros = Some(1_000_000);
         let requests = [subagent_request("a"), subagent_request("b")];
 
         assert!(!super::should_run_subagent_batch(&config, &requests[0], 0));
@@ -791,7 +792,7 @@ mod tests {
     #[test]
     fn sync_subagent_receives_only_remaining_aggregate_budget() {
         let mut config = config(SubagentConfig::default());
-        config.max_budget_usd = Some(0.5);
+        config.budget.max_cost_usd_micros = Some(500_000);
         let mut cost_tracker = CostTracker::new(None);
         cost_tracker.add_usage(Usage {
             input_tokens: 1_000_000,
@@ -801,9 +802,13 @@ mod tests {
 
         let child_config = super::config_for_remaining_subagent_budget(&config, &cost_tracker);
 
-        let remaining = child_config.max_budget_usd.expect("remaining budget");
-        assert!((remaining - 0.36).abs() < 1e-12);
-        assert_eq!(config.max_budget_usd, Some(0.5));
+        // 1M flash input tokens ≈ $0.14, leaving ≈ $0.36 of the $0.50 budget.
+        let remaining = child_config
+            .budget
+            .max_cost_usd_micros
+            .expect("remaining budget");
+        assert!((remaining as f64 - 360_000.0).abs() < 2_000.0);
+        assert_eq!(config.budget.max_cost_usd_micros, Some(500_000));
     }
 
     #[test]
@@ -1759,7 +1764,7 @@ mod tests {
     fn budget_mode_rejects_async_subagent_before_task_launch() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut config = config(SubagentConfig::default());
-        config.max_budget_usd = Some(1.0);
+        config.budget.max_cost_usd_micros = Some(1_000_000);
         let mut events = EventFactory::new("subagent-budget-async".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
@@ -1809,7 +1814,7 @@ mod tests {
             result
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("max_budget_usd is active"))
+                .is_some_and(|error| error.contains("cost budget is active"))
         );
         assert!(task_registry.list().is_empty());
         assert_eq!(cost_tracker.totals(), Default::default());

@@ -22,6 +22,7 @@ pub(crate) struct RuntimeTurnOpeningStep;
 
 pub(crate) struct RuntimeTurnOpeningInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
+    pub(crate) budget: &'a mut crate::budget_controller::BudgetController,
     pub(crate) provider: ProviderKind,
     pub(crate) context_config: &'a context::ContextConfig,
     pub(crate) provider_config: &'a ProviderConfig,
@@ -51,6 +52,23 @@ impl RuntimeTurnOpeningStep {
         mut input: RuntimeTurnOpeningInput<'_, '_, W>,
     ) -> io::Result<RuntimeTurnOpeningResult> {
         let turn_context = input.turn_context.clone();
+
+        // The operation's BudgetController admits this turn; on exhaustion the
+        // loop stops with a typed terminal before any provider request. The
+        // previous turn's tools are already settled (the loop only iterates
+        // after a committed tool result), so the stop creates a checkpoint and
+        // returns `OperationTerminal::Stopped` without a new provider request.
+        if let Err(stop) = input.budget.admit_turn() {
+            let checkpoint_id = format!("{}-budget-stop", input.events.run_id());
+            input.budget.record_checkpoint(checkpoint_id.clone());
+            let result = AgentLoopResult::budget_stop(stop, checkpoint_id);
+            if let Some(error) = result.error.as_deref()
+                && turn_context.emit_deltas
+            {
+                input.sink.emit(input.events.error(error))?;
+            }
+            return Ok(RuntimeTurnOpeningResult::Return(result));
+        }
 
         RuntimeCompactionStep::new(
             input.provider,
@@ -93,9 +111,10 @@ impl RuntimeTurnOpeningStep {
             RuntimeTurnStartResult::Continue => {}
         }
 
-        // Soft-land before the hard MaxInnerTurns wall: inject a pinned system
-        // reminder when remaining inner turns cross configured thresholds.
-        if let Some(message) = input.actor.take_pending_inner_turn_soft_landing() {
+        // Soft-land before a hard budget wall: inject a pinned system reminder
+        // when remaining budget crosses configured thresholds. Reminders come
+        // from the controller and never mutate usage or success state.
+        if let Some(message) = input.budget.take_pending_soft_landing() {
             input.conversation.add_system_pinned(message);
         }
         if let Some(message) = input.actor.take_pending_cost_budget_soft_landing() {

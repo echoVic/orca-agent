@@ -184,6 +184,37 @@ impl ReasoningEffort {
     }
 }
 
+/// Explicit execution budget from `[budget]` configuration or CLI options.
+/// Every dimension is independently optional; all default to `None` (unlimited).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct BudgetConfig {
+    pub max_turns: Option<u32>,
+    pub max_tool_calls: Option<u32>,
+    pub max_cost_usd_micros: Option<u64>,
+    pub max_wall_time_ms: Option<u64>,
+}
+
+impl BudgetConfig {
+    pub fn to_spec(self) -> crate::budget::BudgetSpec {
+        crate::budget::BudgetSpec {
+            max_turns: self.max_turns,
+            max_tool_calls: self.max_tool_calls,
+            max_cost_usd_micros: self.max_cost_usd_micros,
+            max_wall_time_ms: self.max_wall_time_ms,
+        }
+    }
+
+    pub fn from_spec(spec: crate::budget::BudgetSpec) -> Self {
+        Self {
+            max_turns: spec.max_turns,
+            max_tool_calls: spec.max_tool_calls,
+            max_cost_usd_micros: spec.max_cost_usd_micros,
+            max_wall_time_ms: spec.max_wall_time_ms,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolConfig {
     #[serde(default = "default_max_read_parallel")]
@@ -344,7 +375,7 @@ pub struct RunConfig {
     pub runtime_workspace_roots: Option<Vec<PathBuf>>,
     pub permission_rules: PermissionRules,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
-    pub max_budget_usd: Option<f64>,
+    pub budget: BudgetConfig,
     pub subagents: SubagentConfig,
     pub tools: ToolConfig,
     pub workflows: WorkflowConfig,
@@ -639,10 +670,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "<current>".to_string());
     let verifier = config.verifier.as_deref().unwrap_or("<unset>");
-    let max_budget = config
-        .max_budget_usd
-        .map(|budget| budget.to_string())
-        .unwrap_or_else(|| "<unset>".to_string());
+    let budget = budget_summary(&config.budget);
     let runtime = runtime_summary(config);
     let vim_insert_escape = config
         .vim_insert_escape
@@ -663,7 +691,6 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "model_soft_compact_token_limit = \"{}\"\n",
             "cwd = \"{}\"\n",
             "verifier = \"{}\"\n",
-            "max_budget_usd = \"{}\"\n",
             "theme = \"{}\"\n",
             "vim_mode = {}\n",
             "vim_insert_escape = {}\n",
@@ -671,6 +698,12 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "desktop_notifications = {}\n",
             "terminal_notifications = {}\n",
             "auto_memory = {}\n",
+            "\n",
+            "[budget]\n",
+            "max_turns = {}\n",
+            "max_tool_calls = {}\n",
+            "max_cost_usd_micros = {}\n",
+            "max_wall_time_ms = {}\n",
             "\n",
             "[runtime]\n",
             "approval = \"{}\"\n",
@@ -722,7 +755,6 @@ pub fn format_config_show(config: &RunConfig) -> String {
             .unwrap_or_else(|| "<default>".to_string()),
         cwd,
         verifier,
-        max_budget,
         config.theme.as_str(),
         config.vim_mode,
         vim_insert_escape,
@@ -730,6 +762,10 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.desktop_notifications,
         config.terminal_notifications,
         config.auto_memory,
+        budget.max_turns,
+        budget.max_tool_calls,
+        budget.max_cost_usd_micros,
+        budget.max_wall_time_ms,
         runtime.approval,
         runtime.filesystem,
         runtime.network,
@@ -797,6 +833,34 @@ fn runtime_summary(config: &RunConfig) -> RuntimeSummary {
                 .unwrap_or_else(|| "<unset>".to_string())
         ),
     }
+}
+
+fn option_or_unset(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "<unset>".to_string())
+}
+
+fn budget_summary(budget: &BudgetConfig) -> BudgetSummary {
+    BudgetSummary {
+        max_turns: budget
+            .max_turns
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unset>".to_string()),
+        max_tool_calls: budget
+            .max_tool_calls
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unset>".to_string()),
+        max_cost_usd_micros: option_or_unset(budget.max_cost_usd_micros),
+        max_wall_time_ms: option_or_unset(budget.max_wall_time_ms),
+    }
+}
+
+struct BudgetSummary {
+    max_turns: String,
+    max_tool_calls: String,
+    max_cost_usd_micros: String,
+    max_wall_time_ms: String,
 }
 
 fn filesystem_posture(mode: ApprovalMode) -> &'static str {
@@ -894,7 +958,10 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: PermissionRules::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: Some(1.25),
+            budget: BudgetConfig {
+                max_cost_usd_micros: Some(1_250_000),
+                ..BudgetConfig::default()
+            },
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
@@ -968,7 +1035,7 @@ mod tests {
                 "job",
                 "delegation",
             )],
-            max_budget_usd: None,
+            budget: BudgetConfig::default(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),

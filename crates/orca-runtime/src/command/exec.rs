@@ -18,6 +18,10 @@ pub struct ExecCommandRequest {
     pub base_url: Option<String>,
     pub verifier: Option<String>,
     pub max_budget: Option<f64>,
+    pub max_turns: Option<u32>,
+    pub max_tool_calls: Option<u32>,
+    pub max_cost_usd: Option<f64>,
+    pub max_wall_time_secs: Option<u64>,
     pub resume: Option<String>,
     pub resume_at: Option<String>,
     pub fork: Option<String>,
@@ -97,7 +101,18 @@ pub fn run_with_stdin(
     config_request.provider = request.provider;
     config_request.verifier = request.verifier;
     config_request.history_mode = history_mode;
-    config_request.max_budget_usd = request.max_budget;
+    config_request.budget = orca_core::config::BudgetConfig {
+        max_turns: request.max_turns,
+        max_tool_calls: request.max_tool_calls,
+        max_cost_usd_micros: request
+            .max_cost_usd
+            .or(request.max_budget)
+            .filter(|usd| usd.is_finite() && *usd > 0.0)
+            .map(|usd| (usd * 1_000_000.0).round() as u64),
+        max_wall_time_ms: request
+            .max_wall_time_secs
+            .map(|secs| secs.saturating_mul(1_000)),
+    };
     config_request.overrides = ConfigOverrides {
         model: request.model,
         mode: request.approval_mode,

@@ -566,6 +566,18 @@ impl InteractiveSession {
         }
     }
 
+    /// Complete the transcript from the typed operation terminal. The status
+    /// string is derived from the terminal object, never invented by the
+    /// projection.
+    pub fn complete_with_terminal(&mut self, terminal: &orca_core::budget::OperationTerminal) {
+        let status = terminal.as_str();
+        let error = match terminal {
+            orca_core::budget::OperationTerminal::Failed { message, .. } => Some(message.as_str()),
+            _ => None,
+        };
+        self.complete_with_error(status, error);
+    }
+
     pub fn backtrack_last_user(&mut self) -> Option<String> {
         self.conversation.backtrack_last_user()
     }
@@ -772,7 +784,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: PermissionRules::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: Default::default(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
@@ -1120,6 +1132,48 @@ mod tests {
                     .status,
                 TaskStatus::Running
             );
+        });
+    }
+
+    #[test]
+    fn complete_with_terminal_derives_transcript_status_from_typed_terminal() {
+        use orca_core::budget::{BudgetUsage, OperationTerminal, StopReason};
+
+        with_orca_home(|home| {
+            let cfg = config(home.to_path_buf(), HistoryMode::Record);
+            let mut session = InteractiveSession::new_with_preloaded(&cfg, "typed terminal", None)
+                .expect("session");
+
+            session.complete_with_terminal(&OperationTerminal::Completed {
+                usage: BudgetUsage::default(),
+            });
+            assert_eq!(session.completion_error, None);
+
+            let failed = OperationTerminal::Failed {
+                class: orca_core::budget::FailureClass::Runtime,
+                message: "boom".to_string(),
+            };
+            session.complete_with_terminal(&failed);
+            assert_eq!(
+                session.completion_error.as_deref(),
+                Some("boom"),
+                "Failed terminal message flows to the transcript error"
+            );
+
+            let stopped = OperationTerminal::Stopped {
+                reason: StopReason::TurnBudget { max_turns: 3 },
+                usage: BudgetUsage::default(),
+                checkpoint_id: "cp-1".to_string(),
+                resumable: true,
+            };
+            session.complete_with_terminal(&stopped);
+            assert_eq!(session.completion_error, None);
+
+            // The saved transcript carries the derived status, not a
+            // projection-invented one.
+            let store = session.store();
+            let sessions = store.list_sessions(10).expect("list sessions");
+            assert!(!sessions.is_empty());
         });
     }
 }

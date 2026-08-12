@@ -49,8 +49,6 @@ use crate::thread::RuntimeThread;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow_execution::{BackgroundWorkflowRun, observe_background_workflows};
 
-#[cfg(test)]
-const DEFAULT_MAX_TURNS: u32 = 128;
 const HOSTED_EVENT_RELAY_CAPACITY: usize = 1;
 const HOSTED_EVENT_RELAY_POLL: Duration = Duration::from_millis(10);
 
@@ -183,6 +181,9 @@ struct ThreadTurnCompletion {
     usage: UsageTotals,
     main_session_task: Option<ThreadTurnMainSessionTask>,
     background_workflows: RuntimeBackgroundWorkflows,
+    /// Typed operation terminal; the authoritative fact when present (budget
+    /// stops carry `OperationTerminal::Stopped`).
+    terminal: Option<orca_core::budget::OperationTerminal>,
 }
 
 enum PreparedThreadTurnOutcome {
@@ -198,6 +199,8 @@ pub enum ThreadTurnOutcome {
         status: RunStatus,
         end_reason: crate::lifecycle::TurnEndReason,
         background_workflows: RuntimeBackgroundWorkflows,
+        /// Typed operation terminal; the authoritative fact when present.
+        terminal: Option<orca_core::budget::OperationTerminal>,
     },
     ProviderSuspended {
         suspension: Box<RuntimeProviderSuspension>,
@@ -543,10 +546,7 @@ impl ThreadTurnMainSessionTask {
                 self.registry
                     .stop_with_usage(&self.id, status.as_str().to_string(), Some(usage))
             }
-            RunStatus::Failed
-            | RunStatus::ApprovalRequired
-            | RunStatus::BudgetExhausted
-            | RunStatus::VerificationFailed => self
+            RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => self
                 .registry
                 .apply_main_session_terminal_update(
                     &self.id,
@@ -743,6 +743,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             usage,
             main_session_task,
             background_workflows,
+            terminal: result.terminal,
         }))
     }
 }
@@ -755,13 +756,21 @@ impl ThreadTurnCompletion {
         events: &mut EventFactory,
         sink: &mut EventSink<W>,
     ) -> io::Result<RunStatus> {
-        session.complete_with_error(self.status.as_str(), self.error.as_deref());
+        if let Some(terminal) = self.terminal.as_ref() {
+            session.complete_with_terminal(terminal);
+        } else {
+            session.complete_with_error(self.status.as_str(), self.error.as_deref());
+        }
         if let Some(task) = self.main_session_task.as_ref() {
             task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
             task.emit_all(events, sink)?;
         }
         if request.emit_session_completed() {
-            sink.emit(events.session_completed(self.status, session.session_id()))?;
+            if let Some(terminal) = self.terminal.as_ref() {
+                sink.emit(events.session_completed_terminal(terminal, session.session_id()))?;
+            } else {
+                sink.emit(events.session_completed(self.status, session.session_id()))?;
+            }
         }
         Ok(self.status)
     }
@@ -779,12 +788,14 @@ impl PreparedThreadTurnOutcome {
             Self::Completed(mut completion) => {
                 let background_workflows = std::mem::take(&mut completion.background_workflows);
                 let end_reason = completion.end_reason;
+                let terminal = completion.terminal.take();
                 completion
                     .commit(session, request, events, sink)
                     .map(|status| ThreadTurnOutcome::Completed {
                         status,
                         end_reason,
                         background_workflows,
+                        terminal,
                     })
             }
             Self::ProviderSuspended {
@@ -805,9 +816,14 @@ impl ThreadTurnOutcome {
                 status,
                 end_reason: _,
                 background_workflows,
+                terminal,
             } => {
                 background_workflows.join_silently();
-                Ok(status)
+                // The typed terminal's exit code is authoritative for budget
+                // stops (4); plain statuses keep the legacy mapping.
+                Ok(terminal
+                    .map(orca_core::budget::OperationTerminal::exit_code)
+                    .map_or(status, |_| status))
             }
             Self::ProviderSuspended {
                 suspension,
@@ -1070,7 +1086,7 @@ pub fn run(config: RunConfig) -> i32 {
     let stdout = io::stdout();
     let options = ControllerRunOptions::for_run_config(&config);
     match run_inner(config, stdout.lock(), options) {
-        Ok(status) => status.exit_code(),
+        Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("orca: {error}");
             RunStatus::Failed.exit_code()
@@ -1089,7 +1105,7 @@ pub fn run_to_writer_with_options<W: io::Write>(
     options: ControllerRunOptions,
 ) -> i32 {
     match run_inner(config, writer, options) {
-        Ok(status) => status.exit_code(),
+        Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("orca: {error}");
             RunStatus::Failed.exit_code()
@@ -1101,7 +1117,7 @@ fn run_inner<W: io::Write>(
     config: RunConfig,
     mut writer: W,
     options: ControllerRunOptions,
-) -> io::Result<RunStatus> {
+) -> io::Result<i32> {
     let prompt = if config.prompt.trim().is_empty() {
         "(empty prompt)".to_string()
     } else {
@@ -1129,8 +1145,10 @@ fn run_inner<W: io::Write>(
         .map_err(runtime_host_io_error)?;
     let terminal = drain_hosted_events(&operation, relay_rx, &mut writer);
     let status = operation_status(&terminal);
+    let exit_code = operation_exit_code(&terminal);
     let shutdown = host.shutdown().map_err(runtime_host_io_error);
     let status = status?;
+    let exit_code = exit_code?;
     shutdown?;
     if config.desktop_notifications {
         let _ = crate::notify::notify("Orca", &format!("Session {}", status.as_str()));
@@ -1144,7 +1162,7 @@ fn run_inner<W: io::Write>(
             "To continue this session, run: orca exec resume {session_id}"
         )?;
     }
-    Ok(status)
+    Ok(exit_code)
 }
 
 fn drain_hosted_events<W: io::Write>(
@@ -1175,6 +1193,23 @@ fn drain_hosted_events<W: io::Write>(
 fn operation_status(terminal: &OperationTerminal) -> io::Result<RunStatus> {
     match terminal.outcome() {
         OperationOutcome::Completed(status) => Ok(*status),
+        OperationOutcome::Stopped(_) => Ok(RunStatus::Failed),
+        OperationOutcome::Backgrounded { task_id } => Err(io::Error::other(format!(
+            "hosted operation backgrounded as task {task_id} without a background-aware caller"
+        ))),
+        OperationOutcome::ExecutionFailed { kind, message } => {
+            Err(io::Error::new(*kind, message.clone()))
+        }
+        OperationOutcome::Panicked { message } => Err(io::Error::other(message.clone())),
+    }
+}
+
+/// Exit code for a hosted operation: typed terminals own their exit code
+/// (budget stops are 4), plain statuses keep the legacy mapping.
+fn operation_exit_code(terminal: &OperationTerminal) -> io::Result<i32> {
+    match terminal.outcome() {
+        OperationOutcome::Completed(status) => Ok(status.exit_code()),
+        OperationOutcome::Stopped(terminal) => Ok(terminal.clone().exit_code()),
         OperationOutcome::Backgrounded { task_id } => Err(io::Error::other(format!(
             "hosted operation backgrounded as task {task_id} without a background-aware caller"
         ))),
@@ -1492,7 +1527,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: Default::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: Default::default(),
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             external_tools: Vec::new(),
@@ -1546,7 +1581,7 @@ mod tests {
         let status = run_inner(config, &mut output, ControllerRunOptions::default())
             .expect("headless controller run");
 
-        assert_eq!(status, RunStatus::Success);
+        assert_eq!(status, RunStatus::Success.exit_code());
         let events = String::from_utf8(output)
             .expect("utf8 events")
             .lines()
@@ -2203,7 +2238,7 @@ mod tests {
 
     #[test]
     fn workflow_ipc_tool_requires_workflow_child_context() {
-        let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
+        let mut context = RuntimeToolActorContext::new("test-run");
         let request = tool_types::ToolRequest {
             id: "mailbox".to_string(),
             name: tool_types::ToolName::WorkflowReadMessages,
@@ -2317,7 +2352,7 @@ mod tests {
 
     #[test]
     fn subagent_status_returns_session_local_task_result() {
-        let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
+        let mut context = RuntimeToolActorContext::new("test-run");
         let registry = TaskRegistry::new("session-status".to_string());
         let task =
             registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
@@ -2349,7 +2384,7 @@ mod tests {
 
     #[test]
     fn subagent_status_pages_persisted_result_output() {
-        let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
+        let mut context = RuntimeToolActorContext::new("test-run");
         let registry = TaskRegistry::new("session-status-page".to_string());
         let task = registry.create_subagent("inspect large output".to_string(), None);
         registry
@@ -2383,7 +2418,7 @@ mod tests {
 
     #[test]
     fn subagent_status_rejects_invalid_result_page_size() {
-        let mut context = RuntimeToolActorContext::new("test-run", DEFAULT_MAX_TURNS);
+        let mut context = RuntimeToolActorContext::new("test-run");
         let registry = TaskRegistry::new("session-status-page-limit".to_string());
         let task = registry.create_subagent("inspect output".to_string(), None);
         registry.complete(&task.id, "result".to_string()).unwrap();
@@ -2636,7 +2671,7 @@ mod tests {
 
     #[test]
     fn tool_execution_actor_owns_runtime_tool_actor_state() {
-        let actor = ToolExecutionActor::new("tool-actor-run", DEFAULT_MAX_TURNS);
+        let actor = ToolExecutionActor::new("tool-actor-run");
         let task = actor.active_task().expect("active task");
 
         assert_eq!(task.kind(), RuntimeTaskKind::Agent);
@@ -2678,7 +2713,7 @@ mod tests {
             )
             .with_permission_overlay(&mut permission_overlay);
 
-        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
         let (status, result) = actor
             .execute(
                 &config,
@@ -2714,7 +2749,7 @@ mod tests {
         let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
         let cancel = CancelToken::new();
 
-        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
         let execution = actor.handle_approval(ToolApprovalGateContext {
             config: &config,
             events: &mut events,
@@ -2758,8 +2793,7 @@ mod tests {
         let mut permission_overlay = crate::lifecycle::TurnPermissionOverlay::default();
         let mut event_error = None;
 
-        let mut runtime =
-            RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let mut runtime = RuntimeToolActorContext::new(events.run_id().to_string());
         let result = RuntimeToolRouter::new(&mut runtime)
             .dispatch(RuntimeToolInvocationContext {
                 config: &config,
@@ -2825,8 +2859,7 @@ mod tests {
         let normal_handler = Arc::new(PermissionCarryNormalHandler {
             calls: AtomicUsize::new(0),
         });
-        let mut runtime =
-            RuntimeToolActorContext::new(events.run_id().to_string(), DEFAULT_MAX_TURNS);
+        let mut runtime = RuntimeToolActorContext::new(events.run_id().to_string());
 
         for request in &requests {
             let tool_calls = RuntimeToolCallRuntime::with_normal_handler(normal_handler.clone())

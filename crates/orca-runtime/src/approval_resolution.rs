@@ -63,7 +63,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: Default::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: Default::default(),
             mcp_servers: Vec::new(),
             external_tools: Vec::new(),
             hooks: Vec::new(),

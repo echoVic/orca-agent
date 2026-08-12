@@ -80,7 +80,12 @@ Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
 - 通过 `suggest`、沙箱内 `auto-edit`、完全访问 `full-auto` 和只读 `plan`
   模式控制风险，同时提供目录信任机制。
 - 在本地保存对话历史，支持恢复、分叉、搜索、重命名、归档和压缩。
-- 运行没有固定轮次上限的持久目标，并通过子智能体和 JavaScript 工作流处理长任务。
+- 默认没有隐式轮次上限；可通过 `[budget]` 配置（`--max-turns`、
+  `--max-tool-calls`、`--max-cost-usd`、`--max-wall-time-secs`）显式约束
+  单次运行，预算耗尽时先结算当前工具、创建检查点，再以退出码 4 结束，并在
+  JSONL 流中携带类型化终端对象。
+- 运行没有固定轮次上限的持久目标（Goal 累计 token 预算耗尽时会禁用自动续跑），
+  并通过子智能体和 JavaScript 工作流处理长任务。
 - 在工作区受信任后加载项目指令、Skills、Plugins、自定义工具、MCP 工具和资源。
 - 为编辑器、测试框架和 CI 提供稳定的 JSONL、app-server 与 Agent Client
   Protocol（ACP）协议。

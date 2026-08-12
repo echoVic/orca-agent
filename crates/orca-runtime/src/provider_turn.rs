@@ -81,7 +81,7 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) base_provider_config: &'a ProviderConfig,
     pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
     pub(crate) cost_tracker: &'a mut CostTracker,
-    pub(crate) max_budget_usd: Option<f64>,
+    pub(crate) max_cost_usd_micros: Option<u64>,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) conversation: &'a mut RuntimePreparedConversation<'runtime>,
@@ -100,7 +100,7 @@ pub(crate) struct RuntimeProviderTurnInput<'a, 'runtime, W: io::Write> {
     pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) hooks: &'a HookRunner,
     pub(crate) cancel: &'a CancelToken,
-    pub(crate) max_budget_usd: Option<f64>,
+    pub(crate) max_cost_usd_micros: Option<u64>,
     /// Full model context window, used as the denominator for the local
     /// `context.updated` observability event emitted after real usage arrives.
     pub(crate) context_window: usize,
@@ -245,6 +245,7 @@ impl RuntimeProviderErrorStep {
                         status: RunStatus::Failed,
                         reason: TurnEndReason::Unclassified,
                         message,
+                        max_cost_usd_micros: 0,
                     },
                 ))
             }
@@ -400,6 +401,7 @@ impl RuntimeProviderTurnStep {
                         status: RunStatus::Failed,
                         reason: TurnEndReason::Unclassified,
                         message: "provider stream disconnected before completion".to_string(),
+                        max_cost_usd_micros: 0,
                     }));
                 }
             }
@@ -422,16 +424,17 @@ impl RuntimeProviderTurnStep {
         if let Some(usage) = response.usage
             && !usage.is_empty()
         {
-            let totals = match input
-                .actor
-                .record_usage(usage, cost_tracker, input.max_budget_usd)
-            {
-                Ok(totals) => totals,
-                Err(error) => {
-                    usage_error = Some(error);
-                    cost_tracker.totals()
-                }
-            };
+            let totals =
+                match input
+                    .actor
+                    .record_usage(usage, cost_tracker, input.max_cost_usd_micros)
+                {
+                    Ok(totals) => totals,
+                    Err(error) => {
+                        usage_error = Some(error);
+                        cost_tracker.totals()
+                    }
+                };
             if emit_deltas {
                 sink.emit(events.usage_updated(totals))?;
                 if let Some(writer) = history_writer.as_deref_mut() {
@@ -649,7 +652,7 @@ impl RuntimeTurnProviderCycleStep {
                     turn_context: turn_context.clone(),
                     hooks: capabilities.hooks,
                     cancel: capabilities.cancel,
-                    max_budget_usd: input.max_budget_usd,
+                    max_cost_usd_micros: input.max_cost_usd_micros,
                     context_window: input.context_config.max_tokens,
                     io: RuntimeProviderTurnIo {
                         conversation,
@@ -807,6 +810,7 @@ fn cancelled_provider_turn<W: io::Write>(
         status: RunStatus::Cancelled,
         reason: TurnEndReason::Cancelled,
         message: "turn cancelled".to_string(),
+        max_cost_usd_micros: 0,
     }))
 }
 
@@ -924,7 +928,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: PermissionRules::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: Default::default(),
             mcp_servers: Vec::<McpServerConfig>::new(),
             external_tools: Vec::<ExternalToolConfig>::new(),
             hooks: Vec::<HookConfig>::new(),
@@ -1089,7 +1093,7 @@ mod tests {
     fn cancelled_provider_turn_preserves_completed_usage() {
         let mut lifecycle =
             crate::lifecycle::RuntimeSessionLifecycle::new("provider-cancelled-usage".to_string());
-        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut conversation = Conversation::new();
         conversation.add_user("mock_usage_then_cancel".to_string());
         let provider_config = ProviderConfig {
@@ -1123,7 +1127,7 @@ mod tests {
                 ),
                 hooks: &hooks,
                 cancel: &cancel,
-                max_budget_usd: None,
+                max_cost_usd_micros: None,
                 context_window: 1_000_000,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
@@ -1158,7 +1162,7 @@ mod tests {
         let mut lifecycle = crate::lifecycle::RuntimeSessionLifecycle::new(
             "provider-runtime-system-directive".to_string(),
         );
-        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut conversation = Conversation::new();
         conversation.add_system("base system".to_string());
         conversation.add_user("mock_system_echo".to_string());
@@ -1194,7 +1198,7 @@ mod tests {
                 ),
                 hooks: &hooks,
                 cancel: &cancel,
-                max_budget_usd: None,
+                max_cost_usd_micros: None,
                 context_window: 1_000_000,
                 io: RuntimeProviderTurnIo {
                     conversation: &mut conversation,
@@ -1302,6 +1306,7 @@ mod tests {
                 status: RunStatus::Failed,
                 reason: TurnEndReason::Unclassified,
                 message: "provider failed".to_string(),
+                max_cost_usd_micros: 0,
             }),
         );
         match failed {
@@ -1638,7 +1643,7 @@ mod tests {
         let mut lifecycle = crate::runtime_lifecycle::RuntimeSessionLifecycle::new(
             "provider-cycle-continuation".to_string(),
         );
-        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
 
         let result = RuntimeTurnProviderCycleStep::new()
             .run(
@@ -1674,7 +1679,7 @@ mod tests {
                         None,
                     ),
                     cost_tracker: &mut cost_tracker,
-                    max_budget_usd: None,
+                    max_cost_usd_micros: None,
                     events: &mut events,
                     sink: &mut sink,
                     conversation: &mut prepared_conversation,
@@ -1716,6 +1721,7 @@ mod tests {
             status: RunStatus::Cancelled,
             reason: TurnEndReason::Cancelled,
             message: "turn cancelled".to_string(),
+            max_cost_usd_micros: 0,
         });
 
         let error = match output {
@@ -1733,6 +1739,7 @@ mod tests {
             status: RunStatus::Cancelled,
             reason: TurnEndReason::Cancelled,
             message: "turn cancelled".to_string(),
+            max_cost_usd_micros: 0,
         });
         let mut events = EventFactory::new("provider-turn-result".to_string());
         let mut emitted = Vec::new();
@@ -1785,6 +1792,7 @@ mod tests {
                 status: RunStatus::Failed,
                 reason: TurnEndReason::Unclassified,
                 message: "provider failed".to_string(),
+                max_cost_usd_micros: 0,
             }),
         );
         match failed {

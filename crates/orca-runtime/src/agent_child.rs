@@ -9,8 +9,7 @@ pub use crate::child_agent_loop_runner::{
     run_child_agent_with_tool_executor_observed,
 };
 pub use crate::child_agent_loop_setup::{
-    ChildAgentLoopSetup, ChildAgentTurnBudget, DEFAULT_CHILD_AGENT_MAX_TURNS,
-    advance_child_agent_turn, advance_child_agent_turn_with_limit, prepare_child_agent_loop,
+    ChildAgentLoopSetup, ChildAgentTurnBudget, advance_child_agent_turn, prepare_child_agent_loop,
 };
 pub use crate::child_agent_provider_turn::{
     ChildAgentProviderErrorDecision, ChildAgentProviderTurn,

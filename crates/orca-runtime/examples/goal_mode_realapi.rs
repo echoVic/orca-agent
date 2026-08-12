@@ -166,7 +166,7 @@ fn pause_reason_name(reason: GoalPauseReason) -> &'static str {
     }
 }
 
-fn parse_max_budget() -> Result<f64, String> {
+fn parse_max_budget() -> Result<u64, String> {
     let mut args = std::env::args().skip(1);
     let mut max_budget = 0.02;
     while let Some(arg) = args.next() {
@@ -185,7 +185,7 @@ fn parse_max_budget() -> Result<f64, String> {
     if !max_budget.is_finite() || max_budget <= 0.0 {
         return Err("--max-budget must be a positive finite number".to_string());
     }
-    Ok(max_budget)
+    Ok((max_budget * 1_000_000.0).round() as u64)
 }
 
 fn load_api_key() -> Option<String> {
@@ -204,7 +204,7 @@ fn load_api_key() -> Option<String> {
         .cloned()
 }
 
-fn real_api_config(api_key: String, max_budget_usd: f64) -> Result<RunConfig, String> {
+fn real_api_config(api_key: String, max_cost_usd_micros: u64) -> Result<RunConfig, String> {
     Ok(RunConfig {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         prompt: String::new(),
@@ -228,7 +228,10 @@ fn real_api_config(api_key: String, max_budget_usd: f64) -> Result<RunConfig, St
         runtime_workspace_roots: None,
         permission_rules: Default::default(),
         additional_working_directories: Vec::new(),
-        max_budget_usd: Some(max_budget_usd),
+        budget: orca_core::config::BudgetConfig {
+            max_cost_usd_micros: Some(max_cost_usd_micros),
+            ..orca_core::config::BudgetConfig::default()
+        },
         subagents: SubagentConfig::default(),
         tools: ToolConfig::default(),
         workflows: WorkflowConfig::default(),

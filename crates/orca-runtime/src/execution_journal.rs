@@ -1,0 +1,589 @@
+//! Execution journal: the single append-only source of truth for one
+//! operation's terminal and checkpoint facts.
+//!
+//! Ordered records (`operation.started`, `turn.started`, `model.response`,
+//! `tool.started`, `tool.completed`, `checkpoint.created`,
+//! `operation.terminal`) are flushed atomically: either every pending record
+//! is durable or none is. On reopen only committed records exist, so an
+//! unflushed `tool.started` is never replayed; callers restore it as
+//! `indeterminate`. Projections (JSONL stream, saved transcript, TUI) must
+//! read committed records and never invent terminal facts.
+//!
+//! Ordering invariants enforced on append:
+//! - `checkpoint.created` requires every open `tool.started` to already have a
+//!   committed `tool.completed`.
+//! - `operation.terminal` (any variant) requires a committed checkpoint when
+//!   the terminal is `Stopped`, and may be appended only once.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use orca_core::budget::{BudgetUsage, OperationTerminal, StopReason};
+use serde::{Deserialize, Serialize};
+
+pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalRecordKind {
+    OperationStarted,
+    TurnStarted,
+    ModelResponse,
+    ToolStarted,
+    ToolCompleted,
+    CheckpointCreated,
+    OperationTerminal,
+}
+
+impl JournalRecordKind {
+    pub fn as_str_for_test(&self) -> &'static str {
+        match self {
+            Self::OperationStarted => "operation.started",
+            Self::TurnStarted => "turn.started",
+            Self::ModelResponse => "model.response",
+            Self::ToolStarted => "tool.started",
+            Self::ToolCompleted => "tool.completed",
+            Self::CheckpointCreated => "checkpoint.created",
+            Self::OperationTerminal => "operation.terminal",
+        }
+    }
+}
+
+/// Test-only accessors for contract assertions.
+impl JournalRecord {
+    pub fn schema_version_for_test(&self) -> u32 {
+        match self {
+            Self::OperationStarted { schema_version, .. }
+            | Self::TurnStarted { schema_version, .. }
+            | Self::ModelResponse { schema_version, .. }
+            | Self::ToolStarted { schema_version, .. }
+            | Self::ToolCompleted { schema_version, .. }
+            | Self::CheckpointCreated { schema_version, .. }
+            | Self::OperationTerminal { schema_version, .. } => *schema_version,
+        }
+    }
+
+    pub fn tool_call_id_for_test(&self) -> Option<&str> {
+        match self {
+            Self::ToolStarted { tool_call_id, .. } | Self::ToolCompleted { tool_call_id, .. } => {
+                Some(tool_call_id)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn checkpoint_id_for_test(&self) -> Option<&str> {
+        match self {
+            Self::CheckpointCreated { checkpoint_id, .. } => Some(checkpoint_id),
+            _ => None,
+        }
+    }
+}
+
+/// One ordered journal record. Every record carries `operation_id`, the
+/// owning `turn_id` (empty for operation-level records), a monotonically
+/// increasing ordinal, and the schema version.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JournalRecord {
+    OperationStarted {
+        operation_id: String,
+        #[serde(default)]
+        turn_id: String,
+        ordinal: u64,
+        schema_version: u32,
+        started_at_ms: u64,
+    },
+    TurnStarted {
+        operation_id: String,
+        turn_id: String,
+        ordinal: u64,
+        schema_version: u32,
+    },
+    ModelResponse {
+        operation_id: String,
+        turn_id: String,
+        ordinal: u64,
+        schema_version: u32,
+        response_id: String,
+        final_message: Option<String>,
+    },
+    ToolStarted {
+        operation_id: String,
+        turn_id: String,
+        ordinal: u64,
+        schema_version: u32,
+        tool_call_id: String,
+        tool_name: String,
+    },
+    ToolCompleted {
+        operation_id: String,
+        turn_id: String,
+        ordinal: u64,
+        schema_version: u32,
+        tool_call_id: String,
+        status: String,
+        error: Option<String>,
+    },
+    CheckpointCreated {
+        operation_id: String,
+        #[serde(default)]
+        turn_id: String,
+        ordinal: u64,
+        schema_version: u32,
+        checkpoint_id: String,
+        message_id: Option<String>,
+    },
+    OperationTerminal {
+        operation_id: String,
+        #[serde(default)]
+        turn_id: String,
+        ordinal: u64,
+        schema_version: u32,
+        terminal: OperationTerminal,
+    },
+}
+
+impl JournalRecord {
+    pub fn kind(&self) -> JournalRecordKind {
+        match self {
+            Self::OperationStarted { .. } => JournalRecordKind::OperationStarted,
+            Self::TurnStarted { .. } => JournalRecordKind::TurnStarted,
+            Self::ModelResponse { .. } => JournalRecordKind::ModelResponse,
+            Self::ToolStarted { .. } => JournalRecordKind::ToolStarted,
+            Self::ToolCompleted { .. } => JournalRecordKind::ToolCompleted,
+            Self::CheckpointCreated { .. } => JournalRecordKind::CheckpointCreated,
+            Self::OperationTerminal { .. } => JournalRecordKind::OperationTerminal,
+        }
+    }
+
+    pub fn ordinal(&self) -> u64 {
+        match self {
+            Self::OperationStarted { ordinal, .. }
+            | Self::TurnStarted { ordinal, .. }
+            | Self::ModelResponse { ordinal, .. }
+            | Self::ToolStarted { ordinal, .. }
+            | Self::ToolCompleted { ordinal, .. }
+            | Self::CheckpointCreated { ordinal, .. }
+            | Self::OperationTerminal { ordinal, .. } => *ordinal,
+        }
+    }
+
+    pub fn operation_id(&self) -> &str {
+        match self {
+            Self::OperationStarted { operation_id, .. }
+            | Self::TurnStarted { operation_id, .. }
+            | Self::ModelResponse { operation_id, .. }
+            | Self::ToolStarted { operation_id, .. }
+            | Self::ToolCompleted { operation_id, .. }
+            | Self::CheckpointCreated { operation_id, .. }
+            | Self::OperationTerminal { operation_id, .. } => operation_id,
+        }
+    }
+
+    pub fn turn_id(&self) -> &str {
+        match self {
+            Self::OperationStarted { turn_id, .. }
+            | Self::TurnStarted { turn_id, .. }
+            | Self::ModelResponse { turn_id, .. }
+            | Self::ToolStarted { turn_id, .. }
+            | Self::ToolCompleted { turn_id, .. }
+            | Self::CheckpointCreated { turn_id, .. }
+            | Self::OperationTerminal { turn_id, .. } => turn_id,
+        }
+    }
+}
+
+/// Test-only fault injection for proving durability ordering.
+#[derive(Clone, Debug, Default)]
+pub struct JournalFaults {
+    /// When set, the next `flush` fails after writing no bytes. Armed faults
+    /// are consumed by one flush attempt.
+    pub fail_next_flush: bool,
+    /// When set, `append` of `operation.terminal` is rejected even when a
+    /// checkpoint exists (simulates an adapter publishing before flush).
+    pub reject_terminal_without_checkpoint: bool,
+}
+
+/// The append-only journal for one operation.
+pub struct ExecutionJournal {
+    path: PathBuf,
+    operation_id: String,
+    committed: Vec<JournalRecord>,
+    pending: Vec<JournalRecord>,
+    next_ordinal: u64,
+    faults: JournalFaults,
+    terminal_appended: bool,
+}
+
+impl ExecutionJournal {
+    /// Opens (or creates) the journal file and loads committed records.
+    pub fn open(path: PathBuf, operation_id: impl Into<String>) -> io::Result<Self> {
+        let operation_id = operation_id.into();
+        let mut journal = Self {
+            path,
+            operation_id,
+            committed: Vec::new(),
+            pending: Vec::new(),
+            next_ordinal: 1,
+            faults: JournalFaults::default(),
+            terminal_appended: false,
+        };
+        journal.reload_committed()?;
+        Ok(journal)
+    }
+
+    pub fn with_faults(mut self, faults: JournalFaults) -> Self {
+        self.faults = faults;
+        self
+    }
+
+    /// Arms test-only faults on an already-open journal.
+    pub fn set_faults(&mut self, faults: JournalFaults) {
+        self.faults = faults;
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Committed records in ordinal order (durable facts only).
+    pub fn committed(&self) -> &[JournalRecord] {
+        &self.committed
+    }
+
+    /// Pending records not yet flushed.
+    pub fn pending(&self) -> &[JournalRecord] {
+        &self.pending
+    }
+
+    /// True when an `operation.terminal` record is committed.
+    pub fn has_terminal(&self) -> bool {
+        self.terminal_appended
+    }
+
+    /// The committed terminal, when present.
+    pub fn terminal(&self) -> Option<&OperationTerminal> {
+        self.committed.iter().rev().find_map(|record| match record {
+            JournalRecord::OperationTerminal { terminal, .. } => Some(terminal),
+            _ => None,
+        })
+    }
+
+    /// Committed `tool.started` records without a matching committed
+    /// `tool.completed`. These must be restored as `indeterminate` and never
+    /// replayed as completed (their external effects are unknown).
+    pub fn unmatched_tool_starts(&self) -> Vec<&JournalRecord> {
+        let mut started: Vec<&JournalRecord> = Vec::new();
+        for record in &self.committed {
+            match record {
+                JournalRecord::ToolStarted { .. } => started.push(record),
+                JournalRecord::ToolCompleted { tool_call_id, .. } => {
+                    started.retain(|record| match record {
+                        JournalRecord::ToolStarted {
+                            tool_call_id: id, ..
+                        } => id != tool_call_id,
+                        _ => true,
+                    });
+                }
+                _ => {}
+            }
+        }
+        started
+    }
+
+    /// Last committed checkpoint record, newest first.
+    pub fn last_checkpoint(&self) -> Option<&JournalRecord> {
+        self.committed.iter().rev().find_map(|record| {
+            matches!(record, JournalRecord::CheckpointCreated { .. }).then_some(record)
+        })
+    }
+
+    pub fn append(&mut self, record: JournalRecord) -> Result<(), String> {
+        if record.operation_id() != self.operation_id {
+            return Err(format!(
+                "journal record operation {} does not match journal operation {}",
+                record.operation_id(),
+                self.operation_id
+            ));
+        }
+        self.validate_ordering(&record)?;
+        self.next_ordinal += 1;
+        self.pending.push(record);
+        Ok(())
+    }
+
+    /// Appends and immediately flushes (durable before returning).
+    pub fn append_durable(&mut self, record: JournalRecord) -> io::Result<()> {
+        self.append(record).map_err(io::Error::other)?;
+        self.flush()
+    }
+
+    /// Atomically flushes all pending records: either every record is durable
+    /// or none is. With an armed `fail_next_flush` fault the flush fails
+    /// before writing anything and the pending records stay pending.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        if self.faults.fail_next_flush {
+            self.faults.fail_next_flush = false;
+            return Err(io::Error::other("injected flush failure"));
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Write all pending lines with one open handle, then sync. A crash
+        // before sync leaves the file without these records; a crash after
+        // sync but before the method returns is indistinguishable from
+        // success, which is the durability contract.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        repair_incomplete_final_line(&mut file)?;
+        for record in &self.pending {
+            let mut line = serde_json::to_vec(record)
+                .map_err(|error| io::Error::other(format!("journal serialization: {error}")))?;
+            line.push(b'\n');
+            file.write_all(&line)?;
+        }
+        file.flush()?;
+        file.sync_data()?;
+        let flushed = std::mem::take(&mut self.pending);
+        self.committed.extend(flushed);
+        self.terminal_appended = self
+            .committed
+            .iter()
+            .any(|record| matches!(record, JournalRecord::OperationTerminal { .. }));
+        Ok(())
+    }
+
+    /// Emits committed records as JSONL lines through `writer`.
+    pub fn write_projection(&self, mut writer: impl Write) -> io::Result<()> {
+        for record in &self.committed {
+            serde_json::to_writer(&mut writer, record)
+                .map_err(|error| io::Error::other(format!("journal projection: {error}")))?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    fn validate_ordering(&self, record: &JournalRecord) -> Result<(), String> {
+        match record {
+            JournalRecord::OperationStarted { .. } => {
+                if !self.committed.is_empty() || !self.pending.is_empty() {
+                    return Err("operation.started must be the first journal record".to_string());
+                }
+            }
+            JournalRecord::CheckpointCreated { .. } => {
+                if !self.unmatched_tool_starts().is_empty() {
+                    return Err(
+                        "checkpoint.created requires every open tool.started to have a committed tool.completed"
+                            .to_string(),
+                    );
+                }
+            }
+            JournalRecord::OperationTerminal { terminal, .. } => {
+                if self.terminal_appended
+                    || self
+                        .committed
+                        .iter()
+                        .chain(self.pending.iter())
+                        .any(|existing| matches!(existing, JournalRecord::OperationTerminal { .. }))
+                {
+                    return Err("operation.terminal may be appended only once".to_string());
+                }
+                if matches!(terminal, OperationTerminal::Stopped { .. })
+                    && self.last_checkpoint().is_none()
+                {
+                    return Err(
+                        "stopped operation.terminal requires a committed checkpoint.created"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn reload_committed(&mut self) -> io::Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let file = File::open(&self.path)?;
+        let reader = BufReader::new(file);
+        let mut max_ordinal = 0_u64;
+        let mut terminal_seen = false;
+        for (index, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: JournalRecord = serde_json::from_str(&line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("journal record {index} invalid: {error}"),
+                )
+            })?;
+            if record.operation_id() != self.operation_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal record {index} belongs to operation {} not {}",
+                        record.operation_id(),
+                        self.operation_id
+                    ),
+                ));
+            }
+            max_ordinal = max_ordinal.max(record.ordinal());
+            terminal_seen |= matches!(record, JournalRecord::OperationTerminal { .. });
+            self.committed.push(record);
+        }
+        self.next_ordinal = max_ordinal.saturating_add(1);
+        self.terminal_appended = terminal_seen;
+        Ok(())
+    }
+}
+
+fn repair_incomplete_final_line(file: &mut File) -> io::Result<()> {
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut final_byte = [0; 1];
+    file.read_exact(&mut final_byte)?;
+    if final_byte[0] == b'\n' {
+        file.seek(SeekFrom::End(0))?;
+        return Ok(());
+    }
+    // A partial line means a crash mid-write: truncate it so only complete
+    // records survive.
+    file.set_len(file_len.saturating_sub(1))?;
+    file.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+/// Convenience builders used by the agent loop.
+impl ExecutionJournal {
+    pub fn record_operation_started(&self, started_at_ms: u64) -> JournalRecord {
+        JournalRecord::OperationStarted {
+            operation_id: self.operation_id.clone(),
+            turn_id: String::new(),
+            ordinal: self.next_ordinal,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            started_at_ms,
+        }
+    }
+
+    pub fn record_turn_started(&self, turn_id: &str) -> JournalRecord {
+        JournalRecord::TurnStarted {
+            operation_id: self.operation_id.clone(),
+            turn_id: turn_id.to_string(),
+            ordinal: self.next_ordinal,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+        }
+    }
+
+    pub fn record_model_response(
+        &self,
+        turn_id: &str,
+        response_id: &str,
+        final_message: Option<String>,
+    ) -> JournalRecord {
+        JournalRecord::ModelResponse {
+            operation_id: self.operation_id.clone(),
+            turn_id: turn_id.to_string(),
+            ordinal: self.next_ordinal,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            response_id: response_id.to_string(),
+            final_message,
+        }
+    }
+
+    pub fn record_tool_started(
+        &self,
+        turn_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+    ) -> JournalRecord {
+        JournalRecord::ToolStarted {
+            operation_id: self.operation_id.clone(),
+            turn_id: turn_id.to_string(),
+            ordinal: self.next_ordinal,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+        }
+    }
+
+    pub fn record_tool_completed(
+        &self,
+        turn_id: &str,
+        tool_call_id: &str,
+        status: &str,
+        error: Option<String>,
+    ) -> JournalRecord {
+        JournalRecord::ToolCompleted {
+            operation_id: self.operation_id.clone(),
+            turn_id: turn_id.to_string(),
+            ordinal: self.next_ordinal,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            tool_call_id: tool_call_id.to_string(),
+            status: status.to_string(),
+            error,
+        }
+    }
+
+    pub fn record_checkpoint(
+        &self,
+        checkpoint_id: &str,
+        message_id: Option<String>,
+    ) -> JournalRecord {
+        JournalRecord::CheckpointCreated {
+            operation_id: self.operation_id.clone(),
+            turn_id: String::new(),
+            ordinal: self.next_ordinal,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            checkpoint_id: checkpoint_id.to_string(),
+            message_id,
+        }
+    }
+
+    pub fn record_terminal(&self, terminal: OperationTerminal) -> JournalRecord {
+        JournalRecord::OperationTerminal {
+            operation_id: self.operation_id.clone(),
+            turn_id: String::new(),
+            ordinal: self.next_ordinal,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            terminal,
+        }
+    }
+}
+
+/// Free-standing helpers for building terminals from controller state.
+pub fn completed_terminal(usage: BudgetUsage) -> OperationTerminal {
+    OperationTerminal::Completed { usage }
+}
+
+pub fn stopped_terminal(
+    reason: StopReason,
+    usage: BudgetUsage,
+    checkpoint_id: impl Into<String>,
+    resumable: bool,
+) -> OperationTerminal {
+    OperationTerminal::Stopped {
+        reason,
+        usage,
+        checkpoint_id: checkpoint_id.into(),
+        resumable,
+    }
+}

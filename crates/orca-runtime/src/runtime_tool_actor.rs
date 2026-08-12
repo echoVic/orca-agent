@@ -23,14 +23,13 @@ use crate::tasks::TaskRegistry;
 
 pub struct RuntimeToolActorContext {
     lifecycle: RuntimeSessionLifecycle,
-    max_turns: u32,
     pub(crate) permission_overlay: TurnPermissionOverlay,
     pub(crate) thread_extensions: ExtensionData,
     pub(crate) turn_extensions: ExtensionData,
 }
 
 impl RuntimeToolActorContext {
-    pub fn new(run_id: impl Into<String>, max_turns: u32) -> Self {
+    pub fn new(run_id: impl Into<String>) -> Self {
         let run_id = run_id.into();
         let thread_extension_id = run_id.clone();
         let turn_extension_id = format!("{run_id}:tool-actor");
@@ -38,7 +37,6 @@ impl RuntimeToolActorContext {
         lifecycle.start_task(RuntimeTaskKind::Agent);
         Self {
             lifecycle,
-            max_turns,
             permission_overlay: TurnPermissionOverlay::default(),
             thread_extensions: ExtensionData::new(thread_extension_id),
             turn_extensions: ExtensionData::new(turn_extension_id),
@@ -46,7 +44,7 @@ impl RuntimeToolActorContext {
     }
 
     fn actor(&mut self) -> RuntimeTaskActor<'_> {
-        RuntimeTaskActor::new(&mut self.lifecycle, self.max_turns)
+        RuntimeTaskActor::new(&mut self.lifecycle)
     }
 
     pub fn active_task(&self) -> Option<&RuntimeTaskLifecycle> {

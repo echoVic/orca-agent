@@ -168,12 +168,13 @@ fn subagent_budget_exhaustion_error(
     if tool_request.name != orca_core::tool_types::ToolName::Subagent {
         return None;
     }
-    let max_budget = config.max_budget_usd?;
-    let totals = cost_tracker.totals();
-    (totals.estimated_cost_usd > max_budget).then(|| {
+    let max_cost_usd_micros = config.budget.max_cost_usd_micros?;
+    let spent_usd_micros = crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
+    (spent_usd_micros > max_cost_usd_micros).then(|| {
         format!(
-            "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
-            totals.estimated_cost_usd, max_budget
+            "budget stopped: estimated cost ${:.6} exceeded limit ${:.6}",
+            spent_usd_micros as f64 / 1_000_000.0,
+            max_cost_usd_micros as f64 / 1_000_000.0
         )
     })
 }
@@ -728,12 +729,12 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             history_writer.as_deref_mut(),
             tool_request,
             &result,
-            RunStatus::BudgetExhausted,
+            RunStatus::Failed,
             emit_deltas,
         )?;
         return Ok(RuntimeNormalToolTurnExecution {
             outcome: ToolTurnOutcome::Return {
-                status: RunStatus::BudgetExhausted,
+                status: RunStatus::Failed,
                 error: Some(error),
             },
             event_error,
@@ -817,7 +818,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
 
     let outcome = if let Some(error) = budget_exhaustion {
         ToolTurnOutcome::Return {
-            status: RunStatus::BudgetExhausted,
+            status: RunStatus::Failed,
             error: Some(error),
         }
     } else {
@@ -1039,6 +1040,7 @@ mod tests {
             mcp_servers: Vec::new(),
             permission_rules: PermissionRules::default(),
             additional_working_directories: Vec::new(),
+            budget: Default::default(),
             hooks: Vec::new(),
             workflows: WorkflowConfig::default(),
             subagents: SubagentConfig {
@@ -1047,7 +1049,6 @@ mod tests {
             },
             tools: ToolConfig::default(),
             external_tools,
-            max_budget_usd: None,
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,
@@ -2920,7 +2921,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let mut config = config_with_external(Vec::new());
         config.approval_mode = ApprovalMode::FullAuto;
-        config.max_budget_usd = Some(1.0);
+        config.budget.max_cost_usd_micros = Some(1_000_000);
         let subagent_request = |id: &str, prompt: &str| ToolRequest {
             id: id.to_string(),
             name: ToolName::Subagent,
@@ -2992,11 +2993,11 @@ mod tests {
 
         match outcome {
             ToolTurnOutcome::Return { status, error } => {
-                assert_eq!(status, RunStatus::BudgetExhausted);
+                assert_eq!(status, RunStatus::Failed);
                 assert!(
                     error
                         .as_deref()
-                        .is_some_and(|error| error.contains("budget exhausted"))
+                        .is_some_and(|error| error.contains("budget stopped"))
                 );
             }
             ToolTurnOutcome::Continue => panic!("budget crossing must stop the tool turn"),
@@ -3081,7 +3082,7 @@ mod tests {
         assert!(matches!(
             admission_outcome.outcome,
             ToolTurnOutcome::Return {
-                status: RunStatus::BudgetExhausted,
+                status: RunStatus::Failed,
                 ..
             }
         ));

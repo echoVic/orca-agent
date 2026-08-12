@@ -62,11 +62,7 @@ pub use crate::runtime_user_input::{RuntimeUserInputHandler, RuntimeUserInputReq
 
 pub struct RuntimeTaskActor<'a> {
     lifecycle: &'a mut RuntimeSessionLifecycle,
-    max_turns: u32,
     turns_started: u32,
-    /// Soft-landing reminders already delivered for the inner-turn ceiling
-    /// within this outer turn (Codex-style delivery index).
-    inner_turn_reminder_index: u32,
     /// Cost thresholds already acknowledged within this outer turn.
     cost_budget_reminder_index: u32,
     /// Reminder produced after the latest provider usage update and consumed
@@ -86,11 +82,15 @@ pub(crate) fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AgentLoopResult {
-    pub(crate) status: RunStatus,
-    pub(crate) reason: TurnEndReason,
-    pub(crate) final_message: Option<String>,
-    pub(crate) error: Option<String>,
+pub struct AgentLoopResult {
+    pub status: RunStatus,
+    pub reason: TurnEndReason,
+    pub final_message: Option<String>,
+    pub error: Option<String>,
+    /// Typed operation terminal when the loop ended in a budget stop; the
+    /// legacy status/reason pair above stays populated for adapters that have
+    /// not migrated yet (Task 6 completes the migration).
+    pub terminal: Option<orca_core::budget::OperationTerminal>,
 }
 
 pub(crate) enum AgentLoopOutcome {
@@ -105,6 +105,7 @@ impl AgentLoopResult {
             reason: TurnEndReason::Unclassified,
             final_message,
             error: None,
+            terminal: None,
         }
     }
 
@@ -123,13 +124,54 @@ impl AgentLoopResult {
             reason,
             final_message: None,
             error,
+            terminal: None,
+        }
+    }
+
+    /// Typed budget stop produced by the operation's `BudgetController`;
+    /// no further provider request is made after this result. The legacy
+    /// status/reason fields are projections; the typed terminal is the fact.
+    pub fn budget_stop(stop: orca_core::budget::BudgetStop, checkpoint_id: String) -> Self {
+        Self {
+            status: RunStatus::Failed,
+            reason: TurnEndReason::CostBudgetExhausted,
+            final_message: None,
+            error: Some(format!(
+                "budget stopped: {} (turns={}, tool_calls={})",
+                stop.reason.as_str(),
+                stop.usage.turns,
+                stop.usage.tool_calls
+            )),
+            terminal: Some(orca_core::budget::OperationTerminal::Stopped {
+                reason: stop.reason,
+                usage: stop.usage,
+                checkpoint_id,
+                resumable: true,
+            }),
         }
     }
 }
 
 impl From<RuntimeTurnStartError> for AgentLoopResult {
     fn from(error: RuntimeTurnStartError) -> Self {
-        Self::terminal(error.status, error.reason, Some(error.message))
+        // Cost-budget stops produce the typed terminal so adapters never
+        // reconstruct budget facts from constants.
+        let terminal = match error.reason {
+            TurnEndReason::CostBudgetExhausted => {
+                Some(orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::CostBudget {
+                        max_cost_usd_micros: error.max_cost_usd_micros,
+                    },
+                    usage: orca_core::budget::BudgetUsage::default(),
+                    checkpoint_id: String::new(),
+                    resumable: false,
+                })
+            }
+            _ => None,
+        };
+        let mut result = Self::terminal(error.status, error.reason, Some(error.message));
+        result.terminal = terminal;
+        result
     }
 }
 
@@ -238,13 +280,12 @@ pub struct RuntimeActorStartedTurn {
 
 /// Why an outer turn ended, kept separate from [`RunStatus`] because one status
 /// is reachable for reasons that differ in whether resuming can make progress:
-/// an inner-turn ceiling resumes cleanly, while a cost ceiling would re-trip
-/// immediately under unchanged config.
+/// a typed budget stop with a committed checkpoint resumes cleanly, while a
+/// cost ceiling would re-trip immediately under unchanged config. Budget
+/// specifics live in the typed `OperationTerminal`, not here.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TurnEndReason {
-    /// The per-run inner turn ceiling was reached.
-    MaxInnerTurns,
-    /// The configured `max_budget_usd` ceiling was exceeded.
+    /// The configured cost budget ceiling (in USD micros) was exceeded.
     CostBudgetExhausted,
     /// The turn was explicitly cancelled.
     Cancelled,
@@ -256,7 +297,6 @@ pub enum TurnEndReason {
 impl TurnEndReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::MaxInnerTurns => "max_inner_turns",
             Self::CostBudgetExhausted => "cost_budget_exhausted",
             Self::Cancelled => "cancelled",
             Self::Unclassified => "unclassified",
@@ -269,6 +309,9 @@ pub struct RuntimeTurnStartError {
     pub status: RunStatus,
     pub reason: TurnEndReason,
     pub message: String,
+    /// The cost ceiling (USD micros) that caused a `CostBudgetExhausted`
+    /// stop, so adapters never reconstruct limits from constants.
+    pub max_cost_usd_micros: u64,
 }
 
 pub trait RuntimeWorkflowIpc {
@@ -322,41 +365,21 @@ pub trait RuntimeSubagentStatusLookup {
 }
 
 impl<'a> RuntimeTaskActor<'a> {
-    pub fn new(lifecycle: &'a mut RuntimeSessionLifecycle, max_turns: u32) -> Self {
+    pub fn new(lifecycle: &'a mut RuntimeSessionLifecycle) -> Self {
         let turns_started = lifecycle
             .active_task()
             .map(RuntimeTaskLifecycle::current_turn)
             .unwrap_or(0);
         Self {
             lifecycle,
-            max_turns,
             turns_started,
-            inner_turn_reminder_index: 0,
             cost_budget_reminder_index: 0,
             pending_cost_budget_soft_landing: None,
         }
     }
 
-    pub fn max_turns(&self) -> u32 {
-        self.max_turns
-    }
-
     pub fn turns_started(&self) -> u32 {
         self.turns_started
-    }
-
-    /// If the inner-turn soft-landing threshold advanced on the latest
-    /// successful `start_turn`, return the reminder text and mark it delivered.
-    pub fn take_pending_inner_turn_soft_landing(&mut self) -> Option<String> {
-        let reminder = crate::budget_soft_landing::pending_inner_turn_reminder(
-            self.max_turns,
-            self.turns_started,
-            self.inner_turn_reminder_index,
-        )?;
-        self.inner_turn_reminder_index = reminder.reminder_index;
-        Some(crate::budget_soft_landing::format_soft_landing_message(
-            &reminder,
-        ))
     }
 
     pub fn take_pending_cost_budget_soft_landing(&mut self) -> Option<String> {
@@ -370,13 +393,8 @@ impl<'a> RuntimeTaskActor<'a> {
         prompt: Option<&str>,
         emit_event: bool,
     ) -> Result<RuntimeActorStartedTurn, RuntimeTurnStartError> {
-        if self.turns_started >= self.max_turns {
-            return Err(RuntimeTurnStartError {
-                status: RunStatus::BudgetExhausted,
-                reason: TurnEndReason::MaxInnerTurns,
-                message: "max turns exhausted".to_string(),
-            });
-        }
+        // No implicit turn ceiling exists: the operation's BudgetController
+        // admits turns and returns a typed stop instead.
         self.turns_started = self.turns_started.saturating_add(1);
         let started = if emit_event {
             let started =
@@ -456,12 +474,14 @@ impl<'a> RuntimeTaskActor<'a> {
                     status: RunStatus::Cancelled,
                     reason: TurnEndReason::Cancelled,
                     message: "turn cancelled".to_string(),
+                    max_cost_usd_micros: 0,
                 }
             } else {
                 RuntimeTurnStartError {
                     status: RunStatus::Failed,
                     reason: TurnEndReason::Unclassified,
                     message: format!("pre_model_call hook failed: {error}"),
+                    max_cost_usd_micros: 0,
                 }
             }
         })
@@ -781,25 +801,28 @@ impl<'a> RuntimeTaskActor<'a> {
         &mut self,
         usage: Usage,
         cost_tracker: &mut CostTracker,
-        max_budget_usd: Option<f64>,
+        max_cost_usd_micros: Option<u64>,
     ) -> Result<orca_core::cost_types::UsageTotals, RuntimeTurnStartError> {
         let totals = cost_tracker.add_usage(usage);
-        if let Some(max_budget) = max_budget_usd
-            && totals.estimated_cost_usd > max_budget
+        let spent_usd_micros = crate::cost::usd_to_micros(totals.estimated_cost_usd);
+        if let Some(max_cost_usd_micros) = max_cost_usd_micros
+            && spent_usd_micros > max_cost_usd_micros
         {
             return Err(RuntimeTurnStartError {
-                status: RunStatus::BudgetExhausted,
+                status: RunStatus::Failed,
                 reason: TurnEndReason::CostBudgetExhausted,
                 message: format!(
-                    "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
-                    totals.estimated_cost_usd, max_budget
+                    "budget stopped: estimated cost ${:.6} exceeded limit ${:.6}",
+                    totals.estimated_cost_usd,
+                    max_cost_usd_micros as f64 / 1_000_000.0
                 ),
+                max_cost_usd_micros,
             });
         }
-        if let Some(max_budget) = max_budget_usd
+        if let Some(max_cost_usd_micros) = max_cost_usd_micros
             && let Some(reminder) = crate::budget_soft_landing::pending_cost_budget_reminder(
-                max_budget,
-                totals.estimated_cost_usd,
+                max_cost_usd_micros,
+                spent_usd_micros,
                 self.cost_budget_reminder_index,
             )
         {
@@ -1666,7 +1689,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: PermissionRules::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: Default::default(),
             mcp_servers: Vec::<McpServerConfig>::new(),
             external_tools: Vec::new(),
             hooks: Vec::<HookConfig>::new(),
@@ -1708,18 +1731,20 @@ mod tests {
     #[test]
     fn agent_loop_result_preserves_turn_end_reason() {
         let from_start = AgentLoopResult::from(RuntimeTurnStartError {
-            status: RunStatus::BudgetExhausted,
-            reason: TurnEndReason::MaxInnerTurns,
-            message: "max turns exhausted".to_string(),
+            status: RunStatus::Failed,
+            reason: TurnEndReason::Unclassified,
+            message: "provider failed".to_string(),
+            max_cost_usd_micros: 0,
         });
-        assert_eq!(from_start.status, RunStatus::BudgetExhausted);
-        assert_eq!(from_start.reason, TurnEndReason::MaxInnerTurns);
-        assert_eq!(from_start.error.as_deref(), Some("max turns exhausted"));
+        assert_eq!(from_start.status, RunStatus::Failed);
+        assert_eq!(from_start.reason, TurnEndReason::Unclassified);
+        assert_eq!(from_start.error.as_deref(), Some("provider failed"));
 
         let cost = AgentLoopResult::from(RuntimeTurnStartError {
-            status: RunStatus::BudgetExhausted,
+            status: RunStatus::Failed,
             reason: TurnEndReason::CostBudgetExhausted,
-            message: "budget exhausted".to_string(),
+            message: "budget stopped".to_string(),
+            max_cost_usd_micros: 0,
         });
         assert_eq!(cost.reason, TurnEndReason::CostBudgetExhausted);
         assert_ne!(from_start.reason, cost.reason);
@@ -1760,6 +1785,7 @@ mod tests {
                 status: RunStatus::Failed,
                 reason: TurnEndReason::Unclassified,
                 message: "max turns exceeded".to_string(),
+                max_cost_usd_micros: 0,
             }),
         });
         match failed {
@@ -1777,7 +1803,7 @@ mod tests {
     #[test]
     fn turn_start_step_emits_started_event() {
         let mut lifecycle = RuntimeSessionLifecycle::new("turn-start-step".to_string());
-        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut events = EventFactory::new("turn-start-step".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
@@ -1803,7 +1829,7 @@ mod tests {
     #[test]
     fn turn_opening_step_compacts_starts_routes_and_steers() {
         let mut lifecycle = RuntimeSessionLifecycle::new("turn-opening-step".to_string());
-        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut events = EventFactory::new("turn-opening-step".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
@@ -1832,6 +1858,9 @@ mod tests {
         let result = RuntimeTurnOpeningStep::new()
             .open(RuntimeTurnOpeningInput {
                 actor: &mut actor,
+                budget: &mut crate::budget_controller::BudgetController::new(
+                    orca_core::budget::BudgetSpec::default(),
+                ),
                 provider: ProviderKind::DeepSeek,
                 context_config: &context_config,
                 provider_config: &provider_config,
@@ -1865,7 +1894,7 @@ mod tests {
     #[test]
     fn turn_opening_injects_pending_cost_soft_landing_once() {
         let mut lifecycle = RuntimeSessionLifecycle::new("cost-soft-landing".to_string());
-        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 128);
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut cost_tracker = CostTracker::new(Some("deepseek-v4-flash"));
         actor
             .record_usage(
@@ -1875,7 +1904,7 @@ mod tests {
                     cache_tokens: 0,
                 },
                 &mut cost_tracker,
-                Some(0.10),
+                Some(100_000),
             )
             .expect("usage remains below hard cost wall");
 
@@ -1906,6 +1935,9 @@ mod tests {
         let result = RuntimeTurnOpeningStep::new()
             .open(RuntimeTurnOpeningInput {
                 actor: &mut actor,
+                budget: &mut crate::budget_controller::BudgetController::new(
+                    orca_core::budget::BudgetSpec::default(),
+                ),
                 provider: ProviderKind::DeepSeek,
                 context_config: &context_config,
                 provider_config: &provider_config,
@@ -1937,7 +1969,7 @@ mod tests {
     #[test]
     fn model_route_step_returns_provider_config_and_emits_event() {
         let mut lifecycle = RuntimeSessionLifecycle::new("model-route-step".to_string());
-        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut events = EventFactory::new("model-route-step".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
@@ -1983,7 +2015,7 @@ mod tests {
     #[test]
     fn model_route_step_applies_runtime_model_override_directive() {
         let mut lifecycle = RuntimeSessionLifecycle::new("model-route-directive".to_string());
-        let mut actor = RuntimeTaskActor::new(&mut lifecycle, 3);
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut events = EventFactory::new("model-route-directive".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
@@ -2093,20 +2125,22 @@ mod tests {
     }
 
     #[test]
-    fn budget_exhausted_carries_distinct_reasons() {
-        let max_turns = RuntimeTurnStartError {
-            status: RunStatus::BudgetExhausted,
-            reason: TurnEndReason::MaxInnerTurns,
-            message: "max turns exhausted".to_string(),
+    fn budget_stops_carry_distinct_reasons() {
+        let failed = RuntimeTurnStartError {
+            status: RunStatus::Failed,
+            reason: TurnEndReason::Unclassified,
+            message: "provider failed".to_string(),
+            max_cost_usd_micros: 0,
         };
         let cost = RuntimeTurnStartError {
-            status: RunStatus::BudgetExhausted,
+            status: RunStatus::Failed,
             reason: TurnEndReason::CostBudgetExhausted,
-            message: "budget exhausted".to_string(),
+            message: "budget stopped".to_string(),
+            max_cost_usd_micros: 0,
         };
 
-        assert_eq!(max_turns.status, cost.status);
-        assert_ne!(max_turns.reason, cost.reason);
+        assert_eq!(failed.status, cost.status);
+        assert_ne!(failed.reason, cost.reason);
         assert_eq!(TurnEndReason::default(), TurnEndReason::Unclassified);
     }
 }

@@ -234,7 +234,6 @@ impl RuntimeTaskStatus {
             RunStatus::Failed | RunStatus::VerificationFailed => Self::Failed,
             RunStatus::Cancelled => Self::Cancelled,
             RunStatus::ApprovalRequired => Self::ApprovalRequired,
-            RunStatus::BudgetExhausted => Self::BudgetExhausted,
         }
     }
 }

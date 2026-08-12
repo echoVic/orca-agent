@@ -693,14 +693,21 @@ pub fn write_server_event<W: Write>(
     id: &Value,
     event: ServerEvent,
 ) -> io::Result<()> {
+    // Serialize the envelope and its trailing newline into one buffer so the
+    // underlying writer (which may be a `LockedServerWriter` sharing a Mutex
+    // with other event producers) writes the complete line under a single
+    // lock acquisition. Two separate `to_writer`/`writeln` calls would let
+    // another thread interleave its own JSON between them.
+    let mut bytes = Vec::new();
     serde_json::to_writer(
-        &mut *writer,
+        &mut bytes,
         &ServerEventEnvelope {
             id: id.clone(),
             event,
         },
     )?;
-    writeln!(writer)?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes)?;
     writer.flush()
 }
 

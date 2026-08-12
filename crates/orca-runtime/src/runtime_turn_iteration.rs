@@ -26,6 +26,7 @@ pub(crate) struct RuntimeTurnIterationStep {
 
 pub(crate) struct RuntimeTurnIterationInput<'a, 'runtime, W: io::Write> {
     pub(crate) actor: &'a mut RuntimeTaskActor<'runtime>,
+    pub(crate) budget: &'a mut crate::budget_controller::BudgetController,
     pub(crate) provider_context: RuntimeTurnProviderContext<'a>,
     pub(crate) request: RuntimeTurnRequestContext<'a>,
     pub(crate) deps: RuntimeTurnDeps<'a>,
@@ -63,6 +64,7 @@ impl RuntimeTurnIterationStep {
             let (conversation, history_writer) = input.prepared_conversation.parts_mut();
             match self.opening_step.open(RuntimeTurnOpeningInput {
                 actor: input.actor,
+                budget: input.budget,
                 provider: input.provider_context.provider,
                 context_config: input.provider_context.context_config,
                 provider_config: input.provider_context.provider_config,
@@ -107,7 +109,7 @@ impl RuntimeTurnIterationStep {
                     input.deps.turn_interactions.mcp_elicitation_handler(),
                 ),
                 cost_tracker: input.loop_state.cost_tracker,
-                max_budget_usd: input.provider_context.max_budget_usd,
+                max_cost_usd_micros: input.provider_context.max_cost_usd_micros,
                 events: input.output.events,
                 sink: input.output.sink,
                 conversation: input.prepared_conversation,

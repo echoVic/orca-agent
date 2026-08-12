@@ -321,7 +321,6 @@ pub enum RunStatus {
     Cancelled,
     ApprovalRequired,
     VerificationFailed,
-    BudgetExhausted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -352,7 +351,6 @@ impl RunStatus {
             Self::Cancelled => "cancelled",
             Self::ApprovalRequired => "approval_required",
             Self::VerificationFailed => "verification_failed",
-            Self::BudgetExhausted => "budget_exhausted",
         }
     }
 
@@ -362,7 +360,6 @@ impl RunStatus {
             Self::Failed => 1,
             Self::VerificationFailed => 2,
             Self::ApprovalRequired => 3,
-            Self::BudgetExhausted => 4,
             Self::Cancelled => 130,
         }
     }
@@ -1209,6 +1206,30 @@ impl EventFactory {
         self.make(EventType::SessionCompleted, payload)
     }
 
+    /// Terminal-complete session event carrying the typed operation terminal.
+    /// The status string is a projection of the terminal (never an invented
+    /// fact), and the typed terminal object rides along for adapters.
+    pub fn session_completed_terminal(
+        &mut self,
+        terminal: &crate::budget::OperationTerminal,
+        session_id: Option<&str>,
+    ) -> EventDraft {
+        let status = match terminal {
+            crate::budget::OperationTerminal::Completed { .. } => "success",
+            crate::budget::OperationTerminal::Stopped { .. } => "budget_exhausted",
+            crate::budget::OperationTerminal::Failed { .. } => "failed",
+            crate::budget::OperationTerminal::Cancelled { .. } => "cancelled",
+        };
+        let mut payload = json!({
+            "status": status,
+            "terminal": terminal,
+        });
+        if let Some(session_id) = session_id {
+            payload["session_id"] = json!(session_id);
+        }
+        self.make(EventType::SessionCompleted, payload)
+    }
+
     fn make(&mut self, event_type: EventType, payload: Value) -> EventDraft {
         EventDraft {
             run_id: self.run_id.clone(),
@@ -1293,8 +1314,18 @@ mod tests {
         assert_eq!(RunStatus::Failed.exit_code(), 1);
         assert_eq!(RunStatus::VerificationFailed.exit_code(), 2);
         assert_eq!(RunStatus::ApprovalRequired.exit_code(), 3);
-        assert_eq!(RunStatus::BudgetExhausted.exit_code(), 4);
         assert_eq!(RunStatus::Cancelled.exit_code(), 130);
+        // Budget stops carry exit code 4 through the typed terminal.
+        assert_eq!(
+            crate::budget::OperationTerminal::Stopped {
+                reason: crate::budget::StopReason::TurnBudget { max_turns: 3 },
+                usage: crate::budget::BudgetUsage::default(),
+                checkpoint_id: String::new(),
+                resumable: false,
+            }
+            .exit_code(),
+            4
+        );
     }
 
     #[test]
@@ -1368,8 +1399,8 @@ mod tests {
     fn session_completed_payload_carries_durable_session_id_when_present() {
         let mut f = EventFactory::new("run-1".to_string());
 
-        let with_session = f.session_completed(RunStatus::BudgetExhausted, Some("session-9"));
-        assert_eq!(with_session.payload["status"], "budget_exhausted");
+        let with_session = f.session_completed(RunStatus::Failed, Some("session-9"));
+        assert_eq!(with_session.payload["status"], "failed");
         assert_eq!(with_session.payload["session_id"], "session-9");
 
         let without_session = f.session_completed(RunStatus::Success, None);

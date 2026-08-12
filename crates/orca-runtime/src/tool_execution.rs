@@ -40,8 +40,6 @@ use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow_execution::BackgroundWorkflowRun;
 
-const DEFAULT_TOOL_MAX_TURNS: u32 = 128;
-
 #[derive(Debug)]
 struct RuntimeSemanticCommitFailure {
     message: String,
@@ -393,7 +391,7 @@ pub(crate) fn execute_tool_with_approval<W: io::Write>(
     subagent_child_executor: ChildAgentExecutor<io::Sink>,
     workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
 ) -> io::Result<ToolExecutionCompletion> {
-    let mut actor = ToolExecutionActor::new(events.run_id().to_string(), DEFAULT_TOOL_MAX_TURNS);
+    let mut actor = ToolExecutionActor::new(events.run_id().to_string());
     actor.execute_with_event_error(
         config,
         events,
@@ -406,9 +404,9 @@ pub(crate) fn execute_tool_with_approval<W: io::Write>(
 }
 
 impl ToolExecutionActor {
-    pub(crate) fn new(run_id: impl Into<String>, max_turns: u32) -> Self {
+    pub(crate) fn new(run_id: impl Into<String>) -> Self {
         Self {
-            runtime: RuntimeToolActorContext::new(run_id, max_turns),
+            runtime: RuntimeToolActorContext::new(run_id),
         }
     }
 
@@ -1359,7 +1357,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules,
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: Default::default(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
@@ -1445,7 +1443,7 @@ mod tests {
             raw_arguments: None,
         };
         let hooks = HookRunner::default();
-        let mut actor = ToolExecutionActor::new("tool-terminal-status", 1);
+        let mut actor = ToolExecutionActor::new("tool-terminal-status");
         let mut events = EventFactory::new("tool-terminal-status".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
 
@@ -1512,7 +1510,7 @@ mod tests {
             crate::tool_invocation::prepare_tool_invocation(&request, 0, &mcp_registry, &config);
         let cancel = orca_core::cancel::CancelToken::new();
         cancel.cancel();
-        let mut actor = ToolExecutionActor::new("cancelled-pre-tool-hook", 1);
+        let mut actor = ToolExecutionActor::new("cancelled-pre-tool-hook");
         let mut events = EventFactory::new("cancelled-pre-tool-hook".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
 
@@ -1566,7 +1564,7 @@ mod tests {
         let policy = policy_for_tool_execution(&config);
         let mut overlay = TurnPermissionOverlay::default();
         overlay.set_preapproved_tool_call_id(Some("shell-1".to_string()));
-        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
         let cancel = orca_core::cancel::CancelToken::new();
 
         let execution = actor.handle_approval(ToolApprovalGateContext {
@@ -1614,7 +1612,7 @@ mod tests {
         let mut permission_overlay = TurnPermissionOverlay::default();
         let mut events = EventFactory::new("denied-approval-event-error".to_string());
         let mut sink = EventSink::new(FailSecondFlush::default(), OutputFormat::Text);
-        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
 
         let completion = actor
             .execute_with_event_error(
@@ -1678,7 +1676,7 @@ mod tests {
         let mut permission_overlay = TurnPermissionOverlay::default();
         let mut events = EventFactory::new("allowed-approval-event-error".to_string());
         let mut sink = EventSink::new(FailFirstFlush, OutputFormat::Text);
-        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
 
         let completion = actor
             .execute_with_event_error(
@@ -1785,7 +1783,7 @@ mod tests {
                 RuntimeExtensionStores::new(&thread_store, &turn_store),
             );
 
-        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
         let (status, result) = actor
             .execute(
                 &config,
@@ -1859,7 +1857,7 @@ mod tests {
             .with_permission_overlay(&mut permission_overlay);
         let mut events = EventFactory::new("hook-mutation-authority".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
-        let mut actor = ToolExecutionActor::new(events.run_id().to_string(), 128);
+        let mut actor = ToolExecutionActor::new(events.run_id().to_string());
 
         let (status, result) = actor
             .execute(
@@ -1902,7 +1900,7 @@ mod tests {
         }
 
         let config = config_with_permission_rules(PermissionRules::default());
-        let mut actor = ToolExecutionActor::new("tool-user-input-run", 128);
+        let mut actor = ToolExecutionActor::new("tool-user-input-run");
         let mut events = EventFactory::new("tool-user-input-run".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
@@ -1980,7 +1978,7 @@ mod tests {
         }
 
         let config = config_with_permission_rules(PermissionRules::default());
-        let mut actor = ToolExecutionActor::new("tool-user-input-error", 128);
+        let mut actor = ToolExecutionActor::new("tool-user-input-error");
         let mut events = EventFactory::new("tool-user-input-error".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let cwd = std::env::current_dir().expect("cwd");

@@ -28,8 +28,6 @@ use crate::lifecycle::{
     RuntimeUserInputHandler, RuntimeUserInputRequest,
 };
 
-pub(crate) const DEFAULT_MAX_TURNS: u32 = 128;
-
 pub(crate) fn run_agent_loop(
     config: &RunConfig,
     loop_context: AgentLoopContext<'_>,
@@ -59,7 +57,8 @@ pub(crate) fn run_agent_loop(
         workflow_ipc,
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
-    let max_turns = DEFAULT_MAX_TURNS;
+    // One BudgetController per operation owns all limits for this loop.
+    let mut budget = crate::budget_controller::BudgetController::new(config.budget.to_spec());
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
         subagent_depth,
@@ -84,19 +83,20 @@ pub(crate) fn run_agent_loop(
 
     let mut legacy_lifecycle = RuntimeSessionLifecycle::new(events.run_id().to_string());
     let lifecycle = lifecycle.unwrap_or(&mut legacy_lifecycle);
-    let mut actor = RuntimeTaskActor::new(lifecycle, max_turns);
+    let mut actor = RuntimeTaskActor::new(lifecycle);
     let mut turn_loop_step = RuntimeTurnLoopStep::new();
 
     run_agent_turn_loop(
         &mut turn_loop_step,
         RuntimeAgentTurnLoopInput {
             actor: &mut actor,
+            budget: &mut budget,
             provider_context: RuntimeTurnProviderContext::new(
                 config.provider,
                 &ctx_config,
                 &provider_config,
                 &config.model,
-                config.max_budget_usd,
+                config.budget.max_cost_usd_micros,
             ),
             request: RuntimeTurnRequestContext::new(turn_context),
             deps: turn_deps,

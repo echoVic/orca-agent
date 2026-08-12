@@ -37,6 +37,9 @@ pub struct ChildAgentLoopContext<'a> {
     pub memory: &'a MemoryBlock,
     pub hooks: &'a HookRunner,
     pub child_cost_tracker: &'a mut CostTracker,
+    /// Parent budget lease bounding this child's admission; `None` (tests and
+    /// legacy callers) falls back to an unlimited lease derived from config.
+    pub lease: Option<&'a mut crate::budget_controller::BudgetLease>,
 }
 
 pub fn run_child_agent_loop_with_tool_executor<F>(
@@ -54,8 +57,16 @@ where
         context.instructions,
         context.memory,
     );
+    let mut fallback_lease =
+        crate::budget_controller::BudgetController::new(config.budget.to_spec())
+            .child_lease(config.budget.to_spec())
+            .expect("child lease derives from the child config budget");
+    let mut lease = match context.lease {
+        Some(lease) => lease,
+        None => &mut fallback_lease,
+    };
     loop {
-        match advance_child_agent_turn(&mut setup) {
+        match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {}
             ChildAgentTurnBudget::Stop(result) => return Ok(result),
         }
@@ -163,8 +174,16 @@ where
         context.instructions,
         context.memory,
     );
+    let mut fallback_lease =
+        crate::budget_controller::BudgetController::new(config.budget.to_spec())
+            .child_lease(config.budget.to_spec())
+            .expect("child lease derives from the child config budget");
+    let mut lease = match context.lease {
+        Some(lease) => lease,
+        None => &mut fallback_lease,
+    };
     loop {
-        match advance_child_agent_turn(&mut setup) {
+        match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {
                 if let Some(observer) = observer {
                     observer.emit(ChildAgentActivity::TurnStarted { turn: setup.turn });
@@ -330,14 +349,16 @@ pub(crate) fn child_agent_budget_exhausted_result(
     config: &RunConfig,
     child_cost_tracker: &CostTracker,
 ) -> Option<ChildAgentResult> {
-    let max_budget = config.max_budget_usd?;
-    let totals = child_cost_tracker.totals();
-    (totals.estimated_cost_usd > max_budget).then(|| ChildAgentResult {
-        status: RunStatus::BudgetExhausted,
+    let max_cost_usd_micros = config.budget.max_cost_usd_micros?;
+    let spent_usd_micros =
+        crate::cost::usd_to_micros(child_cost_tracker.totals().estimated_cost_usd);
+    (spent_usd_micros > max_cost_usd_micros).then(|| ChildAgentResult {
+        status: RunStatus::Failed,
         final_message: None,
         error: Some(format!(
-            "budget exhausted: estimated cost ${:.6} exceeded limit ${:.6}",
-            totals.estimated_cost_usd, max_budget
+            "budget stopped: estimated cost ${:.6} exceeded limit ${:.6}",
+            spent_usd_micros as f64 / 1_000_000.0,
+            max_cost_usd_micros as f64 / 1_000_000.0
         )),
     })
 }
@@ -389,6 +410,7 @@ where
                 memory,
                 hooks,
                 child_cost_tracker,
+                lease: None,
             },
             |tool_context, child_cancel, tool_request| {
                 execute_tool(config, request, tool_context, child_cancel, tool_request)
@@ -426,6 +448,7 @@ where
                 memory,
                 hooks,
                 child_cost_tracker,
+                lease: None,
             },
             observer,
             |tool_context, child_cancel, tool_request| {

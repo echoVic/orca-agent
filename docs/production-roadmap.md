@@ -186,9 +186,12 @@ parameterized path rules with fail-closed enforcement.
 
 Earlier v0.2.52 separates Goal continuation admission from
 cross-turn progress detection. A turn now ends as advanced, resumably
-interrupted, or blocked. Reaching the inner-turn limit preserves a typed
-`MaxInnerTurns` reason and continues with a structured handoff; cost-budget
-exhaustion, cancellation, approval, and verification failure still pause.
+interrupted, or blocked. (Historical note: this release used
+`TurnEndReason::MaxInnerTurns`; the execution-budget redesign superseded it
+with typed `OperationTerminal::Stopped` terminals.) Reaching the inner-turn
+limit preserved that historical `MaxInnerTurns` reason and continued with a
+structured handoff; cost-budget exhaustion, cancellation, approval, and
+verification failure still paused.
 Soft-landing reminders ask the model to finish its current atomic step and
 update the task plan before the limit is reached.
 
@@ -196,7 +199,8 @@ The durable no-progress watchdog remains a separate safety boundary. It counts
 completed mutating tools and structured plan changes as substantive progress,
 keeps productive-turn barriers across SQLite recovery, pauses after three
 repeated model-fixable gaps, and independently caps eight consecutive
-`MaxInnerTurns` interruptions. The continuation envelope carries the objective,
+budget-stop interruptions (the historical name was `MaxInnerTurns`).
+The continuation envelope carries the objective,
 budget state, open gap, task plan, and a bounded assistant checkpoint so a new
 session can resume without repeating repository exploration.
 
@@ -766,9 +770,10 @@ failed attempt while continuing to emit recovered content and tool progress.
 Reported usage from both attempts is combined. Foreground and detached TUI turns
 no longer lose usage reported by the failed recovery attempt, while controller
 paths retain their runtime-owned accounting. Foreground TUI provider requests
-use serialized admission while `max_budget_usd` is active, and later turns fail
-preflight before their prompt enters conversation history once completed usage
-is over budget. Synchronous child-agent usage is emitted and persisted
+use serialized admission while the historical `max_budget_usd` config was
+active (superseded by the `[budget]` execution-budget redesign), and later
+turns failed preflight before their prompt entered conversation history once
+completed usage was over budget. Synchronous child-agent usage is emitted and persisted
 immediately; budget mode disables parallel batches and rejects asynchronous
 children so their usage is reconciled before the parent turn proceeds. Each
 synchronous child receives only the aggregate budget remaining in its parent,
@@ -1176,6 +1181,7 @@ working baseline used to prioritize the next patch releases.
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
 | Memory | Manual `/remember` plus optional project extraction | Codex memories extension | Partial |
+| Execution budget | One `BudgetController` per operation owns independently optional `[budget]` dimensions (`max_turns`, `max_tool_calls`, `max_cost_usd_micros`, `max_wall_time_ms`); unlimited by default with no implicit 128-turn ceiling. A typed `OperationTerminal` (Completed/Stopped/Failed/Cancelled) is the one terminal fact every surface consumes; budget stops settle the current tool, create a checkpoint, and exit 4. Child agents run under parent `BudgetLease`s that report consumed usage; the execution journal orders `tool.completed` → `checkpoint.created` → `operation.terminal` durably and restores unmatched tool starts as indeterminate. Goals own a cumulative token budget; exhausted Goal budgets disable automatic continuation | Codex/Grok explicit budgets, Claude Code checkpoints | Implemented |
 | Persistent goals | Runtime-owned `GoalActor` and composite `GoalRun` with SQLite state, run/turn ledgers, verified terminal intents, recovery, cancellation, usage, semantic continuation admission, cumulative timing, and goal-scoped `get_goal`, `create_goal`, and narrow `update_goal`. There is no fixed turn ceiling; continuation count is observability data only | Codex goal extension plus explicit call context patterns in Claude Code and Grok Build | Implemented |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
 | Runtime lifecycle | Headless, server-mode, and TUI agent runs seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` owns long-lived interactive state, and focused server processors/managers handle queries, turn control, shell and command execution, permission/user-input responses, and submit operations. Workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`. v0.2.24 closes accepted tool calls with truthful terminal metadata and gives external tools, MCP/workflow children, async subagents, verifier commands, server turns, ordinary shells, and mention-search reapers explicit cleanup ownership; recovered workers require identity checks, and internal worker credentials no longer use argv or persisted workflow records | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; v0.2.24 published, with Windows process-tree parity and deeper TUI loop delegation still open |

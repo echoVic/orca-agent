@@ -57,15 +57,17 @@ pub(crate) fn pending_inner_turn_reminder(
 }
 
 /// Returns a reminder when remaining cost budget crosses configured fractions.
+/// Both values are in USD micros so callers never round-trip through floats.
 pub(crate) fn pending_cost_budget_reminder(
-    max_budget_usd: f64,
-    spent_usd: f64,
+    max_cost_usd_micros: u64,
+    spent_usd_micros: u64,
     delivered_index: u32,
 ) -> Option<SoftLandingReminder> {
-    if max_budget_usd <= 0.0 {
+    if max_cost_usd_micros == 0 {
         return None;
     }
-    let remaining_fraction = ((max_budget_usd - spent_usd) / max_budget_usd).clamp(0.0, 1.0);
+    let remaining_micros = max_cost_usd_micros.saturating_sub(spent_usd_micros);
+    let remaining_fraction = remaining_micros as f64 / max_cost_usd_micros as f64;
     let reminder_index = COST_BUDGET_REMINDER_AT_REMAINING_FRACTION
         .iter()
         .filter(|&&threshold| remaining_fraction <= threshold)
@@ -73,9 +75,6 @@ pub(crate) fn pending_cost_budget_reminder(
     if reminder_index == 0 || reminder_index <= delivered_index {
         return None;
     }
-    // Encode remaining micros so formatters can show a usable dollar figure
-    // without carrying floats on the reminder value itself.
-    let remaining_micros = ((max_budget_usd - spent_usd).max(0.0) * 1_000_000.0).floor() as u64;
     Some(SoftLandingReminder {
         remaining: remaining_micros,
         reminder_index,
@@ -124,7 +123,7 @@ progress with a clear next action.",
             let remaining_usd = reminder.remaining as f64 / 1_000_000.0;
             format!(
                 "[Budget soft landing]\n\
-Cost budget is low: about ${remaining_usd:.4} remains on the configured max_budget_usd ceiling.\n\
+Cost budget is low: about ${remaining_usd:.4} remains on the configured cost ceiling.\n\
 Prioritize finishing or verifying the highest-value requirements. Do not mark the goal complete \
 merely because money is running out. Prefer targeted evidence over broad exploration, update the \
 task plan, and record key findings before the hard wall."
@@ -170,9 +169,9 @@ mod tests {
 
     #[test]
     fn cost_and_goal_token_reminders_use_fraction_thresholds() {
-        let cost = pending_cost_budget_reminder(1.0, 0.80, 0).expect("25% remaining cost");
+        let cost = pending_cost_budget_reminder(1_000_000, 800_000, 0).expect("25% remaining cost");
         assert_eq!(cost.reminder_index, 1);
-        assert!(pending_cost_budget_reminder(1.0, 0.80, 1).is_none());
+        assert!(pending_cost_budget_reminder(1_000_000, 800_000, 1).is_none());
 
         let tokens = pending_goal_token_reminder(10_000, 9_200, 0).expect("8% remaining tokens");
         assert_eq!(tokens.reminder_index, 2); // crossed 25% and 10%

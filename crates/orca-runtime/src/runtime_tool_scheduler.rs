@@ -88,6 +88,7 @@ mod tests {
             mcp_servers: Vec::new(),
             permission_rules: PermissionRules::default(),
             additional_working_directories: Vec::new(),
+            budget: Default::default(),
             hooks: Vec::new(),
             workflows: WorkflowConfig::default(),
             subagents: SubagentConfig {
@@ -100,7 +101,6 @@ mod tests {
                 ..ToolConfig::default()
             },
             external_tools: Vec::new(),
-            max_budget_usd: None,
             vim_mode: false,
             vim_insert_escape: None,
             update_check: false,

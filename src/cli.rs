@@ -106,8 +106,25 @@ struct ExecArgs {
     #[arg(long, global = true)]
     verifier: Option<String>,
 
-    /// Maximum estimated USD budget for this run.
+    /// Maximum number of model turns for this run (unlimited by default).
     #[arg(long, global = true)]
+    max_turns: Option<u32>,
+
+    /// Maximum number of tool calls for this run (unlimited by default).
+    #[arg(long, global = true)]
+    max_tool_calls: Option<u32>,
+
+    /// Maximum estimated cost in USD for this run (unlimited by default).
+    #[arg(long, global = true)]
+    max_cost_usd: Option<f64>,
+
+    /// Maximum wall-clock time in seconds for this run (unlimited by default).
+    #[arg(long, global = true)]
+    max_wall_time_secs: Option<u64>,
+
+    /// Maximum estimated USD budget for this run (legacy alias of
+    /// --max-cost-usd).
+    #[arg(long, global = true, hide = true)]
     max_budget: Option<f64>,
 
     /// Resume a saved conversation by ID, prefix, or 'latest'.
@@ -468,6 +485,10 @@ impl ExecArgs {
                     base_url: self.base_url,
                     verifier: self.verifier,
                     max_budget: self.max_budget,
+                    max_turns: self.max_turns,
+                    max_tool_calls: self.max_tool_calls,
+                    max_cost_usd: self.max_cost_usd,
+                    max_wall_time_secs: self.max_wall_time_secs,
                     resume: selector,
                     resume_at: resume_args.resume_at,
                     fork: None,
@@ -495,6 +516,10 @@ impl ExecArgs {
             base_url: self.base_url,
             verifier: self.verifier,
             max_budget: self.max_budget,
+            max_turns: self.max_turns,
+            max_tool_calls: self.max_tool_calls,
+            max_cost_usd: self.max_cost_usd,
+            max_wall_time_secs: self.max_wall_time_secs,
             resume,
             resume_at,
             fork: self.fork,
@@ -716,6 +741,26 @@ mod tests {
         let request = args.into_request().expect("request");
         assert_eq!(request.max_budget, Some(1.5));
         assert_eq!(request.prompt, ["prompt"]);
+    }
+
+    #[test]
+    fn exec_forwards_explicit_budget_dimensions() {
+        let args = parse_exec(&[
+            "--max-turns",
+            "8",
+            "--max-tool-calls",
+            "64",
+            "--max-cost-usd",
+            "1.25",
+            "--max-wall-time-secs",
+            "3600",
+            "prompt",
+        ]);
+        let request = args.into_request().expect("request");
+        assert_eq!(request.max_turns, Some(8));
+        assert_eq!(request.max_tool_calls, Some(64));
+        assert_eq!(request.max_cost_usd, Some(1.25));
+        assert_eq!(request.max_wall_time_secs, Some(3600));
     }
 
     #[test]

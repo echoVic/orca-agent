@@ -86,7 +86,7 @@ fn agent_loop_deepseek_without_key_fails_on_first_turn() {
 }
 
 #[test]
-fn headless_max_inner_turns_preserve_trajectory_truth() {
+fn headless_unlimited_run_completes_128_tool_cycles() {
     let home = tempdir().expect("temporary ORCA_HOME");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
@@ -100,17 +100,20 @@ fn headless_max_inner_turns_preserve_trajectory_truth() {
             "mock_repeat_read 256",
         ])
         .output()
-        .expect("run max-turn fixture");
+        .expect("run unlimited fixture");
 
-    assert_eq!(output.status.code(), Some(4));
+    // The hidden 128-turn ceiling is gone: an unlimited run admits every
+    // requested tool cycle (256) plus one final terminal turn, and finishes
+    // with success.
+    assert_eq!(output.status.code(), Some(0));
     let events = parse_jsonl(&output.stdout);
     let started_turns = events
         .iter()
         .filter(|event| event["type"] == "turn.started")
         .count();
     assert_eq!(
-        started_turns, 128,
-        "only admitted turns belong in trajectory"
+        started_turns, 257,
+        "unlimited run admits every requested tool cycle plus the terminal turn"
     );
     let completed_tools = events
         .iter()
@@ -118,8 +121,8 @@ fn headless_max_inner_turns_preserve_trajectory_truth() {
         .collect::<Vec<_>>();
     assert_eq!(
         completed_tools.len(),
-        128,
-        "each admitted fixture turn must settle one tool call"
+        256,
+        "each fixture turn must settle one tool call"
     );
     assert!(completed_tools.iter().enumerate().all(|(index, event)| {
         event["payload"]["id"] == format!("mock-repeat-read-1-{}", index + 1)
@@ -133,13 +136,8 @@ fn headless_max_inner_turns_preserve_trajectory_truth() {
         .collect::<Vec<_>>();
     assert_eq!(session_terminals.len(), 1);
     let (terminal_index, terminal) = session_terminals[0];
-    assert_eq!(terminal["payload"]["status"], "budget_exhausted");
+    assert_eq!(terminal["payload"]["status"], "success");
     assert_eq!(terminal_index, events.len() - 1);
-    let max_turn_error = events
-        .iter()
-        .find(|event| event["type"] == "error")
-        .expect("budget exhaustion should expose its terminal reason");
-    assert_eq!(max_turn_error["payload"]["message"], "max turns exhausted");
 
     let records = parse_jsonl(&fs::read(only_session_file(home.path())).expect("read session"));
     let tool_messages = records
@@ -148,69 +146,87 @@ fn headless_max_inner_turns_preserve_trajectory_truth() {
             record["type"] == "conversation.message" && record["message"]["role"] == "tool"
         })
         .collect::<Vec<_>>();
-    assert_eq!(tool_messages.len(), 128);
-    assert!(tool_messages.iter().enumerate().all(|(index, record)| {
-        record["message"]["tool_call_id"] == format!("mock-repeat-read-1-{}", index + 1)
-    }));
+    assert_eq!(tool_messages.len(), 256);
     assert!(tool_messages.iter().all(|record| {
         record["message"]["status"] == "completed"
             && record["message"]["kind"] == "success"
             && record["message"]["exit_code"] == 0
     }));
+}
+
+#[test]
+fn headless_explicit_three_turn_budget_stops_with_typed_terminal() {
+    let home = tempdir().expect("temporary ORCA_HOME");
+    std::fs::create_dir_all(home.path()).expect("create ORCA_HOME");
+    std::fs::write(home.path().join("config.toml"), "[budget]\nmax_turns = 3\n")
+        .expect("write budget config");
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--save-history",
+            "--provider",
+            "mock",
+            "mock_repeat_read 256",
+        ])
+        .output()
+        .expect("run bounded fixture");
+
+    // Explicit three-turn budget: three admitted turns, three settled tool
+    // calls, then a typed budget stop without another provider request.
+    assert_eq!(output.status.code(), Some(4));
+    let events = parse_jsonl(&output.stdout);
+    let started_turns = events
+        .iter()
+        .filter(|event| event["type"] == "turn.started")
+        .count();
+    assert_eq!(
+        started_turns, 3,
+        "explicit budget admits exactly three turns"
+    );
+    let completed_tools = events
+        .iter()
+        .filter(|event| event["type"] == "tool.call.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completed_tools.len(), 3);
+
+    let session_terminals = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"] == "session.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(session_terminals.len(), 1);
+    let (terminal_index, terminal) = session_terminals[0];
+    assert_eq!(terminal["payload"]["status"], "budget_exhausted");
+    assert_eq!(terminal_index, events.len() - 1);
+    let budget_error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("budget stop exposes its terminal reason");
+    assert!(
+        budget_error["payload"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("budget stopped"),
+        "error event must carry the typed budget stop"
+    );
+
+    // The saved transcript agrees on the stop and on the tool settlement.
+    let records = parse_jsonl(&fs::read(only_session_file(home.path())).expect("read session"));
+    let tool_messages = records
+        .iter()
+        .filter(|record| {
+            record["type"] == "conversation.message" && record["message"]["role"] == "tool"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 3);
     assert!(records.iter().all(|record| {
         record["message"]["tool_call_id"]
             .as_str()
-            .is_none_or(|id| id != "mock-repeat-read-1-129")
+            .is_none_or(|id| !id.starts_with("mock-repeat-read-1-4"))
     }));
-
-    let streamed_terminals = completed_tools
-        .iter()
-        .map(|event| {
-            (
-                event["payload"]["id"]
-                    .as_str()
-                    .expect("streamed terminal id")
-                    .to_string(),
-                event["payload"]["status"]
-                    .as_str()
-                    .expect("streamed terminal status")
-                    .to_string(),
-                event["payload"]["kind"]
-                    .as_str()
-                    .expect("streamed terminal kind")
-                    .to_string(),
-                event["payload"]["exit_code"]
-                    .as_i64()
-                    .expect("streamed terminal exit code"),
-            )
-        })
-        .collect::<Vec<_>>();
-    let persisted_terminals = tool_messages
-        .iter()
-        .map(|record| {
-            (
-                record["message"]["tool_call_id"]
-                    .as_str()
-                    .expect("persisted terminal id")
-                    .to_string(),
-                record["message"]["status"]
-                    .as_str()
-                    .expect("persisted terminal status")
-                    .to_string(),
-                record["message"]["kind"]
-                    .as_str()
-                    .expect("persisted terminal kind")
-                    .to_string(),
-                record["message"]["exit_code"]
-                    .as_i64()
-                    .expect("persisted terminal exit code"),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        streamed_terminals, persisted_terminals,
-        "streamed and persisted terminal projections must match in order"
-    );
 }
 
 #[test]

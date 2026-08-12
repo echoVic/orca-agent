@@ -338,12 +338,17 @@ Response mapping:
 
 ### Agent Loop
 
-The runtime executes a multi-turn agent loop (max 128 turns):
+The runtime executes a multi-turn agent loop with no implicit turn ceiling.
+Explicit `[budget]` dimensions (`max_turns`, `max_tool_calls`,
+`max_cost_usd_micros`, `max_wall_time_ms`) are independently optional:
 
 1. Send conversation to DeepSeek (with system prompt + tool schemas)
 2. If response contains tool calls → execute each tool → add results to conversation → next turn
 3. If response is a final message → return success
-4. If budget exhausted → return `budget_exhausted` (exit code 4)
+4. If an explicit budget dimension is exhausted → the operation stops with a
+   typed `OperationTerminal::Stopped` (exit code 4) after settling the current
+   tool and creating a checkpoint; the `session.completed` event carries the
+   typed terminal object.
 
 Subagents run the same loop as a child conversation. Synchronous, asynchronous,
 and workflow child agents apply one immutable delegation snapshot for the parent

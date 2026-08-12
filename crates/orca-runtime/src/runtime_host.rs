@@ -337,6 +337,8 @@ pub enum ThreadOperationOutcome {
         status: RunStatus,
         end_reason: crate::lifecycle::TurnEndReason,
         background_workflows: RuntimeBackgroundWorkflows,
+        /// Typed operation terminal; the authoritative fact when present.
+        terminal: Option<orca_core::budget::OperationTerminal>,
     },
     ProviderSuspended {
         suspension: Box<RuntimeProviderSuspension>,
@@ -350,6 +352,7 @@ impl From<RunStatus> for ThreadOperationOutcome {
             status,
             end_reason: crate::lifecycle::TurnEndReason::Unclassified,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+            terminal: None,
         }
     }
 }
@@ -464,16 +467,24 @@ enum GoalTurnDisposition {
     },
 }
 
+/// Classifies an outer turn for goal continuation from the typed terminal
+/// (when present) plus the legacy status/reason projection.
 fn goal_turn_disposition(
     status: RunStatus,
     reason: crate::lifecycle::TurnEndReason,
+    terminal: Option<&orca_core::budget::OperationTerminal>,
 ) -> GoalTurnDisposition {
-    match (status, reason) {
-        (RunStatus::Success, _) => GoalTurnDisposition::Advanced,
-        (RunStatus::BudgetExhausted, crate::lifecycle::TurnEndReason::MaxInnerTurns) => {
-            GoalTurnDisposition::Interrupted { reason }
-        }
-        _ => GoalTurnDisposition::Blocked { status, reason },
+    match terminal {
+        Some(orca_core::budget::OperationTerminal::Stopped {
+            resumable: true, ..
+        }) => GoalTurnDisposition::Interrupted { reason },
+        Some(orca_core::budget::OperationTerminal::Stopped {
+            resumable: false, ..
+        }) => GoalTurnDisposition::Blocked { status, reason },
+        _ => match status {
+            RunStatus::Success => GoalTurnDisposition::Advanced,
+            _ => GoalTurnDisposition::Blocked { status, reason },
+        },
     }
 }
 
@@ -1902,6 +1913,7 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                     crate::lifecycle::TurnEndReason::Unclassified
                 },
                 background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+                terminal: None,
             });
         }
         if request.operation_kind() != &HostedOperationKind::Turn
@@ -1929,10 +1941,12 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                     status,
                     end_reason,
                     background_workflows,
+                    terminal,
                 } => ThreadOperationOutcome::Completed {
                     status,
                     end_reason,
                     background_workflows,
+                    terminal,
                 },
                 crate::controller::ThreadTurnOutcome::ProviderSuspended {
                     suspension,
@@ -2590,6 +2604,8 @@ fn surface_history_messages(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationOutcome {
     Completed(RunStatus),
+    /// Typed budget/safety stop; the exit code comes from the terminal.
+    Stopped(orca_core::budget::OperationTerminal),
     Backgrounded {
         task_id: String,
     },
@@ -2602,30 +2618,40 @@ pub enum OperationOutcome {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CompletedTurnOutcome {
     status: RunStatus,
     end_reason: crate::lifecycle::TurnEndReason,
+    /// Typed operation terminal; the authoritative fact when present (budget
+    /// stops carry `OperationTerminal::Stopped`).
+    terminal: Option<orca_core::budget::OperationTerminal>,
 }
 
 impl CompletedTurnOutcome {
-    fn goal_status(self) -> orca_core::goal_runtime::GoalTurnStatus {
+    fn goal_status(&self) -> orca_core::goal_runtime::GoalTurnStatus {
+        // The typed terminal is the fact: a budget stop maps to
+        // GoalTurnStatus::BudgetExhausted regardless of the projected status.
+        if matches!(
+            self.terminal,
+            Some(orca_core::budget::OperationTerminal::Stopped { .. })
+        ) {
+            return orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted;
+        }
         match self.status {
             RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
             RunStatus::Cancelled => orca_core::goal_runtime::GoalTurnStatus::Cancelled,
             RunStatus::ApprovalRequired => {
                 orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
             }
-            RunStatus::BudgetExhausted => orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted,
             RunStatus::Failed | RunStatus::VerificationFailed => {
                 orca_core::goal_runtime::GoalTurnStatus::Failed
             }
         }
     }
 
-    fn permits_goal_continuation(self) -> bool {
+    fn permits_goal_continuation(&self) -> bool {
         matches!(
-            goal_turn_disposition(self.status, self.end_reason),
+            goal_turn_disposition(self.status, self.end_reason, self.terminal.as_ref()),
             GoalTurnDisposition::Advanced | GoalTurnDisposition::Interrupted { .. }
         )
     }
@@ -11522,9 +11548,7 @@ fn durable_typed_provider_outcome(
             RunStatus::Success => TaskStatus::Completed,
             RunStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
             RunStatus::Cancelled => TaskStatus::Cancelled,
-            RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::BudgetExhausted => {
-                TaskStatus::Failed
-            }
+            RunStatus::Failed | RunStatus::VerificationFailed => TaskStatus::Failed,
         },
         response: outcome.response.clone(),
         error: outcome.error.clone(),
@@ -12613,10 +12637,14 @@ fn prepare_goal_surface_continuation_worker(
             }
         })?;
     let last_gap_fingerprint = decided.progress.gap_fingerprint.clone();
-    let trigger = if completed_turn.status == RunStatus::BudgetExhausted
-        && completed_turn.end_reason == crate::lifecycle::TurnEndReason::MaxInnerTurns
-    {
-        GoalContinuationTrigger::MaxInnerTurns
+    let trigger = if matches!(
+        completed_turn.terminal,
+        Some(orca_core::budget::OperationTerminal::Stopped {
+            resumable: true,
+            ..
+        })
+    ) {
+        GoalContinuationTrigger::BudgetStop
     } else if matches!(reason, surface::GoalContinuationAdmitReason::GapFeedback) {
         GoalContinuationTrigger::GapFeedback
     } else {
@@ -12629,8 +12657,17 @@ fn prepare_goal_surface_continuation_worker(
         tokens_used: record.usage.charged_tokens(),
         token_budget: record.token_budget,
         last_gap_fingerprint,
-        last_outer_status: Some(completed_turn.status.as_str()),
-        last_end_reason: Some(completed_turn.end_reason.as_str()),
+        // The typed terminal owns budget facts: a budget stop reports the
+        // surface status string derived from the terminal, never a plain
+        // status projection.
+        last_outer_status: Some(match &completed_turn.terminal {
+            Some(orca_core::budget::OperationTerminal::Stopped { .. }) => "budget_exhausted",
+            _ => completed_turn.status.as_str(),
+        }),
+        last_end_reason: Some(match &completed_turn.terminal {
+            Some(orca_core::budget::OperationTerminal::Stopped { .. }) => "budget_stop",
+            _ => completed_turn.end_reason.as_str(),
+        }),
         plan_snapshot,
         previous_checkpoint,
     });
@@ -12744,7 +12781,7 @@ fn prepare_goal_surface_continuation_worker(
         .map(|_| uuid::Uuid::now_v7().to_string());
     let decision_commit_id = uuid::Uuid::now_v7().to_string();
     let (finished_goal_status, predecessor_completion_status, predecessor_terminal) =
-        match completed_turn {
+        match &completed_turn {
             CompletedTurnOutcome {
                 status: RunStatus::Success,
                 ..
@@ -12756,14 +12793,44 @@ fn prepare_goal_surface_continuation_worker(
                 },
             ),
             CompletedTurnOutcome {
-                status: RunStatus::BudgetExhausted,
-                end_reason: crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                status: RunStatus::Failed,
+                terminal:
+                    Some(orca_core::budget::OperationTerminal::Stopped {
+                        reason: stop_reason,
+                        usage: stop_usage,
+                        ..
+                    }),
+                ..
             } => {
-                let limit = u64::from(crate::agent_loop::DEFAULT_MAX_TURNS);
-                let budget = surface::OperationBudget::TurnRequests {
-                    scope: surface::TurnRequestBudgetScope::AgentLoop,
-                    limit,
-                    observed: limit,
+                // No fixed ceiling exists; the observed/limit pair reflects the
+                // typed stop reason carried by the operation terminal.
+                let budget = match stop_reason {
+                    orca_core::budget::StopReason::TurnBudget { max_turns } => {
+                        surface::OperationBudget::TurnRequests {
+                            scope: surface::TurnRequestBudgetScope::AgentLoop,
+                            limit: u64::from(*max_turns),
+                            observed: u64::from(stop_usage.turns),
+                        }
+                    }
+                    orca_core::budget::StopReason::ToolCallBudget { max_tool_calls } => {
+                        surface::OperationBudget::TurnRequests {
+                            scope: surface::TurnRequestBudgetScope::AgentLoop,
+                            limit: u64::from(*max_tool_calls),
+                            observed: u64::from(stop_usage.tool_calls),
+                        }
+                    }
+                    orca_core::budget::StopReason::CostBudget {
+                        max_cost_usd_micros,
+                    } => surface::OperationBudget::MonetaryBudgetUsdMicros {
+                        limit: *max_cost_usd_micros,
+                        observed: stop_usage.cost_usd_micros,
+                    },
+                    orca_core::budget::StopReason::WallTimeBudget { max_wall_time_ms } => {
+                        surface::OperationBudget::ModelTokens {
+                            limit: Some(*max_wall_time_ms),
+                            observed: Some(stop_usage.wall_time_ms),
+                        }
+                    }
                 };
                 (
                     surface::GoalOuterTurnStatus::BudgetExhausted,
@@ -13292,8 +13359,8 @@ fn prepare_legacy_goal_continuation_worker(
                 .recent_gap_fingerprint(&work.session_id)
                 .ok()
                 .flatten();
-            let trigger = if matches!(work.trigger, GoalContinuationTrigger::MaxInnerTurns) {
-                GoalContinuationTrigger::MaxInnerTurns
+            let trigger = if matches!(work.trigger, GoalContinuationTrigger::BudgetStop) {
+                GoalContinuationTrigger::BudgetStop
             } else if last_gap_fingerprint.is_some() {
                 GoalContinuationTrigger::GapFeedback
             } else {
@@ -13303,7 +13370,7 @@ fn prepare_legacy_goal_continuation_worker(
                 GoalContinuationTrigger::GapFeedback => {
                     orca_core::goal_runtime::GoalContinuationReason::GapFeedback
                 }
-                GoalContinuationTrigger::MaxInnerTurns | GoalContinuationTrigger::Progress => {
+                GoalContinuationTrigger::BudgetStop | GoalContinuationTrigger::Progress => {
                     orca_core::goal_runtime::GoalContinuationReason::Progress
                 }
             };
@@ -13393,6 +13460,7 @@ fn settle_lost_goal_turn_worker(
             &turn.session_id,
             orca_core::goal_runtime::GoalTurnStatus::Failed,
             crate::lifecycle::TurnEndReason::Unclassified,
+            None,
             orca_core::goal_runtime::GoalUsage::default(),
             0,
             0,
@@ -27744,7 +27812,7 @@ impl ThreadActor {
                 },
             )
         } else {
-            match (outcome, completed_turn) {
+            match (outcome, &completed_turn) {
                 (
                     OperationOutcome::Completed(RunStatus::Success),
                     Some(CompletedTurnOutcome {
@@ -27793,37 +27861,44 @@ impl ThreadActor {
                     };
                     (surface::GenerationStopReason::Cancelled { cause }, terminal)
                 }
-                (OperationOutcome::Completed(RunStatus::BudgetExhausted), Some(completed))
-                    if completed.status == RunStatus::BudgetExhausted =>
-                {
-                    let budget = match completed.end_reason {
-                        crate::lifecycle::TurnEndReason::MaxInnerTurns => {
-                            let limit = u64::from(crate::agent_loop::DEFAULT_MAX_TURNS);
-                            surface::OperationBudget::TurnRequests {
-                                scope: surface::TurnRequestBudgetScope::AgentLoop,
-                                limit,
-                                observed: limit,
+                (OperationOutcome::Stopped(terminal), Some(_completed)) => {
+                    // The typed terminal owns the budget facts; the surface
+                    // projection derives its budget from the stop reason.
+                    let budget = match terminal {
+                        orca_core::budget::OperationTerminal::Stopped { reason, usage, .. } => {
+                            match reason {
+                                orca_core::budget::StopReason::TurnBudget { max_turns } => {
+                                    surface::OperationBudget::TurnRequests {
+                                        scope: surface::TurnRequestBudgetScope::AgentLoop,
+                                        limit: u64::from(*max_turns),
+                                        observed: u64::from(usage.turns),
+                                    }
+                                }
+                                orca_core::budget::StopReason::ToolCallBudget {
+                                    max_tool_calls,
+                                } => surface::OperationBudget::TurnRequests {
+                                    scope: surface::TurnRequestBudgetScope::AgentLoop,
+                                    limit: u64::from(*max_tool_calls),
+                                    observed: u64::from(usage.tool_calls),
+                                },
+                                orca_core::budget::StopReason::CostBudget {
+                                    max_cost_usd_micros,
+                                } => surface::OperationBudget::MonetaryBudgetUsdMicros {
+                                    limit: *max_cost_usd_micros,
+                                    observed: usage.cost_usd_micros,
+                                },
+                                orca_core::budget::StopReason::WallTimeBudget {
+                                    max_wall_time_ms,
+                                } => surface::OperationBudget::ModelTokens {
+                                    limit: Some(*max_wall_time_ms),
+                                    observed: Some(usage.wall_time_ms),
+                                },
                             }
                         }
-                        crate::lifecycle::TurnEndReason::CostBudgetExhausted => {
-                            let observed = surface_usage.estimated_cost_usd_micros;
-                            let limit = active
-                                .config
-                                .max_budget_usd
-                                .map(|value| {
-                                    (value.max(0.0) * 1_000_000.0).round().min(u64::MAX as f64)
-                                        as u64
-                                })
-                                .unwrap_or(observed);
-                            surface::OperationBudget::MonetaryBudgetUsdMicros { limit, observed }
-                        }
-                        crate::lifecycle::TurnEndReason::Cancelled
-                        | crate::lifecycle::TurnEndReason::Unclassified => {
-                            surface::OperationBudget::ModelTokens {
-                                limit: None,
-                                observed: None,
-                            }
-                        }
+                        _ => surface::OperationBudget::ModelTokens {
+                            limit: None,
+                            observed: None,
+                        },
                     };
                     (
                         surface::GenerationStopReason::Completed {
@@ -28038,7 +28113,7 @@ impl ThreadActor {
                     terminalization: active.surface_terminalization,
                     terminal: terminal.clone(),
                     surface_usage,
-                    completed_turn,
+                    completed_turn: completed_turn.clone(),
                     active_workflow,
                     last_model_response,
                     config: active.config.clone(),
@@ -28049,7 +28124,7 @@ impl ThreadActor {
                 Vec::new(),
                 outcome.clone(),
                 runtime_usage,
-                completed_turn,
+                completed_turn.clone(),
             )?;
             return Ok(None);
         }
@@ -28502,12 +28577,23 @@ impl ThreadActor {
                 GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
                     status,
                     end_reason,
+                    terminal,
                     ..
                 }) => {
                     self.state = Some(result.state);
+                    let outcome = match &terminal {
+                        Some(orca_core::budget::OperationTerminal::Stopped { .. }) => {
+                            OperationOutcome::Stopped(terminal.clone().expect("matched stop"))
+                        }
+                        _ => OperationOutcome::Completed(status),
+                    };
                     (
-                        OperationOutcome::Completed(status),
-                        Some(CompletedTurnOutcome { status, end_reason }),
+                        outcome,
+                        Some(CompletedTurnOutcome {
+                            status,
+                            end_reason,
+                            terminal,
+                        }),
                     )
                 }
                 GenerationTaskOutcome::Executed(ThreadOperationOutcome::ProviderSuspended {
@@ -35038,12 +35124,16 @@ impl ThreadActor {
                         let continuation_turn = match &result.outcome {
                             GenerationTaskOutcome::Executed(
                                 ThreadOperationOutcome::Completed {
-                                    status, end_reason, ..
+                                    status,
+                                    end_reason,
+                                    terminal,
+                                    ..
                                 },
                             ) => {
                                 let completed = CompletedTurnOutcome {
                                     status: *status,
                                     end_reason: *end_reason,
+                                    terminal: terminal.clone(),
                                 };
                                 completed.permits_goal_continuation().then_some(completed)
                             }
@@ -35076,24 +35166,48 @@ impl ThreadActor {
                             match result.outcome {
                                 GenerationTaskOutcome::Executed(
                                     ThreadOperationOutcome::Completed {
-                                        status, end_reason, ..
+                                        status,
+                                        end_reason,
+                                        terminal,
+                                        ..
                                     },
                                 ) => {
                                     if active.request.operation_kind()
                                         == &HostedOperationKind::GoalRun
                                     {
-                                        observe_runtime_event(
-                                            active.request.event_observer().as_deref(),
-                                            result.state.events.session_completed(
+                                        let completion_event = match terminal {
+                                            Some(
+                                                orca_core::budget::OperationTerminal::Stopped {
+                                                    ..
+                                                },
+                                            ) => result.state.events.session_completed_terminal(
+                                                terminal.as_ref().expect("matched stop"),
+                                                result.state.thread.session().session_id(),
+                                            ),
+                                            _ => result.state.events.session_completed(
                                                 status,
                                                 result.state.thread.session().session_id(),
                                             ),
+                                        };
+                                        observe_runtime_event(
+                                            active.request.event_observer().as_deref(),
+                                            completion_event,
                                         );
                                     }
                                     self.state = Some(result.state);
-                                    completed_turn =
-                                        Some(CompletedTurnOutcome { status, end_reason });
-                                    OperationOutcome::Completed(status)
+                                    completed_turn = Some(CompletedTurnOutcome {
+                                        status,
+                                        end_reason,
+                                        terminal: terminal.clone(),
+                                    });
+                                    match terminal {
+                                        Some(orca_core::budget::OperationTerminal::Stopped {
+                                            ..
+                                        }) => OperationOutcome::Stopped(
+                                            terminal.expect("matched stop"),
+                                        ),
+                                        _ => OperationOutcome::Completed(status),
+                                    }
                                 }
                                 GenerationTaskOutcome::Executed(
                                     ThreadOperationOutcome::ProviderSuspended {
@@ -35200,25 +35314,30 @@ impl ThreadActor {
             GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
                 status: RunStatus::Success,
                 end_reason,
+                terminal,
                 ..
             }) => (
-                goal_turn_disposition(RunStatus::Success, *end_reason),
+                goal_turn_disposition(RunStatus::Success, *end_reason, terminal.as_ref()),
                 Some("success"),
                 Some(end_reason.as_str()),
                 GoalContinuationTrigger::Progress,
             ),
             GenerationTaskOutcome::Executed(ThreadOperationOutcome::Completed {
-                status: RunStatus::BudgetExhausted,
-                end_reason: crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                status: RunStatus::Failed,
+                end_reason,
+                terminal:
+                    Some(
+                        terminal @ orca_core::budget::OperationTerminal::Stopped {
+                            resumable: true,
+                            ..
+                        },
+                    ),
                 ..
             }) => (
-                goal_turn_disposition(
-                    RunStatus::BudgetExhausted,
-                    crate::lifecycle::TurnEndReason::MaxInnerTurns,
-                ),
+                goal_turn_disposition(RunStatus::Failed, *end_reason, Some(terminal)),
                 Some("budget_exhausted"),
-                Some("max_inner_turns"),
-                GoalContinuationTrigger::MaxInnerTurns,
+                Some("budget_stop"),
+                GoalContinuationTrigger::BudgetStop,
             ),
             _ => {
                 return self.finish_legacy_goal_without_continuation(active, result);
@@ -36074,10 +36193,7 @@ impl ThreadActor {
                     message: approval_message,
                 },
             ),
-            (
-                None,
-                RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::BudgetExhausted,
-            ) => (
+            (None, RunStatus::Failed | RunStatus::VerificationFailed) => (
                 surface::SurfaceTaskStatus::Failed,
                 surface::GenerationStopReason::ExecutionFailed {
                     class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
@@ -36506,10 +36622,7 @@ impl ThreadActor {
                         ),
                     None => Err("typed approval outcome lost its provider response".to_string()),
                 },
-                (
-                    None,
-                    RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::BudgetExhausted,
-                ) => typed
+                (None, RunStatus::Failed | RunStatus::VerificationFailed) => typed
                     .task_registry
                     .apply_main_session_terminal_update(
                         typed.task_id.as_str(),
@@ -37329,17 +37442,22 @@ fn run_hosted_operation(
             let progress_baseline =
                 crate::thread::TurnProgressBaseline::capture(thread.session().conversation());
             let outcome = executor.run_turn(thread, request, generation, events, writer, cancel);
-            let (status, end_reason) = match &outcome {
+            let (status, end_reason, terminal) = match &outcome {
                 Ok(ThreadOperationOutcome::Completed {
-                    status, end_reason, ..
-                }) => (*status, *end_reason),
+                    status,
+                    end_reason,
+                    terminal,
+                    ..
+                }) => (*status, *end_reason, terminal.clone()),
                 Ok(ThreadOperationOutcome::ProviderSuspended { .. }) => (
                     RunStatus::ApprovalRequired,
                     crate::lifecycle::TurnEndReason::Unclassified,
+                    None,
                 ),
                 Err(_) => (
                     RunStatus::Failed,
                     crate::lifecycle::TurnEndReason::Unclassified,
+                    None,
                 ),
             };
             let usage = crate::thread::goal_usage_delta(
@@ -37357,6 +37475,7 @@ fn run_hosted_operation(
                     binding.as_ref(),
                     status,
                     end_reason,
+                    terminal,
                     usage,
                     Some(events),
                     event_observer.as_deref(),
@@ -37372,17 +37491,21 @@ fn run_hosted_operation(
                     .turn
                     .as_ref()
                     .ok_or_else(|| io::Error::other("surface Goal turn lost its actor context"))?;
-                let goal_status = match status {
-                    RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
-                    RunStatus::Cancelled => orca_core::goal_runtime::GoalTurnStatus::Cancelled,
-                    RunStatus::ApprovalRequired => {
-                        orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
-                    }
-                    RunStatus::BudgetExhausted => {
-                        orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted
-                    }
-                    RunStatus::Failed | RunStatus::VerificationFailed => {
-                        orca_core::goal_runtime::GoalTurnStatus::Failed
+                let goal_status = if matches!(
+                    terminal,
+                    Some(orca_core::budget::OperationTerminal::Stopped { .. })
+                ) {
+                    orca_core::goal_runtime::GoalTurnStatus::BudgetExhausted
+                } else {
+                    match status {
+                        RunStatus::Success => orca_core::goal_runtime::GoalTurnStatus::Success,
+                        RunStatus::Cancelled => orca_core::goal_runtime::GoalTurnStatus::Cancelled,
+                        RunStatus::ApprovalRequired => {
+                            orca_core::goal_runtime::GoalTurnStatus::ApprovalRequired
+                        }
+                        RunStatus::Failed | RunStatus::VerificationFailed => {
+                            orca_core::goal_runtime::GoalTurnStatus::Failed
+                        }
                     }
                 };
                 binding
@@ -37391,6 +37514,7 @@ fn run_hosted_operation(
                         &turn.session_id,
                         goal_status,
                         end_reason,
+                        terminal,
                         usage,
                         evidence.tool_count,
                         evidence.model_response_count,
@@ -37486,15 +37610,18 @@ fn run_headless_session(
     }
     if let ThreadOperationOutcome::Completed {
         end_reason,
+        terminal,
         background_workflows: _,
         ..
     } = &outcome
     {
-        // Soft landing: a budget-exhausted headless session persists a typed
-        // checkpoint before the terminal projection, so the caller can resume
-        // from the last committed boundary with a fresh budget scope.
-        if status == RunStatus::BudgetExhausted
-            && let Some(session_id) = thread.session().session_id().map(str::to_string)
+        // Soft landing: a typed budget stop persists a checkpoint before the
+        // terminal projection, so the caller can resume from the last
+        // committed boundary with a fresh budget scope.
+        if matches!(
+            terminal,
+            Some(orca_core::budget::OperationTerminal::Stopped { .. })
+        ) && let Some(session_id) = thread.session().session_id().map(str::to_string)
         {
             let checkpoint = {
                 let session = thread.session();
@@ -37506,7 +37633,7 @@ fn run_headless_session(
                     });
                 crate::thread_store::SessionCheckpointRecord {
                     session_id,
-                    status: status.as_str().to_string(),
+                    status: "budget_exhausted".to_string(),
                     reason: Some(end_reason.as_str().to_string()),
                     budget_consumed: session.aggregate_usage_totals(),
                     last_committed_message_id,
@@ -37522,7 +37649,11 @@ fn run_headless_session(
                 eprintln!("orca: warning: failed to record session checkpoint: {error}");
             }
         }
-        sink.emit(events.session_completed(status, thread.session().session_id()))?;
+        if let Some(terminal) = terminal {
+            sink.emit(events.session_completed_terminal(terminal, thread.session().session_id()))?;
+        } else {
+            sink.emit(events.session_completed(status, thread.session().session_id()))?;
+        }
     }
     Ok(outcome)
 }
@@ -37657,7 +37788,7 @@ fn run_provider_background_task(
                 usage,
             );
         }
-        RunStatus::Failed | RunStatus::VerificationFailed | RunStatus::BudgetExhausted => {
+        RunStatus::Failed | RunStatus::VerificationFailed => {
             let _ = context.task_registry.apply_main_session_terminal_update(
                 &context.task_id,
                 MainSessionTerminalUpdate::Failed {
@@ -37799,7 +37930,7 @@ fn provider_response_usage_totals(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GoalContinuationTrigger {
     Progress,
-    MaxInnerTurns,
+    BudgetStop,
     GapFeedback,
 }
 
@@ -37820,7 +37951,7 @@ struct GoalContinuationEnvelope {
 fn goal_continuation_trigger_name(trigger: GoalContinuationTrigger) -> &'static str {
     match trigger {
         GoalContinuationTrigger::Progress => "progress",
-        GoalContinuationTrigger::MaxInnerTurns => "max_inner_turns",
+        GoalContinuationTrigger::BudgetStop => "budget_stop",
         GoalContinuationTrigger::GapFeedback => "gap_feedback",
     }
 }
@@ -37850,8 +37981,8 @@ fn goal_continuation_envelope_prompt(envelope: &GoalContinuationEnvelope) -> Str
         .as_deref()
         .unwrap_or("No assistant checkpoint was recorded.");
     let next_action = match envelope.trigger {
-        GoalContinuationTrigger::MaxInnerTurns => {
-            "The previous outer turn hit the per-run inner-turn ceiling before finishing. \
+        GoalContinuationTrigger::BudgetStop => {
+            "The previous outer turn stopped on an explicit budget before finishing. \
 Do not restart from scratch. Resume from durable worktree evidence, finish the highest-value \
 unfinished requirements, and leave a clear next action if another outer turn is still needed. \
 Do not mark complete merely because a turn budget expired."
@@ -38731,10 +38862,12 @@ mod tests {
                         status,
                         end_reason,
                         background_workflows,
+                        terminal,
                     } => ThreadOperationOutcome::Completed {
                         status,
                         end_reason,
                         background_workflows,
+                        terminal,
                     },
                     crate::controller::ThreadTurnOutcome::ProviderSuspended {
                         suspension,
@@ -38763,13 +38896,17 @@ mod tests {
                 "Goal continuation admitted an unexpected third turn"
             );
             if call == 0 {
-                thread
-                    .lifecycle_mut()
-                    .finish_task(RunStatus::BudgetExhausted);
+                thread.lifecycle_mut().finish_task(RunStatus::Failed);
                 return Ok(ThreadOperationOutcome::Completed {
-                    status: RunStatus::BudgetExhausted,
-                    end_reason: crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                    status: RunStatus::Failed,
+                    end_reason: crate::lifecycle::TurnEndReason::Unclassified,
                     background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+                    terminal: Some(orca_core::budget::OperationTerminal::Stopped {
+                        reason: orca_core::budget::StopReason::TurnBudget { max_turns: 1 },
+                        usage: orca_core::budget::BudgetUsage::default(),
+                        checkpoint_id: "surface-goal-continuation".to_string(),
+                        resumable: true,
+                    }),
                 });
             }
             SurfaceGoalUpdateExecutor.run_turn(thread, request, generation, events, writer, cancel)
@@ -38813,13 +38950,19 @@ mod tests {
             _writer: &mut (dyn io::Write + Send),
             _cancel: &CancelToken,
         ) -> io::Result<ThreadOperationOutcome> {
-            thread
-                .lifecycle_mut()
-                .finish_task(RunStatus::BudgetExhausted);
+            thread.lifecycle_mut().finish_task(RunStatus::Failed);
             Ok(ThreadOperationOutcome::Completed {
-                status: RunStatus::BudgetExhausted,
+                status: RunStatus::Failed,
                 end_reason: crate::lifecycle::TurnEndReason::CostBudgetExhausted,
                 background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+                terminal: Some(orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::CostBudget {
+                        max_cost_usd_micros: 1_000,
+                    },
+                    usage: orca_core::budget::BudgetUsage::default(),
+                    checkpoint_id: String::new(),
+                    resumable: false,
+                }),
             })
         }
     }
@@ -38902,10 +39045,12 @@ mod tests {
                         status,
                         end_reason,
                         background_workflows,
+                        terminal,
                     } => ThreadOperationOutcome::Completed {
                         status,
                         end_reason,
                         background_workflows,
+                        terminal,
                     },
                     crate::controller::ThreadTurnOutcome::ProviderSuspended {
                         suspension,
@@ -39471,7 +39616,7 @@ mod tests {
             runtime_workspace_roots: None,
             permission_rules: Default::default(),
             additional_working_directories: Vec::new(),
-            max_budget_usd: None,
+            budget: Default::default(),
             subagents: SubagentConfig::default(),
             tools: ToolConfig::default(),
             workflows: WorkflowConfig::default(),
@@ -48803,11 +48948,11 @@ mod tests {
         // Success remains admissible.
         assert_eq!(goal_continuation_preflight(baseline), None);
 
-        // MaxInnerTurns is an interruption, not a block.
+        // A resumable typed budget stop is an interruption, not a block.
         assert_eq!(
             goal_continuation_preflight(GoalContinuationPreflight {
                 disposition: GoalTurnDisposition::Interrupted {
-                    reason: crate::lifecycle::TurnEndReason::MaxInnerTurns,
+                    reason: crate::lifecycle::TurnEndReason::Unclassified,
                 },
                 ..baseline
             }),
@@ -48818,7 +48963,7 @@ mod tests {
         assert!(matches!(
             goal_continuation_preflight(GoalContinuationPreflight {
                 disposition: GoalTurnDisposition::Blocked {
-                    status: RunStatus::BudgetExhausted,
+                    status: RunStatus::Failed,
                     reason: crate::lifecycle::TurnEndReason::CostBudgetExhausted,
                 },
                 ..baseline
@@ -48851,40 +48996,59 @@ mod tests {
     }
 
     #[test]
-    fn turn_disposition_allows_success_or_max_inner_turns() {
+    fn turn_disposition_allows_success_or_resumable_budget_stop() {
         use crate::lifecycle::TurnEndReason;
 
         let success = ThreadOperationOutcome::Completed {
             status: RunStatus::Success,
             end_reason: TurnEndReason::Unclassified,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+            terminal: None,
         };
-        let max_inner = ThreadOperationOutcome::Completed {
-            status: RunStatus::BudgetExhausted,
-            end_reason: TurnEndReason::MaxInnerTurns,
+        let budget_stop = ThreadOperationOutcome::Completed {
+            status: RunStatus::Failed,
+            end_reason: TurnEndReason::Unclassified,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+            terminal: Some(orca_core::budget::OperationTerminal::Stopped {
+                reason: orca_core::budget::StopReason::TurnBudget { max_turns: 3 },
+                usage: orca_core::budget::BudgetUsage::default(),
+                checkpoint_id: "cp-1".to_string(),
+                resumable: true,
+            }),
         };
         let cost = ThreadOperationOutcome::Completed {
-            status: RunStatus::BudgetExhausted,
+            status: RunStatus::Failed,
             end_reason: TurnEndReason::CostBudgetExhausted,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+            terminal: Some(orca_core::budget::OperationTerminal::Stopped {
+                reason: orca_core::budget::StopReason::CostBudget {
+                    max_cost_usd_micros: 1_000,
+                },
+                usage: orca_core::budget::BudgetUsage::default(),
+                checkpoint_id: String::new(),
+                resumable: false,
+            }),
         };
         let failed = ThreadOperationOutcome::Completed {
             status: RunStatus::Failed,
             end_reason: TurnEndReason::Unclassified,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
+            terminal: None,
         };
 
         let disposition = |outcome: &ThreadOperationOutcome| match outcome {
             ThreadOperationOutcome::Completed {
-                status, end_reason, ..
-            } => goal_turn_disposition(*status, *end_reason),
+                status,
+                end_reason,
+                terminal,
+                ..
+            } => goal_turn_disposition(*status, *end_reason, terminal.as_ref()),
             _ => unreachable!("test outcomes are completed"),
         };
 
         assert_eq!(disposition(&success), GoalTurnDisposition::Advanced);
         assert!(matches!(
-            disposition(&max_inner),
+            disposition(&budget_stop),
             GoalTurnDisposition::Interrupted { .. }
         ));
         assert!(matches!(
@@ -48902,22 +49066,39 @@ mod tests {
         use crate::lifecycle::TurnEndReason;
 
         assert_eq!(
-            goal_turn_disposition(RunStatus::Success, TurnEndReason::Unclassified),
+            goal_turn_disposition(RunStatus::Success, TurnEndReason::Unclassified, None),
             GoalTurnDisposition::Advanced
         );
         assert_eq!(
-            goal_turn_disposition(RunStatus::BudgetExhausted, TurnEndReason::MaxInnerTurns),
+            goal_turn_disposition(
+                RunStatus::Failed,
+                TurnEndReason::Unclassified,
+                Some(&orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::TurnBudget { max_turns: 3 },
+                    usage: orca_core::budget::BudgetUsage::default(),
+                    checkpoint_id: "cp-1".to_string(),
+                    resumable: true,
+                }),
+            ),
             GoalTurnDisposition::Interrupted {
-                reason: TurnEndReason::MaxInnerTurns
+                reason: TurnEndReason::Unclassified
             }
         );
         assert_eq!(
             goal_turn_disposition(
-                RunStatus::BudgetExhausted,
-                TurnEndReason::CostBudgetExhausted
+                RunStatus::Failed,
+                TurnEndReason::CostBudgetExhausted,
+                Some(&orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::CostBudget {
+                        max_cost_usd_micros: 1_000,
+                    },
+                    usage: orca_core::budget::BudgetUsage::default(),
+                    checkpoint_id: String::new(),
+                    resumable: false,
+                }),
             ),
             GoalTurnDisposition::Blocked {
-                status: RunStatus::BudgetExhausted,
+                status: RunStatus::Failed,
                 reason: TurnEndReason::CostBudgetExhausted
             }
         );
@@ -48928,12 +49109,12 @@ mod tests {
         let prompt = goal_continuation_envelope_prompt(&GoalContinuationEnvelope {
             objective: "finish the runtime refactor".to_string(),
             continuation: 4,
-            trigger: GoalContinuationTrigger::MaxInnerTurns,
+            trigger: GoalContinuationTrigger::BudgetStop,
             tokens_used: 12_000,
             token_budget: Some(20_000),
             last_gap_fingerprint: Some("runtime:continuation-gate".to_string()),
             last_outer_status: Some("budget_exhausted"),
-            last_end_reason: Some("max_inner_turns"),
+            last_end_reason: Some("budget_stop"),
             plan_snapshot: Some(
                 "[completed] classify end reasons\n[in_progress] wire continuation".to_string(),
             ),
@@ -48942,7 +49123,7 @@ mod tests {
             ),
         });
 
-        assert!(prompt.contains("trigger: max_inner_turns"));
+        assert!(prompt.contains("trigger: budget_stop"));
         assert!(prompt.contains("tokens remaining: 8000"));
         assert!(prompt.contains("[in_progress] wire continuation"));
         assert!(prompt.contains("HookManager APIs differ"));
@@ -49217,11 +49398,11 @@ mod tests {
             })
             .expect("wait continued Goal terminal");
         let surface::WaitOperationTerminalResult::Terminal { value } = terminal else {
-            panic!("MaxInnerTurns continuation did not publish a terminal result");
+            panic!("budget-stop continuation did not publish a terminal result");
         };
         assert!(
             matches!(value.terminal, surface::OperationTerminal::Succeeded { .. }),
-            "unexpected terminal after MaxInnerTurns continuation: {:?}",
+            "unexpected terminal after budget-stop continuation: {:?}",
             value.terminal
         );
         assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
@@ -49289,9 +49470,9 @@ mod tests {
             continuation_prompt
                 .contains("<objective>\ncontinue once before verified completion\n</objective>")
         );
-        assert!(continuation_prompt.contains("- trigger: max_inner_turns"));
+        assert!(continuation_prompt.contains("- trigger: budget_stop"));
         assert!(continuation_prompt.contains("- previous outer-turn status: budget_exhausted"));
-        assert!(continuation_prompt.contains("- previous end reason: max_inner_turns"));
+        assert!(continuation_prompt.contains("- previous end reason: budget_stop"));
         assert!(matches!(
             snapshot.goal.as_ref().map(|goal| &goal.state),
             Some(surface::SurfaceGoalState::Complete { .. })
@@ -49504,7 +49685,8 @@ mod tests {
         let host = RuntimeHost::start_with_executor(Arc::new(SurfaceGoalCostBudgetExecutor))
             .expect("start cost-budget Goal runtime");
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
-        config.max_budget_usd = Some(0.0);
+        // Any provider spend crosses a 1-micro cost ceiling.
+        config.budget.max_cost_usd_micros = Some(1);
         let thread = host
             .start_thread(config, "cost-budget Goal")
             .expect("start recorded cost-budget Goal thread");

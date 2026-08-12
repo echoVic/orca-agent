@@ -909,7 +909,7 @@ mod tests {
                 .to_string(),
             ),
         };
-        let mut context = RuntimeToolActorContext::new("test-run", 2);
+        let mut context = RuntimeToolActorContext::new("test-run");
 
         let result = context
             .execute_workflow_draft_tool_with_registry(&request, true, cwd.path(), &registry, 3)
@@ -951,7 +951,7 @@ mod tests {
             target: None,
             raw_arguments: Some(format!(r#"{{"task_id":"{}"}}"#, task.id)),
         };
-        let mut context = RuntimeToolActorContext::new("test-run", 8);
+        let mut context = RuntimeToolActorContext::new("test-run");
 
         let result = context.execute_task_stop_tool(&request, &registry);
 
@@ -1029,7 +1029,7 @@ while :; do :; done
             target: None,
             raw_arguments: Some(format!(r#"{{"task_id":"{}"}}"#, task.id)),
         };
-        let mut context = RuntimeToolActorContext::new("test-run", 8);
+        let mut context = RuntimeToolActorContext::new("test-run");
 
         let result = context.execute_task_stop_tool(&request, &registry);
 
@@ -1066,7 +1066,7 @@ while :; do :; done
             target: None,
             raw_arguments: Some(format!(r#"{{"task_id":"{}"}}"#, task.id)),
         };
-        let mut context = RuntimeToolActorContext::new("test-run", 8);
+        let mut context = RuntimeToolActorContext::new("test-run");
 
         let result = context.execute_task_stop_tool(&request, &registry);
 
@@ -1096,7 +1096,7 @@ while :; do :; done
                 .to_string(),
             ),
         };
-        let mut context = RuntimeToolActorContext::new("test-run", 8);
+        let mut context = RuntimeToolActorContext::new("test-run");
 
         let result = context.execute_request_permissions_tool_with_policy(
             &request,

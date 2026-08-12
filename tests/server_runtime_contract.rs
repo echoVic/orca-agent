@@ -1405,7 +1405,7 @@ fn test_run_config(cwd: &std::path::Path) -> RunConfig {
         runtime_workspace_roots: None,
         permission_rules: PermissionRules::default(),
         additional_working_directories: Vec::new(),
-        max_budget_usd: None,
+        budget: Default::default(),
         subagents: SubagentConfig::default(),
         tools: ToolConfig::default(),
         workflows: WorkflowConfig::default(),

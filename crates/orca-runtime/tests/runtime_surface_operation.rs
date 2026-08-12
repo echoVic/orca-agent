@@ -325,7 +325,7 @@ fn test_config(cwd: PathBuf, history_mode: HistoryMode) -> RunConfig {
         runtime_workspace_roots: None,
         permission_rules: Default::default(),
         additional_working_directories: Vec::new(),
-        max_budget_usd: None,
+        budget: Default::default(),
         subagents: SubagentConfig::default(),
         tools: ToolConfig::default(),
         workflows: WorkflowConfig::default(),

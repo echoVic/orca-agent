@@ -10,7 +10,7 @@ use toml::Value;
 use crate::approval_rules::PermissionRules;
 use crate::approval_types::ApprovalMode;
 use crate::config::{
-    DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
+    BudgetConfig, DEFAULT_MAX_WORKFLOW_AGENTS_PER_RUN, DEFAULT_MAX_WORKFLOW_CONCURRENT_AGENTS,
     MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, PermissionProfileConfig, ReasoningEffort,
     ThemeName, ToolConfig, WorkflowConfig, WorkflowTeamConfig,
 };
@@ -28,6 +28,8 @@ pub struct FileConfig {
     pub reasoning_effort: ReasoningEffort,
     #[serde(default)]
     pub model_runtime: ModelRuntimeConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
     #[serde(default)]
     pub mcp_servers: Vec<crate::mcp_types::McpServerConfig>,
     #[serde(default)]
@@ -75,6 +77,8 @@ struct RawFileConfig {
     #[serde(default)]
     pub model_runtime: ModelRuntimeConfig,
     #[serde(default)]
+    pub budget: BudgetConfig,
+    #[serde(default)]
     pub mcp_servers: Vec<crate::mcp_types::McpServerConfig>,
     #[serde(default)]
     pub hooks: Vec<crate::hook_types::HookConfig>,
@@ -113,6 +117,7 @@ impl Default for FileConfig {
             base_url: None,
             reasoning_effort: ReasoningEffort::default(),
             model_runtime: ModelRuntimeConfig::default(),
+            budget: BudgetConfig::default(),
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             permissions: PermissionRules::default(),
@@ -147,6 +152,7 @@ impl From<RawFileConfig> for FileConfig {
             base_url: raw.base_url,
             reasoning_effort: raw.reasoning_effort,
             model_runtime: raw.model_runtime.normalized(),
+            budget: raw.budget,
             mcp_servers: raw.mcp_servers,
             hooks: raw.hooks,
             permissions: raw.permissions,
@@ -600,6 +606,32 @@ base_url = "https://custom.api.com"
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(config.base_url.as_deref(), Some("https://custom.api.com"));
+    }
+
+    #[test]
+    fn parse_budget_section_defaults_to_unlimited() {
+        let config: FileConfig = toml::from_str("").unwrap();
+        assert_eq!(config.budget, BudgetConfig::default());
+        assert!(config.budget.max_turns.is_none());
+        assert!(config.budget.max_tool_calls.is_none());
+        assert!(config.budget.max_cost_usd_micros.is_none());
+        assert!(config.budget.max_wall_time_ms.is_none());
+    }
+
+    #[test]
+    fn parse_budget_section_carries_explicit_dimensions() {
+        let toml = r#"
+[budget]
+max_turns = 16
+max_tool_calls = 64
+max_cost_usd_micros = 1250000
+max_wall_time_ms = 3600000
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.budget.max_turns, Some(16));
+        assert_eq!(config.budget.max_tool_calls, Some(64));
+        assert_eq!(config.budget.max_cost_usd_micros, Some(1_250_000));
+        assert_eq!(config.budget.max_wall_time_ms, Some(3_600_000));
     }
 
     #[test]

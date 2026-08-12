@@ -199,10 +199,10 @@ fn finish_task_maps_run_status_to_lifecycle_status() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-test");
     lifecycle.start_task(RuntimeTaskKind::Agent);
 
-    let task = lifecycle.finish_task(RunStatus::BudgetExhausted).unwrap();
+    let task = lifecycle.finish_task(RunStatus::Failed).unwrap();
 
-    assert_eq!(task.status(), RuntimeTaskStatus::BudgetExhausted);
-    assert_eq!(task.payload()["status"], "budget_exhausted");
+    assert_eq!(task.status(), RuntimeTaskStatus::Failed);
+    assert_eq!(task.payload()["status"], "failed");
 }
 
 #[test]
@@ -221,53 +221,52 @@ fn shell_task_snapshot_serializes_lifecycle_payload() {
 }
 
 #[test]
-fn task_actor_starts_turns_and_enforces_turn_budget() {
+fn task_actor_starts_turns_without_implicit_ceiling() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 1);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let mut events = EventFactory::new("run-actor".to_string());
     let turn_id = TurnId::new();
 
-    let first = actor
+    // The hidden 128-turn ceiling is gone: an unbounded actor admits turns
+    // far beyond the legacy limit; explicit limits live in BudgetController.
+    for turn in 1..=150 {
+        let started = actor
+            .start_turn(&mut events, &turn_id, Some("hello"), true)
+            .expect("unlimited turns start");
+        assert_eq!(started.turn(), turn);
+    }
+    let started = actor
         .start_turn(&mut events, &turn_id, Some("hello"), true)
-        .expect("first turn");
-
-    assert_eq!(first.turn(), 1);
-    let event = first.event().expect("emitted event");
-    assert_eq!(event.payload["turn"], 1);
+        .expect("151st turn starts");
+    let event = started.event().expect("emitted event");
+    assert_eq!(event.payload["turn"], 151);
     assert_eq!(event.payload["task"]["task_id"], "run-actor:task-1");
     assert_eq!(event.payload["task"]["kind"], "agent");
-
-    let exhausted = actor
-        .start_turn(&mut events, &turn_id, None, true)
-        .expect_err("turn budget exhausted");
-    assert_eq!(exhausted.status, RunStatus::BudgetExhausted);
-    assert_eq!(exhausted.message, "max turns exhausted");
 }
 
 #[test]
-fn task_actor_enforces_turn_budget_from_existing_lifecycle_state() {
+fn task_actor_starts_turn_from_existing_lifecycle_state() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
     lifecycle.next_turn();
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 1);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let mut events = EventFactory::new("run-actor".to_string());
     let turn_id = TurnId::new();
 
-    let exhausted = actor
+    let started = actor
         .start_turn(&mut events, &turn_id, Some("second turn"), true)
-        .expect_err("turn budget exhausted");
+        .expect("turn starts regardless of prior lifecycle state");
 
-    assert_eq!(exhausted.status, RunStatus::BudgetExhausted);
-    assert_eq!(exhausted.message, "max turns exhausted");
-    assert_eq!(actor.active_task().expect("task").current_turn(), 1);
+    assert_eq!(started.turn(), 2);
+    assert_eq!(actor.active_task().expect("task").current_turn(), 2);
 }
 
 #[test]
 fn task_actor_advances_turn_without_emitting_event() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let mut events = EventFactory::new("run-actor".to_string());
     let turn_id = TurnId::new();
 
@@ -284,7 +283,7 @@ fn task_actor_advances_turn_without_emitting_event() {
 fn task_actor_routes_model_turn_and_updates_cost_model() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let mut cost_tracker = CostTracker::new(Some("deepseek-v4-flash"));
     let provider_config = ProviderConfig {
         api_key: None,
@@ -319,7 +318,7 @@ fn task_actor_routes_model_turn_and_updates_cost_model() {
 fn task_actor_records_usage_and_reports_budget_exhaustion() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let mut cost_tracker = CostTracker::new(Some(PRO_MODEL));
 
     let exhausted = actor
@@ -330,12 +329,12 @@ fn task_actor_records_usage_and_reports_budget_exhaustion() {
                 cache_tokens: 0,
             },
             &mut cost_tracker,
-            Some(0.000001),
+            Some(1),
         )
         .expect_err("budget exhausted");
 
-    assert_eq!(exhausted.status, RunStatus::BudgetExhausted);
-    assert!(exhausted.message.contains("budget exhausted"));
+    assert_eq!(exhausted.status, RunStatus::Failed);
+    assert!(exhausted.message.contains("budget stopped"));
     assert_eq!(cost_tracker.totals().total_tokens(), 2_000_000);
 }
 
@@ -343,7 +342,7 @@ fn task_actor_records_usage_and_reports_budget_exhaustion() {
 fn task_actor_runs_pre_model_hook_and_returns_injected_context() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let hooks = HookRunner::new(vec![HookConfig {
         event: HookEvent::PreModelCall,
         command: "printf '%s' '{\"action\":\"inject\",\"context\":\"actor hook context\"}'"
@@ -362,7 +361,7 @@ fn task_actor_runs_pre_model_hook_and_returns_injected_context() {
 fn task_actor_formats_post_model_hook_failure_as_warning() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let hooks = HookRunner::new(vec![HookConfig {
         event: HookEvent::PostModelCall,
         command: "exit 7".to_string(),
@@ -388,7 +387,7 @@ fn task_actor_formats_post_model_hook_failure_as_warning() {
 fn task_actor_calls_streaming_provider_and_forwards_model_deltas() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let provider_config = ProviderConfig {
         api_key: None,
         base_url: None,
@@ -438,7 +437,7 @@ fn task_actor_calls_streaming_provider_and_forwards_model_deltas() {
 fn task_actor_builds_shell_tool_events_with_task_lifecycle() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let mut events = EventFactory::new("run-actor".to_string());
     let request = ToolRequest {
         id: "tool-1".to_string(),
@@ -468,7 +467,7 @@ fn task_actor_builds_shell_tool_events_with_task_lifecycle() {
 fn task_actor_runs_pre_tool_hook_and_formats_blocked_result() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let request = ToolRequest {
         id: "tool-1".to_string(),
         name: ToolName::Bash,
@@ -497,7 +496,7 @@ fn task_actor_runs_pre_tool_hook_and_formats_blocked_result() {
 fn task_actor_formats_post_tool_hook_failure_as_warning() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let request = ToolRequest {
         id: "tool-1".to_string(),
         name: ToolName::Bash,
@@ -523,7 +522,7 @@ fn task_actor_formats_post_tool_hook_failure_as_warning() {
 fn task_actor_resolves_required_tool_approval_as_allowed() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let request = ToolRequest {
         id: "tool-1".to_string(),
         name: ToolName::Bash,
@@ -562,7 +561,7 @@ fn task_actor_resolves_required_tool_approval_as_allowed() {
 fn task_actor_resolves_denied_tool_approval_with_denied_result() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let request = ToolRequest {
         id: "tool-1".to_string(),
         name: ToolName::Bash,
@@ -619,7 +618,7 @@ fn task_actor_routes_interactive_approval_through_handler() {
 
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let request = ToolRequest {
         id: "tool-1".to_string(),
         name: ToolName::Bash,
@@ -664,7 +663,7 @@ fn tool_actor_context_routes_canonical_user_question_through_handler() {
         }
     }
 
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let request = ToolRequest {
         id: "ask".to_string(),
         name: ToolName::AskUserQuestion,
@@ -701,7 +700,7 @@ fn tool_actor_context_cancelled_user_input_returns_cancelled_result() {
         }
     }
 
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let request = ToolRequest {
         id: "ask".to_string(),
         name: ToolName::AskUserQuestion,
@@ -741,7 +740,7 @@ fn tool_actor_context_maps_invalid_ask_user_question_to_invalid_input_result() {
         }
     }
 
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let request = ToolRequest {
         id: "ask-invalid".to_string(),
         name: ToolName::AskUserQuestion,
@@ -794,7 +793,7 @@ fn tool_actor_context_routes_ask_user_question_through_typed_handler() {
         }
     }
 
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let request = ToolRequest {
         id: "ask-structured".to_string(),
         name: ToolName::AskUserQuestion,
@@ -828,7 +827,7 @@ fn tool_actor_context_routes_ask_user_question_through_typed_handler() {
 
 #[test]
 fn tool_actor_context_grants_request_permissions_write_roots_for_current_turn() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let extra = tempfile::tempdir().expect("extra");
     let request = ToolRequest {
         id: "grant".to_string(),
@@ -866,7 +865,7 @@ fn tool_actor_context_grants_request_permissions_write_roots_for_current_turn() 
 
 #[test]
 fn tool_actor_context_grants_request_permissions_entry_write_roots() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let extra = tempfile::tempdir().expect("extra");
     let request = ToolRequest {
         id: "grant".to_string(),
@@ -910,7 +909,7 @@ fn tool_actor_context_grants_request_permissions_entry_write_roots() {
 
 #[test]
 fn tool_actor_context_reports_request_permissions_network_domain_grants() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let request = ToolRequest {
         id: "grant-network".to_string(),
         name: ToolName::RequestPermissions,
@@ -1131,7 +1130,7 @@ fn tool_actor_context_includes_strict_auto_review_in_permission_output() {
         }
     }
 
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let extra = tempfile::tempdir().expect("extra");
     let request = ToolRequest {
         id: "grant".to_string(),
@@ -1170,7 +1169,7 @@ fn task_actor_executes_normal_tool_with_runtime_policy() {
     let config = danger_full_access_config();
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
-    let mut actor = RuntimeTaskActor::new(&mut lifecycle, 2);
+    let mut actor = RuntimeTaskActor::new(&mut lifecycle);
     let task_registry = TaskRegistry::new("run-actor".to_string());
     let request = ToolRequest {
         id: "tool-1".to_string(),
@@ -1214,7 +1213,7 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
     std::fs::create_dir(&outside).expect("outside dir");
     let extra_file = extra.join("allowed.txt");
     let outside_file = outside.join("blocked.txt");
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let task_registry = TaskRegistry::new("run-tools".to_string());
     let request = ToolRequest {
         id: "tool-1".to_string(),
@@ -1283,7 +1282,7 @@ fn tool_actor_context_retries_bash_after_filesystem_permission_grant() {
     std::fs::create_dir(&workspace).expect("workspace dir");
     std::fs::create_dir(&outside).expect("outside dir");
     let outside_file = outside.join("granted.txt");
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let mut config = test_run_config();
     config.cwd = Some(workspace.clone());
     let task_registry = TaskRegistry::new("run-tools".to_string());
@@ -1349,7 +1348,7 @@ fn tool_actor_context_retries_workspace_git_write_after_permission_grant() {
     let git_dir = repo.path().join(".git");
     std::fs::create_dir(&git_dir).expect("git dir");
     let index_lock = git_dir.join("index.lock");
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let mut config = test_run_config();
     config.cwd = Some(repo.path().to_path_buf());
     let task_registry = TaskRegistry::new("run-tools".to_string());
@@ -1434,7 +1433,7 @@ fn tool_actor_context_retries_pathless_sandbox_denial_unsandboxed_after_permissi
         "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
         outside_file.display()
     );
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let mut config = test_run_config();
     config.cwd = Some(workspace.clone());
     let task_registry = TaskRegistry::new("run-tools".to_string());
@@ -1483,7 +1482,7 @@ fn tool_actor_context_reports_git_index_lock_sandbox_denial() {
     std::fs::create_dir_all(&workspace).expect("workspace dir");
     std::fs::create_dir(&git_dir).expect("git dir");
     let index_lock = git_dir.join("index.lock");
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let mut config = test_run_config();
     config.cwd = Some(workspace.clone());
     let task_registry = TaskRegistry::new("run-tools".to_string());
@@ -1526,7 +1525,7 @@ fn tool_actor_context_reports_git_index_lock_sandbox_denial() {
 #[test]
 fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution() {
     let config = danger_full_access_config();
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());
     let request = ToolRequest {
         id: "tool-1".to_string(),
@@ -1603,7 +1602,7 @@ fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution()
 
 #[test]
 fn tool_actor_context_cancels_normal_tool_before_admission_without_shell_task() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());
     let cancel = orca_core::cancel::CancelToken::new();
     cancel.cancel();
@@ -1663,7 +1662,7 @@ fn tool_actor_context_cancels_normal_tool_before_admission_without_shell_task() 
 #[test]
 fn tool_actor_context_preserves_shell_session_timeout_as_failure() {
     let config = danger_full_access_config();
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());
     let request = ToolRequest {
         id: "tool-timeout".to_string(),
@@ -1716,7 +1715,7 @@ fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
     let shell_registry = task_registry.clone();
     let handle = std::thread::spawn(move || {
         let config = danger_full_access_config();
-        let mut context = RuntimeToolActorContext::new("run-tools", 2);
+        let mut context = RuntimeToolActorContext::new("run-tools");
         let request = ToolRequest {
             id: "tool-1".to_string(),
             name: ToolName::Bash,
@@ -1756,7 +1755,7 @@ fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-    let mut stop_context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut stop_context = RuntimeToolActorContext::new("run-tools");
     let stop_request = ToolRequest {
         id: "stop".to_string(),
         name: ToolName::TaskStop,
@@ -1798,7 +1797,7 @@ fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
 
 #[test]
 fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
-    let context = RuntimeToolActorContext::new("run-tools", 2);
+    let context = RuntimeToolActorContext::new("run-tools");
 
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::WorkflowDraft), false),
@@ -1868,7 +1867,7 @@ fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
 
 #[test]
 fn tool_actor_context_executes_workflow_ipc_guardrail_without_child_context() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let request = ToolRequest {
         id: "mailbox".to_string(),
         name: ToolName::WorkflowReadMessages,
@@ -1891,7 +1890,7 @@ fn tool_actor_context_executes_workflow_ipc_guardrail_without_child_context() {
 
 #[test]
 fn tool_actor_context_executes_workflow_ipc_against_runtime_trait() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let ipc = FakeWorkflowIpc;
     let request = ToolRequest {
         id: "mailbox".to_string(),
@@ -1919,7 +1918,7 @@ fn tool_actor_context_executes_workflow_ipc_against_runtime_trait() {
 
 #[test]
 fn tool_actor_context_executes_subagent_status_against_runtime_lookup() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let request = ToolRequest {
         id: "status".to_string(),
         name: ToolName::SubagentStatus,
@@ -1943,7 +1942,7 @@ fn tool_actor_context_executes_subagent_status_against_runtime_lookup() {
 
 #[test]
 fn tool_actor_context_lists_tasks_with_package3_shape() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let registry = TaskRegistry::new("session-1".to_string());
     let task = registry.create_shell("Run server".to_string(), "npm run dev".to_string());
     registry.mark_running(&task.id).unwrap();
@@ -1969,7 +1968,7 @@ fn tool_actor_context_lists_tasks_with_package3_shape() {
 
 #[test]
 fn tool_actor_context_stops_running_task_by_task_id() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let registry = TaskRegistry::new("session-1".to_string());
     let task = registry.create_shell("Run server".to_string(), "npm run dev".to_string());
     registry.mark_running(&task.id).unwrap();
@@ -1997,7 +1996,7 @@ fn tool_actor_context_stops_running_task_by_task_id() {
 
 #[test]
 fn tool_actor_context_stops_running_task_by_deprecated_shell_id_alias() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let registry = TaskRegistry::new("session-1".to_string());
     let task = registry.create_shell("Run server".to_string(), "npm run dev".to_string());
     registry.mark_running(&task.id).unwrap();
@@ -2022,7 +2021,7 @@ fn tool_actor_context_stops_running_task_by_deprecated_shell_id_alias() {
 
 #[test]
 fn tool_actor_context_rejects_task_stop_without_id() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let registry = TaskRegistry::new("session-1".to_string());
     let request = ToolRequest {
         id: "stop".to_string(),
@@ -2043,7 +2042,7 @@ fn tool_actor_context_rejects_task_stop_without_id() {
 
 #[test]
 fn tool_actor_context_rejects_unknown_task_stop() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let registry = TaskRegistry::new("session-1".to_string());
     let request = ToolRequest {
         id: "stop".to_string(),
@@ -2064,7 +2063,7 @@ fn tool_actor_context_rejects_unknown_task_stop() {
 
 #[test]
 fn tool_actor_context_rejects_terminal_task_stop() {
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let registry = TaskRegistry::new("session-1".to_string());
     let task = registry.create_shell("Run server".to_string(), "npm run dev".to_string());
     registry.complete(&task.id, "done".to_string()).unwrap();
@@ -2088,7 +2087,7 @@ fn tool_actor_context_rejects_terminal_task_stop() {
 #[test]
 fn tool_actor_context_executes_workflow_draft_preview() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut context = RuntimeToolActorContext::new("run-tools", 2);
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let request = ToolRequest {
         id: "draft".to_string(),
         name: ToolName::WorkflowDraft,
@@ -2309,7 +2308,7 @@ fn test_run_config() -> RunConfig {
         runtime_workspace_roots: None,
         permission_rules: PermissionRules::default(),
         additional_working_directories: Vec::new(),
-        max_budget_usd: None,
+        budget: Default::default(),
         subagents: SubagentConfig::default(),
         tools: ToolConfig::default(),
         workflows: WorkflowConfig::default(),

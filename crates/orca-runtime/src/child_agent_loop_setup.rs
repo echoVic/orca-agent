@@ -9,12 +9,11 @@ use orca_provider::ProviderConfig;
 use orca_provider::context::ContextConfig;
 
 use crate::agent_common;
+use crate::budget_controller::BudgetLease;
 use crate::child_agent_types::{ChildAgentRequest, ChildAgentResult};
 use crate::compaction::RuntimeCompactionRetryState;
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
-
-pub const DEFAULT_CHILD_AGENT_MAX_TURNS: u32 = 128;
 
 pub struct ChildAgentLoopSetup {
     pub mcp_registry: McpRegistry,
@@ -86,10 +85,33 @@ pub fn prepare_child_agent_loop(
     }
 }
 
-pub fn advance_child_agent_turn(setup: &mut ChildAgentLoopSetup) -> ChildAgentTurnBudget {
-    advance_child_agent_turn_with_limit(setup, DEFAULT_CHILD_AGENT_MAX_TURNS)
+/// Advances the child loop one turn through the child's budget lease. The
+/// lease is bounded by the parent's remaining operation budget, so a child
+/// can never spend beyond what the parent reserved for it.
+pub fn advance_child_agent_turn(
+    setup: &mut ChildAgentLoopSetup,
+    lease: &mut BudgetLease,
+) -> ChildAgentTurnBudget {
+    setup.turn = setup.turn.saturating_add(1);
+    if let Err(stop) = lease.admit_turn() {
+        return ChildAgentTurnBudget::Stop(ChildAgentResult {
+            status: RunStatus::Failed,
+            final_message: None,
+            error: Some(format!(
+                "budget stopped: child {} (turns={}, tool_calls={})",
+                stop.reason.as_str(),
+                stop.usage.turns,
+                stop.usage.tool_calls
+            )),
+        });
+    }
+
+    ChildAgentTurnBudget::Continue
 }
 
+/// Test-only variant that advances against an explicit turn ceiling without a
+/// parent lease.
+#[cfg(test)]
 pub fn advance_child_agent_turn_with_limit(
     setup: &mut ChildAgentLoopSetup,
     max_turns: u32,
@@ -97,9 +119,9 @@ pub fn advance_child_agent_turn_with_limit(
     setup.turn = setup.turn.saturating_add(1);
     if setup.turn > max_turns {
         return ChildAgentTurnBudget::Stop(ChildAgentResult {
-            status: RunStatus::BudgetExhausted,
+            status: RunStatus::Failed,
             final_message: None,
-            error: Some("max turns exhausted".to_string()),
+            error: Some("budget stopped: child turn budget exhausted".to_string()),
         });
     }
 

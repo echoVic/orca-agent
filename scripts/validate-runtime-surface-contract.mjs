@@ -234,8 +234,7 @@ const ACP_PROJECTION_DISPOSITIONS = new Set([
 ]);
 
 const ACP_TERMINAL_DISPOSITIONS = new Set([
-  "OrcaBudgetExhausted",
-  "OrcaNotAdmitted",
+    "OrcaNotAdmitted",
   "OrcaOperationFailed",
   "OrcaOperationJoinFailed",
   "OrcaOperationPanicked",

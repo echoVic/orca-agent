@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use orca_core::config::file::{ConfigOverrides, FileConfig, load_effective_config};
-use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
+use orca_core::config::{BudgetConfig, HistoryMode, OutputFormat, ProviderKind, RunConfig};
 use orca_core::model::ModelSelection;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -22,7 +22,7 @@ pub struct RunConfigRequest {
     pub verifier: Option<String>,
     pub history_mode: HistoryMode,
     pub show_session_picker: bool,
-    pub max_budget_usd: Option<f64>,
+    pub budget: BudgetConfig,
     pub overrides: ConfigOverrides,
     pub desktop_notifications: DesktopNotifications,
 }
@@ -39,7 +39,7 @@ impl RunConfigRequest {
             verifier: None,
             history_mode: HistoryMode::Record,
             show_session_picker: false,
-            max_budget_usd: None,
+            budget: BudgetConfig::default(),
             overrides: ConfigOverrides::default(),
             desktop_notifications: DesktopNotifications::FromConfig,
         }
@@ -81,7 +81,22 @@ pub fn assemble_run_config(
         runtime_workspace_roots: None,
         permission_rules: file.permissions,
         additional_working_directories: Vec::new(),
-        max_budget_usd: request.max_budget_usd,
+        budget: {
+            let mut budget = file.budget;
+            if budget.max_cost_usd_micros.is_none() {
+                budget.max_cost_usd_micros = request.budget.max_cost_usd_micros;
+            }
+            if budget.max_turns.is_none() {
+                budget.max_turns = request.budget.max_turns;
+            }
+            if budget.max_tool_calls.is_none() {
+                budget.max_tool_calls = request.budget.max_tool_calls;
+            }
+            if budget.max_wall_time_ms.is_none() {
+                budget.max_wall_time_ms = request.budget.max_wall_time_ms;
+            }
+            budget
+        },
         mcp_servers: file.mcp_servers,
         hooks: file.hooks,
         external_tools: orca_tools::external::load_default_external_tools(),
@@ -139,7 +154,10 @@ mod tests {
             verifier: Some("cargo test".to_string()),
             history_mode: HistoryMode::Resume("latest".to_string()),
             show_session_picker: true,
-            max_budget_usd: Some(2.5),
+            budget: BudgetConfig {
+                max_cost_usd_micros: Some(2_500_000),
+                ..BudgetConfig::default()
+            },
             overrides: ConfigOverrides::default(),
             desktop_notifications: DesktopNotifications::FromConfig,
         };
@@ -158,7 +176,7 @@ mod tests {
             HistoryMode::Resume(ref selector) if selector == "latest"
         ));
         assert!(config.show_session_picker);
-        assert_eq!(config.max_budget_usd, Some(2.5));
+        assert_eq!(config.budget.max_cost_usd_micros, Some(2_500_000));
         assert!(!config.update_check);
         assert_eq!(
             config

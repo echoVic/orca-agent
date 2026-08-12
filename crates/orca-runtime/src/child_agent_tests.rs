@@ -52,7 +52,7 @@ fn config(model: Option<&str>) -> RunConfig {
         runtime_workspace_roots: None,
         permission_rules: PermissionRules::default(),
         additional_working_directories: Vec::new(),
-        max_budget_usd: None,
+        budget: Default::default(),
         subagents: SubagentConfig::default(),
         tools: ToolConfig::default(),
         workflows: WorkflowConfig::default(),
@@ -179,33 +179,55 @@ fn prepare_child_agent_loop_applies_request_tool_allowlist_to_provider_schema() 
 }
 
 #[test]
-fn advance_child_agent_turn_stops_after_runtime_owned_limit() {
+fn advance_child_agent_turn_stops_when_lease_is_exhausted() {
     let runtime_config = config(None);
     let mut setup = child_loop_setup(&runtime_config);
+    let mut controller =
+        crate::budget_controller::BudgetController::new(orca_core::budget::BudgetSpec {
+            max_turns: Some(1),
+            ..orca_core::budget::BudgetSpec::default()
+        });
+    let mut lease = controller
+        .child_lease(orca_core::budget::BudgetSpec {
+            max_turns: Some(1),
+            ..orca_core::budget::BudgetSpec::default()
+        })
+        .expect("child lease");
 
     assert!(matches!(
-        advance_child_agent_turn_with_limit(&mut setup, 1),
+        advance_child_agent_turn(&mut setup, &mut lease),
         ChildAgentTurnBudget::Continue
     ));
     assert_eq!(setup.turn, 1);
 
-    match advance_child_agent_turn_with_limit(&mut setup, 1) {
+    match advance_child_agent_turn(&mut setup, &mut lease) {
         ChildAgentTurnBudget::Stop(result) => {
-            assert_eq!(result.status, RunStatus::BudgetExhausted);
-            assert_eq!(result.error.as_deref(), Some("max turns exhausted"));
+            assert_eq!(result.status, RunStatus::Failed);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("budget stopped"))
+            );
         }
-        ChildAgentTurnBudget::Continue => panic!("turn beyond limit should stop"),
+        ChildAgentTurnBudget::Continue => panic!("turn beyond lease should stop"),
     }
     assert_eq!(setup.turn, 2);
+    assert_eq!(lease.finish().turns, 1);
 }
 
 #[test]
-fn advance_child_agent_turn_uses_default_child_limit() {
+fn advance_child_agent_turn_uses_child_config_budget() {
     let runtime_config = config(None);
     let mut setup = child_loop_setup(&runtime_config);
+    let mut controller =
+        crate::budget_controller::BudgetController::new(runtime_config.budget.to_spec());
+    let mut lease = controller
+        .child_lease(runtime_config.budget.to_spec())
+        .expect("child lease");
 
     assert!(matches!(
-        advance_child_agent_turn(&mut setup),
+        advance_child_agent_turn(&mut setup, &mut lease),
         ChildAgentTurnBudget::Continue
     ));
 
@@ -877,6 +899,7 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
             memory: &memory,
             hooks: &HookRunner::default(),
             child_cost_tracker: &mut tracker,
+            lease: None,
         },
         |_setup, _cancel, tool_request| {
             tool_count += 1;
@@ -911,7 +934,8 @@ fn observed_child_agent_stops_at_local_budget_after_emitting_exact_usage() {
     let instructions = ProjectInstructions::default();
     let memory = MemoryBlock::default();
     let mut runtime_config = config(None);
-    runtime_config.max_budget_usd = Some(0.0);
+    // Any provider spend crosses a 1-micro cost ceiling.
+    runtime_config.budget.max_cost_usd_micros = Some(1);
     let mut tracker = CostTracker::new(None);
     let activities = RefCell::new(Vec::new());
     let observer = ChildAgentActivityObserver::new(|activity| {
@@ -927,6 +951,7 @@ fn observed_child_agent_stops_at_local_budget_after_emitting_exact_usage() {
             memory: &memory,
             hooks: &HookRunner::default(),
             child_cost_tracker: &mut tracker,
+            lease: None,
         },
         Some(&observer),
         |_setup, _cancel, _tool_request| {
@@ -935,12 +960,12 @@ fn observed_child_agent_stops_at_local_budget_after_emitting_exact_usage() {
     )
     .expect("child loop should report budget exhaustion");
 
-    assert_eq!(result.status, RunStatus::BudgetExhausted);
+    assert_eq!(result.status, RunStatus::Failed);
     assert!(
         result
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("budget exhausted"))
+            .is_some_and(|error| error.contains("budget stopped"))
     );
     let totals = tracker.totals();
     assert_eq!(totals.input_tokens, 120);
