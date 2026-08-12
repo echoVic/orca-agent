@@ -269,3 +269,27 @@ semantics stay exact (outer Unauthorized for non-matching settlements).
 2. Behavioral oracle unchanged (runtime_host 66/66 x 5, lib suite green,
    nextest ci lib gate green, fmt + diff-check clean).
 3. Diff review: relocation plus the call boundary only.
+
+## Series Boundary (slices 6+ deferred, with a recorded deletion threshold)
+
+The remaining capability methods stay in `ThreadActor`:
+
+- `settle_surface_acp_terminal_observation`: its waiter outcome types
+  (`RuntimeAcpTerminalObservation` / `RuntimeAcpTerminalOutput` /
+  `RuntimeAcpTerminalExitStatus`) are part of the PUBLIC
+  `RuntimeAcpTerminalHandle` API surface; extracting the state machine
+  would move public Rust symbols.
+- `settle_surface_acp_terminal_cleanup`,
+  `complete_surface_terminal_cleanup`, `begin_surface_terminal_release`,
+  `settle_surface_terminal_cleanup_ambiguous`: orchestration is coupled to
+  actor-owned lease/waiter/dispatch state (coordinator snapshots, hub
+  dispatch, waiter registration).
+
+Deletion threshold: when the typed interaction/terminal broker gets its
+own module owner (the roadmap's P0.3e2 broker work), these flows move
+together with their lease/waiter state instead of being force-extracted
+now. Slices 1-5 shipped the coherent core: batch construction, commit
+settlement sequencing, and the read/write/terminal-create settlement
+state machines (capability.rs 962 -> ~1,790 lines; the actor shed ~570
+lines of capability-specific code, each slice verified by the unchanged
+behavioral oracle).
