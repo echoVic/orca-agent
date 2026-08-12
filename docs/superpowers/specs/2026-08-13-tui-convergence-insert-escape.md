@@ -64,3 +64,15 @@ Move the five terminal-presentation free functions
 target with no AppState coupling; pure relocation, app.rs imports the
 module. Same acceptance as slice 1 (orca-tui lib + tui_pty_contract +
 fmt + relocation-only diff).
+
+## Slice 3: Input Wake Selection Extraction
+
+### Scope
+
+Move the input wake-selection category (`InputWake` enum,
+`receive_prioritized_input_or_control`, and the two test-only helpers
+`receive_input_batch` / `receive_input_or_control`, app.rs:739-851) into
+`crates/orca-tui/src/input_wake.rs`. Pure relocation; the test helpers
+keep their `#[cfg(test)]` gating inside the new module and stay visible
+to the app.rs tests via the parent import. Same acceptance as slices 1-2
+(orcaui lib + tui_pty_contract + fmt + relocation-only diff).
