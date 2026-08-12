@@ -390,6 +390,38 @@ impl Drop for SurfaceSubscriptionReceiver {
     }
 }
 
+/// Delivers one ACP capability dispatch with a bounded retry through a
+/// full lane: the client drain polls every 100ms, and the executor's
+/// concurrent close() calls dispatch back-to-back, so a capacity-1 lane
+/// can legitimately be full for up to one poll interval. The retry budget
+/// (200ms = two drain polls) covers that race; a wedged client still fails
+/// closed into the existing ambiguous settlement instead of blocking the
+/// actor unboundedly. `Disconnected` never retries.
+const ACP_DISPATCH_FULL_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+const ACP_DISPATCH_FULL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn send_acp_dispatch_retrying_full<T>(
+    sender: &SyncSender<T>,
+    mut dispatch: T,
+) -> Result<(), AcpCapabilityDispatchError> {
+    let deadline = std::time::Instant::now() + ACP_DISPATCH_FULL_RETRY_BUDGET;
+    loop {
+        match sender.try_send(dispatch) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(returned)) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(AcpCapabilityDispatchError::Full);
+                }
+                dispatch = returned;
+                std::thread::sleep(ACP_DISPATCH_FULL_RETRY_BACKOFF);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(AcpCapabilityDispatchError::Disconnected);
+            }
+        }
+    }
+}
+
 impl SurfaceHub {
     pub fn new_tui(
         snapshot: SurfaceSnapshot,
@@ -747,13 +779,10 @@ impl SurfaceHub {
         }
         let sender = subscriber
             .acp_read_dispatch_tx
-            .as_ref()
+            .clone()
             .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
-        match sender.try_send(dispatch) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(AcpCapabilityDispatchError::Full),
-            Err(TrySendError::Disconnected(_)) => Err(AcpCapabilityDispatchError::Disconnected),
-        }
+        drop(state);
+        send_acp_dispatch_retrying_full(&sender, dispatch)
     }
 
     pub(crate) fn claim_acp_write_text_file_dispatch(
@@ -811,13 +840,10 @@ impl SurfaceHub {
         }
         let sender = subscriber
             .acp_write_dispatch_tx
-            .as_ref()
+            .clone()
             .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
-        match sender.try_send(dispatch) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(AcpCapabilityDispatchError::Full),
-            Err(TrySendError::Disconnected(_)) => Err(AcpCapabilityDispatchError::Disconnected),
-        }
+        drop(state);
+        send_acp_dispatch_retrying_full(&sender, dispatch)
     }
 
     pub(crate) fn claim_acp_terminal_create_dispatch(
@@ -875,13 +901,10 @@ impl SurfaceHub {
         }
         let sender = subscriber
             .acp_terminal_create_dispatch_tx
-            .as_ref()
+            .clone()
             .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
-        match sender.try_send(dispatch) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(AcpCapabilityDispatchError::Full),
-            Err(TrySendError::Disconnected(_)) => Err(AcpCapabilityDispatchError::Disconnected),
-        }
+        drop(state);
+        send_acp_dispatch_retrying_full(&sender, dispatch)
     }
 
     pub(crate) fn claim_acp_terminal_observation_dispatch(
@@ -944,13 +967,10 @@ impl SurfaceHub {
         }
         let sender = subscriber
             .acp_terminal_observation_dispatch_tx
-            .as_ref()
+            .clone()
             .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
-        match sender.try_send(dispatch) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(AcpCapabilityDispatchError::Full),
-            Err(TrySendError::Disconnected(_)) => Err(AcpCapabilityDispatchError::Disconnected),
-        }
+        drop(state);
+        send_acp_dispatch_retrying_full(&sender, dispatch)
     }
 
     pub(crate) fn claim_acp_terminal_cleanup_dispatch(
@@ -1013,13 +1033,10 @@ impl SurfaceHub {
         }
         let sender = subscriber
             .acp_terminal_cleanup_dispatch_tx
-            .as_ref()
+            .clone()
             .ok_or(AcpCapabilityDispatchError::StaleRoute)?;
-        match sender.try_send(dispatch) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(AcpCapabilityDispatchError::Full),
-            Err(TrySendError::Disconnected(_)) => Err(AcpCapabilityDispatchError::Disconnected),
-        }
+        drop(state);
+        send_acp_dispatch_retrying_full(&sender, dispatch)
     }
 
     pub(crate) fn apply_committed(
@@ -2456,5 +2473,26 @@ mod tests {
             Err(AcpCapabilityDispatchError::StaleRoute),
             "a sealed hub cannot receive a capability dispatch"
         );
+    }
+
+    #[test]
+    fn acp_dispatch_retries_a_full_lane_until_the_client_drains() {
+        // The captured ACP stall: two back-to-back dispatches overflow the
+        // capacity-1 lane between the client's 100ms drain polls, the
+        // second frame is lost, and the client waits forever. The retry
+        // must deliver the second dispatch once the client drains.
+        let (sender, receiver) = sync_channel::<u8>(1);
+        sender.send(1).expect("first dispatch fills the lane");
+        let sender_clone = sender.clone();
+        let send_thread =
+            std::thread::spawn(move || send_acp_dispatch_retrying_full(&sender_clone, 2));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(receiver.recv(), Ok(1), "first dispatch drains");
+        assert_eq!(
+            send_thread.join().expect("dispatch thread joins"),
+            Ok(()),
+            "the retry delivers the second dispatch after the drain"
+        );
+        assert_eq!(receiver.recv(), Ok(2), "no frame was lost");
     }
 }
