@@ -48,6 +48,10 @@ use crate::input_event_actions::{
     handle_paste_event, handle_resize_event, handle_scroll_lines, should_queue_input_event,
 };
 use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions};
+use crate::insert_escape::{
+    PendingInsertEscapeRouting, flush_expired_insert_escape,
+    flush_pending_insert_escape_before_non_key, resolve_pending_insert_escape_before_routing,
+};
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
@@ -68,12 +72,6 @@ use crate::types::{
 use crate::ui;
 use crate::vim::{PendingInsertEscapeFlow, VimState};
 use crate::workspace_status;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingInsertEscapeRouting {
-    Continue,
-    Consumed,
-}
 
 struct HostedSideParent {
     thread: RuntimeThreadHandle,
@@ -165,70 +163,6 @@ fn exit_session_id(
     } else {
         active_session_id
     }
-}
-
-fn refresh_after_insert_escape_flush(
-    state: &mut AppState,
-    config: &RunConfig,
-    textarea: &TextArea<'_>,
-) {
-    state.reset_history_navigation();
-    refresh_input_menus(textarea, state, config);
-}
-
-fn resolve_pending_insert_escape_before_routing(
-    event: &Event,
-    now: Instant,
-    vim_state: &mut VimState,
-    textarea: &mut TextArea<'_>,
-    state: &mut AppState,
-    config: &RunConfig,
-    theme: &Theme,
-) -> PendingInsertEscapeRouting {
-    let Event::Key(key) = event else {
-        return PendingInsertEscapeRouting::Continue;
-    };
-    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return PendingInsertEscapeRouting::Continue;
-    }
-    match vim_state.resolve_pending_insert_escape(&Input::from(event.clone()), now, textarea) {
-        PendingInsertEscapeFlow::Consumed => {
-            vim_state.configure_block(textarea, theme);
-            PendingInsertEscapeRouting::Consumed
-        }
-        PendingInsertEscapeFlow::Flushed => {
-            refresh_after_insert_escape_flush(state, config, textarea);
-            PendingInsertEscapeRouting::Continue
-        }
-        PendingInsertEscapeFlow::NoPending => PendingInsertEscapeRouting::Continue,
-    }
-}
-
-fn flush_pending_insert_escape_before_non_key(
-    vim_state: &mut VimState,
-    textarea: &mut TextArea<'_>,
-    state: &mut AppState,
-    config: &RunConfig,
-) -> bool {
-    if !vim_state.flush_pending_insert_escape(textarea) {
-        return false;
-    }
-    refresh_after_insert_escape_flush(state, config, textarea);
-    true
-}
-
-fn flush_expired_insert_escape(
-    now: Instant,
-    vim_state: &mut VimState,
-    textarea: &mut TextArea<'_>,
-    state: &mut AppState,
-    config: &RunConfig,
-) -> bool {
-    if !vim_state.flush_expired_insert_escape(now, textarea) {
-        return false;
-    }
-    refresh_after_insert_escape_flush(state, config, textarea);
-    true
 }
 
 pub fn run_tui(config: RunConfig) -> i32 {
