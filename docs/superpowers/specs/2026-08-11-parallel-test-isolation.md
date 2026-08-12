@@ -2,8 +2,22 @@
 
 ## Status
 
-Proposed for `codex/parallel-test-isolation`, based on `origin/main` at
+Implemented and verified on `main` (commits `3ede071d1`, `b3aa84aef`,
+`ab0730e95`, `a9155c388`, `82d431176`), based on `origin/main` at
 `2dfb21a4f85164e8ec687afbb66b4cd963bdc805` (v0.3.14 + review regressions fix).
+All original acceptance criteria have fresh passing evidence:
+
+- Criterion 1 (concurrent goal-store opens): covered by the
+  `initialize_schema_fenced` behavior tests.
+- Criterion 2 (lib suite green): 3 consecutive default-parallelism runs
+  1088/1088 plus the nextest ci lib gate 1088/1088 (fresh evidence in the
+  Round 2 Addendum).
+- Criterion 3 (runtime_host integration, default parallelism, 5 consecutive
+  runs): 5/5 green at 66/66 each (fresh evidence, round 5).
+- Criterion 7 (threads=16 no hangs): one full run green (Round 2 Addendum).
+- The four load-coupled flake follow-ups remain open with instrumented
+  plans in the Round 2/3 follow-up sections; they are rare on an unloaded
+  machine and CI-mitigated (nextest threads-required overrides).
 
 ## Problem And Evidence
 
