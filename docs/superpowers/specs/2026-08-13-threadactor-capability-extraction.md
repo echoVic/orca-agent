@@ -227,3 +227,24 @@ application.
    lib suite green, nextest ci lib gate green, fmt and diff-check clean.
 3. Diff review: relocation plus the outcome struct only; no
    state-transition or validation edits.
+
+## Slice 4: ACP Write Settlement State Machine
+
+### Scope
+
+Same pattern as slice 3 for the ACP write flow: move the pure settlement
+state machine out of `settle_surface_acp_write_text_file` into
+`settle_acp_write_text_file_call(call, settlement) -> io::Result<()>` —
+the state-guarded `Completed` / `RemoteError` / `FailedBeforeWrite` /
+`ExternalEffectAmbiguous` transitions with canonical digest and
+diagnostics, mutating the call in place. The actor keeps authorization,
+the deferred path, the ambiguous-vs-plain batch choice (it reads the
+resulting call state), commit-with-retry, retain, and reply application.
+
+### Acceptance
+
+1. The state machine lives in capability.rs; the actor uses it; compile
+   clean.
+2. Behavioral oracle unchanged (runtime_host 66/66 x 5, lib suite green,
+   nextest ci lib gate green, fmt + diff-check clean).
+3. Diff review: relocation plus the call boundary only.
