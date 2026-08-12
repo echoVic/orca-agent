@@ -172,6 +172,7 @@ fn failed_child_still_reports_consumed_usage_receipt() {
         status: orca_core::event_schema::RunStatus::Failed,
         final_message: None,
         error: Some("child failed after one turn".to_string()),
+        budget_usage: None,
     };
     let consumed = lease.finish();
     assert_eq!(consumed.turns, 1);

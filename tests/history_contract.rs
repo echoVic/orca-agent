@@ -826,8 +826,8 @@ fn budget_exhausted_session_persists_typed_checkpoint() {
         .position(|record| record["type"] == "session.completed")
         .expect("completed index");
     assert!(
-        checkpoint_index > completed_index,
-        "checkpoint lands after the budget terminal and before the projection flush"
+        checkpoint_index < completed_index,
+        "the resume boundary (session checkpoint) lands BEFORE the terminal: the operation can only claim resumability after its boundary is durable"
     );
 }
 

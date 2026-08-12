@@ -873,6 +873,7 @@ pub struct SessionWriter {
     conversation_records: Arc<Mutex<Vec<StoredConversationRecord>>>,
     event_sequence_cursor: Arc<Mutex<u64>>,
     turn_id: Option<TurnId>,
+    session_id: Option<String>,
 }
 
 fn restore_plaintext_transcript(path: PathBuf) -> io::Result<PathBuf> {
@@ -923,6 +924,24 @@ impl SessionWriter {
         &self.path
     }
 
+    /// The session id of this transcript, when known (from the session meta
+    /// record). `None` for transcripts without one.
+    pub(crate) fn session_id(&self) -> Option<String> {
+        self.session_id.clone()
+    }
+
+    /// The last committed conversation item id (the durable resume boundary)
+    /// written to this transcript, when one exists. Message records are
+    /// appended with their item id before any checkpoint references them.
+    pub(crate) fn last_committed_message_id(&self) -> Option<String> {
+        self.conversation_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .rev()
+            .find_map(|record| record.item_id.as_ref().map(|id| id.as_str().to_string()))
+    }
+
     pub fn start(
         cwd: &Path,
         provider: &str,
@@ -933,6 +952,7 @@ impl SessionWriter {
     }
 
     pub fn start_from_meta(meta: SessionMeta) -> io::Result<Self> {
+        let session_id = meta.session_id.clone();
         let path = history::session_path(&meta.session_id, meta.created_at)?;
         write_record(&path, &SessionRecord::Meta(meta))?;
         Ok(Self {
@@ -940,6 +960,7 @@ impl SessionWriter {
             conversation_records: Arc::new(Mutex::new(Vec::new())),
             event_sequence_cursor: Arc::new(Mutex::new(0)),
             turn_id: None,
+            session_id: Some(session_id),
         })
     }
 
@@ -962,8 +983,10 @@ impl SessionWriter {
         append_usage_baseline(&path)?;
         let event_sequence_cursor = read_transcript(&path)?.next_event_seq;
         let mut conversation_records = Vec::new();
+        let mut session_id = None;
         for record in read_records(&path)? {
             match record {
+                SessionRecord::Meta(meta) => session_id = Some(meta.session_id),
                 SessionRecord::Message {
                     id,
                     turn_id,
@@ -987,6 +1010,7 @@ impl SessionWriter {
             conversation_records: Arc::new(Mutex::new(conversation_records)),
             event_sequence_cursor: Arc::new(Mutex::new(event_sequence_cursor)),
             turn_id: None,
+            session_id,
         })
     }
 
@@ -1468,6 +1492,7 @@ mod tests {
             conversation_records: Arc::new(Mutex::new(Vec::new())),
             event_sequence_cursor: Arc::new(Mutex::new(0)),
             turn_id: None,
+            session_id: None,
         };
         (directory, path, writer)
     }

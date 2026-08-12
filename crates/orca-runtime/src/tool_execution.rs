@@ -136,6 +136,9 @@ pub(crate) struct ToolExecutionCompletion {
     pub(crate) result: tool_types::ToolResult,
     pub(crate) disposition: RuntimeToolTurnDisposition,
     pub(crate) event_error: Option<io::Error>,
+    /// The subagent child's consumed budget receipt, when this tool ran a
+    /// child agent that reported one.
+    pub(crate) child_budget_usage: Option<orca_core::budget::BudgetUsage>,
 }
 
 impl ToolExecutionCompletion {
@@ -145,6 +148,7 @@ impl ToolExecutionCompletion {
             result,
             disposition: RuntimeToolTurnDisposition::ContinueModel,
             event_error: None,
+            child_budget_usage: None,
         }
     }
 
@@ -750,9 +754,13 @@ impl ToolExecutionActor {
                     ),
                 ),
                 disposition: RuntimeToolTurnDisposition::ContinueModel,
+                child_budget_usage: None,
             },
         };
         let result = dispatch.result;
+        // The subagent child's budget receipt rides to the turn settlement
+        // point so the parent operation merges exactly what the child spent.
+        let child_budget_usage = dispatch.child_budget_usage;
         if let (Some(registry), Some(extension_stores)) = (extension_registry, extension_stores) {
             registry.on_tool_finish(ToolFinishInput {
                 thread_store: extension_stores.thread_store(),
@@ -772,6 +780,7 @@ impl ToolExecutionActor {
             emit_deltas,
             provider_response_ingress,
             Some(cancel),
+            child_budget_usage,
         );
         if !completion
             .event_error
@@ -1053,6 +1062,7 @@ impl ToolExecutionActor {
         emit_deltas: bool,
         provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
         cancel: Option<&CancelToken>,
+        child_budget_usage: Option<orca_core::budget::BudgetUsage>,
     ) -> ToolExecutionCompletion {
         let mut event_error = None;
         retain_first_io_error(
@@ -1104,6 +1114,7 @@ impl ToolExecutionActor {
             result: result.clone(),
             disposition: RuntimeToolTurnDisposition::ContinueModel,
             event_error,
+            child_budget_usage,
         }
     }
 }
@@ -1472,6 +1483,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert_eq!(completion.status, RunStatus::Cancelled);
         assert!(completion.event_error.is_none());
@@ -1491,6 +1503,7 @@ mod tests {
             &hooks,
             ".",
             false,
+            None,
             None,
             None,
         );

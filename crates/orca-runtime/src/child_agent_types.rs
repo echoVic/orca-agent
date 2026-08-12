@@ -57,6 +57,10 @@ pub struct ChildAgentResult {
     pub status: RunStatus,
     pub final_message: Option<String>,
     pub error: Option<String>,
+    /// The budget the child actually consumed, when the executing loop owns a
+    /// budget (lease or operation controller). The parent merges this receipt
+    /// so its own usage reflects every child's consumption.
+    pub budget_usage: Option<orca_core::budget::BudgetUsage>,
 }
 
 pub(crate) type ChildAgentExecutor<W> = fn(

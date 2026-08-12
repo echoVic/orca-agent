@@ -61,10 +61,15 @@ impl RuntimeTurnOpeningStep {
         // `checkpoint.created` to the journal before the terminal is durable,
         // and the surfaced terminal carries that checkpoint (resumable).
         if let Err(stop) = input.operation.admit_turn(turn_context.turn_id.as_str())? {
-            let checkpoint_id = format!("{}-budget-stop", input.events.run_id());
-            let terminal = input.operation.commit_budget_stop(
+            // Commit the real resume boundary first (session checkpoint with
+            // the durable last-committed message id), then the operation
+            // journal's checkpoint + terminal; the surfaced terminal is
+            // resumable only because the boundary is already durable.
+            let terminal = input.operation.commit_budget_stop_with_boundary(
                 turn_context.turn_id.as_str(),
-                &checkpoint_id,
+                input.events.run_id(),
+                input.history_writer.as_deref_mut(),
+                &input.cost_tracker.totals(),
                 None,
             )?;
             let result = AgentLoopResult::budget_stop(terminal, stop);

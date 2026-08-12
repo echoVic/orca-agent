@@ -422,6 +422,13 @@ impl RuntimeProviderTurnStep {
                         stream,
                         input.provider_config.model.clone(),
                         response_identity,
+                    )
+                    .with_operation(
+                        crate::provider_stream::SuspendedOperationHandle {
+                            journal_path: input.operation.journal.path().to_path_buf(),
+                            operation_id: input.operation.journal.operation_id().to_string(),
+                            spec: *input.operation.controller.spec(),
+                        },
                     ),
                 ));
             }
@@ -450,13 +457,6 @@ impl RuntimeProviderTurnStep {
             {
                 budget_stop = Some(stop);
             }
-            // Wall time is synced after every provider exchange so a
-            // wall-time stop lands promptly, not only at the next turn admit.
-            if budget_stop.is_none()
-                && let Err(stop) = input.operation.sync_wall_time()
-            {
-                budget_stop = Some(stop);
-            }
             if emit_deltas {
                 sink.emit(events.usage_updated(totals))?;
                 if let Some(writer) = history_writer.as_deref_mut() {
@@ -471,17 +471,29 @@ impl RuntimeProviderTurnStep {
             }
         }
 
+        // Wall time is synced after EVERY completed provider exchange —
+        // a provider that returns no usage (or fails after a long request)
+        // must still land a wall-time stop promptly, not only at the next
+        // turn admit.
+        if budget_stop.is_none()
+            && let Err(stop) = input.operation.sync_wall_time()
+        {
+            budget_stop = Some(stop);
+        }
+
         if input.cancel.is_cancelled() {
             return cancelled_provider_turn(emit_deltas, events, sink);
         }
         if let Some(stop) = budget_stop {
-            // Commit the stop durably before surfacing: `checkpoint.created`
-            // then `operation.terminal`, both flushed to the journal. The
-            // surfaced terminal carries the real checkpoint and resumability.
-            let checkpoint_id = format!("{}-budget-stop", events.run_id());
-            let terminal = input.operation.commit_budget_stop(
+            // Commit the stop durably before surfacing: the session
+            // checkpoint (real durable message boundary) first, then the
+            // journal's checkpoint + terminal. The surfaced terminal carries
+            // the real checkpoint and resumability.
+            let terminal = input.operation.commit_budget_stop_with_boundary(
                 input.turn_context.turn_id.as_str(),
-                &checkpoint_id,
+                events.run_id(),
+                history_writer.as_deref_mut(),
+                &cost_tracker.totals(),
                 None,
             )?;
             return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {

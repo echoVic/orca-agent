@@ -78,6 +78,7 @@ pub fn run_child_agent_provider_turn(
                     status: RunStatus::Failed,
                     final_message: None,
                     error: Some(format!("pre_model_call hook failed: {error}")),
+                    budget_usage: None,
                 },
                 usage: None,
             };
@@ -111,6 +112,7 @@ pub fn run_child_agent_provider_turn(
                 status: RunStatus::Failed,
                 final_message: None,
                 error: Some(format!("post_model_call hook failed: {error}")),
+                budget_usage: None,
             },
             usage: response.usage,
         };
@@ -147,6 +149,7 @@ pub fn run_child_agent_provider_turn_observed(
                     status: RunStatus::Failed,
                     final_message: None,
                     error: Some(format!("pre_model_call hook failed: {error}")),
+                    budget_usage: None,
                 },
                 usage: None,
             };
@@ -184,6 +187,7 @@ pub fn run_child_agent_provider_turn_observed(
                 status: RunStatus::Failed,
                 final_message: None,
                 error: Some(format!("post_model_call hook failed: {error}")),
+                budget_usage: None,
             },
             usage: response.usage,
         };
@@ -253,6 +257,7 @@ pub fn handle_child_agent_provider_error(
                 status: RunStatus::Failed,
                 final_message: None,
                 error: Some(error),
+                budget_usage: None,
             }),
         )),
     }

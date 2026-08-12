@@ -16,10 +16,22 @@ pub enum RuntimeProviderSuspensionEvent {
     Completed(RuntimeModelResponse),
 }
 
+/// A resumable handle to the suspended operation's execution journal and
+/// budget spec. The background completion path reopens the journal (appending
+/// continues exactly where the loop stopped) and settles cost, wall time, and
+/// the operation terminal against the authoritative journal.
+#[derive(Clone, Debug)]
+pub struct SuspendedOperationHandle {
+    pub(crate) journal_path: std::path::PathBuf,
+    pub(crate) operation_id: String,
+    pub(crate) spec: orca_core::budget::BudgetSpec,
+}
+
 pub struct RuntimeProviderSuspension {
     stream: ProviderStreamingCall,
     model: Option<String>,
     identity: ModelResponseIdentity,
+    operation: Option<SuspendedOperationHandle>,
 }
 
 impl RuntimeProviderSuspension {
@@ -32,7 +44,17 @@ impl RuntimeProviderSuspension {
             stream,
             model,
             identity,
+            operation: None,
         }
+    }
+
+    pub(crate) fn with_operation(mut self, operation: SuspendedOperationHandle) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    pub(crate) fn operation(&self) -> Option<&SuspendedOperationHandle> {
+        self.operation.as_ref()
     }
 
     pub fn recv_timeout(

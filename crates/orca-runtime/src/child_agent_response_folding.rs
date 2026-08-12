@@ -52,6 +52,7 @@ pub fn fold_child_agent_provider_response(
             status: RunStatus::Success,
             final_message: response.assistant_content.clone(),
             error: None,
+            budget_usage: None,
         });
     }
 
@@ -100,6 +101,7 @@ pub fn fold_child_agent_tool_result(
             status: run_status_from_tool_status(result.status),
             final_message: None,
             error: result.error.clone(),
+            budget_usage: None,
         });
     }
 

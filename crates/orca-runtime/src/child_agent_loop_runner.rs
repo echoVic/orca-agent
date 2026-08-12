@@ -42,6 +42,19 @@ pub struct ChildAgentLoopContext<'a> {
     pub lease: Option<&'a mut crate::budget_controller::BudgetLease>,
 }
 
+/// Attaches the child's consumed budget receipt from its lease to the
+/// result, so the parent always learns what the child actually spent even
+/// when the child failed mid-loop.
+fn attach_child_usage_receipt(
+    mut result: ChildAgentResult,
+    lease: &crate::budget_controller::BudgetLease,
+) -> ChildAgentResult {
+    if result.budget_usage.is_none() {
+        result.budget_usage = Some(lease.usage());
+    }
+    result
+}
+
 pub fn run_child_agent_loop_with_tool_executor<F>(
     config: &RunConfig,
     context: ChildAgentLoopContext<'_>,
@@ -68,7 +81,9 @@ where
     loop {
         match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {}
-            ChildAgentTurnBudget::Stop(result) => return Ok(result),
+            ChildAgentTurnBudget::Stop(result) => {
+                return Ok(attach_child_usage_receipt(result, &lease));
+            }
         }
 
         compact_child_agent_conversation_if_needed(config, &mut setup, context.cwd, context.hooks)?;
@@ -91,9 +106,9 @@ where
                 if let Some(result) =
                     child_agent_budget_exhausted_result(config, context.child_cost_tracker)
                 {
-                    return Ok(result);
+                    return Ok(attach_child_usage_receipt(result, &lease));
                 }
-                return Ok(result);
+                return Ok(attach_child_usage_receipt(result, &lease));
             }
         };
 
@@ -109,11 +124,13 @@ where
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
-            return Ok(result);
+            return Ok(attach_child_usage_receipt(result, &lease));
         }
         match provider_error_decision {
             Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
-            Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
+            Some(ChildAgentProviderErrorDecision::Fail(result)) => {
+                return Ok(attach_child_usage_receipt(result, &lease));
+            }
             None => {}
         }
 
@@ -122,10 +139,12 @@ where
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
-            return Ok(result);
+            return Ok(attach_child_usage_receipt(result, &lease));
         }
         match provider_fold {
-            ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
+            ChildAgentProviderResponseFold::Complete(result) => {
+                return Ok(attach_child_usage_receipt(result, &lease));
+            }
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
 
@@ -148,11 +167,13 @@ where
             if let Some(result) =
                 child_agent_budget_exhausted_result(config, context.child_cost_tracker)
             {
-                return Ok(result);
+                return Ok(attach_child_usage_receipt(result, &lease));
             }
             match tool_fold {
                 ChildAgentToolResultFold::Continue => {}
-                ChildAgentToolResultFold::Stop(result) => return Ok(result),
+                ChildAgentToolResultFold::Stop(result) => {
+                    return Ok(attach_child_usage_receipt(result, &lease));
+                }
             }
         }
     }
@@ -189,7 +210,9 @@ where
                     observer.emit(ChildAgentActivity::TurnStarted { turn: setup.turn });
                 }
             }
-            ChildAgentTurnBudget::Stop(result) => return Ok(result),
+            ChildAgentTurnBudget::Stop(result) => {
+                return Ok(attach_child_usage_receipt(result, &lease));
+            }
         }
 
         compact_child_agent_conversation_if_needed(config, &mut setup, context.cwd, context.hooks)?;
@@ -213,9 +236,9 @@ where
                 if let Some(result) =
                     child_agent_budget_exhausted_result(config, context.child_cost_tracker)
                 {
-                    return Ok(result);
+                    return Ok(attach_child_usage_receipt(result, &lease));
                 }
-                return Ok(result);
+                return Ok(attach_child_usage_receipt(result, &lease));
             }
         };
 
@@ -231,11 +254,13 @@ where
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
-            return Ok(result);
+            return Ok(attach_child_usage_receipt(result, &lease));
         }
         match provider_error_decision {
             Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
-            Some(ChildAgentProviderErrorDecision::Fail(result)) => return Ok(result),
+            Some(ChildAgentProviderErrorDecision::Fail(result)) => {
+                return Ok(attach_child_usage_receipt(result, &lease));
+            }
             None => {}
         }
 
@@ -255,10 +280,12 @@ where
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
-            return Ok(result);
+            return Ok(attach_child_usage_receipt(result, &lease));
         }
         match provider_fold {
-            ChildAgentProviderResponseFold::Complete(result) => return Ok(result),
+            ChildAgentProviderResponseFold::Complete(result) => {
+                return Ok(attach_child_usage_receipt(result, &lease));
+            }
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
 
@@ -301,11 +328,13 @@ where
             if let Some(result) =
                 child_agent_budget_exhausted_result(config, context.child_cost_tracker)
             {
-                return Ok(result);
+                return Ok(attach_child_usage_receipt(result, &lease));
             }
             match tool_fold {
                 ChildAgentToolResultFold::Continue => {}
-                ChildAgentToolResultFold::Stop(result) => return Ok(result),
+                ChildAgentToolResultFold::Stop(result) => {
+                    return Ok(attach_child_usage_receipt(result, &lease));
+                }
             }
         }
     }
@@ -360,6 +389,7 @@ pub(crate) fn child_agent_budget_exhausted_result(
             spent_usd_micros as f64 / 1_000_000.0,
             max_cost_usd_micros as f64 / 1_000_000.0
         )),
+        budget_usage: None,
     })
 }
 

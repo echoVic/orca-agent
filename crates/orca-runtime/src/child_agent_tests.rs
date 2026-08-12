@@ -1319,6 +1319,7 @@ fn run_child_agent_applies_subagent_model_override() {
             status: RunStatus::Success,
             final_message: Some("ok".to_string()),
             error: None,
+            budget_usage: None,
         })
     });
 
@@ -1348,6 +1349,7 @@ fn run_child_agent_ignores_auto_override() {
             status: RunStatus::Success,
             final_message: None,
             error: None,
+            budget_usage: None,
         })
     });
 

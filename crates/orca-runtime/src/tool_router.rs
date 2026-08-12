@@ -80,6 +80,9 @@ pub(crate) enum RuntimeToolTurnDisposition {
 pub(crate) struct RuntimeToolDispatchOutput {
     pub(crate) result: tool_types::ToolResult,
     pub(crate) disposition: RuntimeToolTurnDisposition,
+    /// The subagent child's consumed budget receipt, when this dispatch ran
+    /// a child agent that reported one.
+    pub(crate) child_budget_usage: Option<orca_core::budget::BudgetUsage>,
 }
 
 impl RuntimeToolDispatchOutput {
@@ -87,6 +90,7 @@ impl RuntimeToolDispatchOutput {
         Self {
             result,
             disposition: RuntimeToolTurnDisposition::ContinueModel,
+            child_budget_usage: None,
         }
     }
 
@@ -94,6 +98,7 @@ impl RuntimeToolDispatchOutput {
         Self {
             result,
             disposition: RuntimeToolTurnDisposition::StopTurn,
+            child_budget_usage: None,
         }
     }
 }
@@ -160,6 +165,7 @@ impl<'a> RuntimeToolRouter<'a> {
             child_budget,
         } = context;
 
+        let mut dispatch_child_budget_usage = None;
         let result = match self.runtime.classify_dispatch(execution_request, goal_mode) {
             RuntimeSpecialToolDispatch::GetGoal
             | RuntimeSpecialToolDispatch::CreateGoal
@@ -223,27 +229,31 @@ impl<'a> RuntimeToolRouter<'a> {
                 wait_for_background_workflows,
                 workflow_lifecycle_ingress,
             ),
-            RuntimeSpecialToolDispatch::Subagent => execute_subagent_tool(
-                config,
-                cwd,
-                events,
-                sink,
-                execution_request,
-                subagent_depth,
-                instructions,
-                memory,
-                mcp_registry,
-                hooks,
-                emit_deltas,
-                cost_tracker,
-                cancel,
-                task_registry,
-                root_task_id,
-                workflow_ipc,
-                subagent_child_executor,
-                event_error,
-                child_budget.as_ref(),
-            ),
+            RuntimeSpecialToolDispatch::Subagent => {
+                let (result, child_budget_usage) = execute_subagent_tool(
+                    config,
+                    cwd,
+                    events,
+                    sink,
+                    execution_request,
+                    subagent_depth,
+                    instructions,
+                    memory,
+                    mcp_registry,
+                    hooks,
+                    emit_deltas,
+                    cost_tracker,
+                    cancel,
+                    task_registry,
+                    root_task_id,
+                    workflow_ipc,
+                    subagent_child_executor,
+                    event_error,
+                    child_budget.as_ref(),
+                )?;
+                dispatch_child_budget_usage = child_budget_usage;
+                Ok(result)
+            }
             RuntimeSpecialToolDispatch::SubagentStatus => Ok(self
                 .runtime
                 .execute_subagent_status_tool(execution_request, task_registry)),
@@ -347,6 +357,10 @@ impl<'a> RuntimeToolRouter<'a> {
                 Ok(output.result)
             }
         }?;
-        Ok(RuntimeToolDispatchOutput::continue_model(result))
+        Ok(RuntimeToolDispatchOutput {
+            result,
+            disposition: RuntimeToolTurnDisposition::ContinueModel,
+            child_budget_usage: dispatch_child_budget_usage,
+        })
     }
 }

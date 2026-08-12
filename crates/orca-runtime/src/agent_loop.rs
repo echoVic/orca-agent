@@ -60,14 +60,18 @@ pub(crate) fn run_agent_loop(
         lifecycle,
     } = turn_execution.expect("agent loop turn execution");
     // One OperationContext per agent loop (root and each child) owns the
-    // BudgetController and the ExecutionJournal for this operation. Recorded
-    // operations persist the journal under ORCA_HOME; stateless operations
-    // (jsonl without --save-history, server submits without history) journal
-    // to the temp directory and never create runtime artifacts in ORCA_HOME.
+    // BudgetController and the ExecutionJournal for this operation. Any
+    // history mode backed by a durable session (Record, Resume, ResumeAt,
+    // Fork) persists the journal under ORCA_HOME; only Disabled operations
+    // journal to the temp directory so stateless runs never create runtime
+    // artifacts in ORCA_HOME.
     let mut operation = crate::operation_context::OperationContext::open(
         config.budget.to_spec(),
         turn_id.as_str(),
-        matches!(config.history_mode, orca_core::config::HistoryMode::Record),
+        !matches!(
+            config.history_mode,
+            orca_core::config::HistoryMode::Disabled
+        ),
     )?;
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
@@ -123,7 +127,12 @@ pub(crate) fn run_agent_loop(
     // surfacing, so every other exit appends the terminal once here. The
     // journal is the source of truth for the operation's terminal fact, and
     // the `Completed` usage is finalized from the controller before commit.
+    // ApprovalRequired is NOT a terminal: the operation is parked waiting
+    // for approval and may resume, so no terminal is committed for it.
     if let AgentLoopOutcome::Completed(result) = &mut outcome {
+        if result.status == orca_core::event_schema::RunStatus::ApprovalRequired {
+            return Ok(outcome);
+        }
         if let OperationTerminal::Completed { usage } = &mut result.terminal {
             *usage = operation.controller.usage();
         }
@@ -196,6 +205,9 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         status: child.status,
         final_message: child.final_message,
         error: child.error,
+        // The child's consumed budget rides on the typed terminal usage so
+        // the parent can merge the exact receipt into its own operation.
+        budget_usage: child.terminal.usage(),
     })
 }
 

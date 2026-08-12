@@ -52,9 +52,9 @@ pub(crate) struct RuntimeSubagentBatchToolTurnRequest<'a> {
     pub(crate) tool_requests: &'a [tool_types::ToolRequest],
     pub(crate) subagent_depth: u32,
     pub(crate) emit_deltas: bool,
-    /// Lease-derived budget bound bounding every child in this batch (parent
-    /// remaining minus outstanding reservations).
-    pub(crate) child_budget: Option<orca_core::budget::BudgetSpec>,
+    /// Per-child lease-derived budget bounds (parent remaining minus
+    /// outstanding reservations), one per batch child in tool_requests order.
+    pub(crate) child_budgets: Vec<Option<orca_core::budget::BudgetSpec>>,
 }
 
 pub(crate) struct RuntimeSubagentBatchToolTurnIo<'a, W: io::Write> {
@@ -82,6 +82,8 @@ pub(crate) struct RuntimeSubagentBatchToolTurnRuntime<'a> {
 struct SubagentBatchExecution {
     results: Vec<(RunStatus, tool_types::ToolResult)>,
     event_error: Option<io::Error>,
+    /// Each child's consumed budget receipt, in child order.
+    child_budget_usage: Vec<Option<orca_core::budget::BudgetUsage>>,
 }
 
 fn emit_batch_event<W: io::Write>(
@@ -166,7 +168,7 @@ pub(crate) fn record_subagent_batch_results(
 
 pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
     context: RuntimeSubagentBatchToolTurnContext<'_, W>,
-) -> io::Result<ToolTurnOutcome> {
+) -> io::Result<(ToolTurnOutcome, Vec<Option<orca_core::budget::BudgetUsage>>)> {
     let RuntimeSubagentBatchToolTurnContext {
         request,
         io,
@@ -180,7 +182,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         tool_requests,
         subagent_depth,
         emit_deltas,
-        child_budget,
+        child_budgets,
     } = request;
     let RuntimeSubagentBatchToolTurnIo {
         events,
@@ -219,7 +221,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         root_task_id,
         workflow_ipc,
         child_executor,
-        child_budget.as_ref(),
+        &child_budgets,
     );
 
     let record_outcome = record_subagent_batch_results(
@@ -232,13 +234,17 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         return Err(error);
     }
 
+    let receipts = execution.child_budget_usage;
     match record_outcome {
-        SubagentBatchRecordOutcome::Continue => Ok(ToolTurnOutcome::Continue),
-        SubagentBatchRecordOutcome::Return { status, error } => Ok(ToolTurnOutcome::Return {
-            status,
-            error,
-            terminal: None,
-        }),
+        SubagentBatchRecordOutcome::Continue => Ok((ToolTurnOutcome::Continue, receipts)),
+        SubagentBatchRecordOutcome::Return { status, error } => Ok((
+            ToolTurnOutcome::Return {
+                status,
+                error,
+                terminal: None,
+            },
+            receipts,
+        )),
     }
 }
 
@@ -269,14 +275,14 @@ fn execute_subagent_batch(
     root_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
-    child_budget: Option<&orca_core::budget::BudgetSpec>,
+    child_budgets: &[Option<orca_core::budget::BudgetSpec>],
 ) -> SubagentBatchExecution {
-    // The parent operation's lease bounds every child in this batch; without
-    // an override the batch falls back to the parent config's budget.
-    let child_config = child_budget
-        .map(|spec| apply_child_budget_spec(config, spec))
-        .unwrap_or_else(|| config.clone());
+    // Each child's own lease bounds it (parent remaining minus outstanding
+    // reservations); without a lease the child falls back to the parent
+    // config's budget. The child_config is resolved per child below.
     let mut results: Vec<Option<(RunStatus, tool_types::ToolResult)>> =
+        vec![None; tool_requests.len()];
+    let mut child_budget_usage: Vec<Option<orca_core::budget::BudgetUsage>> =
         vec![None; tool_requests.len()];
     let mut runtime_outputs: Vec<Option<RuntimeSubagentCallOutput>> =
         (0..tool_requests.len()).map(|_| None).collect();
@@ -395,6 +401,10 @@ fn execute_subagent_batch(
         );
         let description = request.description.clone();
         let tool_id = effective.id.clone();
+        let child_config = match child_budgets.get(idx) {
+            Some(Some(spec)) => apply_child_budget_spec(config, spec),
+            _ => config.clone(),
+        };
         let invocation = RuntimeSubagentInvocation::snapshot(
             effective,
             request,
@@ -458,7 +468,9 @@ fn execute_subagent_batch(
                 );
             }
         }
+        let child_receipt = output.child_budget_usage;
         results[idx] = Some((output.status, output.result));
+        child_budget_usage[idx] = child_receipt;
     }
 
     SubagentBatchExecution {
@@ -467,6 +479,7 @@ fn execute_subagent_batch(
             .map(|result| result.expect("each subagent batch item has a result"))
             .collect(),
         event_error,
+        child_budget_usage,
     }
 }
 
@@ -491,7 +504,10 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     child_executor: ChildAgentExecutor<io::Sink>,
     event_error: &mut Option<io::Error>,
     child_budget: Option<&orca_core::budget::BudgetSpec>,
-) -> io::Result<tool_types::ToolResult> {
+) -> io::Result<(
+    tool_types::ToolResult,
+    Option<orca_core::budget::BudgetUsage>,
+)> {
     let request = subagent::with_delegation_snapshot(
         subagent::create_subagent_request(tool_request),
         orca_core::config::DelegationSnapshot::from_config(config),
@@ -509,7 +525,10 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
             emit_deltas,
             event_error,
         );
-        return Ok(tool_types::ToolResult::failed(tool_request, error, None));
+        return Ok((
+            tool_types::ToolResult::failed(tool_request, error, None),
+            None,
+        ));
     }
 
     if request.mode == SubagentMode::Async && config.budget.max_cost_usd_micros.is_some() {
@@ -523,7 +542,10 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
             emit_deltas,
             event_error,
         );
-        return Ok(tool_types::ToolResult::failed(tool_request, error, None));
+        return Ok((
+            tool_types::ToolResult::failed(tool_request, error, None),
+            None,
+        ));
     }
 
     if request.mode == SubagentMode::Async {
@@ -539,7 +561,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         if emit_deltas && let Some(task) = launch.task.as_ref() {
             emit_batch_event(sink, events.task_status_updated(task), event_error);
         }
-        return Ok(launch.result);
+        return Ok((launch.result, None));
     }
     let child_config = config_for_remaining_subagent_budget(config, cost_tracker, child_budget);
     let invocation = RuntimeSubagentInvocation::snapshot(
@@ -571,7 +593,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     if emit_deltas {
         emit_runtime_subagent_terminal(events, sink, &execution.output, event_error);
     }
-    Ok(execution.output.result)
+    Ok((execution.output.result, execution.output.child_budget_usage))
 }
 
 fn config_for_remaining_subagent_budget(
@@ -991,14 +1013,14 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-batch-turn".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
-        let outcome =
+        let (outcome, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
-                    child_budget: None,
+                    child_budgets: Vec::new(),
                     emit_deltas: true,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1047,6 +1069,7 @@ mod tests {
             status: RunStatus::Success,
             final_message: Some("injected child result".to_string()),
             error: None,
+            budget_usage: None,
         })
     }
 
@@ -1069,6 +1092,7 @@ mod tests {
             status: RunStatus::Cancelled,
             final_message: None,
             error: Some("child turn cancelled".to_string()),
+            budget_usage: None,
         })
     }
 
@@ -1087,6 +1111,7 @@ mod tests {
             status: RunStatus::Cancelled,
             final_message: None,
             error: Some("child cancelled parent batch".to_string()),
+            budget_usage: None,
         })
     }
 
@@ -1102,6 +1127,7 @@ mod tests {
             status: RunStatus::Success,
             final_message: Some("finished".to_string()),
             error: None,
+            budget_usage: None,
         })
     }
 
@@ -1159,14 +1185,14 @@ mod tests {
         let mut conversation = orca_core::conversation::Conversation::new();
         let started = Instant::now();
 
-        let outcome =
+        let (outcome, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
-                    child_budget: None,
+                    child_budgets: Vec::new(),
                     emit_deltas: false,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1239,7 +1265,7 @@ mod tests {
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
-                    child_budget: None,
+                    child_budgets: Vec::new(),
                     emit_deltas: true,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1306,14 +1332,14 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-batch-panic".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
-        let outcome =
+        let (outcome, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
-                    child_budget: None,
+                    child_budgets: Vec::new(),
                     emit_deltas: true,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1380,6 +1406,7 @@ mod tests {
             status: RunStatus::Success,
             final_message: Some("child completed before cleanup".to_string()),
             error: None,
+            budget_usage: None,
         })
     }
 
@@ -1430,7 +1457,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-cleanup-failure".to_string());
         let mut event_error = None;
 
-        let result = super::execute_subagent_tool(
+        let (result, _receipt) = super::execute_subagent_tool(
             &config,
             repo.path(),
             &mut events,
@@ -1504,7 +1531,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-panic-cleanup".to_string());
         let mut event_error = None;
 
-        let result = super::execute_subagent_tool(
+        let (result, _receipt) = super::execute_subagent_tool(
             &config,
             repo.path(),
             &mut events,
@@ -1568,14 +1595,14 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-batch-cancelled".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
 
-        let outcome =
+        let (outcome, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
                 request: super::RuntimeSubagentBatchToolTurnRequest {
                     config: &config,
                     cwd: cwd.path(),
                     tool_requests: &requests,
                     subagent_depth: 0,
-                    child_budget: None,
+                    child_budgets: Vec::new(),
                     emit_deltas: true,
                 },
                 io: super::RuntimeSubagentBatchToolTurnIo {
@@ -1646,7 +1673,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-injected".to_string());
         let mut event_error = None;
 
-        let result = super::execute_subagent_tool(
+        let (result, _receipt) = super::execute_subagent_tool(
             &config,
             cwd.path(),
             &mut events,
@@ -1696,7 +1723,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-pre-cancelled".to_string());
         let mut event_error = None;
 
-        let result = super::execute_subagent_tool(
+        let (result, _receipt) = super::execute_subagent_tool(
             &config,
             cwd.path(),
             &mut events,
@@ -1753,7 +1780,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-single-panic".to_string());
         let mut event_error = None;
 
-        let result = super::execute_subagent_tool(
+        let (result, _receipt) = super::execute_subagent_tool(
             &config,
             cwd.path(),
             &mut events,
@@ -1827,7 +1854,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-budget-async".to_string());
         let mut event_error = None;
 
-        let result = super::execute_subagent_tool(
+        let (result, _receipt) = super::execute_subagent_tool(
             &config,
             cwd.path(),
             &mut events,
@@ -1877,7 +1904,7 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-cancelled".to_string());
         let mut event_error = None;
 
-        let result = super::execute_subagent_tool(
+        let (result, _receipt) = super::execute_subagent_tool(
             &config,
             cwd.path(),
             &mut events,

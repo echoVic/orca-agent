@@ -3065,6 +3065,7 @@ mod tests {
             status: RunStatus::Success,
             final_message: Some("injected workflow child result".to_string()),
             error: None,
+            budget_usage: None,
         })
     }
 
@@ -3088,6 +3089,7 @@ mod tests {
             status: RunStatus::Cancelled,
             final_message: None,
             error: Some("workflow child cancelled".to_string()),
+            budget_usage: None,
         })
     }
 

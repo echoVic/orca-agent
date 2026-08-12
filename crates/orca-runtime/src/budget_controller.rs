@@ -146,6 +146,9 @@ impl BudgetController {
     /// child's effective spec is the intersection of its own limits with what
     /// the parent has left *after* deducting every outstanding reservation,
     /// so concurrent children can never double-spend the parent's operation.
+    /// A dimension with nothing left (consumed or reserved) grants no
+    /// capacity: the lease is refused instead of padding the remainder, so a
+    /// child can never be handed budget the parent does not have.
     /// The reservation is held for the lease's lifetime and returned when the
     /// lease settles (RAII via [`BudgetLease::finish`] and `Drop`); consumed
     /// usage reports back through [`BudgetController::merge_child_usage`].
@@ -163,6 +166,12 @@ impl BudgetController {
             .expect("lease reservation pool")
             .reserved;
         let remaining = self.remaining_spec_after(reserved);
+        if let Some(reason) = exhausted_dimension_of(&remaining, &self.spec) {
+            return Err(BudgetStop {
+                reason,
+                usage: self.usage,
+            });
+        }
         let effective = intersect_specs(remaining, child_spec);
         {
             let mut pool = self.reservations.lock().expect("lease reservation pool");
@@ -192,14 +201,15 @@ impl BudgetController {
     }
 
     /// What this operation still has left, per dimension, after both consumed
-    /// usage and capacity reserved by outstanding child leases.
+    /// usage and capacity reserved by outstanding child leases. A dimension
+    /// with nothing left yields `Some(0)` — never a padded minimum — so a
+    /// lease can never be granted capacity the parent does not have.
     fn remaining_spec_after(&self, reserved: BudgetUsage) -> BudgetSpec {
         let subtract_turns = |limit: Option<u32>| {
             limit.map(|limit| {
                 limit
                     .saturating_sub(self.usage.turns)
                     .saturating_sub(reserved.turns)
-                    .max(1)
             })
         };
         let subtract_tools = |limit: Option<u32>| {
@@ -207,7 +217,6 @@ impl BudgetController {
                 limit
                     .saturating_sub(self.usage.tool_calls)
                     .saturating_sub(reserved.tool_calls)
-                    .max(1)
             })
         };
         BudgetSpec {
@@ -217,23 +226,43 @@ impl BudgetController {
                 limit
                     .saturating_sub(self.usage.cost_usd_micros)
                     .saturating_sub(reserved.cost_usd_micros)
-                    .max(1)
             }),
             max_wall_time_ms: self.spec.max_wall_time_ms.map(|limit| {
                 limit
                     .saturating_sub(self.usage.wall_time_ms)
                     .saturating_sub(reserved.wall_time_ms)
-                    .max(1)
             }),
         }
     }
 
     /// Publishes elapsed wall time into usage and stops when the wall-time
-    /// dimension is exhausted. Call after any long-running provider exchange
-    /// so a wall-time stop lands promptly, not only at the next turn admit.
+    /// dimension is exhausted (or a stop was already latched). The turn
+    /// dimension is never a constraint here: a turn already admitted may
+    /// keep running its tools while the wall clock ticks. Call after every
+    /// provider exchange so a wall-time stop lands promptly.
     pub(crate) fn sync_wall_time(&mut self) -> Result<(), BudgetStop> {
         self.sync_wall_time_inner();
-        self.stop_if_exhausted().map_or(Ok(()), Err)
+        self.stop_if_wall_time_exhausted().map_or(Ok(()), Err)
+    }
+
+    fn stop_if_wall_time_exhausted(&mut self) -> Option<BudgetStop> {
+        let reason = match self.state {
+            TerminalState::Stopped(reason) => reason,
+            TerminalState::Running => {
+                let Some(max_wall_time_ms) = self.spec.max_wall_time_ms else {
+                    return None;
+                };
+                if self.usage.wall_time_ms <= max_wall_time_ms {
+                    return None;
+                }
+                StopReason::WallTimeBudget { max_wall_time_ms }
+            }
+        };
+        self.state = TerminalState::Stopped(reason);
+        Some(BudgetStop {
+            reason,
+            usage: self.usage,
+        })
     }
 
     fn sync_wall_time_inner(&mut self) {
@@ -500,6 +529,33 @@ fn intersect_specs(left: BudgetSpec, right: BudgetSpec) -> BudgetSpec {
     }
 }
 
+/// The first dimension with nothing left to grant (`Some(0)` after consumed
+/// usage and outstanding reservations are deducted). The parent still has
+/// the dimension configured, so the reason reports the original limit.
+fn exhausted_dimension_of(remaining: &BudgetSpec, spec: &BudgetSpec) -> Option<StopReason> {
+    if remaining.max_turns == Some(0) {
+        return Some(StopReason::TurnBudget {
+            max_turns: spec.max_turns.unwrap_or(0),
+        });
+    }
+    if remaining.max_tool_calls == Some(0) {
+        return Some(StopReason::ToolCallBudget {
+            max_tool_calls: spec.max_tool_calls.unwrap_or(0),
+        });
+    }
+    if remaining.max_cost_usd_micros == Some(0) {
+        return Some(StopReason::CostBudget {
+            max_cost_usd_micros: spec.max_cost_usd_micros.unwrap_or(0),
+        });
+    }
+    if remaining.max_wall_time_ms == Some(0) {
+        return Some(StopReason::WallTimeBudget {
+            max_wall_time_ms: spec.max_wall_time_ms.unwrap_or(0),
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,7 +573,8 @@ mod tests {
         parent.admit_turn().expect("parent turn 1");
 
         // Two outstanding leases: the first reserves the remaining two turns,
-        // so the second can only see one turn left — never the full two.
+        // so the second finds nothing left and is refused — it never sees
+        // capacity the parent does not have.
         let first = parent
             .child_lease(BudgetSpec {
                 max_turns: Some(5),
@@ -526,13 +583,15 @@ mod tests {
             .expect("first lease granted");
         assert_eq!(first.spec().max_turns, Some(2));
 
-        let second = parent
-            .child_lease(BudgetSpec {
-                max_turns: Some(5),
-                ..spec()
-            })
-            .expect("second lease granted");
-        assert_eq!(second.spec().max_turns, Some(1));
+        let second = parent.child_lease(BudgetSpec {
+            max_turns: Some(5),
+            ..spec()
+        });
+        let stop = second.expect_err("second lease must be refused");
+        assert!(matches!(
+            stop.reason,
+            StopReason::TurnBudget { max_turns: 3 }
+        ));
     }
 
     #[test]

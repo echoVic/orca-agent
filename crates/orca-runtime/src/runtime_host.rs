@@ -37610,46 +37610,17 @@ fn run_headless_session(
         sink.emit(events.error(&format!("session_end hook failed: {error}")))?;
     }
     if let ThreadOperationOutcome::Completed {
-        end_reason,
         terminal,
         background_workflows: _,
         ..
     } = &outcome
     {
-        // Soft landing: a typed budget stop persists a checkpoint before the
-        // terminal projection, so the caller can resume from the last
-        // committed boundary with a fresh budget scope.
-        if matches!(
-            terminal,
-            Some(orca_core::budget::OperationTerminal::Stopped { .. })
-        ) && let Some(session_id) = thread.session().session_id().map(str::to_string)
-        {
-            let checkpoint = {
-                let session = thread.session();
-                let last_committed_message_id =
-                    session.conversation_records().and_then(|records| {
-                        records.iter().rev().find_map(|record| {
-                            record.item_id.as_ref().map(|id| id.as_str().to_string())
-                        })
-                    });
-                crate::thread_store::SessionCheckpointRecord {
-                    session_id,
-                    status: "budget_exhausted".to_string(),
-                    reason: Some(end_reason.as_str().to_string()),
-                    budget_consumed: session.aggregate_usage_totals(),
-                    last_committed_message_id,
-                    resumable: true,
-                    task_plan: crate::thread::plan_snapshot(session.conversation())
-                        .map(str::to_string),
-                    recorded_at: chrono::Utc::now(),
-                }
-            };
-            if let Some(writer) = thread.session_mut().writer_mut()
-                && let Err(error) = writer.append_checkpoint(checkpoint)
-            {
-                eprintln!("orca: warning: failed to record session checkpoint: {error}");
-            }
-        }
+        // The resume boundary for a budget stop is committed by the agent
+        // loop itself (OperationContext::commit_budget_stop_with_boundary)
+        // in the correct order: session checkpoint with the durable
+        // last-committed message id first, then journal checkpoint +
+        // terminal. Nothing is written here so the boundary can never be
+        // duplicated or come after the terminal.
         if let Some(terminal) = terminal {
             // Legacy statuses that predate typed terminals keep their own
             // session status: approval-required and verification-failed are
@@ -37673,6 +37644,54 @@ fn run_headless_session(
         }
     }
     Ok(outcome)
+}
+
+/// Settles a suspended provider exchange against the operation's journal:
+/// the provider-reported usage is recorded (cost + wall time) and the
+/// operation terminal commits once. ApprovalRequired stays non-terminal.
+fn settle_suspended_operation(
+    handle: &crate::provider_stream::SuspendedOperationHandle,
+    response: &crate::model_response::RuntimeModelResponse,
+    model: Option<&str>,
+    status: RunStatus,
+    error: Option<&str>,
+) {
+    let Ok(mut operation) = crate::operation_context::OperationContext::reopen(
+        handle.journal_path.clone(),
+        handle.spec,
+        &handle.operation_id,
+    ) else {
+        return;
+    };
+    let usage = provider_response_usage_totals(&response.response, model);
+    if let Some(usage) = usage {
+        let spent = crate::cost::usd_to_micros(usage.estimated_cost_usd);
+        let recorded = operation.controller.usage().cost_usd_micros;
+        let delta = spent.saturating_sub(recorded);
+        if delta > 0 {
+            // Cost exhaustion latches the controller; the next admission
+            // surfaces it as a typed stop.
+            let _ = operation.record_cost_usd_micros(delta);
+        }
+    }
+    let _ = operation.sync_wall_time();
+    if status == RunStatus::ApprovalRequired {
+        return;
+    }
+    let terminal = match status {
+        RunStatus::Success => orca_core::budget::OperationTerminal::Completed {
+            usage: operation.controller.usage(),
+        },
+        RunStatus::Cancelled => orca_core::budget::OperationTerminal::Cancelled {
+            reason: orca_core::budget::CancelReason::User,
+            checkpoint_id: None,
+        },
+        _ => orca_core::budget::OperationTerminal::Failed {
+            class: orca_core::budget::FailureClass::Runtime,
+            message: error.unwrap_or_default().to_string(),
+        },
+    };
+    let _ = operation.commit_terminal(&handle.operation_id, terminal);
 }
 
 fn run_provider_background_task(
@@ -37747,6 +37766,22 @@ fn run_provider_background_task(
         } else {
             status = RunStatus::Success;
         }
+    }
+
+    // The suspended operation settles against its authoritative journal:
+    // provider cost and wall time land in the budget controller, and the
+    // operation terminal commits once (ApprovalRequired is not a terminal —
+    // the operation stays parked for approval and may resume).
+    if let Some(handle) = suspension.operation()
+        && let Some(response) = response.as_ref()
+    {
+        settle_suspended_operation(
+            handle,
+            response,
+            context.model.as_deref(),
+            status,
+            error.as_deref(),
+        );
     }
 
     if let Some(surface_outcome) = context.surface_outcome {

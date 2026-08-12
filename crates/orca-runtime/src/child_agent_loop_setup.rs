@@ -103,6 +103,7 @@ pub fn advance_child_agent_turn(
                 stop.usage.turns,
                 stop.usage.tool_calls
             )),
+            budget_usage: None,
         });
     }
 
@@ -122,6 +123,7 @@ pub fn advance_child_agent_turn_with_limit(
             status: RunStatus::Failed,
             final_message: None,
             error: Some("budget stopped: child turn budget exhausted".to_string()),
+            budget_usage: None,
         });
     }
 

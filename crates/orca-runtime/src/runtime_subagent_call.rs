@@ -89,6 +89,8 @@ pub(crate) struct RuntimeSubagentCallOutput {
     pub(crate) event_output: Option<String>,
     pub(crate) event_error: Option<String>,
     pub(crate) cost_tracker: CostTracker,
+    /// The child's consumed budget receipt, when the child loop reported one.
+    pub(crate) child_budget_usage: Option<orca_core::budget::BudgetUsage>,
 }
 
 pub(crate) struct RuntimeSubagentAdmission {
@@ -197,6 +199,7 @@ impl RuntimeSubagentBatch {
                             event_output: None,
                             event_error: Some(message),
                             cost_tracker: CostTracker::new(None),
+                            child_budget_usage: None,
                         },
                     )),
                     event_error: None,
@@ -243,6 +246,7 @@ impl RuntimeSubagentBatch {
                             event_output: None,
                             event_error: Some(error),
                             cost_tracker: CostTracker::new(None),
+            child_budget_usage: None,
                         }
                     }
                 };
@@ -301,6 +305,7 @@ fn run_subagent_worker(
                     event_output: None,
                     event_error: Some(error),
                     cost_tracker: CostTracker::new(config.model.as_deref()),
+                    child_budget_usage: None,
                 };
             }
         }
@@ -378,6 +383,7 @@ fn run_subagent_worker(
                 event_output: None,
                 event_error: Some(error),
                 cost_tracker: CostTracker::new(config.model.as_deref()),
+                child_budget_usage: None,
             }
         }
     }
@@ -421,6 +427,7 @@ fn finish_child_output(
                 event_output: child.final_message,
                 event_error: Some(error),
                 cost_tracker,
+                child_budget_usage: child.budget_usage,
             };
         }
     };
@@ -445,6 +452,7 @@ fn finish_child_output(
                     event_output: Some(output),
                     event_error: Some(error),
                     cost_tracker,
+                    child_budget_usage: child.budget_usage,
                 };
             }
             append_worktree_outcome(&mut output, worktree.as_ref());
@@ -461,6 +469,7 @@ fn finish_child_output(
                 event_output: Some(output),
                 event_error: None,
                 cost_tracker,
+                child_budget_usage: child.budget_usage,
             }
         }
         RunStatus::Cancelled => {
@@ -481,6 +490,7 @@ fn finish_child_output(
                 event_output: child.final_message,
                 event_error: Some(error),
                 cost_tracker,
+                child_budget_usage: child.budget_usage,
             }
         }
         status => {
@@ -501,6 +511,7 @@ fn finish_child_output(
                 event_output: child.final_message,
                 event_error: Some(error),
                 cost_tracker,
+                child_budget_usage: child.budget_usage,
             }
         }
     }
@@ -520,6 +531,7 @@ fn cancelled_before_start(invocation: RuntimeSubagentInvocation) -> RuntimeSubag
         event_output: None,
         event_error: None,
         cost_tracker: CostTracker::new(invocation.config.model.as_deref()),
+        child_budget_usage: None,
     }
 }
 
@@ -538,6 +550,7 @@ fn failed_before_start(
         event_output: None,
         event_error: Some(error),
         cost_tracker: CostTracker::new(invocation.config.model.as_deref()),
+        child_budget_usage: None,
     }
 }
 

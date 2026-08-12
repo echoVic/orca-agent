@@ -5,6 +5,7 @@ use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
+use orca_core::conversation::Message;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::tool_types::{ToolRequest, ToolResult};
@@ -99,6 +100,9 @@ pub(crate) struct RuntimeNormalToolTurnContext<'a, W: io::Write> {
 pub(crate) struct RuntimeNormalToolTurnExecution {
     outcome: ToolTurnOutcome,
     event_error: Option<io::Error>,
+    /// The subagent child's consumed budget receipt, when this tool ran a
+    /// child agent that reported one.
+    child_budget_usage: Option<orca_core::budget::BudgetUsage>,
 }
 
 pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
@@ -351,8 +355,9 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                         Some("budget stopped before dispatch".to_string()),
                     )?;
                 }
-                let checkpoint_id = format!("{}-budget-stop", events.run_id());
-                let terminal = operation.commit_budget_stop(turn_id, &checkpoint_id, None)?;
+                // Settle every unstarted tool first (their conversation
+                // results are the resume boundary), then commit the real
+                // session boundary + journal checkpoint + terminal.
                 close_unstarted_tool_requests(
                     sampling_state,
                     tool_requests,
@@ -363,6 +368,13 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     emit_deltas,
                     provider_response_ingress,
                     "an earlier tool dispatch was stopped by the operation budget",
+                )?;
+                let terminal = operation.commit_budget_stop_with_boundary(
+                    turn_id,
+                    events.run_id(),
+                    history_writer.as_deref_mut(),
+                    &cost_tracker.totals(),
+                    None,
                 )?;
                 return Ok(ToolTurnOutcome::Return {
                     status: RunStatus::Failed,
@@ -378,23 +390,67 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         }
 
         if let RuntimeToolDispatch::SubagentBatch(dispatch_window) = dispatch {
-            // Reserve the batch's child budget from the parent operation so
-            // concurrent children never double-spend it; the effective spec
-            // bounds every child in the batch and settles back afterwards.
-            let mut child_lease = operation.as_deref_mut().and_then(|operation| {
-                operation
-                    .controller
-                    .child_lease(config.budget.to_spec())
-                    .ok()
-            });
-            let outcome = run_subagent_batch_tool_turn(RuntimeSubagentBatchToolTurnContext {
+            // Reserve ONE lease per batch child from the parent operation so
+            // concurrent children can never double-spend it: each child's
+            // effective spec accounts for every earlier child's outstanding
+            // reservation. Leases settle back (RAII) with the child receipts.
+            let mut child_leases: Vec<Option<crate::budget_controller::BudgetLease>> = Vec::new();
+            let mut child_budgets: Vec<Option<orca_core::budget::BudgetSpec>> = Vec::new();
+            if let Some(operation) = operation.as_deref_mut() {
+                for _ in dispatch_window.tool_requests() {
+                    match operation.controller.child_lease(config.budget.to_spec()) {
+                        Ok(lease) => {
+                            child_budgets.push(Some(*lease.spec()));
+                            child_leases.push(Some(lease));
+                        }
+                        Err(stop) => {
+                            // The parent has no capacity left for another
+                            // child: settle the already-granted leases and
+                            // stop the batch through the typed budget stop.
+                            for lease in child_leases.drain(..).flatten() {
+                                let consumed = lease.finish();
+                                let _ = operation.controller.merge_child_usage(consumed);
+                            }
+                            let terminal = operation.commit_budget_stop_with_boundary(
+                                turn_id,
+                                events.run_id(),
+                                history_writer.as_deref_mut(),
+                                &cost_tracker.totals(),
+                                None,
+                            )?;
+                            close_unstarted_tool_requests(
+                                sampling_state,
+                                tool_requests,
+                                events,
+                                sink,
+                                conversation,
+                                history_writer.as_deref_mut(),
+                                emit_deltas,
+                                provider_response_ingress,
+                                "an earlier subagent dispatch was stopped by the operation budget",
+                            )?;
+                            return Ok(ToolTurnOutcome::Return {
+                                status: RunStatus::Failed,
+                                error: Some(format!(
+                                    "budget stopped: {} (turns={}, tool_calls={})",
+                                    stop.reason.as_str(),
+                                    stop.usage.turns,
+                                    stop.usage.tool_calls
+                                )),
+                                terminal: Some(terminal),
+                            });
+                        }
+                    }
+                }
+            }
+            let batch_result = run_subagent_batch_tool_turn(RuntimeSubagentBatchToolTurnContext {
                 request: RuntimeSubagentBatchToolTurnRequest {
                     config,
                     cwd,
                     tool_requests: dispatch_window.tool_requests(),
                     subagent_depth,
                     emit_deltas,
-                    child_budget: child_lease.as_ref().map(|lease| *lease.spec()),
+                    child_budgets,
                 },
                 io: RuntimeSubagentBatchToolTurnIo {
                     events,
@@ -417,11 +473,21 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 },
                 child_executor: batch_child_executor,
             });
+            // The cursor advances past the whole window before error
+            // handling, so the unstarted-close below never double-records
+            // children the batch already settled.
             sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
+            let (outcome, batch_receipts) = match batch_result {
+                Ok(pair) => pair,
                 Err(error) => {
-                    settle_child_lease(&mut child_lease, &mut operation);
+                    // The batch failed before producing receipts; every
+                    // granted lease still settles (reservation returns).
+                    for lease in child_leases.drain(..).flatten() {
+                        let consumed = lease.finish();
+                        if let Some(operation) = operation.as_deref_mut() {
+                            let _ = operation.controller.merge_child_usage(consumed);
+                        }
+                    }
                     close_unstarted_tool_requests(
                         sampling_state,
                         tool_requests,
@@ -438,11 +504,22 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             };
             if let Some(operation) = operation.as_deref_mut() {
                 for request in dispatch_window.tool_requests() {
-                    operation.record_tool_completed(turn_id, &request.id, "completed", None)?;
+                    operation.record_tool_completed(
+                        turn_id,
+                        &request.id,
+                        conversation_tool_settlement(conversation, &request.id).0,
+                        conversation_tool_settlement(conversation, &request.id).1,
+                    )?;
                 }
             }
             if matches!(outcome, ToolTurnOutcome::Return { .. }) {
-                settle_child_lease(&mut child_lease, &mut operation);
+                for (lease, receipt) in child_leases
+                    .drain(..)
+                    .flatten()
+                    .zip(batch_receipts.into_iter())
+                {
+                    settle_child_lease(&mut Some(lease), receipt, &mut operation);
+                }
                 close_unstarted_tool_requests(
                     sampling_state,
                     tool_requests,
@@ -456,7 +533,13 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 )?;
                 return Ok(outcome);
             }
-            settle_child_lease(&mut child_lease, &mut operation);
+            for (lease, receipt) in child_leases
+                .drain(..)
+                .flatten()
+                .zip(batch_receipts.into_iter())
+            {
+                settle_child_lease(&mut Some(lease), receipt, &mut operation);
+            }
             continue;
         }
 
@@ -508,7 +591,12 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             };
             if let Some(operation) = operation.as_deref_mut() {
                 for request in dispatch_window.tool_requests() {
-                    operation.record_tool_completed(turn_id, &request.id, "completed", None)?;
+                    operation.record_tool_completed(
+                        turn_id,
+                        &request.id,
+                        conversation_tool_settlement(conversation, &request.id).0,
+                        conversation_tool_settlement(conversation, &request.id).1,
+                    )?;
                 }
             }
             if matches!(outcome, ToolTurnOutcome::Return { .. }) {
@@ -596,7 +684,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         let execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
-                settle_child_lease(&mut child_lease, &mut operation);
+                settle_child_lease(&mut child_lease, None, &mut operation);
                 if is_semantic_commit_failure(&error) {
                     return Err(error);
                 }
@@ -660,7 +748,11 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         };
         sampling_state.advance_tool_cursor_one(tool_requests.len());
         if let Some(error) = execution.event_error {
-            settle_child_lease(&mut child_lease, &mut operation);
+            settle_child_lease(
+                &mut child_lease,
+                execution.child_budget_usage,
+                &mut operation,
+            );
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -676,10 +768,19 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         }
         let outcome = execution.outcome;
         if let Some(operation) = operation.as_deref_mut() {
-            operation.record_tool_completed(turn_id, &tool_request.id, "completed", None)?;
+            operation.record_tool_completed(
+                turn_id,
+                &tool_request.id,
+                conversation_tool_settlement(conversation, &tool_request.id).0,
+                conversation_tool_settlement(conversation, &tool_request.id).1,
+            )?;
         }
         if matches!(outcome, ToolTurnOutcome::Return { .. }) {
-            settle_child_lease(&mut child_lease, &mut operation);
+            settle_child_lease(
+                &mut child_lease,
+                execution.child_budget_usage,
+                &mut operation,
+            );
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -693,27 +794,67 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             )?;
             return Ok(outcome);
         }
-        settle_child_lease(&mut child_lease, &mut operation);
+        settle_child_lease(
+            &mut child_lease,
+            execution.child_budget_usage,
+            &mut operation,
+        );
     }
 
     Ok(ToolTurnOutcome::Continue)
 }
 
-/// Settles a child budget lease exactly once: consumed usage merges into the
-/// parent operation and the reservation returns to its pool. Safe to call
-/// repeatedly on every branch exit; only the first call settles.
+/// Settles a child budget lease exactly once: the child's consumed usage
+/// receipt (when the child reported one) merges into the parent operation and
+/// the reservation returns to its pool. Safe to call repeatedly on every
+/// branch exit; only the first call settles.
 fn settle_child_lease(
     child_lease: &mut Option<crate::budget_controller::BudgetLease>,
+    child_usage: Option<orca_core::budget::BudgetUsage>,
     operation: &mut Option<&mut OperationContext>,
 ) {
     let Some(lease) = child_lease.take() else {
         return;
     };
-    let consumed = lease.finish();
+    let consumed = child_usage.unwrap_or_else(|| lease.finish());
     if let Some(operation) = operation.as_deref_mut() {
         // Merging past the parent's ceiling latches the parent stop; the
         // next turn admission surfaces it as a typed terminal.
         let _ = operation.controller.merge_child_usage(consumed);
+    }
+}
+
+/// The final settlement label for a tool from the committed conversation
+/// (the same source the tool events and recovery read), so the journal never
+/// disagrees with the conversation about a tool's outcome.
+fn conversation_tool_settlement(
+    conversation: &Conversation,
+    tool_call_id: &str,
+) -> (&'static str, Option<String>) {
+    conversation
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Tool {
+                tool_call_id: id,
+                terminal: Some(terminal),
+                ..
+            } if id == tool_call_id => Some((tool_status_label(&terminal.status), None)),
+            _ => None,
+        })
+        .unwrap_or(("completed", None))
+}
+
+fn tool_status_label(status: &orca_core::tool_types::ToolStatus) -> &'static str {
+    use orca_core::tool_types::ToolStatus;
+    match status {
+        ToolStatus::Completed => "completed",
+        ToolStatus::Failed => "failed",
+        ToolStatus::Indeterminate => "indeterminate",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Cancelled => "cancelled",
+        ToolStatus::NotImplemented => "not_implemented",
     }
 }
 
@@ -887,6 +1028,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
                 terminal: None,
             },
             event_error,
+            child_budget_usage: None,
         });
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
@@ -1001,6 +1143,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     Ok(RuntimeNormalToolTurnExecution {
         outcome,
         event_error,
+        child_budget_usage: execution.child_budget_usage,
     })
 }
 
@@ -1273,6 +1416,7 @@ mod tests {
             status: RunStatus::Success,
             final_message: Some("first child completed".to_string()),
             error: None,
+            budget_usage: None,
         })
     }
 
@@ -1287,6 +1431,7 @@ mod tests {
             status: RunStatus::Success,
             final_message: Some("child finished".to_string()),
             error: None,
+            budget_usage: None,
         })
     }
 
@@ -1331,6 +1476,7 @@ mod tests {
             status: RunStatus::Cancelled,
             final_message: None,
             error: Some("root-scoped cancellation".to_string()),
+            budget_usage: None,
         })
     }
 

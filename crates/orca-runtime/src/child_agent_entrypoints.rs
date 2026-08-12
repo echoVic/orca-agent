@@ -63,6 +63,7 @@ where
                 status: RunStatus::Failed,
                 final_message: None,
                 error: Some(error.to_string()),
+                budget_usage: None,
             }
         });
     (result, child_cost_tracker)
