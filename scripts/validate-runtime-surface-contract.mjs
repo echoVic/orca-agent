@@ -831,8 +831,8 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
 ]);
 
 const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES = new Map([
-  ["crates/orca-tui/src/app.rs:clear_terminal_scrollback:Terminal::clear", 1],
-  ["crates/orca-tui/src/app.rs:resume_terminal_render:Terminal::clear", 1],
+  ["crates/orca-tui/src/scrollback.rs:clear_terminal_scrollback:Terminal::clear", 1],
+  ["crates/orca-tui/src/presentation.rs:resume_terminal_render:Terminal::clear", 1],
   [
     "crates/orca-tui/src/surface_actions.rs:launch_workflow:crate::surface_client::launch_workflow",
     1,
@@ -846,11 +846,11 @@ const BASELINE_UNRESOLVED_USER_ACTION_SEND_SITES = new Map([]);
 
 const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
   [
-    "crates/orca-tui/src/app.rs:clear_terminal_scrollback",
-    "11b29531e3da780b33bfc28b127c19c2e1ee203dcd99c5fccaf26846417d571d",
+    "crates/orca-tui/src/scrollback.rs:clear_terminal_scrollback",
+    "6a0f700ce189fe0b8356ee5e61df87c9292f488c979bbb520100502d75b8be8a",
   ],
   [
-    "crates/orca-tui/src/app.rs:resume_terminal_render",
+    "crates/orca-tui/src/presentation.rs:resume_terminal_render",
     "8ff17eeb9d82b6b0f014b64e21d1813e4f26880ffeddee8971da8aac661813dc",
   ],
   [

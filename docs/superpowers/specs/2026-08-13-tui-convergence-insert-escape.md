@@ -118,3 +118,21 @@ four helpers `shutdown_attached_side_on_controller_exit`,
 `crates/orca-tui/src/hosted_side.rs`, and the `TuiExit` struct into
 `exit_policy.rs` (the exit type belongs with the exit policy). Pure
 relocation; same acceptance as slices 1-6.
+
+## Baseline Maintenance (added after the CI baseline fix)
+
+Any slice that relocates a function listed in the reviewed TUI
+inventories of `scripts/validate-runtime-surface-contract.mjs` must
+refresh those inventories in the same commit:
+
+- `BASELINE_DIRECT_TUI_MUTATION_SITES`
+- `BASELINE_HARMLESS_SAME_NAME_METHOD_SITES`
+- `BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES`
+- `BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256`
+- `BASELINE_UNRESOLVED_USER_ACTION_SEND_SITES` and its SHA256 map
+
+Oracle: `node --test scripts/test-validate-runtime-surface-contract.mjs`.
+The exported `scanTuiMutation*` helpers dump the current inventory for
+regeneration. Slices 2 and 5 missed this step and red-lined CI on main
+until the dedicated fix (see
+`2026-08-13-ci-surface-contract-baseline-drift.md`).
