@@ -62,7 +62,7 @@ use crate::runtime_actor::background::{
 };
 use crate::runtime_actor::capability::{
     CapabilityCommitEffect, CapabilityReply, PendingSurfaceCapabilitySettlement,
-    PendingSurfaceCapabilityTransition, PendingSurfaceCapabilityWaiterOutcome,
+    PendingSurfaceCapabilityWaiterOutcome, ResidentCapabilityController,
     ResidentSurfaceCapabilityCall, ResidentSurfaceCapabilityWaiter, ResidentTerminalCleanupLease,
     RuntimeCapabilityController,
 };
@@ -8774,7 +8774,7 @@ fn surface_input_presentation_text(input: &surface::SurfaceInput) -> surface::Di
     surface_persisted_display_text(input.canonical_text.as_str())
 }
 
-fn surface_persisted_display_text(text: &str) -> surface::DisplayText {
+pub(crate) fn surface_persisted_display_text(text: &str) -> surface::DisplayText {
     surface::DisplayText::new(crate::thread_store::redact_sensitive_text(text))
 }
 
@@ -9008,9 +9008,6 @@ impl std::ops::DerefMut for ResidentSurfaceSlot {
             .expect("typed surface state is present after client admission")
     }
 }
-
-type ResidentCapabilityController =
-    RuntimeCapabilityController<ResidentSurfaceCapabilityCall, PendingSurfaceCapabilityTransition>;
 
 type ResidentBackgroundController = BackgroundOperationController<
     HostBackgroundTask,
@@ -10500,7 +10497,7 @@ fn surface_goal_mutation_event(
     ))
 }
 
-fn runtime_surface_event_batch(
+pub(crate) fn runtime_surface_event_batch(
     snapshot: &surface::SurfaceSnapshot,
     events: Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
     commit_id: Option<surface::SurfaceCommitId>,
@@ -17196,28 +17193,19 @@ impl ThreadActor {
         &self,
         call: surface::SurfaceCapabilityCall,
     ) -> surface::SurfaceCommitBatch {
-        self.capability_call_transition_batch(vec![call])
+        crate::runtime_actor::capability::capability_call_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
+        )
     }
 
     fn capability_call_transition_batch(
         &self,
         calls: Vec<surface::SurfaceCapabilityCall>,
     ) -> surface::SurfaceCommitBatch {
-        self.surface_event_batch_with_commit_id(
-            calls
-                .into_iter()
-                .map(|call| {
-                    (
-                        surface::SurfaceScope::Generation {
-                            fence: call.fence.clone(),
-                        },
-                        surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
-                            call,
-                        }),
-                    )
-                })
-                .collect(),
-            None,
+        crate::runtime_actor::capability::capability_call_transition_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            calls,
         )
     }
 
@@ -17228,73 +17216,20 @@ impl ThreadActor {
         Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
         surface::SurfaceClientCommandError,
     > {
-        let surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous { error, .. } =
-            &call.state
-        else {
-            return Err(surface::SurfaceClientCommandError::Unauthorized);
-        };
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
-        let tool = snapshot
-            .tools
-            .iter()
-            .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
-            .filter(|tool| tool.result.is_none())
-            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
-        let terminal = surface::SurfaceToolTerminal {
-            kind: surface::SurfaceToolResultKind::ExternalEffectAmbiguous,
-            source: surface::ToolTerminalSource::Observed,
-            invocation_started: surface::ToolInvocationStarted::Yes,
-        };
-        let content = surface_persisted_display_text(error.as_str());
-        let result = surface::SurfaceToolResult {
-            tool_call_id: call.owning_tool_call_id.clone(),
-            name: tool.request.name.clone(),
-            terminal: terminal.clone(),
-            output: None,
-            error: Some(content.clone()),
-            exit_code: None,
-            truncated: false,
-            file_change: None,
-        };
-        let scope = surface::SurfaceScope::Generation {
-            fence: call.fence.clone(),
-        };
-        Ok(vec![
-            (
-                scope.clone(),
-                surface::SurfaceEvent::Tool(surface::ToolPatch::Completed { result }),
-            ),
-            (
-                scope,
-                surface::SurfaceEvent::Item(surface::ItemPatch::Added {
-                    item: surface::SurfaceItem::ToolResultMessage {
-                        id: surface::SurfaceItemId::new(),
-                        turn_id: tool.request.turn_id.clone(),
-                        tool_call_id: tool.request.tool_call_id.clone(),
-                        content,
-                        terminal,
-                        pinned: false,
-                    },
-                }),
-            ),
-        ])
+        crate::runtime_actor::capability::ambiguous_capability_tool_events(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
+        )
     }
 
     fn ambiguous_write_capability_batch(
         &self,
         call: surface::SurfaceCapabilityCall,
     ) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
-        let scope = surface::SurfaceScope::Generation {
-            fence: call.fence.clone(),
-        };
-        let mut events = vec![(
-            scope,
-            surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
-                call: call.clone(),
-            }),
-        )];
-        events.extend(self.ambiguous_capability_tool_events(&call)?);
-        Ok(self.surface_event_batch_with_commit_id(events, None))
+        crate::runtime_actor::capability::ambiguous_write_capability_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
+        )
     }
 
     fn terminal_create_completed_batch(
@@ -17302,31 +17237,10 @@ impl ThreadActor {
         call: surface::SurfaceCapabilityCall,
         terminal_id: surface::SurfaceRemoteTerminalId,
     ) -> surface::SurfaceCommitBatch {
-        let scope = surface::SurfaceScope::Generation {
-            fence: call.fence.clone(),
-        };
-        let lease = surface::SurfaceRemoteTerminalLease {
-            lease_id: ResidentCapabilityController::terminal_create_lease_id(&call.call_id),
-            owning_tool_call_id: call.owning_tool_call_id.clone(),
-            state: surface::SurfaceRemoteTerminalLeaseState::Live {
-                terminal_id,
-                owner_fence: call.fence.clone(),
-            },
-        };
-        self.surface_event_batch_with_commit_id(
-            vec![
-                (
-                    scope.clone(),
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
-                ),
-                (
-                    scope,
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
-                        lease,
-                    }),
-                ),
-            ],
-            None,
+        crate::runtime_actor::capability::terminal_create_completed_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
+            terminal_id,
         )
     }
 
@@ -17334,32 +17248,10 @@ impl ThreadActor {
         &self,
         call: surface::SurfaceCapabilityCall,
     ) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
-        let scope = surface::SurfaceScope::Generation {
-            fence: call.fence.clone(),
-        };
-        let lease = surface::SurfaceRemoteTerminalLease {
-            lease_id: ResidentCapabilityController::terminal_create_lease_id(&call.call_id),
-            owning_tool_call_id: call.owning_tool_call_id.clone(),
-            state: surface::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
-                create_call_id: call.call_id.clone(),
-            },
-        };
-        let mut events = vec![
-            (
-                scope.clone(),
-                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
-                    call: call.clone(),
-                }),
-            ),
-            (
-                scope,
-                surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
-                    lease,
-                }),
-            ),
-        ];
-        events.extend(self.ambiguous_capability_tool_events(&call)?);
-        Ok(self.surface_event_batch_with_commit_id(events, None))
+        crate::runtime_actor::capability::ambiguous_terminal_create_capability_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
+        )
     }
 
     fn terminal_cleanup_started_batch(
@@ -17367,31 +17259,10 @@ impl ThreadActor {
         call: surface::SurfaceCapabilityCall,
         lease: surface::SurfaceRemoteTerminalLease,
     ) -> surface::SurfaceCommitBatch {
-        let scope = surface::SurfaceScope::Generation {
-            fence: call.fence.clone(),
-        };
-        let mut delivery_possible = call.clone();
-        delivery_possible.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
-        self.surface_event_batch_with_commit_id(
-            vec![
-                (
-                    scope.clone(),
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
-                ),
-                (
-                    scope.clone(),
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
-                        lease,
-                    }),
-                ),
-                (
-                    scope,
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
-                        call: delivery_possible,
-                    }),
-                ),
-            ],
-            None,
+        crate::runtime_actor::capability::terminal_cleanup_started_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
+            lease,
         )
     }
 
@@ -17399,25 +17270,9 @@ impl ThreadActor {
         &self,
         call: surface::SurfaceCapabilityCall,
     ) -> surface::SurfaceCommitBatch {
-        let scope = surface::SurfaceScope::Generation {
-            fence: call.fence.clone(),
-        };
-        let mut delivery_possible = call.clone();
-        delivery_possible.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
-        self.surface_event_batch_with_commit_id(
-            vec![
-                (
-                    scope.clone(),
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
-                ),
-                (
-                    scope,
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
-                        call: delivery_possible,
-                    }),
-                ),
-            ],
-            None,
+        crate::runtime_actor::capability::terminal_release_started_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
         )
     }
 
@@ -17426,23 +17281,10 @@ impl ThreadActor {
         call: surface::SurfaceCapabilityCall,
         lease: surface::SurfaceRemoteTerminalLease,
     ) -> surface::SurfaceCommitBatch {
-        let scope = surface::SurfaceScope::Generation {
-            fence: call.fence.clone(),
-        };
-        self.surface_event_batch_with_commit_id(
-            vec![
-                (
-                    scope.clone(),
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
-                ),
-                (
-                    scope,
-                    surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
-                        lease,
-                    }),
-                ),
-            ],
-            None,
+        crate::runtime_actor::capability::terminal_cleanup_completed_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
+            lease,
         )
     }
 
@@ -17452,57 +17294,13 @@ impl ThreadActor {
         lease_id: surface::UuidV7,
         terminal_id: surface::SurfaceRemoteTerminalId,
     ) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
-        let scope = surface::SurfaceScope::Generation {
-            fence: call.fence.clone(),
-        };
-        let lease = surface::SurfaceRemoteTerminalLease {
+        crate::runtime_actor::capability::ambiguous_terminal_cleanup_capability_batch(
+            &self.resident_surface.coordinator.state().snapshot(),
+            call,
             lease_id,
-            owning_tool_call_id: call.owning_tool_call_id.clone(),
-            state: surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
-                terminal_id: Some(terminal_id),
-                owner_fence: call.fence.clone(),
-            },
-        };
-        let mut events = vec![
-            (
-                scope.clone(),
-                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
-                    call: call.clone(),
-                }),
-            ),
-            (
-                scope,
-                surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
-                    lease,
-                }),
-            ),
-        ];
-        let has_other_pending_capability = self
-            .resident_surface
-            .coordinator
-            .state()
-            .snapshot()
-            .tools
-            .iter()
-            .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
-            .is_some_and(|tool| {
-                tool.capability_calls.iter().any(|candidate| {
-                    candidate.call_id != call.call_id
-                        && !matches!(
-                            candidate.state,
-                            surface::SurfaceCapabilityCallState::Completed { .. }
-                                | surface::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
-                                | surface::SurfaceCapabilityCallState::ObservationUnavailable { .. }
-                                | surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. }
-                        )
-                })
-            });
-        if !has_other_pending_capability {
-            events.extend(self.ambiguous_capability_tool_events(&call)?);
-        }
-        Ok(self.surface_event_batch_with_commit_id(events, None))
+            terminal_id,
+        )
     }
-
     fn retry_surface_capability_transition(
         &mut self,
         call_id: &surface::SurfaceCapabilityCallId,

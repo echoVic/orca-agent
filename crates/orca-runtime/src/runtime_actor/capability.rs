@@ -960,3 +960,321 @@ mod tests {
         );
     }
 }
+
+/// The concrete controller instantiation for resident surface capability
+/// calls; the one alias shared by the runtime host and this module.
+pub(crate) type ResidentCapabilityController =
+    RuntimeCapabilityController<ResidentSurfaceCapabilityCall, PendingSurfaceCapabilityTransition>;
+
+// Surface capability commit-batch construction. These builders produce the
+// exact event sequences the capability controller commits; they read only
+// the surface snapshot and their explicit inputs, never actor state.
+// ThreadActor keeps thin delegations (slice 1 of the ThreadActor split).
+
+pub(crate) fn capability_call_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    call: surface::SurfaceCapabilityCall,
+) -> surface::SurfaceCommitBatch {
+    capability_call_transition_batch(snapshot, vec![call])
+}
+
+pub(crate) fn capability_call_transition_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    calls: Vec<surface::SurfaceCapabilityCall>,
+) -> surface::SurfaceCommitBatch {
+    crate::runtime_host::runtime_surface_event_batch(
+        snapshot,
+        calls
+            .into_iter()
+            .map(|call| {
+                (
+                    surface::SurfaceScope::Generation {
+                        fence: call.fence.clone(),
+                    },
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+                )
+            })
+            .collect(),
+        None,
+    )
+}
+
+pub(crate) fn ambiguous_capability_tool_events(
+    snapshot: &surface::SurfaceSnapshot,
+    call: &surface::SurfaceCapabilityCall,
+) -> Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>, surface::SurfaceClientCommandError>
+{
+    let surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous { error, .. } = &call.state
+    else {
+        return Err(surface::SurfaceClientCommandError::Unauthorized);
+    };
+    let tool = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+        .filter(|tool| tool.result.is_none())
+        .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+    let terminal = surface::SurfaceToolTerminal {
+        kind: surface::SurfaceToolResultKind::ExternalEffectAmbiguous,
+        source: surface::ToolTerminalSource::Observed,
+        invocation_started: surface::ToolInvocationStarted::Yes,
+    };
+    let content = crate::runtime_host::surface_persisted_display_text(error.as_str());
+    let result = surface::SurfaceToolResult {
+        tool_call_id: call.owning_tool_call_id.clone(),
+        name: tool.request.name.clone(),
+        terminal: terminal.clone(),
+        output: None,
+        error: Some(content.clone()),
+        exit_code: None,
+        truncated: false,
+        file_change: None,
+    };
+    let scope = surface::SurfaceScope::Generation {
+        fence: call.fence.clone(),
+    };
+    Ok(vec![
+        (
+            scope.clone(),
+            surface::SurfaceEvent::Tool(surface::ToolPatch::Completed { result }),
+        ),
+        (
+            scope,
+            surface::SurfaceEvent::Item(surface::ItemPatch::Added {
+                item: surface::SurfaceItem::ToolResultMessage {
+                    id: surface::SurfaceItemId::new(),
+                    turn_id: tool.request.turn_id.clone(),
+                    tool_call_id: tool.request.tool_call_id.clone(),
+                    content,
+                    terminal,
+                    pinned: false,
+                },
+            }),
+        ),
+    ])
+}
+
+pub(crate) fn ambiguous_write_capability_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    call: surface::SurfaceCapabilityCall,
+) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
+    let scope = surface::SurfaceScope::Generation {
+        fence: call.fence.clone(),
+    };
+    let mut events = vec![(
+        scope,
+        surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+            call: call.clone(),
+        }),
+    )];
+    events.extend(ambiguous_capability_tool_events(snapshot, &call)?);
+    Ok(crate::runtime_host::runtime_surface_event_batch(
+        snapshot, events, None,
+    ))
+}
+
+pub(crate) fn terminal_create_completed_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    call: surface::SurfaceCapabilityCall,
+    terminal_id: surface::SurfaceRemoteTerminalId,
+) -> surface::SurfaceCommitBatch {
+    let scope = surface::SurfaceScope::Generation {
+        fence: call.fence.clone(),
+    };
+    let lease = surface::SurfaceRemoteTerminalLease {
+        lease_id: ResidentCapabilityController::terminal_create_lease_id(&call.call_id),
+        owning_tool_call_id: call.owning_tool_call_id.clone(),
+        state: surface::SurfaceRemoteTerminalLeaseState::Live {
+            terminal_id,
+            owner_fence: call.fence.clone(),
+        },
+    };
+    crate::runtime_host::runtime_surface_event_batch(
+        snapshot,
+        vec![
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+            ),
+            (
+                scope,
+                surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                    lease,
+                }),
+            ),
+        ],
+        None,
+    )
+}
+
+pub(crate) fn ambiguous_terminal_create_capability_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    call: surface::SurfaceCapabilityCall,
+) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
+    let scope = surface::SurfaceScope::Generation {
+        fence: call.fence.clone(),
+    };
+    let lease = surface::SurfaceRemoteTerminalLease {
+        lease_id: ResidentCapabilityController::terminal_create_lease_id(&call.call_id),
+        owning_tool_call_id: call.owning_tool_call_id.clone(),
+        state: surface::SurfaceRemoteTerminalLeaseState::IdentityUnknown {
+            create_call_id: call.call_id.clone(),
+        },
+    };
+    let mut events = vec![
+        (
+            scope.clone(),
+            surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                call: call.clone(),
+            }),
+        ),
+        (
+            scope,
+            surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged { lease }),
+        ),
+    ];
+    events.extend(ambiguous_capability_tool_events(snapshot, &call)?);
+    Ok(crate::runtime_host::runtime_surface_event_batch(
+        snapshot, events, None,
+    ))
+}
+
+pub(crate) fn terminal_cleanup_started_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    call: surface::SurfaceCapabilityCall,
+    lease: surface::SurfaceRemoteTerminalLease,
+) -> surface::SurfaceCommitBatch {
+    let scope = surface::SurfaceScope::Generation {
+        fence: call.fence.clone(),
+    };
+    let mut delivery_possible = call.clone();
+    delivery_possible.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
+    crate::runtime_host::runtime_surface_event_batch(
+        snapshot,
+        vec![
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+            ),
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                    lease,
+                }),
+            ),
+            (
+                scope,
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                    call: delivery_possible,
+                }),
+            ),
+        ],
+        None,
+    )
+}
+
+pub(crate) fn terminal_release_started_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    call: surface::SurfaceCapabilityCall,
+) -> surface::SurfaceCommitBatch {
+    let scope = surface::SurfaceScope::Generation {
+        fence: call.fence.clone(),
+    };
+    let mut delivery_possible = call.clone();
+    delivery_possible.state = surface::SurfaceCapabilityCallState::DeliveryPossible;
+    crate::runtime_host::runtime_surface_event_batch(
+        snapshot,
+        vec![
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+            ),
+            (
+                scope,
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                    call: delivery_possible,
+                }),
+            ),
+        ],
+        None,
+    )
+}
+
+pub(crate) fn terminal_cleanup_completed_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    call: surface::SurfaceCapabilityCall,
+    lease: surface::SurfaceRemoteTerminalLease,
+) -> surface::SurfaceCommitBatch {
+    let scope = surface::SurfaceScope::Generation {
+        fence: call.fence.clone(),
+    };
+    crate::runtime_host::runtime_surface_event_batch(
+        snapshot,
+        vec![
+            (
+                scope.clone(),
+                surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged { call }),
+            ),
+            (
+                scope,
+                surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged {
+                    lease,
+                }),
+            ),
+        ],
+        None,
+    )
+}
+
+pub(crate) fn ambiguous_terminal_cleanup_capability_batch(
+    snapshot: &surface::SurfaceSnapshot,
+    call: surface::SurfaceCapabilityCall,
+    lease_id: surface::UuidV7,
+    terminal_id: surface::SurfaceRemoteTerminalId,
+) -> Result<surface::SurfaceCommitBatch, surface::SurfaceClientCommandError> {
+    let scope = surface::SurfaceScope::Generation {
+        fence: call.fence.clone(),
+    };
+    let lease = surface::SurfaceRemoteTerminalLease {
+        lease_id,
+        owning_tool_call_id: call.owning_tool_call_id.clone(),
+        state: surface::SurfaceRemoteTerminalLeaseState::CleanupAmbiguous {
+            terminal_id: Some(terminal_id),
+            owner_fence: call.fence.clone(),
+        },
+    };
+    let mut events = vec![
+        (
+            scope.clone(),
+            surface::SurfaceEvent::Tool(surface::ToolPatch::CapabilityCallChanged {
+                call: call.clone(),
+            }),
+        ),
+        (
+            scope,
+            surface::SurfaceEvent::Tool(surface::ToolPatch::RemoteTerminalLeaseChanged { lease }),
+        ),
+    ];
+    let has_other_pending_capability = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == call.owning_tool_call_id)
+        .is_some_and(|tool| {
+            tool.capability_calls.iter().any(|candidate| {
+                candidate.call_id != call.call_id
+                    && !matches!(
+                        candidate.state,
+                        surface::SurfaceCapabilityCallState::Completed { .. }
+                            | surface::SurfaceCapabilityCallState::FailedBeforeWrite { .. }
+                            | surface::SurfaceCapabilityCallState::ObservationUnavailable { .. }
+                            | surface::SurfaceCapabilityCallState::ExternalEffectAmbiguous { .. }
+                    )
+            })
+        });
+    if !has_other_pending_capability {
+        events.extend(ambiguous_capability_tool_events(snapshot, &call)?);
+    }
+    Ok(crate::runtime_host::runtime_surface_event_batch(
+        snapshot, events, None,
+    ))
+}
