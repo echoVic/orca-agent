@@ -467,3 +467,65 @@ mod tests {
                 && text.is_char_boundary(range.end))
     }
 }
+
+use crate::types::{AppState, AppStatus, PanelMode};
+
+impl AppState {
+    pub(crate) fn open_transcript_search(&mut self) {
+        if self.panel_mode == PanelMode::Conversation
+            && matches!(
+                self.status,
+                AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+            )
+        {
+            self.transcript_search.open_new();
+        }
+    }
+
+    pub(crate) fn close_transcript_search(&mut self) {
+        self.transcript_search.close();
+    }
+
+    pub(crate) fn replace_transcript_search_query(&mut self, query: &str) {
+        self.transcript_search.replace_query(query);
+    }
+
+    pub(crate) fn refresh_transcript_search(&mut self) {
+        let generation = self.transcript_render_cache.content_generation();
+        let viewport_base = self.viewport_base_row;
+        let live_start = self.flushed_count.min(self.messages.len());
+        let cache = &self.transcript_render_cache;
+        self.transcript_search
+            .refresh_with(generation, viewport_base, |query| {
+                cache.search(live_start, query)
+            });
+    }
+
+    pub(crate) fn search_next(&mut self) {
+        self.refresh_transcript_search();
+        let Some(found) = self.transcript_search.next().cloned() else {
+            return;
+        };
+        self.scroll_offset = self.transcript_render_cache.reveal_offset(
+            self.flushed_count,
+            self.scroll_offset,
+            self.visible_height,
+            &found,
+        );
+        self.auto_scroll = false;
+    }
+
+    pub(crate) fn search_previous(&mut self) {
+        self.refresh_transcript_search();
+        let Some(found) = self.transcript_search.previous().cloned() else {
+            return;
+        };
+        self.scroll_offset = self.transcript_render_cache.reveal_offset(
+            self.flushed_count,
+            self.scroll_offset,
+            self.visible_height,
+            &found,
+        );
+        self.auto_scroll = false;
+    }
+}

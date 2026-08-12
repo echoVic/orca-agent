@@ -154,3 +154,16 @@ to the impl block's module); `types.rs` imports back the two helpers it
 still uses. Same acceptance as slices 1-7 plus both surface-contract
 validators (baseline-maintenance step). Full spec:
 `2026-08-13-tui-convergence-workflow-panel.md`.
+
+## Slice 9: Transcript Search Orchestration Extraction
+
+### Scope
+
+Move the six transcript-search AppState methods (`open_transcript_search`,
+`close_transcript_search`, `replace_transcript_search_query`,
+`refresh_transcript_search`, `search_next`, `search_previous`,
+types.rs:2174-2230) into `crates/orca-tui/src/transcript_search.rs` as an
+additional `impl AppState` block next to `TranscriptSearchState`. All six
+are already `pub(crate)`; no visibility change. No baseline drift
+(verified by the validators). Same acceptance as slices 1-8. Full spec:
+`2026-08-13-tui-convergence-transcript-search.md`.
