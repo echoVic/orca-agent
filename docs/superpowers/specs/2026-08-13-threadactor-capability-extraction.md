@@ -136,3 +136,46 @@ until each slice's oracle passes.
   dispatch; coordinator remains the state source of truth.
 - Slice is independently implementable, verifiable, committable, and
   revertible; no new compatibility layer or second fact source.
+
+## Slice 2: Settlement Orchestration Behind An Injected Dispatcher
+
+### Scope
+
+Move the capability commit settlement orchestration out of `ThreadActor`
+into `runtime_actor::capability` as one `SurfaceCapabilitySettlement`
+struct owning `&mut` access to the capability controller and the surface
+coordinator:
+
+- `retry_surface_capability_transition`
+- `apply_surface_capability_commit` (returns the optional
+  `RuntimeActorEffect` reply for the actor to apply — actor-effect
+  application stays in the actor)
+- `apply_deferred_surface_capability_settlement` (deferred variants call
+  the eight actor flows through a new
+  `DeferredCapabilitySettlementDispatcher` trait implemented by
+  `ThreadActor`, breaking the callback cycle)
+- `settle_surface_capability_transitions_for_shutdown`
+
+### Non-Goals
+
+- The eight ACP `settle_*`/`begin_*`/dispatch flows stay in the actor
+  (slices 3-6 move them).
+- No wire, snapshot, persistence, CLI, or TUI change; no behavior change.
+
+### Ownership
+
+- `runtime_actor::capability` owns settlement orchestration; `ThreadActor`
+  keeps command dispatch and the actor-owned settle flows, exposed through
+  the dispatcher trait.
+- The trait methods are typed (no dynamic dispatch objects); one
+  implementation exists.
+
+### Acceptance
+
+1. The four orchestration methods live in capability.rs; the actor
+   implements the dispatcher trait; compile is clean.
+2. Behavioral oracle unchanged: runtime_host integration 66/66 x 5
+   consecutive runs, lib suite green, nextest ci lib gate green, fmt and
+   diff-check clean.
+3. Diff review: relocation plus the trait/parameter plumbing only; no
+   event-construction or control-flow edits.
