@@ -41,9 +41,14 @@ use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{
     make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
 };
+use crate::exit_policy::TuiExit;
 use crate::exit_policy::{exit_resume_hint, exit_session_id};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::hosted_runtime::TuiHostedOperationOutcome;
+use crate::hosted_side::{
+    HostedSideParent, hosted_config_for_active, rotate_attached_event_sender,
+    shutdown_attached_side_on_controller_exit, side_parent_status_for_runtime_thread,
+};
 use crate::input_event_actions::{
     BatchedInputEvent, MouseFlow, coalesce_input_events, consume_focus_event, handle_mouse_event,
     handle_paste_event, handle_resize_event, handle_scroll_lines, should_queue_input_event,
@@ -87,80 +92,6 @@ use crate::presentation::{
     complete_presentation_resume, finish_terminal_presentation, initialize_terminal_presentation,
     resume_terminal_render, with_terminal_presentation_cleanup,
 };
-
-struct HostedSideParent {
-    thread: RuntimeThreadHandle,
-    event_tx: mpsc::Sender<TuiEvent>,
-    attachment: SessionAttachmentId,
-    side_thread: RuntimeThreadHandle,
-    side_event_tx: mpsc::Sender<TuiEvent>,
-    side_attachment: SessionAttachmentId,
-    side_config: Arc<Mutex<RunConfig>>,
-    parent_title: String,
-}
-
-fn shutdown_attached_side_on_controller_exit(side: HostedSideParent) {
-    // The controller owns both actors while the attached child exists.
-    // Always settle/join the child first, even when it is the visible
-    // projection, then release the parent. No actor may be left behind on
-    // TUI exit or allowed to publish late events.
-    let _ = side
-        .side_thread
-        .shutdown_with_timeout(Duration::from_secs(5));
-    let _ = side.thread.shutdown_with_timeout(Duration::from_secs(5));
-}
-
-fn side_parent_status_for_runtime_thread(thread: &RuntimeThreadHandle) -> SideParentStatus {
-    match thread.state() {
-        Ok(orca_runtime::runtime_host::RuntimeThreadState::Running { .. }) => {
-            SideParentStatus::Running
-        }
-        Ok(orca_runtime::runtime_host::RuntimeThreadState::Idle) => SideParentStatus::Idle,
-        Ok(orca_runtime::runtime_host::RuntimeThreadState::Unavailable) | Err(_) => {
-            SideParentStatus::Closed
-        }
-    }
-}
-
-fn hosted_config_for_active(
-    side_parent: Option<&HostedSideParent>,
-    thread: Option<&RuntimeThreadHandle>,
-    main_config: &Arc<Mutex<RunConfig>>,
-) -> Arc<Mutex<RunConfig>> {
-    if let (Some(side), Some(active)) = (side_parent, thread)
-        && active.thread_id() == side.side_thread.thread_id()
-    {
-        return side.side_config.clone();
-    }
-    main_config.clone()
-}
-
-fn rotate_attached_event_sender(
-    root_event_tx: &mpsc::Sender<TuiEvent>,
-    attachment: &mut SessionAttachmentId,
-    event_tx: &mut mpsc::Sender<TuiEvent>,
-    routing: Option<&Arc<Mutex<AttachmentRouting>>>,
-) {
-    *attachment = attachment.next();
-    *event_tx = match routing {
-        Some(routing) => {
-            let event_tx = spawn_attached_event_sender_with_routing(
-                root_event_tx.clone(),
-                *attachment,
-                Some(routing.clone()),
-            );
-            AttachmentRouting::switch_attachment(routing, root_event_tx, *attachment, None, false);
-            event_tx
-        }
-        None => spawn_attached_event_sender(root_event_tx.clone(), *attachment),
-    };
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct TuiExit {
-    code: i32,
-    session_id: Option<String>,
-}
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {

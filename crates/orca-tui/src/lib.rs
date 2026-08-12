@@ -23,6 +23,7 @@ mod exit_policy;
 mod frame_scheduler;
 mod global_actions;
 mod hosted_runtime;
+mod hosted_side;
 mod idle_key_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;

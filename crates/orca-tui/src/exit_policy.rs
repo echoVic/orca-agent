@@ -3,6 +3,12 @@
 //! convergence slice 6).
 
 use orca_core::config::HistoryMode;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct TuiExit {
+    pub(crate) code: i32,
+    pub(crate) session_id: Option<String>,
+}
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 pub(crate) fn exit_resume_hint(session_id: Option<&str>) -> Option<String> {
