@@ -184,3 +184,28 @@ pub enum OperationTerminal {
 - TUI, JSONL, history, Goal, and Harbor agree on one terminal record.
 - Budget stop, verifier result, and process exit are independently observable.
 - Focused tests, workspace tests, and real headless evidence pass.
+
+## Post-Implementation Review Rounds
+
+All 50 tasks landed (commits 4b45fee7d, 175d553c8, 3b8896d5f, 375696348),
+followed by three review rounds that closed protocol gaps before release:
+
+- Round 1: operation-owned context (BudgetController + ExecutionJournal)
+  threaded through the loop; real journal checkpoints before resumable
+  terminals; all four budget dimensions enforced by the controller;
+  non-optional typed terminals; precise surface budget variants; RAII child
+  leases; verifier independence on budget stops.
+- Round 2: real durable resume boundaries (session checkpoint with the last
+  committed message id) before journal terminals; per-child lease
+  reservations with mandatory usage receipts; committed tool outcomes in the
+  journal; unconditional wall-time sync; suspended-exchange operation
+  handles; approval waits stay non-terminal; journal persistence follows
+  every durable history mode.
+- Round 3: settlement-order guarantees (tools settle before any checkpoint),
+  suspended over-budget exchanges commit non-resumable stops, refused leases
+  become typed budget stops, batch children partition the remaining budget,
+  receipts survive persistence failures, stateless stops are never
+  resumable, and checkpoint reasons are dimension-specific.
+
+Released as v0.3.16 with the acceptance tests named in the spec's
+Review Round 3 addendum.

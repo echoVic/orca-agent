@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.16":
+        "Hardens the execution-budget protocol end to end. Budget stops commit the real durable conversation boundary first (session checkpoint with the last committed message id), then the journal checkpoint and terminal, so a resumable terminal can never point at a boundary that does not exist. Child-agent leases reserve per child and settle exactly once with usage receipts, batch children partition the remaining budget evenly, and stateless or suspended over-budget exchanges commit non-resumable stops instead of claiming success. The operation journal records the committed tool outcome (status and error) with dimension-specific stop reasons, and approval-waiting operations never persist a terminal.",
       "v0.3.15":
         "Eliminates the high-parallelism test hangs and flaky failures under cargo test --test-threads=16. The test harness now uses thread-local per-test homes instead of mutating ORCA_HOME, and RuntimeHost installs the calling test's home on all of its threads, so hosted tests resolve one consistent private home with no env-lock deadlocks. GoalStore schema initialization is fenced behind a cross-process sibling lock with WAL set once at init, so concurrent opens no longer race DDL. The typed-provider-outcome failure injection is session-keyed, and load-sensitive tests poll instead of racing a 20 ms budget.",
       "v0.3.14":
@@ -592,6 +594,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.16":
+        "全面加固执行预算协议。预算停止先提交真实的持久化对话边界（带最后提交消息 id 的 session checkpoint），再写 journal checkpoint 和 terminal，可恢复的 terminal 永远不会指向不存在的边界。子代理 lease 按子代理逐个预留并恰好一次结算（带回 usage receipt），batch 子代理均分剩余额度，stateless 或挂起后超预算的交换只会提交不可恢复的 stop 而不是虚假的成功。操作 journal 记录已提交的工具结果（状态和错误）与按维度区分的停止原因，等待审批的操作永不持久化 terminal。",
       "v0.3.15":
         "消除 cargo test --test-threads=16 下的高并行测试挂起与偶发失败。测试框架改用线程本地私有 home，不再修改 ORCA_HOME 环境变量；RuntimeHost 会把调用方测试的 home 安装到其全部线程，hosted 测试全程解析同一个私有 home，不再有 env 锁死锁。GoalStore schema 初始化由同目录跨进程文件锁保护，WAL 只在初始化时设置一次，并发打开不再竞争 DDL。typed-provider-outcome 失败注入按 session 隔离，负载敏感的测试改为轮询而非竞速 20ms 预算。",
       "v0.3.14":

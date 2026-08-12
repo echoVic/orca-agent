@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.15";
+export const releaseVersion = "v0.3.16";
 
 export const releases = [
+  {
+    version: "v0.3.16",
+    date: "2026-08-13",
+    title: "Execution budget protocol hardening: durable boundaries, child leases, truthful terminals",
+    body: "Three review rounds close every execution-budget protocol gap: budget stops commit the real durable resume boundary before any resumable terminal, child-agent leases reserve and settle per child with usage receipts, suspended and stateless exchanges never claim resumability or success they cannot back, and the operation journal records the committed tool outcome with dimension-specific stop reasons.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.16",
+  },
   {
     version: "v0.3.15",
     date: "2026-08-12",
