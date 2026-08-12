@@ -185,3 +185,45 @@ into `runtime_actor::capability`:
    diff-check clean.
 3. Diff review: relocation plus the trait/parameter plumbing only; no
    event-construction or control-flow edits.
+
+## Slice 3: ACP Read Settlement State Machine
+
+### Scope
+
+Move the PURE settlement state machine of the ACP read flow out of
+`settle_surface_acp_read_text_file` into capability.rs as
+`settle_acp_read_text_file_call(call, settlement) -> AcpReadSettleOutcome`
+where `AcpReadSettleOutcome { waiter_result, physically_written }`:
+
+- the accepted-state validation per settlement variant;
+- the `Completed`/`FailedBeforeWrite`/`RemoteError`/`ObservationUnavailable`
+  state transitions including the durable result limit check, canonical
+  digest, and diagnostic construction;
+- the physically-written transition construction.
+
+The actor keeps: `authorize_surface_capability_settlement` (shared
+authorization), the `has_transition`/deferred path, batch construction via
+`capability_call_transition_batch`, commit-with-retry, retain, and reply
+application.
+
+### Non-Goals
+
+- The write/create/observation/cleanup settle flows (slices 4-6).
+- Authorization, commit retries, and actor-effect application stay in the
+  actor.
+- No wire, snapshot, persistence, CLI, or TUI change; no behavior change.
+
+### Ownership
+
+- capability.rs owns the read settlement state machine (pure over the
+  call record and the settlement payload); the actor owns authorization
+  and durable commit sequencing.
+
+### Acceptance
+
+1. The state machine lives in capability.rs as a pure function; the actor
+   method uses it; compile clean.
+2. Behavioral oracle unchanged: runtime_host integration 66/66 x 5,
+   lib suite green, nextest ci lib gate green, fmt and diff-check clean.
+3. Diff review: relocation plus the outcome struct only; no
+   state-transition or validation edits.
