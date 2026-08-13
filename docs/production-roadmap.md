@@ -3,7 +3,7 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-13
+Last updated: 2026-08-14
 
 The 2026-08-10 headless resume slice makes "restore a headless execution" a
 first-class CLI capability, following Codex's `exec resume` design while keeping
@@ -92,6 +92,13 @@ verify the resulting handle is regular, so a concurrent FIFO replacement cannot
 stall a picker or transcript read. Stateless server checks distinguish recorded
 catalog/transcript state from the empty index infrastructure created by listing.
 This changes no public protocol, SQLite schema, or persisted transcript format.
+
+The current TUI convergence slice gives input-history persistence and
+draft-restoring recall one module owner. `AppState` remains the single aggregate
+fact source for the history vector, navigation cursor, and saved draft; only the
+local I/O and state-transition policy move out of `types.rs`. Key routing,
+history JSONL, CLI, server/JSONL, and session persistence behavior remain
+unchanged.
 
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the

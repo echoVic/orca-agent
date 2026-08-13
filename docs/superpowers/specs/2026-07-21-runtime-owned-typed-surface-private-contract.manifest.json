@@ -5086,9 +5086,9 @@
     [
       "input_history",
       [
-        "crates/orca-tui/src/types.rs:1260",
-        "crates/orca-tui/src/types.rs:1305",
-        "crates/orca-tui/src/types.rs:1331"
+        "crates/orca-tui/src/input_history.rs:3",
+        "crates/orca-tui/src/input_history.rs:62",
+        "crates/orca-tui/src/input_history.rs:88"
       ],
       "presentation_local_store",
       "local_input_history_append",

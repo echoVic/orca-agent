@@ -24,6 +24,7 @@ use crate::edit_highlight_worker::DrainResults;
 use crate::edit_highlight_worker::{
     EditHighlightJob, EditHighlightOutcome, EditHighlightResult, EditHighlightRuntime,
 };
+use crate::input_history::load_input_history;
 use crate::queued_input::{QueuedComposerState, QueuedUserMessage};
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
@@ -2212,90 +2213,6 @@ impl AppState {
     }
 }
 
-fn input_history_path() -> Option<std::path::PathBuf> {
-    // Unit tests must never read or pollute the real user history.
-    if cfg!(test) {
-        return None;
-    }
-    dirs::home_dir().map(|h| h.join(".orca").join("history.jsonl"))
-}
-
-fn current_project() -> String {
-    std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default()
-}
-
-fn load_input_history() -> Vec<String> {
-    let Some(path) = input_history_path() else {
-        return Vec::new();
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let project = current_project();
-    const MAX: usize = 500;
-    // Read all valid entries, newest-first (reverse lines), project entries first
-    let entries: Vec<(String, bool)> = content
-        .lines()
-        .rev()
-        .filter_map(|line| {
-            let v: serde_json::Value = serde_json::from_str(line).ok()?;
-            let display = v["display"].as_str()?.to_string();
-            let is_current = v["project"].as_str().unwrap_or("") == project;
-            Some((display, is_current))
-        })
-        .take(MAX * 2)
-        .collect();
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
-    // Current project first
-    for (display, is_current) in &entries {
-        if *is_current && seen.insert(display.clone()) {
-            result.push(display.clone());
-            if result.len() >= MAX {
-                break;
-            }
-        }
-    }
-    // Then other projects
-    for (display, is_current) in &entries {
-        if !is_current && seen.insert(display.clone()) {
-            result.push(display.clone());
-            if result.len() >= MAX {
-                break;
-            }
-        }
-    }
-    result.reverse();
-    result
-}
-
-fn append_input_history(prompt: &str) {
-    let Some(path) = input_history_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let entry = serde_json::json!({
-        "display": prompt,
-        "timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-        "project": current_project(),
-    });
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "{}", entry);
-    }
-}
-
 impl AppState {
     pub(crate) fn enqueue_user_message(
         &mut self,
@@ -2389,55 +2306,6 @@ impl AppState {
         self.queued_follow_up_autosend = true;
         self.queued_input_error = None;
         self.next_queued_submission_id = 1;
-    }
-
-    pub fn record_prompt(&mut self, prompt: String) {
-        if self
-            .input_history
-            .last()
-            .map(|last| last != &prompt)
-            .unwrap_or(true)
-        {
-            self.input_history.push(prompt.clone());
-            append_input_history(&prompt);
-        }
-        self.history_cursor = None;
-        self.draft_before_history = None;
-    }
-
-    pub fn history_previous(&mut self, current_draft: String) -> Option<String> {
-        if self.input_history.is_empty() {
-            return None;
-        }
-
-        let next = match self.history_cursor {
-            Some(0) => return None,
-            Some(index) => index - 1,
-            None => {
-                self.draft_before_history = Some(current_draft);
-                self.input_history.len() - 1
-            }
-        };
-        self.history_cursor = Some(next);
-        self.input_history.get(next).cloned()
-    }
-
-    pub fn history_next(&mut self) -> Option<String> {
-        let cursor = self.history_cursor?;
-        let next = cursor + 1;
-
-        if next >= self.input_history.len() {
-            self.history_cursor = None;
-            return Some(self.draft_before_history.take().unwrap_or_default());
-        }
-
-        self.history_cursor = Some(next);
-        self.input_history.get(next).cloned()
-    }
-
-    pub fn reset_history_navigation(&mut self) {
-        self.history_cursor = None;
-        self.draft_before_history = None;
     }
 
     pub fn nth_final_assistant_response(&self, position: usize) -> Option<&str> {

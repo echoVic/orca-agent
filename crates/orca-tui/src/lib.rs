@@ -29,6 +29,7 @@ mod idle_navigation_actions;
 mod idle_submit_actions;
 mod input_adapter;
 mod input_event_actions;
+mod input_history;
 mod input_runtime;
 mod input_wake;
 mod insert_escape;
