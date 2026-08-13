@@ -167,3 +167,17 @@ additional `impl AppState` block next to `TranscriptSearchState`. All six
 are already `pub(crate)`; no visibility change. No baseline drift
 (verified by the validators). Same acceptance as slices 1-8. Full spec:
 `2026-08-13-tui-convergence-transcript-search.md`.
+
+## Slice 10: Session Picker State Extraction
+
+### Scope
+
+Move the saved-session picker AppState category (doc comment plus
+`filtered_session_indices`, the six selection-navigation methods,
+`session_query_push`, `session_query_pop`,
+`reset_session_selection_to_first_match`, `selected_session_id`,
+types.rs:2443-2544) into `crates/orca-tui/src/session_picker.rs`.
+Relocation only: the private reset helper becomes `pub(crate)` because the
+`update` reducer's session-backfill handler (types.rs:2553) also calls it.
+No baseline drift (verified by the validators). Same acceptance as slices
+1-9. Full spec: `2026-08-13-tui-convergence-session-picker.md`.

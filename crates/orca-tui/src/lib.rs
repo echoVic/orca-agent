@@ -44,6 +44,7 @@ mod running_actions;
 mod runtime_event_actions;
 mod scrollback;
 mod selection;
+mod session_picker;
 mod session_picker_actions;
 mod setup_actions;
 pub mod shortcuts;
