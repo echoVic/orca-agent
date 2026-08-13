@@ -1,5 +1,8 @@
 # Auto-Memory Governance Implementation Plan
 
+> Historical plan. Superseded on 2026-08-13 by
+> `../specs/2026-08-13-auto-memory-v2.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 
 **Goal:** Make final-response auto-memory cancellation-aware and serialize

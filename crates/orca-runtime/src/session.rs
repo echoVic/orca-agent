@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
@@ -50,6 +51,8 @@ pub struct InteractiveSession {
     mcp_registry: McpRegistry,
     hooks: HookRunner,
     memory: MemoryBlock,
+    auto_memory_worker: Option<memory::AutomaticMemoryWorker>,
+    auto_memory_turn_starts: HashMap<String, usize>,
     task_registry: TaskRegistry,
     last_manual_compaction: Option<ManualCompactionOutcome>,
 }
@@ -393,7 +396,11 @@ impl InteractiveSession {
             TaskRegistry::new_for_cwd(task_session_id, &cwd)
         };
 
-        Ok(Self {
+        let auto_memory_worker = (config.auto_memory
+            && !matches!(config.history_mode, HistoryMode::Disabled))
+        .then(memory::AutomaticMemoryWorker::start)
+        .flatten();
+        let session = Self {
             store,
             conversation,
             writer,
@@ -406,9 +413,18 @@ impl InteractiveSession {
             mcp_registry,
             hooks,
             memory,
+            auto_memory_worker,
+            auto_memory_turn_starts: HashMap::new(),
             task_registry,
             last_manual_compaction: None,
-        })
+        };
+        if let (Some(worker), Some(work)) = (
+            session.auto_memory_worker.as_ref(),
+            memory::automatic_memory_work_for_config(config, &cwd),
+        ) {
+            worker.wake(work);
+        }
+        Ok(session)
     }
 
     pub fn conversation(&self) -> &Conversation {
@@ -515,6 +531,95 @@ impl InteractiveSession {
         &self.memory
     }
 
+    pub(crate) fn enqueue_automatic_memory_turn(
+        &mut self,
+        config: &RunConfig,
+        cwd: &Path,
+        memory_start: usize,
+        turn_id: &str,
+        cancel: &orca_core::cancel::CancelToken,
+    ) -> Result<(), String> {
+        self.auto_memory_turn_starts.remove(turn_id);
+        let Some(session_id) = self.session_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(worker) = self.auto_memory_worker.as_ref() else {
+            return Ok(());
+        };
+        let messages = self.automatic_memory_turn_messages(memory_start, turn_id);
+        let Some(work) = memory::enqueue_automatic_memory_turn(
+            config, cwd, &messages, turn_id, session_id, cancel,
+        )?
+        else {
+            return Ok(());
+        };
+        worker.wake(work);
+        Ok(())
+    }
+
+    fn automatic_memory_turn_messages(&self, memory_start: usize, turn_id: &str) -> Vec<Message> {
+        let durable_messages = self
+            .writer
+            .as_ref()
+            .map(SessionWriter::conversation_records)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| {
+                record
+                    .turn_id
+                    .as_ref()
+                    .is_some_and(|record_turn_id| record_turn_id.as_str() == turn_id)
+            })
+            .map(|record| Message::from(record.message))
+            .collect::<Vec<_>>();
+        if durable_messages
+            .iter()
+            .any(|message| matches!(message, Message::User { .. }))
+        {
+            durable_messages
+        } else {
+            self.conversation
+                .messages
+                .get(memory_start..)
+                .unwrap_or_default()
+                .to_vec()
+        }
+    }
+
+    pub(crate) fn begin_automatic_memory_turn(
+        &mut self,
+        turn_id: &str,
+        existing_turn: bool,
+    ) -> usize {
+        if existing_turn {
+            return self
+                .auto_memory_turn_starts
+                .get(turn_id)
+                .copied()
+                .unwrap_or(self.conversation.messages.len());
+        }
+        self.auto_memory_turn_starts.clear();
+        let start = self.conversation.messages.len();
+        self.auto_memory_turn_starts
+            .insert(turn_id.to_string(), start);
+        start
+    }
+
+    pub(crate) fn finish_automatic_memory_turn(&mut self, turn_id: &str) {
+        self.auto_memory_turn_starts.remove(turn_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_automatic_memory(&self) {
+        self.wait_for_automatic_memory_snapshot();
+    }
+
+    pub(crate) fn wait_for_automatic_memory_snapshot(&self) {
+        if let Some(worker) = self.auto_memory_worker.as_ref() {
+            worker.barrier();
+        }
+    }
+
     pub fn task_registry(&self) -> &TaskRegistry {
         &self.task_registry
     }
@@ -558,11 +663,24 @@ impl InteractiveSession {
     }
 
     pub fn complete_with_error(&mut self, status: &str, error: Option<&str>) {
+        let _ = self.complete_with_error_durable(status, error);
+    }
+
+    pub(crate) fn complete_with_error_durable(
+        &mut self,
+        status: &str,
+        error: Option<&str>,
+    ) -> bool {
         self.completion_error = error.map(str::to_string);
-        if let Some(writer) = &mut self.writer
-            && let Err(error) = writer.complete_with_error(status, error)
-        {
-            eprintln!("orca: warning: history completion write failed: {error}");
+        let Some(writer) = &mut self.writer else {
+            return false;
+        };
+        match writer.complete_with_error(status, error) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("orca: warning: history completion write failed: {error}");
+                false
+            }
         }
     }
 
@@ -570,12 +688,19 @@ impl InteractiveSession {
     /// string is derived from the terminal object, never invented by the
     /// projection.
     pub fn complete_with_terminal(&mut self, terminal: &orca_core::budget::OperationTerminal) {
+        let _ = self.complete_with_terminal_durable(terminal);
+    }
+
+    pub(crate) fn complete_with_terminal_durable(
+        &mut self,
+        terminal: &orca_core::budget::OperationTerminal,
+    ) -> bool {
         let status = terminal.as_str();
         let error = match terminal {
             orca_core::budget::OperationTerminal::Failed { message, .. } => Some(message.as_str()),
             _ => None,
         };
-        self.complete_with_error(status, error);
+        self.complete_with_error_durable(status, error)
     }
 
     pub fn backtrack_last_user(&mut self) -> Option<String> {
@@ -807,6 +932,48 @@ mod tests {
         let _guard = history::lock_test_env();
         let home = history::isolated_test_orca_home_subdir("with-orca-home");
         history::with_test_orca_home(&home, f)
+    }
+
+    #[test]
+    fn automatic_memory_recovers_the_exact_turn_from_the_durable_ledger() {
+        with_orca_home(|home| {
+            let mut cfg = config(home.to_path_buf(), HistoryMode::Record);
+            cfg.auto_memory = true;
+            let mut session = InteractiveSession::new_with_preloaded(&cfg, "first prompt", None)
+                .expect("session");
+            let earlier_turn = TurnId::new();
+            let current_turn = TurnId::new();
+            let writer = session.writer_mut().expect("writer");
+            writer.enter_turn(earlier_turn);
+            writer
+                .append_message(&Message::user("stale historical prompt".to_string()))
+                .expect("earlier prompt");
+            writer.enter_turn(current_turn.clone());
+            writer
+                .append_message(&Message::user("current durable prompt".to_string()))
+                .expect("current prompt");
+            writer
+                .append_message(&Message::Assistant {
+                    content: Some("current durable response".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    pinned: false,
+                })
+                .expect("current response");
+
+            let messages = session.automatic_memory_turn_messages(
+                session.conversation.messages.len(),
+                current_turn.as_str(),
+            );
+            let contents = messages
+                .iter()
+                .filter_map(Message::content_str)
+                .collect::<Vec<_>>();
+
+            assert!(contents.contains(&"current durable prompt"));
+            assert!(contents.contains(&"current durable response"));
+            assert!(!contents.contains(&"stale historical prompt"));
+        });
     }
 
     #[test]

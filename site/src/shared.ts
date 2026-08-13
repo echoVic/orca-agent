@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.19";
+export const releaseVersion = "v0.3.20";
 
 export const releases = [
+  {
+    version: "v0.3.20",
+    date: "2026-08-13",
+    title: "Durable project memory with bounded, verified recall",
+    body: "Recorded root turns can now asynchronously extract a bounded set of durable project facts after transcript and verifier success. The project-scoped ledger uses leased, fenced jobs for crash recovery and retry; recall is provenance-bearing internal context backed by a repairable SQLite FTS index with lexical fallback. Manual /remember remains separate, and auto_memory = false disables automatic capture and recall.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.20",
+  },
   {
     version: "v0.3.19",
     date: "2026-08-13",

@@ -74,7 +74,9 @@ Orca prints the exact `orca --resume <SESSION_ID>` command for the session.
 
 Use `/plan` for read-only planning, `/goal` for a persistent objective,
 `/workflows` for background work, and `/trust` to manage the current folder's
-sandbox permissions.
+sandbox permissions. Automatic project memory is enabled for recorded sessions
+by default; use `/remember` for explicit user or project facts. See
+[Memory](docs/memory.md) for capture, recall, storage, privacy, and deletion.
 
 ## What it does
 
@@ -90,6 +92,8 @@ sandbox permissions.
 - Saves local conversations with `--resume` for continuation and `--fork` for
   branching; `orca exec resume <SESSION_ID>` restores a headless session with a
   fresh budget scope, and headless exits print the exact resume command.
+- Learns a bounded set of durable project facts after successfully committed
+  turns and retrieves only prompt-relevant facts on later turns.
 - Runs with no implicit turn ceiling; optional `[budget]` limits
   (`--max-turns`, `--max-tool-calls`, `--max-cost-usd`,
   `--max-wall-time-secs`) bound an operation explicitly, and budget stops
@@ -118,6 +122,7 @@ across tool turns as required by DeepSeek.
 More detail:
 
 - [Persistent Goal Mode](docs/goal-mode.md)
+- [Memory](docs/memory.md)
 - [Harness and app-server contract](docs/harness-contract.md)
 - [Dynamic workflow design](docs/claude-code-workflow-parity.md)
 - [Production roadmap](docs/production-roadmap.md)

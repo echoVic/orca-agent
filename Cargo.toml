@@ -48,7 +48,7 @@ windows-sys = "0.61"
 
 [package]
 name = "blade-deepseek"
-version = "0.3.19"
+version = "0.3.20"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"

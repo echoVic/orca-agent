@@ -629,6 +629,26 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
     let has_tool_results = current_turn_has_tool_results(conversation);
     let prompt = conversation.last_user_message().unwrap_or("");
 
+    if conversation.messages.iter().any(|message| {
+        matches!(
+            message,
+            Message::System { content, .. } if content.starts_with("AUTO_MEMORY_EXTRACTOR_V2")
+        )
+    }) {
+        let msg = if prompt.contains("mock_auto_memory_malformed") {
+            "malformed automatic memory response".to_string()
+        } else {
+            "- project: Release qualification requires a clean install smoke test.".to_string()
+        };
+        return ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta(msg.clone())],
+            assistant_content: Some(msg),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
     if let Some((requested_tools, request_number, completed_tools)) =
         mock_repeat_read_state(conversation)
         && completed_tools < requested_tools

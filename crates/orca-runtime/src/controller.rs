@@ -4,7 +4,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
-use orca_core::config::{OutputFormat, RunConfig};
+use orca_core::config::{HistoryMode, OutputFormat, RunConfig};
 use orca_core::conversation::Message;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
@@ -144,6 +144,7 @@ pub struct ThreadTurnExecutor<'a> {
 pub struct ThreadTurnContext<'a> {
     cwd: PathBuf,
     prompt: String,
+    memory_start: usize,
     parts: InteractiveSessionRuntimeParts<'a>,
 }
 
@@ -175,6 +176,8 @@ struct PreparedThreadTurn<'a, 'session, W: io::Write> {
 }
 
 struct ThreadTurnCompletion {
+    cwd: PathBuf,
+    memory_start: usize,
     status: RunStatus,
     end_reason: crate::lifecycle::TurnEndReason,
     error: Option<String>,
@@ -391,6 +394,13 @@ impl<'a> ThreadTurnContext<'a> {
     ) -> io::Result<Self> {
         let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
         let prompt = request.prompt().to_string();
+        if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
+            session.wait_for_automatic_memory_snapshot();
+        }
+        let memory_start = session.begin_automatic_memory_turn(
+            request.turn_id().as_str(),
+            request.prompt_placement() == ThreadTurnPromptPlacement::ExistingTurn,
+        );
         let mut parts = session.runtime_parts();
         if let Some(writer) = parts.writer.as_deref_mut() {
             writer.enter_turn(request.turn_id().clone());
@@ -398,6 +408,13 @@ impl<'a> ThreadTurnContext<'a> {
         parts
             .conversation
             .replace_mode_context(agent_common::mode_context(config.approval_mode));
+        crate::memory::refresh_project_memory_context(
+            parts.conversation,
+            &cwd,
+            &prompt,
+            config.auto_memory && !matches!(config.history_mode, HistoryMode::Disabled),
+            request.prompt_placement() == ThreadTurnPromptPlacement::ExistingTurn,
+        );
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
             parts
                 .conversation
@@ -413,7 +430,12 @@ impl<'a> ThreadTurnContext<'a> {
             parts.conversation.messages.push(message);
         }
 
-        Ok(Self { cwd, prompt, parts })
+        Ok(Self {
+            cwd,
+            prompt,
+            memory_start,
+            parts,
+        })
     }
 
     pub fn cwd(&self) -> &Path {
@@ -606,7 +628,12 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             thread_extensions,
             turn_extension_id,
         } = self;
-        let ThreadTurnContext { cwd, prompt, parts } = context;
+        let ThreadTurnContext {
+            cwd,
+            prompt,
+            memory_start,
+            parts,
+        } = context;
         let main_session_task = ThreadTurnMainSessionTask::from_request(
             request,
             parts.task_registry,
@@ -739,6 +766,8 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
         let background_workflows =
             RuntimeBackgroundWorkflows::from_vec(std::mem::take(background_workflows));
         Ok(PreparedThreadTurnOutcome::Completed(ThreadTurnCompletion {
+            cwd,
+            memory_start,
             status,
             end_reason,
             error,
@@ -753,8 +782,10 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
 impl ThreadTurnCompletion {
     fn commit<W: io::Write>(
         self,
+        config: &RunConfig,
         session: &mut InteractiveSession,
         request: &ThreadTurnRequest,
+        cancel: &CancelToken,
         events: &mut EventFactory,
         sink: &mut EventSink<W>,
     ) -> io::Result<RunStatus> {
@@ -772,7 +803,8 @@ impl ThreadTurnCompletion {
                 orca_core::budget::OperationTerminal::Stopped { .. }
             )
         {
-            session.complete_with_error(self.status.as_str(), self.error.as_deref());
+            let _ =
+                session.complete_with_error_durable(self.status.as_str(), self.error.as_deref());
             if let Some(task) = self.main_session_task.as_ref() {
                 task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
                 task.emit_all(events, sink)?;
@@ -782,11 +814,11 @@ impl ThreadTurnCompletion {
             }
             return Ok(self.status);
         }
-        if let Some(terminal) = self.terminal.as_ref() {
-            session.complete_with_terminal(terminal);
+        let transcript_committed = if let Some(terminal) = self.terminal.as_ref() {
+            session.complete_with_terminal_durable(terminal)
         } else {
-            session.complete_with_error(self.status.as_str(), self.error.as_deref());
-        }
+            session.complete_with_error_durable(self.status.as_str(), self.error.as_deref())
+        };
         if let Some(task) = self.main_session_task.as_ref() {
             task.finish_and_emit(self.status, self.error.as_deref(), self.usage, events, sink)?;
             task.emit_all(events, sink)?;
@@ -798,6 +830,24 @@ impl ThreadTurnCompletion {
                 sink.emit(events.session_completed(self.status, session.session_id()))?;
             }
         }
+        if crate::memory::automatic_memory_capture_is_eligible(
+            config,
+            self.status,
+            transcript_committed,
+            request.emit_session_completed(),
+        ) {
+            if let Err(error) = session.enqueue_automatic_memory_turn(
+                config,
+                &self.cwd,
+                self.memory_start,
+                request.turn_id().as_str(),
+                cancel,
+            ) {
+                eprintln!("orca: warning: automatic memory extraction failed: {error}");
+            }
+        } else {
+            session.finish_automatic_memory_turn(request.turn_id().as_str());
+        }
         Ok(self.status)
     }
 }
@@ -805,8 +855,10 @@ impl ThreadTurnCompletion {
 impl PreparedThreadTurnOutcome {
     fn commit<W: io::Write>(
         self,
+        config: &RunConfig,
         session: &mut InteractiveSession,
         request: &ThreadTurnRequest,
+        cancel: &CancelToken,
         events: &mut EventFactory,
         sink: &mut EventSink<W>,
     ) -> io::Result<ThreadTurnOutcome> {
@@ -816,7 +868,7 @@ impl PreparedThreadTurnOutcome {
                 let end_reason = completion.end_reason;
                 let terminal = completion.terminal.take();
                 completion
-                    .commit(session, request, events, sink)
+                    .commit(config, session, request, cancel, events, sink)
                     .map(|status| ThreadTurnOutcome::Completed {
                         status,
                         end_reason,
@@ -1372,7 +1424,7 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
             turn_extension_id,
         }
         .execute()?
-        .commit(session, request, events, &mut sink);
+        .commit(config, session, request, &cancel, events, &mut sink);
     }
 
     let mut execution = ThreadTurnExecution::new_with_cancel_and_observer(
@@ -1395,7 +1447,14 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
         turn_extension_id,
     }
     .execute()?
-    .commit(session, request, &mut execution.events, &mut execution.sink)
+    .commit(
+        config,
+        session,
+        request,
+        &execution.cancel,
+        &mut execution.events,
+        &mut execution.sink,
+    )
 }
 
 #[cfg(test)]
@@ -1771,6 +1830,117 @@ mod tests {
         );
         assert_eq!(user_records[0].turn_id, turn_id.as_str());
         assert!(user_records[0].item_id.starts_with("item_"));
+    }
+
+    #[test]
+    fn completed_persistent_root_turn_records_automatic_memory_with_provenance() {
+        crate::history::with_redirected_orca_home("auto-memory-completed-root", |home| {
+            let cwd = tempfile::tempdir().expect("cwd");
+            let mut config = config(SubagentConfig::default());
+            config.cwd = Some(cwd.path().to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            config.auto_memory = true;
+            let mut thread = RuntimeThread::start(&config, "automatic memory").expect("thread");
+            let session_id = thread.thread_id().to_string();
+            let request = ThreadTurnRequest::new(
+                "Remember that release qualification requires a clean install smoke test.",
+            );
+            let turn_id = request.turn_id().to_string();
+
+            let status = thread
+                .run_request(&config, &request, Vec::new())
+                .expect("successful root turn");
+
+            assert_eq!(status, RunStatus::Success);
+            thread.session().wait_for_automatic_memory();
+            let candidates = automatic_memory_candidate_files(home);
+            assert_eq!(candidates.len(), 1);
+            let records = std::fs::read_to_string(&candidates[0]).expect("candidate ledger");
+            let candidate: serde_json::Value =
+                serde_json::from_str(records.lines().next().expect("candidate")).expect("json");
+            assert_eq!(candidate["turn_id"], turn_id);
+            assert_eq!(candidate["session_id"], session_id);
+
+            let next_status = thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new(
+                        "What clean install smoke test is required for release qualification?",
+                    ),
+                    Vec::new(),
+                )
+                .expect("next turn recalls memory");
+            assert_eq!(next_status, RunStatus::Success);
+            let recalled = thread
+                .session()
+                .conversation()
+                .internal_context
+                .get(orca_core::conversation::MEMORY_CONTEXT_FRAGMENT_ID)
+                .expect("recalled memory context");
+            assert!(recalled.content.contains("clean install smoke test"));
+            assert!(recalled.content.contains(&turn_id));
+        });
+    }
+
+    #[test]
+    fn verification_failed_turn_does_not_record_automatic_memory() {
+        crate::history::with_redirected_orca_home("auto-memory-verifier-failed", |home| {
+            let cwd = tempfile::tempdir().expect("cwd");
+            let mut config = config(SubagentConfig::default());
+            config.cwd = Some(cwd.path().to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            config.auto_memory = true;
+            config.verifier = Some("exit 9".to_string());
+            let mut thread =
+                RuntimeThread::start(&config, "failed automatic memory").expect("thread");
+
+            let status = thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("This turn must fail verification."),
+                    Vec::new(),
+                )
+                .expect("verified root turn");
+
+            assert_eq!(status, RunStatus::VerificationFailed);
+            assert!(automatic_memory_candidate_files(home).is_empty());
+        });
+    }
+
+    #[test]
+    fn history_disabled_turn_neither_recalls_nor_writes_automatic_memory() {
+        crate::history::with_redirected_orca_home("auto-memory-stateless", |home| {
+            let cwd = tempfile::tempdir().expect("cwd");
+            let mut config = config(SubagentConfig::default());
+            config.cwd = Some(cwd.path().to_path_buf());
+            config.history_mode = HistoryMode::Disabled;
+            config.auto_memory = true;
+            let mut thread =
+                RuntimeThread::start(&config, "stateless automatic memory").expect("thread");
+
+            let status = thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("A stateless turn must not use memory."),
+                    Vec::new(),
+                )
+                .expect("stateless root turn");
+
+            assert_eq!(status, RunStatus::Success);
+            assert!(!home.join("memory").exists());
+        });
+    }
+
+    fn automatic_memory_candidate_files(home: &Path) -> Vec<PathBuf> {
+        let projects = home.join("memory/projects");
+        let Ok(entries) = std::fs::read_dir(projects) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("candidates.jsonl"))
+            .filter(|path| path.is_file())
+            .collect()
     }
 
     #[test]

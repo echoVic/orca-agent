@@ -90,17 +90,20 @@ pub const MODE_CONTEXT_FRAGMENT_ID: &str = "mode";
 pub const GOAL_CONTEXT_FRAGMENT_ID: &str = "goal";
 pub const PLAN_CONTEXT_FRAGMENT_ID: &str = "plan";
 pub const SKILL_CONTEXT_FRAGMENT_ID: &str = "skill";
+pub const MEMORY_CONTEXT_FRAGMENT_ID: &str = "memory";
 
 pub const RUNTIME_CONTEXT_MAX_TOKENS: usize = 1_024;
 pub const MODE_CONTEXT_MAX_TOKENS: usize = 2_048;
 pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const SKILL_CONTEXT_MAX_TOKENS: usize = 4_096;
+pub const MEMORY_CONTEXT_MAX_TOKENS: usize = 3_072;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InternalContextKind {
     Runtime,
+    Memory,
     Goal,
     Plan,
     Skill,
@@ -323,6 +326,18 @@ impl Conversation {
                 .filter(|text| !text.trim().is_empty())
                 .map(|text| format!("[Skill context]\n{text}")),
             SKILL_CONTEXT_MAX_TOKENS,
+        );
+    }
+
+    pub fn replace_memory_context(&mut self, content: Option<String>) {
+        self.replace_internal_context(
+            MEMORY_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Memory,
+            InternalContextOrigin::System,
+            content
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| format!("[Relevant memory]\n{text}")),
+            MEMORY_CONTEXT_MAX_TOKENS,
         );
     }
 
@@ -615,6 +630,31 @@ mod tests {
         assert!(
             conv.internal_context
                 .get(SKILL_CONTEXT_FRAGMENT_ID)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn replace_memory_context_keeps_recalled_memory_out_of_transcript_messages() {
+        let mut conv = Conversation::new();
+        conv.add_user("prepare a release".to_string());
+        conv.replace_memory_context(Some(
+            "- Run the workspace verification before publishing.".to_string(),
+        ));
+
+        assert_eq!(conv.messages.len(), 1);
+        let fragment = conv
+            .internal_context
+            .get(MEMORY_CONTEXT_FRAGMENT_ID)
+            .expect("memory context");
+        assert_eq!(fragment.kind, InternalContextKind::Memory);
+        assert_eq!(fragment.origin, InternalContextOrigin::System);
+        assert!(fragment.content.contains("workspace verification"));
+
+        conv.replace_memory_context(None);
+        assert!(
+            conv.internal_context
+                .get(MEMORY_CONTEXT_FRAGMENT_ID)
                 .is_none()
         );
     }

@@ -1,5 +1,9 @@
 # Auto-Memory Governance Spec
 
+> Historical design. Superseded on 2026-08-13 by
+> `2026-08-13-auto-memory-v2.md`, which replaces synchronous final-response
+> appends with durable jobs, typed candidates, and relevant recall.
+
 ## Problem and Evidence
 
 Final-response auto-memory is invoked from

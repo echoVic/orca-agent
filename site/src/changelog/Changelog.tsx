@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.20":
+        "Adds durable, project-scoped automatic memory for recorded sessions. After a successful verifier-gated root turn, Orca queues bounded and redacted extraction work behind a leased, fenced job ledger. Later turns receive only relevant, provenance-bearing facts as non-transcript context; the repairable SQLite FTS index falls back to lexical recall. Manual /remember remains separate, while auto_memory = false disables automatic capture and recall.",
       "v0.3.19":
         "Fixes the runtime-surface release gate's repeated Rust-source masking. The validator now caches masks by source content, so its self-tests finish in a bounded time instead of rescanning the full TUI tree for every synthetic inventory fixture. v0.3.18's 45-minute release timeout and split test gates remain in force.",
       "v0.3.18":
@@ -600,6 +602,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.20":
+        "为录制会话加入持久化、项目级的自动记忆。通过 verifier 的根 turn 在 transcript 成功提交后，会把有界且已脱敏的提取任务写入带 lease 与 fencing 的 job ledger；后续 turn 只把相关、带来源信息的事实作为非 transcript 上下文注入。可修复的 SQLite FTS 索引失效时会回退到词法召回。手动 /remember 仍独立，auto_memory = false 会关闭自动采集和召回。",
       "v0.3.19":
         "修复 runtime surface 发布门禁重复扫描 Rust 源码的问题。Validator 现在按源码内容缓存 mask 结果，自测不再为每个 synthetic inventory fixture 重复扫描完整 TUI 树，能够在有界时间内结束。v0.3.18 的 45 分钟 Release 超时和分段测试门禁继续保留。",
       "v0.3.18":

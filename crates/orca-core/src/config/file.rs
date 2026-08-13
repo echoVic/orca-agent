@@ -56,7 +56,7 @@ pub struct FileConfig {
     pub desktop_notifications: bool,
     #[serde(default = "default_true")]
     pub terminal_notifications: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub auto_memory: bool,
 }
 
@@ -104,7 +104,7 @@ struct RawFileConfig {
     pub desktop_notifications: bool,
     #[serde(default = "default_true")]
     pub terminal_notifications: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub auto_memory: bool,
 }
 
@@ -131,7 +131,7 @@ impl Default for FileConfig {
             update_check: true,
             desktop_notifications: false,
             terminal_notifications: true,
-            auto_memory: false,
+            auto_memory: true,
         }
     }
 }
@@ -1151,6 +1151,14 @@ auto_memory = true
         assert!(!config.update_check);
         assert!(config.desktop_notifications);
         assert!(config.auto_memory);
+    }
+
+    #[test]
+    fn auto_memory_defaults_to_enabled() {
+        let parsed: FileConfig = toml::from_str("").unwrap();
+
+        assert!(parsed.auto_memory);
+        assert!(FileConfig::default().auto_memory);
     }
 
     #[test]
