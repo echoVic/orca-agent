@@ -34,6 +34,11 @@ const UNSTABLE_SURFACE_SOURCE_ROOTS = [
   "crates/orca-tui/src",
 ];
 
+// Inventory validation revisits the same Rust sources for each closed-world
+// mutation fixture. Keep the lexical mask reusable while preserving distinct
+// entries for synthetic source overrides used by the self-tests.
+const rustNonCodeMaskCache = new Map();
+
 const TABLES = {
   source_fact_columns: "source_facts",
   non_event_source_columns: "non_event_sources",
@@ -2843,6 +2848,8 @@ function cfgTestExternalModulePaths(repoRoot, sourcePaths, sourceOverrides) {
 }
 
 function maskRustNonCode(source) {
+  const cached = rustNonCodeMaskCache.get(source);
+  if (cached !== undefined) return cached;
   let output = "";
   let index = 0;
   let state = "code";
@@ -2934,6 +2941,7 @@ function maskRustNonCode(source) {
     else if (character === "\\") escaped = true;
     else if (character === '"') state = "code";
   }
+  rustNonCodeMaskCache.set(source, output);
   return output;
 }
 

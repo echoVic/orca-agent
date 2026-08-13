@@ -45,7 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Validate reviewed artifacts and current inventories
         run: |
-          node --test scripts/test-validate-runtime-surface-contract.mjs
+          node scripts/test-validate-runtime-surface-contract.mjs
           node scripts/validate-runtime-surface-contract.mjs
       - name: Validate dependency graph and Rust inventory
         run: |

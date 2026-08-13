@@ -1176,7 +1176,7 @@ for (const [relativePath, minimumOccurrences] of [
     `${relativePath} must fetch full history for every runtime contract job`,
   );
   for (const command of [
-    "node --test scripts/test-validate-runtime-surface-contract.mjs",
+    "node scripts/test-validate-runtime-surface-contract.mjs",
     "node scripts/validate-runtime-surface-contract.mjs",
   ]) {
     assert.ok(
@@ -1210,7 +1210,7 @@ for (const [relativePath, minimumOccurrences] of [
     "runtime contract workflow must fetch the reviewed design commit",
   );
   for (const command of [
-    "node --test scripts/test-validate-runtime-surface-contract.mjs",
+    "node scripts/test-validate-runtime-surface-contract.mjs",
     "node scripts/validate-runtime-surface-contract.mjs",
     "cargo test -p orca-tui runtime_surface_contract --lib --locked",
   ]) {

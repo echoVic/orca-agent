@@ -348,4 +348,6 @@ The durable accounting implementation shipped in v0.3.17. v0.3.18 also makes
 the release gate bounded and observable: the Ubuntu test job has a 45-minute
 hard timeout, and its TUI library, PTY contract, and workspace gates are
 reported as separate steps so a stalled native or PTY command cannot leave the
-release workflow running indefinitely.
+release workflow running indefinitely. v0.3.19 fixes the validator's repeated
+Rust-source masking by caching masks by source content, so the self-tests do
+not rescan the full TUI tree for every synthetic inventory fixture.

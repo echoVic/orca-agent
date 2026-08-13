@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.19":
+        "Fixes the runtime-surface release gate's repeated Rust-source masking. The validator now caches masks by source content, so its self-tests finish in a bounded time instead of rescanning the full TUI tree for every synthetic inventory fixture. v0.3.18's 45-minute release timeout and split test gates remain in force.",
       "v0.3.18":
         "Makes the release gate observable and bounded: the Ubuntu release test job now has a 45-minute timeout and separates the TUI library, PTY contract, and workspace gates so a stalled native or PTY command cannot leave the release workflow running indefinitely. It also carries the durable execution-budget accounting, retry-safe hosted cancellation, and reused provider tool-call id fixes from v0.3.17.",
       "v0.3.17":
@@ -598,6 +600,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.19":
+        "修复 runtime surface 发布门禁重复扫描 Rust 源码的问题。Validator 现在按源码内容缓存 mask 结果，自测不再为每个 synthetic inventory fixture 重复扫描完整 TUI 树，能够在有界时间内结束。v0.3.18 的 45 分钟 Release 超时和分段测试门禁继续保留。",
       "v0.3.18":
         "让发布门禁可观测且有界：Ubuntu Release 测试 job 现在有 45 分钟硬超时，并把 TUI library、PTY contract 和 workspace 三组门禁拆开，某个 native 或 PTY 命令失去进度时不会再让发布流水线无限运行。同时包含 v0.3.17 的持久化执行预算、可恢复 hosted cancellation 和 provider 重复 tool-call id 修复。",
       "v0.3.17":

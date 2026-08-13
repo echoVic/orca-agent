@@ -35,7 +35,7 @@ jobs:
           sudo apt-get install -y ripgrep
       - name: Validate runtime surface contract
         run: |
-          node --test scripts/test-validate-runtime-surface-contract.mjs
+          node scripts/test-validate-runtime-surface-contract.mjs
           node scripts/validate-runtime-surface-contract.mjs
           cargo metadata --locked --format-version 1 > /dev/null
           cargo test -p orca-tui runtime_surface_contract --lib --locked

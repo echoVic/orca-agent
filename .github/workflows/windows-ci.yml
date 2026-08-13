@@ -65,7 +65,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          node --test scripts/test-validate-runtime-surface-contract.mjs
+          node scripts/test-validate-runtime-surface-contract.mjs
           node scripts/validate-runtime-surface-contract.mjs
           node scripts/test-validate-windows-platform-boundaries.mjs
           node scripts/validate-windows-platform-boundaries.mjs
@@ -133,7 +133,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          node --test scripts/test-validate-runtime-surface-contract.mjs
+          node scripts/test-validate-runtime-surface-contract.mjs
           node scripts/validate-runtime-surface-contract.mjs
           node scripts/test-validate-windows-platform-boundaries.mjs
           node scripts/validate-windows-platform-boundaries.mjs
