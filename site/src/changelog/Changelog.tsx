@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.18":
+        "Makes the release gate observable and bounded: the Ubuntu release test job now has a 45-minute timeout and separates the TUI library, PTY contract, and workspace gates so a stalled native or PTY command cannot leave the release workflow running indefinitely. It also carries the durable execution-budget accounting, retry-safe hosted cancellation, and reused provider tool-call id fixes from v0.3.17.",
       "v0.3.17":
         "Makes execution-budget accounting durable across restart, provider suspension, approval continuation, and settlement retries. Journal schema v2 records the immutable operation budget plus cumulative budget.usage facts; reopening reconstructs the original wall-clock deadline and rejects budget drift. Stable provider response identities make cost settlement exactly once, while foreground responses charge their own tracker delta instead of comparing unrelated cumulative baselines. Concurrent child leases split the parent's actual remaining turns, tools, and cost atomically, share one wall deadline, and preserve usage receipts through I/O failures. Typed live and recovered surfaces now project the same budget terminal.",
       "v0.3.16":
@@ -596,6 +598,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.18":
+        "让发布门禁可观测且有界：Ubuntu Release 测试 job 现在有 45 分钟硬超时，并把 TUI library、PTY contract 和 workspace 三组门禁拆开，某个 native 或 PTY 命令失去进度时不会再让发布流水线无限运行。同时包含 v0.3.17 的持久化执行预算、可恢复 hosted cancellation 和 provider 重复 tool-call id 修复。",
       "v0.3.17":
         "让执行预算在进程重启、provider 挂起、审批续跑和结算重试后仍保持同一份账。Journal schema v2 持久化不可变的 operation budget 与累计 budget.usage；重新打开时恢复原始 wall-clock deadline，并拒绝预算漂移。Provider cost 以稳定 response id 做恰好一次结算，前台响应只计算本次 CostTracker 增量，不再比较两套无关的累计基线。并发子代理原子拆分父操作真实剩余的 turns、tools 与 cost，共享同一 wall deadline，I/O 失败也不会丢 usage receipt；live 与 recovery surface 统一投影同一个预算 terminal。",
       "v0.3.16":

@@ -17,6 +17,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
         with:
@@ -42,13 +43,18 @@ jobs:
         run: |
           python3 -m unittest discover -s terminal_bench -p 'test_*.py' -v
           node scripts/test-repository-hygiene.mjs
-      - name: Run tests
+      - name: Run TUI library gate
         env:
           RUST_BACKTRACE: "1"
-        run: |
-          cargo nextest run -p orca-tui --lib --locked --profile ci-serial
-          cargo nextest run --test tui_pty_contract --locked --profile ci-serial
-          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+        run: cargo nextest run -p orca-tui --lib --locked --profile ci-serial
+      - name: Run TUI PTY contract gate
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run --test tui_pty_contract --locked --profile ci-serial
+      - name: Run workspace gate
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
 
   version:
     runs-on: ubuntu-latest

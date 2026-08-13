@@ -4,15 +4,15 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.17";
+export const releaseVersion = "v0.3.18";
 
 export const releases = [
   {
-    version: "v0.3.17",
+    version: "v0.3.18",
     date: "2026-08-13",
     title: "Durable execution-budget accounting across restart and suspension",
     body: "Makes budget usage a versioned journal fact instead of an in-memory suspension snapshot. Restarts recover the original operation budget and cumulative turns, tools, cost, and wall deadline; provider settlement is idempotent by response identity; concurrent children split the parent's actual remaining additive capacity and share one wall-clock deadline; and every runtime surface projects the same durable budget terminal.",
-    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.17",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.18",
   },
   {
     version: "v0.3.16",

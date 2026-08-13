@@ -343,3 +343,9 @@ Compatibility is intentionally broken at the operation-journal boundary.
 Schema v1 and mixed-version records are explicitly rejected. Saved sessions
 remain valid resume boundaries, but a v1 in-flight operation journal is not
 migrated or continued.
+
+The durable accounting implementation shipped in v0.3.17. v0.3.18 also makes
+the release gate bounded and observable: the Ubuntu test job has a 45-minute
+hard timeout, and its TUI library, PTY contract, and workspace gates are
+reported as separate steps so a stalled native or PTY command cannot leave the
+release workflow running indefinitely.
