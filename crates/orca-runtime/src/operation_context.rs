@@ -14,7 +14,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use orca_core::budget::{BudgetSpec, BudgetStop, OperationTerminal};
+use orca_core::budget::{BudgetSpec, BudgetStop, BudgetUsage, OperationTerminal};
 
 use crate::budget_controller::BudgetController;
 use crate::execution_journal::{ExecutionJournal, JOURNAL_SCHEMA_VERSION, JournalRecord};
@@ -37,39 +37,91 @@ impl OperationContext {
     /// stateless operations never create runtime persistence artifacts in
     /// `ORCA_HOME`.
     pub(crate) fn open(spec: BudgetSpec, operation_id: &str, persistent: bool) -> io::Result<Self> {
-        let journal = ExecutionJournal::open(journal_path(operation_id, persistent), operation_id)?;
-        let mut context = Self {
-            controller: BudgetController::new(spec),
-            journal,
-        };
-        if context.journal.committed().is_empty() {
-            context
-                .journal
-                .append_durable(JournalRecord::OperationStarted {
+        Self::open_at(journal_path(operation_id, persistent), spec, operation_id)
+    }
+
+    fn open_at(journal_path: PathBuf, spec: BudgetSpec, operation_id: &str) -> io::Result<Self> {
+        let mut journal = ExecutionJournal::open(journal_path, operation_id)?;
+        if journal.committed().is_empty() {
+            let started_at_ms = unix_ms();
+            journal
+                .append(JournalRecord::OperationStarted {
                     operation_id: operation_id.to_string(),
                     turn_id: String::new(),
                     ordinal: 0,
                     schema_version: JOURNAL_SCHEMA_VERSION,
-                    started_at_ms: unix_ms(),
-                })?;
+                    started_at_ms,
+                    budget_spec: spec,
+                })
+                .map_err(io::Error::other)?;
+            journal
+                .append(JournalRecord::BudgetUsage {
+                    operation_id: operation_id.to_string(),
+                    turn_id: String::new(),
+                    ordinal: 0,
+                    schema_version: JOURNAL_SCHEMA_VERSION,
+                    usage: BudgetUsage::default(),
+                    recorded_at_ms: started_at_ms,
+                    accounting_id: Some("operation-start".to_string()),
+                })
+                .map_err(io::Error::other)?;
+            journal.flush()?;
         }
-        Ok(context)
+        let durable_spec = journal.operation_budget_spec().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation journal has no durable budget spec",
+            )
+        })?;
+        if durable_spec != spec {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "operation budget changed across resume: journal={durable_spec:?}, requested={spec:?}"
+                ),
+            ));
+        }
+        let usage = journal.latest_budget_usage().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation journal has no durable budget usage",
+            )
+        })?;
+        let started_at_ms = journal.operation_started_at_ms().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation journal has no durable start timestamp",
+            )
+        })?;
+        Ok(Self {
+            controller: BudgetController::from_durable_usage(
+                durable_spec,
+                usage,
+                unix_ms().saturating_sub(started_at_ms),
+            ),
+            journal,
+        })
     }
 
     /// Reopens an existing operation journal at its exact path (the
     /// suspended-operation completion path, which must continue appending to
     /// the same file the loop used). Committed records reload; appends
     /// continue with fresh ordinals.
+    #[cfg(test)]
     pub(crate) fn reopen(
         journal_path: PathBuf,
         spec: BudgetSpec,
         operation_id: &str,
     ) -> io::Result<Self> {
-        let journal = ExecutionJournal::open(journal_path, operation_id)?;
-        Ok(Self {
-            controller: BudgetController::new(spec),
-            journal,
-        })
+        Self::open_at(journal_path, spec, operation_id)
+    }
+
+    pub(crate) fn reopen_suspended(
+        journal_path: PathBuf,
+        spec: BudgetSpec,
+        operation_id: &str,
+    ) -> io::Result<Self> {
+        Self::open_at(journal_path, spec, operation_id)
     }
 
     /// Admits the model turn, then records `turn.started` durably for the
@@ -80,12 +132,20 @@ impl OperationContext {
         let admitted = self.controller.admit_turn();
         match admitted {
             Ok(()) => {
-                self.journal.append_durable(JournalRecord::TurnStarted {
-                    operation_id: self.journal.operation_id().to_string(),
-                    turn_id: turn_id.to_string(),
-                    ordinal: 0,
-                    schema_version: JOURNAL_SCHEMA_VERSION,
-                })?;
+                let admitted_turn = self.controller.usage().turns;
+                self.journal
+                    .append(JournalRecord::TurnStarted {
+                        operation_id: self.journal.operation_id().to_string(),
+                        turn_id: turn_id.to_string(),
+                        ordinal: 0,
+                        schema_version: JOURNAL_SCHEMA_VERSION,
+                    })
+                    .map_err(io::Error::other)?;
+                self.append_budget_usage(
+                    turn_id,
+                    Some(format!("turn-admit:{turn_id}:{admitted_turn}")),
+                )?;
+                self.journal.flush()?;
                 Ok(Ok(()))
             }
             Err(stop) => Ok(Err(stop)),
@@ -103,14 +163,22 @@ impl OperationContext {
         let admitted = self.controller.admit_tool_call();
         match admitted {
             Ok(()) => {
-                self.journal.append_durable(JournalRecord::ToolStarted {
-                    operation_id: self.journal.operation_id().to_string(),
-                    turn_id: turn_id.to_string(),
-                    ordinal: 0,
-                    schema_version: JOURNAL_SCHEMA_VERSION,
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                })?;
+                let admitted_tool_call = self.controller.usage().tool_calls;
+                self.journal
+                    .append(JournalRecord::ToolStarted {
+                        operation_id: self.journal.operation_id().to_string(),
+                        turn_id: turn_id.to_string(),
+                        ordinal: 0,
+                        schema_version: JOURNAL_SCHEMA_VERSION,
+                        tool_call_id: tool_call_id.to_string(),
+                        tool_name: tool_name.to_string(),
+                    })
+                    .map_err(io::Error::other)?;
+                self.append_budget_usage(
+                    turn_id,
+                    Some(format!("tool-admit:{turn_id}:{admitted_tool_call}")),
+                )?;
+                self.journal.flush()?;
                 Ok(Ok(()))
             }
             Err(stop) => Ok(Err(stop)),
@@ -127,31 +195,83 @@ impl OperationContext {
         status: impl Into<String>,
         error: Option<String>,
     ) -> io::Result<()> {
-        self.journal.append_durable(JournalRecord::ToolCompleted {
-            operation_id: self.journal.operation_id().to_string(),
-            turn_id: turn_id.to_string(),
-            ordinal: 0,
-            schema_version: JOURNAL_SCHEMA_VERSION,
-            tool_call_id: tool_call_id.to_string(),
-            status: status.into(),
-            error,
-        })
+        let _ = self.controller.sync_wall_time();
+        self.journal
+            .append(JournalRecord::ToolCompleted {
+                operation_id: self.journal.operation_id().to_string(),
+                turn_id: turn_id.to_string(),
+                ordinal: 0,
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                tool_call_id: tool_call_id.to_string(),
+                status: status.into(),
+                error,
+            })
+            .map_err(io::Error::other)?;
+        self.append_budget_usage(turn_id, None)?;
+        self.journal.flush()
     }
 
     /// Records provider cost (USD micros spent since the last recording)
-    /// against the operation. Cost facts persist with the next checkpoint or
-    /// terminal's usage snapshot.
+    /// against the operation. The accounting id makes settlement idempotent
+    /// across retries while every attempt still publishes a fresh usage fact.
     pub(crate) fn record_cost_usd_micros(
         &mut self,
         cost_usd_micros: u64,
-    ) -> Result<(), BudgetStop> {
-        self.controller.record_cost_usd_micros(cost_usd_micros)
+        accounting_id: &str,
+    ) -> io::Result<Result<(), BudgetStop>> {
+        if self.journal.has_budget_accounting_id(accounting_id) {
+            let result = self.controller.sync_wall_time();
+            self.append_budget_usage("", None)?;
+            self.journal.flush()?;
+            return Ok(result);
+        }
+        let result = self.controller.record_cost_usd_micros(cost_usd_micros);
+        self.append_budget_usage("", Some(accounting_id.to_string()))?;
+        self.journal.flush()?;
+        Ok(result)
     }
 
     /// Publishes elapsed wall time so a long provider call stops promptly at
     /// the next accounting boundary instead of only at the next turn admit.
-    pub(crate) fn sync_wall_time(&mut self) -> Result<(), BudgetStop> {
-        self.controller.sync_wall_time()
+    pub(crate) fn sync_wall_time(&mut self) -> io::Result<Result<(), BudgetStop>> {
+        let result = self.controller.sync_wall_time();
+        self.append_budget_usage("", None)?;
+        self.journal.flush()?;
+        Ok(result)
+    }
+
+    pub(crate) fn merge_child_usage(
+        &mut self,
+        usage: BudgetUsage,
+    ) -> io::Result<Result<(), BudgetStop>> {
+        let result = self.controller.merge_child_usage(usage);
+        self.append_budget_usage("", None)?;
+        self.journal.flush()?;
+        Ok(result)
+    }
+
+    fn append_budget_usage(
+        &mut self,
+        turn_id: &str,
+        accounting_id: Option<String>,
+    ) -> io::Result<()> {
+        self.journal
+            .append(JournalRecord::BudgetUsage {
+                operation_id: self.journal.operation_id().to_string(),
+                turn_id: turn_id.to_string(),
+                ordinal: 0,
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                usage: self.controller.usage(),
+                recorded_at_ms: unix_ms(),
+                accounting_id,
+            })
+            .map_err(io::Error::other)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_current_budget_usage(&mut self) -> io::Result<()> {
+        self.append_budget_usage("", Some("test-baseline".to_string()))?;
+        self.journal.flush()
     }
 
     /// Commits a budget stop in journal order: `checkpoint.created` durable,
@@ -431,6 +551,114 @@ mod tests {
     }
 
     #[test]
+    fn repeated_inner_turns_use_distinct_accounting_ids() {
+        let mut context = OperationContext::for_tests(BudgetSpec::default(), "op-inner-turns");
+        context
+            .admit_turn("turn-1")
+            .expect("first journal write")
+            .expect("first turn admitted");
+        context
+            .admit_turn("turn-1")
+            .expect("second journal write")
+            .expect("second turn admitted");
+
+        assert_eq!(context.controller.usage().turns, 2);
+        let accounting_ids = context
+            .journal
+            .committed()
+            .iter()
+            .filter_map(|record| match record {
+                JournalRecord::BudgetUsage { accounting_id, .. } => accounting_id.as_deref(),
+                _ => None,
+            })
+            .filter(|id| id.starts_with("turn-admit:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            accounting_ids,
+            ["turn-admit:turn-1:1", "turn-admit:turn-1:2"]
+        );
+    }
+
+    #[test]
+    fn reopen_restores_durable_usage_and_rejects_budget_drift() {
+        let spec = BudgetSpec {
+            max_turns: Some(4),
+            max_cost_usd_micros: Some(50_000),
+            ..BudgetSpec::default()
+        };
+        let mut context = OperationContext::for_tests(spec, "op-durable-budget");
+        context
+            .admit_turn("turn-1")
+            .expect("journal ok")
+            .expect("turn admitted");
+        context
+            .record_cost_usd_micros(7_000, "provider-response:one")
+            .expect("usage persisted")
+            .expect("inside budget");
+        let path = context.journal.path().to_path_buf();
+        let operation_id = context.journal.operation_id().to_string();
+        drop(context);
+
+        let reopened = OperationContext::reopen(path.clone(), spec, &operation_id)
+            .expect("same operation resumes");
+        assert_eq!(reopened.controller.usage().turns, 1);
+        assert_eq!(reopened.controller.usage().cost_usd_micros, 7_000);
+        drop(reopened);
+
+        let changed = match OperationContext::reopen(
+            path,
+            BudgetSpec {
+                max_turns: Some(5),
+                ..spec
+            },
+            &operation_id,
+        ) {
+            Ok(_) => panic!("resume cannot silently replace the operation budget"),
+            Err(error) => error,
+        };
+        assert_eq!(changed.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn provider_accounting_id_is_exactly_once_across_reopen() {
+        let spec = BudgetSpec {
+            max_cost_usd_micros: Some(50_000),
+            ..BudgetSpec::default()
+        };
+        let mut context = OperationContext::for_tests(spec, "op-accounting-id");
+        context
+            .record_cost_usd_micros(9_000, "provider-response:stable")
+            .expect("usage persisted")
+            .expect("inside budget");
+        let path = context.journal.path().to_path_buf();
+        let operation_id = context.journal.operation_id().to_string();
+        drop(context);
+
+        let mut reopened =
+            OperationContext::reopen(path, spec, &operation_id).expect("operation resumes");
+        let usage_fact_count = reopened
+            .journal
+            .committed()
+            .iter()
+            .filter(|record| matches!(record, JournalRecord::BudgetUsage { .. }))
+            .count();
+        reopened
+            .record_cost_usd_micros(9_000, "provider-response:stable")
+            .expect("retry succeeds")
+            .expect("retry remains inside budget");
+        assert_eq!(reopened.controller.usage().cost_usd_micros, 9_000);
+        assert_eq!(
+            reopened
+                .journal
+                .committed()
+                .iter()
+                .filter(|record| matches!(record, JournalRecord::BudgetUsage { .. }))
+                .count(),
+            usage_fact_count + 1
+        );
+    }
+
+    #[test]
     fn tool_admission_records_started_only_when_admitted() {
         let mut context = OperationContext::for_tests(BudgetSpec::default(), "op-tool");
         context
@@ -447,6 +675,36 @@ mod tests {
             matches!(record, JournalRecord::ToolCompleted { tool_call_id, .. } if tool_call_id == "call-1")
         }));
         assert!(context.journal.unmatched_tool_starts().is_empty());
+    }
+
+    #[test]
+    fn repeated_provider_tool_ids_use_distinct_admission_accounting_ids() {
+        let mut context = OperationContext::for_tests(BudgetSpec::default(), "op-reused-tool-id");
+        for _ in 0..2 {
+            context
+                .admit_tool_call("turn-1", "call-1", "update_plan")
+                .expect("journal ok")
+                .expect("admitted");
+            context
+                .record_tool_completed("turn-1", "call-1", "completed", None)
+                .expect("settled");
+        }
+
+        assert_eq!(context.controller.usage().tool_calls, 2);
+        let accounting_ids = context
+            .journal
+            .committed()
+            .iter()
+            .filter_map(|record| match record {
+                JournalRecord::BudgetUsage { accounting_id, .. } => accounting_id.as_deref(),
+                _ => None,
+            })
+            .filter(|id| id.starts_with("tool-admit:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            accounting_ids,
+            ["tool-admit:turn-1:1", "tool-admit:turn-1:2"]
+        );
     }
 
     #[test]

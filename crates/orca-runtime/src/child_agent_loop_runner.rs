@@ -49,10 +49,37 @@ fn attach_child_usage_receipt(
     mut result: ChildAgentResult,
     lease: &crate::budget_controller::BudgetLease,
 ) -> ChildAgentResult {
-    if result.budget_usage.is_none() {
-        result.budget_usage = Some(lease.usage());
-    }
+    result.budget_usage = Some(lease.usage());
     result
+}
+
+fn child_lease_stop_result(stop: orca_core::budget::BudgetStop) -> ChildAgentResult {
+    ChildAgentResult {
+        status: RunStatus::Failed,
+        final_message: None,
+        error: Some(format!(
+            "budget stopped: child {} (turns={}, tool_calls={})",
+            stop.reason.as_str(),
+            stop.usage.turns,
+            stop.usage.tool_calls
+        )),
+        budget_usage: Some(stop.usage),
+    }
+}
+
+fn sync_child_cost_to_lease(
+    lease: &mut crate::budget_controller::BudgetLease,
+    tracker: &CostTracker,
+    recorded_cost_usd_micros: &mut u64,
+) -> Result<(), orca_core::budget::BudgetStop> {
+    let total = crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd);
+    let delta = total.saturating_sub(*recorded_cost_usd_micros);
+    *recorded_cost_usd_micros = total;
+    if delta == 0 {
+        lease.sync_wall_time()
+    } else {
+        lease.record_cost_usd_micros(delta)
+    }
 }
 
 pub fn run_child_agent_loop_with_tool_executor<F>(
@@ -78,6 +105,7 @@ where
         Some(lease) => lease,
         None => &mut fallback_lease,
     };
+    let mut recorded_cost_usd_micros = lease.usage().cost_usd_micros;
     loop {
         match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {}
@@ -103,6 +131,13 @@ where
             ChildAgentProviderTurn::Response(response) => response,
             ChildAgentProviderTurn::Fail { result, usage } => {
                 record_child_provider_usage(usage, context.child_cost_tracker, None);
+                if let Err(stop) = sync_child_cost_to_lease(
+                    lease,
+                    context.child_cost_tracker,
+                    &mut recorded_cost_usd_micros,
+                ) {
+                    return Ok(child_lease_stop_result(stop));
+                }
                 if let Some(result) =
                     child_agent_budget_exhausted_result(config, context.child_cost_tracker)
                 {
@@ -121,6 +156,13 @@ where
             context.child_cost_tracker,
             None,
         )?;
+        if let Err(stop) = sync_child_cost_to_lease(
+            lease,
+            context.child_cost_tracker,
+            &mut recorded_cost_usd_micros,
+        ) {
+            return Ok(child_lease_stop_result(stop));
+        }
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
@@ -136,6 +178,13 @@ where
 
         let provider_fold =
             fold_child_agent_provider_response(&mut setup, &response, context.child_cost_tracker);
+        if let Err(stop) = sync_child_cost_to_lease(
+            lease,
+            context.child_cost_tracker,
+            &mut recorded_cost_usd_micros,
+        ) {
+            return Ok(child_lease_stop_result(stop));
+        }
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
@@ -150,6 +199,9 @@ where
 
         let tool_requests = child_agent_tool_requests(&response);
         for (index, tool_request) in tool_requests.iter().enumerate() {
+            if let Err(stop) = lease.admit_tool_call() {
+                return Ok(child_lease_stop_result(stop));
+            }
             let tool_context = ChildAgentToolContext {
                 policy: &setup.policy,
                 mcp_registry: &setup.mcp_registry,
@@ -164,6 +216,13 @@ where
                 tool_execution.child_cost,
                 context.child_cost_tracker,
             );
+            if let Err(stop) = sync_child_cost_to_lease(
+                lease,
+                context.child_cost_tracker,
+                &mut recorded_cost_usd_micros,
+            ) {
+                return Ok(child_lease_stop_result(stop));
+            }
             if let Some(result) =
                 child_agent_budget_exhausted_result(config, context.child_cost_tracker)
             {
@@ -203,6 +262,7 @@ where
         Some(lease) => lease,
         None => &mut fallback_lease,
     };
+    let mut recorded_cost_usd_micros = lease.usage().cost_usd_micros;
     loop {
         match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {
@@ -233,6 +293,13 @@ where
             ChildAgentProviderTurn::Response(response) => response,
             ChildAgentProviderTurn::Fail { result, usage } => {
                 record_child_provider_usage(usage, context.child_cost_tracker, observer);
+                if let Err(stop) = sync_child_cost_to_lease(
+                    lease,
+                    context.child_cost_tracker,
+                    &mut recorded_cost_usd_micros,
+                ) {
+                    return Ok(child_lease_stop_result(stop));
+                }
                 if let Some(result) =
                     child_agent_budget_exhausted_result(config, context.child_cost_tracker)
                 {
@@ -251,6 +318,13 @@ where
             context.child_cost_tracker,
             observer,
         )?;
+        if let Err(stop) = sync_child_cost_to_lease(
+            lease,
+            context.child_cost_tracker,
+            &mut recorded_cost_usd_micros,
+        ) {
+            return Ok(child_lease_stop_result(stop));
+        }
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
@@ -270,12 +344,21 @@ where
             .is_some_and(|usage| !usage.is_empty());
         let provider_fold =
             fold_child_agent_provider_response(&mut setup, &response, context.child_cost_tracker);
+        let lease_stop = sync_child_cost_to_lease(
+            lease,
+            context.child_cost_tracker,
+            &mut recorded_cost_usd_micros,
+        )
+        .err();
         if had_usage {
             if let Some(observer) = observer {
                 observer.emit(ChildAgentActivity::Usage(
                     context.child_cost_tracker.totals(),
                 ));
             }
+        }
+        if let Some(stop) = lease_stop {
+            return Ok(child_lease_stop_result(stop));
         }
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
@@ -291,6 +374,9 @@ where
 
         let tool_requests = child_agent_tool_requests(&response);
         for (index, tool_request) in tool_requests.iter().enumerate() {
+            if let Err(stop) = lease.admit_tool_call() {
+                return Ok(child_lease_stop_result(stop));
+            }
             let tool_context = ChildAgentToolContext {
                 policy: &setup.policy,
                 mcp_registry: &setup.mcp_registry,
@@ -318,6 +404,13 @@ where
                 tool_execution.child_cost,
                 context.child_cost_tracker,
             );
+            if let Err(stop) = sync_child_cost_to_lease(
+                lease,
+                context.child_cost_tracker,
+                &mut recorded_cost_usd_micros,
+            ) {
+                return Ok(child_lease_stop_result(stop));
+            }
             if had_child_cost {
                 if let Some(observer) = observer {
                     observer.emit(ChildAgentActivity::Usage(

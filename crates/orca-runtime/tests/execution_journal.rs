@@ -105,6 +105,33 @@ fn reopen_loads_only_committed_records_in_order() {
 }
 
 #[test]
+fn reopen_rejects_previous_schema_explicitly() {
+    let dir = tempdir().expect("tempdir");
+    let path = journal_path(&dir);
+    let current = serde_json::to_string(&JournalRecord::OperationStarted {
+        operation_id: "op-old-schema".to_string(),
+        turn_id: String::new(),
+        ordinal: 1,
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        started_at_ms: 1,
+        budget_spec: BudgetSpec::default(),
+    })
+    .expect("serialize current record");
+    let previous = current.replace(
+        &format!("\"schema_version\":{JOURNAL_SCHEMA_VERSION}"),
+        &format!("\"schema_version\":{}", JOURNAL_SCHEMA_VERSION - 1),
+    );
+    std::fs::write(&path, format!("{previous}\n")).expect("write previous schema journal");
+
+    let error = match ExecutionJournal::open(path, "op-old-schema") {
+        Ok(_) => panic!("schema changes are intentionally not backward compatible"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("unsupported schema"));
+}
+
+#[test]
 fn unflushed_tool_started_never_replays_on_reopen() {
     let dir = tempdir().expect("tempdir");
     let path = journal_path(&dir);
@@ -219,7 +246,7 @@ fn stopped_terminal_requires_committed_checkpoint() {
             cost_usd_micros: 0,
             wall_time_ms: 0,
         },
-        checkpoint_id: String::new(),
+        checkpoint_id: "cp-boundary".to_string(),
         resumable: false,
     };
     let error = journal
@@ -345,7 +372,7 @@ fn reopen_recovers_from_torn_final_line_mid_write() {
         .open(&path)
         .expect("open journal for tearing");
     use std::io::Write;
-    file.write_all(br#"{"type":"tool.completed","operation_id":"op-torn","turn_id":"turn-1","ordinal":4,"schema_version":1,"tool_call_id":"call-1","status":"comp"#)
+    file.write_all(br#"{"type":"tool.completed","operation_id":"op-torn","turn_id":"turn-1","ordinal":4,"schema_version":2,"tool_call_id":"call-1","status":"comp"#)
         .expect("write torn line");
     file.flush().expect("flush torn line");
     drop(file);
@@ -402,4 +429,83 @@ fn append_stamps_unique_ordinals_for_prebuilt_batches() {
         3,
         "prebuilt batch records must not share ordinals"
     );
+}
+
+#[test]
+fn reopen_rejects_non_contiguous_ordinals() {
+    let dir = tempdir().expect("tempdir");
+    let path = journal_path(&dir);
+    let record = JournalRecord::OperationStarted {
+        operation_id: "op-bad-ordinal".to_string(),
+        turn_id: String::new(),
+        ordinal: 2,
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        started_at_ms: 1,
+        budget_spec: BudgetSpec::default(),
+    };
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .expect("write corrupt journal");
+
+    let error = match ExecutionJournal::open(path, "op-bad-ordinal") {
+        Ok(_) => panic!("non-contiguous ordinal must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("expected 1"));
+}
+
+#[test]
+fn reopen_rejects_regressive_budget_usage() {
+    let dir = tempdir().expect("tempdir");
+    let path = journal_path(&dir);
+    let records = [
+        JournalRecord::OperationStarted {
+            operation_id: "op-regressive".to_string(),
+            turn_id: String::new(),
+            ordinal: 1,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            started_at_ms: 1,
+            budget_spec: BudgetSpec::default(),
+        },
+        JournalRecord::BudgetUsage {
+            operation_id: "op-regressive".to_string(),
+            turn_id: String::new(),
+            ordinal: 2,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            usage: BudgetUsage {
+                turns: 2,
+                ..BudgetUsage::default()
+            },
+            recorded_at_ms: 2,
+            accounting_id: Some("first".to_string()),
+        },
+        JournalRecord::BudgetUsage {
+            operation_id: "op-regressive".to_string(),
+            turn_id: String::new(),
+            ordinal: 3,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            usage: BudgetUsage {
+                turns: 1,
+                ..BudgetUsage::default()
+            },
+            recorded_at_ms: 3,
+            accounting_id: Some("second".to_string()),
+        },
+    ];
+    let contents = records
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&path, format!("{contents}\n")).expect("write corrupt journal");
+
+    let error = match ExecutionJournal::open(path, "op-regressive") {
+        Ok(_) => panic!("regressive cumulative usage must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("monotonic"));
 }

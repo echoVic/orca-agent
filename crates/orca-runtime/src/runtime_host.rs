@@ -813,6 +813,7 @@ impl HostedTurnRequest {
             .with_tool_mode(tool_mode)
             .with_goal_turn_origin(self.goal_turn_origin)
             .with_options(self.options)
+            .with_deferred_cancel_terminal(true)
             .with_session_completed_event(
                 self.envelope == HostedOperationEnvelope::Turn
                     && self.emit_session_completed
@@ -6790,6 +6791,10 @@ fn reconcile_durable_provider_outcomes_on_start(
         let approval_message =
             surface::SafeDiagnosticText::try_new("background provider requires approval")
                 .expect("fixed diagnostic is bounded");
+        let budget_terminal = outcome
+            .operation_terminal
+            .as_ref()
+            .and_then(surface_budget_from_core_terminal);
         let (task_status, stop_reason, terminal) = if committed_user_cancel {
             (
                 surface::SurfaceTaskStatus::Cancelled,
@@ -6799,6 +6804,16 @@ fn reconcile_durable_provider_outcomes_on_start(
                 surface::OperationTerminal::Cancelled {
                     reason: surface::CancelReason::User,
                 },
+            )
+        } else if let Some(budget) = budget_terminal {
+            (
+                surface::SurfaceTaskStatus::Stopped,
+                surface::GenerationStopReason::Completed {
+                    status: surface::GenerationCompletionStatus::BudgetExhausted {
+                        budget: budget.clone(),
+                    },
+                },
+                surface::OperationTerminal::BudgetExhausted { budget },
             )
         } else {
             match outcome.status {
@@ -7019,7 +7034,15 @@ fn mirror_recovered_typed_provider_outcome(
                 None => Err("recovered approval outcome lost its provider response".to_string()),
             },
             TaskStatus::Stopped | TaskStatus::Cancelled => {
-                task_registry.stop_with_usage(task_id, "cancelled".to_string(), outcome.usage)
+                let result = if matches!(
+                    outcome.operation_terminal,
+                    Some(orca_core::budget::OperationTerminal::Stopped { .. })
+                ) {
+                    "budget_exhausted"
+                } else {
+                    "cancelled"
+                };
+                task_registry.stop_with_usage(task_id, result.to_string(), outcome.usage)
             }
             TaskStatus::Failed => task_registry
                 .apply_main_session_terminal_update(
@@ -11544,6 +11567,7 @@ struct TypedProviderBackgroundOutcome {
     status: RunStatus,
     error: Option<String>,
     usage: Option<UsageTotals>,
+    operation_terminal: Option<orca_core::budget::OperationTerminal>,
     completed_at_ms: i64,
 }
 
@@ -11559,15 +11583,23 @@ fn durable_typed_provider_outcome(
     outcome: &TypedProviderBackgroundOutcome,
 ) -> DurableTypedProviderOutcome {
     DurableTypedProviderOutcome {
-        status: match outcome.status {
-            RunStatus::Success => TaskStatus::Completed,
-            RunStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
-            RunStatus::Cancelled => TaskStatus::Cancelled,
-            RunStatus::Failed | RunStatus::VerificationFailed => TaskStatus::Failed,
+        status: if matches!(
+            outcome.operation_terminal,
+            Some(orca_core::budget::OperationTerminal::Stopped { .. })
+        ) {
+            TaskStatus::Stopped
+        } else {
+            match outcome.status {
+                RunStatus::Success => TaskStatus::Completed,
+                RunStatus::ApprovalRequired => TaskStatus::ApprovalRequired,
+                RunStatus::Cancelled => TaskStatus::Cancelled,
+                RunStatus::Failed | RunStatus::VerificationFailed => TaskStatus::Failed,
+            }
         },
         response: outcome.response.clone(),
         error: outcome.error.clone(),
         usage: outcome.usage,
+        operation_terminal: outcome.operation_terminal.clone(),
         completed_at_ms: outcome.completed_at_ms,
     }
 }
@@ -12819,34 +12851,7 @@ fn prepare_goal_surface_continuation_worker(
             } => {
                 // No fixed ceiling exists; the observed/limit pair reflects the
                 // typed stop reason carried by the operation terminal.
-                let budget = match stop_reason {
-                    orca_core::budget::StopReason::TurnBudget { max_turns } => {
-                        surface::OperationBudget::TurnRequests {
-                            scope: surface::TurnRequestBudgetScope::AgentLoop,
-                            limit: u64::from(*max_turns),
-                            observed: u64::from(stop_usage.turns),
-                        }
-                    }
-                    orca_core::budget::StopReason::ToolCallBudget { max_tool_calls } => {
-                        surface::OperationBudget::TurnRequests {
-                            scope: surface::TurnRequestBudgetScope::AgentLoop,
-                            limit: u64::from(*max_tool_calls),
-                            observed: u64::from(stop_usage.tool_calls),
-                        }
-                    }
-                    orca_core::budget::StopReason::CostBudget {
-                        max_cost_usd_micros,
-                    } => surface::OperationBudget::MonetaryBudgetUsdMicros {
-                        limit: *max_cost_usd_micros,
-                        observed: stop_usage.cost_usd_micros,
-                    },
-                    orca_core::budget::StopReason::WallTimeBudget { max_wall_time_ms } => {
-                        surface::OperationBudget::ModelTokens {
-                            limit: Some(*max_wall_time_ms),
-                            observed: Some(stop_usage.wall_time_ms),
-                        }
-                    }
-                };
+                let budget = surface_budget_from_stop(*stop_reason, *stop_usage);
                 (
                     surface::GoalOuterTurnStatus::BudgetExhausted,
                     surface::GenerationCompletionStatus::BudgetExhausted {
@@ -34705,7 +34710,33 @@ impl ThreadActor {
                         {
                             return self.dispatch_legacy_goal_continuation(active, result);
                         }
-                        let writer_error = result.writer.finish_generation(true).err();
+                        let deferred_cancel_terminal_error = match &result.outcome {
+                            GenerationTaskOutcome::Executed(
+                                ThreadOperationOutcome::Completed {
+                                    terminal:
+                                        Some(
+                                            terminal @ orca_core::budget::OperationTerminal::Cancelled {
+                                                ..
+                                            },
+                                        ),
+                                    ..
+                                },
+                            ) => crate::operation_context::OperationContext::open(
+                                active.config.budget.to_spec(),
+                                active.request.turn_id.as_str(),
+                                !matches!(active.config.history_mode, HistoryMode::Disabled),
+                            )
+                            .and_then(|mut operation| {
+                                operation.commit_terminal(
+                                    active.request.turn_id.as_str(),
+                                    terminal.clone(),
+                                )
+                            })
+                            .err(),
+                            _ => None,
+                        };
+                        let writer_error = deferred_cancel_terminal_error
+                            .or_else(|| result.writer.finish_generation(true).err());
                         if let Some(error) = writer_error {
                             self.state = Some(result.state);
                             OperationOutcome::ExecutionFailed {
@@ -35515,6 +35546,7 @@ impl ThreadActor {
                         status: RunStatus::Failed,
                         error: Some(message),
                         usage: None,
+                        operation_terminal: None,
                         completed_at_ms,
                     };
                     *surface_outcome
@@ -35693,68 +35725,82 @@ impl ThreadActor {
         let approval_required = shutdown_reason.is_none()
             && !committed_user_cancel
             && outcome.status == RunStatus::ApprovalRequired;
-        let (task_status, stop_reason, terminal) = match (shutdown_reason.clone(), outcome.status) {
-            (Some(reason), _) => (
-                surface::SurfaceTaskStatus::Stopped,
-                surface::GenerationStopReason::Cancelled {
-                    cause: match reason {
-                        surface::SurfaceShutdownReason::HostShutdown => {
-                            surface::TerminalizationCause::HostShutdown
-                        }
-                        surface::SurfaceShutdownReason::ThreadClose => {
-                            surface::TerminalizationCause::ThreadClose
-                        }
+        let budget_terminal = outcome
+            .operation_terminal
+            .as_ref()
+            .and_then(surface_budget_from_core_terminal);
+        let (task_status, stop_reason, terminal) =
+            match (shutdown_reason.clone(), outcome.status, budget_terminal) {
+                (Some(reason), _, _) => (
+                    surface::SurfaceTaskStatus::Stopped,
+                    surface::GenerationStopReason::Cancelled {
+                        cause: match reason {
+                            surface::SurfaceShutdownReason::HostShutdown => {
+                                surface::TerminalizationCause::HostShutdown
+                            }
+                            surface::SurfaceShutdownReason::ThreadClose => {
+                                surface::TerminalizationCause::ThreadClose
+                            }
+                        },
                     },
-                },
-                surface::OperationTerminal::Shutdown { reason },
-            ),
-            (None, _) if committed_user_cancel => (
-                surface::SurfaceTaskStatus::Cancelled,
-                surface::GenerationStopReason::Cancelled {
-                    cause: surface::TerminalizationCause::UserCancel,
-                },
-                surface::OperationTerminal::Cancelled {
-                    reason: surface::CancelReason::User,
-                },
-            ),
-            (None, RunStatus::Success) => (
-                surface::SurfaceTaskStatus::Completed,
-                surface::GenerationStopReason::Completed {
-                    status: surface::GenerationCompletionStatus::Success,
-                },
-                surface::OperationTerminal::Succeeded {
-                    usage: usage.clone(),
-                },
-            ),
-            (None, RunStatus::Cancelled) => (
-                surface::SurfaceTaskStatus::Cancelled,
-                surface::GenerationStopReason::Cancelled {
-                    cause: surface::TerminalizationCause::UserCancel,
-                },
-                surface::OperationTerminal::Cancelled {
-                    reason: surface::CancelReason::User,
-                },
-            ),
-            (None, RunStatus::ApprovalRequired) => (
-                surface::SurfaceTaskStatus::ApprovalRequired,
-                surface::GenerationStopReason::ProviderSuspended,
-                surface::OperationTerminal::Failed {
-                    class: surface::FailureClass::LegacyApprovalRequired,
-                    message: approval_message,
-                },
-            ),
-            (None, RunStatus::Failed | RunStatus::VerificationFailed) => (
-                surface::SurfaceTaskStatus::Failed,
-                surface::GenerationStopReason::ExecutionFailed {
-                    class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
-                    message: failure_message.clone(),
-                },
-                surface::OperationTerminal::Failed {
-                    class: surface::FailureClass::RuntimeInvariant,
-                    message: failure_message,
-                },
-            ),
-        };
+                    surface::OperationTerminal::Shutdown { reason },
+                ),
+                (None, _, _) if committed_user_cancel => (
+                    surface::SurfaceTaskStatus::Cancelled,
+                    surface::GenerationStopReason::Cancelled {
+                        cause: surface::TerminalizationCause::UserCancel,
+                    },
+                    surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User,
+                    },
+                ),
+                (None, _, Some(budget)) => (
+                    surface::SurfaceTaskStatus::Stopped,
+                    surface::GenerationStopReason::Completed {
+                        status: surface::GenerationCompletionStatus::BudgetExhausted {
+                            budget: budget.clone(),
+                        },
+                    },
+                    surface::OperationTerminal::BudgetExhausted { budget },
+                ),
+                (None, RunStatus::Success, None) => (
+                    surface::SurfaceTaskStatus::Completed,
+                    surface::GenerationStopReason::Completed {
+                        status: surface::GenerationCompletionStatus::Success,
+                    },
+                    surface::OperationTerminal::Succeeded {
+                        usage: usage.clone(),
+                    },
+                ),
+                (None, RunStatus::Cancelled, None) => (
+                    surface::SurfaceTaskStatus::Cancelled,
+                    surface::GenerationStopReason::Cancelled {
+                        cause: surface::TerminalizationCause::UserCancel,
+                    },
+                    surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User,
+                    },
+                ),
+                (None, RunStatus::ApprovalRequired, None) => (
+                    surface::SurfaceTaskStatus::ApprovalRequired,
+                    surface::GenerationStopReason::ProviderSuspended,
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::LegacyApprovalRequired,
+                        message: approval_message,
+                    },
+                ),
+                (None, RunStatus::Failed | RunStatus::VerificationFailed, None) => (
+                    surface::SurfaceTaskStatus::Failed,
+                    surface::GenerationStopReason::ExecutionFailed {
+                        class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
+                        message: failure_message.clone(),
+                    },
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::RuntimeInvariant,
+                        message: failure_message,
+                    },
+                ),
+            };
         let finalize_intent_id =
             surface::SurfaceFinalizeIntentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
@@ -36145,46 +36191,62 @@ impl ThreadActor {
             if let Some(usage) = outcome.usage {
                 self.usage_ledger.add(usage);
             }
-            let result = match (shutdown_reason, outcome.status) {
-                (Some(_), _) | (None, RunStatus::Cancelled) => typed.task_registry.stop_with_usage(
+            let budget_stopped = matches!(
+                outcome.operation_terminal,
+                Some(orca_core::budget::OperationTerminal::Stopped { .. })
+            );
+            let result = if budget_stopped {
+                typed.task_registry.stop_with_usage(
                     typed.task_id.as_str(),
-                    outcome.status.as_str().to_string(),
+                    "budget_exhausted".to_string(),
                     outcome.usage,
-                ),
-                (None, RunStatus::Success) => typed
-                    .task_registry
-                    .apply_main_session_terminal_update(
-                        typed.task_id.as_str(),
-                        MainSessionTerminalUpdate::Completed {
-                            result: outcome.status.as_str().to_string(),
-                        },
-                        outcome.usage,
-                    )
-                    .map(|_| ()),
-                (None, RunStatus::ApprovalRequired) => match outcome.response.clone() {
-                    Some(response) => typed
-                        .task_registry
-                        .approval_required_for_pending_provider_response_with_usage(
+                )
+            } else {
+                match (shutdown_reason, outcome.status) {
+                    (Some(_), _) | (None, RunStatus::Cancelled) => {
+                        typed.task_registry.stop_with_usage(
                             typed.task_id.as_str(),
                             outcome.status.as_str().to_string(),
-                            response,
                             outcome.usage,
-                        ),
-                    None => Err("typed approval outcome lost its provider response".to_string()),
-                },
-                (None, RunStatus::Failed | RunStatus::VerificationFailed) => typed
-                    .task_registry
-                    .apply_main_session_terminal_update(
-                        typed.task_id.as_str(),
-                        MainSessionTerminalUpdate::Failed {
-                            error: outcome
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "background provider failed".to_string()),
-                        },
-                        outcome.usage,
-                    )
-                    .map(|_| ()),
+                        )
+                    }
+                    (None, RunStatus::Success) => typed
+                        .task_registry
+                        .apply_main_session_terminal_update(
+                            typed.task_id.as_str(),
+                            MainSessionTerminalUpdate::Completed {
+                                result: outcome.status.as_str().to_string(),
+                            },
+                            outcome.usage,
+                        )
+                        .map(|_| ()),
+                    (None, RunStatus::ApprovalRequired) => match outcome.response.clone() {
+                        Some(response) => typed
+                            .task_registry
+                            .approval_required_for_pending_provider_response_with_usage(
+                                typed.task_id.as_str(),
+                                outcome.status.as_str().to_string(),
+                                response,
+                                outcome.usage,
+                            ),
+                        None => {
+                            Err("typed approval outcome lost its provider response".to_string())
+                        }
+                    },
+                    (None, RunStatus::Failed | RunStatus::VerificationFailed) => typed
+                        .task_registry
+                        .apply_main_session_terminal_update(
+                            typed.task_id.as_str(),
+                            MainSessionTerminalUpdate::Failed {
+                                error: outcome
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "background provider failed".to_string()),
+                            },
+                            outcome.usage,
+                        )
+                        .map(|_| ()),
+                }
             };
             if let Err(error) = result {
                 eprintln!(
@@ -37204,46 +37266,80 @@ fn run_headless_session(
 /// whose budget is gone must surface the stop instead of parking forever).
 fn settle_suspended_operation(
     handle: &crate::provider_stream::SuspendedOperationHandle,
-    response: &crate::model_response::RuntimeModelResponse,
+    response: Option<&crate::model_response::RuntimeModelResponse>,
     model: Option<&str>,
     status: RunStatus,
     error: Option<&str>,
-) -> io::Result<()> {
-    let mut operation = crate::operation_context::OperationContext::reopen(
-        handle.journal_path.clone(),
-        handle.spec,
-        &handle.operation_id,
-    )?;
-    // Resume accounting from the suspension snapshot: turns, tools, cost,
-    // and wall time continue exactly where the loop stopped.
-    operation.controller.restore_usage(handle.usage);
-
-    let usage = provider_response_usage_totals(&response.response, model);
-    let mut budget_stop = None;
-    if let Some(usage) = usage {
-        let spent = crate::cost::usd_to_micros(usage.estimated_cost_usd);
-        let recorded = operation.controller.usage().cost_usd_micros;
-        let delta = spent.saturating_sub(recorded);
-        if delta > 0
-            && let Err(stop) = operation.record_cost_usd_micros(delta)
-        {
-            budget_stop = Some(stop);
+) -> io::Result<Option<orca_core::budget::OperationTerminal>> {
+    let mut last_error = None;
+    for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+        match settle_suspended_operation_once(handle, response, model, status, error) {
+            Ok(terminal) => return Ok(terminal),
+            Err(settle_error) => {
+                last_error = Some(settle_error);
+                if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+                    std::thread::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
+                }
+            }
         }
     }
-    if budget_stop.is_none()
-        && let Err(stop) = operation.sync_wall_time()
-    {
-        budget_stop = Some(stop);
+    Err(last_error.expect("at least one suspended-operation settlement attempt"))
+}
+
+fn settle_suspended_operation_once(
+    handle: &crate::provider_stream::SuspendedOperationHandle,
+    response: Option<&crate::model_response::RuntimeModelResponse>,
+    model: Option<&str>,
+    status: RunStatus,
+    error: Option<&str>,
+) -> io::Result<Option<orca_core::budget::OperationTerminal>> {
+    let mut operation = crate::operation_context::OperationContext::reopen_suspended(
+        handle.journal_path.clone(),
+        handle.budget_spec,
+        &handle.operation_id,
+    )?;
+    if let Some(terminal) = operation.journal.terminal().cloned() {
+        return Ok(Some(terminal));
+    }
+    let usage =
+        response.and_then(|response| provider_response_usage_totals(&response.response, model));
+    let mut budget_stop = None;
+    if let Some(usage) = usage {
+        // Response usage is this provider exchange's delta. The suspended
+        // snapshot already contains earlier exchanges, so subtracting it here
+        // would undercharge every background completion.
+        let spent = crate::cost::usd_to_micros(usage.estimated_cost_usd);
+        if spent > 0 {
+            let accounting_id = format!(
+                "provider-response:{}",
+                response
+                    .expect("usage came from a provider response")
+                    .identity
+                    .item_ids
+                    .agent_message_item_id()
+            );
+            match operation.record_cost_usd_micros(spent, &accounting_id)? {
+                Ok(()) => {}
+                Err(stop) => budget_stop = Some(stop),
+            }
+        }
+    }
+    if budget_stop.is_none() {
+        match operation.sync_wall_time()? {
+            Ok(()) => {}
+            Err(stop) => budget_stop = Some(stop),
+        }
     }
     if status == RunStatus::ApprovalRequired && budget_stop.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(_stop) = budget_stop {
         // The exchange exceeded the budget: a non-resumable Stopped terminal
         // (no durable conversation boundary exists in the background path).
         let checkpoint_id = format!("{}-budget-stop", handle.operation_id);
-        operation.commit_non_resumable_budget_stop(&handle.operation_id, &checkpoint_id)?;
-        return Ok(());
+        let terminal =
+            operation.commit_non_resumable_budget_stop(&handle.operation_id, &checkpoint_id)?;
+        return Ok(Some(terminal));
     }
     let terminal = match status {
         RunStatus::Success => orca_core::budget::OperationTerminal::Completed {
@@ -37254,12 +37350,12 @@ fn settle_suspended_operation(
             checkpoint_id: None,
         },
         _ => orca_core::budget::OperationTerminal::Failed {
-            class: orca_core::budget::FailureClass::Runtime,
+            class: orca_core::budget::FailureClass::Provider,
             message: error.unwrap_or_default().to_string(),
         },
     };
-    operation.commit_terminal(&handle.operation_id, terminal)?;
-    Ok(())
+    operation.commit_terminal(&handle.operation_id, terminal.clone())?;
+    Ok(Some(terminal))
 }
 
 fn run_provider_background_task(
@@ -37340,17 +37436,31 @@ fn run_provider_background_task(
     // provider cost and wall time land in the budget controller, and the
     // operation terminal commits once (ApprovalRequired is not a terminal —
     // the operation stays parked for approval and may resume).
-    if let Some(handle) = suspension.operation()
-        && let Some(response) = response.as_ref()
-        && let Err(settle_error) = settle_suspended_operation(
+    let mut operation_terminal = None;
+    if let Some(handle) = suspension.operation() {
+        match settle_suspended_operation(
             handle,
-            response,
+            response.as_ref(),
             context.model.as_deref(),
             status,
             error.as_deref(),
-        )
-    {
-        eprintln!("orca: warning: failed to settle suspended operation: {settle_error}");
+        ) {
+            Ok(terminal) => {
+                operation_terminal = terminal;
+                if let Some(orca_core::budget::OperationTerminal::Stopped { reason, .. }) =
+                    operation_terminal.as_ref()
+                {
+                    status = RunStatus::Failed;
+                    error = Some(format!("budget stopped: {}", reason.as_str()));
+                }
+            }
+            Err(settle_error) => {
+                status = RunStatus::Failed;
+                error = Some(format!(
+                    "failed to settle suspended operation journal: {settle_error}"
+                ));
+            }
+        }
     }
 
     if let Some(surface_outcome) = context.surface_outcome {
@@ -37360,6 +37470,7 @@ fn run_provider_background_task(
             status,
             error,
             usage,
+            operation_terminal,
             completed_at_ms,
         };
         *surface_outcome
@@ -37380,45 +37491,56 @@ fn run_provider_background_task(
         .task_registry
         .get(&context.task_id)
         .is_some_and(|task| task.is_backgrounded);
-    match status {
-        RunStatus::Cancelled => {
-            let _ = context.task_registry.stop_with_usage(
-                &context.task_id,
-                status.as_str().to_string(),
-                usage,
-            );
-        }
-        RunStatus::ApprovalRequired => {
-            if let Some(response) = response {
-                let _ = context
-                    .task_registry
-                    .approval_required_for_pending_provider_response_with_usage(
-                        &context.task_id,
-                        status.as_str().to_string(),
-                        response,
-                        usage,
-                    );
+    if matches!(
+        operation_terminal,
+        Some(orca_core::budget::OperationTerminal::Stopped { .. })
+    ) {
+        let _ = context.task_registry.stop_with_usage(
+            &context.task_id,
+            "budget_exhausted".to_string(),
+            usage,
+        );
+    } else {
+        match status {
+            RunStatus::Cancelled => {
+                let _ = context.task_registry.stop_with_usage(
+                    &context.task_id,
+                    status.as_str().to_string(),
+                    usage,
+                );
             }
-        }
-        RunStatus::Success => {
-            let _ = context.task_registry.apply_main_session_terminal_update(
-                &context.task_id,
-                MainSessionTerminalUpdate::Completed {
-                    result: status.as_str().to_string(),
-                },
-                usage,
-            );
-        }
-        RunStatus::Failed | RunStatus::VerificationFailed => {
-            let _ = context.task_registry.apply_main_session_terminal_update(
-                &context.task_id,
-                MainSessionTerminalUpdate::Failed {
-                    error: error
-                        .clone()
-                        .unwrap_or_else(|| "background provider failed".to_string()),
-                },
-                usage,
-            );
+            RunStatus::ApprovalRequired => {
+                if let Some(response) = response {
+                    let _ = context
+                        .task_registry
+                        .approval_required_for_pending_provider_response_with_usage(
+                            &context.task_id,
+                            status.as_str().to_string(),
+                            response,
+                            usage,
+                        );
+                }
+            }
+            RunStatus::Success => {
+                let _ = context.task_registry.apply_main_session_terminal_update(
+                    &context.task_id,
+                    MainSessionTerminalUpdate::Completed {
+                        result: status.as_str().to_string(),
+                    },
+                    usage,
+                );
+            }
+            RunStatus::Failed | RunStatus::VerificationFailed => {
+                let _ = context.task_registry.apply_main_session_terminal_update(
+                    &context.task_id,
+                    MainSessionTerminalUpdate::Failed {
+                        error: error
+                            .clone()
+                            .unwrap_or_else(|| "background provider failed".to_string()),
+                    },
+                    usage,
+                );
+            }
         }
     }
     if let Some(writer) = &mut context.history_writer {
@@ -37546,6 +37668,50 @@ fn provider_response_usage_totals(
     let usage = response.usage.filter(|usage| !usage.is_empty())?;
     let mut tracker = crate::cost::CostTracker::new(model);
     Some(tracker.add_usage(usage))
+}
+
+fn surface_budget_from_core_terminal(
+    terminal: &orca_core::budget::OperationTerminal,
+) -> Option<surface::OperationBudget> {
+    match terminal {
+        orca_core::budget::OperationTerminal::Stopped { reason, usage, .. } => {
+            Some(surface_budget_from_stop(*reason, *usage))
+        }
+        _ => None,
+    }
+}
+
+fn surface_budget_from_stop(
+    reason: orca_core::budget::StopReason,
+    usage: orca_core::budget::BudgetUsage,
+) -> surface::OperationBudget {
+    match reason {
+        orca_core::budget::StopReason::TurnBudget { max_turns } => {
+            surface::OperationBudget::TurnRequests {
+                scope: surface::TurnRequestBudgetScope::AgentLoop,
+                limit: u64::from(max_turns),
+                observed: u64::from(usage.turns),
+            }
+        }
+        orca_core::budget::StopReason::ToolCallBudget { max_tool_calls } => {
+            surface::OperationBudget::ToolCalls {
+                limit: u64::from(max_tool_calls),
+                observed: u64::from(usage.tool_calls),
+            }
+        }
+        orca_core::budget::StopReason::CostBudget {
+            max_cost_usd_micros,
+        } => surface::OperationBudget::MonetaryBudgetUsdMicros {
+            limit: max_cost_usd_micros,
+            observed: usage.cost_usd_micros,
+        },
+        orca_core::budget::StopReason::WallTimeBudget { max_wall_time_ms } => {
+            surface::OperationBudget::WallTimeMs {
+                limit: max_wall_time_ms,
+                observed: usage.wall_time_ms,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42324,6 +42490,7 @@ mod tests {
 
     #[test]
     fn denied_background_approval_retries_exact_terminal_batch() {
+        let _test_env = crate::history::lock_test_env();
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start denied approval retry host");
         let thread = host
@@ -50950,11 +51117,13 @@ mod tests {
             cost_usd_micros: 4_000,
             wall_time_ms: 0,
         });
+        operation
+            .persist_current_budget_usage()
+            .expect("baseline usage persists");
         let handle = SuspendedOperationHandle {
             journal_path: operation.journal.path().to_path_buf(),
             operation_id: operation.journal.operation_id().to_string(),
-            spec,
-            usage: operation.controller.usage(),
+            budget_spec: *operation.controller.spec(),
         };
         drop(operation);
         let response = RuntimeModelResponse::new(
@@ -50974,7 +51143,7 @@ mod tests {
         );
         settle_suspended_operation(
             &handle,
-            &response,
+            Some(&response),
             Some("deepseek-v4-flash"),
             RunStatus::Success,
             None,
@@ -51006,8 +51175,8 @@ mod tests {
             "tool accounting resumed from the snapshot"
         );
         assert_eq!(
-            usage.cost_usd_micros, 16_800,
-            "the provider-reported total for the exchange is charged exactly once"
+            usage.cost_usd_micros, 20_800,
+            "the response delta is added exactly once to the pre-suspension cost"
         );
 
         // The same exchange against a budget the snapshot + delta exceeds
@@ -51026,16 +51195,18 @@ mod tests {
             cost_usd_micros: 4_000,
             wall_time_ms: 0,
         });
+        operation
+            .persist_current_budget_usage()
+            .expect("baseline usage persists");
         let handle = SuspendedOperationHandle {
             journal_path: operation.journal.path().to_path_buf(),
             operation_id: operation.journal.operation_id().to_string(),
-            spec: strict_spec,
-            usage: operation.controller.usage(),
+            budget_spec: *operation.controller.spec(),
         };
         drop(operation);
         settle_suspended_operation(
             &handle,
-            &response,
+            Some(&response),
             Some("deepseek-v4-flash"),
             RunStatus::Success,
             None,
@@ -51079,5 +51250,69 @@ mod tests {
             !resumable,
             "no durable conversation boundary exists in the background path"
         );
+    }
+
+    #[test]
+    fn suspended_operation_settles_cancel_and_disconnect_without_a_response() {
+        use crate::provider_stream::SuspendedOperationHandle;
+        use orca_core::budget::{BudgetSpec, CancelReason, FailureClass, OperationTerminal};
+
+        for (suffix, status, error) in [
+            ("cancel", RunStatus::Cancelled, None),
+            (
+                "disconnect",
+                RunStatus::Failed,
+                Some("provider stream ended without a response"),
+            ),
+        ] {
+            let operation_id = format!("op-settle-{suffix}");
+            let operation = crate::operation_context::OperationContext::for_tests(
+                BudgetSpec::default(),
+                &operation_id,
+            );
+            let handle = SuspendedOperationHandle {
+                journal_path: operation.journal.path().to_path_buf(),
+                operation_id: operation.journal.operation_id().to_string(),
+                budget_spec: *operation.controller.spec(),
+            };
+            drop(operation);
+
+            settle_suspended_operation(&handle, None, None, status, error)
+                .expect("response-less terminal settles");
+            let reopened = crate::operation_context::OperationContext::reopen(
+                handle.journal_path.clone(),
+                BudgetSpec::default(),
+                &handle.operation_id,
+            )
+            .expect("journal reopens");
+            let terminal = reopened
+                .journal
+                .committed()
+                .iter()
+                .find_map(|record| match record {
+                    crate::execution_journal::JournalRecord::OperationTerminal {
+                        terminal, ..
+                    } => Some(terminal),
+                    _ => None,
+                })
+                .expect("response-less path writes a terminal");
+            match status {
+                RunStatus::Cancelled => assert!(matches!(
+                    terminal,
+                    OperationTerminal::Cancelled {
+                        reason: CancelReason::User,
+                        ..
+                    }
+                )),
+                RunStatus::Failed => assert!(matches!(
+                    terminal,
+                    OperationTerminal::Failed {
+                        class: FailureClass::Provider,
+                        message,
+                    } if message.contains("without a response")
+                )),
+                _ => unreachable!(),
+            }
+        }
     }
 }

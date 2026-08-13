@@ -294,6 +294,7 @@ pub(crate) struct DurableTypedProviderOutcome {
     pub response: Option<RuntimeModelResponse>,
     pub error: Option<String>,
     pub usage: Option<UsageTotals>,
+    pub operation_terminal: Option<orca_core::budget::OperationTerminal>,
     pub completed_at_ms: i64,
 }
 
@@ -306,6 +307,8 @@ struct PersistedTypedProviderOutcome {
     error: Option<String>,
     #[serde(default)]
     usage: Option<UsageTotals>,
+    #[serde(default)]
+    operation_terminal: Option<orca_core::budget::OperationTerminal>,
     completed_at_ms: i64,
 }
 
@@ -2587,6 +2590,7 @@ impl TryFrom<PersistedTypedProviderOutcome> for DurableTypedProviderOutcome {
             response,
             error: outcome.error,
             usage: outcome.usage,
+            operation_terminal: outcome.operation_terminal,
             completed_at_ms: outcome.completed_at_ms,
         })
     }
@@ -2601,6 +2605,7 @@ impl From<&DurableTypedProviderOutcome> for PersistedTypedProviderOutcome {
             }),
             error: outcome.error.as_deref().map(redact_sensitive_text),
             usage: outcome.usage,
+            operation_terminal: outcome.operation_terminal.clone(),
             completed_at_ms: outcome.completed_at_ms,
         }
     }
@@ -3200,6 +3205,49 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_typed_provider_outcome_round_trips_budget_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let session_id = "provider-budget-terminal".to_string();
+        let registry = TaskRegistry::new_persistent(session_id.clone(), root.clone()).unwrap();
+        let task = registry.create_main_session("background provider".to_string());
+        registry.mark_running(&task.id).unwrap();
+        let terminal = orca_core::budget::OperationTerminal::Stopped {
+            reason: orca_core::budget::StopReason::WallTimeBudget {
+                max_wall_time_ms: 1_000,
+            },
+            usage: orca_core::budget::BudgetUsage {
+                turns: 2,
+                tool_calls: 1,
+                cost_usd_micros: 50,
+                wall_time_ms: 1_001,
+            },
+            checkpoint_id: "provider-budget-stop".to_string(),
+            resumable: false,
+        };
+        registry
+            .record_typed_provider_outcome(
+                &task.id,
+                DurableTypedProviderOutcome {
+                    status: TaskStatus::Stopped,
+                    response: None,
+                    error: Some("budget stopped: wall_time_budget".to_string()),
+                    usage: None,
+                    operation_terminal: Some(terminal.clone()),
+                    completed_at_ms: 42,
+                },
+            )
+            .unwrap();
+
+        let reloaded = TaskRegistry::new_persistent_attached(session_id, root).unwrap();
+        let outcome = reloaded
+            .typed_provider_outcome(&task.id)
+            .expect("durable provider outcome reloads");
+        assert_eq!(outcome.status, TaskStatus::Stopped);
+        assert_eq!(outcome.operation_terminal, Some(terminal));
+    }
 
     fn runtime_response(response: ProviderResponse) -> RuntimeModelResponse {
         RuntimeModelResponse::new(response, TurnId::new())

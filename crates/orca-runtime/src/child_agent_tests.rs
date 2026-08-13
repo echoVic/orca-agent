@@ -920,6 +920,11 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
         Some("Mock completed after tool execution.")
     );
     assert_eq!(tool_count, 1);
+    let budget_usage = result
+        .budget_usage
+        .expect("child loop returns an exact budget receipt");
+    assert_eq!(budget_usage.turns, 2);
+    assert_eq!(budget_usage.tool_calls, 1);
 }
 
 #[test]
@@ -971,6 +976,15 @@ fn observed_child_agent_stops_at_local_budget_after_emitting_exact_usage() {
     assert_eq!(totals.input_tokens, 120);
     assert_eq!(totals.output_tokens, 30);
     assert_eq!(totals.cache_tokens, 10);
+    let budget_usage = result
+        .budget_usage
+        .expect("budget-stopped child still returns its consumed receipt");
+    assert_eq!(budget_usage.turns, 1);
+    assert_eq!(
+        budget_usage.cost_usd_micros,
+        crate::cost::usd_to_micros(totals.estimated_cost_usd),
+        "the lease receipt includes provider spend"
+    );
     let usage_events = activities
         .borrow()
         .iter()

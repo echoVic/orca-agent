@@ -188,7 +188,7 @@ pub enum OperationTerminal {
 ## Post-Implementation Review Rounds
 
 All 50 tasks landed (commits 4b45fee7d, 175d553c8, 3b8896d5f, 375696348),
-followed by three review rounds that closed protocol gaps before release:
+followed by four review rounds that closed protocol gaps before release:
 
 - Round 1: operation-owned context (BudgetController + ExecutionJournal)
   threaded through the loop; real journal checkpoints before resumable
@@ -206,6 +206,13 @@ followed by three review rounds that closed protocol gaps before release:
   become typed budget stops, batch children partition the remaining budget,
   receipts survive persistence failures, stateless stops are never
   resumable, and checkpoint reasons are dimension-specific.
+- Round 4: schema-v2 durable budget facts replace suspension snapshots;
+  provider response identities make retry accounting exactly once; foreground
+  provider deltas are independent of restored cumulative baselines; batch
+  leases split the controller's actual remaining additive capacity atomically;
+  child wall time shares one deadline instead of being summed; and typed live
+  and recovered surfaces consume the same durable budget terminal.
 
-Released as v0.3.16 with the acceptance tests named in the spec's
-Review Round 3 addendum.
+Released as v0.3.17 with the acceptance tests named in the spec's
+Review Round 4 addendum. Operation journal schema v2 is intentionally not
+backward-compatible with in-flight v1 operation journals.

@@ -427,8 +427,7 @@ impl RuntimeProviderTurnStep {
                         crate::provider_stream::SuspendedOperationHandle {
                             journal_path: input.operation.journal.path().to_path_buf(),
                             operation_id: input.operation.journal.operation_id().to_string(),
-                            spec: *input.operation.controller.spec(),
-                            usage: input.operation.controller.usage(),
+                            budget_spec: *input.operation.controller.spec(),
                         },
                     ),
                 ));
@@ -440,6 +439,7 @@ impl RuntimeProviderTurnStep {
         if let Some(usage) = response.usage
             && !usage.is_empty()
         {
+            let spent_before = crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
             // The operation's controller owns the cost dimension; the legacy
             // actor-side ceiling check is disabled here so every dimension is
             // enforced by the one controller (and journaled with the terminal).
@@ -451,12 +451,22 @@ impl RuntimeProviderTurnStep {
                 }
             };
             let spent_total = crate::cost::usd_to_micros(totals.estimated_cost_usd);
-            let recorded_before = input.operation.controller.usage().cost_usd_micros;
-            let delta = spent_total.saturating_sub(recorded_before);
-            if delta > 0
-                && let Err(stop) = input.operation.record_cost_usd_micros(delta)
-            {
-                budget_stop = Some(stop);
+            // Derive this exchange's delta from the in-memory tracker before
+            // and after record_usage. The operation controller may have been
+            // restored from a journal with a different cumulative baseline.
+            let delta = spent_total.saturating_sub(spent_before);
+            if delta > 0 {
+                let accounting_id = format!(
+                    "provider-response:{}",
+                    response_identity.item_ids.agent_message_item_id()
+                );
+                match input
+                    .operation
+                    .record_cost_usd_micros(delta, &accounting_id)?
+                {
+                    Ok(()) => {}
+                    Err(stop) => budget_stop = Some(stop),
+                }
             }
             if emit_deltas {
                 sink.emit(events.usage_updated(totals))?;
@@ -476,10 +486,11 @@ impl RuntimeProviderTurnStep {
         // a provider that returns no usage (or fails after a long request)
         // must still land a wall-time stop promptly, not only at the next
         // turn admit.
-        if budget_stop.is_none()
-            && let Err(stop) = input.operation.sync_wall_time()
-        {
-            budget_stop = Some(stop);
+        if budget_stop.is_none() {
+            match input.operation.sync_wall_time()? {
+                Ok(()) => {}
+                Err(stop) => budget_stop = Some(stop),
+            }
         }
 
         if input.cancel.is_cancelled() {
@@ -1232,6 +1243,75 @@ mod tests {
         assert!(output.contains("\"used_tokens\":120"));
         assert!(output.contains("\"limit_tokens\":1000000"));
         assert!(!output.contains("\"type\":\"error\""));
+    }
+
+    #[test]
+    fn provider_turn_accounts_response_cost_on_top_of_restored_durable_usage() {
+        let mut lifecycle =
+            crate::lifecycle::RuntimeSessionLifecycle::new("provider-restored-cost".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_usage_then_cancel".to_string());
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(orca_core::model::FLASH_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let hooks = HookRunner::default();
+        let cancel = CancelToken::new();
+        let mut cost_tracker = CostTracker::new(Some(orca_core::model::FLASH_MODEL));
+        let mut events = EventFactory::new("provider-restored-cost".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut operation = crate::operation_context::OperationContext::for_tests(
+            orca_core::budget::BudgetSpec {
+                max_cost_usd_micros: Some(10_000),
+                ..orca_core::budget::BudgetSpec::default()
+            },
+            "provider-restored-cost",
+        );
+        operation
+            .controller
+            .restore_usage(orca_core::budget::BudgetUsage {
+                cost_usd_micros: 1_000,
+                ..orca_core::budget::BudgetUsage::default()
+            });
+
+        let result = RuntimeProviderTurnStep::new()
+            .run(RuntimeProviderTurnInput {
+                actor: &mut actor,
+                operation: &mut operation,
+                provider: ProviderKind::Mock,
+                runtime_system_messages: &[],
+                provider_config: &provider_config,
+                turn_context: RuntimeTurnContext::new(
+                    Path::new("."),
+                    "mock_usage_then_cancel",
+                    0,
+                    true,
+                    &SubagentType::General,
+                ),
+                hooks: &hooks,
+                cancel: &cancel,
+                context_window: 1_000_000,
+                io: RuntimeProviderTurnIo {
+                    conversation: &mut conversation,
+                    cost_tracker: &mut cost_tracker,
+                    events: &mut events,
+                    sink: &mut sink,
+                    history_writer: None,
+                },
+            })
+            .expect("provider turn");
+
+        assert!(matches!(result, RuntimeProviderTurnOutput::Terminal(_)));
+        assert!(
+            operation.controller.usage().cost_usd_micros > 1_000,
+            "the new response must be charged even when durable usage exceeds the fresh tracker's total"
+        );
     }
 
     #[test]

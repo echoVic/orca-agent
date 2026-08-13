@@ -256,6 +256,7 @@ pub struct ThreadTurnRequest {
     provider_suspension_control: Option<Arc<dyn RuntimeProviderSuspensionControl>>,
     provider_response_ingress: Option<Arc<dyn RuntimeProviderResponseIngress>>,
     workflow_lifecycle_ingress: Option<Arc<dyn RuntimeWorkflowLifecycleIngress>>,
+    defer_cancel_terminal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -624,6 +625,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
 
         let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
             .with_turn_id(request.turn_id().clone())
+            .with_deferred_cancel_terminal(request.defer_cancel_terminal())
             .with_root_task_id(request.root_task_id())
             .with_services(
                 parts.instructions,
@@ -885,6 +887,7 @@ impl ThreadTurnRequest {
             provider_suspension_control: None,
             provider_response_ingress: None,
             workflow_lifecycle_ingress: None,
+            defer_cancel_terminal: false,
         }
     }
 
@@ -1052,6 +1055,15 @@ impl ThreadTurnRequest {
     pub fn with_existing_turn_prompt(mut self) -> Self {
         self.prompt_placement = ThreadTurnPromptPlacement::ExistingTurn;
         self
+    }
+
+    pub(crate) fn with_deferred_cancel_terminal(mut self, defer: bool) -> Self {
+        self.defer_cancel_terminal = defer;
+        self
+    }
+
+    fn defer_cancel_terminal(&self) -> bool {
+        self.defer_cancel_terminal
     }
 
     pub fn steer_handle(&self) -> Option<&ThreadSteerHandle> {

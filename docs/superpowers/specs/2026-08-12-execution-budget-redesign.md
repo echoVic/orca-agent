@@ -47,10 +47,10 @@ In scope:
   options for each dimension.
 - `BudgetController` in `orca-runtime` owning admission, accounting, reminders,
   and child leases; one controller per operation.
-- `ExecutionJournal`: ordered records (`operation.started`, `turn.started`,
-  `model.response`, `tool.started`, `tool.completed`, `checkpoint.created`,
-  `operation.terminal`) with atomic flush; JSONL/transcript projections feed
-  only from committed records.
+- `ExecutionJournal`: ordered records (`operation.started`, `budget.usage`,
+  `turn.started`, `model.response`, `tool.started`, `tool.completed`,
+  `checkpoint.created`, `operation.terminal`) with atomic flush;
+  JSONL/transcript projections feed only from committed records.
 - Removal of `DEFAULT_MAX_TURNS`, `RunStatus::BudgetExhausted`,
   `TurnEndReason::MaxInnerTurns`, and `RuntimeTaskActor.max_turns`.
 - Resume from `last_committed_message_id`; unmatched `tool.started` restored as
@@ -302,3 +302,44 @@ cargo test -p orca-runtime --lib -- operation_context::tests::stateless_budget_s
   runtime_host::tests::suspended_exchange tool_turn::tests::batch_child_spec \
   subagent_execution::tests::batch_persistence
 ```
+
+## Review Round 4 Addendum: Durable Accounting and Fair Remaining Capacity
+
+Round 3 still treated the suspended controller snapshot as recovery authority
+and partitioned batch children from the original config. That was insufficient
+for process restart, approval continuation, and settlement retry.
+
+1. Journal schema v2 stores the immutable `BudgetSpec` in
+   `operation.started` and appends cumulative `budget.usage` facts at every
+   admission/accounting boundary. Reopen restores the newest committed usage,
+   reconstructs elapsed wall time from the original absolute start timestamp,
+   and rejects a requested spec that differs from the durable operation spec.
+2. Provider cost settlement uses the stable response item id as its accounting
+   id. Reopening and retrying the same response observes the committed id and
+   does not charge it twice. A duplicate retry still persists a fresh wall-time
+   fact. Foreground provider accounting derives the response delta from the
+   `CostTracker` before and after that call, never by subtracting the durable
+   controller's potentially different cumulative baseline. Tool admission uses
+   the operation-local monotonic admission count instead of provider tool-call
+   ids, because providers may legally reuse an id for a schema-failed retry.
+3. Batch child leases are allocated together from the controller's current
+   remaining and already-reserved capacity. Additive dimensions are split
+   fairly; the entire allocation is refused if any finite dimension has less
+   than one unit per child. Wall time is a shared deadline, not an additive
+   receipt, so parallel child elapsed values are never summed.
+4. Child leases enforce wall time after zero-cost provider responses, and
+   receipts include provider cost, child turns, tool calls, and nested child
+   work even when later conversation/event persistence fails.
+5. Typed provider outcomes persist the core `OperationTerminal`; live,
+   recovery, Goal, and legacy task projections classify a durable stopped
+   terminal as budget exhaustion instead of rebuilding the result from the
+   provider status.
+6. Hosted resumable generations defer a cancellation terminal to the host.
+   The host commits `Cancelled` only after deciding that no queued resume will
+   replace the generation; a successor can therefore append to the same
+   logical turn journal without violating the terminal-is-final invariant.
+
+Compatibility is intentionally broken at the operation-journal boundary.
+Schema v1 and mixed-version records are explicitly rejected. Saved sessions
+remain valid resume boundaries, but a v1 in-flight operation journal is not
+migrated or continued.

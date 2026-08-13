@@ -16,19 +16,14 @@ pub enum RuntimeProviderSuspensionEvent {
     Completed(RuntimeModelResponse),
 }
 
-/// A resumable handle to the suspended operation's execution journal and
-/// budget spec. The background completion path reopens the journal (appending
-/// continues exactly where the loop stopped) and settles cost, wall time, and
-/// the operation terminal against the authoritative journal.
+/// A resumable handle to the suspended operation's execution journal. The
+/// journal owns the durable budget spec and cumulative usage; the background
+/// completion path reopens that same source of truth.
 #[derive(Clone, Debug)]
 pub struct SuspendedOperationHandle {
     pub(crate) journal_path: std::path::PathBuf,
     pub(crate) operation_id: String,
-    pub(crate) spec: orca_core::budget::BudgetSpec,
-    /// The controller's usage at suspension, so the completion path resumes
-    /// accounting from the exact point the loop stopped (turns, tools, cost,
-    /// and wall time) instead of a fresh zero-usage controller.
-    pub(crate) usage: orca_core::budget::BudgetUsage,
+    pub(crate) budget_spec: orca_core::budget::BudgetSpec,
 }
 
 pub struct RuntimeProviderSuspension {

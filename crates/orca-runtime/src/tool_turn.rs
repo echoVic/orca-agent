@@ -105,6 +105,21 @@ pub(crate) struct RuntimeNormalToolTurnExecution {
     child_budget_usage: Option<orca_core::budget::BudgetUsage>,
 }
 
+#[derive(Debug)]
+pub(crate) struct RuntimeNormalToolTurnFailure {
+    error: io::Error,
+    child_budget_usage: Option<orca_core::budget::BudgetUsage>,
+}
+
+impl From<io::Error> for RuntimeNormalToolTurnFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            child_budget_usage: None,
+        }
+    }
+}
+
 pub(crate) struct RuntimeNormalToolTurnRequest<'a> {
     pub(crate) config: &'a RunConfig,
     pub(crate) cwd: &'a Path,
@@ -398,68 +413,64 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             // remainder; each child's effective spec still accounts for
             // every earlier child's outstanding reservation.
             let window_requests = dispatch_window.tool_requests();
-            let child_count = window_requests.len().max(1) as u32;
-            let batch_child_spec =
-                divide_spec_across_children(config.budget.to_spec(), child_count);
             let mut child_leases: Vec<Option<crate::budget_controller::BudgetLease>> = Vec::new();
             let mut child_budgets: Vec<Option<orca_core::budget::BudgetSpec>> = Vec::new();
             if let Some(operation) = operation.as_deref_mut() {
-                for _ in window_requests {
-                    match operation.controller.child_lease(batch_child_spec) {
-                        Ok(lease) => {
+                match operation
+                    .controller
+                    .child_leases(config.budget.to_spec(), window_requests.len())
+                {
+                    Ok(leases) => {
+                        for lease in leases {
                             child_budgets.push(Some(*lease.spec()));
                             child_leases.push(Some(lease));
                         }
-                        Err(stop) => {
-                            // The parent has no capacity left for another
-                            // child. Settle in journal order FIRST: granted
-                            // leases, then every batch tool (all were admitted
-                            // with committed tool.started) as cancelled, then
-                            // the conversation, and only then the session
-                            // boundary + operation terminal — a checkpoint can
-                            // never precede open tool settlement.
-                            for lease in child_leases.drain(..).flatten() {
-                                let consumed = lease.finish();
-                                let _ = operation.controller.merge_child_usage(consumed);
-                            }
-                            for request in window_requests {
-                                operation.record_tool_completed(
-                                    turn_id,
-                                    &request.id,
-                                    "cancelled",
-                                    Some("budget stopped before dispatch".to_string()),
-                                )?;
-                            }
-                            close_unstarted_tool_requests(
-                                sampling_state,
-                                tool_requests,
-                                events,
-                                sink,
-                                conversation,
-                                history_writer.as_deref_mut(),
-                                emit_deltas,
-                                provider_response_ingress,
-                                "an earlier subagent dispatch was stopped by the operation budget",
-                            )?;
-                            let terminal = operation.commit_budget_stop_with_boundary(
+                    }
+                    Err(stop) => {
+                        // The parent has no capacity left for another
+                        // child. Settle in journal order FIRST: granted
+                        // leases, then every batch tool (all were admitted
+                        // with committed tool.started) as cancelled, then
+                        // the conversation, and only then the session
+                        // boundary + operation terminal — a checkpoint can
+                        // never precede open tool settlement.
+                        for request in window_requests {
+                            operation.record_tool_completed(
                                 turn_id,
-                                events.run_id(),
-                                history_writer.as_deref_mut(),
-                                &cost_tracker.totals(),
-                                None,
-                                stop,
+                                &request.id,
+                                "cancelled",
+                                Some("budget stopped before dispatch".to_string()),
                             )?;
-                            return Ok(ToolTurnOutcome::Return {
-                                status: RunStatus::Failed,
-                                error: Some(format!(
-                                    "budget stopped: {} (turns={}, tool_calls={})",
-                                    stop.reason.as_str(),
-                                    stop.usage.turns,
-                                    stop.usage.tool_calls
-                                )),
-                                terminal: Some(terminal),
-                            });
                         }
+                        close_unstarted_tool_requests(
+                            sampling_state,
+                            tool_requests,
+                            events,
+                            sink,
+                            conversation,
+                            history_writer.as_deref_mut(),
+                            emit_deltas,
+                            provider_response_ingress,
+                            "an earlier subagent dispatch was stopped by the operation budget",
+                        )?;
+                        let terminal = operation.commit_budget_stop_with_boundary(
+                            turn_id,
+                            events.run_id(),
+                            history_writer.as_deref_mut(),
+                            &cost_tracker.totals(),
+                            None,
+                            stop,
+                        )?;
+                        return Ok(ToolTurnOutcome::Return {
+                            status: RunStatus::Failed,
+                            error: Some(format!(
+                                "budget stopped: {} (turns={}, tool_calls={})",
+                                stop.reason.as_str(),
+                                stop.usage.turns,
+                                stop.usage.tool_calls
+                            )),
+                            terminal: Some(terminal),
+                        });
                     }
                 }
             }
@@ -509,7 +520,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                         .flatten()
                         .zip(batch_receipts.into_iter())
                     {
-                        settle_child_lease(&mut Some(lease), receipt, &mut operation);
+                        settle_child_lease(&mut Some(lease), receipt, &mut operation)?;
                     }
                     close_unstarted_tool_requests(
                         sampling_state,
@@ -541,7 +552,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     .flatten()
                     .zip(batch_receipts.into_iter())
                 {
-                    settle_child_lease(&mut Some(lease), receipt, &mut operation);
+                    settle_child_lease(&mut Some(lease), receipt, &mut operation)?;
                 }
                 close_unstarted_tool_requests(
                     sampling_state,
@@ -561,7 +572,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 .flatten()
                 .zip(batch_receipts.into_iter())
             {
-                settle_child_lease(&mut Some(lease), receipt, &mut operation);
+                settle_child_lease(&mut Some(lease), receipt, &mut operation)?;
             }
             continue;
         }
@@ -763,8 +774,9 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         });
         let execution = match execution {
             Ok(execution) => execution,
-            Err(error) => {
-                settle_child_lease(&mut child_lease, None, &mut operation);
+            Err(failure) => {
+                settle_child_lease(&mut child_lease, failure.child_budget_usage, &mut operation)?;
+                let error = failure.error;
                 if is_semantic_commit_failure(&error) {
                     return Err(error);
                 }
@@ -832,7 +844,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 &mut child_lease,
                 execution.child_budget_usage,
                 &mut operation,
-            );
+            )?;
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -860,7 +872,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 &mut child_lease,
                 execution.child_budget_usage,
                 &mut operation,
-            );
+            )?;
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -878,26 +890,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             &mut child_lease,
             execution.child_budget_usage,
             &mut operation,
-        );
+        )?;
     }
 
     Ok(ToolTurnOutcome::Continue)
-}
-
-/// Partitions a budget spec evenly across concurrent batch children so the
-/// first lease can never monopolize the parent's entire finite remainder.
-fn divide_spec_across_children(
-    spec: orca_core::budget::BudgetSpec,
-    children: u32,
-) -> orca_core::budget::BudgetSpec {
-    let share32 = |limit: Option<u32>| limit.map(|limit| (limit / children).max(1));
-    let share64 = |limit: Option<u64>| limit.map(|limit| (limit / u64::from(children)).max(1));
-    orca_core::budget::BudgetSpec {
-        max_turns: share32(spec.max_turns),
-        max_tool_calls: share32(spec.max_tool_calls),
-        max_cost_usd_micros: share64(spec.max_cost_usd_micros),
-        max_wall_time_ms: share64(spec.max_wall_time_ms),
-    }
 }
 
 /// Settles a child budget lease exactly once: the child's consumed usage
@@ -908,16 +904,17 @@ fn settle_child_lease(
     child_lease: &mut Option<crate::budget_controller::BudgetLease>,
     child_usage: Option<orca_core::budget::BudgetUsage>,
     operation: &mut Option<&mut OperationContext>,
-) {
+) -> io::Result<()> {
     let Some(lease) = child_lease.take() else {
-        return;
+        return Ok(());
     };
     let consumed = child_usage.unwrap_or_else(|| lease.finish());
     if let Some(operation) = operation.as_deref_mut() {
         // Merging past the parent's ceiling latches the parent stop; the
         // next turn admission surfaces it as a typed terminal.
-        let _ = operation.controller.merge_child_usage(consumed);
+        let _ = operation.merge_child_usage(consumed)?;
     }
+    Ok(())
 }
 
 /// The final settlement label for a tool from the committed conversation
@@ -1046,7 +1043,7 @@ fn emit_tool_terminal_events<W: io::Write>(
 
 pub(crate) fn run_normal_tool_turn<W: io::Write>(
     context: RuntimeNormalToolTurnContext<'_, W>,
-) -> io::Result<RuntimeNormalToolTurnExecution> {
+) -> Result<RuntimeNormalToolTurnExecution, RuntimeNormalToolTurnFailure> {
     let RuntimeNormalToolTurnContext {
         sampling_state,
         request,
@@ -1168,28 +1165,37 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         subagent_child_executor,
         workflow_child_executor,
     )?;
+    let child_budget_usage = execution.child_budget_usage;
     if execution
         .event_error
         .as_ref()
         .is_some_and(is_semantic_commit_failure)
     {
-        return Err(execution
-            .event_error
-            .take()
-            .expect("semantic commit failure remains available"));
+        return Err(RuntimeNormalToolTurnFailure {
+            error: execution
+                .event_error
+                .take()
+                .expect("semantic commit failure remains available"),
+            child_budget_usage,
+        });
     }
 
     let budget_exhaustion = subagent_budget_exhaustion_error(config, tool_request, cost_tracker);
     let mut event_error = execution.event_error;
     if budget_exhaustion.is_some() {
-        sampling_state.record_normal_tool_result(
-            conversation,
-            history_writer.as_deref_mut(),
-            tool_request,
-            &execution.result,
-            execution.status,
-            emit_deltas,
-        )?;
+        sampling_state
+            .record_normal_tool_result(
+                conversation,
+                history_writer.as_deref_mut(),
+                tool_request,
+                &execution.result,
+                execution.status,
+                emit_deltas,
+            )
+            .map_err(|error| RuntimeNormalToolTurnFailure {
+                error,
+                child_budget_usage,
+            })?;
         let totals = cost_tracker.totals();
         if emit_deltas {
             if let Err(error) = sink.emit(events.usage_updated(totals))
@@ -1213,14 +1219,19 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             terminal: None,
         }
     } else {
-        let record_outcome = sampling_state.record_normal_tool_result(
-            conversation,
-            history_writer.as_deref_mut(),
-            tool_request,
-            &execution.result,
-            execution.status,
-            emit_deltas,
-        )?;
+        let record_outcome = sampling_state
+            .record_normal_tool_result(
+                conversation,
+                history_writer.as_deref_mut(),
+                tool_request,
+                &execution.result,
+                execution.status,
+                emit_deltas,
+            )
+            .map_err(|error| RuntimeNormalToolTurnFailure {
+                error,
+                child_budget_usage,
+            })?;
         if execution.disposition == RuntimeToolTurnDisposition::StopTurn {
             ToolTurnOutcome::Return {
                 status: execution.status,
@@ -1237,11 +1248,15 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         execution.result.truncated,
         events,
         sink,
-    )?;
+    )
+    .map_err(|error| RuntimeNormalToolTurnFailure {
+        error,
+        child_budget_usage,
+    })?;
     Ok(RuntimeNormalToolTurnExecution {
         outcome,
         event_error,
-        child_budget_usage: execution.child_budget_usage,
+        child_budget_usage,
     })
 }
 
@@ -3530,47 +3545,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn batch_child_spec_partitions_finite_dimensions_and_keeps_unlimited() {
-        use orca_core::budget::BudgetSpec;
-
-        let spec = BudgetSpec {
-            max_turns: Some(9),
-            max_tool_calls: Some(2),
-            max_cost_usd_micros: Some(9_000),
-            max_wall_time_ms: None,
-        };
-        let share = divide_spec_across_children(spec, 3);
-        assert_eq!(share.max_turns, Some(3), "turns divide evenly");
-        assert_eq!(
-            share.max_tool_calls,
-            Some(1),
-            "a divided dimension floors at one so children still admit work"
-        );
-        assert_eq!(share.max_cost_usd_micros, Some(3_000));
-        assert_eq!(
-            share.max_wall_time_ms, None,
-            "unlimited dimensions stay unlimited for every child"
-        );
-
-        let whole = divide_spec_across_children(BudgetSpec::default(), 4);
-        assert_eq!(
-            whole,
-            BudgetSpec::default(),
-            "an unlimited parent grants unlimited shares"
-        );
-
-        let tiny = divide_spec_across_children(
-            BudgetSpec {
-                max_turns: Some(1),
-                ..BudgetSpec::default()
-            },
-            2,
-        );
-        assert_eq!(
-            tiny.max_turns,
-            Some(1),
-            "the floor never fabricates capacity below one"
-        );
-    }
+    // Batch partitioning is owned and tested by BudgetController: the tool
+    // turn must not derive shares from the original config independently of
+    // the controller's consumed and reserved state.
 }

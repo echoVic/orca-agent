@@ -1,8 +1,8 @@
 //! Execution journal: the single append-only source of truth for one
 //! operation's terminal and checkpoint facts.
 //!
-//! Ordered records (`operation.started`, `turn.started`, `model.response`,
-//! `tool.started`, `tool.completed`, `checkpoint.created`,
+//! Ordered records (`operation.started`, `budget.usage`, `turn.started`,
+//! `model.response`, `tool.started`, `tool.completed`, `checkpoint.created`,
 //! `operation.terminal`) are flushed atomically: either every pending record
 //! is durable or none is. On reopen only committed records exist, so an
 //! unflushed `tool.started` is never replayed; callers restore it as
@@ -19,15 +19,16 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use orca_core::budget::{BudgetUsage, OperationTerminal, StopReason};
+use orca_core::budget::{BudgetSpec, BudgetUsage, OperationTerminal, StopReason};
 use serde::{Deserialize, Serialize};
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalRecordKind {
     OperationStarted,
+    BudgetUsage,
     TurnStarted,
     ModelResponse,
     ToolStarted,
@@ -40,6 +41,7 @@ impl JournalRecordKind {
     pub fn as_str_for_test(&self) -> &'static str {
         match self {
             Self::OperationStarted => "operation.started",
+            Self::BudgetUsage => "budget.usage",
             Self::TurnStarted => "turn.started",
             Self::ModelResponse => "model.response",
             Self::ToolStarted => "tool.started",
@@ -55,6 +57,7 @@ impl JournalRecord {
     pub fn schema_version_for_test(&self) -> u32 {
         match self {
             Self::OperationStarted { schema_version, .. }
+            | Self::BudgetUsage { schema_version, .. }
             | Self::TurnStarted { schema_version, .. }
             | Self::ModelResponse { schema_version, .. }
             | Self::ToolStarted { schema_version, .. }
@@ -94,6 +97,21 @@ pub enum JournalRecord {
         ordinal: u64,
         schema_version: u32,
         started_at_ms: u64,
+        budget_spec: BudgetSpec,
+    },
+    /// Monotonic cumulative operation usage at a durable accounting
+    /// boundary. Recovery uses the newest committed snapshot; deltas are
+    /// never replayed, so retrying a settlement cannot double charge.
+    BudgetUsage {
+        operation_id: String,
+        #[serde(default)]
+        turn_id: String,
+        ordinal: u64,
+        schema_version: u32,
+        usage: BudgetUsage,
+        recorded_at_ms: u64,
+        #[serde(default)]
+        accounting_id: Option<String>,
     },
     TurnStarted {
         operation_id: String,
@@ -149,6 +167,7 @@ impl JournalRecord {
     pub fn kind(&self) -> JournalRecordKind {
         match self {
             Self::OperationStarted { .. } => JournalRecordKind::OperationStarted,
+            Self::BudgetUsage { .. } => JournalRecordKind::BudgetUsage,
             Self::TurnStarted { .. } => JournalRecordKind::TurnStarted,
             Self::ModelResponse { .. } => JournalRecordKind::ModelResponse,
             Self::ToolStarted { .. } => JournalRecordKind::ToolStarted,
@@ -161,6 +180,7 @@ impl JournalRecord {
     pub fn ordinal(&self) -> u64 {
         match self {
             Self::OperationStarted { ordinal, .. }
+            | Self::BudgetUsage { ordinal, .. }
             | Self::TurnStarted { ordinal, .. }
             | Self::ModelResponse { ordinal, .. }
             | Self::ToolStarted { ordinal, .. }
@@ -173,6 +193,7 @@ impl JournalRecord {
     pub fn operation_id(&self) -> &str {
         match self {
             Self::OperationStarted { operation_id, .. }
+            | Self::BudgetUsage { operation_id, .. }
             | Self::TurnStarted { operation_id, .. }
             | Self::ModelResponse { operation_id, .. }
             | Self::ToolStarted { operation_id, .. }
@@ -185,6 +206,7 @@ impl JournalRecord {
     pub fn turn_id(&self) -> &str {
         match self {
             Self::OperationStarted { turn_id, .. }
+            | Self::BudgetUsage { turn_id, .. }
             | Self::TurnStarted { turn_id, .. }
             | Self::ModelResponse { turn_id, .. }
             | Self::ToolStarted { turn_id, .. }
@@ -279,6 +301,42 @@ impl ExecutionJournal {
         })
     }
 
+    /// Newest committed cumulative budget usage, if any.
+    pub fn latest_budget_usage(&self) -> Option<BudgetUsage> {
+        self.committed.iter().rev().find_map(|record| match record {
+            JournalRecord::BudgetUsage { usage, .. } => Some(*usage),
+            _ => None,
+        })
+    }
+
+    /// Original wall-clock start timestamp. Wall time is an operation
+    /// deadline, so time spent suspended or with the process down counts.
+    pub fn operation_started_at_ms(&self) -> Option<u64> {
+        self.committed.iter().find_map(|record| match record {
+            JournalRecord::OperationStarted { started_at_ms, .. } => Some(*started_at_ms),
+            _ => None,
+        })
+    }
+
+    pub fn operation_budget_spec(&self) -> Option<BudgetSpec> {
+        self.committed.iter().find_map(|record| match record {
+            JournalRecord::OperationStarted { budget_spec, .. } => Some(*budget_spec),
+            _ => None,
+        })
+    }
+
+    pub fn has_budget_accounting_id(&self, accounting_id: &str) -> bool {
+        self.committed.iter().any(|record| {
+            matches!(
+                record,
+                JournalRecord::BudgetUsage {
+                    accounting_id: Some(existing),
+                    ..
+                } if existing == accounting_id
+            )
+        })
+    }
+
     /// Committed `tool.started` records without a matching committed
     /// `tool.completed`. These must be restored as `indeterminate` and never
     /// replayed as completed (their external effects are unknown).
@@ -309,6 +367,13 @@ impl ExecutionJournal {
     }
 
     pub fn append(&mut self, record: JournalRecord) -> Result<(), String> {
+        if record.schema_version_for_test() != JOURNAL_SCHEMA_VERSION {
+            return Err(format!(
+                "journal record schema {} is unsupported; expected {}",
+                record.schema_version_for_test(),
+                JOURNAL_SCHEMA_VERSION
+            ));
+        }
         if record.operation_id() != self.operation_id {
             return Err(format!(
                 "journal record operation {} does not match journal operation {}",
@@ -384,14 +449,91 @@ impl ExecutionJournal {
     }
 
     fn validate_ordering(&self, record: &JournalRecord) -> Result<(), String> {
+        let existing = self.committed.iter().chain(self.pending.iter());
+        let has_started = existing
+            .clone()
+            .any(|record| matches!(record, JournalRecord::OperationStarted { .. }));
+        if !matches!(record, JournalRecord::OperationStarted { .. }) && !has_started {
+            return Err("operation.started must precede every journal record".to_string());
+        }
+        if self.terminal_appended
+            || existing
+                .clone()
+                .any(|record| matches!(record, JournalRecord::OperationTerminal { .. }))
+        {
+            return Err(
+                "operation.terminal may be appended only once and must be the final journal record"
+                    .to_string(),
+            );
+        }
         match record {
             JournalRecord::OperationStarted { .. } => {
                 if !self.committed.is_empty() || !self.pending.is_empty() {
                     return Err("operation.started must be the first journal record".to_string());
                 }
             }
+            JournalRecord::BudgetUsage {
+                usage,
+                accounting_id,
+                ..
+            } => {
+                if let Some(previous) = self
+                    .committed
+                    .iter()
+                    .chain(self.pending.iter())
+                    .rev()
+                    .find_map(|record| match record {
+                        JournalRecord::BudgetUsage { usage, .. } => Some(*usage),
+                        _ => None,
+                    })
+                    && (usage.turns < previous.turns
+                        || usage.tool_calls < previous.tool_calls
+                        || usage.cost_usd_micros < previous.cost_usd_micros
+                        || usage.wall_time_ms < previous.wall_time_ms)
+                {
+                    return Err("budget.usage must be cumulative and monotonic".to_string());
+                }
+                if let Some(accounting_id) = accounting_id
+                    && self
+                        .committed
+                        .iter()
+                        .chain(self.pending.iter())
+                        .any(|record| {
+                            matches!(
+                                record,
+                                JournalRecord::BudgetUsage {
+                                    accounting_id: Some(existing),
+                                    ..
+                                } if existing == accounting_id
+                            )
+                        })
+                {
+                    return Err(format!(
+                        "budget accounting id {accounting_id} may be committed only once"
+                    ));
+                }
+            }
+            JournalRecord::ToolCompleted { tool_call_id, .. } => {
+                if !self
+                    .unmatched_tool_starts_including_pending()
+                    .iter()
+                    .any(|started| {
+                        matches!(
+                            started,
+                            JournalRecord::ToolStarted {
+                                tool_call_id: started_id,
+                                ..
+                            } if started_id == tool_call_id
+                        )
+                    })
+                {
+                    return Err(format!(
+                        "tool.completed {tool_call_id} requires an unmatched tool.started"
+                    ));
+                }
+            }
             JournalRecord::CheckpointCreated { .. } => {
-                if !self.unmatched_tool_starts().is_empty() {
+                if !self.unmatched_tool_starts_including_pending().is_empty() {
                     return Err(
                         "checkpoint.created requires every open tool.started to have a committed tool.completed"
                             .to_string(),
@@ -399,27 +541,49 @@ impl ExecutionJournal {
                 }
             }
             JournalRecord::OperationTerminal { terminal, .. } => {
-                if self.terminal_appended
-                    || self
-                        .committed
-                        .iter()
-                        .chain(self.pending.iter())
-                        .any(|existing| matches!(existing, JournalRecord::OperationTerminal { .. }))
-                {
-                    return Err("operation.terminal may be appended only once".to_string());
-                }
-                if matches!(terminal, OperationTerminal::Stopped { .. })
-                    && self.last_checkpoint().is_none()
-                {
-                    return Err(
-                        "stopped operation.terminal requires a committed checkpoint.created"
-                            .to_string(),
-                    );
+                if let OperationTerminal::Stopped { checkpoint_id, .. } = terminal {
+                    let checkpoint_matches = self.committed.iter().any(|record| {
+                        matches!(
+                            record,
+                            JournalRecord::CheckpointCreated {
+                                checkpoint_id: committed_id,
+                                ..
+                            } if committed_id == checkpoint_id
+                        )
+                    });
+                    if !checkpoint_matches {
+                        return Err(
+                            "stopped operation.terminal requires its checkpoint.created to be committed"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn unmatched_tool_starts_including_pending(&self) -> Vec<&JournalRecord> {
+        let mut started = Vec::new();
+        for record in self.committed.iter().chain(self.pending.iter()) {
+            match record {
+                JournalRecord::ToolStarted { .. } => started.push(record),
+                JournalRecord::ToolCompleted { tool_call_id, .. } => {
+                    started.retain(|record| {
+                        !matches!(
+                            record,
+                            JournalRecord::ToolStarted {
+                                tool_call_id: started_id,
+                                ..
+                            } if started_id == tool_call_id
+                        )
+                    });
+                }
+                _ => {}
+            }
+        }
+        started
     }
 
     fn repair_and_reload(&mut self) -> io::Result<()> {
@@ -444,19 +608,50 @@ impl ExecutionJournal {
         }
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
-        let mut max_ordinal = 0_u64;
-        let mut terminal_seen = false;
+        let mut expected_ordinal = 1_u64;
         for (index, line) in reader.lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let record: JournalRecord = serde_json::from_str(&line).map_err(|error| {
+            let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("journal record {index} invalid: {error}"),
                 )
             })?;
+            let schema_version = value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("journal record {index} has no integer schema_version"),
+                    )
+                })?;
+            if schema_version != u64::from(JOURNAL_SCHEMA_VERSION) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal record {index} uses unsupported schema {schema_version}; expected {JOURNAL_SCHEMA_VERSION}"
+                    ),
+                ));
+            }
+            let record: JournalRecord = serde_json::from_value(value).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("journal record {index} invalid: {error}"),
+                )
+            })?;
+            if record.ordinal() != expected_ordinal {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal record {index} has ordinal {}; expected {expected_ordinal}",
+                        record.ordinal()
+                    ),
+                ));
+            }
             if record.operation_id() != self.operation_id {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -467,12 +662,18 @@ impl ExecutionJournal {
                     ),
                 ));
             }
-            max_ordinal = max_ordinal.max(record.ordinal());
-            terminal_seen |= matches!(record, JournalRecord::OperationTerminal { .. });
+            self.validate_ordering(&record).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("journal record {index} violates ordering: {error}"),
+                )
+            })?;
+            let terminal = matches!(record, JournalRecord::OperationTerminal { .. });
             self.committed.push(record);
+            self.terminal_appended = terminal;
+            expected_ordinal = expected_ordinal.saturating_add(1);
         }
-        self.next_ordinal = max_ordinal.saturating_add(1);
-        self.terminal_appended = terminal_seen;
+        self.next_ordinal = expected_ordinal;
         Ok(())
     }
 }
@@ -526,6 +727,7 @@ fn stamp_ordinal(record: JournalRecord, ordinal: u64) -> JournalRecord {
             turn_id,
             schema_version,
             started_at_ms,
+            budget_spec,
             ..
         } => JournalRecord::OperationStarted {
             operation_id,
@@ -533,6 +735,24 @@ fn stamp_ordinal(record: JournalRecord, ordinal: u64) -> JournalRecord {
             ordinal,
             schema_version,
             started_at_ms,
+            budget_spec,
+        },
+        JournalRecord::BudgetUsage {
+            operation_id,
+            turn_id,
+            schema_version,
+            usage,
+            recorded_at_ms,
+            accounting_id,
+            ..
+        } => JournalRecord::BudgetUsage {
+            operation_id,
+            turn_id,
+            ordinal,
+            schema_version,
+            usage,
+            recorded_at_ms,
+            accounting_id,
         },
         JournalRecord::TurnStarted {
             operation_id,
@@ -632,6 +852,7 @@ impl ExecutionJournal {
             ordinal: self.next_ordinal,
             schema_version: JOURNAL_SCHEMA_VERSION,
             started_at_ms,
+            budget_spec: BudgetSpec::default(),
         }
     }
 

@@ -49,6 +49,7 @@ pub(crate) fn run_agent_loop(
         prompt,
         subagent_depth,
         subagent_type,
+        defer_cancel_terminal,
         ..
     } = turn_context.clone();
     let turn_deps = turn_deps.expect("agent loop turn deps");
@@ -136,7 +137,13 @@ pub(crate) fn run_agent_loop(
         if let OperationTerminal::Completed { usage } = &mut result.terminal {
             *usage = operation.controller.usage();
         }
-        operation.commit_terminal(turn_id.as_str(), result.terminal.clone())?;
+        // Hosted resumable turns let the host decide whether a cancellation
+        // ends the logical turn or merely replaces its current generation.
+        if !(defer_cancel_terminal
+            && matches!(result.terminal, OperationTerminal::Cancelled { .. }))
+        {
+            operation.commit_terminal(turn_id.as_str(), result.terminal.clone())?;
+        }
     }
 
     Ok(outcome)

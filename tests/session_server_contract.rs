@@ -2570,7 +2570,10 @@ fn server_mode_resumes_active_thread_turn_before_cancellation_checkpoint() {
     assert_eq!(duplicate_resume["status"], "resumed");
 
     let completed = child.expect_event("turn-slow", "turn_completed");
-    assert_eq!(completed["status"], "success");
+    assert_eq!(
+        completed["status"], "success",
+        "resumed turn failed: {completed}"
+    );
 
     child.close_stdin();
     let output = child.wait_with_output().expect("wait for server");

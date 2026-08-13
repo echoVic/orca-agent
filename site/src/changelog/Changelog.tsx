@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.17":
+        "Makes execution-budget accounting durable across restart, provider suspension, approval continuation, and settlement retries. Journal schema v2 records the immutable operation budget plus cumulative budget.usage facts; reopening reconstructs the original wall-clock deadline and rejects budget drift. Stable provider response identities make cost settlement exactly once, while foreground responses charge their own tracker delta instead of comparing unrelated cumulative baselines. Concurrent child leases split the parent's actual remaining turns, tools, and cost atomically, share one wall deadline, and preserve usage receipts through I/O failures. Typed live and recovered surfaces now project the same budget terminal.",
       "v0.3.16":
         "Hardens the execution-budget protocol end to end. Budget stops commit the real durable conversation boundary first (session checkpoint with the last committed message id), then the journal checkpoint and terminal, so a resumable terminal can never point at a boundary that does not exist. Child-agent leases reserve per child and settle exactly once with usage receipts, batch children partition the remaining budget evenly, and stateless or suspended over-budget exchanges commit non-resumable stops instead of claiming success. The operation journal records the committed tool outcome (status and error) with dimension-specific stop reasons, and approval-waiting operations never persist a terminal.",
       "v0.3.15":
@@ -594,6 +596,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.17":
+        "让执行预算在进程重启、provider 挂起、审批续跑和结算重试后仍保持同一份账。Journal schema v2 持久化不可变的 operation budget 与累计 budget.usage；重新打开时恢复原始 wall-clock deadline，并拒绝预算漂移。Provider cost 以稳定 response id 做恰好一次结算，前台响应只计算本次 CostTracker 增量，不再比较两套无关的累计基线。并发子代理原子拆分父操作真实剩余的 turns、tools 与 cost，共享同一 wall deadline，I/O 失败也不会丢 usage receipt；live 与 recovery surface 统一投影同一个预算 terminal。",
       "v0.3.16":
         "全面加固执行预算协议。预算停止先提交真实的持久化对话边界（带最后提交消息 id 的 session checkpoint），再写 journal checkpoint 和 terminal，可恢复的 terminal 永远不会指向不存在的边界。子代理 lease 按子代理逐个预留并恰好一次结算（带回 usage receipt），batch 子代理均分剩余额度，stateless 或挂起后超预算的交换只会提交不可恢复的 stop 而不是虚假的成功。操作 journal 记录已提交的工具结果（状态和错误）与按维度区分的停止原因，等待审批的操作永不持久化 terminal。",
       "v0.3.15":

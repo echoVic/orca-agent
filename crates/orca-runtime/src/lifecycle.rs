@@ -230,6 +230,7 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
     pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
     pub(crate) wait_for_background_workflows: bool,
+    pub(crate) defer_cancel_terminal: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -943,6 +944,11 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_deferred_cancel_terminal(mut self, defer: bool) -> Self {
+        self.turn_context = self.turn_context.with_deferred_cancel_terminal(defer);
+        self
+    }
+
     pub(crate) fn with_root_task_id(mut self, root_task_id: Option<&'a str>) -> Self {
         self.turn_context = self.turn_context.with_root_task_id(root_task_id);
         self
@@ -1192,6 +1198,7 @@ impl<'a> RuntimeTurnContext<'a> {
             provider_response_ingress: None,
             workflow_lifecycle_ingress: None,
             wait_for_background_workflows: true,
+            defer_cancel_terminal: false,
         }
     }
 
@@ -1253,6 +1260,11 @@ impl<'a> RuntimeTurnContext<'a> {
 
     pub(crate) fn with_wait_for_background_workflows(mut self, wait: bool) -> Self {
         self.wait_for_background_workflows = wait;
+        self
+    }
+
+    pub(crate) fn with_deferred_cancel_terminal(mut self, defer: bool) -> Self {
+        self.defer_cancel_terminal = defer;
         self
     }
 
