@@ -124,6 +124,18 @@ ordinary diff rendering is the silent fallback after malformed input, stale
 identity, spawn/channel failure, or restart. TUI output, runtime events, CLI,
 server/JSONL, and persisted formats are unchanged.
 
+The surface-metrics convergence slice makes the authoritative reducer snapshot
+the only production TUI update for usage and context facts. One private
+`SurfaceMetricsState` now owns usage, usage revision, context revision, used
+tokens, and limit tokens; the duplicate `TuiEvent::UsageUpdated` and
+`TuiEvent::ContextUpdated` paths and their `context_observed` arbitration flag
+are deleted. Context compaction still constructs its dedicated lifecycle event
+before the batch snapshot. The existing manual-compaction delivery boundary
+then commits that snapshot before publishing `Compacted` and the terminal event,
+so the notice observes the committed metrics. Session identity, Goal, workflow,
+and operation projection remain the next convergence boundary. CLI,
+server/JSONL, ACP, runtime surface events, and persisted formats are unchanged.
+
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the
 release checksum, installs the runner and setup helper, and can provision,
@@ -1296,13 +1308,14 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has extracted twelve modules so far (insert-escape, presentation,
+   stream has extracted thirteen modules so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
-   queued-submission, edit-highlight); `app.rs` is down from 10,186 to 9,770
-   lines and `types.rs` from 9,442 to 8,261. Renderer-owned
-   orchestration and projection duplication (`surface_projection.rs`, 2,282
-   lines) remain the open core of this matrix row.
+   queued-submission, edit-highlight, surface-metrics); `app.rs` is down from
+   10,186 to 9,793 lines and `types.rs` from 9,442 to 8,223. Renderer-owned
+   orchestration and the remaining identity/Goal/workflow/operation projection
+   duplication (`surface_projection.rs`, 2,395 lines) remain the open core of
+   this matrix row.
 4. **P2.4 context/cache identity is not a release slice.** DeepSeek usage
    already parses `prompt_cache_hit_tokens` (`crates/orca-provider/src/deepseek_http.rs:192`),
    but deterministic cache-critical prefixes (stable system prompt, tool

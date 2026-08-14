@@ -3051,7 +3051,7 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
     let mode_prefix = separator;
     let mode_value = state.approval_mode.as_str();
     let mode_width = UnicodeWidthStr::width(mode_prefix) + UnicodeWidthStr::width(mode_value);
-    let context = (state.context_limit_tokens > 0).then(|| context_cell(state, theme));
+    let context = (state.context_limit_tokens() > 0).then(|| context_cell(state, theme));
     let reserved_context_width = context
         .as_ref()
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
@@ -3094,12 +3094,13 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
     let mut lower_priority = Vec::new();
     // Session cost only appears once there is something to report; a fresh
     // session keeps the bar clean instead of showing zeros.
-    if state.usage.total_tokens() > 0 {
+    let usage = state.usage();
+    if usage.total_tokens() > 0 {
         lower_priority.push(Span::styled(
             format!(
                 "{separator}{} tokens{separator}{}",
-                format_token_count(state.usage.total_tokens()),
-                format_cost(state.usage.estimated_cost_usd),
+                format_token_count(usage.total_tokens()),
+                format_cost(usage.estimated_cost_usd),
             ),
             Style::default().fg(theme.muted),
         ));
@@ -3250,12 +3251,14 @@ fn format_elapsed_compact(elapsed_secs: u64) -> String {
 /// session reads high. Pure local observability — never sent upstream, so it
 /// cannot affect DeepSeek's prefix cache. Hidden until a real budget is known.
 fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
-    if state.context_limit_tokens == 0 {
+    let used_tokens = state.context_used_tokens();
+    let limit_tokens = state.context_limit_tokens();
+    if limit_tokens == 0 {
         return Span::raw("");
     }
-    let used = state.context_used_tokens.min(state.context_limit_tokens);
-    let remaining = state.context_limit_tokens.saturating_sub(used);
-    let percent = (remaining * 100) / state.context_limit_tokens;
+    let used = used_tokens.min(limit_tokens);
+    let remaining = limit_tokens.saturating_sub(used);
+    let percent = (remaining * 100) / limit_tokens;
     let color = if percent > 50 {
         theme.success
     } else if percent > 20 {
@@ -4594,9 +4597,10 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::surface_projection::SurfaceProjectionState;
     use crate::types::{
-        PlanApprovalDialog, SlashMenu, SlashMenuItem, SurfaceProjectionState, TuiEvent,
-        TuiInteractionKey, TuiInteractionKind,
+        PlanApprovalDialog, SlashMenu, SlashMenuItem, TuiEvent, TuiInteractionKey,
+        TuiInteractionKind,
     };
     use chrono::Utc;
     use crossbeam_channel as mpsc;
@@ -4608,6 +4612,43 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    fn set_surface_metrics(
+        state: &mut AppState,
+        used_tokens: usize,
+        limit_tokens: usize,
+        usage: orca_core::cost_types::UsageTotals,
+    ) {
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState {
+                session_id: state
+                    .current_session_id
+                    .clone()
+                    .unwrap_or_else(|| "metrics-test".to_string()),
+                title: state
+                    .current_session_title
+                    .clone()
+                    .unwrap_or_else(|| "Metrics test".to_string()),
+                usage_revision: 1,
+                usage,
+                context_revision: 1,
+                context_used_tokens: used_tokens,
+                context_limit_tokens: limit_tokens,
+                workflow_tasks: state.workflow_panel.tasks.clone(),
+                current_goal: state.current_goal.clone(),
+                foreground_operation_id: None,
+            },
+        )));
+    }
+
+    fn set_surface_context(state: &mut AppState, used_tokens: usize, limit_tokens: usize) {
+        set_surface_metrics(
+            state,
+            used_tokens,
+            limit_tokens,
+            orca_core::cost_types::UsageTotals::default(),
+        );
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum CursorEvent {
@@ -6488,8 +6529,7 @@ mod tests {
     #[test]
     fn context_cell_starts_at_full_remaining_capacity() {
         let mut state = test_state();
-        state.context_limit_tokens = 1_000_000;
-        state.context_used_tokens = 0;
+        set_surface_context(&mut state, 0, 1_000_000);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
 
@@ -6500,8 +6540,7 @@ mod tests {
     #[test]
     fn context_cell_shows_remaining_percentage() {
         let mut state = test_state();
-        state.context_limit_tokens = 1000;
-        state.context_used_tokens = 250;
+        set_surface_context(&mut state, 250, 1_000);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
         // 25% of the window used means 75% remains.
@@ -6512,8 +6551,7 @@ mod tests {
     #[test]
     fn context_cell_clamps_used_at_full_window() {
         let mut state = test_state();
-        state.context_limit_tokens = 1000;
-        state.context_used_tokens = 1200; // over-full estimate clamps to 0% remaining
+        set_surface_context(&mut state, 1_200, 1_000);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
         assert_eq!(cell.content.as_ref(), "  ·  context 0%");
@@ -6525,13 +6563,11 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let mut warn = test_state();
-        warn.context_limit_tokens = 1000;
-        warn.context_used_tokens = 700; // 30% remains
+        set_surface_context(&mut warn, 700, 1_000);
         assert_eq!(context_cell(&warn, &theme).style.fg, Some(theme.warning));
 
         let mut danger = test_state();
-        danger.context_limit_tokens = 1000;
-        danger.context_used_tokens = 900; // 10% remains
+        set_surface_context(&mut danger, 900, 1_000);
         assert_eq!(context_cell(&danger, &theme).style.fg, Some(theme.error));
     }
 
@@ -6660,11 +6696,17 @@ mod tests {
     #[test]
     fn status_line_prioritizes_context_workspace_then_usage_and_shortcuts() {
         let mut state = test_state();
-        state.context_limit_tokens = 1000;
-        state.context_used_tokens = 250;
-        state.usage.input_tokens = 8_000;
-        state.usage.output_tokens = 664;
-        state.usage.estimated_cost_usd = 0.003852;
+        set_surface_metrics(
+            &mut state,
+            250,
+            1_000,
+            orca_core::cost_types::UsageTotals {
+                input_tokens: 8_000,
+                output_tokens: 664,
+                cache_tokens: 0,
+                estimated_cost_usd: 0.003852,
+            },
+        );
         state.cwd = "~/Documents/GitHub/blade-deepseek".to_string();
         state.workspace_git = Some(GitIdentity::Branch("feature/footer".to_string()));
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -6691,7 +6733,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_context_survives_same_revision_surface_sync_in_footer() {
+    fn equal_revision_surface_sync_keeps_committed_context_in_footer() {
         let mut state = test_state();
         let snapshot = SurfaceProjectionState {
             session_id: "goal-session".to_string(),
@@ -6699,8 +6741,8 @@ mod tests {
             usage_revision: 1,
             usage: orca_core::cost_types::UsageTotals::default(),
             context_revision: 1,
-            context_used_tokens: 0,
-            context_limit_tokens: 128_000,
+            context_used_tokens: 393_527,
+            context_limit_tokens: 1_000_000,
             workflow_tasks: Vec::new(),
             current_goal: None,
             foreground_operation_id: None,
@@ -6708,12 +6750,7 @@ mod tests {
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             snapshot.clone(),
         )));
-        state.update(TuiEvent::ContextUpdated {
-            used_tokens: 393_527,
-            limit_tokens: 1_000_000,
-        });
-
-        // A later operation batch carries the unchanged context snapshot.
+        // A later operation batch carries the same committed context snapshot.
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(snapshot)));
 
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -6728,8 +6765,7 @@ mod tests {
     fn status_line_reserves_known_context_before_truncating_a_long_model() {
         let mut state = test_state();
         state.model_name = "a-very-long-model-name-that-would-fill-the-footer".to_string();
-        state.context_limit_tokens = 1000;
-        state.context_used_tokens = 250;
+        set_surface_context(&mut state, 250, 1_000);
         state.cwd = "~/workspace".to_string();
         state.workspace_git = Some(GitIdentity::Branch("main".to_string()));
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -6758,11 +6794,17 @@ mod tests {
     #[test]
     fn responsive_status_line_keeps_mode_and_context_before_optional_metadata() {
         let mut state = test_state();
-        state.context_limit_tokens = 1000;
-        state.context_used_tokens = 250;
-        state.usage.input_tokens = 8_000;
-        state.usage.output_tokens = 664;
-        state.usage.estimated_cost_usd = 0.003852;
+        set_surface_metrics(
+            &mut state,
+            250,
+            1_000,
+            orca_core::cost_types::UsageTotals {
+                input_tokens: 8_000,
+                output_tokens: 664,
+                cache_tokens: 0,
+                estimated_cost_usd: 0.003852,
+            },
+        );
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let narrow = status_line(&state, &theme, 46).to_string();

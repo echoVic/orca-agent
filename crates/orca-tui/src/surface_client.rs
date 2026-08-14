@@ -2779,6 +2779,10 @@ mod tests {
             .iter()
             .position(|event| matches!(event, TuiEvent::Compacted { .. }))
             .expect("compaction completed");
+        let projection = events
+            .iter()
+            .rposition(|event| matches!(event, TuiEvent::SurfaceProjectionSynced(_)))
+            .expect("compaction projection snapshot");
         let terminal = events
             .iter()
             .position(
@@ -2790,7 +2794,8 @@ mod tests {
             outcome,
             TuiHostedOperationOutcome::ManualCompaction
         ));
-        assert!(started < completed);
+        assert!(started < projection);
+        assert!(projection < completed);
         assert!(completed < terminal);
         assert!(controller.current_id().is_none());
         assert!(!controller.has_surface_active());

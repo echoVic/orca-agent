@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use orca_core::approval_types::ActionKind;
 use orca_core::cost_types::UsageTotals;
+use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::task_types::{
     BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
@@ -21,7 +22,99 @@ use orca_runtime::surface::{
     SurfaceWorkflowStatus, ToolPatch, UnixMillis,
 };
 
-use crate::types::{SurfaceProjectionState, TuiEvent, TuiTaskLifecycle};
+use crate::types::{AppState, TuiEvent, TuiTaskLifecycle};
+
+/// Runtime-derived values that the TUI must keep in lockstep with the
+/// authoritative surface reducer after each projected batch.
+#[derive(Clone, Debug, PartialEq)]
+#[doc(hidden)]
+pub struct SurfaceProjectionState {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) usage_revision: u64,
+    pub(crate) usage: UsageTotals,
+    pub(crate) context_revision: u64,
+    pub(crate) context_used_tokens: usize,
+    pub(crate) context_limit_tokens: usize,
+    pub(crate) workflow_tasks: Vec<BackgroundTaskSummary>,
+    pub(crate) current_goal: Option<ThreadGoal>,
+    pub(crate) foreground_operation_id: Option<SurfaceOperationId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SurfaceMetricsState {
+    usage: UsageTotals,
+    usage_revision: Option<u64>,
+    context_revision: Option<u64>,
+    context_used_tokens: usize,
+    context_limit_tokens: usize,
+}
+
+impl SurfaceMetricsState {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn rejects_usage_revision(&self, revision: u64) -> bool {
+        self.usage_revision
+            .is_some_and(|current| revision < current)
+    }
+
+    pub(crate) fn apply_projection(&mut self, projection: &SurfaceProjectionState) {
+        self.usage = projection.usage.clone();
+        self.usage_revision = Some(projection.usage_revision);
+        if self
+            .context_revision
+            .is_none_or(|current| projection.context_revision > current)
+        {
+            self.context_revision = Some(projection.context_revision);
+            self.context_used_tokens = projection.context_used_tokens;
+            self.context_limit_tokens = projection.context_limit_tokens;
+        }
+    }
+
+    pub(crate) fn usage(&self) -> &UsageTotals {
+        &self.usage
+    }
+
+    pub(crate) fn context_used_tokens(&self) -> usize {
+        self.context_used_tokens
+    }
+
+    pub(crate) fn context_limit_tokens(&self) -> usize {
+        self.context_limit_tokens
+    }
+
+    pub(crate) fn assert_matches_projection(&self, projection: &SurfaceProjectionState) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            debug_assert_eq!(self.usage, projection.usage);
+            debug_assert_eq!(self.usage_revision, Some(projection.usage_revision));
+            debug_assert_eq!(self.context_revision, Some(projection.context_revision));
+            debug_assert_eq!(self.context_used_tokens, projection.context_used_tokens);
+            debug_assert_eq!(self.context_limit_tokens, projection.context_limit_tokens);
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = projection;
+    }
+}
+
+impl AppState {
+    /// Returns usage from the latest committed runtime surface snapshot.
+    pub fn usage(&self) -> &UsageTotals {
+        self.surface_metrics.usage()
+    }
+
+    /// Returns context usage from the latest committed context revision.
+    pub fn context_used_tokens(&self) -> usize {
+        self.surface_metrics.context_used_tokens()
+    }
+
+    /// Returns the context limit from the latest committed context revision.
+    pub fn context_limit_tokens(&self) -> usize {
+        self.surface_metrics.context_limit_tokens()
+    }
+}
 
 pub(crate) fn history_messages_from_surface_snapshot(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
@@ -643,58 +736,40 @@ impl TuiSurfaceProjection {
                         })
                         .collect(),
                 }),
-                SurfaceEvent::Usage(usage) => {
-                    projected.push(TuiEvent::UsageUpdated {
-                        revision: usage.revision.get(),
-                        usage: UsageTotals {
-                            input_tokens: usage.thread_total.input_tokens,
-                            output_tokens: usage.thread_total.output_tokens,
-                            cache_tokens: usage.thread_total.cache_tokens,
-                            estimated_cost_usd: usage.thread_total.estimated_cost_usd_micros as f64
-                                / 1_000_000.0,
-                        },
-                    });
-                }
-                SurfaceEvent::Context(context) => {
-                    projected.push(TuiEvent::ContextUpdated {
-                        used_tokens: usize::try_from(context.used_tokens).unwrap_or(usize::MAX),
-                        limit_tokens: usize::try_from(context.limit_tokens).unwrap_or(usize::MAX),
-                    });
-                    match &context.compaction {
-                        orca_runtime::surface::CompactionState::Running { .. } => {
-                            projected.push(TuiEvent::CompactionStarted);
-                        }
-                        orca_runtime::surface::CompactionState::Completed {
-                            reason,
-                            strategy,
-                            before_messages,
-                            after_messages,
-                            collapsed_messages,
-                            status_text,
-                            ..
-                        } => {
-                            projected.push(TuiEvent::Compacted {
-                                before_messages: usize::try_from(*before_messages)
-                                    .unwrap_or(usize::MAX),
-                                after_messages: usize::try_from(*after_messages)
-                                    .unwrap_or(usize::MAX),
-                                reason: match reason {
-                                    orca_runtime::surface::CompactionReason::Manual => {
-                                        "manual".to_string()
-                                    }
-                                    orca_runtime::surface::CompactionReason::Automatic => {
-                                        "automatic".to_string()
-                                    }
-                                },
-                                strategy: strategy.as_str().to_string(),
-                                collapsed_messages: usize::try_from(*collapsed_messages)
-                                    .unwrap_or(usize::MAX),
-                                status_text: status_text.as_str().to_string(),
-                            });
-                        }
-                        orca_runtime::surface::CompactionState::Idle => {}
+                SurfaceEvent::Usage(_) => {}
+                SurfaceEvent::Context(context) => match &context.compaction {
+                    orca_runtime::surface::CompactionState::Running { .. } => {
+                        projected.push(TuiEvent::CompactionStarted);
                     }
-                }
+                    orca_runtime::surface::CompactionState::Completed {
+                        reason,
+                        strategy,
+                        before_messages,
+                        after_messages,
+                        collapsed_messages,
+                        status_text,
+                        ..
+                    } => {
+                        projected.push(TuiEvent::Compacted {
+                            before_messages: usize::try_from(*before_messages)
+                                .unwrap_or(usize::MAX),
+                            after_messages: usize::try_from(*after_messages).unwrap_or(usize::MAX),
+                            reason: match reason {
+                                orca_runtime::surface::CompactionReason::Manual => {
+                                    "manual".to_string()
+                                }
+                                orca_runtime::surface::CompactionReason::Automatic => {
+                                    "automatic".to_string()
+                                }
+                            },
+                            strategy: strategy.as_str().to_string(),
+                            collapsed_messages: usize::try_from(*collapsed_messages)
+                                .unwrap_or(usize::MAX),
+                            status_text: status_text.as_str().to_string(),
+                        });
+                    }
+                    orca_runtime::surface::CompactionState::Idle => {}
+                },
                 SurfaceEvent::Operation(OperationPatch::AgentLoopTurnStarted { turn })
                     if focused_operation.as_ref() == Some(&turn.fence.operation_id) =>
                 {
@@ -1904,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_usage_projection_preserves_usage_revision() {
+    fn typed_usage_projection_waits_for_commit_snapshot() {
         let before = cursor(0, 1);
         let commit_class = CommitClass::Recorded {
             thread_owner_epoch: ThreadOwnerEpoch::new(1),
@@ -1945,14 +2020,12 @@ mod tests {
         };
         let mut projection = TuiSurfaceProjection::from_snapshot(before.clone(), &[]);
 
-        assert!(matches!(
-            projection.reduce_typed_batch(&batch).unwrap().as_slice(),
-            [TuiEvent::UsageUpdated { revision: 17, usage }]
-                if usage.input_tokens == 8_000
-                    && usage.output_tokens == 900
-                    && usage.cache_tokens == 450
-                    && usage.estimated_cost_usd == 0.035
-        ));
+        assert!(
+            projection
+                .reduce_typed_batch(&batch)
+                .expect("valid usage batch")
+                .is_empty()
+        );
 
         let mut projection = TuiSurfaceProjection::from_snapshot(before.clone(), &[]);
         assert!(matches!(
@@ -1960,6 +2033,46 @@ mod tests {
             Err(SurfaceProjectionError::MissingReducerSnapshot)
         ));
         assert_eq!(projection.cursor(), &before);
+    }
+
+    #[test]
+    fn typed_context_projection_waits_for_commit_snapshot() {
+        let before = cursor(0, 1);
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(2).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(18)).unwrap(),
+        };
+        let event = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(19)).unwrap(),
+            commit_class,
+            scope: SurfaceScope::Thread,
+            event: SurfaceEvent::Context(orca_runtime::surface::SurfaceContextSnapshot {
+                revision: orca_runtime::surface::ContextRevision::try_new(2).unwrap(),
+                used_tokens: 4_096,
+                limit_tokens: 128_000,
+                compaction: orca_runtime::surface::CompactionState::Idle,
+                fragments: Vec::new(),
+                provider_replay: orca_runtime::surface::ProviderReplayHealth::None,
+            }),
+        };
+        let after = SurfaceCursor {
+            next_seq: SequenceNumber::new(1),
+            source_revision: CursorSourceRevision::Recorded {
+                durable_revision: DurableRevision::try_new(2).unwrap(),
+            },
+            ..before.clone()
+        };
+        let batch = commit_batch_with_events(before.clone(), after, vec![event], 20);
+        let mut projection = TuiSurfaceProjection::from_snapshot(before, &[]);
+
+        assert!(
+            projection
+                .reduce_typed_batch(&batch)
+                .expect("valid context batch")
+                .is_empty()
+        );
     }
 
     #[test]

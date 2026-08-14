@@ -72,13 +72,13 @@ use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::stdio_guard::RetryWriter;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
+use crate::surface_projection::SurfaceProjectionState;
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
 #[cfg(test)]
 use crate::types::AttachedTuiEvent;
 use crate::types::{
-    AppState, AppStatus, ChatMessage, SessionAttachmentId, SideParentStatus,
-    SurfaceProjectionState, TuiEvent, UserAction,
+    AppState, AppStatus, ChatMessage, SessionAttachmentId, SideParentStatus, TuiEvent, UserAction,
 };
 use crate::ui;
 use crate::vim::{PendingInsertEscapeFlow, VimState};
@@ -2661,15 +2661,23 @@ done
             TuiEvent::WorkflowTasksUpdated {
                 tasks: vec![workflow_task("task-b", "workflow-b")],
             },
-            TuiEvent::UsageUpdated {
-                revision: 20,
+            TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
+                session_id: "session-b".to_string(),
+                title: "title-b".to_string(),
+                usage_revision: 20,
                 usage: orca_core::cost_types::UsageTotals {
                     input_tokens: 200,
                     output_tokens: 50,
                     cache_tokens: 0,
                     estimated_cost_usd: 0.25,
                 },
-            },
+                context_revision: 1,
+                context_used_tokens: 200,
+                context_limit_tokens: 128_000,
+                workflow_tasks: vec![workflow_task("task-b", "workflow-b")],
+                current_goal: Some(goal_b.clone()),
+                foreground_operation_id: None,
+            })),
             TuiEvent::GoalUpdated(goal_b),
             TuiEvent::TurnStarted {
                 turn: 3,
@@ -2684,7 +2692,7 @@ done
 
         let messages = format!("{:?}", state.messages);
         let tasks = state.workflow_panel.tasks.clone();
-        let usage = state.usage.clone();
+        let usage = state.usage().clone();
         let goal = state.current_goal.clone();
         let identity = (
             state.current_session_id.clone(),
@@ -2716,15 +2724,23 @@ done
             TuiEvent::WorkflowTasksUpdated {
                 tasks: vec![workflow_task("task-a", "stale-workflow-a")],
             },
-            TuiEvent::UsageUpdated {
-                revision: 99,
+            TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
+                session_id: "session-a".to_string(),
+                title: "stale-title-a".to_string(),
+                usage_revision: 99,
                 usage: orca_core::cost_types::UsageTotals {
                     input_tokens: 9_999,
                     output_tokens: 9_999,
                     cache_tokens: 0,
                     estimated_cost_usd: 99.0,
                 },
-            },
+                context_revision: 99,
+                context_used_tokens: 9_999,
+                context_limit_tokens: 128_000,
+                workflow_tasks: vec![workflow_task("task-a", "stale-workflow-a")],
+                current_goal: Some(goal_a.clone()),
+                foreground_operation_id: None,
+            })),
             TuiEvent::GoalUpdated(goal_a),
             TuiEvent::MessageDelta("stale-delta-a".to_string()),
             TuiEvent::SessionCompleted {
@@ -2736,7 +2752,7 @@ done
 
         assert_eq!(format!("{:?}", state.messages), messages);
         assert_eq!(state.workflow_panel.tasks, tasks);
-        assert_eq!(state.usage, usage);
+        assert_eq!(state.usage(), &usage);
         assert_eq!(state.current_goal, goal);
         assert_eq!(
             (
@@ -4882,6 +4898,13 @@ done
             };
             assert_eq!(projection.context_used_tokens, 41_483);
             assert_eq!(projection.context_limit_tokens, 1_000_000);
+            let expected_usage = projection.usage.clone();
+
+            let (mut resumed_state, _action_rx) = test_state();
+            resumed_state.update(TuiEvent::SurfaceProjectionSynced(projection));
+            assert_eq!(resumed_state.usage(), &expected_usage);
+            assert_eq!(resumed_state.context_used_tokens(), 41_483);
+            assert_eq!(resumed_state.context_limit_tokens(), 1_000_000);
 
             harness.shutdown();
         });

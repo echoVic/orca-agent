@@ -54,12 +54,13 @@ pub(crate) fn handle_slash_command(
             )));
         }
         SlashCommand::Cost => {
+            let usage = state.usage();
             state.push_message(ChatMessage::System(format!(
                 "Session usage: {} input, {} output, {} cache tokens, estimated ${:.6}.",
-                state.usage.input_tokens,
-                state.usage.output_tokens,
-                state.usage.cache_tokens,
-                state.usage.estimated_cost_usd
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_tokens,
+                usage.estimated_cost_usd
             )));
         }
         SlashCommand::ConfigShow => {
@@ -266,16 +267,16 @@ pub(crate) fn handle_slash_command(
 fn format_status(state: &AppState) -> String {
     let session_id = state.current_session_id.as_deref().unwrap_or("-");
     let title = state.current_session_title.as_deref().unwrap_or("-");
-    let context = if state.context_limit_tokens == 0 {
+    let context_used_tokens = state.context_used_tokens();
+    let context_limit_tokens = state.context_limit_tokens();
+    let context = if context_limit_tokens == 0 {
         "-".to_string()
     } else {
-        let used = state.context_used_tokens.min(state.context_limit_tokens);
-        let remaining = state.context_limit_tokens.saturating_sub(used);
-        format!(
-            "{remaining} remaining / {} total",
-            state.context_limit_tokens,
-        )
+        let used = context_used_tokens.min(context_limit_tokens);
+        let remaining = context_limit_tokens.saturating_sub(used);
+        format!("{remaining} remaining / {context_limit_tokens} total")
     };
+    let usage = state.usage();
     let active_tasks = state
         .workflow_panel
         .tasks
@@ -311,10 +312,10 @@ fn format_status(state: &AppState) -> String {
         state.reasoning_effort.as_str(),
         state.approval_mode.as_str(),
         state.cwd,
-        state.usage.input_tokens,
-        state.usage.output_tokens,
-        state.usage.cache_tokens,
-        state.usage.estimated_cost_usd,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_tokens,
+        usage.estimated_cost_usd,
         if state.recoverable_operation_id.is_some() {
             "yes"
         } else {
@@ -395,7 +396,9 @@ pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::surface_projection::SurfaceProjectionState;
     use crate::test_support::test_run_config;
+    use crate::types::TuiEvent;
 
     fn state() -> AppState {
         let (action_tx, _) = mpsc::unbounded();
@@ -460,14 +463,25 @@ mod tests {
     #[test]
     fn status_slash_command_reports_session_snapshot() {
         let mut state = state();
-        state.current_session_id = Some("session-1".to_string());
-        state.current_session_title = Some("Release triage".to_string());
-        state.context_used_tokens = 250;
-        state.context_limit_tokens = 1_000;
-        state.usage.input_tokens = 100;
-        state.usage.output_tokens = 50;
-        state.usage.cache_tokens = 25;
-        state.usage.estimated_cost_usd = 0.125;
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState {
+                session_id: "session-1".to_string(),
+                title: "Release triage".to_string(),
+                usage_revision: 1,
+                usage: orca_core::cost_types::UsageTotals {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_tokens: 25,
+                    estimated_cost_usd: 0.125,
+                },
+                context_revision: 1,
+                context_used_tokens: 250,
+                context_limit_tokens: 1_000,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+            },
+        )));
         state.recoverable_operation_id = Some(
             orca_runtime::surface::SurfaceOperationId::try_from_bytes([
                 0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,

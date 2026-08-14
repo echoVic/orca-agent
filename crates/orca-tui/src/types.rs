@@ -26,6 +26,9 @@ use crate::edit_highlight::parsed_diff_structure_matches_target;
 use crate::input_history::load_input_history;
 use crate::queued_input::QueuedSubmissionState;
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
+use crate::surface_projection::SurfaceMetricsState;
+#[doc(hidden)]
+pub use crate::surface_projection::SurfaceProjectionState;
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
@@ -225,23 +228,6 @@ pub struct AttachedTuiEvent {
     pub(crate) event: TuiEvent,
 }
 
-/// Runtime-derived values that the TUI must keep in lockstep with the
-/// authoritative surface reducer after each projected batch.
-#[derive(Clone, Debug, PartialEq)]
-#[doc(hidden)]
-pub struct SurfaceProjectionState {
-    pub(crate) session_id: String,
-    pub(crate) title: String,
-    pub(crate) usage_revision: u64,
-    pub(crate) usage: UsageTotals,
-    pub(crate) context_revision: u64,
-    pub(crate) context_used_tokens: usize,
-    pub(crate) context_limit_tokens: usize,
-    pub(crate) workflow_tasks: Vec<BackgroundTaskSummary>,
-    pub(crate) current_goal: Option<ThreadGoal>,
-    pub(crate) foreground_operation_id: Option<SurfaceOperationId>,
-}
-
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
@@ -402,14 +388,6 @@ pub enum TuiEvent {
     },
     OperationRejected(String),
     Error(String),
-    UsageUpdated {
-        revision: u64,
-        usage: UsageTotals,
-    },
-    ContextUpdated {
-        used_tokens: usize,
-        limit_tokens: usize,
-    },
     CompactionStarted,
     SessionCompleted {
         status: String,
@@ -887,15 +865,7 @@ pub struct AppState {
     pub session_picker_error: Option<String>,
     pub session_picker_next_offset: Option<usize>,
     pub session_picker_backfill_complete: bool,
-    pub usage: UsageTotals,
-    usage_revision: Option<u64>,
-    /// Revision of the typed surface context snapshot last applied. Legacy
-    /// provider context events are transient and intentionally do not advance
-    /// this value, so an older snapshot cannot overwrite their observation.
-    context_revision: Option<u64>,
-    context_observed: bool,
-    pub context_used_tokens: usize,
-    pub context_limit_tokens: usize,
+    pub(crate) surface_metrics: SurfaceMetricsState,
     pub slash_menu: Option<SlashMenu>,
     pub mention: MentionPopupState,
     pub mention_bindings: MentionBindings,
@@ -1057,12 +1027,7 @@ impl AppState {
             session_picker_error: None,
             session_picker_next_offset: None,
             session_picker_backfill_complete: true,
-            usage: UsageTotals::default(),
-            usage_revision: None,
-            context_revision: None,
-            context_observed: false,
-            context_used_tokens: 0,
-            context_limit_tokens: 0,
+            surface_metrics: SurfaceMetricsState::default(),
             slash_menu: None,
             mention: MentionPopupState::default(),
             mention_bindings: MentionBindings::default(),
@@ -1326,30 +1291,21 @@ impl AppState {
     fn assert_tool_call_index_consistent(&self) {}
 
     fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
-        if self.current_session_id.as_deref() == Some(projection.session_id.as_str())
+        let session_changed =
+            self.current_session_id.as_deref() != Some(projection.session_id.as_str());
+        if !session_changed
             && self
-                .usage_revision
-                .is_some_and(|revision| projection.usage_revision < revision)
+                .surface_metrics
+                .rejects_usage_revision(projection.usage_revision)
         {
             return;
         }
+        if session_changed {
+            self.surface_metrics.reset();
+        }
         self.current_session_id = Some(projection.session_id.clone());
         self.current_session_title = Some(projection.title.clone());
-        self.usage = projection.usage.clone();
-        self.usage_revision = Some(projection.usage_revision);
-        let revision_advanced = self
-            .context_revision
-            .is_none_or(|revision| projection.context_revision > revision);
-        let should_apply_context =
-            revision_advanced && (!self.context_observed || self.context_revision.is_some());
-        if revision_advanced {
-            self.context_revision = Some(projection.context_revision);
-        }
-        if should_apply_context {
-            self.context_used_tokens = projection.context_used_tokens;
-            self.context_limit_tokens = projection.context_limit_tokens;
-            self.context_observed = false;
-        }
+        self.surface_metrics.apply_projection(&projection);
         self.current_goal = projection.current_goal.clone();
         self.active_surface_operation_id = projection.foreground_operation_id.clone();
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
@@ -1365,13 +1321,7 @@ impl AppState {
             self.current_session_title.as_deref(),
             Some(projection.title.as_str())
         );
-        debug_assert_eq!(self.usage, projection.usage);
-        debug_assert_eq!(self.usage_revision, Some(projection.usage_revision));
-        if !self.context_observed {
-            debug_assert_eq!(self.context_revision, Some(projection.context_revision));
-            debug_assert_eq!(self.context_used_tokens, projection.context_used_tokens);
-            debug_assert_eq!(self.context_limit_tokens, projection.context_limit_tokens);
-        }
+        self.surface_metrics.assert_matches_projection(projection);
         debug_assert_eq!(
             self.workflow_panel.tasks,
             sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
@@ -1452,12 +1402,7 @@ impl AppState {
         self.active_surface_operation_id = None;
         self.recoverable_operation_id = None;
         self.recovery_prompt_visible = false;
-        self.usage = UsageTotals::default();
-        self.usage_revision = None;
-        self.context_used_tokens = 0;
-        self.context_limit_tokens = 0;
-        self.context_revision = None;
-        self.context_observed = false;
+        self.surface_metrics.reset();
         self.approval_dialog = None;
         self.pending_input = None;
         self.approval_allowlist.clear();
@@ -2347,23 +2292,6 @@ impl AppState {
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
             | TuiEvent::MentionRuntimeReady(_) => {}
-            TuiEvent::UsageUpdated { revision, usage } => {
-                if self
-                    .usage_revision
-                    .is_none_or(|current_revision| revision > current_revision)
-                {
-                    self.usage = usage;
-                    self.usage_revision = Some(revision);
-                }
-            }
-            TuiEvent::ContextUpdated {
-                used_tokens,
-                limit_tokens,
-            } => {
-                self.context_used_tokens = used_tokens;
-                self.context_limit_tokens = limit_tokens;
-                self.context_observed = true;
-            }
             TuiEvent::CompactionStarted => {
                 self.set_status(AppStatus::Compacting);
             }
@@ -3259,9 +3187,23 @@ mod tests {
                 status: PlanStatus::InProgress,
             }],
         ));
-        state.usage.input_tokens = 42;
-        state.context_used_tokens = 21;
-        state.context_limit_tokens = 100;
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState {
+                session_id: "old-session".to_string(),
+                title: "Old session".to_string(),
+                usage_revision: 1,
+                usage: UsageTotals {
+                    input_tokens: 42,
+                    ..UsageTotals::default()
+                },
+                context_revision: 1,
+                context_used_tokens: 21,
+                context_limit_tokens: 100,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+            },
+        )));
         state.approval_allowlist.insert("bash".to_string());
         state.model_name = "deepseek-v4-pro".to_string();
         state.reasoning_effort = orca_core::config::ReasoningEffort::High;
@@ -3285,9 +3227,9 @@ mod tests {
 
         assert!(state.messages.is_empty());
         assert!(state.current_plan.is_none());
-        assert_eq!(state.usage, UsageTotals::default());
-        assert_eq!(state.context_used_tokens, 0);
-        assert_eq!(state.context_limit_tokens, 0);
+        assert_eq!(state.usage(), &UsageTotals::default());
+        assert_eq!(state.context_used_tokens(), 0);
+        assert_eq!(state.context_limit_tokens(), 0);
         assert!(state.approval_allowlist.is_empty());
         assert_eq!(state.status, AppStatus::Idle);
         assert_eq!(state.model_name, "deepseek-v4-pro");
@@ -4783,7 +4725,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_update_allows_compaction_drop_and_rejects_stale_revision() {
+    fn usage_projection_allows_compaction_drop_and_rejects_stale_revision() {
         let mut state = state();
         let before_compaction = UsageTotals {
             input_tokens: 50_000,
@@ -4804,20 +4746,32 @@ mod tests {
             estimated_cost_usd: 0.025,
         };
 
-        state.update(TuiEvent::UsageUpdated {
-            revision: 10,
-            usage: before_compaction,
-        });
-        state.update(TuiEvent::UsageUpdated {
-            revision: 11,
-            usage: after_compaction.clone(),
-        });
-        state.update(TuiEvent::UsageUpdated {
-            revision: 9,
-            usage: stale,
-        });
+        let projection = |usage_revision, usage| SurfaceProjectionState {
+            session_id: "usage-session".to_string(),
+            title: "Usage session".to_string(),
+            usage_revision,
+            usage,
+            context_revision: 1,
+            context_used_tokens: 8_000,
+            context_limit_tokens: 128_000,
+            workflow_tasks: Vec::new(),
+            current_goal: None,
+            foreground_operation_id: None,
+        };
 
-        assert_eq!(state.usage, after_compaction);
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            10,
+            before_compaction,
+        ))));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            11,
+            after_compaction.clone(),
+        ))));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            9, stale,
+        ))));
+
+        assert_eq!(state.usage(), &after_compaction);
     }
 
     #[test]
@@ -4877,9 +4831,9 @@ mod tests {
             state.current_session_title.as_deref(),
             Some("canonical title")
         );
-        assert_eq!(state.usage, expected.usage);
-        assert_eq!(state.context_used_tokens, expected.context_used_tokens);
-        assert_eq!(state.context_limit_tokens, expected.context_limit_tokens);
+        assert_eq!(state.usage(), &expected.usage);
+        assert_eq!(state.context_used_tokens(), expected.context_used_tokens);
+        assert_eq!(state.context_limit_tokens(), expected.context_limit_tokens);
         assert_eq!(state.workflow_panel.tasks, expected.workflow_tasks);
         assert_eq!(state.current_goal, expected.current_goal);
         assert_eq!(
@@ -4888,48 +4842,37 @@ mod tests {
         );
         state.assert_surface_projection_consistent(&expected);
 
-        // A legacy provider usage event is more recent than the typed snapshot
-        // when the snapshot revision has not advanced. The stale snapshot must
-        // not put the footer back at 0%.
-        state.update(TuiEvent::ContextUpdated {
-            used_tokens: 25_000,
-            limit_tokens: 1_000_000,
-        });
+        let mut same_context_revision = expected.clone();
+        same_context_revision.context_used_tokens = 25_000;
+        same_context_revision.context_limit_tokens = 1_000_000;
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
-            expected.clone(),
+            same_context_revision,
         )));
-        assert_eq!(state.context_used_tokens, 25_000);
-        assert_eq!(state.context_limit_tokens, 1_000_000);
-        state.assert_surface_projection_consistent(&expected);
+        assert_eq!(state.context_used_tokens(), expected.context_used_tokens);
+        assert_eq!(state.context_limit_tokens(), expected.context_limit_tokens);
 
         let mut compacted = expected.clone();
         compacted.context_revision = 2;
         compacted.context_used_tokens = 10_000;
         compacted.context_limit_tokens = 1_000_000;
-        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(compacted)));
-        assert_eq!(state.context_used_tokens, 10_000);
-        assert_eq!(state.context_limit_tokens, 1_000_000);
-
-        let (pre_tx, _pre_rx) = mpsc::unbounded();
-        let mut pre_snapshot = AppState::new(
-            pre_tx,
-            "0.0.0-test".to_string(),
-            "mock".to_string(),
-            "/tmp".to_string(),
-        );
-        pre_snapshot.update(TuiEvent::ContextUpdated {
-            used_tokens: 30_000,
-            limit_tokens: 1_000_000,
-        });
-        pre_snapshot.update(TuiEvent::SurfaceProjectionSynced(Box::new(
-            expected.clone(),
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            compacted.clone(),
         )));
-        assert_eq!(pre_snapshot.context_used_tokens, 30_000);
-        let mut next_revision = expected.clone();
-        next_revision.context_revision = 2;
-        next_revision.context_used_tokens = 12_000;
-        pre_snapshot.update(TuiEvent::SurfaceProjectionSynced(Box::new(next_revision)));
-        assert_eq!(pre_snapshot.context_used_tokens, 12_000);
+        assert_eq!(state.context_used_tokens(), 10_000);
+        assert_eq!(state.context_limit_tokens(), 1_000_000);
+
+        let mut newer_usage_with_stale_context = compacted;
+        newer_usage_with_stale_context.usage_revision = 8;
+        newer_usage_with_stale_context.usage.input_tokens = 800;
+        newer_usage_with_stale_context.context_revision = 1;
+        newer_usage_with_stale_context.context_used_tokens = 50_000;
+        newer_usage_with_stale_context.context_limit_tokens = 128_000;
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            newer_usage_with_stale_context,
+        )));
+        assert_eq!(state.usage().input_tokens, 800);
+        assert_eq!(state.context_used_tokens(), 10_000);
+        assert_eq!(state.context_limit_tokens(), 1_000_000);
 
         let mut stale = expected.clone();
         stale.usage_revision = 6;
@@ -4941,19 +4884,38 @@ mod tests {
             state.current_session_title.as_deref(),
             Some("canonical title")
         );
-        assert_eq!(state.usage, expected.usage);
+        assert_eq!(state.usage().input_tokens, 800);
         assert_eq!(
             state.active_surface_operation_id,
             expected.foreground_operation_id
         );
 
-        state.update(TuiEvent::SessionProjectionReset {
-            session_id: "next-session".to_string(),
-            title: "next title".to_string(),
-        });
+        let mut next_session = expected.clone();
+        next_session.session_id = "next-session".to_string();
+        next_session.title = "next title".to_string();
+        next_session.usage_revision = 1;
+        next_session.usage.input_tokens = 12;
+        next_session.context_revision = 1;
+        next_session.context_used_tokens = 12_000;
+        next_session.context_limit_tokens = 256_000;
+        next_session.workflow_tasks.clear();
+        next_session.current_goal = None;
+        next_session.foreground_operation_id = None;
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(next_session)));
+        assert_eq!(state.usage().input_tokens, 12);
+        assert_eq!(state.context_used_tokens(), 12_000);
+        assert_eq!(state.context_limit_tokens(), 256_000);
         assert!(state.active_surface_operation_id.is_none());
         assert!(state.current_goal.is_none());
         assert!(state.workflow_panel.tasks.is_empty());
+
+        state.update(TuiEvent::SessionProjectionReset {
+            session_id: "empty-session".to_string(),
+            title: "empty title".to_string(),
+        });
+        assert_eq!(state.usage(), &UsageTotals::default());
+        assert_eq!(state.context_used_tokens(), 0);
+        assert_eq!(state.context_limit_tokens(), 0);
     }
 
     #[test]
