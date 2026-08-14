@@ -110,6 +110,20 @@ preview rather than the queue. Queue state remains intentionally process-local,
 so restart begins empty and makes no durability or exactly-once claim. TUI key
 flows, runtime events, CLI, server/JSONL, and persisted formats are unchanged.
 
+The edit-highlight convergence slice gives workspace/theme configuration,
+worker runtime, pending-job coordination, applied revision styles, and test
+hooks one private `EditHighlightState` owner in `edit_highlight.rs`. AppState
+still owns transcript messages, revision advancement, and render-cache
+invalidation; the renderer receives only an immutable applied-style projection.
+Runtime replacement raises a shutdown fence, closes the job sender and result
+receiver, then joins its bounded worker before returning. The fence is checked
+before and during queue coalescing, so reconfiguration cannot leave an unowned
+old worker, drain a queued backlog, or publish its derived styles later.
+Highlight state remains process-local and rebuildable;
+ordinary diff rendering is the silent fallback after malformed input, stale
+identity, spawn/channel failure, or restart. TUI output, runtime events, CLI,
+server/JSONL, and persisted formats are unchanged.
+
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the
 release checksum, installs the runner and setup helper, and can provision,
@@ -1282,10 +1296,11 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has extracted nine modules so far (insert-escape, presentation,
+   stream has extracted twelve modules so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
-   workflow-panel, transcript-search-orchestration); `app.rs` is down from
-   10,186 to 9,764 lines and `types.rs` from 9,442 to 9,185. Renderer-owned
+   workflow-panel, transcript-search-orchestration, input-history,
+   queued-submission, edit-highlight); `app.rs` is down from 10,186 to 9,770
+   lines and `types.rs` from 9,442 to 8,261. Renderer-owned
    orchestration and projection duplication (`surface_projection.rs`, 2,282
    lines) remain the open core of this matrix row.
 4. **P2.4 context/cache identity is not a release slice.** DeepSeek usage

@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
@@ -63,13 +64,32 @@ fn coalesce_jobs(
     first: EditHighlightJob,
     queued: impl IntoIterator<Item = EditHighlightJob>,
 ) -> Vec<EditHighlightJob> {
+    coalesce_jobs_until_shutdown(first, queued, || false)
+        .expect("shutdown callback never requests cancellation")
+}
+
+fn coalesce_jobs_until_shutdown(
+    first: EditHighlightJob,
+    queued: impl IntoIterator<Item = EditHighlightJob>,
+    shutdown_requested: impl Fn() -> bool,
+) -> Option<Vec<EditHighlightJob>> {
+    if shutdown_requested() {
+        return None;
+    }
     let mut positions = HashMap::new();
     let mut jobs = Vec::new();
 
     positions.insert(first.tool_id.clone(), 0);
     jobs.push(first);
 
-    for job in queued {
+    let mut queued = queued.into_iter();
+    loop {
+        if shutdown_requested() {
+            return None;
+        }
+        let Some(job) = queued.next() else {
+            break;
+        };
         if let Some(position) = positions.get(&job.tool_id).copied() {
             jobs[position] = job;
         } else {
@@ -78,7 +98,7 @@ fn coalesce_jobs(
         }
     }
 
-    jobs
+    Some(jobs)
 }
 
 fn read_capped_utf8_from(reader: impl Read, is_file: bool, metadata_len: u64) -> Option<String> {
@@ -131,9 +151,24 @@ fn run_job(job: &EditHighlightJob) -> EditHighlightOutcome {
     .unwrap_or(EditHighlightOutcome::Failed)
 }
 
-fn worker_loop(job_rx: Receiver<EditHighlightJob>, result_tx: Sender<EditHighlightResult>) {
-    while let Ok(first) = job_rx.recv() {
-        for job in coalesce_jobs(first, job_rx.try_iter()) {
+fn worker_loop(
+    job_rx: Receiver<EditHighlightJob>,
+    result_tx: Sender<EditHighlightResult>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Acquire) {
+        let Ok(first) = job_rx.recv() else {
+            return;
+        };
+        let Some(jobs) = coalesce_jobs_until_shutdown(first, job_rx.try_iter(), || {
+            shutdown.load(Ordering::Acquire)
+        }) else {
+            return;
+        };
+        for job in jobs {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
             let outcome = run_job(&job);
             if result_tx
                 .send(EditHighlightResult { job, outcome })
@@ -149,16 +184,20 @@ fn spawn_worker() -> io::Result<(
     Sender<EditHighlightJob>,
     Receiver<EditHighlightResult>,
     JoinHandle<()>,
+    Arc<AtomicBool>,
 )> {
     spawn_worker_with_runner(worker_loop)
 }
 
 fn spawn_worker_with_runner(
-    runner: impl FnOnce(Receiver<EditHighlightJob>, Sender<EditHighlightResult>) + Send + 'static,
+    runner: impl FnOnce(Receiver<EditHighlightJob>, Sender<EditHighlightResult>, Arc<AtomicBool>)
+    + Send
+    + 'static,
 ) -> io::Result<(
     Sender<EditHighlightJob>,
     Receiver<EditHighlightResult>,
     JoinHandle<()>,
+    Arc<AtomicBool>,
 )> {
     spawn_worker_with(runner, |worker| {
         thread::Builder::new()
@@ -168,22 +207,29 @@ fn spawn_worker_with_runner(
 }
 
 fn spawn_worker_with(
-    runner: impl FnOnce(Receiver<EditHighlightJob>, Sender<EditHighlightResult>) + Send + 'static,
+    runner: impl FnOnce(Receiver<EditHighlightJob>, Sender<EditHighlightResult>, Arc<AtomicBool>)
+    + Send
+    + 'static,
     spawner: impl FnOnce(Box<dyn FnOnce() + Send + 'static>) -> io::Result<JoinHandle<()>>,
 ) -> io::Result<(
     Sender<EditHighlightJob>,
     Receiver<EditHighlightResult>,
     JoinHandle<()>,
+    Arc<AtomicBool>,
 )> {
     let (job_tx, job_rx) = crossbeam_channel::unbounded();
     let (result_tx, result_rx) = crossbeam_channel::unbounded();
-    let worker = spawner(Box::new(move || runner(job_rx, result_tx)))?;
-    Ok((job_tx, result_rx, worker))
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker = spawner(Box::new(move || runner(job_rx, result_tx, worker_shutdown)))?;
+    Ok((job_tx, result_rx, worker, shutdown))
 }
 
 pub(crate) struct EditHighlightRuntime {
-    job_tx: Sender<EditHighlightJob>,
-    result_rx: Receiver<EditHighlightResult>,
+    job_tx: Option<Sender<EditHighlightJob>>,
+    result_rx: Option<Receiver<EditHighlightResult>>,
+    worker: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
     pending: HashMap<String, EditHighlightJob>,
     next_job_id: u64,
     #[cfg(test)]
@@ -196,15 +242,18 @@ impl EditHighlightRuntime {
     }
 
     fn new_with_channels(
-        (job_tx, result_rx, _worker): (
+        (job_tx, result_rx, worker, shutdown): (
             Sender<EditHighlightJob>,
             Receiver<EditHighlightResult>,
             JoinHandle<()>,
+            Arc<AtomicBool>,
         ),
     ) -> io::Result<Self> {
         Ok(Self {
-            job_tx,
-            result_rx,
+            job_tx: Some(job_tx),
+            result_rx: Some(result_rx),
+            worker: Some(worker),
+            shutdown,
             pending: HashMap::new(),
             next_job_id: 1,
             #[cfg(test)]
@@ -215,6 +264,19 @@ impl EditHighlightRuntime {
     #[cfg(test)]
     fn new_with_worker(
         runner: impl FnOnce(Receiver<EditHighlightJob>, Sender<EditHighlightResult>) + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::new_with_channels(spawn_worker_with_runner(
+            move |job_rx, result_tx, _shutdown| {
+                runner(job_rx, result_tx);
+            },
+        )?)
+    }
+
+    #[cfg(test)]
+    fn new_with_shutdown_worker(
+        runner: impl FnOnce(Receiver<EditHighlightJob>, Sender<EditHighlightResult>, Arc<AtomicBool>)
+        + Send
+        + 'static,
     ) -> io::Result<Self> {
         Self::new_with_channels(spawn_worker_with_runner(runner)?)
     }
@@ -233,7 +295,12 @@ impl EditHighlightRuntime {
     }
 
     pub(crate) fn submit(&mut self, job: EditHighlightJob) -> bool {
-        if self.job_tx.send(job.clone()).is_err() {
+        let submitted = self
+            .job_tx
+            .as_ref()
+            .is_some_and(|job_tx| job_tx.send(job.clone()).is_ok());
+        if !submitted {
+            self.job_tx = None;
             self.pending.clear();
             return false;
         }
@@ -247,8 +314,12 @@ impl EditHighlightRuntime {
 
     pub(crate) fn drain_results(&mut self) -> DrainResults {
         let mut results = Vec::new();
+        let result_rx = self
+            .result_rx
+            .as_ref()
+            .expect("edit highlight result receiver available while runtime is live");
         let disconnected = loop {
-            match self.result_rx.try_recv() {
+            match result_rx.try_recv() {
                 Ok(result) => results.push(result),
                 Err(TryRecvError::Empty) => break false,
                 Err(TryRecvError::Disconnected) => break true,
@@ -321,11 +392,24 @@ impl EditHighlightRuntime {
         drop(job_rx);
         let (_result_tx, result_rx) = crossbeam_channel::unbounded();
         Self {
-            job_tx,
-            result_rx,
+            job_tx: Some(job_tx),
+            result_rx: Some(result_rx),
+            worker: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
             pending: HashMap::new(),
             next_job_id: 1,
             successful_submit_count: 0,
+        }
+    }
+}
+
+impl Drop for EditHighlightRuntime {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.job_tx.take();
+        self.result_rx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -336,7 +420,7 @@ mod tests {
     use std::io::{self, Read};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crossbeam_channel::RecvTimeoutError;
@@ -349,8 +433,8 @@ mod tests {
 
     use super::{
         DrainResults, EditHighlightJob, EditHighlightOutcome, EditHighlightResult,
-        EditHighlightRuntime, coalesce_jobs, read_capped_utf8_from, read_capped_utf8_with, run_job,
-        spawn_worker,
+        EditHighlightRuntime, coalesce_jobs, coalesce_jobs_until_shutdown, read_capped_utf8_from,
+        read_capped_utf8_with, run_job, spawn_worker,
     };
     use crate::diff_highlight::{RefinedDiffStyles, parse_unified_diff};
     use crate::syntax_highlight::{
@@ -783,7 +867,7 @@ mod tests {
             .expect("run mkfifo");
         assert!(status.success());
         let submitted = job(40, "fifo", fifo.clone(), "src/item.py", MATCHING_DIFF);
-        let (job_tx, result_rx, worker) = spawn_worker().expect("test worker");
+        let (job_tx, result_rx, worker, _shutdown) = spawn_worker().expect("test worker");
 
         job_tx.send(submitted).unwrap();
         let result = match result_rx.recv_timeout(Duration::from_secs(1)) {
@@ -816,7 +900,7 @@ mod tests {
         let path = directory.path().join("item.py");
         std::fs::write(&path, "value: int = 42\n").unwrap();
         let expected = job(41, "edit-a", path, "src/item.py", MATCHING_DIFF);
-        let (job_tx, result_rx, worker) = spawn_worker().expect("test worker");
+        let (job_tx, result_rx, worker, _shutdown) = spawn_worker().expect("test worker");
 
         assert_eq!(worker.thread().name(), Some("orca-edit-highlight"));
         job_tx.send(expected.clone()).unwrap();
@@ -832,7 +916,7 @@ mod tests {
 
     #[test]
     fn worker_exits_when_job_channel_disconnects() {
-        let (job_tx, result_rx, worker) = spawn_worker().expect("test worker");
+        let (job_tx, result_rx, worker, _shutdown) = spawn_worker().expect("test worker");
 
         drop(job_tx);
         worker.join().expect("worker shutdown");
@@ -844,12 +928,95 @@ mod tests {
     }
 
     #[test]
+    fn drop_closes_job_channel_and_joins_worker() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
+        let runtime = EditHighlightRuntime::new_with_worker(move |job_rx, _result_tx| {
+            while job_rx.recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(50));
+            worker_exited.store(true, Ordering::Release);
+        })
+        .unwrap();
+
+        drop(runtime);
+
+        assert!(exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drop_closes_result_channel_before_joining_worker() {
+        let result_disconnected = Arc::new(AtomicBool::new(false));
+        let worker_observation = Arc::clone(&result_disconnected);
+        let mut runtime = EditHighlightRuntime::new_with_worker(move |job_rx, result_tx| {
+            let submitted = job_rx.recv().expect("submitted job");
+            std::thread::sleep(Duration::from_millis(50));
+            let send_failed = result_tx
+                .send(EditHighlightResult {
+                    job: submitted,
+                    outcome: EditHighlightOutcome::Failed,
+                })
+                .is_err();
+            worker_observation.store(send_failed, Ordering::Release);
+        })
+        .unwrap();
+        assert!(runtime.submit(job(1, "edit-1", PathBuf::from("/item.py"), "item.py", "")));
+
+        drop(runtime);
+
+        assert!(result_disconnected.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drop_fences_queued_backlog_before_joining_worker() {
+        let (accepted_tx, accepted_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let queued_consumed = Arc::new(AtomicUsize::new(usize::MAX));
+        let worker_consumed = Arc::clone(&queued_consumed);
+        let mut runtime =
+            EditHighlightRuntime::new_with_shutdown_worker(move |job_rx, _result_tx, shutdown| {
+                let first = job_rx.recv().expect("first submitted job");
+                accepted_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                let queued_before = job_rx.len();
+                let coalesced = coalesce_jobs_until_shutdown(first, job_rx.try_iter(), || {
+                    shutdown.load(Ordering::Acquire)
+                });
+                worker_consumed.store(queued_before - job_rx.len(), Ordering::Release);
+                assert!(coalesced.is_none());
+            })
+            .unwrap();
+        assert!(runtime.submit(job(1, "edit-1", PathBuf::from("/item.py"), "item.py", "")));
+        accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker accepted first job");
+        for job_id in 2..=1_002 {
+            assert!(runtime.submit(job(
+                job_id,
+                &format!("edit-{job_id}"),
+                PathBuf::from(format!("/{job_id}.py")),
+                &format!("{job_id}.py"),
+                ""
+            )));
+        }
+
+        let shutdown = Arc::clone(&runtime.shutdown);
+        let dropper = std::thread::spawn(move || drop(runtime));
+        while !shutdown.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+        dropper.join().unwrap();
+
+        assert_eq!(queued_consumed.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn worker_exits_when_result_receiver_disconnects() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("item.py");
         std::fs::write(&path, "value: int = 42\n").unwrap();
         let submitted = job(51, "edit-a", path, "src/item.py", MATCHING_DIFF);
-        let (job_tx, result_rx, worker) = spawn_worker().expect("test worker");
+        let (job_tx, result_rx, worker, _shutdown) = spawn_worker().expect("test worker");
 
         drop(result_rx);
         job_tx.send(submitted).unwrap();
@@ -960,8 +1127,10 @@ mod tests {
         let (_result_tx, result_rx) = crossbeam_channel::unbounded();
         let existing = job(1, "existing", PathBuf::from("/old"), "old.py", "");
         let mut runtime = EditHighlightRuntime {
-            job_tx,
-            result_rx,
+            job_tx: Some(job_tx),
+            result_rx: Some(result_rx),
+            worker: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
             pending: HashMap::from([(existing.tool_id.clone(), existing)]),
             next_job_id: 2,
             successful_submit_count: 0,
@@ -1056,8 +1225,10 @@ mod tests {
         let (job_tx, _job_rx) = crossbeam_channel::unbounded();
         let (result_tx, result_rx) = crossbeam_channel::unbounded();
         let mut runtime = EditHighlightRuntime {
-            job_tx,
-            result_rx,
+            job_tx: Some(job_tx),
+            result_rx: Some(result_rx),
+            worker: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
             pending: HashMap::new(),
             next_job_id: 1,
             successful_submit_count: 0,

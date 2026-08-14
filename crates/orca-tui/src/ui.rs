@@ -823,7 +823,7 @@ pub(crate) fn render_live_messages(
     let live_start = state.flushed_count.min(state.messages.len());
     let messages = &state.messages;
     let revisions = &state.message_revisions;
-    let highlights = &state.applied_diff_highlights;
+    let highlights = state.edit_highlights.applied();
     {
         let cache = &mut state.transcript_render_cache;
         let outcome = cache.prepare(

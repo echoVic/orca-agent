@@ -1,6 +1,7 @@
 use crossbeam_channel as mpsc;
 use std::collections::{HashMap, VecDeque};
-use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,16 +20,12 @@ use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 use orca_runtime::surface::{RuntimeSurfaceThreadHandle, SurfaceOperationId};
 
 use crate::display_text::truncate_to_display_width;
+use crate::edit_highlight::EditHighlightState;
 #[cfg(test)]
-use crate::edit_highlight_worker::DrainResults;
-use crate::edit_highlight_worker::{
-    EditHighlightJob, EditHighlightOutcome, EditHighlightResult, EditHighlightRuntime,
-};
+use crate::edit_highlight::parsed_diff_structure_matches_target;
 use crate::input_history::load_input_history;
 use crate::queued_input::QueuedSubmissionState;
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
-use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
-use crate::terminal_capabilities::{TerminalColorLevel, syntax_style_revision};
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
@@ -131,88 +128,6 @@ fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
         ));
     }
     parts.join(" · ")
-}
-
-fn normalize_diff_relative_path(path: &str) -> Option<PathBuf> {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        return None;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(component) => normalized.push(component),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    (!normalized.as_os_str().is_empty()).then_some(normalized)
-}
-
-fn unified_diff_header_path(header: &str) -> &str {
-    let path = header.split_once('\t').map_or(header, |(path, _)| path);
-    path.strip_prefix("a/")
-        .or_else(|| path.strip_prefix("b/"))
-        .unwrap_or(path)
-}
-
-fn parsed_diff_structure_matches_target(
-    parsed: &crate::diff_highlight::ParsedDiff,
-    diff: &str,
-    target: &Path,
-) -> bool {
-    if !parsed.is_structurally_valid() || parsed.has_multiple_files {
-        return false;
-    }
-    let mut lines = diff.lines();
-    let Some(old_header) = lines.next().and_then(|line| line.strip_prefix("--- ")) else {
-        return false;
-    };
-    let Some(new_header) = lines.next().and_then(|line| line.strip_prefix("+++ ")) else {
-        return false;
-    };
-    let old_path = unified_diff_header_path(old_header);
-    let new_path = unified_diff_header_path(new_header);
-    let old_is_null = old_path == "/dev/null";
-    let new_is_null = new_path == "/dev/null";
-    if old_is_null && new_is_null {
-        return false;
-    }
-    if (!old_is_null && normalize_diff_relative_path(old_path).is_none())
-        || (!new_is_null && normalize_diff_relative_path(new_path).as_deref() != Some(target))
-        || (new_is_null && normalize_diff_relative_path(old_path).as_deref() != Some(target))
-    {
-        return false;
-    }
-    parsed
-        .destination_path
-        .as_deref()
-        .and_then(normalize_diff_relative_path)
-        .as_deref()
-        == Some(target)
-}
-
-fn parsed_diff_has_valid_new_side(parsed: &crate::diff_highlight::ParsedDiff) -> bool {
-    let mut new_side_lines = parsed
-        .hunks
-        .iter()
-        .flat_map(|hunk| hunk.source_lines())
-        .filter(|line| {
-            matches!(
-                line.kind,
-                crate::diff_highlight::DiffLineKind::Context
-                    | crate::diff_highlight::DiffLineKind::Insert
-            )
-        });
-    new_side_lines
-        .next()
-        .is_some_and(|line| line.new_line.is_some_and(|line_number| line_number > 0))
-        && new_side_lines.all(|line| line.new_line.is_some_and(|line_number| line_number > 0))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -912,19 +827,6 @@ impl MentionPopupState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct AppliedDiffHighlight {
-    pub(crate) tool_id: String,
-    pub(crate) display_path: String,
-    pub(crate) styles: Arc<crate::diff_highlight::RefinedDiffStyles>,
-}
-
-#[cfg(test)]
-type EditHighlightRuntimeFactory = fn() -> std::io::Result<EditHighlightRuntime>;
-
-#[cfg(test)]
-type EditHighlightDrain = fn(&mut EditHighlightRuntime) -> DrainResults;
-
 pub struct AppState {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) message_revisions: Vec<u64>,
@@ -1043,15 +945,7 @@ pub struct AppState {
     /// the composer is hidden.
     pub input_area: Option<ratatui::layout::Rect>,
     pub(crate) search_area: Option<ratatui::layout::Rect>,
-    workspace_root: Option<PathBuf>,
-    pub(crate) syntax_theme: SyntaxTheme,
-    pub(crate) syntax_color_level: TerminalColorLevel,
-    edit_highlight_runtime: Option<EditHighlightRuntime>,
-    pub(crate) applied_diff_highlights: HashMap<u64, AppliedDiffHighlight>,
-    #[cfg(test)]
-    edit_highlight_runtime_factory: EditHighlightRuntimeFactory,
-    #[cfg(test)]
-    edit_highlight_drain: Option<EditHighlightDrain>,
+    pub(crate) edit_highlights: EditHighlightState,
     /// A mouse drag is adjusting the composer's own text selection.
     pub composer_mouse_selecting: bool,
     /// Messages that arrived below the viewport while auto-follow was
@@ -1199,380 +1093,10 @@ impl AppState {
             frame_area: None,
             input_area: None,
             search_area: None,
-            workspace_root: None,
-            syntax_theme: SyntaxTheme::OneHalfDark,
-            syntax_color_level: TerminalColorLevel::TrueColor,
-            edit_highlight_runtime: None,
-            applied_diff_highlights: HashMap::new(),
-            #[cfg(test)]
-            edit_highlight_runtime_factory: EditHighlightRuntime::new,
-            #[cfg(test)]
-            edit_highlight_drain: None,
+            edit_highlights: EditHighlightState::default(),
             composer_mouse_selecting: false,
             unseen_messages: 0,
         }
-    }
-
-    pub(crate) fn configure_syntax_highlighting(
-        &mut self,
-        workspace_root: PathBuf,
-        syntax_theme: SyntaxTheme,
-        syntax_color_level: TerminalColorLevel,
-    ) {
-        self.workspace_root = Some(workspace_root);
-        self.syntax_theme = syntax_theme;
-        self.syntax_color_level = syntax_color_level;
-        self.edit_highlight_runtime = None;
-        self.applied_diff_highlights.clear();
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn edit_highlight_needs_tick(&self) -> bool {
-        self.edit_highlight_runtime
-            .as_ref()
-            .is_some_and(EditHighlightRuntime::has_pending)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn poll_edit_highlight_results(&mut self) -> bool {
-        let Some(runtime) = self.edit_highlight_runtime.as_mut() else {
-            return false;
-        };
-        #[cfg(test)]
-        let drained = match self.edit_highlight_drain {
-            Some(drain) => drain(runtime),
-            None => runtime.drain_results(),
-        };
-        #[cfg(not(test))]
-        let drained = runtime.drain_results();
-
-        let mut redraw = false;
-        for result in drained.results {
-            redraw |= self.apply_edit_highlight_result(result);
-        }
-        if drained.disconnected {
-            self.edit_highlight_runtime = None;
-        }
-        redraw
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn refined_diff_styles(
-        &self,
-        message_index: usize,
-        tool_id: &str,
-    ) -> Option<&crate::diff_highlight::RefinedDiffStyles> {
-        let message = self.messages.get(message_index)?;
-        let ChatMessage::ToolCall { id, .. } = message else {
-            return None;
-        };
-        (id == tool_id)
-            .then(|| {
-                Self::refined_diff_styles_for_message(
-                    &self.message_revisions,
-                    &self.applied_diff_highlights,
-                    message_index,
-                    message,
-                )
-            })
-            .flatten()
-    }
-
-    pub(crate) fn refined_diff_styles_for_message<'a>(
-        revisions: &[u64],
-        highlights: &'a HashMap<u64, AppliedDiffHighlight>,
-        message_index: usize,
-        message: &ChatMessage,
-    ) -> Option<&'a crate::diff_highlight::RefinedDiffStyles> {
-        let revision = *revisions.get(message_index)?;
-        let ChatMessage::ToolCall { id, .. } = message else {
-            return None;
-        };
-        let highlight = highlights.get(&revision)?;
-        (highlight.tool_id == *id).then_some(highlight.styles.as_ref())
-    }
-
-    fn new_edit_highlight_runtime(&self) -> std::io::Result<EditHighlightRuntime> {
-        #[cfg(test)]
-        {
-            (self.edit_highlight_runtime_factory)()
-        }
-        #[cfg(not(test))]
-        {
-            EditHighlightRuntime::new()
-        }
-    }
-
-    fn resolve_edit_target(&self, target: &str) -> Option<(PathBuf, String)> {
-        let target_path = Path::new(target);
-        if target_path.as_os_str().is_empty() || target_path.is_absolute() {
-            return None;
-        }
-        let configured_workspace = self.workspace_root.as_ref()?;
-        let resolved_path =
-            orca_tools::resolve_workspace_path(configured_workspace, Some(target)).ok()?;
-        let display_path = resolved_path
-            .strip_prefix(configured_workspace)
-            .ok()?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if display_path.is_empty() {
-            return None;
-        }
-        let workspace_root = configured_workspace.canonicalize().ok()?;
-        if !workspace_root.is_dir() {
-            return None;
-        }
-        let absolute_path = resolved_path.canonicalize().ok()?;
-        if !absolute_path.starts_with(&workspace_root) || !absolute_path.is_file() {
-            return None;
-        }
-        Some((absolute_path, display_path))
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn edit_target_matches_job(&self, target: &str, job: &EditHighlightJob) -> bool {
-        self.resolve_edit_target(target)
-            .is_some_and(|(absolute_path, display_path)| {
-                absolute_path == job.absolute_path && display_path == job.display_path
-            })
-    }
-
-    fn submit_edit_highlight_for_message(&mut self, message_index: usize) {
-        self.reconcile_message_tracking();
-        let Some(ChatMessage::ToolCall {
-            id,
-            target: Some(target),
-            status,
-            diff: Some(diff),
-            ..
-        }) = self.messages.get(message_index)
-        else {
-            return;
-        };
-        if status != "completed" || diff.trim().is_empty() {
-            return;
-        }
-
-        let parsed = crate::diff_highlight::parse_unified_diff(diff);
-        let Some(destination_path) = parsed.destination_path.as_deref() else {
-            return;
-        };
-        let Some((absolute_path, display_path)) = self.resolve_edit_target(target) else {
-            return;
-        };
-        let Some(normalized_destination) = normalize_diff_relative_path(destination_path) else {
-            return;
-        };
-        if !parsed_diff_structure_matches_target(&parsed, diff, Path::new(&display_path))
-            || normalized_destination != Path::new(&display_path)
-            || !parsed_diff_has_valid_new_side(&parsed)
-            || highlighter_for_path(
-                &normalized_destination,
-                self.syntax_theme,
-                self.syntax_color_level,
-            )
-            .is_none()
-        {
-            return;
-        }
-
-        let Some(message_revision) = self.message_revisions.get(message_index).copied() else {
-            return;
-        };
-        let tool_id = id.clone();
-
-        if self.edit_highlight_runtime.is_none() {
-            let Ok(runtime) = self.new_edit_highlight_runtime() else {
-                return;
-            };
-            self.edit_highlight_runtime = Some(runtime);
-        }
-        let runtime = self
-            .edit_highlight_runtime
-            .as_mut()
-            .expect("edit highlight runtime initialized");
-        let job = EditHighlightJob {
-            job_id: runtime.allocate_job_id(),
-            tool_id,
-            message_index,
-            message_revision,
-            syntax_theme_revision: syntax_style_revision(
-                self.syntax_theme,
-                self.syntax_color_level,
-            ),
-            syntax_theme: self.syntax_theme,
-            syntax_color_level: self.syntax_color_level,
-            absolute_path,
-            display_path,
-            parsed,
-        };
-        if !runtime.submit(job) {
-            self.edit_highlight_runtime = None;
-        }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn apply_edit_highlight_result(&mut self, result: EditHighlightResult) -> bool {
-        let Some(runtime) = self.edit_highlight_runtime.as_mut() else {
-            return false;
-        };
-        if !runtime.pending_matches(&result.job) || !runtime.finish_pending(&result.job) {
-            return false;
-        }
-        let EditHighlightOutcome::Ready { styles } = result.outcome else {
-            return false;
-        };
-
-        let job = result.job;
-        if self.syntax_theme != job.syntax_theme
-            || self.syntax_color_level != job.syntax_color_level
-            || syntax_style_revision(self.syntax_theme, self.syntax_color_level)
-                != job.syntax_theme_revision
-            || self.message_revisions.get(job.message_index).copied() != Some(job.message_revision)
-        {
-            return false;
-        }
-        let Some(ChatMessage::ToolCall {
-            id,
-            target: Some(target),
-            status,
-            diff: Some(diff),
-            ..
-        }) = self.messages.get(job.message_index)
-        else {
-            return false;
-        };
-        if id != &job.tool_id || status != "completed" {
-            return false;
-        }
-        let current_parsed = crate::diff_highlight::parse_unified_diff(diff);
-        let Some(current_destination) = current_parsed.destination_path.as_deref() else {
-            return false;
-        };
-        let Some(normalized_destination) = normalize_diff_relative_path(current_destination) else {
-            return false;
-        };
-        if current_parsed != job.parsed
-            || normalized_destination.to_string_lossy().replace('\\', "/") != job.display_path
-            || !self.edit_target_matches_job(target, &job)
-        {
-            return false;
-        }
-
-        if !self.touch_message(job.message_index) {
-            return false;
-        }
-        let Some(applied_revision) = self.message_revisions.get(job.message_index).copied() else {
-            return false;
-        };
-        self.applied_diff_highlights.insert(
-            applied_revision,
-            AppliedDiffHighlight {
-                tool_id: job.tool_id,
-                display_path: job.display_path,
-                styles,
-            },
-        );
-        true
-    }
-
-    fn clear_pending_edit_highlights(&mut self) {
-        if let Some(runtime) = self.edit_highlight_runtime.as_mut() {
-            runtime.clear_pending();
-        }
-    }
-
-    fn remove_applied_highlight_for_message(&mut self, index: usize) {
-        if matches!(self.messages.get(index), Some(ChatMessage::ToolCall { .. }))
-            && let Some(revision) = self.message_revisions.get(index)
-        {
-            self.applied_diff_highlights.remove(revision);
-        }
-    }
-
-    fn remove_applied_highlights_for_tool_id(&mut self, tool_id: &str) {
-        self.applied_diff_highlights
-            .retain(|_, highlight| highlight.tool_id != tool_id);
-    }
-
-    fn prune_applied_diff_highlights(&mut self) {
-        let present_revisions = self
-            .messages
-            .iter()
-            .zip(&self.message_revisions)
-            .filter_map(|(message, revision)| match message {
-                ChatMessage::ToolCall { id, .. } => Some((*revision, id.as_str())),
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>();
-        self.applied_diff_highlights.retain(|revision, highlight| {
-            present_revisions
-                .get(revision)
-                .is_some_and(|tool_id| *tool_id == highlight.tool_id)
-        });
-    }
-
-    #[cfg(test)]
-    fn pending_edit_highlight_count(&self) -> usize {
-        self.edit_highlight_runtime
-            .as_ref()
-            .map_or(0, EditHighlightRuntime::pending_count)
-    }
-
-    #[cfg(test)]
-    fn successful_edit_highlight_submit_count(&self) -> usize {
-        self.edit_highlight_runtime
-            .as_ref()
-            .map_or(0, EditHighlightRuntime::successful_submit_count)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_edit_highlight_job(&self, tool_id: &str) -> Option<EditHighlightJob> {
-        self.edit_highlight_runtime.as_ref()?.pending_job(tool_id)
-    }
-
-    #[cfg(test)]
-    fn edit_highlight_runtime_started(&self) -> bool {
-        self.edit_highlight_runtime.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn syntax_workspace_root_for_test(&self) -> Option<&Path> {
-        self.workspace_root.as_deref()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn syntax_theme_for_test(&self) -> SyntaxTheme {
-        self.syntax_theme
-    }
-
-    #[cfg(test)]
-    pub(crate) fn syntax_color_level_for_test(&self) -> TerminalColorLevel {
-        self.syntax_color_level
-    }
-
-    #[cfg(test)]
-    pub(crate) fn edit_highlight_runtime_started_for_test(&self) -> bool {
-        self.edit_highlight_runtime.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_edit_highlight_count_for_test(&self) -> usize {
-        self.pending_edit_highlight_count()
-    }
-
-    #[cfg(test)]
-    fn set_edit_highlight_runtime_factory_for_test(
-        &mut self,
-        factory: EditHighlightRuntimeFactory,
-    ) {
-        self.edit_highlight_runtime_factory = factory;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_edit_highlight_drain_for_test(&mut self, drain: Option<EditHighlightDrain>) {
-        self.edit_highlight_drain = drain;
     }
 
     /// Map a mouse position to transcript content space; `None` outside the
@@ -1892,7 +1416,7 @@ impl AppState {
         self.reset_assistant_stream();
         self.reset_queued_user_messages();
         self.messages = messages.into_iter().collect();
-        self.applied_diff_highlights.clear();
+        self.clear_applied_edit_highlights();
         self.clear_pending_edit_highlights();
         self.reset_message_tracking();
         self.finalized_count = 0;
@@ -1909,7 +1433,7 @@ impl AppState {
         self.message_revisions.clear();
         self.tool_call_indices.clear();
         self.transcript_render_cache.clear();
-        self.applied_diff_highlights.clear();
+        self.clear_applied_edit_highlights();
         self.clear_pending_edit_highlights();
         self.finalized_count = 0;
         self.flushed_count = 0;
@@ -2040,9 +1564,7 @@ impl AppState {
             return false;
         }
         let old_revision = self.message_revisions[index];
-        if let Some(runtime) = self.edit_highlight_runtime.as_mut() {
-            runtime.cancel_pending_for_message(index, old_revision);
-        }
+        self.cancel_pending_edit_highlight_for_message(index, old_revision);
         self.remove_applied_highlight_for_message(index);
         // Rewriting any message but the tail can change its height and shift
         // every row below it. Tail rewrites (streaming deltas) leave earlier
@@ -2096,7 +1618,7 @@ impl AppState {
         self.flushed_count = retained_flushed;
         if retained_mask.iter().any(|retain| !retain) {
             for revision in removed_tool_revisions {
-                self.applied_diff_highlights.remove(&revision);
+                self.remove_applied_highlight_revision(revision);
             }
             self.clear_pending_edit_highlights();
             self.prune_applied_diff_highlights();
@@ -3611,17 +3133,17 @@ mod tests {
         let state = state();
 
         assert!(state.workspace_git.is_none());
-        assert!(state.workspace_root.is_none());
+        assert!(state.syntax_workspace_root_for_test().is_none());
         assert_eq!(
-            state.syntax_theme,
+            state.syntax_theme_for_test(),
             crate::syntax_highlight::SyntaxTheme::OneHalfDark
         );
         assert_eq!(
-            state.syntax_color_level,
+            state.syntax_color_level_for_test(),
             crate::terminal_capabilities::TerminalColorLevel::TrueColor
         );
-        assert!(state.edit_highlight_runtime.is_none());
-        assert!(state.applied_diff_highlights.is_empty());
+        assert!(!state.edit_highlight_runtime_started_for_test());
+        assert!(state.edit_highlights.applied().is_empty());
     }
 
     fn interaction_key(kind: TuiInteractionKind, id: &str) -> TuiInteractionKey {
@@ -7955,18 +7477,20 @@ arbitrary metadata
         );
         assert!(Arc::ptr_eq(
             state
-                .applied_diff_highlights
+                .edit_highlights
+                .applied()
                 .get(&state.message_revisions[job.message_index])
                 .map(|highlight| &highlight.styles)
                 .expect("applied styles"),
             &expected_styles
         ));
         assert_eq!(
-            state.applied_diff_highlights[&state.message_revisions[job.message_index]].tool_id,
+            state.edit_highlights.applied()[&state.message_revisions[job.message_index]].tool_id,
             job.tool_id
         );
         assert_eq!(
-            state.applied_diff_highlights[&state.message_revisions[job.message_index]].display_path,
+            state.edit_highlights.applied()[&state.message_revisions[job.message_index]]
+                .display_path,
             job.display_path
         );
         assert!(
@@ -7990,7 +7514,7 @@ arbitrary metadata
         {
             let messages = &state.messages;
             let revisions = &state.message_revisions;
-            let highlights = &state.applied_diff_highlights;
+            let highlights = state.edit_highlights.applied();
             let cache = &mut state.transcript_render_cache;
             cache.prepare(
                 messages,
@@ -8023,7 +7547,7 @@ arbitrary metadata
         {
             let messages = &state.messages;
             let revisions = &state.message_revisions;
-            let highlights = &state.applied_diff_highlights;
+            let highlights = state.edit_highlights.applied();
             let cache = &mut state.transcript_render_cache;
             cache.prepare(
                 messages,
@@ -8067,7 +7591,7 @@ arbitrary metadata
         {
             let messages = &state.messages;
             let revisions = &state.message_revisions;
-            let highlights = &state.applied_diff_highlights;
+            let highlights = state.edit_highlights.applied();
             let cache = &mut state.transcript_render_cache;
             cache.prepare(
                 messages,
@@ -8209,7 +7733,7 @@ class Item:
             Box::new(|_, job| job.absolute_path = PathBuf::from("/other/item.py")),
             Box::new(|_, job| job.display_path = "src/other.py".to_string()),
             Box::new(|state, _| {
-                state.syntax_theme = crate::syntax_highlight::SyntaxTheme::OneHalfLight;
+                state.set_syntax_theme_for_test(crate::syntax_highlight::SyntaxTheme::OneHalfLight);
             }),
             Box::new(|_, job| {
                 job.syntax_theme_revision = crate::terminal_capabilities::syntax_style_revision(
@@ -8251,16 +7775,18 @@ class Item:
     #[test]
     fn stale_edit_highlight_is_rejected_when_only_syntax_color_level_changes() {
         let (_directory, mut state, job) = state_with_submitted_edit_job();
-        let syntax_theme = state.syntax_theme;
-        state.syntax_color_level = crate::terminal_capabilities::TerminalColorLevel::Ansi256;
+        let syntax_theme = state.syntax_theme_for_test();
+        state.set_syntax_color_level_for_test(
+            crate::terminal_capabilities::TerminalColorLevel::Ansi256,
+        );
         let revisions_before = state.message_revisions.clone();
 
-        assert_eq!(state.syntax_theme, syntax_theme);
-        assert_ne!(state.syntax_color_level, job.syntax_color_level);
+        assert_eq!(state.syntax_theme_for_test(), syntax_theme);
+        assert_ne!(state.syntax_color_level_for_test(), job.syntax_color_level);
         assert_ne!(
             crate::terminal_capabilities::syntax_style_revision(
-                state.syntax_theme,
-                state.syntax_color_level,
+                state.syntax_theme_for_test(),
+                state.syntax_color_level_for_test(),
             ),
             job.syntax_theme_revision
         );
@@ -8303,7 +7829,7 @@ class Item:
         assert!(!state.apply_edit_highlight_result(ready_result(job.clone())));
         assert_eq!(state.pending_edit_highlight_count(), 0);
         assert_eq!(state.message_revisions, revisions);
-        assert!(state.applied_diff_highlights.is_empty());
+        assert!(state.edit_highlights.applied().is_empty());
     }
 
     #[test]
@@ -8629,7 +8155,7 @@ class Item:
         assert!(
             AppState::refined_diff_styles_for_message(
                 &state.message_revisions,
-                &state.applied_diff_highlights,
+                state.edit_highlights.applied(),
                 0,
                 &state.messages[0],
             )
@@ -8638,7 +8164,7 @@ class Item:
         assert!(
             AppState::refined_diff_styles_for_message(
                 &state.message_revisions,
-                &state.applied_diff_highlights,
+                state.edit_highlights.applied(),
                 1,
                 &state.messages[1],
             )
@@ -8648,7 +8174,7 @@ class Item:
         state.truncate_messages(1);
 
         assert!(state.refined_diff_styles(0, "duplicate").is_none());
-        assert!(state.applied_diff_highlights.is_empty());
+        assert!(state.edit_highlights.applied().is_empty());
     }
 
     #[test]
@@ -8670,7 +8196,7 @@ class Item:
         state.truncate_messages(1);
 
         assert!(state.refined_diff_styles(0, "edit-a").is_some());
-        assert_eq!(state.applied_diff_highlights.len(), 1);
+        assert_eq!(state.edit_highlights.applied().len(), 1);
     }
 
     #[test]
