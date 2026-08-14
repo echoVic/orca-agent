@@ -3,7 +3,7 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-14
+Last updated: 2026-08-15
 
 The 2026-08-10 headless resume slice makes "restore a headless execution" a
 first-class CLI capability, following Codex's `exec resume` design while keeping
@@ -99,6 +99,16 @@ fact source for the history vector, navigation cursor, and saved draft; only the
 local I/O and state-transition policy move out of `types.rs`. Key routing,
 history JSONL, CLI, server/JSONL, and session persistence behavior remain
 unchanged.
+
+The next TUI convergence slice gives queued follow-up facts one private
+`QueuedSubmissionState` owner in `queued_input.rs`. The pending FIFO, in-flight
+admission fence, autosend flag, last error, and next id now change only through
+owner transitions; channel dispatch remains in `queued_input_actions.rs`, while
+`AppState` still coordinates global status, transcript projection, input-history
+recording, and typed `UserAction` construction. The UI reads a bounded owned
+preview rather than the queue. Queue state remains intentionally process-local,
+so restart begins empty and makes no durability or exactly-once claim. TUI key
+flows, runtime events, CLI, server/JSONL, and persisted formats are unchanged.
 
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the

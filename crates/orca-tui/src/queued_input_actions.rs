@@ -39,7 +39,7 @@ pub(crate) fn enqueue_composer_follow_up(
     };
 
     if state.enqueue_user_message(message).is_err() {
-        state.queued_input_error = Some("queued follow-up limit reached".to_string());
+        state.report_queued_input_error("queued follow-up limit reached".to_string());
         return false;
     }
 
@@ -89,7 +89,7 @@ pub(crate) fn dispatch_next_queued_user_message(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> QueuedDispatch {
-    if state.queued_submission_in_flight.is_some() {
+    if state.queued_submission_in_flight() {
         return QueuedDispatch::Blocked;
     }
     let Some(action) = state.begin_next_queued_message() else {
@@ -102,13 +102,11 @@ pub(crate) fn dispatch_next_queued_user_message(
             QueuedDispatch::Started
         }
         Err(mpsc::TrySendError::Full(_)) => {
-            state.rollback_queued_submission();
-            state.queued_input_error = Some("follow-up action queue is full".to_string());
+            state.fail_queued_submission_dispatch("follow-up action queue is full".to_string());
             QueuedDispatch::Failed
         }
         Err(mpsc::TrySendError::Disconnected(_)) => {
-            state.rollback_queued_submission();
-            state.queued_input_error = Some("follow-up action channel is closed".to_string());
+            state.fail_queued_submission_dispatch("follow-up action channel is closed".to_string());
             QueuedDispatch::Failed
         }
     }
@@ -257,7 +255,7 @@ mod tests {
             &mut vim,
             &theme,
         ));
-        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_pending_visible_text().len(), 1);
         assert_eq!(textarea_text(&textarea), "");
         assert_eq!(state.status, AppStatus::Running);
         assert!(state.pending_pastes.is_empty());
@@ -289,7 +287,7 @@ mod tests {
             &theme,
         ));
         assert_eq!(textarea_text(&textarea), "keep me");
-        assert!(state.queued_input_error.is_some());
+        assert!(state.queued_input_error().is_some());
         assert!(
             !state
                 .messages
@@ -314,12 +312,12 @@ mod tests {
             &theme,
         ));
         assert_eq!(textarea_text(&textarea), "latest");
-        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_pending_visible_text().len(), 1);
         assert_eq!(
-            state.queued_user_messages.front().unwrap().visible_text(),
-            "first"
+            state.queued_pending_visible_text().first().copied(),
+            Some("first")
         );
-        assert!(state.queued_input_error.is_none());
+        assert!(state.queued_input_error().is_none());
     }
 
     #[test]
@@ -338,9 +336,8 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == "first"
         ));
-        assert_eq!(state.queued_user_messages.len(), 1);
-        assert_eq!(state.queued_user_messages[0].visible_text(), "second");
-        assert!(state.queued_submission_in_flight.is_some());
+        assert_eq!(state.queued_pending_visible_text(), vec!["second"]);
+        assert!(state.queued_submission_in_flight());
         assert_eq!(
             state.input_history.last().map(String::as_str),
             Some("first")
@@ -349,7 +346,10 @@ mod tests {
 
     #[test]
     fn full_and_disconnected_action_channels_restore_queue_front() {
-        for disconnected in [false, true] {
+        for (disconnected, expected_error) in [
+            (false, "follow-up action queue is full"),
+            (true, "follow-up action channel is closed"),
+        ] {
             let (action_tx, action_rx) = mpsc::bounded(1);
             if disconnected {
                 drop(action_rx);
@@ -371,9 +371,8 @@ mod tests {
                 "disconnected={disconnected}"
             );
             assert_eq!(state.status, AppStatus::Idle);
-            assert_eq!(state.queued_user_messages.len(), 1);
-            assert_eq!(state.queued_user_messages[0].visible_text(), "first");
-            assert!(state.queued_submission_in_flight.is_none());
+            assert_eq!(state.queued_pending_visible_text(), vec!["first"]);
+            assert!(!state.queued_submission_in_flight());
             assert!(
                 !state
                     .messages
@@ -381,7 +380,8 @@ mod tests {
                     .any(|message| matches!(message, ChatMessage::User(text) if text == "first"))
             );
             assert!(!state.input_history.iter().any(|entry| entry == "first"));
-            assert!(state.queued_input_error.is_some());
+            assert_eq!(state.queued_input_error(), Some(expected_error));
+            assert!(state.queued_autosend_enabled());
         }
     }
 
@@ -408,7 +408,7 @@ mod tests {
             &mut vim,
             &theme,
         ));
-        assert!(state.queued_user_messages.is_empty());
+        assert!(state.queued_pending_visible_text().is_empty());
         assert_eq!(textarea_text(&textarea), "hidden draft");
         assert!(action_rx.try_recv().is_err());
     }
@@ -436,7 +436,7 @@ mod tests {
             &theme,
         ));
         assert_eq!(state.panel_mode, PanelMode::Workflows);
-        assert!(state.queued_user_messages.is_empty());
+        assert!(state.queued_pending_visible_text().is_empty());
         assert_eq!(textarea_text(&textarea), "");
         assert!(action_rx.try_recv().is_err());
     }
@@ -463,7 +463,7 @@ mod tests {
             &mut vim,
             &theme,
         ));
-        assert!(state.queued_user_messages.is_empty());
+        assert!(state.queued_pending_visible_text().is_empty());
         assert!(matches!(
             state.messages.last(),
             Some(ChatMessage::Error(message)) if message.contains("unknown slash command")
@@ -500,7 +500,7 @@ mod tests {
         }
 
         assert_eq!(textarea_text(&textarea), "draft");
-        assert!(state.queued_user_messages.is_empty());
+        assert!(state.queued_pending_visible_text().is_empty());
         assert!(action_rx.try_recv().is_err());
     }
 }

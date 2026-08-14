@@ -103,7 +103,7 @@ mod tests {
 
         assert!(state.plan_approval_dialog.is_none());
         assert_eq!(state.status, crate::types::AppStatus::Running);
-        assert!(state.queued_follow_up_autosend);
+        assert!(state.queued_autosend_enabled());
         assert!(matches!(
             rx.try_recv(),
             Ok(UserAction::ImplementApprovedPlan {

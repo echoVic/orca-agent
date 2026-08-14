@@ -139,7 +139,7 @@ mod tests {
             &shared,
             &action_tx,
         ));
-        assert!(state.queued_follow_up_autosend);
+        assert!(state.queued_autosend_enabled());
         assert!(matches!(
             action_rx.try_recv(),
             Ok(UserAction::SubmitWithMentions { prompt, .. })

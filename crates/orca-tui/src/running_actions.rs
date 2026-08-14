@@ -76,7 +76,7 @@ mod tests {
 
         handle_running_shortcut(RunningShortcut::Interrupt, &mut state, &action_tx);
 
-        assert!(!state.queued_follow_up_autosend);
+        assert!(!state.queued_autosend_enabled());
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -101,6 +101,6 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::SubmitQueued { prompt, .. }) if prompt == "follow up"
         ));
-        assert!(state.queued_submission_in_flight.is_some());
+        assert!(state.queued_submission_in_flight());
     }
 }

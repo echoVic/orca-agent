@@ -281,7 +281,7 @@ mod tests {
         );
 
         assert!(action_rx.try_recv().is_err());
-        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_pending_visible_text().len(), 1);
         assert_eq!(state.pending_workflow_notifications.len(), 1);
     }
 
@@ -323,7 +323,7 @@ mod tests {
         );
 
         assert!(action_rx.try_recv().is_err());
-        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_pending_visible_text().len(), 1);
         assert_eq!(state.pending_workflow_notifications.len(), 1);
     }
 
@@ -404,8 +404,7 @@ mod tests {
         );
 
         assert!(action_rx.try_recv().is_err());
-        assert_eq!(state.queued_user_messages.len(), 1);
-        assert_eq!(state.queued_user_messages[0].visible_text(), "second");
+        assert_eq!(state.queued_pending_visible_text(), vec!["second"]);
     }
 
     #[test]
@@ -458,7 +457,7 @@ mod tests {
 
         handle_runtime_event(
             TuiEvent::SubmissionRejected {
-                queued_id: Some(state.queued_submission_in_flight.as_ref().unwrap().id()),
+                queued_id: state.queued_in_flight_id(),
                 prompt,
                 message: "rejected".to_string(),
             },
@@ -474,7 +473,7 @@ mod tests {
         assert_eq!(textarea_text(&textarea), visible);
         assert_eq!(state.pending_pastes[0].1, pasted);
         assert_eq!(state.mention_bindings.bindings().len(), 1);
-        assert!(state.queued_submission_in_flight.is_none());
+        assert!(!state.queued_submission_in_flight());
         assert!(
             !state
                 .messages
@@ -523,7 +522,7 @@ mod tests {
             &mut presentation,
         );
 
-        assert!(state.queued_submission_in_flight.is_some());
+        assert!(state.queued_submission_in_flight());
         assert_eq!(textarea_text(&textarea), "other prompt");
     }
 

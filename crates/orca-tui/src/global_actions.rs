@@ -96,7 +96,7 @@ mod tests {
             .expect("cancel compaction");
 
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
-        assert!(!state.queued_follow_up_autosend);
+        assert!(!state.queued_autosend_enabled());
     }
 
     #[test]

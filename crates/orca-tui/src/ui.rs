@@ -283,17 +283,16 @@ fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line
     {
         return Vec::new();
     }
-    let Some(snapshot) =
-        crate::queued_input::QueuedPreviewSnapshot::from_queue(&state.queued_user_messages)
-    else {
+    let Some(view) = state.queued_submission_view() else {
         return Vec::new();
     };
+    let snapshot = view.preview;
     let width = width as usize;
-    let header = state.queued_input_error.as_ref().map_or_else(
+    let header = view.error.as_ref().map_or_else(
         || format!(" Queued {} · Alt+Up edit latest", snapshot.len),
         |error| format!(" Queue error · {error}"),
     );
-    let header_color = if state.queued_input_error.is_some() {
+    let header_color = if view.error.is_some() {
         theme.error
     } else {
         theme.muted
@@ -4768,6 +4767,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn queued_preview_projects_exact_error_header_and_style() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut state = test_state();
+        state.enqueue_user_message(queued("first")).unwrap();
+        state.report_queued_input_error("follow-up action queue is full".to_string());
+
+        let lines = queued_preview_lines(&state, 80, &theme);
+
+        assert_eq!(
+            lines[0].to_string(),
+            " Queue error · follow-up action queue is full"
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.error));
     }
 
     #[test]

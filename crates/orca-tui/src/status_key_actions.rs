@@ -363,8 +363,7 @@ mod tests {
             &mut vim,
             &theme,
         );
-        assert_eq!(state.queued_user_messages.len(), 1);
-        assert_eq!(state.queued_user_messages[0].visible_text(), "x\n/compact");
+        assert_eq!(state.queued_pending_visible_text(), vec!["x\n/compact"]);
         assert!(textarea.is_empty());
         assert_eq!(state.status, AppStatus::Running);
         assert!(action_rx.try_recv().is_err());
@@ -426,7 +425,7 @@ mod tests {
             &mut vim,
             &theme,
         );
-        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_pending_visible_text().len(), 1);
         assert_eq!(vim.mode, crate::vim::VimMode::Normal);
         assert!(textarea.is_empty());
         assert!(action_rx.try_recv().is_err());
@@ -472,7 +471,7 @@ mod tests {
             "@item.rs "
         );
         assert_eq!(state.mention_bindings.bindings().len(), 1);
-        assert!(state.queued_user_messages.is_empty());
+        assert!(state.queued_pending_visible_text().is_empty());
 
         press_status_key(
             KeyCode::Enter,
@@ -485,14 +484,8 @@ mod tests {
             &mut vim,
             &theme,
         );
-        assert_eq!(state.queued_user_messages.len(), 1);
-        assert_eq!(
-            state.queued_user_messages[0]
-                .submission_bindings()
-                .bindings()
-                .len(),
-            1
-        );
+        assert_eq!(state.queued_pending_visible_text().len(), 1);
+        assert_eq!(state.queued_pending_submission_binding_count(0), Some(1));
         assert!(action_rx.try_recv().is_err());
     }
 
@@ -532,7 +525,7 @@ mod tests {
             &theme,
         );
         assert_eq!(crate::composer_textarea::textarea_text(&textarea), "queued");
-        assert!(state.queued_user_messages.is_empty());
+        assert!(state.queued_pending_visible_text().is_empty());
 
         state.enqueue_user_message(queued()).unwrap();
         state.set_status(AppStatus::WaitingUserInput);
@@ -547,7 +540,7 @@ mod tests {
             &mut vim,
             &theme,
         );
-        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_pending_visible_text().len(), 1);
         assert_eq!(crate::composer_textarea::textarea_text(&textarea), "queued");
     }
 

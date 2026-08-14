@@ -6726,7 +6726,7 @@ done
             || Ok(()),
         )
         .unwrap();
-        assert_eq!(state.queued_user_messages.len(), 1);
+        assert_eq!(state.queued_pending_visible_text().len(), 1);
         assert!(action_rx.try_recv().is_err());
         assert!(
             !state
@@ -6758,7 +6758,7 @@ done
             || Ok(()),
         )
         .unwrap();
-        assert!(state.queued_user_messages.is_empty());
+        assert!(state.queued_pending_visible_text().is_empty());
         assert_eq!(textarea_text(&textarea), "foo");
 
         textarea.insert_char('!');
@@ -6808,7 +6808,7 @@ done
             state.messages.last(),
             Some(ChatMessage::User(text)) if text == "foo!"
         ));
-        assert!(state.queued_user_messages.is_empty());
+        assert!(state.queued_pending_visible_text().is_empty());
         terminal
             .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
             .unwrap();
@@ -6900,12 +6900,12 @@ done
                     )
                 });
                 if expected_count == 2 {
-                    assert_eq!(state.queued_user_messages.len(), 1);
+                    assert_eq!(state.queued_pending_visible_text().len(), 1);
                     state.set_status(AppStatus::Running);
                 }
             }
 
-            assert!(state.queued_user_messages.is_empty());
+            assert!(state.queued_pending_visible_text().is_empty());
             harness.shutdown();
         });
     }
@@ -7110,7 +7110,20 @@ done
             .unwrap();
 
             let (mut state, _rx) = test_state();
-            state.status = AppStatus::Idle;
+            state
+                .enqueue_user_message(
+                    crate::queued_input::QueuedUserMessage::from_composer(
+                        "in flight".to_string(),
+                        Vec::new(),
+                        orca_runtime::mentions::MentionBindings::default(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            state.set_status(AppStatus::Idle);
+            state
+                .begin_next_queued_message()
+                .expect("seed in-flight queued submission");
             state
                 .enqueue_user_message(
                     crate::queued_input::QueuedUserMessage::from_composer(
@@ -7121,16 +7134,9 @@ done
                     .unwrap(),
                 )
                 .unwrap();
-            state.queued_submission_in_flight = Some(
-                crate::queued_input::QueuedUserMessage::from_composer(
-                    "in flight".to_string(),
-                    Vec::new(),
-                    orca_runtime::mentions::MentionBindings::default(),
-                )
-                .unwrap(),
-            );
-            state.queued_input_error = Some("error".to_string());
+            state.report_queued_input_error("error".to_string());
             state.suspend_queued_follow_up_autosend();
+            state.set_status(AppStatus::Idle);
             state.slash_menu = Some(SlashMenu {
                 items: commands::all_commands()
                     .iter()
@@ -7175,10 +7181,10 @@ done
             assert_eq!(state.status, AppStatus::SessionPicker);
             assert!(!state.session_picker_sessions.is_empty());
             assert!(state.slash_menu.is_none());
-            assert!(state.queued_user_messages.is_empty());
-            assert!(state.queued_submission_in_flight.is_none());
-            assert!(state.queued_input_error.is_none());
-            assert!(state.queued_follow_up_autosend);
+            assert!(state.queued_pending_visible_text().is_empty());
+            assert!(!state.queued_submission_in_flight());
+            assert!(state.queued_input_error().is_none());
+            assert!(state.queued_autosend_enabled());
         });
     }
 

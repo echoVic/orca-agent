@@ -25,7 +25,7 @@ use crate::edit_highlight_worker::{
     EditHighlightJob, EditHighlightOutcome, EditHighlightResult, EditHighlightRuntime,
 };
 use crate::input_history::load_input_history;
-use crate::queued_input::{QueuedComposerState, QueuedUserMessage};
+use crate::queued_input::QueuedSubmissionState;
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
 use crate::terminal_capabilities::{TerminalColorLevel, syntax_style_revision};
@@ -973,11 +973,7 @@ pub struct AppState {
     pub show_shortcuts: bool,
     pub input_history: Vec<String>,
     pub(crate) pending_pastes: Vec<(String, String)>,
-    pub(crate) queued_user_messages: VecDeque<QueuedUserMessage>,
-    pub(crate) queued_submission_in_flight: Option<QueuedUserMessage>,
-    pub(crate) queued_follow_up_autosend: bool,
-    pub(crate) queued_input_error: Option<String>,
-    next_queued_submission_id: u64,
+    pub(crate) queued_submission: QueuedSubmissionState,
     pub history_cursor: Option<usize>,
     pub draft_before_history: Option<String>,
     pub last_ctrl_c: Option<Instant>,
@@ -1155,11 +1151,7 @@ impl AppState {
             show_shortcuts: false,
             input_history: load_input_history(),
             pending_pastes: Vec::new(),
-            queued_user_messages: VecDeque::new(),
-            queued_submission_in_flight: None,
-            queued_follow_up_autosend: true,
-            queued_input_error: None,
-            next_queued_submission_id: 1,
+            queued_submission: QueuedSubmissionState::default(),
             history_cursor: None,
             draft_before_history: None,
             last_ctrl_c: None,
@@ -2214,100 +2206,6 @@ impl AppState {
 }
 
 impl AppState {
-    pub(crate) fn enqueue_user_message(
-        &mut self,
-        mut message: QueuedUserMessage,
-    ) -> Result<(), QueuedUserMessage> {
-        if self.queued_user_messages.len() >= crate::channels::USER_ACTION_CAPACITY {
-            return Err(message);
-        }
-        message.assign_id(self.next_queued_submission_id);
-        self.next_queued_submission_id = self.next_queued_submission_id.wrapping_add(1).max(1);
-        self.queued_user_messages.push_back(message);
-        self.queued_input_error = None;
-        Ok(())
-    }
-
-    pub(crate) fn pop_latest_queued_message(&mut self) -> Option<QueuedUserMessage> {
-        let message = self.queued_user_messages.pop_back();
-        if message.is_some() {
-            self.queued_input_error = None;
-        }
-        message
-    }
-
-    pub(crate) fn begin_next_queued_message(&mut self) -> Option<UserAction> {
-        if self.status != AppStatus::Idle
-            || !self.queued_follow_up_autosend
-            || self.queued_submission_in_flight.is_some()
-        {
-            return None;
-        }
-        let message = self.queued_user_messages.pop_front()?;
-        self.push_message(ChatMessage::User(message.visible_text().to_string()));
-        self.enter_running();
-        self.scroll_to_bottom();
-        self.queued_submission_in_flight = Some(message.clone());
-        self.queued_input_error = None;
-        Some(UserAction::SubmitQueued {
-            id: message.id(),
-            prompt: message.submission_text().to_string(),
-            bindings: message.submission_bindings().clone(),
-        })
-    }
-
-    pub(crate) fn commit_queued_submission_admission(&mut self) {
-        let Some(prompt) = self
-            .queued_submission_in_flight
-            .as_ref()
-            .map(|message| message.submission_text().to_string())
-        else {
-            return;
-        };
-        self.record_prompt(prompt);
-    }
-
-    pub(crate) fn rollback_queued_submission(&mut self) -> Option<QueuedUserMessage> {
-        let message = self.queued_submission_in_flight.take()?;
-        self.remove_after_last_user();
-        self.queued_user_messages.push_front(message.clone());
-        self.set_status(AppStatus::Idle);
-        Some(message)
-    }
-
-    pub(crate) fn take_rejected_queued_composer_state(&mut self) -> Option<QueuedComposerState> {
-        let message = self.queued_submission_in_flight.take()?;
-        self.suspend_queued_follow_up_autosend();
-        self.queued_input_error = None;
-        Some(message.into_composer_state())
-    }
-
-    pub(crate) fn suspend_queued_follow_up_autosend(&mut self) {
-        self.queued_follow_up_autosend = false;
-    }
-
-    pub(crate) fn resume_queued_follow_up_autosend(&mut self) {
-        self.queued_follow_up_autosend = true;
-    }
-
-    pub(crate) fn queued_follow_up_pending_or_in_flight(&self) -> bool {
-        !self.queued_user_messages.is_empty() || self.queued_submission_in_flight.is_some()
-    }
-
-    pub(crate) fn queued_submission_matches_id(&self, id: u64) -> bool {
-        self.queued_submission_in_flight
-            .as_ref()
-            .is_some_and(|message| message.id() == id)
-    }
-
-    pub(crate) fn reset_queued_user_messages(&mut self) {
-        self.queued_user_messages.clear();
-        self.queued_submission_in_flight = None;
-        self.queued_follow_up_autosend = true;
-        self.queued_input_error = None;
-        self.next_queued_submission_id = 1;
-    }
-
     pub fn nth_final_assistant_response(&self, position: usize) -> Option<&str> {
         if position == 0 {
             return None;
@@ -2448,9 +2346,7 @@ impl AppState {
                 self.enter_running();
             }
             TuiEvent::QueuedSubmissionStarted { id } => {
-                if self.queued_submission_matches_id(id) {
-                    self.queued_submission_in_flight = None;
-                }
+                self.settle_queued_submission_started(id);
                 self.enter_running();
             }
             TuiEvent::BackgroundTaskOutputAttached { .. } => {
@@ -3496,131 +3392,17 @@ mod tests {
     }
 
     #[test]
-    fn queued_follow_ups_promote_fifo_restore_lifo_and_fence_admission() {
-        let mut state = state();
-        state.enqueue_user_message(queued("first")).unwrap();
-        state.enqueue_user_message(queued("second")).unwrap();
-        state.enqueue_user_message(queued("third")).unwrap();
-        state.set_status(AppStatus::Idle);
-
-        let action = state.begin_next_queued_message().expect("first action");
-        assert!(matches!(
-            action,
-            UserAction::SubmitQueued { prompt, .. } if prompt == "first"
-        ));
-        assert_eq!(state.queued_user_messages.len(), 2);
-        assert!(state.queued_submission_in_flight.is_some());
-        assert!(state.begin_next_queued_message().is_none());
-        assert!(matches!(
-            state.messages.last(),
-            Some(ChatMessage::User(text)) if text == "first"
-        ));
-        assert!(!state.input_history.iter().any(|entry| entry == "first"));
-        state.commit_queued_submission_admission();
-        assert_eq!(
-            state.input_history.last().map(String::as_str),
-            Some("first")
-        );
-
-        state.update(TuiEvent::TurnStarted {
-            turn: 1,
-            task: None,
-        });
-        assert!(state.queued_submission_in_flight.is_some());
-        let id = state.queued_submission_in_flight.as_ref().unwrap().id();
-        state.update(TuiEvent::QueuedSubmissionStarted { id });
-        assert!(state.queued_submission_in_flight.is_none());
-        assert_eq!(
-            state.pop_latest_queued_message().unwrap().visible_text(),
-            "third"
-        );
-        assert_eq!(
-            state.queued_user_messages.front().unwrap().visible_text(),
-            "second"
-        );
-    }
-
-    #[test]
-    fn queued_follow_up_capacity_matches_user_action_mailbox() {
-        let mut state = state();
-        for index in 0..crate::channels::USER_ACTION_CAPACITY {
-            state
-                .enqueue_user_message(queued(&format!("queued {index}")))
-                .unwrap();
-        }
-        let rejected = state
-            .enqueue_user_message(queued("overflow"))
-            .expect_err("65th item rejected");
-        assert_eq!(rejected.visible_text(), "overflow");
-        assert_eq!(
-            state.queued_user_messages.len(),
-            crate::channels::USER_ACTION_CAPACITY
-        );
-    }
-
-    #[test]
-    fn queued_submission_rollback_and_rejection_preserve_distinct_paths() {
-        let mut state = state();
-        state.enqueue_user_message(queued("first")).unwrap();
-        state.set_status(AppStatus::Idle);
-        state.begin_next_queued_message().unwrap();
-
-        let rolled_back = state.rollback_queued_submission().unwrap();
-        assert_eq!(rolled_back.visible_text(), "first");
-        assert_eq!(
-            state.queued_user_messages.front().unwrap().visible_text(),
-            "first"
-        );
-        assert!(
-            !state
-                .messages
-                .iter()
-                .any(|message| matches!(message, ChatMessage::User(text) if text == "first"))
-        );
-        assert!(!state.input_history.iter().any(|entry| entry == "first"));
-
-        state.begin_next_queued_message().unwrap();
-        state.update(TuiEvent::SubmissionRejected {
-            queued_id: Some(state.queued_submission_in_flight.as_ref().unwrap().id()),
-            prompt: "first".to_string(),
-            message: "rejected".to_string(),
-        });
-        let restored = state.take_rejected_queued_composer_state().unwrap();
-        assert_eq!(restored.visible_text, "first");
-        assert!(state.queued_submission_in_flight.is_none());
-        assert!(!state.queued_follow_up_autosend);
-        assert!(state.queued_user_messages.is_empty());
-    }
-
-    #[test]
-    fn unrelated_turn_start_and_rejection_do_not_consume_queued_admission_fence() {
-        let mut state = state();
-        state.enqueue_user_message(queued("queued prompt")).unwrap();
-        state.set_status(AppStatus::Idle);
-        state.begin_next_queued_message().unwrap();
-
-        state.update(TuiEvent::TurnStarted {
-            turn: 1,
-            task: None,
-        });
-        assert!(state.queued_submission_in_flight.is_some());
-
-        state.update(TuiEvent::SubmissionRejected {
-            queued_id: Some(u64::MAX),
-            prompt: "other prompt".to_string(),
-            message: "other rejection".to_string(),
-        });
-        assert!(state.queued_submission_in_flight.is_some());
-    }
-
-    #[test]
     fn conversation_replacement_resets_all_queued_follow_up_state() {
         for clear in [false, true] {
             let mut state = state();
+            state.enqueue_user_message(queued("in flight")).unwrap();
+            state.set_status(AppStatus::Idle);
+            state
+                .begin_next_queued_message()
+                .expect("seed in-flight queued submission");
             state.enqueue_user_message(queued("queued")).unwrap();
-            state.queued_submission_in_flight = Some(queued("in flight"));
             state.suspend_queued_follow_up_autosend();
-            state.queued_input_error = Some("full".to_string());
+            state.report_queued_input_error("full".to_string());
 
             if clear {
                 state.clear_messages();
@@ -3628,13 +3410,16 @@ mod tests {
                 state.replace_messages([ChatMessage::System("replacement".to_string())]);
             }
 
-            assert!(state.queued_user_messages.is_empty());
-            assert!(state.queued_submission_in_flight.is_none());
-            assert!(state.queued_follow_up_autosend);
-            assert!(state.queued_input_error.is_none());
-            assert!(state.queued_user_messages.is_empty());
-            assert!(state.queued_submission_in_flight.is_none());
+            assert!(state.queued_pending_visible_text().is_empty());
+            assert!(!state.queued_submission_in_flight());
+            assert!(state.queued_autosend_enabled());
+            assert!(state.queued_input_error().is_none());
             assert!(!state.queued_follow_up_pending_or_in_flight());
+
+            state.enqueue_user_message(queued("after reset")).unwrap();
+            state.set_status(AppStatus::Idle);
+            state.begin_next_queued_message().unwrap();
+            assert_eq!(state.queued_in_flight_id(), Some(1));
         }
     }
 
@@ -4779,7 +4564,7 @@ mod tests {
         assert!(dialog.plan.contains("# Plan"));
         assert_eq!(dialog.selected, 0);
         assert_eq!(state.status, AppStatus::Idle);
-        assert!(!state.queued_follow_up_autosend);
+        assert!(!state.queued_autosend_enabled());
 
         state.plan_approval_dialog = None;
         state.resume_queued_follow_up_autosend();

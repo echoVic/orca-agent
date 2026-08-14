@@ -165,7 +165,7 @@ mod running_paste_tests {
         assert!(state.begin_next_queued_message().is_some());
         state.commit_queued_submission_admission();
         assert_eq!(state.input_history.last().unwrap(), pasted.trim());
-        state.rollback_queued_submission();
+        state.fail_queued_submission_dispatch("follow-up action queue is full".to_string());
         state.set_status(crate::types::AppStatus::Running);
         assert!(restore_latest_queued_message(
             &mut state,
