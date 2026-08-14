@@ -28,7 +28,9 @@ use orca_runtime::surface::{
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::operation_controller::{SurfacePresentationCancellation, TuiSurfaceTaskControl};
-use crate::surface_projection::TuiSurfaceProjection;
+use crate::surface_projection::{
+    GoalProjectionPresentation, SurfaceProjectionState, TuiSurfaceProjection,
+};
 use crate::types::TuiEvent;
 
 #[derive(Debug)]
@@ -1053,7 +1055,7 @@ pub(crate) fn read_goal(
 pub(crate) fn edit_goal(
     thread: &RuntimeSurfaceThreadHandle,
     objective: String,
-) -> io::Result<Option<orca_core::goal_types::ThreadGoal>> {
+) -> io::Result<SurfaceProjectionState> {
     mutate_idle_goal(thread, |goal| {
         Ok(GoalMutationAction::Edit {
             fence: goal_fence(goal),
@@ -1064,18 +1066,19 @@ pub(crate) fn edit_goal(
     })
 }
 
-pub(crate) fn clear_goal(thread: &RuntimeSurfaceThreadHandle) -> io::Result<()> {
+pub(crate) fn clear_goal(
+    thread: &RuntimeSurfaceThreadHandle,
+) -> io::Result<SurfaceProjectionState> {
     mutate_idle_goal(thread, |goal| {
         Ok(GoalMutationAction::Clear {
             fence: goal_fence(goal),
         })
     })
-    .map(|_| ())
 }
 
 pub(crate) fn pause_goal(
     thread: &RuntimeSurfaceThreadHandle,
-) -> io::Result<orca_core::goal_types::ThreadGoal> {
+) -> io::Result<SurfaceProjectionState> {
     let surface = thread.surface();
     let attachment = attach_goal(&surface, false)?;
     let snapshot = &attachment.baseline.snapshot;
@@ -1103,17 +1106,13 @@ pub(crate) fn pause_goal(
             )));
         }
     };
-    Ok(crate::surface_projection::thread_goal_from_surface(
-        &output.goal,
-        snapshot.thread.created_at,
-        snapshot.thread.updated_at,
-    ))
+    committed_goal_projection(thread, &output.goal_cursor)
 }
 
 fn mutate_idle_goal(
     thread: &RuntimeSurfaceThreadHandle,
     action: impl FnOnce(&SurfaceGoal) -> io::Result<GoalMutationAction>,
-) -> io::Result<Option<orca_core::goal_types::ThreadGoal>> {
+) -> io::Result<SurfaceProjectionState> {
     let surface = thread.surface();
     let attachment = attach_goal(&surface, false)?;
     let snapshot = &attachment.baseline.snapshot;
@@ -1128,13 +1127,39 @@ fn mutate_idle_goal(
     let output = committed_goal_output(
         result.map_err(|error| io::Error::other(format!("typed TUI Goal failed: {error:?}")))?,
     )?;
-    Ok(output.goal.as_ref().map(|goal| {
-        crate::surface_projection::thread_goal_from_surface(
-            goal,
-            snapshot.thread.created_at,
-            snapshot.thread.updated_at,
-        )
-    }))
+    committed_goal_projection(thread, &output.change_cursor)
+}
+
+fn committed_goal_projection(
+    thread: &RuntimeSurfaceThreadHandle,
+    change_cursor: &orca_runtime::surface::SurfaceCursor,
+) -> io::Result<SurfaceProjectionState> {
+    let snapshot = read_snapshot(thread).map_err(|error| {
+        io::Error::other(format!(
+            "Goal mutation committed but TUI projection failed: {error}"
+        ))
+    })?;
+    if !goal_projection_cursor_covers_commit(&snapshot.cursor, change_cursor) {
+        return Err(io::Error::other(
+            "Goal mutation committed but TUI projection failed: fresh snapshot did not include the committed cursor",
+        ));
+    }
+    let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
+    let presentation = if projection.current_goal.is_some() {
+        GoalProjectionPresentation::Updated
+    } else {
+        GoalProjectionPresentation::Cleared
+    };
+    Ok(projection.with_goal_presentation(presentation))
+}
+
+fn goal_projection_cursor_covers_commit(
+    snapshot_cursor: &orca_runtime::surface::SurfaceCursor,
+    committed_cursor: &orca_runtime::surface::SurfaceCursor,
+) -> bool {
+    snapshot_cursor.thread_id == committed_cursor.thread_id
+        && snapshot_cursor.incarnation == committed_cursor.incarnation
+        && snapshot_cursor.next_seq >= committed_cursor.next_seq
 }
 
 pub(crate) fn set_goal_and_run(
@@ -2574,12 +2599,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn goal_projection_cursor_requires_committed_identity_and_sequence() {
+        let committed = crate::surface_projection::test_surface_cursor(2);
+        let equal = committed.clone();
+        let newer = crate::surface_projection::test_surface_cursor(3);
+        let older = crate::surface_projection::test_surface_cursor(1);
+        assert!(goal_projection_cursor_covers_commit(&equal, &committed));
+        assert!(goal_projection_cursor_covers_commit(&newer, &committed));
+        assert!(!goal_projection_cursor_covers_commit(&older, &committed));
+
+        let mut different_thread = newer.clone();
+        let mut thread_bytes = [3; 16];
+        thread_bytes[6] = 0x73;
+        thread_bytes[8] = 0x83;
+        different_thread.thread_id =
+            orca_runtime::surface::SurfaceThreadId::try_from_bytes(thread_bytes)
+                .expect("different test thread id");
+        assert!(!goal_projection_cursor_covers_commit(
+            &different_thread,
+            &committed
+        ));
+
+        let mut different_incarnation = newer;
+        let mut incarnation_bytes = [4; 16];
+        incarnation_bytes[6] = 0x74;
+        incarnation_bytes[8] = 0x84;
+        different_incarnation.incarnation =
+            orca_runtime::surface::SurfaceIncarnation::try_from_bytes(incarnation_bytes)
+                .expect("different test surface incarnation");
+        assert!(!goal_projection_cursor_covers_commit(
+            &different_incarnation,
+            &committed
+        ));
+    }
+
+    #[test]
     fn background_presentation_shutdown_does_not_deadlock_on_a_full_tui_mailbox() {
         let controller = TuiSurfaceTaskControl::new();
         let monitor_controller = controller.clone();
         let (event_tx, _event_rx) = mpsc::bounded(1);
         event_tx
-            .send(TuiEvent::GoalCleared)
+            .send(TuiEvent::Notice("fill TUI mailbox".to_string()))
             .expect("fill TUI mailbox");
         let mut operation_bytes = [31; 16];
         operation_bytes[6] = 0x7f;
@@ -2599,7 +2659,7 @@ mod tests {
                         &event_tx,
                         &monitor_controller,
                         &cancellation,
-                        TuiEvent::GoalCleared,
+                        TuiEvent::Notice("blocked presentation".to_string()),
                     ));
                     monitor_exited.store(true, std::sync::atomic::Ordering::Release);
                 },

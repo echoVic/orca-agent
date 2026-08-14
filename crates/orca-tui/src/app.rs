@@ -2662,6 +2662,7 @@ done
                 tasks: vec![workflow_task("task-b", "workflow-b")],
             },
             TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(20),
                 session_id: "session-b".to_string(),
                 title: "title-b".to_string(),
                 usage_revision: 20,
@@ -2677,8 +2678,8 @@ done
                 workflow_tasks: vec![workflow_task("task-b", "workflow-b")],
                 current_goal: Some(goal_b.clone()),
                 foreground_operation_id: None,
+                goal_presentation: None,
             })),
-            TuiEvent::GoalUpdated(goal_b),
             TuiEvent::TurnStarted {
                 turn: 3,
                 task: None,
@@ -2693,7 +2694,7 @@ done
         let messages = format!("{:?}", state.messages);
         let tasks = state.workflow_panel.tasks.clone();
         let usage = state.usage().clone();
-        let goal = state.current_goal.clone();
+        let goal = state.current_goal().cloned();
         let identity = (
             state.current_session_id.clone(),
             state.current_session_title.clone(),
@@ -2725,6 +2726,7 @@ done
                 tasks: vec![workflow_task("task-a", "stale-workflow-a")],
             },
             TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(99),
                 session_id: "session-a".to_string(),
                 title: "stale-title-a".to_string(),
                 usage_revision: 99,
@@ -2740,8 +2742,8 @@ done
                 workflow_tasks: vec![workflow_task("task-a", "stale-workflow-a")],
                 current_goal: Some(goal_a.clone()),
                 foreground_operation_id: None,
+                goal_presentation: None,
             })),
-            TuiEvent::GoalUpdated(goal_a),
             TuiEvent::MessageDelta("stale-delta-a".to_string()),
             TuiEvent::SessionCompleted {
                 status: "failed".to_string(),
@@ -2753,7 +2755,7 @@ done
         assert_eq!(format!("{:?}", state.messages), messages);
         assert_eq!(state.workflow_panel.tasks, tasks);
         assert_eq!(state.usage(), &usage);
-        assert_eq!(state.current_goal, goal);
+        assert_eq!(state.current_goal(), goal.as_ref());
         assert_eq!(
             (
                 state.current_session_id.clone(),
@@ -4976,29 +4978,37 @@ done
             });
 
             action_tx.send(UserAction::GoalResume).unwrap();
-            let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let projection = loop {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection.current_goal.is_some() =>
+                    {
+                        break projection;
+                    }
+                    TuiEvent::Error(message) => {
+                        panic!("unexpected Goal resume error: {message}")
+                    }
+                    _ => {}
+                }
+            };
             action_tx.send(UserAction::Interrupt).unwrap();
             action_tx.send(UserAction::Cancel).unwrap();
             handle.join().unwrap();
 
-            let resumed_session_id = match event {
-                TuiEvent::GoalUpdated(goal) => {
-                    assert_eq!(goal.objective, "resume me");
-                    assert_eq!(goal.status, orca_core::goal_types::ThreadGoalStatus::Active);
-                    // Resume continues the same thread: the goal must stay on
-                    // the original session id; only fork mints a new one.
-                    assert_eq!(goal.session_id, old_session_id);
-                    assert_eq!(goal.token_budget, Some(80_000));
-                    assert_eq!(goal.tokens_used, 23_456);
-                    assert_eq!(goal.time_used_seconds, 13 * 60);
-                    assert!(
-                        goal.created_at > 0,
-                        "typed Goal presentation uses the owning thread timestamp"
-                    );
-                    goal.session_id
-                }
-                other => panic!("expected resumed goal update, got {other:?}"),
-            };
+            let goal = projection.current_goal.expect("resumed Goal projection");
+            assert_eq!(goal.objective, "resume me");
+            assert_eq!(goal.status, orca_core::goal_types::ThreadGoalStatus::Active);
+            // Resume continues the same thread: the goal must stay on
+            // the original session id; only fork mints a new one.
+            assert_eq!(goal.session_id, old_session_id);
+            assert_eq!(goal.token_budget, Some(80_000));
+            assert_eq!(goal.tokens_used, 23_456);
+            assert_eq!(goal.time_used_seconds, 13 * 60);
+            assert!(
+                goal.created_at > 0,
+                "typed Goal presentation uses the owning thread timestamp"
+            );
+            let resumed_session_id = goal.session_id;
             let store = orca_runtime::goal_store::GoalStore::load_default().unwrap();
             let persisted = store
                 .project_thread_goal(&resumed_session_id)
@@ -5059,10 +5069,12 @@ done
                         seen.push(format!("notice: {message}"));
                         stalled_notice = true;
                     }
-                    Ok(TuiEvent::GoalUpdated(goal))
-                        if goal.status == orca_core::goal_types::ThreadGoalStatus::Stalled =>
+                    Ok(TuiEvent::SurfaceProjectionSynced(projection))
+                        if projection.current_goal.as_ref().is_some_and(|goal| {
+                            goal.status == orca_core::goal_types::ThreadGoalStatus::Stalled
+                        }) =>
                     {
-                        seen.push(format!("goal: {goal:?}"));
+                        seen.push(format!("goal: {:?}", projection.current_goal));
                         stalled_status = true;
                     }
                     Ok(event) => seen.push(format!("{event:?}")),
@@ -5109,14 +5121,18 @@ done
             let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
 
             harness.send(UserAction::GoalResume);
-            let event = harness.recv_until(|event| matches!(event, TuiEvent::GoalUpdated(_)));
+            let event = harness.recv_until(|event| {
+                matches!(event, TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection.current_goal.is_some())
+            });
 
             match event {
-                TuiEvent::GoalUpdated(goal) => {
+                TuiEvent::SurfaceProjectionSynced(projection) => {
+                    let goal = projection.current_goal.expect("resumed Goal projection");
                     assert_eq!(goal.objective, "resume atomically");
                     assert_eq!(goal.status, orca_core::goal_types::ThreadGoalStatus::Active);
                 }
-                other => panic!("expected resumed goal update, got {other:?}"),
+                other => panic!("expected resumed Goal projection, got {other:?}"),
             }
             assert!(matches!(
                 &harness.config.lock().unwrap().history_mode,
@@ -5256,7 +5272,10 @@ done
             action_tx.send(UserAction::GoalPause).unwrap();
             let event = loop {
                 let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                if matches!(event, TuiEvent::GoalUpdated(_)) {
+                if matches!(&event, TuiEvent::SurfaceProjectionSynced(projection)
+                if projection.current_goal.as_ref().is_some_and(|goal| {
+                    goal.status == orca_core::goal_types::ThreadGoalStatus::Paused
+                })) {
                     break event;
                 }
                 if let TuiEvent::Error(message) = event {
@@ -5267,11 +5286,12 @@ done
             handle.join().unwrap();
 
             match event {
-                TuiEvent::GoalUpdated(goal) => {
+                TuiEvent::SurfaceProjectionSynced(projection) => {
+                    let goal = projection.current_goal.expect("paused Goal projection");
                     assert_eq!(goal.session_id, session_id);
                     assert_eq!(goal.status, orca_core::goal_types::ThreadGoalStatus::Paused);
                 }
-                other => panic!("expected paused goal update, got {other:?}"),
+                other => panic!("expected paused Goal projection, got {other:?}"),
             }
             let reloaded = orca_runtime::goal_store::GoalStore::load_default()
                 .unwrap()
@@ -5331,7 +5351,18 @@ done
                 .unwrap();
             loop {
                 match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                    TuiEvent::GoalUpdated(goal) if goal.objective == "edited objective" => break,
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection
+                            .current_goal
+                            .as_ref()
+                            .is_some_and(|goal| goal.objective == "edited objective")
+                            && projection.goal_presentation
+                                == Some(
+                                    crate::surface_projection::GoalProjectionPresentation::Updated,
+                                ) =>
+                    {
+                        break;
+                    }
                     TuiEvent::Error(message) => panic!("unexpected Goal edit error: {message}"),
                     _ => {}
                 }
@@ -5339,7 +5370,15 @@ done
             action_tx.send(UserAction::GoalClear).unwrap();
             loop {
                 match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                    TuiEvent::GoalCleared => break,
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection.current_goal.is_none()
+                            && projection.goal_presentation
+                                == Some(
+                                    crate::surface_projection::GoalProjectionPresentation::Cleared,
+                                ) =>
+                    {
+                        break;
+                    }
                     TuiEvent::Error(message) => panic!("unexpected Goal clear error: {message}"),
                     _ => {}
                 }
@@ -5379,16 +5418,73 @@ done
                     .event_rx
                     .recv_timeout(remaining)
                     .expect("active goal pause update");
-                if matches!(
-                    &event,
-                    TuiEvent::GoalUpdated(goal)
-                        if goal.status == orca_core::goal_types::ThreadGoalStatus::Paused
-                ) {
-                    break event;
+                match &event {
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection.current_goal.as_ref().is_some_and(|goal| {
+                            goal.status == orca_core::goal_types::ThreadGoalStatus::Paused
+                        }) && projection.goal_presentation
+                            == Some(
+                                crate::surface_projection::GoalProjectionPresentation::Updated,
+                            ) =>
+                    {
+                        break event;
+                    }
+                    TuiEvent::Error(message) => {
+                        panic!("unexpected active Goal pause error: {message}")
+                    }
+                    _ => {}
                 }
             };
 
-            assert!(matches!(paused, TuiEvent::GoalUpdated(_)));
+            assert!(matches!(paused, TuiEvent::SurfaceProjectionSynced(_)));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn typed_goal_projection_creation_and_removal_use_committed_snapshots() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::GoalSet("mock_stream_delay_ms 5000".to_string()));
+            let created = harness.recv_until(|event| {
+                matches!(event, TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection.current_goal.is_some()
+                        && projection.goal_presentation
+                            == Some(crate::surface_projection::GoalProjectionPresentation::Updated))
+            });
+            let TuiEvent::SurfaceProjectionSynced(created) = created else {
+                unreachable!("predicate accepted only a surface projection")
+            };
+            let created_cursor = created.cursor.clone();
+            assert_eq!(
+                created
+                    .current_goal
+                    .as_ref()
+                    .map(|goal| goal.objective.as_str()),
+                Some("mock_stream_delay_ms 5000")
+            );
+
+            harness.send(UserAction::GoalPause);
+            harness.recv_until(|event| {
+                matches!(event, TuiEvent::SurfaceProjectionSynced(projection)
+                if projection.current_goal.as_ref().is_some_and(|goal| {
+                    goal.status == orca_core::goal_types::ThreadGoalStatus::Paused
+                }))
+            });
+            harness.send(UserAction::GoalClear);
+            let removed = harness.recv_until(|event| {
+                matches!(event, TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection.current_goal.is_none()
+                        && projection.goal_presentation
+                            == Some(crate::surface_projection::GoalProjectionPresentation::Cleared))
+            });
+            let TuiEvent::SurfaceProjectionSynced(removed) = removed else {
+                unreachable!("predicate accepted only a surface projection")
+            };
+            assert_eq!(removed.cursor.thread_id, created_cursor.thread_id);
+            assert_eq!(removed.cursor.incarnation, created_cursor.incarnation);
+            assert!(removed.cursor.next_seq > created_cursor.next_seq);
+
             harness.shutdown();
         });
     }
@@ -8617,12 +8713,9 @@ fn hosted_tui_controller_loop(
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
                 match actions.edit_goal(&session_id, objective, now_timestamp()) {
-                    Ok(Some(goal)) => {
-                        let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
-                    }
-                    Ok(None) => {
+                    Ok(projection) => {
                         let _ =
-                            event_tx.send(TuiEvent::Error("no goal is currently set".to_string()));
+                            event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
                     }
                     Err(error) => {
                         let _ =
@@ -8662,8 +8755,9 @@ fn hosted_tui_controller_loop(
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
                 match actions.clear_goal(&session_id) {
-                    Ok(()) => {
-                        let _ = event_tx.send(TuiEvent::GoalCleared);
+                    Ok(projection) => {
+                        let _ =
+                            event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
                     }
                     Err(error) => {
                         let _ = event_tx
@@ -8703,8 +8797,9 @@ fn hosted_tui_controller_loop(
                 };
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
                 match actions.pause_goal() {
-                    Ok(goal) => {
-                        let _ = event_tx.send(TuiEvent::GoalUpdated(goal));
+                    Ok(projection) => {
+                        let _ =
+                            event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
                     }
                     Err(error) => {
                         let _ = event_tx
@@ -9539,7 +9634,6 @@ fn resume_latest_active_goal_hosted(
             control,
             event_tx,
             || {
-                let _ = event_tx.send(TuiEvent::GoalUpdated(active_goal.clone()));
                 let _ = event_tx.send(TuiEvent::Notice(
                     "Resumed latest active goal in a restored session.".to_string(),
                 ));

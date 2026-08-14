@@ -292,7 +292,7 @@ fn format_status(state: &AppState) -> String {
             )
         })
         .count();
-    let goal = state.current_goal.as_ref().map_or("-", |goal| {
+    let goal = state.current_goal().map_or("-", |goal| {
         orca_core::goal_types::goal_status_label(goal.status)
     });
     format!(
@@ -465,6 +465,7 @@ mod tests {
         let mut state = state();
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
                 session_id: "session-1".to_string(),
                 title: "Release triage".to_string(),
                 usage_revision: 1,
@@ -480,6 +481,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: None,
                 foreground_operation_id: None,
+                goal_presentation: None,
             },
         )));
         state.recoverable_operation_id = Some(

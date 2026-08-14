@@ -58,7 +58,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         .unwrap_or(0);
 
     let plan_height = plan_panel_height(state);
-    let goal_height: u16 = if state.current_goal.is_some() { 3 } else { 0 };
+    let goal_height: u16 = if state.current_goal().is_some() { 3 } else { 0 };
     // An activity indicator sits above the composer while the agent is working (or
     // waiting on the user), showing status + elapsed time. It takes two rows — a blank
     // spacer, then the text — so the transcript tail, the indicator, and the input box
@@ -334,7 +334,7 @@ fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         ThreadGoalStatus, format_goal_elapsed_seconds, format_tokens_compact, goal_status_label,
     };
 
-    let Some(goal) = &state.current_goal else {
+    let Some(goal) = state.current_goal() else {
         return;
     };
 
@@ -3166,8 +3166,7 @@ fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::st
                 .map(|started| started.elapsed().as_secs())
                 .unwrap_or_default();
             let persisted_goal_elapsed = state
-                .current_goal
-                .as_ref()
+                .current_goal()
                 .filter(|goal| goal.status.should_continue())
                 .map(|goal| goal.time_used_seconds.max(0) as u64)
                 .unwrap_or_default();
@@ -4621,6 +4620,7 @@ mod tests {
     ) {
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
                 session_id: state
                     .current_session_id
                     .clone()
@@ -4635,8 +4635,9 @@ mod tests {
                 context_used_tokens: used_tokens,
                 context_limit_tokens: limit_tokens,
                 workflow_tasks: state.workflow_panel.tasks.clone(),
-                current_goal: state.current_goal.clone(),
+                current_goal: state.current_goal().cloned(),
                 foreground_operation_id: None,
+                goal_presentation: None,
             },
         )));
     }
@@ -5728,7 +5729,7 @@ mod tests {
         let mut state = test_state();
         let mut goal = goal_with_elapsed(ThreadGoalStatus::Active, 13 * 60);
         goal.objective = "将当前项目重构为分层清晰的生产级 Agent SDK monorepo".repeat(8);
-        state.current_goal = Some(goal);
+        state.replace_current_goal_for_test(Some(goal));
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let width = 80u16;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 3))
@@ -6736,6 +6737,7 @@ mod tests {
     fn equal_revision_surface_sync_keeps_committed_context_in_footer() {
         let mut state = test_state();
         let snapshot = SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(1),
             session_id: "goal-session".to_string(),
             title: "Goal session".to_string(),
             usage_revision: 1,
@@ -6746,6 +6748,7 @@ mod tests {
             workflow_tasks: Vec::new(),
             current_goal: None,
             foreground_operation_id: None,
+            goal_presentation: None,
         };
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             snapshot.clone(),
@@ -7124,7 +7127,10 @@ mod tests {
         let mut state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         state.status = AppStatus::Running;
-        state.current_goal = Some(goal_with_elapsed(ThreadGoalStatus::Active, 13 * 60));
+        state.replace_current_goal_for_test(Some(goal_with_elapsed(
+            ThreadGoalStatus::Active,
+            13 * 60,
+        )));
         state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
 
         let (text, color) = activity_line(&state, &theme).expect("running shows an activity line");
@@ -7138,17 +7144,20 @@ mod tests {
         let mut state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         state.status = AppStatus::Running;
-        state.current_goal = Some(goal_with_elapsed(ThreadGoalStatus::Active, 13 * 60));
+        state.replace_current_goal_for_test(Some(goal_with_elapsed(
+            ThreadGoalStatus::Active,
+            13 * 60,
+        )));
         state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
         let first = activity_line(&state, &theme).unwrap().0;
 
         state.update(TuiEvent::SessionCompleted {
             status: "success".to_string(),
         });
-        state.update(TuiEvent::GoalStatus(Some(goal_with_elapsed(
+        state.replace_current_goal_for_test(Some(goal_with_elapsed(
             ThreadGoalStatus::Active,
             13 * 60 + 20,
-        ))));
+        )));
         state.update(TuiEvent::TurnStarted {
             turn: 2,
             task: None,
@@ -7172,7 +7181,7 @@ mod tests {
         ] {
             let mut state = test_state();
             state.status = AppStatus::Running;
-            state.current_goal = Some(goal_with_elapsed(status, 13 * 60));
+            state.replace_current_goal_for_test(Some(goal_with_elapsed(status, 13 * 60)));
             state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
 
             assert_eq!(activity_line(&state, &theme).unwrap().0, "● running 10s");
@@ -7184,7 +7193,7 @@ mod tests {
         let mut state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         state.status = AppStatus::Running;
-        state.current_goal = Some(goal_with_elapsed(ThreadGoalStatus::Active, -20));
+        state.replace_current_goal_for_test(Some(goal_with_elapsed(ThreadGoalStatus::Active, -20)));
         state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
 
         assert_eq!(activity_line(&state, &theme).unwrap().0, "● running 10s");

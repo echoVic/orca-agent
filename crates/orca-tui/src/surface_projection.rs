@@ -29,6 +29,7 @@ use crate::types::{AppState, TuiEvent, TuiTaskLifecycle};
 #[derive(Clone, Debug, PartialEq)]
 #[doc(hidden)]
 pub struct SurfaceProjectionState {
+    pub(crate) cursor: SurfaceCursor,
     pub(crate) session_id: String,
     pub(crate) title: String,
     pub(crate) usage_revision: u64,
@@ -39,6 +40,97 @@ pub struct SurfaceProjectionState {
     pub(crate) workflow_tasks: Vec<BackgroundTaskSummary>,
     pub(crate) current_goal: Option<ThreadGoal>,
     pub(crate) foreground_operation_id: Option<SurfaceOperationId>,
+    pub(crate) goal_presentation: Option<GoalProjectionPresentation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GoalProjectionPresentation {
+    Updated,
+    Cleared,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceGoalProjectionEffect {
+    Updated(ThreadGoal),
+    Cleared,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SurfaceGoalProjectionState {
+    current: Option<ThreadGoal>,
+    cursor: Option<SurfaceCursor>,
+    presented_cursor: Option<SurfaceCursor>,
+}
+
+impl SurfaceGoalProjectionState {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn current(&self) -> Option<&ThreadGoal> {
+        self.current.as_ref()
+    }
+
+    pub(crate) fn apply_projection(
+        &mut self,
+        projection: &SurfaceProjectionState,
+    ) -> Option<SurfaceGoalProjectionEffect> {
+        let accepts_projection = match self.cursor.as_ref() {
+            None => true,
+            Some(current)
+                if current.thread_id != projection.cursor.thread_id
+                    || current.incarnation != projection.cursor.incarnation =>
+            {
+                false
+            }
+            Some(current) if projection.cursor.next_seq < current.next_seq => false,
+            Some(current) if projection.cursor.next_seq == current.next_seq => {
+                self.current == projection.current_goal
+            }
+            Some(_) => true,
+        };
+        if !accepts_projection {
+            return None;
+        }
+
+        if self.cursor.as_ref() != Some(&projection.cursor) {
+            self.current = projection.current_goal.clone();
+            self.cursor = Some(projection.cursor.clone());
+        }
+
+        let presentation = projection.goal_presentation?;
+        if self.cursor.as_ref() != Some(&projection.cursor)
+            || self.presented_cursor.as_ref() == Some(&projection.cursor)
+        {
+            return None;
+        }
+        let effect = match (presentation, self.current.as_ref()) {
+            (GoalProjectionPresentation::Updated, Some(goal)) => {
+                SurfaceGoalProjectionEffect::Updated(goal.clone())
+            }
+            (GoalProjectionPresentation::Cleared, None) => SurfaceGoalProjectionEffect::Cleared,
+            _ => return None,
+        };
+        self.presented_cursor = Some(projection.cursor.clone());
+        Some(effect)
+    }
+
+    pub(crate) fn assert_matches_projection(&self, projection: &SurfaceProjectionState) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            debug_assert_eq!(self.cursor.as_ref(), Some(&projection.cursor));
+            debug_assert_eq!(self.current, projection.current_goal);
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = projection;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_for_test(&mut self, goal: Option<ThreadGoal>) {
+        self.current = goal;
+        self.cursor = None;
+        self.presented_cursor = None;
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -114,12 +206,43 @@ impl AppState {
     pub fn context_limit_tokens(&self) -> usize {
         self.surface_metrics.context_limit_tokens()
     }
+
+    /// Returns the latest Goal from an accepted runtime surface snapshot.
+    pub fn current_goal(&self) -> Option<&ThreadGoal> {
+        self.surface_goal.current()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_current_goal_for_test(&mut self, goal: Option<ThreadGoal>) {
+        self.surface_goal.replace_for_test(goal);
+    }
 }
 
 pub(crate) fn history_messages_from_surface_snapshot(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
 ) -> Vec<crate::types::ChatMessage> {
     history_messages_from_surface_items(&snapshot.items)
+}
+
+#[cfg(test)]
+pub(crate) fn test_surface_cursor(next_seq: u64) -> SurfaceCursor {
+    let mut thread_bytes = [1; 16];
+    thread_bytes[6] = 0x71;
+    thread_bytes[8] = 0x81;
+    let mut incarnation_bytes = [2; 16];
+    incarnation_bytes[6] = 0x72;
+    incarnation_bytes[8] = 0x82;
+    SurfaceCursor {
+        thread_id: orca_runtime::surface::SurfaceThreadId::try_from_bytes(thread_bytes)
+            .expect("test surface thread id"),
+        incarnation: orca_runtime::surface::SurfaceIncarnation::try_from_bytes(incarnation_bytes)
+            .expect("test surface incarnation"),
+        next_seq: orca_runtime::surface::SequenceNumber::new(next_seq),
+        source_revision: orca_runtime::surface::CursorSourceRevision::Recorded {
+            durable_revision: orca_runtime::surface::DurableRevision::try_new(next_seq.max(1))
+                .expect("test durable revision"),
+        },
+    }
 }
 
 fn history_messages_from_surface_items(items: &[SurfaceItem]) -> Vec<crate::types::ChatMessage> {
@@ -260,6 +383,7 @@ pub(crate) type TuiStreamDeliveryWatermark = BTreeMap<SurfaceStreamId, ByteOffse
 impl SurfaceProjectionState {
     pub(crate) fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
         Self {
+            cursor: snapshot.cursor.clone(),
             session_id: surface_thread_id_text(&snapshot.thread.thread_id),
             title: snapshot.thread.title.as_str().to_string(),
             usage_revision: snapshot.usage.revision.get(),
@@ -281,7 +405,16 @@ impl SurfaceProjectionState {
                 .foreground_operation
                 .as_ref()
                 .map(|operation| operation.operation_id.clone()),
+            goal_presentation: None,
         }
+    }
+
+    pub(crate) fn with_goal_presentation(
+        mut self,
+        presentation: GoalProjectionPresentation,
+    ) -> Self {
+        self.goal_presentation = Some(presentation);
+        self
     }
 }
 
@@ -294,8 +427,6 @@ pub(crate) struct TuiSurfaceProjection {
     focused_operation: Option<SurfaceOperationId>,
     pending_turn_started: Option<TuiTaskLifecycle>,
     goal: Option<SurfaceGoal>,
-    thread_created_at: UnixMillis,
-    thread_updated_at: UnixMillis,
     reducer_state: Option<SurfaceReducerState>,
 }
 
@@ -316,8 +447,6 @@ impl TuiSurfaceProjection {
             focused_operation: None,
             pending_turn_started: None,
             goal: None,
-            thread_created_at: UnixMillis::new(0),
-            thread_updated_at: UnixMillis::new(0),
             reducer_state: None,
         }
     }
@@ -367,8 +496,6 @@ impl TuiSurfaceProjection {
                 (operation.operation_id.clone(), turn_ids)
             })
             .collect();
-        projection.thread_created_at = snapshot.thread.created_at;
-        projection.thread_updated_at = snapshot.thread.updated_at;
         projection.reducer_state = Some(SurfaceReducerState::new(snapshot.clone()));
         projection
     }
@@ -802,7 +929,6 @@ impl TuiSurfaceProjection {
                         }
                         orca_runtime::surface::GoalPatch::Removed { .. } => {
                             goal = None;
-                            projected.push(TuiEvent::GoalCleared);
                             continue;
                         }
                         patch => {
@@ -820,7 +946,6 @@ impl TuiSurfaceProjection {
                                 }
                                 SurfaceGoalReceiptState::Removed { .. } => {
                                     goal = None;
-                                    projected.push(TuiEvent::GoalCleared);
                                     continue;
                                 }
                             }
@@ -859,11 +984,6 @@ impl TuiSurfaceProjection {
                                     .to_string(),
                             ));
                         }
-                        projected.push(TuiEvent::GoalUpdated(thread_goal_from_surface(
-                            current,
-                            self.thread_created_at,
-                            self.thread_updated_at,
-                        )));
                     }
                 }
                 _ => {}
@@ -900,6 +1020,11 @@ impl TuiSurfaceProjection {
         if self.reducer_state.is_none() {
             return Err(SurfaceProjectionError::MissingReducerSnapshot);
         }
+        let has_goal_patch = batch
+            .events
+            .as_slice()
+            .iter()
+            .any(|event| matches!(&event.event, SurfaceEvent::Goal(_)));
         let needs_projection_snapshot = batch.events.as_slice().iter().any(|event| {
             matches!(
                 &event.event,
@@ -917,13 +1042,21 @@ impl TuiSurfaceProjection {
         if !needs_projection_snapshot {
             return Ok(projected);
         }
-        let Some(state) = self
+        let Some(mut state) = self
             .reducer_state
             .as_ref()
             .map(|state| SurfaceProjectionState::from_surface_snapshot(state.snapshot()))
         else {
             return Err(SurfaceProjectionError::MissingReducerSnapshot);
         };
+        if has_goal_patch {
+            let presentation = if state.current_goal.is_some() {
+                GoalProjectionPresentation::Updated
+            } else {
+                GoalProjectionPresentation::Cleared
+            };
+            state = state.with_goal_presentation(presentation);
+        }
         projected.push(TuiEvent::SurfaceProjectionSynced(Box::new(state)));
         Ok(projected)
     }
@@ -1498,11 +1631,20 @@ fn response_matches_streamed_items<'a>(
 mod tests {
     use super::*;
     use orca_runtime::surface::{
-        ByteOffset, CommitClass, CursorSourceRevision, DisplayText, DurableRevision, NonEmptyVec,
-        SequenceNumber, Sha256Digest, SurfaceAssistantMessageItem, SurfaceAssistantReasoningItem,
-        SurfaceCommitId, SurfaceEventEnvelope, SurfaceEventId, SurfaceIncarnation,
-        SurfaceInputCorrelationId, SurfaceItemId, SurfaceScope, SurfaceThreadId, SurfaceTurnId,
-        ThreadOwnerEpoch, UuidV7,
+        ByteOffset, CanonicalPath, CommitClass, CompactionState, ContextRevision,
+        CursorSourceRevision, DisplayText, DurableRevision, GoalCatalogRevision, GoalOwnerEpoch,
+        GoalPatch, GoalPatchEnvelope, GoalRevision, GoalUsage, McpCatalogRevision, NonEmptyText,
+        NonEmptyVec, PinnedContextRevision, PlanRevision, PolicyEpoch, ProviderReplayHealth,
+        SequenceNumber, SessionHealthRevision, SessionMetadataRevision, SettingsRevision,
+        Sha256Digest, SurfaceApprovalMode, SurfaceAssistantMessageItem,
+        SurfaceAssistantReasoningItem, SurfaceCommitId, SurfaceContextSnapshot,
+        SurfaceEventEnvelope, SurfaceEventId, SurfaceGoalId, SurfaceGoalStoreReceipt,
+        SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceMcpCatalogSnapshot,
+        SurfaceNetworkPermissions, SurfacePermissionRuleSet, SurfacePinnedContextSnapshot,
+        SurfacePlanSnapshot, SurfaceReasoningEffort, SurfaceRuntimeSettings, SurfaceScope,
+        SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceThreadId,
+        SurfaceThreadSnapshot, SurfaceTurnId, ThreadOwnerEpoch, ThreadPersistence,
+        UsageTotals as SurfaceUsageTotals, UuidV7, canonical_batch_digest,
     };
     use orca_runtime::surface::{SurfaceGenerationId, SurfaceUsageSnapshot, UsageRevision};
 
@@ -1600,6 +1742,335 @@ mod tests {
             batch_digest: Sha256Digest::new([digest_seed; 32]),
             events: NonEmptyVec::try_new(events).unwrap(),
         }
+    }
+
+    fn goal_projection_snapshot() -> SurfaceSnapshot {
+        let path =
+            CanonicalPath::try_new(std::env::temp_dir().join("orca-tui-goal-projection-owner"))
+                .expect("canonical test path");
+        SurfaceSnapshot {
+            cursor: cursor(0, 1),
+            thread: SurfaceThreadSnapshot {
+                thread_id: SurfaceThreadId::try_from_bytes(uuid_v7_bytes(1)).unwrap(),
+                owner_epoch: ThreadOwnerEpoch::new(1),
+                persistence: ThreadPersistence::RecordedCatalogued,
+                title: DisplayText::new("Goal projection test"),
+                metadata_revision: SessionMetadataRevision::try_new(1).unwrap(),
+                created_at: UnixMillis::new(1),
+                updated_at: UnixMillis::new(1),
+                cwd: path.clone(),
+                workspace_roots: vec![path.clone()],
+                closed: false,
+            },
+            foreground_operation: None,
+            queued_operations: Vec::new(),
+            background_operations: Vec::new(),
+            operation_history: Vec::new(),
+            items: Vec::new(),
+            assistant_streams: Vec::new(),
+            tools: Vec::new(),
+            plan: SurfacePlanSnapshot {
+                revision: PlanRevision::try_new(1).unwrap(),
+                explanation: None,
+                items: Vec::new(),
+                causative_generation: None,
+            },
+            usage: SurfaceUsageSnapshot {
+                revision: UsageRevision::try_new(1).unwrap(),
+                thread_total: SurfaceUsageTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                    estimated_cost_usd_micros: 0,
+                },
+                active_operation: None,
+                goal: None,
+                workflow: Vec::new(),
+            },
+            context: SurfaceContextSnapshot {
+                revision: ContextRevision::try_new(1).unwrap(),
+                used_tokens: 0,
+                limit_tokens: 128_000,
+                compaction: CompactionState::Idle,
+                fragments: Vec::new(),
+                provider_replay: ProviderReplayHealth::None,
+            },
+            interactions: Vec::new(),
+            tasks: Vec::new(),
+            workflows: Vec::new(),
+            subagents: Vec::new(),
+            goal: None,
+            settings: SurfaceSettingsSnapshot {
+                host_revision: SettingsRevision::try_new(1).unwrap(),
+                thread_revision: SettingsRevision::try_new(1).unwrap(),
+                effective: SurfaceRuntimeSettings {
+                    model: NonEmptyText::try_new("deepseek-v4").unwrap(),
+                    reasoning_effort: SurfaceReasoningEffort::High,
+                    approval_mode: SurfaceApprovalMode::AutoEdit,
+                    cwd: path.clone(),
+                    workspace_roots: vec![path],
+                    active_permission_profile: None,
+                    permission_rules: SurfacePermissionRuleSet {
+                        ordered_rules: Vec::new(),
+                        digest: Sha256Digest::new([1; 32]),
+                    },
+                    additional_working_directories: Vec::new(),
+                    network_permissions: SurfaceNetworkPermissions {
+                        enabled: Some(true),
+                        domains: Vec::new(),
+                    },
+                    policy_epoch: PolicyEpoch::try_new(1).unwrap(),
+                },
+                pending: None,
+                frozen_generation_revision: None,
+            },
+            mcp_catalog: SurfaceMcpCatalogSnapshot {
+                revision: McpCatalogRevision::try_new(1).unwrap(),
+                servers: Vec::new(),
+                tools: Vec::new(),
+                resources: Vec::new(),
+                resource_templates: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            pinned_context: SurfacePinnedContextSnapshot {
+                revision: PinnedContextRevision::try_new(1).unwrap(),
+                entries: Vec::new(),
+            },
+            session_health: SurfaceSessionHealth {
+                revision: SessionHealthRevision::try_new(1).unwrap(),
+                accepting_admission: true,
+                issues: Vec::new(),
+                closing: false,
+                closed: false,
+            },
+        }
+    }
+
+    fn goal_projection_goal() -> SurfaceGoal {
+        SurfaceGoal {
+            goal_id: SurfaceGoalId::try_new("tui-goal-projection").unwrap(),
+            thread_id: SurfaceThreadId::try_from_bytes(uuid_v7_bytes(1)).unwrap(),
+            goal_revision: GoalRevision::try_new(1).unwrap(),
+            goal_owner_epoch: GoalOwnerEpoch::try_new(1).unwrap(),
+            catalog_revision: GoalCatalogRevision::try_new(1).unwrap(),
+            receipt_digest: Sha256Digest::new([2; 32]),
+            objective: NonEmptyText::try_new("project the committed Goal").unwrap(),
+            objective_revision: orca_runtime::surface::GoalObjectiveRevision::new(1),
+            state: SurfaceGoalState::Active,
+            token_budget: Some(10_000),
+            usage: GoalUsage {
+                charged_input_tokens: 0,
+                output_tokens: 0,
+                cache_tokens: 0,
+                verifier_tokens: 0,
+                cost_micros: 0,
+                elapsed_seconds: 0,
+            },
+            current_run: None,
+            last_transition: None,
+        }
+    }
+
+    fn goal_projection_batch(
+        projection: &TuiSurfaceProjection,
+        seed: u8,
+        receipt: SurfaceGoalStoreReceipt,
+        patch: GoalPatch,
+    ) -> SurfaceCommitBatch {
+        let before = projection.cursor().clone();
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(u64::from(seed)).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(seed)).unwrap(),
+        };
+        let event = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(seed.wrapping_add(1))).unwrap(),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Goal {
+                goal_id: receipt.goal_id.clone(),
+                causative_generation: None,
+            },
+            event: SurfaceEvent::Goal(GoalPatchEnvelope { receipt, patch }),
+        };
+        let mut batch = SurfaceCommitBatch {
+            cursor_before: before.clone(),
+            cursor_after: SurfaceCursor {
+                next_seq: SequenceNumber::new(before.next_seq.get() + 1),
+                source_revision: CursorSourceRevision::Recorded {
+                    durable_revision: DurableRevision::try_new(u64::from(seed)).unwrap(),
+                },
+                ..before
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: Sha256Digest::new([0; 32]),
+            events: NonEmptyVec::try_new(vec![event]).unwrap(),
+        };
+        batch.batch_digest = canonical_batch_digest(&batch);
+        batch
+    }
+
+    fn assert_single_goal_projection(
+        projection: &TuiSurfaceProjection,
+        batch: &SurfaceCommitBatch,
+        events: &[TuiEvent],
+        presentation: GoalProjectionPresentation,
+    ) {
+        let [TuiEvent::SurfaceProjectionSynced(state)] = events else {
+            panic!("Goal batch must end in exactly one projection: {events:?}");
+        };
+        let reducer_snapshot = projection
+            .reducer_state
+            .as_ref()
+            .expect("Goal projection reducer state")
+            .snapshot();
+        assert_eq!(state.cursor, batch.cursor_after);
+        assert_eq!(
+            state.current_goal,
+            SurfaceProjectionState::from_surface_snapshot(reducer_snapshot).current_goal
+        );
+        assert_eq!(state.goal_presentation, Some(presentation));
+    }
+
+    #[test]
+    fn typed_goal_projection_creation_update_and_removal_end_in_one_snapshot() {
+        let snapshot = goal_projection_snapshot();
+        let mut projection = TuiSurfaceProjection::from_surface_snapshot(&snapshot);
+        let goal = goal_projection_goal();
+        let created_receipt = SurfaceGoalStoreReceipt {
+            goal_id: goal.goal_id.clone(),
+            goal_revision: goal.goal_revision,
+            objective_revision: goal.objective_revision,
+            catalog_revision: goal.catalog_revision,
+            goal_owner_epoch: goal.goal_owner_epoch,
+            row_state: SurfaceGoalReceiptState::Present {
+                state: goal.state.clone(),
+                current_run: None,
+            },
+            store_commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(20)).unwrap(),
+            receipt_digest: Sha256Digest::new([20; 32]),
+        };
+        let created_batch = goal_projection_batch(
+            &projection,
+            21,
+            created_receipt,
+            GoalPatch::Created { goal: goal.clone() },
+        );
+        let created_events = projection
+            .project_typed_batch(&created_batch)
+            .expect("project Goal creation");
+        assert_single_goal_projection(
+            &projection,
+            &created_batch,
+            &created_events,
+            GoalProjectionPresentation::Updated,
+        );
+
+        let mut edited_goal = goal.clone();
+        edited_goal.goal_revision = GoalRevision::try_new(2).unwrap();
+        edited_goal.objective = NonEmptyText::try_new("project the edited Goal").unwrap();
+        edited_goal.objective_revision = orca_runtime::surface::GoalObjectiveRevision::new(2);
+        let edited_receipt = SurfaceGoalStoreReceipt {
+            goal_id: edited_goal.goal_id.clone(),
+            goal_revision: edited_goal.goal_revision,
+            objective_revision: edited_goal.objective_revision,
+            catalog_revision: edited_goal.catalog_revision,
+            goal_owner_epoch: edited_goal.goal_owner_epoch,
+            row_state: SurfaceGoalReceiptState::Present {
+                state: edited_goal.state.clone(),
+                current_run: None,
+            },
+            store_commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(22)).unwrap(),
+            receipt_digest: Sha256Digest::new([22; 32]),
+        };
+        let edited_batch = goal_projection_batch(
+            &projection,
+            23,
+            edited_receipt,
+            GoalPatch::Edited {
+                goal_id: edited_goal.goal_id.clone(),
+                previous_revision: GoalRevision::try_new(1).unwrap(),
+                goal: edited_goal.clone(),
+            },
+        );
+        let edited_events = projection
+            .project_typed_batch(&edited_batch)
+            .expect("project Goal edit");
+        assert_single_goal_projection(
+            &projection,
+            &edited_batch,
+            &edited_events,
+            GoalProjectionPresentation::Updated,
+        );
+
+        let tombstone_revision = GoalRevision::try_new(3).unwrap();
+        let removed_receipt = SurfaceGoalStoreReceipt {
+            goal_id: edited_goal.goal_id.clone(),
+            goal_revision: tombstone_revision,
+            objective_revision: edited_goal.objective_revision,
+            catalog_revision: GoalCatalogRevision::try_new(2).unwrap(),
+            goal_owner_epoch: edited_goal.goal_owner_epoch,
+            row_state: SurfaceGoalReceiptState::Removed { tombstone_revision },
+            store_commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(24)).unwrap(),
+            receipt_digest: Sha256Digest::new([24; 32]),
+        };
+        let removed_batch = goal_projection_batch(
+            &projection,
+            25,
+            removed_receipt,
+            GoalPatch::Removed {
+                goal_id: edited_goal.goal_id,
+                previous_revision: GoalRevision::try_new(2).unwrap(),
+                tombstone_revision,
+            },
+        );
+        let removed_events = projection
+            .project_typed_batch(&removed_batch)
+            .expect("project Goal removal");
+        assert_single_goal_projection(
+            &projection,
+            &removed_batch,
+            &removed_events,
+            GoalProjectionPresentation::Cleared,
+        );
+        assert!(
+            projection
+                .reducer_state
+                .as_ref()
+                .expect("Goal projection reducer state")
+                .snapshot()
+                .goal
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn typed_goal_projection_without_reducer_rejects_before_goal_mutation() {
+        let before = cursor(0, 1);
+        let mut projection = TuiSurfaceProjection::from_snapshot(before.clone(), &[]);
+        let goal = goal_projection_goal();
+        let receipt = SurfaceGoalStoreReceipt {
+            goal_id: goal.goal_id.clone(),
+            goal_revision: goal.goal_revision,
+            objective_revision: goal.objective_revision,
+            catalog_revision: goal.catalog_revision,
+            goal_owner_epoch: goal.goal_owner_epoch,
+            row_state: SurfaceGoalReceiptState::Present {
+                state: goal.state.clone(),
+                current_run: None,
+            },
+            store_commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(30)).unwrap(),
+            receipt_digest: Sha256Digest::new([30; 32]),
+        };
+        let batch = goal_projection_batch(&projection, 31, receipt, GoalPatch::Created { goal });
+
+        assert!(matches!(
+            projection.project_typed_batch(&batch),
+            Err(SurfaceProjectionError::MissingReducerSnapshot)
+        ));
+        assert_eq!(projection.cursor(), &before);
+        assert!(projection.goal.is_none());
     }
 
     #[test]
@@ -2174,8 +2645,6 @@ mod tests {
                 turn: 4,
             }),
             goal: None,
-            thread_created_at: UnixMillis::new(0),
-            thread_updated_at: UnixMillis::new(0),
             reducer_state: None,
         };
 
@@ -2375,8 +2844,6 @@ mod tests {
             focused_operation: None,
             pending_turn_started: None,
             goal: None,
-            thread_created_at: UnixMillis::new(0),
-            thread_updated_at: UnixMillis::new(0),
             reducer_state: None,
         };
 

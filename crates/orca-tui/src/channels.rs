@@ -34,7 +34,11 @@ mod tests {
                 .try_send(TuiEvent::MessageDelta(index.to_string()))
                 .expect("event within capacity");
         }
-        assert!(event_tx.try_send(TuiEvent::GoalCleared).is_err());
+        assert!(
+            event_tx
+                .try_send(TuiEvent::Notice("mailbox full".to_string()))
+                .is_err()
+        );
 
         let (action_tx, _action_rx) = user_action_channel();
         for _ in 0..USER_ACTION_CAPACITY {
@@ -88,7 +92,9 @@ mod tests {
         }
         let (done_tx, done_rx) = mpsc::unbounded();
         let producer = thread::spawn(move || {
-            done_tx.send(event_tx.send(TuiEvent::GoalCleared)).unwrap();
+            done_tx
+                .send(event_tx.send(TuiEvent::Notice("blocked send".to_string())))
+                .unwrap();
         });
 
         assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());

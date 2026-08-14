@@ -132,9 +132,21 @@ tokens, and limit tokens; the duplicate `TuiEvent::UsageUpdated` and
 are deleted. Context compaction still constructs its dedicated lifecycle event
 before the batch snapshot. The existing manual-compaction delivery boundary
 then commits that snapshot before publishing `Compacted` and the terminal event,
-so the notice observes the committed metrics. Session identity, Goal, workflow,
-and operation projection remain the next convergence boundary. CLI,
+so the notice observes the committed metrics. CLI,
 server/JSONL, ACP, runtime surface events, and persisted formats are unchanged.
+
+The Goal projection convergence slice makes the authoritative reducer snapshot
+the only production TUI update for the committed Goal fact. One private
+`SurfaceGoalProjectionState` owns the displayed Goal, its accepted surface
+cursor, and presentation deduplication; lower cursors, contradictory equal
+cursors, and different incarnations before reset cannot replace it.
+`GoalStatus` is presentation-only, while edit, clear, and pause re-read a fresh
+post-commit snapshot and prove that it covers the mutation cursor. The granular
+`GoalUpdated`/`GoalCleared` events and public mutable `AppState.current_goal`
+field are deleted; renderers use the immutable `current_goal()` query. Session
+identity, workflow, and operation projection remain the next convergence
+boundaries. CLI, server/JSONL, ACP, runtime surface events, Goal persistence,
+and persisted transcript formats are unchanged.
 
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the

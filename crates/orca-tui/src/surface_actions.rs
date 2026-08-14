@@ -14,6 +14,7 @@ use orca_runtime::surface::{
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::surface_projection::SurfaceProjectionState;
 use crate::types::{TuiEvent, TuiMemoryScope};
 
 #[cfg(test)]
@@ -211,17 +212,17 @@ impl TuiSurfaceActions {
         session_id: &str,
         objective: String,
         at: i64,
-    ) -> Result<Option<ThreadGoal>, String> {
+    ) -> Result<SurfaceProjectionState, String> {
         let _ = (session_id, at);
         crate::surface_client::edit_goal(&self.thread, objective).map_err(|error| error.to_string())
     }
 
-    pub(crate) fn clear_goal(&self, session_id: &str) -> Result<(), String> {
+    pub(crate) fn clear_goal(&self, session_id: &str) -> Result<SurfaceProjectionState, String> {
         let _ = session_id;
         crate::surface_client::clear_goal(&self.thread).map_err(|error| error.to_string())
     }
 
-    pub(crate) fn pause_goal(&self) -> Result<ThreadGoal, String> {
+    pub(crate) fn pause_goal(&self) -> Result<SurfaceProjectionState, String> {
         crate::surface_client::pause_goal(&self.thread).map_err(|error| error.to_string())
     }
 

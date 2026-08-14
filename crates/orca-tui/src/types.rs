@@ -26,9 +26,11 @@ use crate::edit_highlight::parsed_diff_structure_matches_target;
 use crate::input_history::load_input_history;
 use crate::queued_input::QueuedSubmissionState;
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
-use crate::surface_projection::SurfaceMetricsState;
 #[doc(hidden)]
 pub use crate::surface_projection::SurfaceProjectionState;
+use crate::surface_projection::{
+    SurfaceGoalProjectionEffect, SurfaceGoalProjectionState, SurfaceMetricsState,
+};
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
@@ -408,8 +410,6 @@ pub enum TuiEvent {
     PlanImplementationStarted {
         prompt: String,
     },
-    GoalUpdated(ThreadGoal),
-    GoalCleared,
     GoalStatus(Option<ThreadGoal>),
     Backtracked {
         prompt: String,
@@ -877,7 +877,7 @@ pub struct AppState {
     /// The most recent update_plan call failed, so `current_plan` may be
     /// showing outdated statuses. Cleared by the next successful update.
     pub plan_update_failed: bool,
-    pub current_goal: Option<ThreadGoal>,
+    pub(crate) surface_goal: SurfaceGoalProjectionState,
     active_surface_operation_id: Option<SurfaceOperationId>,
     pub recoverable_operation_id: Option<SurfaceOperationId>,
     pub recovery_prompt_visible: bool,
@@ -1037,7 +1037,7 @@ impl AppState {
             assistant_stream: StreamingMarkdownAssembler::default(),
             assistant_stream_tail: None,
             plan_update_failed: false,
-            current_goal: None,
+            surface_goal: SurfaceGoalProjectionState::default(),
             active_surface_operation_id: None,
             recoverable_operation_id: None,
             recovery_prompt_visible: false,
@@ -1302,13 +1302,31 @@ impl AppState {
         }
         if session_changed {
             self.surface_metrics.reset();
+            self.surface_goal.reset();
         }
         self.current_session_id = Some(projection.session_id.clone());
         self.current_session_title = Some(projection.title.clone());
         self.surface_metrics.apply_projection(&projection);
-        self.current_goal = projection.current_goal.clone();
+        let goal_effect = self.surface_goal.apply_projection(&projection);
         self.active_surface_operation_id = projection.foreground_operation_id.clone();
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
+        match goal_effect {
+            Some(SurfaceGoalProjectionEffect::Updated(goal)) => {
+                let should_keep_running =
+                    self.status == AppStatus::Running && goal.status.should_continue();
+                let notice = format_goal_notice(&goal);
+                self.push_goal_notice(notice);
+                if !should_keep_running {
+                    self.set_status(AppStatus::Idle);
+                }
+            }
+            Some(SurfaceGoalProjectionEffect::Cleared) => {
+                self.finish_assistant_stream();
+                self.push_message(ChatMessage::System("Goal cleared.".to_string()));
+                self.set_status(AppStatus::Idle);
+            }
+            None => {}
+        }
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1326,7 +1344,7 @@ impl AppState {
             self.workflow_panel.tasks,
             sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
         );
-        debug_assert_eq!(self.current_goal, projection.current_goal);
+        self.surface_goal.assert_matches_projection(projection);
         debug_assert_eq!(
             self.active_surface_operation_id,
             projection.foreground_operation_id
@@ -1398,7 +1416,7 @@ impl AppState {
         self.current_plan = None;
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
         self.plan_update_failed = false;
-        self.current_goal = None;
+        self.surface_goal.reset();
         self.active_surface_operation_id = None;
         self.recoverable_operation_id = None;
         self.recovery_prompt_visible = false;
@@ -2374,24 +2392,7 @@ impl AppState {
                 )));
                 self.set_status(AppStatus::Idle);
             }
-            TuiEvent::GoalUpdated(goal) => {
-                let should_keep_running =
-                    self.status == AppStatus::Running && goal.status.should_continue();
-                let notice = format_goal_notice(&goal);
-                self.current_goal = Some(goal);
-                self.push_goal_notice(notice);
-                if !should_keep_running {
-                    self.set_status(AppStatus::Idle);
-                }
-            }
-            TuiEvent::GoalCleared => {
-                self.current_goal = None;
-                self.finish_assistant_stream();
-                self.push_message(ChatMessage::System("Goal cleared.".to_string()));
-                self.set_status(AppStatus::Idle);
-            }
             TuiEvent::GoalStatus(goal) => {
-                self.current_goal = goal.clone();
                 let mut should_keep_running = false;
                 match goal {
                     Some(goal) => {
@@ -3189,6 +3190,7 @@ mod tests {
         ));
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
                 session_id: "old-session".to_string(),
                 title: "Old session".to_string(),
                 usage_revision: 1,
@@ -3202,6 +3204,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: None,
                 foreground_operation_id: None,
+                goal_presentation: None,
             },
         )));
         state.approval_allowlist.insert("bash".to_string());
@@ -4747,6 +4750,7 @@ mod tests {
         };
 
         let projection = |usage_revision, usage| SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(usage_revision),
             session_id: "usage-session".to_string(),
             title: "Usage session".to_string(),
             usage_revision,
@@ -4757,6 +4761,7 @@ mod tests {
             workflow_tasks: Vec::new(),
             current_goal: None,
             foreground_operation_id: None,
+            goal_presentation: None,
         };
 
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
@@ -4775,7 +4780,211 @@ mod tests {
     }
 
     #[test]
-    fn surface_projection_consistency_reconciles_session_scoped_state() {
+    fn surface_goal_projection_rejects_equal_usage_stale_snapshot() {
+        let mut state = state();
+        let committed = ThreadGoal {
+            session_id: "goal-session".to_string(),
+            objective: "new objective".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Paused,
+            token_budget: Some(10_000),
+            tokens_used: 100,
+            time_used_seconds: 10,
+            created_at: 1,
+            updated_at: 3,
+        };
+        let stale = ThreadGoal {
+            objective: "old objective".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            tokens_used: 10,
+            time_used_seconds: 1,
+            updated_at: 2,
+            ..committed.clone()
+        };
+        let projection = |cursor, goal, goal_presentation| SurfaceProjectionState {
+            cursor,
+            session_id: "goal-session".to_string(),
+            title: "Goal session".to_string(),
+            usage_revision: 1,
+            usage: UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: Vec::new(),
+            current_goal: goal,
+            foreground_operation_id: None,
+            goal_presentation,
+        };
+
+        let committed_projection = projection(
+            crate::surface_projection::test_surface_cursor(2),
+            Some(committed.clone()),
+            Some(crate::surface_projection::GoalProjectionPresentation::Updated),
+        );
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            committed_projection.clone(),
+        )));
+        let goal_notice_count = |state: &AppState| {
+            state
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(message, ChatMessage::System(text) if text.contains("new objective"))
+                })
+                .count()
+        };
+        assert_eq!(goal_notice_count(&state), 1);
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            committed_projection.clone(),
+        )));
+        assert_eq!(goal_notice_count(&state), 1, "equal replay is silent");
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            crate::surface_projection::test_surface_cursor(2),
+            Some(stale.clone()),
+            Some(crate::surface_projection::GoalProjectionPresentation::Updated),
+        ))));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            crate::surface_projection::test_surface_cursor(1),
+            Some(stale.clone()),
+            None,
+        ))));
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            crate::surface_projection::test_surface_cursor(3),
+            Some(committed.clone()),
+            None,
+        ))));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            crate::surface_projection::test_surface_cursor(2),
+            Some(stale.clone()),
+            Some(crate::surface_projection::GoalProjectionPresentation::Updated),
+        ))));
+
+        let mut different_incarnation = crate::surface_projection::test_surface_cursor(4);
+        let mut incarnation_bytes = [5; 16];
+        incarnation_bytes[6] = 0x75;
+        incarnation_bytes[8] = 0x85;
+        different_incarnation.incarnation =
+            orca_runtime::surface::SurfaceIncarnation::try_from_bytes(incarnation_bytes)
+                .expect("different test surface incarnation");
+        let after_reset = ThreadGoal {
+            objective: "accepted after reset".to_string(),
+            updated_at: 4,
+            ..stale
+        };
+        let different_incarnation_projection = projection(
+            different_incarnation,
+            Some(after_reset.clone()),
+            Some(crate::surface_projection::GoalProjectionPresentation::Updated),
+        );
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            different_incarnation_projection.clone(),
+        )));
+
+        assert_eq!(state.current_goal(), Some(&committed));
+        assert_eq!(goal_notice_count(&state), 1);
+
+        state.update(TuiEvent::SessionProjectionReset {
+            session_id: "goal-session".to_string(),
+            title: "Goal session".to_string(),
+        });
+        assert!(state.current_goal().is_none());
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            different_incarnation_projection,
+        )));
+        assert_eq!(state.current_goal(), Some(&after_reset));
+    }
+
+    #[test]
+    fn surface_goal_projection_hydration_is_silent() {
+        let mut state = state();
+        let goal = ThreadGoal {
+            session_id: "goal-session".to_string(),
+            objective: "hydrate without a notice".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Paused,
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 1,
+            created_at: 1,
+            updated_at: 2,
+        };
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
+                session_id: "goal-session".to_string(),
+                title: "Goal session".to_string(),
+                usage_revision: 1,
+                usage: UsageTotals::default(),
+                context_revision: 1,
+                context_used_tokens: 0,
+                context_limit_tokens: 128_000,
+                workflow_tasks: Vec::new(),
+                current_goal: Some(goal.clone()),
+                foreground_operation_id: None,
+                goal_presentation: None,
+            },
+        )));
+
+        assert_eq!(state.current_goal(), Some(&goal));
+        assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn surface_goal_projection_presents_clear_once_per_cursor() {
+        let mut state = state();
+        let goal = ThreadGoal {
+            session_id: "goal-session".to_string(),
+            objective: "clear me".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Paused,
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 1,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let projection = |next_seq, goal, goal_presentation| SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(next_seq),
+            session_id: "goal-session".to_string(),
+            title: "Goal session".to_string(),
+            usage_revision: 1,
+            usage: UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: Vec::new(),
+            current_goal: goal,
+            foreground_operation_id: None,
+            goal_presentation,
+        };
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            1,
+            Some(goal),
+            None,
+        ))));
+        let cleared = projection(
+            2,
+            None,
+            Some(crate::surface_projection::GoalProjectionPresentation::Cleared),
+        );
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(cleared.clone())));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(cleared)));
+
+        assert!(state.current_goal().is_none());
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(message, ChatMessage::System(text) if text == "Goal cleared.")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn surface_projection_consistency_current_goal_reconciles_session_scoped_state() {
         let mut state = state();
         state.update(TuiEvent::SessionProjectionReset {
             session_id: "stale-session".to_string(),
@@ -4802,6 +5011,7 @@ mod tests {
             updated_at: 2,
         };
         let expected = SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(7),
             session_id: "canonical-session".to_string(),
             title: "canonical title".to_string(),
             usage_revision: 7,
@@ -4817,6 +5027,7 @@ mod tests {
             workflow_tasks: vec![workflow_task_summary("task-1", "Canonical task")],
             current_goal: Some(goal),
             foreground_operation_id: Some(operation_id),
+            goal_presentation: None,
         };
 
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
@@ -4835,7 +5046,7 @@ mod tests {
         assert_eq!(state.context_used_tokens(), expected.context_used_tokens);
         assert_eq!(state.context_limit_tokens(), expected.context_limit_tokens);
         assert_eq!(state.workflow_panel.tasks, expected.workflow_tasks);
-        assert_eq!(state.current_goal, expected.current_goal);
+        assert_eq!(state.current_goal(), expected.current_goal.as_ref());
         assert_eq!(
             state.active_surface_operation_id,
             expected.foreground_operation_id
@@ -4906,7 +5117,7 @@ mod tests {
         assert_eq!(state.context_used_tokens(), 12_000);
         assert_eq!(state.context_limit_tokens(), 256_000);
         assert!(state.active_surface_operation_id.is_none());
-        assert!(state.current_goal.is_none());
+        assert!(state.current_goal().is_none());
         assert!(state.workflow_panel.tasks.is_empty());
 
         state.update(TuiEvent::SessionProjectionReset {
@@ -5854,7 +6065,7 @@ mod tests {
     }
 
     #[test]
-    fn active_goal_updates_do_not_mark_running_app_idle() {
+    fn active_goal_projection_does_not_mark_running_app_idle() {
         let mut state = state();
         state.status = AppStatus::Running;
         let goal = ThreadGoal {
@@ -5871,8 +6082,54 @@ mod tests {
         state.update(TuiEvent::GoalStatus(Some(goal.clone())));
         assert_eq!(state.status, AppStatus::Running);
 
-        state.update(TuiEvent::GoalUpdated(goal));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
+                session_id: "session-1".to_string(),
+                title: "Goal session".to_string(),
+                usage_revision: 1,
+                usage: UsageTotals::default(),
+                context_revision: 1,
+                context_used_tokens: 0,
+                context_limit_tokens: 128_000,
+                workflow_tasks: Vec::new(),
+                current_goal: Some(goal),
+                foreground_operation_id: None,
+                goal_presentation: Some(
+                    crate::surface_projection::GoalProjectionPresentation::Updated,
+                ),
+            },
+        )));
         assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn goal_status_is_presentation_only() {
+        let mut state = state();
+        let committed = ThreadGoal {
+            session_id: "session-1".to_string(),
+            objective: "committed objective".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Paused,
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 1,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let queried = ThreadGoal {
+            objective: "queried objective".to_string(),
+            status: orca_core::goal_types::ThreadGoalStatus::Active,
+            updated_at: 3,
+            ..committed.clone()
+        };
+        state.replace_current_goal_for_test(Some(committed.clone()));
+
+        state.update(TuiEvent::GoalStatus(Some(queried)));
+
+        assert_eq!(state.current_goal(), Some(&committed));
+        assert!(state.messages.iter().any(
+            |message| matches!(message, ChatMessage::System(text) if text.contains("queried objective"))
+        ));
     }
 
     #[test]
