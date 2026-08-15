@@ -1941,7 +1941,7 @@ fn append_assistant_markdown(
 }
 
 fn plan_panel_height(state: &AppState) -> u16 {
-    match &state.current_plan {
+    match state.current_plan() {
         Some((_, plan)) => {
             let items = plan.len() as u16;
             // 2 for border, 1 for title = items + 2, capped at 10
@@ -1954,11 +1954,11 @@ fn plan_panel_height(state: &AppState) -> u16 {
 fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     use orca_core::plan_types::PlanStatus;
 
-    let Some((_, plan)) = &state.current_plan else {
+    let Some((_, plan)) = state.current_plan() else {
         return;
     };
 
-    let (title, border_color) = if state.plan_update_failed {
+    let (title, border_color) = if state.plan_update_failed() {
         (
             " Task Plan (last update failed — may be stale) ",
             theme.warning,
@@ -7074,7 +7074,7 @@ mod tests {
     fn long_plan_steps_and_tool_targets_stay_on_single_rows() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut state = test_state();
-        state.current_plan = Some((
+        state.replace_plan_for_test(Some((
             None,
             vec![
                 PlanItem {
@@ -7087,7 +7087,7 @@ mod tests {
                     status: PlanStatus::Pending,
                 },
             ],
-        ));
+        )));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 4))
             .expect("test backend");
         terminal

@@ -24,6 +24,7 @@ use crate::edit_highlight::EditHighlightState;
 #[cfg(test)]
 use crate::edit_highlight::parsed_diff_structure_matches_target;
 use crate::input_history::load_input_history;
+use crate::plan_panel::PlanPanelState;
 use crate::queued_input::QueuedSubmissionState;
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 #[doc(hidden)]
@@ -852,13 +853,10 @@ pub struct AppState {
     pub mention: MentionPopupState,
     pub mention_bindings: MentionBindings,
     pub atomic_skill_tokens: MentionBindings,
-    pub current_plan: Option<(Option<String>, Vec<PlanItem>)>,
+    pub(crate) plan_panel: PlanPanelState,
     proposed_plan_parser: ProposedPlanStreamParser,
     assistant_stream: StreamingMarkdownAssembler,
     assistant_stream_tail: Option<usize>,
-    /// The most recent update_plan call failed, so `current_plan` may be
-    /// showing outdated statuses. Cleared by the next successful update.
-    pub plan_update_failed: bool,
     pub(crate) surface_goal: SurfaceGoalProjectionState,
     pub(crate) surface_operation: SurfaceOperationProjectionState,
     pub recovery_prompt_visible: bool,
@@ -1012,11 +1010,10 @@ impl AppState {
             mention: MentionPopupState::default(),
             mention_bindings: MentionBindings::default(),
             atomic_skill_tokens: MentionBindings::default(),
-            current_plan: None,
+            plan_panel: PlanPanelState::default(),
             proposed_plan_parser: ProposedPlanStreamParser::default(),
             assistant_stream: StreamingMarkdownAssembler::default(),
             assistant_stream_tail: None,
-            plan_update_failed: false,
             surface_goal: SurfaceGoalProjectionState::default(),
             surface_operation: SurfaceOperationProjectionState::default(),
             recovery_prompt_visible: false,
@@ -1417,9 +1414,8 @@ impl AppState {
     pub(crate) fn reset_session_projection(&mut self) {
         self.surface_session.reset();
         self.clear_messages();
-        self.current_plan = None;
+        self.clear_plan_panel();
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
-        self.plan_update_failed = false;
         self.surface_goal.reset();
         self.surface_operation.reset();
         self.recovery_prompt_visible = false;
@@ -1806,7 +1802,7 @@ impl AppState {
             } => {
                 self.replace_messages(messages);
                 if let Some(plan) = plan {
-                    self.current_plan = Some(plan);
+                    self.restore_plan(Some(plan));
                 }
                 self.push_message(ChatMessage::System(label));
                 self.finalized_count = self.messages.len();
@@ -1969,7 +1965,7 @@ impl AppState {
                     // the scrollback; a failed call means that panel is now
                     // showing outdated statuses.
                     if status != "completed" {
-                        self.plan_update_failed = true;
+                        self.mark_plan_update_failed();
                     }
                     return;
                 }
@@ -2042,12 +2038,7 @@ impl AppState {
                 // The live plan is shown in the bottom panel during the turn. It is archived
                 // inline (and the panel cleared) when the turn completes, so we avoid pushing a
                 // message on every update to keep the scrollback clean.
-                self.plan_update_failed = false;
-                self.current_plan = if plan.is_empty() {
-                    None
-                } else {
-                    Some((explanation, plan))
-                };
+                self.apply_plan_update(explanation, plan);
             }
             TuiEvent::SubagentStarted { id, description } => {
                 if self.suppress_background_main_session_output {
@@ -2594,10 +2585,7 @@ impl AppState {
     /// Move the live plan out of the bottom panel and into the scrollback as an archived
     /// checklist when a turn ends, so the panel stops occluding content once work is done.
     fn archive_current_plan(&mut self) {
-        self.plan_update_failed = false;
-        if let Some((explanation, plan)) = self.current_plan.take()
-            && !plan.is_empty()
-        {
+        if let Some((explanation, plan)) = self.take_plan_for_archive() {
             self.push_message(ChatMessage::PlanUpdate { explanation, plan });
         }
     }
@@ -3150,7 +3138,7 @@ mod tests {
         // `live_start` skip the whole transcript and blanked the pane on switch.
         assert_eq!(state.flushed_count, 0);
         assert_eq!(
-            state.current_plan.as_ref().unwrap().0.as_deref(),
+            state.current_plan().unwrap().0.as_deref(),
             Some("resume plan")
         );
         assert_eq!(state.status, AppStatus::Idle);
@@ -3160,13 +3148,13 @@ mod tests {
     fn new_session_started_resets_conversation_state_and_preserves_runtime_settings() {
         let mut state = state();
         state.push_message(ChatMessage::User("old prompt".to_string()));
-        state.current_plan = Some((
+        state.replace_plan_for_test(Some((
             Some("old plan".to_string()),
             vec![PlanItem {
                 step: "old step".to_string(),
                 status: PlanStatus::InProgress,
             }],
-        ));
+        )));
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(1),
@@ -3226,7 +3214,7 @@ mod tests {
         state.update(TuiEvent::NewSessionStarted);
 
         assert!(state.messages.is_empty());
-        assert!(state.current_plan.is_none());
+        assert!(state.current_plan().is_none());
         assert_eq!(state.usage(), &UsageTotals::default());
         assert_eq!(state.context_used_tokens(), 0);
         assert_eq!(state.context_limit_tokens(), 0);
@@ -3885,13 +3873,13 @@ mod tests {
 
         // During the turn the plan only lives in the bottom panel, not the scrollback.
         assert!(state.messages.is_empty());
-        assert!(state.current_plan.is_some());
+        assert!(state.current_plan().is_some());
 
         // When the turn completes the panel clears and the plan is archived inline.
         state.update(TuiEvent::SessionCompleted {
             status: "success".to_string(),
         });
-        assert!(state.current_plan.is_none());
+        assert!(state.current_plan().is_none());
         assert_eq!(state.messages.len(), 1);
         match &state.messages[0] {
             ChatMessage::PlanUpdate { explanation, plan } => {
@@ -3941,7 +3929,7 @@ mod tests {
                 status: PlanStatus::InProgress,
             }],
         });
-        assert!(!state.plan_update_failed);
+        assert!(!state.plan_update_failed());
 
         state.update(TuiEvent::ToolCompleted {
             id: "tool-plan-2".to_string(),
@@ -3952,10 +3940,13 @@ mod tests {
             kind: Some("error".to_string()),
         });
         assert!(
-            state.plan_update_failed,
+            state.plan_update_failed(),
             "failed update must mark the panel stale"
         );
-        assert!(state.current_plan.is_some(), "the stale plan stays visible");
+        assert!(
+            state.current_plan().is_some(),
+            "the stale plan stays visible"
+        );
 
         state.update(TuiEvent::PlanUpdated {
             explanation: None,
@@ -3965,7 +3956,7 @@ mod tests {
             }],
         });
         assert!(
-            !state.plan_update_failed,
+            !state.plan_update_failed(),
             "a successful update clears the stale marker"
         );
     }
@@ -3988,12 +3979,12 @@ mod tests {
             diff: None,
             kind: Some("error".to_string()),
         });
-        assert!(state.plan_update_failed);
+        assert!(state.plan_update_failed());
 
         state.update(TuiEvent::SessionCompleted {
             status: "success".to_string(),
         });
-        assert!(!state.plan_update_failed);
+        assert!(!state.plan_update_failed());
     }
 
     #[test]

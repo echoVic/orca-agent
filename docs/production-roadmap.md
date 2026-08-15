@@ -180,6 +180,14 @@ have no production `TaskPatch::Reconciled` snapshot path, so this slice does
 not introduce a TUI cache. CLI, server/JSONL, ACP, runtime surface events,
 operation persistence, and transcript formats are unchanged.
 
+The 2026-08-15 plan-panel ownership slice moves only process-local TUI
+presentation facts behind one private `PlanPanelState`: the live structured
+plan and its failed-update marker. Existing `PlanUpdated` and legacy
+`HistoryLoaded.plan` payloads remain the inputs because legacy structured-plan
+hydration has not moved into the runtime surface. This deliberately changes no
+runtime plan persistence, history format, surface projection, protocol, or
+renderer behavior.
+
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the
 release checksum, installs the runner and setup helper, and can provision,
