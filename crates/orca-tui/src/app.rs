@@ -2745,7 +2745,7 @@ done
         }
 
         let messages = format!("{:?}", state.messages);
-        let tasks = state.workflow_panel.tasks.clone();
+        let tasks = state.workflow_tasks().to_vec();
         let usage = state.usage().clone();
         let goal = state.current_goal().cloned();
         let identity = (
@@ -2804,7 +2804,7 @@ done
         }
 
         assert_eq!(format!("{:?}", state.messages), messages);
-        assert_eq!(state.workflow_panel.tasks, tasks);
+        assert_eq!(state.workflow_tasks(), tasks);
         assert_eq!(state.usage(), &usage);
         assert_eq!(state.current_goal(), goal.as_ref());
         assert_eq!(
@@ -2950,10 +2950,10 @@ done
     fn workflows_panel_keys_move_selected_task() {
         let (mut state, _rx) = test_state();
         state.show_workflows();
-        state.workflow_panel.tasks = vec![
+        state.replace_workflow_tasks_for_test(vec![
             workflow_task("task-1", "audit"),
             workflow_task("task-2", "repair"),
-        ];
+        ]);
 
         let action_tx = state.event_tx.clone();
 
@@ -2962,14 +2962,14 @@ done
             &mut state,
             &action_tx
         ));
-        assert_eq!(state.workflow_panel.selected, 1);
+        assert_eq!(state.workflow_selected_index(), 1);
 
         assert!(handle_workflows_panel_key(
             KeyCode::Up,
             &mut state,
             &action_tx
         ));
-        assert_eq!(state.workflow_panel.selected, 0);
+        assert_eq!(state.workflow_selected_index(), 0);
     }
 
     #[test]
@@ -2987,7 +2987,7 @@ done
             arguments: "{}".to_string(),
         });
         state.show_workflows();
-        state.workflow_panel.tasks = vec![task];
+        state.replace_workflow_tasks_for_test(vec![task]);
 
         let action_tx = state.event_tx.clone();
         assert!(handle_workflows_panel_key(
@@ -3007,7 +3007,7 @@ done
         let mut task = workflow_task("task-running", "running");
         task.status = orca_core::task_types::TaskStatus::Running;
         state.show_workflows();
-        state.workflow_panel.tasks = vec![task];
+        state.replace_workflow_tasks_for_test(vec![task]);
 
         let action_tx = state.event_tx.clone();
         assert!(handle_workflows_panel_key(
@@ -3029,7 +3029,7 @@ done
         task.status = orca_core::task_types::TaskStatus::Running;
         task.is_backgrounded = true;
         state.show_workflows();
-        state.workflow_panel.tasks = vec![task];
+        state.replace_workflow_tasks_for_test(vec![task]);
 
         let action_tx = state.event_tx.clone();
         assert!(handle_workflows_panel_key(

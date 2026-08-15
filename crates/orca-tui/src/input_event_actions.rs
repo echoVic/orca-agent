@@ -1289,16 +1289,16 @@ mod tests {
 
         // Workflows panel: wheel moves the task selection.
         state.panel_mode = crate::types::PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![
+        state.replace_workflow_tasks_for_test(vec![
             test_workflow_task("a"),
             test_workflow_task("b"),
             test_workflow_task("c"),
-        ];
-        state.workflow_panel.selected = 0;
+        ]);
+        state.select_workflow_index_for_test(0);
         handle_scroll_lines(&mut state, 3, now);
-        assert_eq!(state.workflow_panel.selected, 1);
+        assert_eq!(state.workflow_selected_index(), 1);
         handle_scroll_lines(&mut state, -3, now);
-        assert_eq!(state.workflow_panel.selected, 0);
+        assert_eq!(state.workflow_selected_index(), 0);
 
         // Session picker: wheel moves the session selection.
         state.panel_mode = crate::types::PanelMode::Conversation;

@@ -48,10 +48,7 @@ pub(crate) fn handle_workflows_panel_key(
 }
 
 fn selected_stoppable_task(state: &AppState) -> Option<&BackgroundTaskSummary> {
-    let task = state
-        .workflow_panel
-        .tasks
-        .get(state.workflow_panel.selected)?;
+    let task = state.selected_workflow_task()?;
     if is_terminal_task_status(task.status) {
         return None;
     }
@@ -59,10 +56,7 @@ fn selected_stoppable_task(state: &AppState) -> Option<&BackgroundTaskSummary> {
 }
 
 fn selected_foregroundable_task(state: &AppState) -> Option<&BackgroundTaskSummary> {
-    let task = state
-        .workflow_panel
-        .tasks
-        .get(state.workflow_panel.selected)?;
+    let task = state.selected_workflow_task()?;
     if task.task_type != TaskType::MainSession
         || task.status != TaskStatus::Running
         || !task.is_backgrounded

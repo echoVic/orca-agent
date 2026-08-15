@@ -188,6 +188,16 @@ hydration has not moved into the runtime surface. This deliberately changes no
 runtime plan persistence, history format, surface projection, protocol, or
 renderer behavior.
 
+The 2026-08-15 workflow-panel ownership slice moves task-row presentation and
+selection behind one private `WorkflowPanelState`. Renderers and task controls
+use immutable AppState queries, while every accepted full or single-task
+projection still routes through the existing sort, selected-id retention,
+background/approval reveal, and foreground-return transition. This does not
+reconcile task sources: non-recorded runtime threads still expose live
+`TaskRegistry` summaries and have no production `TaskPatch::Reconciled`
+surface producer, so no TUI task cache, protocol, persistence, or runtime
+workflow behavior is introduced.
+
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the
 release checksum, installs the runner and setup helper, and can provision,

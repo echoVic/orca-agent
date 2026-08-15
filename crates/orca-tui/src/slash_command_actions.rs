@@ -278,8 +278,7 @@ fn format_status(state: &AppState) -> String {
     };
     let usage = state.usage();
     let active_tasks = state
-        .workflow_panel
-        .tasks
+        .workflow_tasks()
         .iter()
         .filter(|task| {
             matches!(

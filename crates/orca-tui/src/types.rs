@@ -40,7 +40,7 @@ use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
 use crate::transcript_view::TranscriptRenderContext;
 use crate::workflow_panel::{
-    push_pending_workflow_notification_unique, sort_workflow_tasks_for_panel,
+    WorkflowPanelState, push_pending_workflow_notification_unique, sort_workflow_tasks_for_panel,
 };
 use crate::workspace_status::GitIdentity;
 
@@ -734,12 +734,6 @@ pub enum PanelMode {
     Agents,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct WorkflowPanelState {
-    pub selected: usize,
-    pub tasks: Vec<BackgroundTaskSummary>,
-}
-
 #[derive(Debug, Clone)]
 pub struct SlashMenuItem {
     pub command: String,
@@ -862,7 +856,7 @@ pub struct AppState {
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
-    pub workflow_panel: WorkflowPanelState,
+    pub(crate) workflow_panel: WorkflowPanelState,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
     pub tick: u64,
@@ -1346,7 +1340,7 @@ impl AppState {
         self.surface_session.assert_matches_projection(projection);
         self.surface_metrics.assert_matches_projection(projection);
         debug_assert_eq!(
-            self.workflow_panel.tasks,
+            self.workflow_tasks(),
             sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
         );
         self.surface_goal.assert_matches_projection(projection);
@@ -1439,7 +1433,7 @@ impl AppState {
         self.reset_history_navigation();
         self.last_ctrl_c = None;
         self.panel_mode = PanelMode::Conversation;
-        self.workflow_panel = WorkflowPanelState::default();
+        self.reset_workflow_panel();
         self.pending_workflow_notifications.clear();
         self.suppress_background_main_session_output = false;
         self.last_completed_at = None;
@@ -2139,7 +2133,7 @@ impl AppState {
             }
             TuiEvent::WorkflowTasksUpdated { tasks } => self.apply_workflow_tasks_update(tasks),
             TuiEvent::WorkflowTaskUpdated { task } => {
-                let mut tasks = self.workflow_panel.tasks.clone();
+                let mut tasks = self.workflow_tasks().to_vec();
                 if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == task.id) {
                     *existing = task;
                 } else {
@@ -5372,7 +5366,7 @@ mod tests {
         assert_eq!(state.usage(), &expected.usage);
         assert_eq!(state.context_used_tokens(), expected.context_used_tokens);
         assert_eq!(state.context_limit_tokens(), expected.context_limit_tokens);
-        assert_eq!(state.workflow_panel.tasks, expected.workflow_tasks);
+        assert_eq!(state.workflow_tasks(), expected.workflow_tasks);
         assert_eq!(state.current_goal(), expected.current_goal.as_ref());
         assert_eq!(
             state.foreground_operation_id(),
@@ -5763,75 +5757,78 @@ mod tests {
         let state = state();
 
         assert_eq!(state.panel_mode, PanelMode::Conversation);
-        assert_eq!(state.workflow_panel.selected, 0);
-        assert!(state.workflow_panel.tasks.is_empty());
+        assert_eq!(state.workflow_selected_index(), 0);
+        assert!(state.workflow_tasks().is_empty());
     }
 
     #[test]
     fn show_workflows_preserves_available_selection() {
         let mut state = state();
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
-            id: "task-1".to_string(),
-            task_type: TaskType::Workflow,
-            status: TaskStatus::Running,
-            is_backgrounded: false,
-            description: "demo".to_string(),
-            created_at_ms: 1_000,
-            started_at_ms: Some(1_000),
-            completed_at_ms: None,
-            command: None,
-            agent_type: None,
-            server: None,
-            tool: None,
-            pending_tool_call: None,
-            name: Some("audit".to_string()),
-            workflow_run_id: Some("workflow-run-1".to_string()),
-            phase_count: Some(2),
-            workflow_progress: None,
-            workflow_phases: Vec::new(),
-            workflow_agents: Vec::new(),
-            workflow_script_path: None,
-            workflow_launch_input: None,
-            workflow_final_summary: None,
-            workflow_failure_count: 0,
-            usage: None,
-            subagent_current_activity: None,
-            subagent_turn: None,
-            last_activity_at_ms: None,
-            result: None,
-            error: None,
-            retry_count: 0,
-            output_truncated: false,
-            publication_revision: None,
-        }];
-        state.workflow_panel.selected = 9;
+        state.replace_workflow_tasks_for_test(vec![
+            BackgroundTaskSummary {
+                id: "task-1".to_string(),
+                task_type: TaskType::Workflow,
+                status: TaskStatus::Running,
+                is_backgrounded: false,
+                description: "demo".to_string(),
+                created_at_ms: 1_000,
+                started_at_ms: Some(1_000),
+                completed_at_ms: None,
+                command: None,
+                agent_type: None,
+                server: None,
+                tool: None,
+                pending_tool_call: None,
+                name: Some("audit".to_string()),
+                workflow_run_id: Some("workflow-run-1".to_string()),
+                phase_count: Some(2),
+                workflow_progress: None,
+                workflow_phases: Vec::new(),
+                workflow_agents: Vec::new(),
+                workflow_script_path: None,
+                workflow_launch_input: None,
+                workflow_final_summary: None,
+                workflow_failure_count: 0,
+                usage: None,
+                subagent_current_activity: None,
+                subagent_turn: None,
+                last_activity_at_ms: None,
+                result: None,
+                error: None,
+                retry_count: 0,
+                output_truncated: false,
+                publication_revision: None,
+            },
+            workflow_task_summary("task-2", "repair"),
+        ]);
+        state.select_workflow_index_for_test(1);
 
         state.show_workflows();
 
         assert_eq!(state.panel_mode, PanelMode::Workflows);
-        assert_eq!(state.workflow_panel.selected, 0);
+        assert_eq!(state.workflow_selected_index(), 1);
     }
 
     #[test]
     fn workflow_panel_selection_moves_within_available_tasks() {
         let mut state = state();
-        state.workflow_panel.tasks = vec![
+        state.replace_workflow_tasks_for_test(vec![
             workflow_task_summary("task-1", "audit"),
             workflow_task_summary("task-2", "repair"),
-        ];
+        ]);
 
         state.select_next_workflow_task();
-        assert_eq!(state.workflow_panel.selected, 1);
+        assert_eq!(state.workflow_selected_index(), 1);
 
         state.select_next_workflow_task();
-        assert_eq!(state.workflow_panel.selected, 1);
+        assert_eq!(state.workflow_selected_index(), 1);
 
         state.select_previous_workflow_task();
-        assert_eq!(state.workflow_panel.selected, 0);
+        assert_eq!(state.workflow_selected_index(), 0);
 
-        state.workflow_panel.tasks.clear();
+        state.replace_workflow_tasks_for_test(Vec::new());
         state.select_next_workflow_task();
-        assert_eq!(state.workflow_panel.selected, 0);
+        assert_eq!(state.workflow_selected_index(), 0);
     }
 
     #[test]
@@ -5848,7 +5845,7 @@ mod tests {
             target: Some("background task".to_string()),
             arguments: "{\"limit\":1}".to_string(),
         });
-        state.workflow_panel.tasks = vec![task];
+        state.replace_workflow_tasks_for_test(vec![task]);
 
         assert!(state.open_selected_background_approval_dialog());
 
@@ -5874,7 +5871,7 @@ mod tests {
             target: Some("foreground claimed task".to_string()),
             arguments: "{}".to_string(),
         });
-        state.workflow_panel.tasks = vec![task];
+        state.replace_workflow_tasks_for_test(vec![task]);
 
         assert!(state.open_selected_background_approval_dialog());
         assert_eq!(
@@ -5889,19 +5886,15 @@ mod tests {
     #[test]
     fn show_agents_uses_dedicated_panel_mode() {
         let mut state = state();
-        state.workflow_panel.selected = 9;
-
         state.show_agents();
 
         assert_eq!(state.panel_mode, PanelMode::Agents);
-        assert_eq!(state.workflow_panel.selected, 0);
+        assert_eq!(state.workflow_selected_index(), 0);
     }
 
     #[test]
     fn workflow_events_update_panel_and_queue_model_notification() {
         let mut state = state();
-        state.workflow_panel.selected = 9;
-
         state.update(TuiEvent::WorkflowTasksUpdated {
             tasks: vec![BackgroundTaskSummary {
                 id: "task-1".to_string(),
@@ -5945,8 +5938,8 @@ mod tests {
             summary: "audit: done".to_string(),
         });
 
-        assert_eq!(state.workflow_panel.tasks.len(), 1);
-        assert_eq!(state.workflow_panel.selected, 0);
+        assert_eq!(state.workflow_tasks().len(), 1);
+        assert_eq!(state.workflow_selected_index(), 0);
         let notification = state
             .pending_workflow_notifications
             .pop_front()
@@ -6063,8 +6056,7 @@ mod tests {
 
         assert_eq!(
             state
-                .workflow_panel
-                .tasks
+                .workflow_tasks()
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>(),
@@ -6082,8 +6074,8 @@ mod tests {
         completed.status = TaskStatus::Completed;
         completed.completed_at_ms = Some(9_000);
         completed.last_activity_at_ms = Some(9_000);
-        state.workflow_panel.tasks = vec![running.clone(), completed.clone()];
-        state.workflow_panel.selected = 1;
+        state.replace_workflow_tasks_for_test(vec![running.clone(), completed.clone()]);
+        state.select_workflow_index_for_test(1);
 
         running.last_activity_at_ms = Some(10_000);
         state.update(TuiEvent::WorkflowTasksUpdated {
@@ -6091,13 +6083,13 @@ mod tests {
         });
 
         assert_eq!(
-            state.workflow_panel.tasks[state.workflow_panel.selected].id,
-            "task-completed"
+            state.selected_workflow_task().map(|task| task.id.as_str()),
+            Some("task-completed")
         );
     }
 
     #[test]
-    fn single_task_status_updates_merge_without_dropping_other_panel_tasks() {
+    fn workflow_task_update_preserves_owner_selection() {
         let mut state = state();
         let mut running = workflow_task_summary("task-running", "running");
         running.status = TaskStatus::Running;
@@ -6109,28 +6101,30 @@ mod tests {
         state.update(TuiEvent::WorkflowTasksUpdated {
             tasks: vec![running.clone(), completed.clone()],
         });
-        state.workflow_panel.selected = state
-            .workflow_panel
-            .tasks
-            .iter()
-            .position(|task| task.id == "task-completed")
-            .expect("completed task remains visible");
+        state.show_workflows();
+        state.select_next_workflow_task();
+        assert_eq!(
+            state.selected_workflow_task().map(|task| task.id.as_str()),
+            Some("task-completed")
+        );
 
-        running.last_activity_at_ms = Some(10_000);
-        state.update(TuiEvent::WorkflowTaskUpdated { task: running });
+        completed.status = TaskStatus::Failed;
+        completed.last_activity_at_ms = Some(10_000);
+        state.update(TuiEvent::WorkflowTaskUpdated { task: completed });
 
         assert_eq!(
             state
-                .workflow_panel
-                .tasks
+                .workflow_tasks()
                 .iter()
                 .map(|task| task.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["task-running", "task-completed"]
         );
         assert_eq!(
-            state.workflow_panel.tasks[state.workflow_panel.selected].id,
-            "task-completed"
+            state
+                .selected_workflow_task()
+                .map(|task| (task.id.as_str(), task.status)),
+            Some(("task-completed", TaskStatus::Failed))
         );
     }
 
@@ -6152,24 +6146,24 @@ mod tests {
 
         assert_eq!(state.panel_mode, PanelMode::Workflows);
         assert_eq!(
-            state.workflow_panel.tasks[state.workflow_panel.selected].id,
-            "task-main"
+            state.selected_workflow_task().map(|task| task.id.as_str()),
+            Some("task-main")
         );
 
-        state.workflow_panel.selected = state
-            .workflow_panel
-            .tasks
+        let selected = state
+            .workflow_tasks()
             .iter()
             .position(|task| task.id == "task-workflow")
             .expect("workflow task remains visible");
+        state.select_workflow_index_for_test(selected);
         backgrounded.last_activity_at_ms = Some(10_000);
         state.update(TuiEvent::WorkflowTasksUpdated {
             tasks: vec![workflow, backgrounded],
         });
 
         assert_eq!(
-            state.workflow_panel.tasks[state.workflow_panel.selected].id,
-            "task-workflow"
+            state.selected_workflow_task().map(|task| task.id.as_str()),
+            Some("task-workflow")
         );
     }
 
@@ -6198,24 +6192,24 @@ mod tests {
 
         assert_eq!(state.panel_mode, PanelMode::Workflows);
         assert_eq!(
-            state.workflow_panel.tasks[state.workflow_panel.selected].id,
-            "task-approval"
+            state.selected_workflow_task().map(|task| task.id.as_str()),
+            Some("task-approval")
         );
 
-        state.workflow_panel.selected = state
-            .workflow_panel
-            .tasks
+        let selected = state
+            .workflow_tasks()
             .iter()
             .position(|task| task.id == "task-workflow")
             .expect("workflow task remains visible");
+        state.select_workflow_index_for_test(selected);
         approval.last_activity_at_ms = Some(10_000);
         state.update(TuiEvent::WorkflowTasksUpdated {
             tasks: vec![workflow, approval],
         });
 
         assert_eq!(
-            state.workflow_panel.tasks[state.workflow_panel.selected].id,
-            "task-workflow"
+            state.selected_workflow_task().map(|task| task.id.as_str()),
+            Some("task-workflow")
         );
     }
 
@@ -6328,8 +6322,8 @@ mod tests {
         selected.is_backgrounded = true;
         let mut other = workflow_task_summary("task-other", "other");
         other.status = TaskStatus::Running;
-        state.workflow_panel.tasks = vec![selected.clone(), other.clone()];
-        state.workflow_panel.selected = 0;
+        state.replace_workflow_tasks_for_test(vec![selected.clone(), other.clone()]);
+        state.select_workflow_index_for_test(0);
 
         selected.is_backgrounded = false;
         state.update(TuiEvent::WorkflowTasksUpdated {

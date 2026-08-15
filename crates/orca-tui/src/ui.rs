@@ -900,7 +900,8 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let tasks = state.workflow_panel.tasks.iter().collect::<Vec<_>>();
+    let selected_index = state.workflow_selected_index();
+    let tasks = state.workflow_tasks().iter().collect::<Vec<_>>();
 
     if tasks.is_empty() {
         let lines = vec![
@@ -921,7 +922,7 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     let row_h: u16 = 2;
     let mut constraints = vec![Constraint::Length(hint_h), Constraint::Length(header_h)];
     constraints.extend(tasks.iter().enumerate().map(|(index, task)| {
-        let detail_rows = if index == state.workflow_panel.selected {
+        let detail_rows = if index == selected_index {
             workflow_metadata_row_count(task)
                 + workflow_phase_detail_rows(task).len() as u16
                 + workflow_agent_row_count(task)
@@ -933,10 +934,7 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     constraints.push(Constraint::Min(0));
     let rows = Layout::vertical(constraints).split(inner);
 
-    let selected_task = state
-        .workflow_panel
-        .tasks
-        .get(state.workflow_panel.selected);
+    let selected_task = state.selected_workflow_task();
     frame.render_widget(
         Paragraph::new(workflow_panel_action_hint(selected_task, theme)),
         rows[0],
@@ -952,7 +950,7 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
 
     for (index, task) in tasks.iter().enumerate() {
         let row_area = rows[index + 2];
-        let selected = index == state.workflow_panel.selected;
+        let selected = index == selected_index;
         let marker = if selected { ">" } else { " " };
         let name = task.name.as_deref().unwrap_or(task.description.as_str());
         let task_type = task_type_label(task);
@@ -1096,8 +1094,7 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
     frame.render_widget(block, area);
 
     let rows = state
-        .workflow_panel
-        .tasks
+        .workflow_tasks()
         .iter()
         .flat_map(|task| {
             let workflow_name = task.name.as_deref().unwrap_or(task.description.as_str());
@@ -3157,7 +3154,7 @@ fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> Color {
 /// elapsed wall-clock time.
 fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::style::Color)> {
     match &state.status {
-        AppStatus::Idle => background_task_activity_line(&state.workflow_panel.tasks, theme),
+        AppStatus::Idle => background_task_activity_line(state.workflow_tasks(), theme),
         AppStatus::Setup | AppStatus::SessionPicker => None,
         AppStatus::Running => {
             let live_elapsed = state
@@ -4635,7 +4632,7 @@ mod tests {
                 context_revision: 1,
                 context_used_tokens: used_tokens,
                 context_limit_tokens: limit_tokens,
-                workflow_tasks: state.workflow_panel.tasks.clone(),
+                workflow_tasks: state.workflow_tasks().to_vec(),
                 current_goal: state.current_goal().cloned(),
                 foreground_operation_id: None,
                 recoverable_operation_id: None,
@@ -7273,7 +7270,7 @@ mod tests {
         );
         approval.status = TaskStatus::ApprovalRequired;
         state.status = AppStatus::Idle;
-        state.workflow_panel.tasks = vec![running, approval];
+        state.replace_workflow_tasks_for_test(vec![running, approval]);
 
         let (text, color) = activity_line(&state, &theme).expect("task attention remains visible");
 
@@ -7336,7 +7333,7 @@ mod tests {
     fn workflows_panel_renders_async_subagent_tasks() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+        state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-subagent".to_string(),
             task_type: TaskType::Subagent,
             status: TaskStatus::Running,
@@ -7380,7 +7377,7 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
             publication_revision: None,
-        }];
+        }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 16))
@@ -7402,7 +7399,7 @@ mod tests {
     fn workflows_panel_renders_selected_workflow_agent_rows() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+        state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-workflow".to_string(),
             task_type: TaskType::Workflow,
             status: TaskStatus::Completed,
@@ -7465,7 +7462,7 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
             publication_revision: None,
-        }];
+        }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 30))
@@ -7503,7 +7500,7 @@ mod tests {
     fn agents_panel_renders_all_workflow_agent_rows() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Agents;
-        state.workflow_panel.tasks = vec![
+        state.replace_workflow_tasks_for_test(vec![
             workflow_task_for_agent_dashboard(
                 "audit",
                 "scan",
@@ -7514,7 +7511,7 @@ mod tests {
                 "review",
                 orca_core::workflow_types::WorkflowAgentStatus::Completed,
             ),
-        ];
+        ]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18))
@@ -7666,7 +7663,7 @@ mod tests {
     fn workflows_panel_renders_selected_task_error_detail() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+        state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
             task_type: TaskType::MainSession,
             status: TaskStatus::Failed,
@@ -7699,7 +7696,7 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
             publication_revision: None,
-        }];
+        }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
@@ -7718,7 +7715,7 @@ mod tests {
     fn workflows_panel_renders_selected_task_multiline_error_detail() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+        state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
             task_type: TaskType::MainSession,
             status: TaskStatus::Failed,
@@ -7751,7 +7748,7 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
             publication_revision: None,
-        }];
+        }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14))
@@ -7813,7 +7810,7 @@ mod tests {
     fn workflows_panel_renders_selected_task_result_detail() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+        state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
             task_type: TaskType::MainSession,
             status: TaskStatus::Completed,
@@ -7846,7 +7843,7 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
             publication_revision: None,
-        }];
+        }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
@@ -7865,7 +7862,7 @@ mod tests {
     fn workflows_panel_renders_contextual_action_hints_for_selected_task() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+        state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
             task_type: TaskType::MainSession,
             status: TaskStatus::Running,
@@ -7898,7 +7895,7 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
             publication_revision: None,
-        }];
+        }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
@@ -7913,7 +7910,9 @@ mod tests {
         assert!(rendered.contains("s stop"));
         assert!(rendered.contains("Esc close"));
 
-        state.workflow_panel.tasks[0].status = TaskStatus::Completed;
+        let mut completed_task = state.workflow_tasks()[0].clone();
+        completed_task.status = TaskStatus::Completed;
+        state.replace_workflow_tasks_for_test(vec![completed_task]);
         terminal
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .expect("draw terminal task");
@@ -7928,7 +7927,7 @@ mod tests {
     fn workflows_panel_renders_foreground_action_hint_for_backgrounded_main_session() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+        state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
             task_type: TaskType::MainSession,
             status: TaskStatus::Running,
@@ -7961,7 +7960,7 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
             publication_revision: None,
-        }];
+        }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
@@ -7979,7 +7978,7 @@ mod tests {
     fn workflows_panel_renders_approval_action_hint_for_selected_background_approval() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
-        state.workflow_panel.tasks = vec![BackgroundTaskSummary {
+        state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-approval".to_string(),
             task_type: TaskType::MainSession,
             status: TaskStatus::ApprovalRequired,
@@ -8018,7 +8017,7 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
             publication_revision: None,
-        }];
+        }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
