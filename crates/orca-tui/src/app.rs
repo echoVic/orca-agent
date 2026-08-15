@@ -3479,7 +3479,7 @@ done
             loop {
                 let event = self
                     .event_rx
-                    .recv_timeout(Duration::from_secs(3))
+                    .recv_timeout(Duration::from_secs(10))
                     .expect("attached hosted TUI event");
                 let event = match accept_attached_tui_event(&mut self.state, event) {
                     Ok(Some(event)) => event,
