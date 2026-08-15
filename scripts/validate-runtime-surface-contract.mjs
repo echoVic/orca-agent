@@ -417,6 +417,16 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
 
 const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
   [
+    "session_picker_transition",
+    new Map([
+      [
+        "crates/orca-tui/src/hosted_session_lifecycle.rs",
+        /pub\(crate\)\s+fn\s+handle_hosted_session_action\s*\(/,
+      ],
+      ["crates/orca-tui/src/app.rs", /\bhandle_hosted_session_action\s*\(/],
+    ]),
+  ],
+  [
     "goal_callbacks",
     new Map([
       [

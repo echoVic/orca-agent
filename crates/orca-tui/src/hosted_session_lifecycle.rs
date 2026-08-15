@@ -11,14 +11,17 @@ use orca_runtime::runtime_host::{
 };
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
+use crate::attachment_routing::AttachmentRouting;
 use crate::background_tasks::notify_recovered_background_approvals_for_tui;
 use crate::bridge;
 use crate::hosted_goal::{goal_continuation_prompt, send_goal_history_error};
 use crate::hosted_runtime::emit_hosted_operation_error;
+use crate::hosted_session::{announce_runtime_ready, emit_typed_history_snapshot};
+use crate::hosted_side::rotate_attached_event_sender;
 use crate::operation_controller::TuiSurfaceTaskControl;
-use crate::surface_actions::TuiSurfaceActions;
-use crate::surface_projection::SurfaceProjectionState;
-use crate::types::TuiEvent;
+use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
+use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
+use crate::types::{SessionAttachmentId, TuiEvent};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_hosted_thread(
@@ -303,6 +306,256 @@ pub(crate) fn refresh_saved_session_picker(event_tx: &mpsc::Sender<TuiEvent>, no
     }
 }
 
+pub(crate) enum HostedSessionAction {
+    New,
+    ForkCurrent { title: Option<String> },
+    RenameCurrent { title: String },
+    ResumeSaved { session_id: String },
+    ForkSaved { session_id: String },
+    RenameSaved { session_id: String, title: String },
+    ArchiveSaved { session_id: String },
+    DeleteSaved { session_id: String },
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_hosted_session_action(
+    action: HostedSessionAction,
+    thread: &mut Option<RuntimeThreadHandle>,
+    host: &RuntimeHostHandle,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    root_event_tx: &mpsc::Sender<TuiEvent>,
+    event_tx: &mut mpsc::Sender<TuiEvent>,
+    session_attachment: &mut SessionAttachmentId,
+    attachment_routing: &Arc<Mutex<AttachmentRouting>>,
+) {
+    match action {
+        HostedSessionAction::New => match start_new_hosted_session(
+            thread,
+            host,
+            config,
+            preloaded,
+            pending_workflow_notifications,
+        ) {
+            Ok(projection) => {
+                rotate_attached_event_sender(
+                    root_event_tx,
+                    session_attachment,
+                    event_tx,
+                    Some(attachment_routing),
+                );
+                let _ = event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
+                announce_runtime_ready(thread.as_ref().expect("new hosted thread"), event_tx);
+                let _ = event_tx.send(TuiEvent::NewSessionStarted);
+            }
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::OperationRejected(error));
+            }
+        },
+        HostedSessionAction::ForkCurrent { title } => match start_forked_hosted_session(
+            thread,
+            host,
+            config,
+            preloaded,
+            pending_workflow_notifications,
+            title,
+        ) {
+            Ok((mode, projection)) => {
+                rotate_attached_event_sender(
+                    root_event_tx,
+                    session_attachment,
+                    event_tx,
+                    Some(attachment_routing),
+                );
+                let _ = event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
+                announce_runtime_ready(thread.as_ref().expect("forked hosted thread"), event_tx);
+                if let Some(runtime_thread) = thread.as_ref()
+                    && let Err(error) = emit_typed_history_snapshot(
+                        runtime_thread,
+                        &mode,
+                        Some(SessionProjectionPresentation::Forked),
+                        event_tx,
+                    )
+                {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                        "failed to project forked conversation: {error}"
+                    )));
+                }
+            }
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::OperationRejected(error));
+            }
+        },
+        HostedSessionAction::RenameCurrent { title } => {
+            let Some(session_id) = thread
+                .as_ref()
+                .and_then(RuntimeThreadHandle::session_id)
+                .map(str::to_string)
+            else {
+                let _ = event_tx.send(TuiEvent::OperationRejected(
+                    "current conversation is not resumable yet".to_string(),
+                ));
+                return;
+            };
+            let rename_result = thread
+                .as_ref()
+                .map(|runtime_thread| {
+                    TuiSurfaceActions::new(runtime_thread.typed_surface())
+                        .rename_current_session(&session_id, &title)
+                })
+                .unwrap_or_else(|| {
+                    Err(std::io::Error::other(
+                        "current conversation surface is unavailable",
+                    ))
+                });
+            match rename_result {
+                Ok(projection) => {
+                    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                        "failed to rename conversation: {error}"
+                    )));
+                }
+            }
+        }
+        HostedSessionAction::ResumeSaved { session_id } => {
+            match switch_saved_hosted_session(
+                thread,
+                host,
+                config,
+                preloaded,
+                pending_workflow_notifications,
+                HistoryMode::Resume(session_id),
+                None,
+            ) {
+                Ok((mode, projection)) => {
+                    rotate_attached_event_sender(
+                        root_event_tx,
+                        session_attachment,
+                        event_tx,
+                        Some(attachment_routing),
+                    );
+                    if let Some(runtime_thread) = thread.as_ref() {
+                        let _ =
+                            event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
+                        announce_runtime_ready(runtime_thread, event_tx);
+                    }
+                    if let Some(runtime_thread) = thread.as_ref()
+                        && let Err(error) =
+                            emit_typed_history_snapshot(runtime_thread, &mode, None, event_tx)
+                    {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                            "failed to project resumed conversation: {error}"
+                        )));
+                    }
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                }
+            }
+        }
+        HostedSessionAction::ForkSaved { session_id } => {
+            match switch_saved_hosted_session(
+                thread,
+                host,
+                config,
+                preloaded,
+                pending_workflow_notifications,
+                HistoryMode::Fork(session_id),
+                None,
+            ) {
+                Ok((mode, projection)) => {
+                    rotate_attached_event_sender(
+                        root_event_tx,
+                        session_attachment,
+                        event_tx,
+                        Some(attachment_routing),
+                    );
+                    if let Some(runtime_thread) = thread.as_ref() {
+                        let _ =
+                            event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
+                        announce_runtime_ready(runtime_thread, event_tx);
+                        if let Err(error) = emit_typed_history_snapshot(
+                            runtime_thread,
+                            &mode,
+                            Some(SessionProjectionPresentation::Forked),
+                            event_tx,
+                        ) {
+                            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                "failed to project forked conversation: {error}"
+                            )));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                }
+            }
+        }
+        HostedSessionAction::RenameSaved { session_id, title } => {
+            match TuiHostActions::rename_saved_session(&session_id, &title) {
+                Ok(()) => refresh_saved_session_picker(
+                    root_event_tx,
+                    format!("Renamed conversation to {title}."),
+                ),
+                Err(error) => {
+                    let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                        "failed to rename conversation: {error}"
+                    )));
+                }
+            }
+        }
+        HostedSessionAction::ArchiveSaved { session_id } => {
+            if thread
+                .as_ref()
+                .and_then(RuntimeThreadHandle::session_id)
+                .is_some_and(|current| current == session_id)
+            {
+                let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(
+                    "cannot archive the current conversation".to_string(),
+                ));
+                return;
+            }
+            match TuiHostActions::archive_saved_session(&session_id) {
+                Ok(()) => refresh_saved_session_picker(
+                    root_event_tx,
+                    "Archived saved conversation.".to_string(),
+                ),
+                Err(error) => {
+                    let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                        "failed to archive conversation: {error}"
+                    )));
+                }
+            }
+        }
+        HostedSessionAction::DeleteSaved { session_id } => {
+            if thread
+                .as_ref()
+                .and_then(RuntimeThreadHandle::session_id)
+                .is_some_and(|current| current == session_id)
+            {
+                let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(
+                    "cannot delete the current conversation".to_string(),
+                ));
+                return;
+            }
+            match TuiHostActions::delete_saved_session(&session_id) {
+                Ok(()) => refresh_saved_session_picker(
+                    root_event_tx,
+                    "Deleted saved conversation.".to_string(),
+                ),
+                Err(error) => {
+                    let _ = root_event_tx.send(TuiEvent::SavedSessionActionFailed(format!(
+                        "failed to delete conversation: {error}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_latest_active_goal_hosted(
     thread: &mut Option<RuntimeThreadHandle>,
@@ -443,5 +696,158 @@ mod tests {
         ));
         assert!(thread.is_none());
         assert!(preloaded.lock().expect("preloaded state").is_none());
+    }
+
+    #[test]
+    fn rename_current_without_thread_uses_focused_session_action_owner() {
+        let mut run_config = crate::test_support::test_run_config();
+        run_config.history_mode = HistoryMode::Record;
+        let config = Arc::new(Mutex::new(run_config));
+        let preloaded = Arc::new(Mutex::new(None));
+        let pending = crate::bridge::PendingWorkflowNotifications::new();
+        let (root_event_tx, event_rx) = mpsc::unbounded();
+        let mut event_tx = root_event_tx.clone();
+        let mut attachment = crate::types::SessionAttachmentId::new(1);
+        let initial_attachment = attachment;
+        let routing = Arc::new(Mutex::new(
+            crate::attachment_routing::AttachmentRouting::new(attachment),
+        ));
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let host = runtime.handle();
+        runtime.shutdown().expect("runtime host shutdown");
+        let mut thread = None;
+
+        handle_hosted_session_action(
+            HostedSessionAction::RenameCurrent {
+                title: "renamed".to_string(),
+            },
+            &mut thread,
+            &host,
+            &config,
+            &preloaded,
+            &pending,
+            &root_event_tx,
+            &mut event_tx,
+            &mut attachment,
+            &routing,
+        );
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::OperationRejected(message))
+                if message == "current conversation is not resumable yet"
+        ));
+        assert!(thread.is_none());
+        assert_eq!(attachment, initial_attachment);
+        assert!(matches!(
+            config.lock().expect("config").history_mode,
+            HistoryMode::Record
+        ));
+        assert!(preloaded.lock().expect("preloaded state").is_none());
+    }
+
+    #[test]
+    fn destructive_saved_actions_reject_the_current_recorded_session_on_root() {
+        let _home = crate::test_support::isolate_orca_home();
+        let mut run_config = crate::test_support::test_run_config();
+        run_config.history_mode = HistoryMode::Record;
+        run_config.show_session_picker = true;
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let host = runtime.handle();
+        let current = host
+            .start_thread(run_config.clone(), "protected conversation")
+            .expect("recorded runtime thread");
+        let session_id = current
+            .session_id()
+            .expect("recorded session id")
+            .to_string();
+        let thread_id = current.thread_id().to_string();
+        let transcript = RuntimeSurfaceHostHandle::load_saved_session(&session_id)
+            .expect("current transcript is loadable before action");
+        let config = Arc::new(Mutex::new(run_config));
+        let preloaded = Arc::new(Mutex::new(Some(transcript)));
+        let pending = crate::bridge::PendingWorkflowNotifications::new();
+        let (root_event_tx, root_event_rx) = mpsc::unbounded();
+        let (attached_event_tx, attached_event_rx) = mpsc::unbounded();
+        let mut event_tx = attached_event_tx;
+        let mut attachment = crate::types::SessionAttachmentId::new(7);
+        let initial_attachment = attachment;
+        let routing = Arc::new(Mutex::new(
+            crate::attachment_routing::AttachmentRouting::new(attachment),
+        ));
+        let mut thread = Some(current);
+
+        for (action, expected) in [
+            (
+                HostedSessionAction::ArchiveSaved {
+                    session_id: session_id.clone(),
+                },
+                "cannot archive the current conversation",
+            ),
+            (
+                HostedSessionAction::DeleteSaved {
+                    session_id: session_id.clone(),
+                },
+                "cannot delete the current conversation",
+            ),
+        ] {
+            handle_hosted_session_action(
+                action,
+                &mut thread,
+                &host,
+                &config,
+                &preloaded,
+                &pending,
+                &root_event_tx,
+                &mut event_tx,
+                &mut attachment,
+                &routing,
+            );
+
+            assert!(matches!(
+                root_event_rx.try_recv(),
+                Ok(TuiEvent::SavedSessionActionFailed(message)) if message == expected
+            ));
+            assert!(root_event_rx.try_recv().is_err());
+            assert!(attached_event_rx.try_recv().is_err());
+            assert_eq!(
+                thread.as_ref().map(RuntimeThreadHandle::thread_id),
+                Some(thread_id.as_str())
+            );
+            assert_eq!(attachment, initial_attachment);
+            assert!(matches!(
+                config.lock().expect("config").history_mode,
+                HistoryMode::Record
+            ));
+            assert!(config.lock().expect("config").show_session_picker);
+            assert_eq!(
+                preloaded
+                    .lock()
+                    .expect("preloaded state")
+                    .as_ref()
+                    .map(|saved| saved.meta.session_id.as_str()),
+                Some(session_id.as_str())
+            );
+            assert_eq!(
+                RuntimeSurfaceHostHandle::load_saved_session(&session_id)
+                    .expect("current transcript remains loadable")
+                    .meta
+                    .session_id,
+                session_id
+            );
+            let saved = RuntimeSurfaceHostHandle::list_saved_sessions(100)
+                .expect("saved session list remains readable")
+                .into_iter()
+                .find(|saved| saved.session_id == session_id)
+                .expect("current session remains in the active list");
+            assert!(!saved.archived);
+        }
+
+        thread
+            .take()
+            .expect("current thread")
+            .shutdown()
+            .expect("current thread shutdown");
+        runtime.shutdown().expect("runtime host shutdown");
     }
 }

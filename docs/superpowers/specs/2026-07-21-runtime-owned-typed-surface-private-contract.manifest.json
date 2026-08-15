@@ -5012,7 +5012,9 @@
       "session_picker_transition",
       [
         "crates/orca-tui/src/session_picker_actions.rs:48",
-        "crates/orca-tui/src/input_event_actions.rs:232"
+        "crates/orca-tui/src/input_event_actions.rs:232",
+        "crates/orca-tui/src/hosted_session_lifecycle.rs:321",
+        "crates/orca-tui/src/app.rs:8815"
       ],
       "session_transition",
       "direct_transcript_load_without_switching_runtime_thread",
@@ -5027,9 +5029,9 @@
     [
       "goal_callbacks",
       [
-        "crates/orca-tui/src/hosted_session_lifecycle.rs:307",
+        "crates/orca-tui/src/hosted_session_lifecycle.rs:560",
         "crates/orca-tui/src/hosted_goal.rs:184",
-        "crates/orca-tui/src/app.rs:9300"
+        "crates/orca-tui/src/app.rs:9181"
       ],
       "goal_session_operation_authority",
       "competing_goal_actor_reread_history_and_thread_shutdown",

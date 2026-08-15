@@ -509,6 +509,63 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const sessionActionCalls = source.match(/\bhandle_hosted_session_action\s*\(/g) ?? [];
+  assert.equal(
+    sessionActionCalls.length,
+    8,
+    "session transition mutation fixture must find all eight production dispatch calls",
+  );
+  const withoutSessionActionDispatch = source.replace(
+    /\bhandle_hosted_session_action\s*\(/g,
+    "removed_hosted_session_action_dispatch(",
+  );
+  assert.match(
+    withoutSessionActionDispatch,
+    /handle_hosted_session_action/,
+    "session transition mutation fixture must preserve the import",
+  );
+  expectFailure(
+    "session transition validation rejects removed production dispatch even when the import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutSessionActionDispatch]]),
+      }),
+    /session_picker_transition source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/hosted_session_lifecycle.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutSessionActionOwner = source.replace(
+    /pub\(crate\)\s+fn\s+handle_hosted_session_action\s*\(/,
+    "pub(crate) fn removed_hosted_session_action_owner(",
+  );
+  assert.notEqual(
+    withoutSessionActionOwner,
+    source,
+    "session owner mutation fixture must remove the production owner definition",
+  );
+  assert.match(
+    withoutSessionActionOwner,
+    /\bhandle_hosted_session_action\s*\(/,
+    "session owner mutation fixture must preserve a call to the removed owner",
+  );
+  expectFailure(
+    "session transition validation rejects a removed production owner even when calls remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutSessionActionOwner]]),
+      }),
+    /session_picker_transition source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/hosted_session_lifecycle\.rs/,
+  );
+}
+
+{
   const manifest = cloneManifest();
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\
