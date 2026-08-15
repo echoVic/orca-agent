@@ -198,6 +198,15 @@ reconcile task sources: non-recorded runtime threads still expose live
 surface producer, so no TUI task cache, protocol, persistence, or runtime
 workflow behavior is introduced.
 
+The 2026-08-15 Side background reentry slice keeps attachment rotation strict
+while restoring the active Side task panel after a return from main. Parent to
+Side activation still retires the previous Side sender and publishes its reset
+and history before accepting new events. It then replaces only the presentation
+monitor for each live runtime-owned background operation with one bound to the
+new attachment. The task remains backgrounded, stale output remains fenced, and
+explicit foreground control is unchanged; no runtime ownership, protocol, or
+persisted data changes.
+
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the
 release checksum, installs the runner and setup helper, and can provision,

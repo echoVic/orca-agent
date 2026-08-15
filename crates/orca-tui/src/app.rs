@@ -3423,6 +3423,82 @@ done
         }
     }
 
+    struct AttachedHostedTuiHarness {
+        action_tx: mpsc::Sender<UserAction>,
+        event_rx: mpsc::Receiver<TuiEvent>,
+        runtime: TuiAgentRuntime,
+        state: AppState,
+    }
+
+    impl AttachedHostedTuiHarness {
+        fn start(config: RunConfig) -> Self {
+            let config = Arc::new(Mutex::new(config));
+            let preloaded = Arc::new(Mutex::new(None));
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let pending = bridge::PendingWorkflowNotifications::new();
+            let controller = TuiSurfaceTaskControl::new();
+            let agent_config = Arc::clone(&config);
+            let agent_preloaded = Arc::clone(&preloaded);
+            let agent_events = event_tx.clone();
+            let agent_pending = pending.clone();
+            let runtime = TuiAgentRuntime::spawn_hosted(
+                action_rx,
+                event_tx,
+                8,
+                controller,
+                move |controller, commands, host| {
+                    hosted_tui_controller_loop(
+                        agent_config,
+                        agent_preloaded,
+                        agent_events,
+                        commands,
+                        controller,
+                        agent_pending,
+                        host,
+                    );
+                },
+            )
+            .expect("attached hosted TUI runtime");
+            let (state, _actions) = test_state();
+            Self {
+                action_tx,
+                event_rx,
+                runtime,
+                state,
+            }
+        }
+
+        fn send(&self, action: UserAction) {
+            self.action_tx
+                .send(action)
+                .expect("attached hosted TUI action");
+        }
+
+        fn recv_until(&mut self, mut predicate: impl FnMut(&TuiEvent) -> bool) -> TuiEvent {
+            loop {
+                let event = self
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("attached hosted TUI event");
+                let event = match accept_attached_tui_event(&mut self.state, event) {
+                    Ok(Some(event)) => event,
+                    Ok(None) | Err(()) => continue,
+                };
+                self.state.update(event.clone());
+                if predicate(&event) {
+                    return event;
+                }
+            }
+        }
+    }
+
+    impl Drop for AttachedHostedTuiHarness {
+        fn drop(&mut self) {
+            let _ = self.runtime.shutdown();
+        }
+    }
+
     #[test]
     fn hosted_tui_submit_clears_actor_operation_before_terminal_ui_event() {
         with_orca_home(|_| {
@@ -3834,6 +3910,74 @@ done
                         && projection.title == parent_title
             ));
             harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_side_reentry_rebinds_background_presentation_to_active_attachment() {
+        with_orca_home(|_| {
+            let mut harness = AttachedHostedTuiHarness::start(test_config(HistoryMode::Record));
+            harness.send(UserAction::Submit("parent identity prompt".to_string()));
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::StartSideConversation {
+                prompt: Some("mock_stream_delay_ms 1500".to_string()),
+            });
+            harness.recv_until(|event| {
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
+            });
+
+            harness.send(UserAction::BackgroundCurrentTurn);
+            let task = matching_task_update(
+                harness.recv_until(|event| {
+                    matching_task_update(event.clone(), |task| {
+                        task.task_type == orca_core::task_types::TaskType::MainSession
+                            && task.status == orca_core::task_types::TaskStatus::Running
+                            && task.is_backgrounded
+                    })
+                    .is_some()
+                }),
+                |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.status == orca_core::task_types::TaskStatus::Running
+                        && task.is_backgrounded
+                },
+            )
+            .expect("captured backgrounded side task");
+
+            harness.send(UserAction::ToggleSideConversation);
+            harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SessionProjectionReset(projection) if projection.session_id.is_some()
+                )
+            });
+            harness.send(UserAction::ToggleSideConversation);
+            harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SessionProjectionReset(projection)
+                        if projection.session_id.is_none() && projection.title == "Side conversation"
+                )
+            });
+
+            let terminal = matching_task_update(
+                harness.recv_until(|event| {
+                    matching_task_update(event.clone(), |candidate| {
+                        candidate.id == task.id
+                            && candidate.is_backgrounded
+                            && candidate.status != orca_core::task_types::TaskStatus::Running
+                    })
+                    .is_some()
+                }),
+                |candidate| {
+                    candidate.id == task.id
+                        && candidate.is_backgrounded
+                        && candidate.status != orca_core::task_types::TaskStatus::Running
+                },
+            )
+            .expect("terminal side task update after reentry");
+            assert!(terminal.is_backgrounded);
         });
     }
 
@@ -8448,6 +8592,17 @@ fn hosted_tui_controller_loop(
                             "failed to project switched conversation: {error}"
                         )));
                         continue;
+                    }
+                    if !side_active {
+                        if let Err(error) = crate::surface_client::rebind_background_presentations(
+                            &target_thread.typed_surface(),
+                            &control,
+                            event_tx.clone(),
+                        ) {
+                            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                "failed to reattach side background task presentation: {error}"
+                            )));
+                        }
                     }
                     if side_active {
                         AttachmentRouting::release_deferred_parent_events(

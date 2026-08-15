@@ -409,6 +409,24 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
     Ok(snapshot)
 }
 
+pub(crate) fn rebind_background_presentations(
+    thread: &RuntimeSurfaceThreadHandle,
+    controller: &TuiSurfaceTaskControl,
+    event_tx: mpsc::Sender<TuiEvent>,
+) -> io::Result<()> {
+    let snapshot = read_snapshot(thread)?;
+    let surface = thread.surface();
+    for background in snapshot.background_operations {
+        spawn_background_presentation(
+            &surface,
+            background.operation_id,
+            controller,
+            event_tx.clone(),
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn update_session_metadata(
     thread: &RuntimeSurfaceThreadHandle,
     expected_revision: SessionMetadataRevision,
