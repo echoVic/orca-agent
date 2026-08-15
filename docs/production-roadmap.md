@@ -241,6 +241,16 @@ transaction. The controller still chooses when Goal resume runs and owns
 attachments, action routing, and final shutdown. This changes no runtime
 surface, persistence, CLI, server/JSONL, ACP, or user-visible Goal behavior.
 
+The 2026-08-16 hosted Goal action ownership slice moves the six show/set/edit/
+clear/pause/resume transactions into one `hosted_goal.rs` entry point. The
+controller now maps existing `UserAction` variants into a crate-private command
+without copying Goal state. Thread startup, runtime-ready and notice ordering,
+committed projection publication, latest-active recovery delegation, and
+Goal-run error shaping remain unchanged. The controller still owns Side
+restrictions, action selection, attachments, and final shutdown. This changes
+no runtime surface, persistence, CLI, server/JSONL, ACP, or user-visible Goal
+behavior.
+
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
 plan and its failed-update marker. Existing `PlanUpdated` and legacy
@@ -1437,15 +1447,16 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established twenty-one focused owners/boundaries so far (insert-escape, presentation,
+   stream has established twenty-three focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection,
    session-identity projection, workflow-task projection, hosted Goal
    orchestration, hosted session projection, hosted session lifecycle, hosted
-   settings, hosted submission, and hosted latest-active Goal recovery);
-   `app.rs` is currently 9,518 lines and `types.rs` 8,806 lines. Renderer-owned
-   orchestration and cold legacy registry reconciliation remain open; live
+   settings, hosted submission, hosted latest-active Goal recovery, and hosted
+   Goal action ownership); `app.rs` is currently 9,385 lines,
+   `hosted_goal.rs` 404 lines, and `types.rs` 8,806 lines. Side and other
+   renderer-owned orchestration plus cold legacy registry reconciliation remain open; live
    task/operation projection duplication has been removed from the TUI event
    boundary (`surface_projection.rs`, 3,280 lines).
 4. **P2.4 context/cache identity is not a release slice.** DeepSeek usage

@@ -2,17 +2,21 @@
 //! runtime handles, configuration, and event channels remain controller-owned.
 
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel as mpsc;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_runtime::history;
-use orca_runtime::runtime_host::{HostedOperationKind, RuntimeThreadHandle};
+use orca_runtime::runtime_host::{HostedOperationKind, RuntimeHostHandle, RuntimeThreadHandle};
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
+use crate::bridge;
 use crate::hosted_runtime::{
     TuiHostedOperationOutcome, emit_hosted_operation_error, hosted_turn_request,
     run_hosted_ordinary_turn, send_submission_error,
 };
+use crate::hosted_session::announce_runtime_ready;
+use crate::hosted_session_lifecycle::{ensure_hosted_thread, resume_latest_active_goal_hosted};
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
@@ -165,4 +169,236 @@ pub(crate) fn send_goal_history_error(event_tx: &mpsc::Sender<TuiEvent>) {
 
 pub(crate) fn goal_history_error_message() -> &'static str {
     "persistent goals require recorded history; enable history before using /goal"
+}
+
+pub(crate) enum HostedGoalAction {
+    Show,
+    Set(String),
+    Edit(String),
+    Clear,
+    Pause,
+    Resume,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_hosted_goal_action(
+    action: HostedGoalAction,
+    thread: &mut Option<RuntimeThreadHandle>,
+    host: &RuntimeHostHandle,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+) {
+    match action {
+        HostedGoalAction::Show => show_hosted_goal(thread, preloaded, config, event_tx),
+        HostedGoalAction::Set(objective) => {
+            let cfg = config.lock().unwrap().clone();
+            let thread_was_missing = thread.is_none();
+            if let Err(error) =
+                ensure_hosted_thread(thread, host, &cfg, preloaded, &objective, event_tx)
+            {
+                let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                return;
+            }
+            if thread_was_missing {
+                announce_runtime_ready(thread.as_ref().expect("goal thread"), event_tx);
+            }
+            let actions = TuiSurfaceActions::new(
+                thread
+                    .as_ref()
+                    .expect("goal thread initialized")
+                    .typed_surface(),
+            );
+            let _ = event_tx.send(TuiEvent::Notice(
+                "Starting goal. Automatic continuation will keep running while it remains active."
+                    .to_string(),
+            ));
+            if let Err(error) = actions.set_goal_and_run(objective, control, event_tx) {
+                emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
+            }
+        }
+        HostedGoalAction::Edit(objective) => {
+            let Some(session_id) =
+                existing_hosted_goal_session_id(thread.as_ref(), preloaded, config, event_tx)
+            else {
+                return;
+            };
+            if thread.is_none() {
+                let cfg = config.lock().unwrap().clone();
+                if let Err(error) =
+                    ensure_hosted_thread(thread, host, &cfg, preloaded, &objective, event_tx)
+                {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    return;
+                }
+                announce_runtime_ready(
+                    thread.as_ref().expect("restored Goal edit thread"),
+                    event_tx,
+                );
+            }
+            let Some(runtime_thread) = thread.as_ref() else {
+                return;
+            };
+            let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+            match actions.edit_goal(&session_id, objective, now_timestamp()) {
+                Ok(projection) => {
+                    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(format!("failed to edit goal: {error}")));
+                }
+            }
+        }
+        HostedGoalAction::Clear => {
+            let Some(session_id) =
+                existing_hosted_goal_session_id(thread.as_ref(), preloaded, config, event_tx)
+            else {
+                return;
+            };
+            if thread.is_none() {
+                let cfg = config.lock().unwrap().clone();
+                if let Err(error) =
+                    ensure_hosted_thread(thread, host, &cfg, preloaded, "clear Goal", event_tx)
+                {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    return;
+                }
+                announce_runtime_ready(
+                    thread.as_ref().expect("restored Goal clear thread"),
+                    event_tx,
+                );
+            }
+            let Some(runtime_thread) = thread.as_ref() else {
+                return;
+            };
+            let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+            match actions.clear_goal(&session_id) {
+                Ok(projection) => {
+                    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+                }
+                Err(error) => {
+                    let _ =
+                        event_tx.send(TuiEvent::Error(format!("failed to clear goal: {error}")));
+                }
+            }
+        }
+        HostedGoalAction::Pause => {
+            let Some(_session_id) =
+                existing_hosted_goal_session_id(thread.as_ref(), preloaded, config, event_tx)
+            else {
+                return;
+            };
+            if thread.is_none() {
+                let cfg = config.lock().unwrap().clone();
+                if let Err(error) =
+                    ensure_hosted_thread(thread, host, &cfg, preloaded, "pause Goal", event_tx)
+                {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    return;
+                }
+                announce_runtime_ready(
+                    thread.as_ref().expect("restored Goal pause thread"),
+                    event_tx,
+                );
+            }
+            let Some(runtime_thread) = thread.as_ref() else {
+                return;
+            };
+            let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+            match actions.pause_goal() {
+                Ok(projection) => {
+                    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+                }
+                Err(error) => {
+                    let _ =
+                        event_tx.send(TuiEvent::Error(format!("failed to pause goal: {error}")));
+                }
+            }
+        }
+        HostedGoalAction::Resume => {
+            if current_hosted_goal_session_id(thread.as_ref(), preloaded).is_none() {
+                resume_latest_active_goal_hosted(
+                    thread,
+                    host,
+                    config,
+                    preloaded,
+                    event_tx,
+                    control,
+                    pending_workflow_notifications,
+                );
+                return;
+            }
+            let Some(session_id) = current_hosted_goal_session_id(thread.as_ref(), preloaded)
+            else {
+                return;
+            };
+            let goal = thread.as_ref().and_then(|runtime_thread| {
+                TuiSurfaceActions::new(runtime_thread.typed_surface())
+                    .goal(&session_id)
+                    .ok()
+                    .flatten()
+            });
+            if let (Some(runtime_thread), Some(goal)) = (thread.as_ref(), goal) {
+                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+                if let Err(error) = actions.resume_goal_and_run(
+                    goal_continuation_prompt(&goal.objective, 1),
+                    control,
+                    event_tx,
+                ) {
+                    emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
+                }
+            }
+        }
+    }
+}
+
+fn now_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crossbeam_channel as mpsc;
+
+    use super::*;
+
+    #[test]
+    fn empty_recorded_goal_show_uses_focused_owner() {
+        let mut run_config = crate::test_support::test_run_config();
+        run_config.history_mode = HistoryMode::Record;
+        let config = Arc::new(Mutex::new(run_config));
+        let preloaded = Arc::new(Mutex::new(None));
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+        let pending = crate::bridge::PendingWorkflowNotifications::new();
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let host = runtime.handle();
+        runtime.shutdown().expect("runtime host shutdown");
+        let mut thread = None;
+
+        handle_hosted_goal_action(
+            HostedGoalAction::Show,
+            &mut thread,
+            &host,
+            &config,
+            &preloaded,
+            &event_tx,
+            &control,
+            &pending,
+        );
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::GoalStatus(None))
+        ));
+        assert!(thread.is_none());
+        assert!(preloaded.lock().expect("preloaded state").is_none());
+    }
 }

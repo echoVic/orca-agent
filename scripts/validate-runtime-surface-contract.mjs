@@ -403,7 +403,7 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["session_picker_transition", /fn handle_session_picker_key|Session picker/],
   [
     "goal_callbacks",
-    /fn update_goal_status_for_session|fn show_hosted_goal|fn resume_latest_active_goal_hosted|\bshow_hosted_goal\s*\(/,
+    /fn update_goal_status_for_session|fn show_hosted_goal|fn resume_latest_active_goal_hosted|\bhandle_hosted_goal_action\s*\(/,
   ],
   [
     "mention_catalog_expansion",
@@ -414,6 +414,30 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["input_history", /fn load_input_history|fn append_input_history|fn record_prompt/],
   ["terminal_clipboard_notifications", /MouseEventKind::Up|pending_clipboard_copy|desktop_notifications/],
 ]);
+
+const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
+  [
+    "goal_callbacks",
+    new Map([
+      [
+        "crates/orca-tui/src/hosted_session_lifecycle.rs",
+        /pub\(crate\)\s+fn\s+resume_latest_active_goal_hosted\s*\(/,
+      ],
+      [
+        "crates/orca-tui/src/hosted_goal.rs",
+        /pub\(crate\)\s+fn\s+handle_hosted_goal_action\s*\(/,
+      ],
+      ["crates/orca-tui/src/app.rs", /\bhandle_hosted_goal_action\s*\(/],
+    ]),
+  ],
+]);
+
+function tuiEntrypointAnchor(entrypoint, relativePath) {
+  return (
+    TUI_ENTRYPOINT_SOURCE_ANCHORS.get(entrypoint)?.get(relativePath) ??
+    TUI_ENTRYPOINT_ANCHORS.get(entrypoint)
+  );
+}
 
 const TUI_RUNTIME_MUTATION_APIS = new Map([
   [
@@ -3875,7 +3899,7 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
       if (!source.relativePath.startsWith("crates/orca-tui/src/")) {
         fail(`${row[0]} source is outside crates/orca-tui/src/: ${reference}`);
       }
-      if (!TUI_ENTRYPOINT_ANCHORS.get(row[0]).test(source.source)) {
+      if (!tuiEntrypointAnchor(row[0], source.relativePath).test(source.source)) {
         fail(`${row[0]} source does not contain its reviewed entrypoint anchor: ${reference}`);
       }
     }

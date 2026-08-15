@@ -454,28 +454,57 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 {
   const relativePath = "crates/orca-tui/src/app.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
-  const withoutGoalShowCallback = source.replace(
-    /^\s*show_hosted_goal\(&thread, &preloaded, &config, &event_tx\);\r?\n/m,
-    "",
+  const goalActionCalls = source.match(/\bhandle_hosted_goal_action\s*\(/g) ?? [];
+  assert.equal(
+    goalActionCalls.length,
+    6,
+    "goal callback mutation fixture must find all six production dispatch calls",
   );
-  assert.notEqual(
-    withoutGoalShowCallback,
-    source,
-    "goal callback mutation fixture must remove the production call",
+  const withoutGoalActionDispatch = source.replace(
+    /\bhandle_hosted_goal_action\s*\(/g,
+    "removed_hosted_goal_action_dispatch(",
   );
   assert.match(
-    withoutGoalShowCallback,
-    /show_hosted_goal,/,
+    withoutGoalActionDispatch,
+    /handle_hosted_goal_action/,
     "goal callback mutation fixture must preserve the import",
   );
   expectFailure(
-    "goal callback validation rejects a removed production call even when the import remains",
+    "goal callback validation rejects removed production dispatch even when the import remains",
     () =>
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
-        sourceOverrides: new Map([[relativePath, withoutGoalShowCallback]]),
+        sourceOverrides: new Map([[relativePath, withoutGoalActionDispatch]]),
       }),
     /goal_callbacks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/hosted_goal.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutGoalActionOwner = source.replace(
+    /pub\(crate\)\s+fn\s+handle_hosted_goal_action\s*\(/,
+    "pub(crate) fn removed_hosted_goal_action_owner(",
+  );
+  assert.notEqual(
+    withoutGoalActionOwner,
+    source,
+    "goal owner mutation fixture must remove the production owner definition",
+  );
+  assert.match(
+    withoutGoalActionOwner,
+    /\bhandle_hosted_goal_action\s*\(/,
+    "goal owner mutation fixture must preserve a call to the removed owner",
+  );
+  expectFailure(
+    "goal callback validation rejects a removed production owner even when calls remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutGoalActionOwner]]),
+      }),
+    /goal_callbacks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/hosted_goal\.rs/,
   );
 }
 

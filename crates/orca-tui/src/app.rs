@@ -2,7 +2,7 @@ use crossbeam_channel as mpsc;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -16,8 +16,10 @@ use orca_core::config::{HistoryMode, RunConfig};
 #[cfg(test)]
 use orca_core::conversation::Message;
 use orca_runtime::history;
+#[cfg(test)]
+use orca_runtime::runtime_host::HostedOperationKind;
 use orca_runtime::runtime_host::{
-    HostedOperationKind, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
+    RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
 };
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
@@ -45,12 +47,10 @@ use crate::exit_policy::{exit_resume_hint, exit_session_id};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 #[cfg(test)]
 use crate::hosted_goal::run_hosted_goal_run;
-use crate::hosted_goal::{
-    current_hosted_goal_session_id, existing_hosted_goal_session_id, goal_continuation_prompt,
-    show_hosted_goal,
-};
+use crate::hosted_goal::{HostedGoalAction, handle_hosted_goal_action};
 #[cfg(test)]
 use crate::hosted_runtime::TuiHostedOperationOutcome;
+#[cfg(test)]
 use crate::hosted_runtime::emit_hosted_operation_error;
 #[cfg(test)]
 use crate::hosted_runtime::{hosted_turn_request, run_hosted_ordinary_turn, send_submission_error};
@@ -62,8 +62,8 @@ use crate::hosted_session::{
 use crate::hosted_session::{chat_message_from_history, load_saved_history_fallback};
 use crate::hosted_session_lifecycle::{
     ensure_hosted_thread, preflight_started_session, reap_hosted_thread,
-    refresh_saved_session_picker, resume_latest_active_goal_hosted, start_forked_hosted_session,
-    start_new_hosted_session, switch_saved_hosted_session,
+    refresh_saved_session_picker, start_forked_hosted_session, start_new_hosted_session,
+    switch_saved_hosted_session,
 };
 use crate::hosted_settings::{
     apply_hosted_settings_action, settings_intent_patches, surface_approval_mode,
@@ -801,13 +801,6 @@ fn run_hosted_tui_controller_for_test(
         std::thread::sleep(Duration::from_millis(5));
     }
     runtime.shutdown().expect("hosted TUI test shutdown");
-}
-
-fn now_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -9304,202 +9297,76 @@ fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::GoalShow) => {
-                show_hosted_goal(&thread, &preloaded, &config, &event_tx);
-            }
-            Ok(UserAction::GoalSet(objective)) => {
-                let cfg = config.lock().unwrap().clone();
-                let thread_was_missing = thread.is_none();
-                if let Err(error) = ensure_hosted_thread(
+                handle_hosted_goal_action(
+                    HostedGoalAction::Show,
                     &mut thread,
                     &host,
-                    &cfg,
+                    &config,
                     &preloaded,
-                    &objective,
                     &event_tx,
-                ) {
-                    send_hosted_action_failure(&event_tx, error);
-                    continue;
-                }
-                if thread_was_missing {
-                    announce_runtime_ready(thread.as_ref().expect("goal thread"), &event_tx);
-                }
-                let actions = TuiSurfaceActions::new(
-                    thread
-                        .as_ref()
-                        .expect("goal thread initialized")
-                        .typed_surface(),
+                    &control,
+                    &pending_workflow_notifications,
                 );
-                let _ = event_tx.send(TuiEvent::Notice(
-                    "Starting goal. Automatic continuation will keep running while it remains active."
-                        .to_string(),
-                ));
-                if let Err(error) = actions.set_goal_and_run(objective, &control, &event_tx) {
-                    emit_hosted_operation_error(&event_tx, error, &HostedOperationKind::GoalRun);
-                }
+            }
+            Ok(UserAction::GoalSet(objective)) => {
+                handle_hosted_goal_action(
+                    HostedGoalAction::Set(objective),
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &event_tx,
+                    &control,
+                    &pending_workflow_notifications,
+                );
             }
             Ok(UserAction::GoalEdit(objective)) => {
-                let Some(session_id) = existing_hosted_goal_session_id(
-                    thread.as_ref(),
-                    &preloaded,
+                handle_hosted_goal_action(
+                    HostedGoalAction::Edit(objective),
+                    &mut thread,
+                    &host,
                     &config,
+                    &preloaded,
                     &event_tx,
-                ) else {
-                    continue;
-                };
-                if thread.is_none() {
-                    let cfg = config.lock().unwrap().clone();
-                    if let Err(error) = ensure_hosted_thread(
-                        &mut thread,
-                        &host,
-                        &cfg,
-                        &preloaded,
-                        &objective,
-                        &event_tx,
-                    ) {
-                        send_hosted_action_failure(&event_tx, error);
-                        continue;
-                    }
-                    announce_runtime_ready(
-                        thread.as_ref().expect("restored Goal edit thread"),
-                        &event_tx,
-                    );
-                }
-                let Some(runtime_thread) = thread.as_ref() else {
-                    continue;
-                };
-                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                match actions.edit_goal(&session_id, objective, now_timestamp()) {
-                    Ok(projection) => {
-                        let _ =
-                            event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
-                    }
-                    Err(error) => {
-                        let _ =
-                            event_tx.send(TuiEvent::Error(format!("failed to edit goal: {error}")));
-                    }
-                }
+                    &control,
+                    &pending_workflow_notifications,
+                );
             }
             Ok(UserAction::GoalClear) => {
-                let Some(session_id) = existing_hosted_goal_session_id(
-                    thread.as_ref(),
-                    &preloaded,
+                handle_hosted_goal_action(
+                    HostedGoalAction::Clear,
+                    &mut thread,
+                    &host,
                     &config,
+                    &preloaded,
                     &event_tx,
-                ) else {
-                    continue;
-                };
-                if thread.is_none() {
-                    let cfg = config.lock().unwrap().clone();
-                    if let Err(error) = ensure_hosted_thread(
-                        &mut thread,
-                        &host,
-                        &cfg,
-                        &preloaded,
-                        "clear Goal",
-                        &event_tx,
-                    ) {
-                        send_hosted_action_failure(&event_tx, error);
-                        continue;
-                    }
-                    announce_runtime_ready(
-                        thread.as_ref().expect("restored Goal clear thread"),
-                        &event_tx,
-                    );
-                }
-                let Some(runtime_thread) = thread.as_ref() else {
-                    continue;
-                };
-                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                match actions.clear_goal(&session_id) {
-                    Ok(projection) => {
-                        let _ =
-                            event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
-                    }
-                    Err(error) => {
-                        let _ = event_tx
-                            .send(TuiEvent::Error(format!("failed to clear goal: {error}")));
-                    }
-                }
+                    &control,
+                    &pending_workflow_notifications,
+                );
             }
             Ok(UserAction::GoalPause) => {
-                let Some(_session_id) = existing_hosted_goal_session_id(
-                    thread.as_ref(),
-                    &preloaded,
+                handle_hosted_goal_action(
+                    HostedGoalAction::Pause,
+                    &mut thread,
+                    &host,
                     &config,
+                    &preloaded,
                     &event_tx,
-                ) else {
-                    continue;
-                };
-                if thread.is_none() {
-                    let cfg = config.lock().unwrap().clone();
-                    if let Err(error) = ensure_hosted_thread(
-                        &mut thread,
-                        &host,
-                        &cfg,
-                        &preloaded,
-                        "pause Goal",
-                        &event_tx,
-                    ) {
-                        send_hosted_action_failure(&event_tx, error);
-                        continue;
-                    }
-                    announce_runtime_ready(
-                        thread.as_ref().expect("restored Goal pause thread"),
-                        &event_tx,
-                    );
-                }
-                let Some(runtime_thread) = thread.as_ref() else {
-                    continue;
-                };
-                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                match actions.pause_goal() {
-                    Ok(projection) => {
-                        let _ =
-                            event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
-                    }
-                    Err(error) => {
-                        let _ = event_tx
-                            .send(TuiEvent::Error(format!("failed to pause goal: {error}")));
-                    }
-                }
+                    &control,
+                    &pending_workflow_notifications,
+                );
             }
             Ok(UserAction::GoalResume) => {
-                if current_hosted_goal_session_id(thread.as_ref(), &preloaded).is_none() {
-                    resume_latest_active_goal_hosted(
-                        &mut thread,
-                        &host,
-                        &config,
-                        &preloaded,
-                        &event_tx,
-                        &control,
-                        &pending_workflow_notifications,
-                    );
-                    continue;
-                }
-                let Some(session_id) = current_hosted_goal_session_id(thread.as_ref(), &preloaded)
-                else {
-                    continue;
-                };
-                let goal = thread.as_ref().and_then(|runtime_thread| {
-                    TuiSurfaceActions::new(runtime_thread.typed_surface())
-                        .goal(&session_id)
-                        .ok()
-                        .flatten()
-                });
-                if let (Some(runtime_thread), Some(goal)) = (thread.as_ref(), goal) {
-                    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                    if let Err(error) = actions.resume_goal_and_run(
-                        goal_continuation_prompt(&goal.objective, 1),
-                        &control,
-                        &event_tx,
-                    ) {
-                        emit_hosted_operation_error(
-                            &event_tx,
-                            error,
-                            &HostedOperationKind::GoalRun,
-                        );
-                    }
-                }
+                handle_hosted_goal_action(
+                    HostedGoalAction::Resume,
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &event_tx,
+                    &control,
+                    &pending_workflow_notifications,
+                );
             }
             Ok(UserAction::Cancel) | Err(_) => break,
             Ok(UserAction::RespondToInteraction { .. }) => {}
