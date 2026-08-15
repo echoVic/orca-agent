@@ -64,6 +64,9 @@ use crate::hosted_session_lifecycle::{
     refresh_saved_session_picker, start_forked_hosted_session, start_new_hosted_session,
     switch_saved_hosted_session,
 };
+use crate::hosted_settings::{
+    apply_hosted_settings_action, settings_intent_patches, surface_approval_mode,
+};
 use crate::hosted_side::{
     HostedSideParent, hosted_config_for_active, rotate_attached_event_sender,
     rotate_side_event_sender, shutdown_attached_side_on_controller_exit,
@@ -87,7 +90,7 @@ use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::presentation::InlineTerminal;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
-use crate::slash_command_actions::{SettingsIntent, decode_settings_intent};
+use crate::slash_command_actions::decode_settings_intent;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::stdio_guard::RetryWriter;
 use crate::submitted_turn::SubmittedTurn;
@@ -9668,175 +9671,4 @@ fn resume_latest_active_goal_hosted(
             emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
         }
     }
-}
-
-fn settings_intent_patches(
-    intent: SettingsIntent,
-) -> Vec<orca_runtime::surface::RuntimeSettingsPatch> {
-    let mut patches = Vec::new();
-    if let Some(model) = intent.model
-        && let Ok(model) = orca_runtime::surface::NonEmptyText::try_new(model)
-    {
-        patches.push(orca_runtime::surface::RuntimeSettingsPatch::SetModel { model });
-    }
-    if let Some(effort) = intent.reasoning_effort {
-        patches.push(orca_runtime::surface::RuntimeSettingsPatch::SetReasoning {
-            effort: match effort {
-                orca_core::config::ReasoningEffort::Low => {
-                    orca_runtime::surface::SurfaceReasoningEffort::Low
-                }
-                orca_core::config::ReasoningEffort::High => {
-                    orca_runtime::surface::SurfaceReasoningEffort::High
-                }
-                orca_core::config::ReasoningEffort::Max => {
-                    orca_runtime::surface::SurfaceReasoningEffort::Max
-                }
-            },
-        });
-    }
-    if let Some(mode) = intent.approval_mode {
-        patches.push(
-            orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
-                mode: surface_approval_mode(mode),
-            },
-        );
-    }
-    patches
-}
-
-fn surface_approval_mode(
-    mode: orca_core::approval_types::ApprovalMode,
-) -> orca_runtime::surface::SurfaceApprovalMode {
-    match mode {
-        orca_core::approval_types::ApprovalMode::Suggest => {
-            orca_runtime::surface::SurfaceApprovalMode::Suggest
-        }
-        orca_core::approval_types::ApprovalMode::AutoEdit => {
-            orca_runtime::surface::SurfaceApprovalMode::AutoEdit
-        }
-        orca_core::approval_types::ApprovalMode::FullAuto => {
-            orca_runtime::surface::SurfaceApprovalMode::FullAuto
-        }
-        orca_core::approval_types::ApprovalMode::Plan => {
-            orca_runtime::surface::SurfaceApprovalMode::Plan
-        }
-    }
-}
-
-fn apply_hosted_settings_action(
-    thread: Option<&RuntimeThreadHandle>,
-    config: &Arc<Mutex<RunConfig>>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    patches: Vec<orca_runtime::surface::RuntimeSettingsPatch>,
-) -> bool {
-    if patches.is_empty() {
-        return false;
-    }
-    if let Some(thread) = thread {
-        let patches = match orca_runtime::surface::NonEmptyVec::try_new(patches) {
-            Ok(patches) => patches,
-            Err(_) => return false,
-        };
-        let actions = TuiSurfaceActions::new(thread.typed_surface());
-        let settings = match actions.update_settings(patches) {
-            Ok(settings) => settings,
-            Err(error) => {
-                let _ = event_tx.send(TuiEvent::OperationRejected(error.to_string()));
-                return false;
-            }
-        };
-        let model = settings.effective.model.as_str().to_string();
-        let reasoning_effort = match settings.effective.reasoning_effort {
-            orca_runtime::surface::SurfaceReasoningEffort::Low => {
-                orca_core::config::ReasoningEffort::Low
-            }
-            orca_runtime::surface::SurfaceReasoningEffort::High => {
-                orca_core::config::ReasoningEffort::High
-            }
-            orca_runtime::surface::SurfaceReasoningEffort::Max => {
-                orca_core::config::ReasoningEffort::Max
-            }
-            orca_runtime::surface::SurfaceReasoningEffort::Medium => {
-                let _ = event_tx.send(TuiEvent::OperationRejected(
-                    "runtime returned an unsupported reasoning effort".to_string(),
-                ));
-                return false;
-            }
-        };
-        let approval_mode = match settings.effective.approval_mode {
-            orca_runtime::surface::SurfaceApprovalMode::Suggest => {
-                orca_core::approval_types::ApprovalMode::Suggest
-            }
-            orca_runtime::surface::SurfaceApprovalMode::AutoEdit => {
-                orca_core::approval_types::ApprovalMode::AutoEdit
-            }
-            orca_runtime::surface::SurfaceApprovalMode::FullAuto => {
-                orca_core::approval_types::ApprovalMode::FullAuto
-            }
-            orca_runtime::surface::SurfaceApprovalMode::Plan => {
-                orca_core::approval_types::ApprovalMode::Plan
-            }
-        };
-        if let Ok(mut cfg) = config.lock() {
-            cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(model.clone()));
-            cfg.reasoning_effort = reasoning_effort;
-            cfg.approval_mode = approval_mode;
-        }
-        let _ = event_tx.send(TuiEvent::SettingsUpdated {
-            model,
-            reasoning_effort,
-            approval_mode,
-        });
-        return true;
-    }
-
-    let mut cfg = config
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for patch in patches {
-        match patch {
-            orca_runtime::surface::RuntimeSettingsPatch::SetModel { model } => {
-                cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(
-                    model.as_str().to_string(),
-                ));
-            }
-            orca_runtime::surface::RuntimeSettingsPatch::SetReasoning { effort } => {
-                cfg.reasoning_effort = match effort {
-                    orca_runtime::surface::SurfaceReasoningEffort::Low => {
-                        orca_core::config::ReasoningEffort::Low
-                    }
-                    orca_runtime::surface::SurfaceReasoningEffort::High => {
-                        orca_core::config::ReasoningEffort::High
-                    }
-                    orca_runtime::surface::SurfaceReasoningEffort::Max => {
-                        orca_core::config::ReasoningEffort::Max
-                    }
-                    orca_runtime::surface::SurfaceReasoningEffort::Medium => continue,
-                };
-            }
-            orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode { mode } => {
-                cfg.approval_mode = match mode {
-                    orca_runtime::surface::SurfaceApprovalMode::Suggest => {
-                        orca_core::approval_types::ApprovalMode::Suggest
-                    }
-                    orca_runtime::surface::SurfaceApprovalMode::AutoEdit => {
-                        orca_core::approval_types::ApprovalMode::AutoEdit
-                    }
-                    orca_runtime::surface::SurfaceApprovalMode::FullAuto => {
-                        orca_core::approval_types::ApprovalMode::FullAuto
-                    }
-                    orca_runtime::surface::SurfaceApprovalMode::Plan => {
-                        orca_core::approval_types::ApprovalMode::Plan
-                    }
-                };
-            }
-            _ => {}
-        }
-    }
-    let _ = event_tx.send(TuiEvent::SettingsUpdated {
-        model: cfg.model.display_name().to_string(),
-        reasoning_effort: cfg.reasoning_effort,
-        approval_mode: cfg.approval_mode,
-    });
-    true
 }
