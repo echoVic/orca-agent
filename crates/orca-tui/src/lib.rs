@@ -29,6 +29,7 @@ mod hosted_session;
 mod hosted_session_lifecycle;
 mod hosted_settings;
 mod hosted_side;
+mod hosted_submission;
 mod idle_key_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;

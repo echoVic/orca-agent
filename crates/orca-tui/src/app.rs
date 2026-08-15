@@ -43,16 +43,17 @@ use crate::composer_textarea::{
 use crate::exit_policy::TuiExit;
 use crate::exit_policy::{exit_resume_hint, exit_session_id};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
+#[cfg(test)]
+use crate::hosted_goal::run_hosted_goal_run;
 use crate::hosted_goal::{
     current_hosted_goal_session_id, existing_hosted_goal_session_id, goal_continuation_prompt,
-    run_hosted_goal_run, send_goal_history_error, show_hosted_goal,
+    send_goal_history_error, show_hosted_goal,
 };
 #[cfg(test)]
 use crate::hosted_runtime::TuiHostedOperationOutcome;
-use crate::hosted_runtime::{
-    emit_hosted_operation_error, hosted_turn_request, run_hosted_ordinary_turn,
-    send_submission_error,
-};
+use crate::hosted_runtime::emit_hosted_operation_error;
+#[cfg(test)]
+use crate::hosted_runtime::{hosted_turn_request, run_hosted_ordinary_turn, send_submission_error};
 use crate::hosted_session::{
     announce_runtime_ready, emit_empty_history_snapshot, emit_typed_history_snapshot,
     project_hosted_thread_attached, read_hosted_projection_batch, typed_history_startup_eligible,
@@ -72,6 +73,7 @@ use crate::hosted_side::{
     rotate_side_event_sender, shutdown_attached_side_on_controller_exit,
     side_parent_status_for_runtime_thread,
 };
+use crate::hosted_submission::handle_hosted_submitted_turn;
 use crate::input_event_actions::{
     BatchedInputEvent, MouseFlow, coalesce_input_events, consume_focus_event, handle_mouse_event,
     handle_paste_event, handle_resize_event, handle_scroll_lines, should_queue_input_event,
@@ -9508,69 +9510,6 @@ fn hosted_tui_controller_loop(
         shutdown_attached_side_on_controller_exit(side);
     } else if let Some(runtime_thread) = thread {
         let _ = runtime_thread.shutdown();
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_hosted_submitted_turn(
-    submitted_turn: SubmittedTurn,
-    config: &Arc<Mutex<RunConfig>>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    thread: &mut Option<RuntimeThreadHandle>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    control: &TuiSurfaceTaskControl,
-    _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-    host: &RuntimeHostHandle,
-) {
-    let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
-    let queued_id = submitted_turn.queued_id();
-    let cfg = config.lock().unwrap().clone();
-    let thread_was_missing = thread.is_none();
-    let cwd = cfg
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let title_seed = submitted_turn.title_seed(submitted_turn.prompt());
-    if let Err(error) = ensure_hosted_thread(thread, host, &cfg, preloaded, &title_seed, event_tx) {
-        send_submission_error(event_tx, queued_id, rejection_prompt.as_deref(), error);
-        return;
-    }
-    if thread_was_missing {
-        announce_runtime_ready(thread.as_ref().expect("submitted thread"), event_tx);
-    }
-    let runtime_thread = thread.as_ref().expect("hosted thread initialized");
-    let workspace_roots = cfg
-        .runtime_workspace_roots
-        .clone()
-        .filter(|roots| !roots.is_empty())
-        .unwrap_or_else(|| vec![cwd.clone()]);
-    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-    let prompt = match submitted_turn.prompt_for_model(&actions, &cwd, &workspace_roots) {
-        Ok(prompt) => prompt,
-        Err(error) => {
-            send_submission_error(event_tx, queued_id, rejection_prompt.as_deref(), error);
-            return;
-        }
-    };
-    if runtime_thread.session_id().is_none() {
-        let request = hosted_turn_request(&submitted_turn.with_model_prompt(prompt), false);
-        if let Err(error) =
-            run_hosted_ordinary_turn(&cfg, runtime_thread, request, event_tx, control)
-        {
-            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::Turn);
-        }
-        return;
-    }
-    run_hosted_goal_run(
-        &cfg,
-        runtime_thread,
-        submitted_turn.with_model_prompt(prompt),
-        orca_core::goal_runtime::GoalTurnOrigin::User,
-        event_tx,
-        control,
-    );
-    if cfg.desktop_notifications {
-        let _ = orca_runtime::notify::notify("Orca", "Task completed");
     }
 }
 
