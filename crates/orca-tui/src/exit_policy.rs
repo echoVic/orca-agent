@@ -16,15 +16,15 @@ pub(crate) fn exit_resume_hint(session_id: Option<&str>) -> Option<String> {
 }
 
 pub(crate) fn exit_session_id(
-    active_session_id: Option<String>,
+    projected_session_id: Option<String>,
     history_mode: &HistoryMode,
 ) -> Option<String> {
     if let HistoryMode::Resume(selector) = history_mode {
         RuntimeSurfaceHostHandle::load_saved_session(selector)
             .ok()
             .map(|transcript| transcript.meta.session_id)
-            .or(active_session_id)
+            .or(projected_session_id)
     } else {
-        active_session_id
+        projected_session_id
     }
 }

@@ -3914,7 +3914,7 @@
         "HostIncarnation",
         "ThreadOwnerEpoch"
       ],
-      "TuiEvent::NewSessionStarted{session_id}|OperationRejected",
+      "TuiEvent::SessionProjectionReset|TuiEvent::NewSessionStarted|OperationRejected",
       "TUI installs the fresh thread and clears conversation state",
       "move_session_switch_behind_typed_host_command"
     ],
@@ -3937,7 +3937,7 @@
         "HostIncarnation",
         "ThreadOwnerEpoch"
       ],
-      "TuiEvent::SessionForked|OperationRejected",
+      "TuiEvent::SessionProjectionReset|TuiEvent::SurfaceProjectionSynced|TuiEvent::HistoryLoaded|OperationRejected",
       "TUI retains the transcript and installs the fork identity",
       "none"
     ],
@@ -3959,7 +3959,7 @@
       [
         "ThreadOwnerEpoch"
       ],
-      "TuiEvent::SessionRenamed|OperationRejected",
+      "TuiEvent::SurfaceProjectionSynced|OperationRejected",
       "TUI updates identity only after the durable store succeeds",
       "none"
     ],
@@ -4005,7 +4005,7 @@
         "HostIncarnation",
         "ThreadOwnerEpoch"
       ],
-      "TuiEvent::SessionForked|OperationRejected",
+      "TuiEvent::SessionProjectionReset|TuiEvent::SurfaceProjectionSynced|TuiEvent::HistoryLoaded|OperationRejected",
       "TUI installs the fork identity after runtime swap",
       "none"
     ],

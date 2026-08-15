@@ -265,8 +265,8 @@ pub(crate) fn handle_slash_command(
 }
 
 fn format_status(state: &AppState) -> String {
-    let session_id = state.current_session_id.as_deref().unwrap_or("-");
-    let title = state.current_session_title.as_deref().unwrap_or("-");
+    let session_id = state.current_session_id().unwrap_or("-");
+    let title = state.current_session_title().unwrap_or("-");
     let context_used_tokens = state.context_used_tokens();
     let context_limit_tokens = state.context_limit_tokens();
     let context = if context_limit_tokens == 0 {
@@ -466,7 +466,7 @@ mod tests {
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(1),
-                session_id: "session-1".to_string(),
+                session_id: Some("session-1".to_string()),
                 title: "Release triage".to_string(),
                 usage_revision: 1,
                 usage: orca_core::cost_types::UsageTotals {
@@ -482,6 +482,7 @@ mod tests {
                 current_goal: None,
                 foreground_operation_id: None,
                 goal_presentation: None,
+                session_presentation: None,
             },
         )));
         state.recoverable_operation_id = Some(

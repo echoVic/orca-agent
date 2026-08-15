@@ -148,6 +148,22 @@ identity, workflow, and operation projection remain the next convergence
 boundaries. CLI, server/JSONL, ACP, runtime surface events, Goal persistence,
 and persisted transcript formats are unchanged.
 
+The session-identity projection convergence slice makes the authoritative
+runtime surface snapshot the only production TUI source for the attached
+thread's title and optional recorded session id. One private
+`SurfaceSessionProjectionState` owns those facts, the accepted thread cursor,
+and once-per-cursor rename/fork presentation. Ephemeral threads keep their
+runtime title without pretending to be resumable; lower, contradictory equal,
+and cross-thread ordinary projections are rejected before any other snapshot
+owner changes. New, resume, fork, and Side transitions publish complete reset
+snapshots, while newly started durable threads must pass a snapshot/id preflight
+before installation. The granular identity/rename/fork events, public mutable
+AppState fields, caller-authored reset titles, and app-loop identity shadow are
+deleted; renderers, commands, picker actions, and exit policy use immutable
+queries. Workflow and operation projection remain open. CLI, server/JSONL,
+ACP, runtime surface events, session persistence, and transcript formats are
+unchanged.
+
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the
 release checksum, installs the runner and setup helper, and can provision,
@@ -1320,14 +1336,15 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has extracted thirteen modules so far (insert-escape, presentation,
+   stream has established fifteen focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
-   queued-submission, edit-highlight, surface-metrics); `app.rs` is down from
-   10,186 to 9,793 lines and `types.rs` from 9,442 to 8,223. Renderer-owned
-   orchestration and the remaining identity/Goal/workflow/operation projection
-   duplication (`surface_projection.rs`, 2,395 lines) remain the open core of
-   this matrix row.
+   queued-submission, edit-highlight, surface-metrics, Goal projection, and
+   session-identity projection); `app.rs` is down from 10,186 to 10,117 lines
+   and `types.rs` from 9,442 to 8,607. Renderer-owned orchestration and the
+   remaining workflow/operation projection duplication
+   (`surface_projection.rs`, 3,036 lines) remain the open core of this matrix
+   row.
 4. **P2.4 context/cache identity is not a release slice.** DeepSeek usage
    already parses `prompt_cache_hit_tokens` (`crates/orca-provider/src/deepseek_http.rs:192`),
    but deterministic cache-critical prefixes (stable system prompt, tool

@@ -26,7 +26,7 @@ use crate::agent_runtime::TuiAgentRuntime;
 #[cfg(test)]
 use crate::attachment_routing::reduce_attached_tui_event;
 use crate::attachment_routing::{
-    AttachmentRouting, accept_attached_tui_event, spawn_attached_event_sender,
+    AttachmentRouting, accept_attached_tui_event, send_attached_event, spawn_attached_event_sender,
     spawn_attached_event_sender_with_routing,
 };
 use crate::background_approval::submit_background_approval_response_for_tui;
@@ -47,7 +47,8 @@ use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iter
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::hosted_side::{
     HostedSideParent, hosted_config_for_active, rotate_attached_event_sender,
-    shutdown_attached_side_on_controller_exit, side_parent_status_for_runtime_thread,
+    rotate_side_event_sender, shutdown_attached_side_on_controller_exit,
+    side_parent_status_for_runtime_thread,
 };
 use crate::input_event_actions::{
     BatchedInputEvent, MouseFlow, coalesce_input_events, consume_focus_event, handle_mouse_event,
@@ -72,7 +73,7 @@ use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::stdio_guard::RetryWriter;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
-use crate::surface_projection::SurfaceProjectionState;
+use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
 #[cfg(test)]
@@ -272,7 +273,6 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     terminal.clear()?;
 
     let resources = (terminal, presentation, terminal_input);
-    let mut active_session_id = None;
     let exit_code = with_terminal_presentation_cleanup(
         resources,
         |(terminal, presentation, _terminal_input)| {
@@ -539,17 +539,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                                             .consume_catalog_dirty(generation, &mut state);
                                     }
                                     TuiEvent::MentionRuntimeReady(thread) => {
-                                        active_session_id =
-                                            thread.session_id().map(ToOwned::to_owned);
                                         mention_search.install_runtime_actions(
                                             TuiSurfaceActions::new(thread),
                                         );
                                     }
-                                    TuiEvent::NewSessionStarted { session_id } => {
+                                    TuiEvent::NewSessionStarted => {
                                         config.history_mode = HistoryMode::Record;
-                                        active_session_id = Some(session_id.clone());
                                         handle_runtime_event(
-                                            TuiEvent::NewSessionStarted { session_id },
+                                            TuiEvent::NewSessionStarted,
                                             &mut state,
                                             &action_tx,
                                             &pending_workflow_notifications,
@@ -653,7 +650,10 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
 
     Ok(TuiExit {
         code: exit_code,
-        session_id: exit_session_id(active_session_id, &config.history_mode),
+        session_id: exit_session_id(
+            state.current_session_id().map(ToOwned::to_owned),
+            &config.history_mode,
+        ),
     })
 }
 
@@ -2313,8 +2313,13 @@ done
                 )
                 .expect("resumed runtime thread");
             let (event_tx, event_rx) = mpsc::unbounded();
-            emit_typed_history_snapshot(&resumed, &HistoryMode::Resume(session_id), &event_tx)
-                .expect("typed restart snapshot");
+            emit_typed_history_snapshot(
+                &resumed,
+                &HistoryMode::Resume(session_id),
+                None,
+                &event_tx,
+            )
+            .expect("typed restart snapshot");
             let events = event_rx.try_iter().collect::<Vec<_>>();
             assert!(events.iter().any(|event| matches!(
                 event,
@@ -2654,16 +2659,12 @@ done
                 plan: None,
                 label: "loaded-b".to_string(),
             },
-            TuiEvent::SessionIdentityUpdated {
-                session_id: "session-b".to_string(),
-                title: "title-b".to_string(),
-            },
             TuiEvent::WorkflowTasksUpdated {
                 tasks: vec![workflow_task("task-b", "workflow-b")],
             },
             TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(20),
-                session_id: "session-b".to_string(),
+                session_id: Some("session-b".to_string()),
                 title: "title-b".to_string(),
                 usage_revision: 20,
                 usage: orca_core::cost_types::UsageTotals {
@@ -2679,6 +2680,7 @@ done
                 current_goal: Some(goal_b.clone()),
                 foreground_operation_id: None,
                 goal_presentation: None,
+                session_presentation: None,
             })),
             TuiEvent::TurnStarted {
                 turn: 3,
@@ -2696,8 +2698,8 @@ done
         let usage = state.usage().clone();
         let goal = state.current_goal().cloned();
         let identity = (
-            state.current_session_id.clone(),
-            state.current_session_title.clone(),
+            state.current_session_id().map(ToOwned::to_owned),
+            state.current_session_title().map(ToOwned::to_owned),
         );
         let status = state.status;
         let recovery = state.recoverable_operation_id.clone();
@@ -2718,16 +2720,12 @@ done
                 plan: None,
                 label: "stale-loaded-a".to_string(),
             },
-            TuiEvent::SessionIdentityUpdated {
-                session_id: "session-a".to_string(),
-                title: "stale-title-a".to_string(),
-            },
             TuiEvent::WorkflowTasksUpdated {
                 tasks: vec![workflow_task("task-a", "stale-workflow-a")],
             },
             TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(99),
-                session_id: "session-a".to_string(),
+                session_id: Some("session-a".to_string()),
                 title: "stale-title-a".to_string(),
                 usage_revision: 99,
                 usage: orca_core::cost_types::UsageTotals {
@@ -2743,6 +2741,7 @@ done
                 current_goal: Some(goal_a.clone()),
                 foreground_operation_id: None,
                 goal_presentation: None,
+                session_presentation: None,
             })),
             TuiEvent::MessageDelta("stale-delta-a".to_string()),
             TuiEvent::SessionCompleted {
@@ -2758,8 +2757,8 @@ done
         assert_eq!(state.current_goal(), goal.as_ref());
         assert_eq!(
             (
-                state.current_session_id.clone(),
-                state.current_session_title.clone(),
+                state.current_session_id().map(ToOwned::to_owned),
+                state.current_session_title().map(ToOwned::to_owned),
             ),
             identity
         );
@@ -3661,15 +3660,31 @@ done
                 _ => unreachable!(),
             };
             harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
-
             harness.send(UserAction::NewSession);
-            let new_session_id = match harness
-                .recv_until(|event| matches!(event, TuiEvent::NewSessionStarted { .. }))
-            {
-                TuiEvent::NewSessionStarted { session_id } => session_id,
-                _ => unreachable!(),
+            let mut reset_session_id = None;
+            let new_session_id = loop {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("new-session projection event")
+                {
+                    TuiEvent::SessionProjectionReset(projection) => {
+                        reset_session_id = projection.session_id;
+                    }
+                    TuiEvent::NewSessionStarted => {
+                        break reset_session_id
+                            .clone()
+                            .expect("recorded new-session reset identity");
+                    }
+                    _ => {}
+                }
             };
 
+            assert_eq!(
+                reset_session_id.as_deref(),
+                Some(new_session_id.as_str()),
+                "the authoritative reset must precede the new-session control signal"
+            );
             assert_ne!(new_session_id, old_session_id);
             assert!(matches!(
                 harness.config.lock().unwrap().history_mode,
@@ -3702,6 +3717,122 @@ done
     }
 
     #[test]
+    fn hosted_side_switches_project_recorded_parent_and_ephemeral_side_identity() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("parent identity prompt".to_string()));
+            let parent_id = match harness
+                .recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
+            {
+                TuiEvent::MentionRuntimeReady(thread) => thread
+                    .session_id()
+                    .expect("recorded parent session id")
+                    .to_string(),
+                _ => unreachable!(),
+            };
+            let parent_projection = harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection.session_id.as_deref() == Some(parent_id.as_str())
+                )
+            });
+            let TuiEvent::SurfaceProjectionSynced(parent_projection) = parent_projection else {
+                unreachable!()
+            };
+            let parent_title = parent_projection.title;
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::StartSideConversation { prompt: None });
+            let side_reset =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionProjectionReset(_)));
+            let TuiEvent::SessionProjectionReset(side_projection) = side_reset else {
+                unreachable!()
+            };
+            assert_eq!(side_projection.session_id, None);
+            assert_eq!(side_projection.title, "Side conversation");
+
+            harness.send(UserAction::ToggleSideConversation);
+            let parent_reset =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionProjectionReset(_)));
+            assert!(matches!(
+                parent_reset,
+                TuiEvent::SessionProjectionReset(projection)
+                    if projection.session_id.as_deref() == Some(parent_id.as_str())
+                        && projection.title == parent_title
+            ));
+
+            harness.send(UserAction::ToggleSideConversation);
+            let side_reset =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionProjectionReset(_)));
+            assert!(matches!(
+                side_reset,
+                TuiEvent::SessionProjectionReset(projection)
+                    if projection.session_id.is_none()
+                        && projection.title == "Side conversation"
+            ));
+
+            harness.send(UserAction::CloseSideConversation);
+            let parent_reset =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionProjectionReset(_)));
+            assert!(matches!(
+                parent_reset,
+                TuiEvent::SessionProjectionReset(projection)
+                    if projection.session_id.as_deref() == Some(parent_id.as_str())
+                        && projection.title == parent_title
+            ));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn session_preflight_failure_preserves_previous_runtime_and_projection() {
+        with_orca_home(|_| {
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let config = test_config(HistoryMode::Record);
+            let previous = host
+                .handle()
+                .start_thread(config.clone(), "Previous conversation")
+                .expect("previous runtime thread");
+            let previous_projection = TuiSurfaceActions::new(previous.typed_surface())
+                .read_snapshot()
+                .map(|snapshot| SurfaceProjectionState::from_surface_snapshot(&snapshot))
+                .expect("previous projection");
+            let previous_id = previous_projection
+                .session_id
+                .clone()
+                .expect("previous recorded session id");
+            let (mut state, _actions) = test_state();
+            state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+                previous_projection,
+            )));
+
+            let uninstalled = host
+                .handle()
+                .start_thread(config, "Uninstalled conversation")
+                .expect("uninstalled runtime thread");
+            uninstalled.shutdown().expect("close uninstalled thread");
+            let error = match preflight_started_session(uninstalled, "test failed switch") {
+                Ok(_) => panic!("closed uninstalled thread must fail projection preflight"),
+                Err(error) => error,
+            };
+
+            assert!(error.contains("failed to project conversation before test failed switch"));
+            assert_eq!(previous.session_id(), Some(previous_id.as_str()));
+            assert!(
+                TuiSurfaceActions::new(previous.typed_surface())
+                    .read_snapshot()
+                    .is_ok()
+            );
+            assert_eq!(state.current_session_id(), Some(previous_id.as_str()));
+            assert_eq!(state.current_session_title(), Some("Previous conversation"));
+
+            previous.shutdown().expect("previous thread shutdown");
+            host.shutdown().expect("runtime host shutdown");
+        });
+    }
+
+    #[test]
     fn hosted_tui_fork_preserves_source_and_projects_copied_history() {
         with_orca_home(|_| {
             let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
@@ -3719,19 +3850,22 @@ done
             harness.send(UserAction::ForkCurrentSession {
                 title: Some("Auth experiment".to_string()),
             });
-            let fork_id = match harness.recv_until(|event| {
+            let fork_projection = harness.recv_until(|event| {
                 matches!(
                     event,
-                    TuiEvent::SessionForked { session_id, .. }
-                        if session_id != &source_id
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection.session_id.as_deref() != Some(source_id.as_str())
+                            && projection.session_presentation
+                                == Some(SessionProjectionPresentation::Forked)
                 )
-            }) {
-                TuiEvent::SessionForked { session_id, title } => {
-                    assert_eq!(title, "Auth experiment");
-                    session_id
-                }
-                _ => unreachable!(),
+            });
+            let TuiEvent::SurfaceProjectionSynced(fork_projection) = fork_projection else {
+                unreachable!()
             };
+            assert_eq!(fork_projection.title, "Auth experiment");
+            let fork_id = fork_projection
+                .session_id
+                .expect("forked recorded session id");
 
             assert_ne!(fork_id, source_id);
             let source = history::load_session(&source_id).expect("source remains loadable");
@@ -3764,20 +3898,42 @@ done
                 _ => unreachable!(),
             };
             harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            let source_title = history::load_session(&source_id)
+                .expect("source transcript")
+                .meta
+                .title;
 
             harness.send(UserAction::NewSession);
-            let current_id = match harness
-                .recv_until(|event| matches!(event, TuiEvent::NewSessionStarted { .. }))
-            {
-                TuiEvent::NewSessionStarted { session_id } => session_id,
-                _ => unreachable!(),
-            };
+            let mut current_id = None;
+            loop {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("new-session event")
+                {
+                    TuiEvent::SessionProjectionReset(projection) => {
+                        current_id = projection.session_id;
+                    }
+                    TuiEvent::NewSessionStarted => break,
+                    _ => {}
+                }
+            }
+            let current_id = current_id.expect("current recorded session id");
             harness.send(UserAction::Submit("current-only prompt".to_string()));
             harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
 
             harness.send(UserAction::ForkSavedSession {
                 session_id: source_id.clone(),
             });
+            let reset =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionProjectionReset(_)));
+            let reset_session_id = match reset {
+                TuiEvent::SessionProjectionReset(projection) => {
+                    assert_eq!(projection.title, format!("Fork of {source_title}"));
+                    projection.session_id.expect("saved fork reset identity")
+                }
+                _ => unreachable!(),
+            };
             let history =
                 harness.recv_until(|event| matches!(event, TuiEvent::HistoryLoaded { .. }));
             let TuiEvent::HistoryLoaded { messages, .. } = history else {
@@ -3793,13 +3949,73 @@ done
                 matches!(message, ChatMessage::User(prompt) if prompt == "current-only prompt")
             }));
 
-            let fork_id =
-                match harness.recv_until(|event| matches!(event, TuiEvent::SessionForked { .. })) {
-                    TuiEvent::SessionForked { session_id, .. } => session_id,
-                    _ => unreachable!(),
-                };
+            let fork_projection = harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection.session_presentation
+                            == Some(SessionProjectionPresentation::Forked)
+                )
+            });
+            let TuiEvent::SurfaceProjectionSynced(fork_projection) = fork_projection else {
+                unreachable!()
+            };
+            let fork_id = fork_projection
+                .session_id
+                .expect("saved fork projection identity");
             assert_ne!(fork_id, source_id);
             assert_ne!(fork_id, current_id);
+            assert_eq!(fork_id, reset_session_id);
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn picker_resume_requires_authoritative_session_reset() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("resume-source prompt".to_string()));
+            let source_id = match harness
+                .recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
+            {
+                TuiEvent::MentionRuntimeReady(thread) => {
+                    thread.session_id().expect("source session id").to_string()
+                }
+                _ => unreachable!(),
+            };
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            let source_title = history::load_session(&source_id)
+                .expect("source transcript")
+                .meta
+                .title;
+
+            harness.send(UserAction::NewSession);
+            harness.recv_until(|event| matches!(event, TuiEvent::NewSessionStarted));
+            harness.send(UserAction::Submit("current-only prompt".to_string()));
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::ResumeSavedSession {
+                session_id: source_id.clone(),
+            });
+            let reset =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionProjectionReset(_)));
+            assert!(matches!(
+                reset,
+                TuiEvent::SessionProjectionReset(projection)
+                    if projection.session_id.as_deref() == Some(source_id.as_str())
+                        && projection.title == source_title
+            ));
+            let history =
+                harness.recv_until(|event| matches!(event, TuiEvent::HistoryLoaded { .. }));
+            let TuiEvent::HistoryLoaded { messages, .. } = history else {
+                unreachable!();
+            };
+            assert!(messages.iter().any(|message| {
+                matches!(message, ChatMessage::User(prompt) if prompt == "resume-source prompt")
+            }));
+            assert!(!messages.iter().any(|message| {
+                matches!(message, ChatMessage::User(prompt) if prompt == "current-only prompt")
+            }));
             harness.shutdown();
         });
     }
@@ -3831,16 +4047,28 @@ done
             harness.send(UserAction::RenameCurrentSession {
                 title: "Release triage".to_string(),
             });
-            let renamed =
-                harness.recv_until(|event| matches!(event, TuiEvent::SessionRenamed { .. }));
+            let renamed = loop {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("rename projection event")
+                {
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection.session_id.as_deref() == Some(session_id.as_str())
+                            && projection.title == "Release triage" =>
+                    {
+                        break projection;
+                    }
+                    _ => {}
+                }
+            };
 
-            assert!(matches!(
-                renamed,
-                TuiEvent::SessionRenamed {
-                    session_id: ref renamed_id,
-                    title: ref renamed_title,
-                } if renamed_id == &session_id && renamed_title == "Release triage"
-            ));
+            assert_eq!(renamed.session_id.as_deref(), Some(session_id.as_str()));
+            assert_eq!(renamed.title, "Release triage");
+            assert_eq!(
+                renamed.session_presentation,
+                Some(SessionProjectionPresentation::Renamed)
+            );
             assert_eq!(
                 history::load_session(&session_id)
                     .expect("renamed session")
@@ -4784,10 +5012,12 @@ done
                 TuiEvent::SessionCompleted { status } if status == "success"
             ));
             source.shutdown();
-            let session_id = history::load_session("latest").unwrap().meta.session_id;
+            let source_transcript = history::load_session("latest").unwrap();
+            let session_id = source_transcript.meta.session_id;
+            let source_title = source_transcript.meta.title;
 
             let mut harness =
-                HostedTuiHarness::start(test_config(HistoryMode::Resume(session_id)), None);
+                HostedTuiHarness::start(test_config(HistoryMode::Resume(session_id.clone())), None);
             let event = harness
                 .event_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -4833,6 +5063,21 @@ done
                 ChatMessage::Assistant(answer)
                     if answer == "Mock history users: restored prompt api_key=<redacted> | mock_history_echo"
             )));
+            let projection = harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection.session_id.as_deref() == Some(session_id.as_str())
+                )
+            });
+            let TuiEvent::SurfaceProjectionSynced(projection) = projection else {
+                unreachable!()
+            };
+            assert_eq!(projection.session_id.as_deref(), Some(session_id.as_str()));
+            assert_eq!(
+                projection.title, source_title,
+                "startup projection must preserve durable title"
+            );
 
             harness.send(UserAction::Submit("mock_history_echo".to_string()));
             let mut saw_restored_history = false;
@@ -5886,10 +6131,7 @@ done
                     } => {
                         task_id = Some(task.id);
                     }
-                    TuiEvent::SessionIdentityUpdated {
-                        title: session_title,
-                        ..
-                    } => title = Some(session_title),
+                    TuiEvent::SurfaceProjectionSynced(projection) => title = Some(projection.title),
                     TuiEvent::WorkflowTaskUpdated { .. } => legacy_task_update_seen = true,
                     TuiEvent::SessionCompleted { .. } => break,
                     _ => {}
@@ -5953,8 +6195,8 @@ done
                 let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 if matches!(
                     event,
-                    TuiEvent::SessionIdentityUpdated { ref title, .. }
-                        if title == "Workflow notification notification-1"
+                    TuiEvent::SurfaceProjectionSynced(ref projection)
+                        if projection.title == "Workflow notification notification-1"
                 ) {
                     break;
                 }
@@ -7859,13 +8101,18 @@ fn hosted_tui_controller_loop(
             | HistoryMode::Fork(selector) => selector,
             HistoryMode::Record | HistoryMode::Disabled => unreachable!(),
         };
-        let title = format!("Restored session {selector}");
         let thread_was_missing = thread.is_none();
-        let result = ensure_hosted_thread(&mut thread, &host, &cfg, &preloaded, &title, &event_tx)
+        let result = RuntimeSurfaceHostHandle::load_saved_session(selector)
+            .map(|transcript| transcript.meta.title)
+            .map_err(|error| format!("failed to load saved session metadata: {error}"))
+            .and_then(|title| {
+                ensure_hosted_thread(&mut thread, &host, &cfg, &preloaded, &title, &event_tx)
+            })
             .and_then(|_| {
                 emit_typed_history_snapshot(
                     thread.as_ref().expect("startup hosted thread"),
                     &startup_history_mode,
+                    None,
                     &event_tx,
                 )
             });
@@ -7969,6 +8216,26 @@ fn hosted_tui_controller_loop(
                             continue;
                         }
                     };
+                let (started, side_projection) =
+                    match preflight_started_session(started, "start side conversation") {
+                        Ok(result) => result,
+                        Err(error) => {
+                            thread = Some(parent);
+                            let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                            continue;
+                        }
+                    };
+                let side_messages = match read_hosted_projection_batch(&started) {
+                    Ok((_, messages)) => messages,
+                    Err(error) => {
+                        reap_hosted_thread(started);
+                        thread = Some(parent);
+                        let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                            "failed to project side conversation: {error}"
+                        )));
+                        continue;
+                    }
+                };
                 let parent_event_tx = event_tx.clone();
                 let parent_attachment = session_attachment;
                 let side_config = Arc::new(Mutex::new(side_config));
@@ -8011,11 +8278,17 @@ fn hosted_tui_controller_loop(
                     Some(parent_attachment),
                     false,
                 );
-                let _ = project_hosted_thread(
-                    thread.as_ref().expect("side thread installed"),
-                    "Side conversation",
-                    &event_tx,
-                );
+                if let Err(error) = project_hosted_thread_attached(
+                    side_projection,
+                    side_messages,
+                    session_attachment,
+                    &root_event_tx,
+                ) {
+                    let _ = event_tx.send(TuiEvent::Error(format!(
+                        "failed to project side conversation: {error}"
+                    )));
+                    continue;
+                }
                 let _ = event_tx.send(TuiEvent::SideConversationChanged {
                     active: true,
                     available: true,
@@ -8050,32 +8323,82 @@ fn hosted_tui_controller_loop(
                     let side_active = thread
                         .as_ref()
                         .is_some_and(|current| current.thread_id() == side.side_thread.thread_id());
+                    let (target_thread, target_event_tx, target_attachment, target_batch) =
+                        if side_active {
+                            let batch = match read_hosted_projection_batch(&side.thread) {
+                                Ok(batch) => batch,
+                                Err(error) => {
+                                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                        "failed to switch to the main conversation: {error}"
+                                    )));
+                                    continue;
+                                }
+                            };
+                            (
+                                side.thread.clone(),
+                                side.event_tx.clone(),
+                                side.attachment,
+                                batch,
+                            )
+                        } else {
+                            let batch = match read_hosted_projection_batch(&side.side_thread) {
+                                Ok(batch) => batch,
+                                Err(error) => {
+                                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                        "failed to switch to the side conversation: {error}"
+                                    )));
+                                    continue;
+                                }
+                            };
+                            let side_event_tx = rotate_side_event_sender(
+                                &root_event_tx,
+                                &mut side.side_attachment,
+                                &attachment_routing,
+                            );
+                            side.side_event_tx = side_event_tx.clone();
+                            (
+                                side.side_thread.clone(),
+                                side_event_tx,
+                                side.side_attachment,
+                                batch,
+                            )
+                        };
+                    thread = Some(target_thread.clone());
+                    event_tx = target_event_tx;
+                    session_attachment = target_attachment;
                     if side_active {
-                        thread = Some(side.thread.clone());
-                        event_tx = side.event_tx.clone();
-                        session_attachment = side.attachment;
+                        AttachmentRouting::switch_attachment_deferred(
+                            &attachment_routing,
+                            &root_event_tx,
+                            session_attachment,
+                            Some(side.attachment),
+                        );
                     } else {
-                        thread = Some(side.side_thread.clone());
-                        event_tx = side.side_event_tx.clone();
-                        session_attachment = side.side_attachment;
+                        AttachmentRouting::switch_attachment(
+                            &attachment_routing,
+                            &root_event_tx,
+                            session_attachment,
+                            Some(side.attachment),
+                            false,
+                        );
                     }
-                    AttachmentRouting::switch_attachment(
-                        &attachment_routing,
-                        &root_event_tx,
+                    if let Err(error) = project_hosted_thread_attached(
+                        target_batch.0,
+                        target_batch.1,
                         session_attachment,
-                        Some(side.attachment),
-                        side_active,
-                    );
-                    let title = if side_active {
-                        "main conversation"
-                    } else {
-                        "Side conversation"
-                    };
-                    let _ = project_hosted_thread(
-                        thread.as_ref().expect("toggled hosted thread"),
-                        title,
-                        &event_tx,
-                    );
+                        &root_event_tx,
+                    ) {
+                        let _ = event_tx.send(TuiEvent::Error(format!(
+                            "failed to project switched conversation: {error}"
+                        )));
+                        continue;
+                    }
+                    if side_active {
+                        AttachmentRouting::release_deferred_parent_events(
+                            &attachment_routing,
+                            &root_event_tx,
+                        );
+                    }
                     if side_active {
                         let _ = event_tx.send(TuiEvent::SideConversationChanged {
                             active: false,
@@ -8100,6 +8423,23 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::CloseSideConversation) => {
                 if let Some(side) = side_parent.take() {
+                    let side_active = thread
+                        .as_ref()
+                        .is_some_and(|current| current.thread_id() == side.side_thread.thread_id());
+                    let parent_batch = if side_active {
+                        match read_hosted_projection_batch(&side.thread) {
+                            Ok(batch) => Some(batch),
+                            Err(error) => {
+                                let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                    "failed to return to the main conversation: {error}"
+                                )));
+                                side_parent = Some(side);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let side_thread = side.side_thread;
                     if let Err(error) = side_thread.shutdown_with_timeout(Duration::from_secs(5)) {
                         let _ = event_tx.send(TuiEvent::OperationRejected(format!(
@@ -8111,23 +8451,42 @@ fn hosted_tui_controller_loop(
                         });
                         continue;
                     }
-                    let side_active = thread
-                        .as_ref()
-                        .is_some_and(|current| current.thread_id() == side_thread.thread_id());
                     if side_active {
-                        thread = Some(side.thread);
-                        event_tx = side.event_tx;
+                        thread = Some(side.thread.clone());
+                        event_tx = side.event_tx.clone();
                         session_attachment = side.attachment;
+                        AttachmentRouting::switch_attachment_deferred(
+                            &attachment_routing,
+                            &root_event_tx,
+                            session_attachment,
+                            Some(side.attachment),
+                        );
+                        let (parent_projection, parent_messages) =
+                            parent_batch.expect("parent batch");
+                        if let Err(error) = project_hosted_thread_attached(
+                            parent_projection,
+                            parent_messages,
+                            session_attachment,
+                            &root_event_tx,
+                        ) {
+                            let _ = event_tx.send(TuiEvent::Error(format!(
+                                "failed to project main conversation: {error}"
+                            )));
+                        }
+                        AttachmentRouting::release_deferred_parent_events(
+                            &attachment_routing,
+                            &root_event_tx,
+                        );
                     } else {
                         thread = Some(side.thread);
+                        AttachmentRouting::switch_attachment(
+                            &attachment_routing,
+                            &root_event_tx,
+                            session_attachment,
+                            None,
+                            false,
+                        );
                     }
-                    AttachmentRouting::switch_attachment(
-                        &attachment_routing,
-                        &root_event_tx,
-                        session_attachment,
-                        None,
-                        true,
-                    );
                     let _ = event_tx.send(TuiEvent::SideConversationChanged {
                         active: false,
                         available: false,
@@ -8135,11 +8494,6 @@ fn hosted_tui_controller_loop(
                         parent_title: String::new(),
                         parent_status: SideParentStatus::Idle,
                     });
-                    let _ = project_hosted_thread(
-                        thread.as_ref().expect("parent thread"),
-                        "main conversation",
-                        &event_tx,
-                    );
                     announce_runtime_ready(thread.as_ref().expect("parent thread"), &event_tx);
                 }
             }
@@ -8151,18 +8505,20 @@ fn hosted_tui_controller_loop(
                     &preloaded,
                     &pending_workflow_notifications,
                 ) {
-                    Ok(session_id) => {
+                    Ok(projection) => {
                         rotate_attached_event_sender(
                             &root_event_tx,
                             &mut session_attachment,
                             &mut event_tx,
                             Some(&attachment_routing),
                         );
+                        let _ =
+                            event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
                         announce_runtime_ready(
                             thread.as_ref().expect("new hosted thread"),
                             &event_tx,
                         );
-                        let _ = event_tx.send(TuiEvent::NewSessionStarted { session_id });
+                        let _ = event_tx.send(TuiEvent::NewSessionStarted);
                     }
                     Err(error) => {
                         let _ = event_tx.send(TuiEvent::OperationRejected(error));
@@ -8178,30 +8534,31 @@ fn hosted_tui_controller_loop(
                     &pending_workflow_notifications,
                     title,
                 ) {
-                    Ok((mode, session_id, title)) => {
+                    Ok((mode, projection)) => {
                         rotate_attached_event_sender(
                             &root_event_tx,
                             &mut session_attachment,
                             &mut event_tx,
                             Some(&attachment_routing),
                         );
-                        let _ = event_tx.send(TuiEvent::SessionProjectionReset {
-                            session_id: session_id.clone(),
-                            title: title.clone(),
-                        });
+                        let _ =
+                            event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
                         announce_runtime_ready(
                             thread.as_ref().expect("forked hosted thread"),
                             &event_tx,
                         );
                         if let Some(runtime_thread) = thread.as_ref()
-                            && let Err(error) =
-                                emit_typed_history_snapshot(runtime_thread, &mode, &event_tx)
+                            && let Err(error) = emit_typed_history_snapshot(
+                                runtime_thread,
+                                &mode,
+                                Some(SessionProjectionPresentation::Forked),
+                                &event_tx,
+                            )
                         {
                             let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                                 "failed to project forked conversation: {error}"
                             )));
                         }
-                        let _ = event_tx.send(TuiEvent::SessionForked { session_id, title });
                     }
                     Err(error) => {
                         let _ = event_tx.send(TuiEvent::OperationRejected(error));
@@ -8231,8 +8588,9 @@ fn hosted_tui_controller_loop(
                         ))
                     });
                 match rename_result {
-                    Ok(()) => {
-                        let _ = event_tx.send(TuiEvent::SessionRenamed { session_id, title });
+                    Ok(projection) => {
+                        let _ =
+                            event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
                     }
                     Err(error) => {
                         let _ = event_tx.send(TuiEvent::OperationRejected(format!(
@@ -8251,7 +8609,7 @@ fn hosted_tui_controller_loop(
                     HistoryMode::Resume(session_id),
                     None,
                 ) {
-                    Ok(mode) => {
+                    Ok((mode, projection)) => {
                         rotate_attached_event_sender(
                             &root_event_tx,
                             &mut session_attachment,
@@ -8259,19 +8617,13 @@ fn hosted_tui_controller_loop(
                             Some(&attachment_routing),
                         );
                         if let Some(runtime_thread) = thread.as_ref() {
-                            let session_id = runtime_thread
-                                .session_id()
-                                .map(ToOwned::to_owned)
-                                .unwrap_or_else(|| "restored-session".to_string());
-                            let _ = event_tx.send(TuiEvent::SessionProjectionReset {
-                                session_id,
-                                title: "Restored conversation".to_string(),
-                            });
+                            let _ = event_tx
+                                .send(TuiEvent::SessionProjectionReset(Box::new(projection)));
                             announce_runtime_ready(runtime_thread, &event_tx);
                         }
                         if let Some(runtime_thread) = thread.as_ref()
                             && let Err(error) =
-                                emit_typed_history_snapshot(runtime_thread, &mode, &event_tx)
+                                emit_typed_history_snapshot(runtime_thread, &mode, None, &event_tx)
                         {
                             let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                                 "failed to project resumed conversation: {error}"
@@ -8293,7 +8645,7 @@ fn hosted_tui_controller_loop(
                     HistoryMode::Fork(session_id),
                     None,
                 ) {
-                    Ok(mode) => {
+                    Ok((mode, projection)) => {
                         rotate_attached_event_sender(
                             &root_event_tx,
                             &mut session_attachment,
@@ -8301,31 +8653,18 @@ fn hosted_tui_controller_loop(
                             Some(&attachment_routing),
                         );
                         if let Some(runtime_thread) = thread.as_ref() {
-                            let session_id = runtime_thread
-                                .session_id()
-                                .map(ToOwned::to_owned)
-                                .unwrap_or_else(|| "forked-session".to_string());
-                            let _ = event_tx.send(TuiEvent::SessionProjectionReset {
-                                session_id,
-                                title: "Forked conversation".to_string(),
-                            });
+                            let _ = event_tx
+                                .send(TuiEvent::SessionProjectionReset(Box::new(projection)));
                             announce_runtime_ready(runtime_thread, &event_tx);
-                            if let Err(error) =
-                                emit_typed_history_snapshot(runtime_thread, &mode, &event_tx)
-                            {
+                            if let Err(error) = emit_typed_history_snapshot(
+                                runtime_thread,
+                                &mode,
+                                Some(SessionProjectionPresentation::Forked),
+                                &event_tx,
+                            ) {
                                 let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                                     "failed to project forked conversation: {error}"
                                 )));
-                            }
-                            if let (Some(fork_id), Ok(snapshot)) = (
-                                runtime_thread.session_id(),
-                                TuiSurfaceActions::new(runtime_thread.typed_surface())
-                                    .read_snapshot(),
-                            ) {
-                                let _ = event_tx.send(TuiEvent::SessionForked {
-                                    session_id: fork_id.to_string(),
-                                    title: snapshot.thread.title.as_str().to_string(),
-                                });
                             }
                         }
                     }
@@ -8896,7 +9235,7 @@ fn start_new_hosted_session(
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-) -> Result<String, String> {
+) -> Result<SurfaceProjectionState, String> {
     ensure_current_session_switchable(thread.as_ref())?;
 
     let mut next_config = config.lock().unwrap().clone();
@@ -8907,10 +9246,7 @@ fn start_new_hosted_session(
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to start a new conversation: {error}"))?;
-    let session_id = started
-        .session_id()
-        .ok_or_else(|| "new conversation did not create a resumable session".to_string())?
-        .to_string();
+    let (started, projection) = preflight_started_session(started, "start a new conversation")?;
 
     install_hosted_session(
         thread,
@@ -8920,7 +9256,7 @@ fn start_new_hosted_session(
         preloaded,
         pending_workflow_notifications,
     );
-    Ok(session_id)
+    Ok(projection)
 }
 
 fn ensure_current_session_switchable(current: Option<&RuntimeThreadHandle>) -> Result<(), String> {
@@ -8992,6 +9328,31 @@ fn reap_hosted_thread(thread: RuntimeThreadHandle) {
     }
 }
 
+fn preflight_started_session(
+    started: RuntimeThreadHandle,
+    operation: &str,
+) -> Result<(RuntimeThreadHandle, SurfaceProjectionState), String> {
+    let projection = TuiSurfaceActions::new(started.typed_surface())
+        .read_snapshot()
+        .map(|snapshot| SurfaceProjectionState::from_surface_snapshot(&snapshot))
+        .map_err(|error| format!("failed to project conversation before {operation}: {error}"));
+    match projection {
+        Ok(projection) if projection.session_id.as_deref() == started.session_id() => {
+            Ok((started, projection))
+        }
+        Ok(_) => {
+            reap_hosted_thread(started);
+            Err(format!(
+                "failed to project conversation before {operation}: snapshot identity did not match the runtime handle"
+            ))
+        }
+        Err(error) => {
+            reap_hosted_thread(started);
+            Err(error)
+        }
+    }
+}
+
 fn install_hosted_session(
     thread: &mut Option<RuntimeThreadHandle>,
     started: RuntimeThreadHandle,
@@ -9017,7 +9378,7 @@ fn start_forked_hosted_session(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     title: Option<String>,
-) -> Result<(HistoryMode, String, String), String> {
+) -> Result<(HistoryMode, SurfaceProjectionState), String> {
     ensure_current_session_switchable(thread.as_ref())?;
     let source_id = thread
         .as_ref()
@@ -9034,10 +9395,7 @@ fn start_forked_hosted_session(
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to fork conversation: {error}"))?;
-    let session_id = started
-        .session_id()
-        .ok_or_else(|| "fork did not create a resumable session".to_string())?
-        .to_string();
+    let (started, projection) = preflight_started_session(started, "fork conversation")?;
 
     install_hosted_session(
         thread,
@@ -9047,7 +9405,7 @@ fn start_forked_hosted_session(
         preloaded,
         pending_workflow_notifications,
     );
-    Ok((mode, session_id, fork_title))
+    Ok((mode, projection))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9059,7 +9417,7 @@ fn switch_saved_hosted_session(
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
     mode: HistoryMode,
     title: Option<String>,
-) -> Result<HistoryMode, String> {
+) -> Result<(HistoryMode, SurfaceProjectionState), String> {
     ensure_current_session_switchable(thread.as_ref())?;
     let selector = match &mode {
         HistoryMode::Resume(selector)
@@ -9086,6 +9444,7 @@ fn switch_saved_hosted_session(
     let started = host
         .start_thread_with_request(request)
         .map_err(|error| format!("failed to switch saved conversation: {error}"))?;
+    let (started, projection) = preflight_started_session(started, "switch conversation")?;
 
     install_hosted_session(
         thread,
@@ -9095,7 +9454,7 @@ fn switch_saved_hosted_session(
         preloaded,
         pending_workflow_notifications,
     );
-    Ok(mode)
+    Ok((mode, projection))
 }
 
 fn refresh_saved_session_picker(event_tx: &mpsc::Sender<TuiEvent>, notice: String) {
@@ -9123,63 +9482,71 @@ fn refresh_saved_session_picker(event_tx: &mpsc::Sender<TuiEvent>, notice: Strin
 fn announce_runtime_ready(thread: &RuntimeThreadHandle, event_tx: &mpsc::Sender<TuiEvent>) {
     let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
     let actions = TuiSurfaceActions::new(thread.typed_surface());
-    if let Ok(snapshot) = actions.read_snapshot() {
-        if let Some(session_id) = thread.session_id() {
-            let _ = event_tx.send(TuiEvent::SessionIdentityUpdated {
-                session_id: session_id.to_string(),
-                title: snapshot.thread.title.as_str().to_string(),
-            });
-        }
-        if let Some(recovery) = snapshot.recoverable_user_operation() {
-            let _ = event_tx.send(TuiEvent::RecoveryAvailable {
-                operation_id: recovery.operation_id().clone(),
-            });
-            let _ = event_tx.send(TuiEvent::Notice(
+    match actions.read_snapshot() {
+        Ok(snapshot) => {
+            let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(
+                SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            )));
+            if let Some(recovery) = snapshot.recoverable_user_operation() {
+                let _ = event_tx.send(TuiEvent::RecoveryAvailable {
+                    operation_id: recovery.operation_id().clone(),
+                });
+                let _ = event_tx.send(TuiEvent::Notice(
                 "A recoverable operation is suspended. Use the recovery controls to continue it or /cancel-operation to close it."
                     .to_string(),
             ));
+            }
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "failed to project the active conversation: {error}"
+            )));
         }
     }
 }
 
-fn emit_live_thread_history_snapshot(
+fn read_hosted_projection_batch(
     thread: &RuntimeThreadHandle,
-    label: &str,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<(), String> {
-    let snapshot = thread.snapshot().map_err(|error| error.to_string())?;
-    let messages = snapshot
-        .messages()
-        .iter()
-        .cloned()
-        .filter_map(chat_message_from_history)
-        .collect();
-    event_tx
-        .send(TuiEvent::HistoryLoaded {
-            messages,
-            plan: None,
-            label: label.to_string(),
+) -> Result<(SurfaceProjectionState, Vec<ChatMessage>), String> {
+    TuiSurfaceActions::new(thread.typed_surface())
+        .read_snapshot()
+        .map(|snapshot| {
+            let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
+            let messages =
+                crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
+            (projection, messages)
         })
         .map_err(|error| error.to_string())
 }
 
-fn project_hosted_thread(
-    thread: &RuntimeThreadHandle,
-    title: &str,
-    event_tx: &mpsc::Sender<TuiEvent>,
+fn project_hosted_thread_attached(
+    projection: SurfaceProjectionState,
+    messages: Vec<ChatMessage>,
+    attachment: SessionAttachmentId,
+    root_event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
-    event_tx
-        .send(TuiEvent::SessionProjectionReset {
-            session_id: thread.thread_id().to_string(),
-            title: title.to_string(),
-        })
-        .map_err(|error| error.to_string())?;
-    emit_live_thread_history_snapshot(thread, "Inherited conversation context.", event_tx)
+    send_attached_event(
+        root_event_tx,
+        attachment,
+        TuiEvent::SessionProjectionReset(Box::new(projection)),
+    )
+    .map_err(|error| error.to_string())?;
+    send_attached_event(
+        root_event_tx,
+        attachment,
+        TuiEvent::HistoryLoaded {
+            messages,
+            plan: None,
+            label: "Inherited conversation context.".to_string(),
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn emit_typed_history_snapshot(
     thread: &RuntimeThreadHandle,
     mode: &HistoryMode,
+    session_presentation: Option<SessionProjectionPresentation>,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
     let actions = TuiSurfaceActions::new(thread.typed_surface());
@@ -9240,7 +9607,11 @@ fn emit_typed_history_snapshot(
         .map_err(|error| error.to_string())?;
     event_tx
         .send(TuiEvent::SurfaceProjectionSynced(Box::new(
-            SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            match session_presentation {
+                Some(presentation) => SurfaceProjectionState::from_surface_snapshot(&snapshot)
+                    .with_session_presentation(presentation),
+                None => SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            },
         )))
         .map_err(|error| error.to_string())?;
     let tasks = crate::surface_projection::workflow_task_summaries(&snapshot);

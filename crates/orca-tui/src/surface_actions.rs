@@ -141,9 +141,13 @@ impl TuiSurfaceActions {
         crate::surface_client::read_snapshot(&self.thread)
     }
 
-    pub(crate) fn rename_current_session(&self, session_id: &str, title: &str) -> io::Result<()> {
+    pub(crate) fn rename_current_session(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> io::Result<SurfaceProjectionState> {
         let before = self.read_snapshot()?;
-        let committed_revision = crate::surface_client::update_session_metadata(
+        let committed = crate::surface_client::update_session_metadata(
             &self.thread,
             before.thread.metadata_revision,
             orca_runtime::surface::SessionMetadataPatch::SetTitle {
@@ -155,7 +159,7 @@ impl TuiSurfaceActions {
         if let Err(error) = TuiHostActions::rename_saved_session(session_id, title) {
             let compensation = crate::surface_client::update_session_metadata(
                 &self.thread,
-                committed_revision,
+                committed.metadata_revision,
                 orca_runtime::surface::SessionMetadataPatch::SetTitle {
                     title: before.thread.title.clone(),
                 },
@@ -174,7 +178,29 @@ impl TuiSurfaceActions {
                 "failed to persist conversation rename: {error}{detail}"
             )));
         }
-        Ok(())
+        let committed_cursor = committed.thread_cursor;
+        let snapshot = self.read_snapshot().map_err(|error| {
+            io::Error::other(format!(
+                "Session rename committed but TUI projection failed: {error}"
+            ))
+        })?;
+        if snapshot.cursor.thread_id != committed_cursor.thread_id
+            || snapshot.cursor.incarnation != committed_cursor.incarnation
+            || snapshot.cursor.next_seq < committed_cursor.next_seq
+        {
+            return Err(io::Error::other(
+                "Session rename committed but TUI projection failed: snapshot did not cover the committed cursor",
+            ));
+        }
+        let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
+        if projection.session_id.as_deref() != Some(session_id) {
+            return Err(io::Error::other(
+                "Session rename committed but TUI projection failed: snapshot identity did not match the recorded session",
+            ));
+        }
+        Ok(projection.with_session_presentation(
+            crate::surface_projection::SessionProjectionPresentation::Renamed,
+        ))
     }
 
     pub(crate) fn add_pinned_context(&self, note: &str) -> io::Result<()> {

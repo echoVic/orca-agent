@@ -30,6 +30,7 @@ use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssemb
 pub use crate::surface_projection::SurfaceProjectionState;
 use crate::surface_projection::{
     SurfaceGoalProjectionEffect, SurfaceGoalProjectionState, SurfaceMetricsState,
+    SurfaceSessionProjectionApply, SurfaceSessionProjectionEffect, SurfaceSessionProjectionState,
 };
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
@@ -346,25 +347,8 @@ pub enum TuiEvent {
         plan: Option<(Option<String>, Vec<PlanItem>)>,
         label: String,
     },
-    NewSessionStarted {
-        session_id: String,
-    },
-    SessionProjectionReset {
-        session_id: String,
-        title: String,
-    },
-    SessionIdentityUpdated {
-        session_id: String,
-        title: String,
-    },
-    SessionRenamed {
-        session_id: String,
-        title: String,
-    },
-    SessionForked {
-        session_id: String,
-        title: String,
-    },
+    NewSessionStarted,
+    SessionProjectionReset(Box<SurfaceProjectionState>),
     SavedSessionsUpdated {
         sessions: Vec<SessionSummary>,
         next_offset: Option<usize>,
@@ -835,8 +819,7 @@ pub struct AppState {
     pub approval_mode: ApprovalMode,
     pub pre_plan_approval_mode: Option<ApprovalMode>,
     pub cwd: String,
-    pub current_session_id: Option<String>,
-    pub current_session_title: Option<String>,
+    pub(crate) surface_session: SurfaceSessionProjectionState,
     pub(crate) side_conversation: Option<SideConversationUiState>,
     pub(crate) side_conversation_visible: bool,
     pub(crate) active_session_attachment: Option<SessionAttachmentId>,
@@ -1000,8 +983,7 @@ impl AppState {
             approval_mode: ApprovalMode::default(),
             pre_plan_approval_mode: None,
             cwd,
-            current_session_id: None,
-            current_session_title: None,
+            surface_session: SurfaceSessionProjectionState::default(),
             side_conversation: None,
             side_conversation_visible: false,
             active_session_attachment: None,
@@ -1291,21 +1273,16 @@ impl AppState {
     fn assert_tool_call_index_consistent(&self) {}
 
     fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
-        let session_changed =
-            self.current_session_id.as_deref() != Some(projection.session_id.as_str());
-        if !session_changed
-            && self
+        let mut surface_session = self.surface_session.clone();
+        let session_apply = surface_session.apply_projection(&projection);
+        if matches!(session_apply, SurfaceSessionProjectionApply::Rejected)
+            || self
                 .surface_metrics
                 .rejects_usage_revision(projection.usage_revision)
         {
             return;
         }
-        if session_changed {
-            self.surface_metrics.reset();
-            self.surface_goal.reset();
-        }
-        self.current_session_id = Some(projection.session_id.clone());
-        self.current_session_title = Some(projection.title.clone());
+        self.surface_session = surface_session;
         self.surface_metrics.apply_projection(&projection);
         let goal_effect = self.surface_goal.apply_projection(&projection);
         self.active_surface_operation_id = projection.foreground_operation_id.clone();
@@ -1327,18 +1304,31 @@ impl AppState {
             }
             None => {}
         }
+        match session_apply {
+            SurfaceSessionProjectionApply::Accepted(Some(
+                SurfaceSessionProjectionEffect::Renamed { title },
+            )) => {
+                self.push_message(ChatMessage::System(format!(
+                    "Renamed conversation to {title}."
+                )));
+                self.set_status(AppStatus::Idle);
+            }
+            SurfaceSessionProjectionApply::Accepted(Some(
+                SurfaceSessionProjectionEffect::Forked { title },
+            )) => {
+                self.push_message(ChatMessage::System(format!(
+                    "Forked conversation as {title}."
+                )));
+                self.set_status(AppStatus::Idle);
+            }
+            SurfaceSessionProjectionApply::Accepted(None)
+            | SurfaceSessionProjectionApply::Rejected => {}
+        }
     }
 
     #[cfg(any(test, debug_assertions))]
     fn assert_surface_projection_consistent(&self, projection: &SurfaceProjectionState) {
-        debug_assert_eq!(
-            self.current_session_id.as_deref(),
-            Some(projection.session_id.as_str())
-        );
-        debug_assert_eq!(
-            self.current_session_title.as_deref(),
-            Some(projection.title.as_str())
-        );
+        self.surface_session.assert_matches_projection(projection);
         self.surface_metrics.assert_matches_projection(projection);
         debug_assert_eq!(
             self.workflow_panel.tasks,
@@ -1409,9 +1399,8 @@ impl AppState {
         self.invalidate_selection();
     }
 
-    pub(crate) fn reset_session_projection(&mut self, session_id: String, title: String) {
-        self.current_session_id = Some(session_id);
-        self.current_session_title = Some(title);
+    pub(crate) fn reset_session_projection(&mut self) {
+        self.surface_session.reset();
         self.clear_messages();
         self.current_plan = None;
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
@@ -1765,31 +1754,13 @@ impl AppState {
             TuiEvent::SurfaceProjectionSynced(projection) => {
                 self.apply_surface_projection_state(*projection);
             }
-            TuiEvent::NewSessionStarted { session_id } => {
-                self.reset_session_projection(session_id, "New conversation".to_string());
-            }
-            TuiEvent::SessionProjectionReset { session_id, title } => {
-                self.reset_session_projection(session_id, title);
-            }
-            TuiEvent::SessionIdentityUpdated { session_id, title } => {
-                self.current_session_id = Some(session_id);
-                self.current_session_title = Some(title);
-            }
-            TuiEvent::SessionRenamed { session_id, title } => {
-                self.current_session_id = Some(session_id);
-                self.current_session_title = Some(title.clone());
-                self.push_message(ChatMessage::System(format!(
-                    "Renamed conversation to {title}."
-                )));
-                self.set_status(AppStatus::Idle);
-            }
-            TuiEvent::SessionForked { session_id, title } => {
-                self.current_session_id = Some(session_id);
-                self.current_session_title = Some(title.clone());
-                self.push_message(ChatMessage::System(format!(
-                    "Forked conversation as {title}."
-                )));
-                self.set_status(AppStatus::Idle);
+            TuiEvent::NewSessionStarted => {}
+            TuiEvent::SessionProjectionReset(projection) => {
+                if !SurfaceSessionProjectionState::accepts_reset(&projection) {
+                    return;
+                }
+                self.reset_session_projection();
+                self.apply_surface_projection_state(*projection);
             }
             TuiEvent::SavedSessionsUpdated {
                 sessions,
@@ -3191,7 +3162,7 @@ mod tests {
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(1),
-                session_id: "old-session".to_string(),
+                session_id: Some("old-session".to_string()),
                 title: "Old session".to_string(),
                 usage_revision: 1,
                 usage: UsageTotals {
@@ -3205,6 +3176,7 @@ mod tests {
                 current_goal: None,
                 foreground_operation_id: None,
                 goal_presentation: None,
+                session_presentation: None,
             },
         )));
         state.approval_allowlist.insert("bash".to_string());
@@ -3224,9 +3196,24 @@ mod tests {
         state.composer_mouse_selecting = true;
         state.enter_running();
 
-        state.update(TuiEvent::NewSessionStarted {
-            session_id: "019f8a00-0000-7000-8000-000000000123".to_string(),
-        });
+        state.update(TuiEvent::SessionProjectionReset(Box::new(
+            SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(2),
+                session_id: Some("019f8a00-0000-7000-8000-000000000123".to_string()),
+                title: "New conversation".to_string(),
+                usage_revision: 1,
+                usage: UsageTotals::default(),
+                context_revision: 1,
+                context_used_tokens: 0,
+                context_limit_tokens: 0,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+                goal_presentation: None,
+                session_presentation: None,
+            },
+        )));
+        state.update(TuiEvent::NewSessionStarted);
 
         assert!(state.messages.is_empty());
         assert!(state.current_plan.is_none());
@@ -3251,19 +3238,29 @@ mod tests {
     }
 
     #[test]
-    fn session_identity_updates_current_projection() {
+    fn surface_session_projection_updates_current_identity() {
         let mut state = state();
 
-        state.update(TuiEvent::SessionIdentityUpdated {
-            session_id: "session-1".to_string(),
-            title: "Auth investigation".to_string(),
-        });
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
+                session_id: Some("session-1".to_string()),
+                title: "Auth investigation".to_string(),
+                usage_revision: 1,
+                usage: UsageTotals::default(),
+                context_revision: 1,
+                context_used_tokens: 0,
+                context_limit_tokens: 0,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+                goal_presentation: None,
+                session_presentation: None,
+            },
+        )));
 
-        assert_eq!(state.current_session_id.as_deref(), Some("session-1"));
-        assert_eq!(
-            state.current_session_title.as_deref(),
-            Some("Auth investigation")
-        );
+        assert_eq!(state.current_session_id(), Some("session-1"));
+        assert_eq!(state.current_session_title(), Some("Auth investigation"));
     }
 
     #[test]
@@ -4751,7 +4748,7 @@ mod tests {
 
         let projection = |usage_revision, usage| SurfaceProjectionState {
             cursor: crate::surface_projection::test_surface_cursor(usage_revision),
-            session_id: "usage-session".to_string(),
+            session_id: Some("usage-session".to_string()),
             title: "Usage session".to_string(),
             usage_revision,
             usage,
@@ -4762,6 +4759,7 @@ mod tests {
             current_goal: None,
             foreground_operation_id: None,
             goal_presentation: None,
+            session_presentation: None,
         };
 
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
@@ -4777,6 +4775,199 @@ mod tests {
         ))));
 
         assert_eq!(state.usage(), &after_compaction);
+    }
+
+    #[test]
+    fn surface_session_projection_fences_stale_and_cross_thread_identity() {
+        let mut state = state();
+        let projection = |cursor, session_id: &str, title: &str| SurfaceProjectionState {
+            cursor,
+            session_id: Some(session_id.to_string()),
+            title: title.to_string(),
+            usage_revision: 1,
+            usage: UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: Vec::new(),
+            current_goal: None,
+            foreground_operation_id: None,
+            goal_presentation: None,
+            session_presentation: None,
+        };
+        let committed = projection(
+            crate::surface_projection::test_surface_cursor(2),
+            "session-1",
+            "Committed title",
+        );
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(committed)));
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            crate::surface_projection::test_surface_cursor(1),
+            "session-1",
+            "Stale title",
+        ))));
+        assert_eq!(
+            state.current_session_title(),
+            Some("Committed title"),
+            "an older cursor must not overwrite the accepted title"
+        );
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            crate::surface_projection::test_surface_cursor(2),
+            "session-1",
+            "Contradictory title",
+        ))));
+        assert_eq!(
+            state.current_session_title(),
+            Some("Committed title"),
+            "an equal cursor with contradictory identity must be rejected"
+        );
+
+        let mut different_cursor = crate::surface_projection::test_surface_cursor(1);
+        let mut thread_bytes = [9; 16];
+        thread_bytes[6] = 0x79;
+        thread_bytes[8] = 0x89;
+        different_cursor.thread_id =
+            orca_runtime::surface::SurfaceThreadId::try_from_bytes(thread_bytes)
+                .expect("different test surface thread id");
+        let mut different_projection =
+            projection(different_cursor, "session-2", "Different thread");
+        different_projection.usage.input_tokens = 99;
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            different_projection.clone(),
+        )));
+        assert_eq!(
+            state.current_session_id(),
+            Some("session-1"),
+            "ordinary projection cannot switch threads"
+        );
+        assert_eq!(
+            state.usage().input_tokens,
+            0,
+            "rejected identity must reject the whole projection envelope"
+        );
+
+        state.update(TuiEvent::SessionProjectionReset(Box::new(
+            different_projection,
+        )));
+        assert_eq!(state.current_session_id(), Some("session-2"));
+        assert_eq!(state.current_session_title(), Some("Different thread"));
+        assert_eq!(state.usage().input_tokens, 99);
+    }
+
+    #[test]
+    fn surface_session_projection_presents_once_per_cursor() {
+        let mut state = state();
+        let projection = |next_seq, title: &str, session_presentation| SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(next_seq),
+            session_id: Some("session-1".to_string()),
+            title: title.to_string(),
+            usage_revision: 1,
+            usage: UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: Vec::new(),
+            current_goal: None,
+            foreground_operation_id: None,
+            goal_presentation: None,
+            session_presentation,
+        };
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            1,
+            "Initial title",
+            None,
+        ))));
+        let renamed = projection(
+            2,
+            "Committed title",
+            Some(crate::surface_projection::SessionProjectionPresentation::Renamed),
+        );
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(renamed.clone())));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(renamed.clone())));
+        let duplicate_directive = SurfaceProjectionState {
+            session_presentation: Some(
+                crate::surface_projection::SessionProjectionPresentation::Forked,
+            ),
+            ..renamed
+        };
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            duplicate_directive,
+        )));
+
+        assert_eq!(state.current_session_title(), Some("Committed title"));
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        ChatMessage::System(text)
+                            if text == "Renamed conversation to Committed title."
+                    )
+                })
+                .count(),
+            1
+        );
+        assert!(!state.messages.iter().any(|message| {
+            matches!(message, ChatMessage::System(text) if text.starts_with("Forked conversation"))
+        }));
+    }
+
+    #[test]
+    fn rejected_reset_preserves_existing_surface_state() {
+        let mut state = state();
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
+                session_id: Some("session-1".to_string()),
+                title: "Existing title".to_string(),
+                usage_revision: 1,
+                usage: UsageTotals {
+                    input_tokens: 7,
+                    ..UsageTotals::default()
+                },
+                context_revision: 1,
+                context_used_tokens: 3,
+                context_limit_tokens: 100,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+                goal_presentation: None,
+                session_presentation: None,
+            },
+        )));
+        state.push_message(ChatMessage::User("keep me".to_string()));
+
+        state.update(TuiEvent::SessionProjectionReset(Box::new(
+            SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(2),
+                session_id: None,
+                title: "Invalid ephemeral rename".to_string(),
+                usage_revision: 2,
+                usage: UsageTotals::default(),
+                context_revision: 2,
+                context_used_tokens: 0,
+                context_limit_tokens: 0,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+                goal_presentation: None,
+                session_presentation: Some(
+                    crate::surface_projection::SessionProjectionPresentation::Renamed,
+                ),
+            },
+        )));
+
+        assert_eq!(state.current_session_id(), Some("session-1"));
+        assert_eq!(state.current_session_title(), Some("Existing title"));
+        assert_eq!(state.usage().input_tokens, 7);
+        assert!(matches!(
+            state.messages.as_slice(),
+            [ChatMessage::User(prompt)] if prompt == "keep me"
+        ));
     }
 
     #[test]
@@ -4802,7 +4993,7 @@ mod tests {
         };
         let projection = |cursor, goal, goal_presentation| SurfaceProjectionState {
             cursor,
-            session_id: "goal-session".to_string(),
+            session_id: Some("goal-session".to_string()),
             title: "Goal session".to_string(),
             usage_revision: 1,
             usage: UsageTotals::default(),
@@ -4813,6 +5004,7 @@ mod tests {
             current_goal: goal,
             foreground_operation_id: None,
             goal_presentation,
+            session_presentation: None,
         };
 
         let committed_projection = projection(
@@ -4885,12 +5077,7 @@ mod tests {
         assert_eq!(state.current_goal(), Some(&committed));
         assert_eq!(goal_notice_count(&state), 1);
 
-        state.update(TuiEvent::SessionProjectionReset {
-            session_id: "goal-session".to_string(),
-            title: "Goal session".to_string(),
-        });
-        assert!(state.current_goal().is_none());
-        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+        state.update(TuiEvent::SessionProjectionReset(Box::new(
             different_incarnation_projection,
         )));
         assert_eq!(state.current_goal(), Some(&after_reset));
@@ -4912,7 +5099,7 @@ mod tests {
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(1),
-                session_id: "goal-session".to_string(),
+                session_id: Some("goal-session".to_string()),
                 title: "Goal session".to_string(),
                 usage_revision: 1,
                 usage: UsageTotals::default(),
@@ -4923,6 +5110,7 @@ mod tests {
                 current_goal: Some(goal.clone()),
                 foreground_operation_id: None,
                 goal_presentation: None,
+                session_presentation: None,
             },
         )));
 
@@ -4945,7 +5133,7 @@ mod tests {
         };
         let projection = |next_seq, goal, goal_presentation| SurfaceProjectionState {
             cursor: crate::surface_projection::test_surface_cursor(next_seq),
-            session_id: "goal-session".to_string(),
+            session_id: Some("goal-session".to_string()),
             title: "Goal session".to_string(),
             usage_revision: 1,
             usage: UsageTotals::default(),
@@ -4956,6 +5144,7 @@ mod tests {
             current_goal: goal,
             foreground_operation_id: None,
             goal_presentation,
+            session_presentation: None,
         };
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
             1,
@@ -4986,10 +5175,10 @@ mod tests {
     #[test]
     fn surface_projection_consistency_current_goal_reconciles_session_scoped_state() {
         let mut state = state();
-        state.update(TuiEvent::SessionProjectionReset {
-            session_id: "stale-session".to_string(),
-            title: "stale title".to_string(),
-        });
+        state.replace_session_identity_for_test(
+            Some("stale-session".to_string()),
+            Some("stale title".to_string()),
+        );
         state.update(TuiEvent::ToolRequested {
             id: "tool-1".to_string(),
             name: "shell".to_string(),
@@ -5012,7 +5201,7 @@ mod tests {
         };
         let expected = SurfaceProjectionState {
             cursor: crate::surface_projection::test_surface_cursor(7),
-            session_id: "canonical-session".to_string(),
+            session_id: Some("canonical-session".to_string()),
             title: "canonical title".to_string(),
             usage_revision: 7,
             usage: UsageTotals {
@@ -5028,20 +5217,13 @@ mod tests {
             current_goal: Some(goal),
             foreground_operation_id: Some(operation_id),
             goal_presentation: None,
+            session_presentation: None,
         };
 
-        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
-            expected.clone(),
-        )));
+        state.update(TuiEvent::SessionProjectionReset(Box::new(expected.clone())));
 
-        assert_eq!(
-            state.current_session_id.as_deref(),
-            Some("canonical-session")
-        );
-        assert_eq!(
-            state.current_session_title.as_deref(),
-            Some("canonical title")
-        );
+        assert_eq!(state.current_session_id(), Some("canonical-session"));
+        assert_eq!(state.current_session_title(), Some("canonical title"));
         assert_eq!(state.usage(), &expected.usage);
         assert_eq!(state.context_used_tokens(), expected.context_used_tokens);
         assert_eq!(state.context_limit_tokens(), expected.context_limit_tokens);
@@ -5091,10 +5273,7 @@ mod tests {
         stale.usage.input_tokens = 1;
         stale.foreground_operation_id = None;
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(stale)));
-        assert_eq!(
-            state.current_session_title.as_deref(),
-            Some("canonical title")
-        );
+        assert_eq!(state.current_session_title(), Some("canonical title"));
         assert_eq!(state.usage().input_tokens, 800);
         assert_eq!(
             state.active_surface_operation_id,
@@ -5102,7 +5281,7 @@ mod tests {
         );
 
         let mut next_session = expected.clone();
-        next_session.session_id = "next-session".to_string();
+        next_session.session_id = Some("next-session".to_string());
         next_session.title = "next title".to_string();
         next_session.usage_revision = 1;
         next_session.usage.input_tokens = 12;
@@ -5113,17 +5292,21 @@ mod tests {
         next_session.current_goal = None;
         next_session.foreground_operation_id = None;
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(next_session)));
-        assert_eq!(state.usage().input_tokens, 12);
-        assert_eq!(state.context_used_tokens(), 12_000);
-        assert_eq!(state.context_limit_tokens(), 256_000);
-        assert!(state.active_surface_operation_id.is_none());
-        assert!(state.current_goal().is_none());
-        assert!(state.workflow_panel.tasks.is_empty());
+        assert_eq!(state.usage().input_tokens, 800);
 
-        state.update(TuiEvent::SessionProjectionReset {
-            session_id: "empty-session".to_string(),
-            title: "empty title".to_string(),
-        });
+        let mut empty = expected;
+        empty.cursor = crate::surface_projection::test_surface_cursor(9);
+        empty.session_id = Some("empty-session".to_string());
+        empty.title = "empty title".to_string();
+        empty.usage_revision = 1;
+        empty.usage = UsageTotals::default();
+        empty.context_revision = 1;
+        empty.context_used_tokens = 0;
+        empty.context_limit_tokens = 0;
+        empty.workflow_tasks.clear();
+        empty.current_goal = None;
+        empty.foreground_operation_id = None;
+        state.update(TuiEvent::SessionProjectionReset(Box::new(empty)));
         assert_eq!(state.usage(), &UsageTotals::default());
         assert_eq!(state.context_used_tokens(), 0);
         assert_eq!(state.context_limit_tokens(), 0);
@@ -6085,7 +6268,7 @@ mod tests {
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(1),
-                session_id: "session-1".to_string(),
+                session_id: Some("session-1".to_string()),
                 title: "Goal session".to_string(),
                 usage_revision: 1,
                 usage: UsageTotals::default(),
@@ -6098,6 +6281,7 @@ mod tests {
                 goal_presentation: Some(
                     crate::surface_projection::GoalProjectionPresentation::Updated,
                 ),
+                session_presentation: None,
             },
         )));
         assert_eq!(state.status, AppStatus::Running);

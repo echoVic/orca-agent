@@ -80,3 +80,17 @@ pub(crate) fn rotate_attached_event_sender(
         None => spawn_attached_event_sender(root_event_tx.clone(), *attachment),
     };
 }
+
+pub(crate) fn rotate_side_event_sender(
+    root_event_tx: &mpsc::Sender<TuiEvent>,
+    attachment: &mut SessionAttachmentId,
+    routing: &Arc<Mutex<AttachmentRouting>>,
+) -> mpsc::Sender<TuiEvent> {
+    AttachmentRouting::retire_attachment(routing, *attachment);
+    *attachment = attachment.next();
+    spawn_attached_event_sender_with_routing(
+        root_event_tx.clone(),
+        *attachment,
+        Some(routing.clone()),
+    )
+}

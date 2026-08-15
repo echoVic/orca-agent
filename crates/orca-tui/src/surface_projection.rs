@@ -19,7 +19,7 @@ use orca_runtime::surface::{
     SurfaceItem, SurfaceOperationFence, SurfaceOperationId, SurfaceReduceMode, SurfaceReduceResult,
     SurfaceReducerErrorCode, SurfaceReducerState, SurfaceStreamId, SurfaceTaskStatus,
     SurfaceToolResultKind, SurfaceUserInputState, SurfaceWorkflow, SurfaceWorkflowAgentStatus,
-    SurfaceWorkflowStatus, ToolPatch, UnixMillis,
+    SurfaceWorkflowStatus, ThreadPersistence, ToolPatch, UnixMillis,
 };
 
 use crate::types::{AppState, TuiEvent, TuiTaskLifecycle};
@@ -30,7 +30,7 @@ use crate::types::{AppState, TuiEvent, TuiTaskLifecycle};
 #[doc(hidden)]
 pub struct SurfaceProjectionState {
     pub(crate) cursor: SurfaceCursor,
-    pub(crate) session_id: String,
+    pub(crate) session_id: Option<String>,
     pub(crate) title: String,
     pub(crate) usage_revision: u64,
     pub(crate) usage: UsageTotals,
@@ -41,6 +41,124 @@ pub struct SurfaceProjectionState {
     pub(crate) current_goal: Option<ThreadGoal>,
     pub(crate) foreground_operation_id: Option<SurfaceOperationId>,
     pub(crate) goal_presentation: Option<GoalProjectionPresentation>,
+    pub(crate) session_presentation: Option<SessionProjectionPresentation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionProjectionPresentation {
+    Renamed,
+    Forked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceSessionProjectionEffect {
+    Renamed { title: String },
+    Forked { title: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceSessionProjectionApply {
+    Rejected,
+    Accepted(Option<SurfaceSessionProjectionEffect>),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SurfaceSessionProjectionState {
+    session_id: Option<String>,
+    title: Option<String>,
+    cursor: Option<SurfaceCursor>,
+    presented_cursor: Option<SurfaceCursor>,
+}
+
+impl SurfaceSessionProjectionState {
+    pub(crate) fn accepts_reset(projection: &SurfaceProjectionState) -> bool {
+        projection.session_presentation.is_none() || projection.session_id.is_some()
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub(crate) fn apply_projection(
+        &mut self,
+        projection: &SurfaceProjectionState,
+    ) -> SurfaceSessionProjectionApply {
+        if projection.session_presentation.is_some() && projection.session_id.is_none() {
+            return SurfaceSessionProjectionApply::Rejected;
+        }
+
+        match self.cursor.as_ref() {
+            None => {}
+            Some(current)
+                if current.thread_id != projection.cursor.thread_id
+                    || current.incarnation != projection.cursor.incarnation =>
+            {
+                return SurfaceSessionProjectionApply::Rejected;
+            }
+            Some(current) if projection.cursor.next_seq < current.next_seq => {
+                return SurfaceSessionProjectionApply::Rejected;
+            }
+            Some(current) if projection.cursor.next_seq == current.next_seq => {
+                if current != &projection.cursor
+                    || self.session_id != projection.session_id
+                    || self.title.as_deref() != Some(projection.title.as_str())
+                {
+                    return SurfaceSessionProjectionApply::Rejected;
+                }
+            }
+            Some(_) => {}
+        }
+
+        if self.cursor.as_ref() != Some(&projection.cursor) {
+            self.session_id.clone_from(&projection.session_id);
+            self.title = Some(projection.title.clone());
+            self.cursor = Some(projection.cursor.clone());
+        }
+
+        let effect = projection.session_presentation.and_then(|presentation| {
+            if self.presented_cursor.as_ref() == Some(&projection.cursor) {
+                return None;
+            }
+            let title = self.title.clone()?;
+            self.presented_cursor = Some(projection.cursor.clone());
+            Some(match presentation {
+                SessionProjectionPresentation::Renamed => {
+                    SurfaceSessionProjectionEffect::Renamed { title }
+                }
+                SessionProjectionPresentation::Forked => {
+                    SurfaceSessionProjectionEffect::Forked { title }
+                }
+            })
+        });
+        SurfaceSessionProjectionApply::Accepted(effect)
+    }
+
+    pub(crate) fn assert_matches_projection(&self, projection: &SurfaceProjectionState) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            debug_assert_eq!(self.cursor.as_ref(), Some(&projection.cursor));
+            debug_assert_eq!(self.session_id, projection.session_id);
+            debug_assert_eq!(self.title.as_deref(), Some(projection.title.as_str()));
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = projection;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_for_test(&mut self, session_id: Option<String>, title: Option<String>) {
+        self.session_id = session_id;
+        self.title = title;
+        self.cursor = None;
+        self.presented_cursor = None;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +310,16 @@ impl SurfaceMetricsState {
 }
 
 impl AppState {
+    /// Returns the recorded session id from the latest accepted surface snapshot.
+    pub fn current_session_id(&self) -> Option<&str> {
+        self.surface_session.session_id()
+    }
+
+    /// Returns the title from the latest accepted surface snapshot.
+    pub fn current_session_title(&self) -> Option<&str> {
+        self.surface_session.title()
+    }
+
     /// Returns usage from the latest committed runtime surface snapshot.
     pub fn usage(&self) -> &UsageTotals {
         self.surface_metrics.usage()
@@ -215,6 +343,15 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn replace_current_goal_for_test(&mut self, goal: Option<ThreadGoal>) {
         self.surface_goal.replace_for_test(goal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_session_identity_for_test(
+        &mut self,
+        session_id: Option<String>,
+        title: Option<String>,
+    ) {
+        self.surface_session.replace_for_test(session_id, title);
     }
 }
 
@@ -384,7 +521,11 @@ impl SurfaceProjectionState {
     pub(crate) fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
         Self {
             cursor: snapshot.cursor.clone(),
-            session_id: surface_thread_id_text(&snapshot.thread.thread_id),
+            session_id: matches!(
+                snapshot.thread.persistence,
+                ThreadPersistence::RecordedCatalogued
+            )
+            .then(|| surface_thread_id_text(&snapshot.thread.thread_id)),
             title: snapshot.thread.title.as_str().to_string(),
             usage_revision: snapshot.usage.revision.get(),
             usage: core_usage_totals(&snapshot.usage.thread_total),
@@ -406,6 +547,7 @@ impl SurfaceProjectionState {
                 .as_ref()
                 .map(|operation| operation.operation_id.clone()),
             goal_presentation: None,
+            session_presentation: None,
         }
     }
 
@@ -414,6 +556,14 @@ impl SurfaceProjectionState {
         presentation: GoalProjectionPresentation,
     ) -> Self {
         self.goal_presentation = Some(presentation);
+        self
+    }
+
+    pub(crate) fn with_session_presentation(
+        mut self,
+        presentation: SessionProjectionPresentation,
+    ) -> Self {
+        self.session_presentation = Some(presentation);
         self
     }
 }
@@ -1931,6 +2081,34 @@ mod tests {
             SurfaceProjectionState::from_surface_snapshot(reducer_snapshot).current_goal
         );
         assert_eq!(state.goal_presentation, Some(presentation));
+    }
+
+    #[test]
+    fn surface_session_projection_does_not_invent_ephemeral_session_id() {
+        let mut snapshot = goal_projection_snapshot();
+        snapshot.thread.persistence = ThreadPersistence::EphemeralNonCataloguedOneShot {
+            close_after: orca_runtime::surface::FirstOperationCompletionPolicy::Terminal,
+        };
+        snapshot.thread.title = DisplayText::new("Ephemeral investigation");
+        let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            event_tx,
+            "0.0.0-test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+
+        assert_eq!(
+            state.current_session_title(),
+            Some("Ephemeral investigation")
+        );
+        assert!(
+            state.current_session_id().is_none(),
+            "ephemeral runtime threads are not resumable sessions"
+        );
     }
 
     #[test]

@@ -539,10 +539,9 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
                 "Session actions",
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             )));
-            for (index, action) in
-                available_session_actions(state.current_session_id.as_deref(), session_id)
-                    .into_iter()
-                    .enumerate()
+            for (index, action) in available_session_actions(state.current_session_id(), session_id)
+                .into_iter()
+                .enumerate()
             {
                 let style = if index == *selected {
                     Style::default()
@@ -4621,14 +4620,16 @@ mod tests {
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(1),
-                session_id: state
-                    .current_session_id
-                    .clone()
-                    .unwrap_or_else(|| "metrics-test".to_string()),
+                session_id: Some(
+                    state
+                        .current_session_id()
+                        .unwrap_or("metrics-test")
+                        .to_string(),
+                ),
                 title: state
-                    .current_session_title
-                    .clone()
-                    .unwrap_or_else(|| "Metrics test".to_string()),
+                    .current_session_title()
+                    .unwrap_or("Metrics test")
+                    .to_string(),
                 usage_revision: 1,
                 usage,
                 context_revision: 1,
@@ -4638,6 +4639,7 @@ mod tests {
                 current_goal: state.current_goal().cloned(),
                 foreground_operation_id: None,
                 goal_presentation: None,
+                session_presentation: None,
             },
         )));
     }
@@ -5804,7 +5806,10 @@ mod tests {
     fn current_session_picker_actions_hide_destructive_commands() {
         let mut state = test_state();
         state.status = AppStatus::SessionPicker;
-        state.current_session_id = Some("session-1".to_string());
+        state.replace_session_identity_for_test(
+            Some("session-1".to_string()),
+            Some("Current session".to_string()),
+        );
         state.session_picker_sessions = vec![session_summary("session-1", "Current session")];
         state.session_picker_phase = SessionPickerPhase::Actions {
             session_id: "session-1".to_string(),
@@ -6738,7 +6743,7 @@ mod tests {
         let mut state = test_state();
         let snapshot = SurfaceProjectionState {
             cursor: crate::surface_projection::test_surface_cursor(1),
-            session_id: "goal-session".to_string(),
+            session_id: Some("goal-session".to_string()),
             title: "Goal session".to_string(),
             usage_revision: 1,
             usage: orca_core::cost_types::UsageTotals::default(),
@@ -6749,6 +6754,7 @@ mod tests {
             current_goal: None,
             foreground_operation_id: None,
             goal_presentation: None,
+            session_presentation: None,
         };
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             snapshot.clone(),

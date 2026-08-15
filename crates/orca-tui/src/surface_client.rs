@@ -10,20 +10,21 @@ use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
     AttachResult, BackgroundTarget, DisplayText, ExpectedGoal, FreshAttachRequest,
-    GoalMutationAction, GoalRunInput, GoalTokenBudgetUpdate, MutationReply, NonEmptyText,
-    NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
+    GoalMutationAction, GoalRunInput, GoalTokenBudgetUpdate, MutationCommitAck, MutationReply,
+    NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
     OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
     OptionalProcessLocalCancel, PinnedContextAction, PinnedContextSourceRevision,
     PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle,
     RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, SessionMetadataPatch,
     SessionMetadataPrecondition, SessionMetadataRevision, Sha256Digest, StaleMutationError,
     SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
-    SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceGoal, SurfaceGoalFence,
-    SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
-    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceUnavailableReason,
-    SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput, UncommittedMutation,
-    WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    SurfaceClientInteractionAnswer, SurfaceCursor, SurfaceEvent, SurfaceFactFamily, SurfaceGoal,
+    SurfaceGoalFence, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
+    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
+    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence,
+    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput,
+    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
+    WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -53,6 +54,12 @@ impl Error for TerminalRecoveryRequired {}
 pub(crate) enum SessionMetadataUpdateError {
     Stale { error: StaleMutationError },
     Other(io::Error),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TuiSessionMetadataCommit {
+    pub(crate) metadata_revision: SessionMetadataRevision,
+    pub(crate) thread_cursor: SurfaceCursor,
 }
 
 impl SessionMetadataUpdateError {
@@ -406,7 +413,7 @@ pub(crate) fn update_session_metadata(
     thread: &RuntimeSurfaceThreadHandle,
     expected_revision: SessionMetadataRevision,
     patch: SessionMetadataPatch,
-) -> Result<SessionMetadataRevision, SessionMetadataUpdateError> {
+) -> Result<TuiSessionMetadataCommit, SessionMetadataUpdateError> {
     let committed_revision = SessionMetadataRevision::try_new(
         expected_revision
             .get()
@@ -461,7 +468,29 @@ pub(crate) fn update_session_metadata(
         io::Error::other(format!("typed TUI metadata update failed: {error:?}"))
     })?;
     match result {
-        MutationReply::Committed { .. } => Ok(committed_revision),
+        MutationReply::Committed { mutation, .. } => {
+            let thread_cursor = mutation
+                .acknowledgements
+                .as_slice()
+                .iter()
+                .find_map(|acknowledgement| match acknowledgement {
+                    MutationCommitAck::ThreadLocalCursor { cursor, family, .. }
+                        if *family == SurfaceFactFamily::Session =>
+                    {
+                        Some(cursor.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    io::Error::other(
+                        "typed TUI metadata commit returned no session cursor acknowledgement",
+                    )
+                })?;
+            Ok(TuiSessionMetadataCommit {
+                metadata_revision: committed_revision,
+                thread_cursor,
+            })
+        }
         MutationReply::Uncommitted {
             mutation: UncommittedMutation::Stale { error, .. },
         } => Err(SessionMetadataUpdateError::Stale { error }),

@@ -78,7 +78,7 @@ pub(crate) fn handle_runtime_event(
         } => state.queued_submission_matches_id(*id),
         _ => false,
     };
-    let new_session_started = matches!(&tui_event, TuiEvent::NewSessionStarted { .. });
+    let new_session_started = matches!(&tui_event, TuiEvent::NewSessionStarted);
     let restored_prompt = match &tui_event {
         TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
         TuiEvent::SubmissionRejected { prompt, .. } if !queued_submission_rejected => {
@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn new_session_started_clears_the_composer() {
+    fn new_session_started_clears_composer_without_resetting_projection() {
         let (action_tx, _action_rx) = mpsc::unbounded();
         let pending = bridge::PendingWorkflowNotifications::new();
         let theme = Theme::named(ThemeName::Dark);
@@ -756,9 +756,7 @@ mod tests {
         let mut vim = VimState::new(false);
 
         handle_runtime_event(
-            TuiEvent::NewSessionStarted {
-                session_id: "019f8a00-0000-7000-8000-000000000123".to_string(),
-            },
+            TuiEvent::NewSessionStarted,
             &mut state,
             &action_tx,
             &pending,
@@ -769,7 +767,7 @@ mod tests {
         );
 
         assert!(textarea_text(&textarea).is_empty());
-        assert_eq!(state.status, AppStatus::Idle);
+        assert_eq!(state.status, AppStatus::Running);
     }
 
     #[test]

@@ -33,7 +33,7 @@ impl SessionPickerAction {
 }
 
 pub(crate) fn available_session_actions(
-    active_session_id: Option<&str>,
+    current_session_id: Option<&str>,
     selected_session_id: &str,
 ) -> Vec<SessionPickerAction> {
     let mut actions = vec![
@@ -41,7 +41,7 @@ pub(crate) fn available_session_actions(
         SessionPickerAction::Fork,
         SessionPickerAction::Rename,
     ];
-    if active_session_id != Some(selected_session_id) {
+    if current_session_id != Some(selected_session_id) {
         actions.extend([SessionPickerAction::Archive, SessionPickerAction::Delete]);
     }
     actions.push(SessionPickerAction::CopySessionId);
@@ -49,11 +49,11 @@ pub(crate) fn available_session_actions(
 }
 
 fn session_action_index(
-    active_session_id: Option<&str>,
+    current_session_id: Option<&str>,
     selected_session_id: &str,
     action: SessionPickerAction,
 ) -> usize {
-    available_session_actions(active_session_id, selected_session_id)
+    available_session_actions(current_session_id, selected_session_id)
         .iter()
         .position(|candidate| *candidate == action)
         .expect("picker phase action must remain available")
@@ -119,8 +119,7 @@ where
             }
             KeyCode::Down => {
                 let action_count =
-                    available_session_actions(state.current_session_id.as_deref(), &session_id)
-                        .len();
+                    available_session_actions(state.current_session_id(), &session_id).len();
                 selected = (selected + 1).min(action_count.saturating_sub(1));
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
@@ -156,7 +155,7 @@ where
             }
             KeyCode::Esc => {
                 let selected = session_action_index(
-                    state.current_session_id.as_deref(),
+                    state.current_session_id(),
                     &session_id,
                     SessionPickerAction::Rename,
                 );
@@ -194,7 +193,7 @@ where
             }
             KeyCode::Enter | KeyCode::Esc => {
                 let selected = session_action_index(
-                    state.current_session_id.as_deref(),
+                    state.current_session_id(),
                     &session_id,
                     SessionPickerAction::Archive,
                 );
@@ -232,7 +231,7 @@ where
             }
             KeyCode::Enter | KeyCode::Esc => {
                 let selected = session_action_index(
-                    state.current_session_id.as_deref(),
+                    state.current_session_id(),
                     &session_id,
                     SessionPickerAction::Delete,
                 );
@@ -274,7 +273,7 @@ fn activate_action<F>(
 where
     F: FnOnce() -> io::Result<()>,
 {
-    let Some(action) = available_session_actions(state.current_session_id.as_deref(), &session_id)
+    let Some(action) = available_session_actions(state.current_session_id(), &session_id)
         .get(selected)
         .copied()
     else {
@@ -551,7 +550,10 @@ mod tests {
         );
 
         let (mut state, rx) = state();
-        state.current_session_id = Some("two".to_string());
+        state.replace_session_identity_for_test(
+            Some("two".to_string()),
+            Some("Current session".to_string()),
+        );
         press(KeyCode::Tab, &mut state);
         for _ in 0..8 {
             press(KeyCode::Down, &mut state);

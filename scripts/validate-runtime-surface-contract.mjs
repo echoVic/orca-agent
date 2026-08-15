@@ -712,6 +712,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
 const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
+  ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
   ["crates/orca-tui/src/app.rs:install_hosted_session:pending_workflow_notifications.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:mention_search.shutdown", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:terminal.clear", 1],
