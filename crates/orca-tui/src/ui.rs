@@ -7240,7 +7240,7 @@ mod tests {
         );
         task.status = TaskStatus::Running;
         state.enter_running();
-        state.update(crate::types::TuiEvent::WorkflowTasksUpdated { tasks: vec![task] });
+        state.replace_workflow_tasks_for_test(vec![task]);
         state.update(crate::types::TuiEvent::SessionCompleted {
             status: "success".to_string(),
         });

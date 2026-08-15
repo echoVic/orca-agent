@@ -365,6 +365,49 @@ impl SurfaceOperationProjectionState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SurfaceWorkflowTaskProjectionState {
+    tasks: Vec<BackgroundTaskSummary>,
+    cursor: Option<SurfaceCursor>,
+}
+
+impl SurfaceWorkflowTaskProjectionState {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn apply_projection(&mut self, projection: &SurfaceProjectionState) -> bool {
+        match self.cursor.as_ref() {
+            None => {}
+            Some(current)
+                if current.thread_id != projection.cursor.thread_id
+                    || current.incarnation != projection.cursor.incarnation
+                    || projection.cursor.next_seq < current.next_seq =>
+            {
+                return false;
+            }
+            Some(current) if projection.cursor.next_seq == current.next_seq => {
+                return current == &projection.cursor && self.tasks == projection.workflow_tasks;
+            }
+            Some(_) => {}
+        }
+
+        self.tasks.clone_from(&projection.workflow_tasks);
+        self.cursor = Some(projection.cursor.clone());
+        true
+    }
+
+    pub(crate) fn assert_matches_projection(&self, projection: &SurfaceProjectionState) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            debug_assert_eq!(self.cursor.as_ref(), Some(&projection.cursor));
+            debug_assert_eq!(self.tasks, projection.workflow_tasks);
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = projection;
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SurfaceMetricsState {
     usage: UsageTotals,
     usage_revision: Option<u64>,
@@ -1275,19 +1318,6 @@ impl TuiSurfaceProjection {
                 _ => {}
             }
         }
-        if let Some(state) = next_reducer_state.as_ref() {
-            let snapshot = state.snapshot();
-            if batch.events.as_slice().iter().any(|event| {
-                matches!(
-                    &event.event,
-                    SurfaceEvent::Task(_) | SurfaceEvent::Workflow(_)
-                )
-            }) {
-                projected.push(TuiEvent::WorkflowTasksUpdated {
-                    tasks: workflow_task_summaries(snapshot),
-                });
-            }
-        }
         self.assistant_streams = assistant_streams;
         self.assistant_stream_order = assistant_stream_order;
         self.focused_operation = focused_operation;
@@ -1414,13 +1444,6 @@ impl TuiSurfaceProjection {
         operation_id: &SurfaceOperationId,
     ) -> Option<BackgroundTaskSummary> {
         background_task_summary_for_operation(self.reducer_state.as_ref()?.snapshot(), operation_id)
-    }
-
-    pub(crate) fn workflow_task_summaries(&self) -> Vec<BackgroundTaskSummary> {
-        self.reducer_state
-            .as_ref()
-            .map(|state| workflow_task_summaries(state.snapshot()))
-            .unwrap_or_default()
     }
 }
 
@@ -1928,9 +1951,10 @@ mod tests {
         SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceMcpCatalogSnapshot,
         SurfaceNetworkPermissions, SurfacePermissionRuleSet, SurfacePinnedContextSnapshot,
         SurfacePlanSnapshot, SurfaceReasoningEffort, SurfaceRuntimeSettings, SurfaceScope,
-        SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceThreadId,
-        SurfaceThreadSnapshot, SurfaceTurnId, ThreadOwnerEpoch, ThreadPersistence,
-        UsageTotals as SurfaceUsageTotals, UuidV7, canonical_batch_digest,
+        SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceTask, SurfaceTaskId,
+        SurfaceTaskType, SurfaceThreadId, SurfaceThreadSnapshot, SurfaceTurnId, TaskPatch,
+        TaskRevision, ThreadOwnerEpoch, ThreadPersistence, UsageTotals as SurfaceUsageTotals,
+        UuidV7, canonical_batch_digest,
     };
     use orca_runtime::surface::{SurfaceGenerationId, SurfaceUsageSnapshot, UsageRevision};
 
@@ -2197,6 +2221,45 @@ mod tests {
         batch
     }
 
+    fn task_projection_batch(
+        projection: &TuiSurfaceProjection,
+        seed: u8,
+        task: SurfaceTask,
+    ) -> SurfaceCommitBatch {
+        let before = projection.cursor().clone();
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(u64::from(seed)).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(seed)).unwrap(),
+        };
+        let event = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(seed.wrapping_add(1))).unwrap(),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Thread,
+            event: SurfaceEvent::Task(TaskPatch::Upserted {
+                expected_revision: None,
+                task,
+            }),
+        };
+        let mut batch = SurfaceCommitBatch {
+            cursor_before: before.clone(),
+            cursor_after: SurfaceCursor {
+                next_seq: SequenceNumber::new(before.next_seq.get() + 1),
+                source_revision: CursorSourceRevision::Recorded {
+                    durable_revision: DurableRevision::try_new(u64::from(seed)).unwrap(),
+                },
+                ..before
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: Sha256Digest::new([0; 32]),
+            events: NonEmptyVec::try_new(vec![event]).unwrap(),
+        };
+        batch.batch_digest = canonical_batch_digest(&batch);
+        batch
+    }
+
     fn assert_single_goal_projection(
         projection: &TuiSurfaceProjection,
         batch: &SurfaceCommitBatch,
@@ -2217,6 +2280,47 @@ mod tests {
             SurfaceProjectionState::from_surface_snapshot(reducer_snapshot).current_goal
         );
         assert_eq!(state.goal_presentation, Some(presentation));
+    }
+
+    #[test]
+    fn task_patch_projects_one_authoritative_snapshot() {
+        let snapshot = goal_projection_snapshot();
+        let mut projection = TuiSurfaceProjection::from_surface_snapshot(&snapshot);
+        let task = SurfaceTask {
+            task_id: SurfaceTaskId::try_new("task-projection-1").unwrap(),
+            revision: TaskRevision::try_new(1).unwrap(),
+            task_type: SurfaceTaskType::Workflow,
+            status: SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: DisplayText::new("project one task snapshot"),
+            created_at: UnixMillis::new(1_000),
+            started_at: Some(UnixMillis::new(1_000)),
+            completed_at: None,
+            parent_operation: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        };
+        let batch = task_projection_batch(&projection, 31, task.clone());
+
+        let events = projection.project_typed_batch(&batch).unwrap();
+
+        let [TuiEvent::SurfaceProjectionSynced(state)] = events.as_slice() else {
+            panic!("task batch must end in one projection: {events:?}");
+        };
+        assert_eq!(state.cursor, batch.cursor_after);
+        assert!(
+            state
+                .workflow_tasks
+                .iter()
+                .any(|item| item.id == task.task_id.as_str())
+        );
     }
 
     #[test]

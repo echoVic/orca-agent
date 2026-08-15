@@ -19,17 +19,8 @@ pub(crate) fn stop_task_for_tui(
         return false;
     };
     match actions.stop_task(task_id, control, event_tx) {
-        Ok(_) => {
-            let tasks = match actions.read_snapshot() {
-                Ok(snapshot) => crate::surface_projection::workflow_task_summaries(&snapshot),
-                Err(error) => {
-                    let _ = event_tx.send(TuiEvent::Error(format!(
-                        "failed to refresh runtime-owned tasks after stop: {error}"
-                    )));
-                    return false;
-                }
-            };
-            let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
+        Ok(projection) => {
+            let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
             let _ = event_tx.send(TuiEvent::Notice(format!(
                 "Task stop requested for {task_id}."
             )));
@@ -56,8 +47,8 @@ pub(crate) fn foreground_task_for_tui(
     };
 
     match actions.foreground_task(task_id, control, event_tx) {
-        Ok(tasks) => {
-            let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
+        Ok(projection) => {
+            let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
             let _ = event_tx.send(TuiEvent::Notice(format!(
                 "Task {task_id} returned to foreground."
             )));
@@ -74,7 +65,8 @@ pub(crate) fn notify_recovered_background_approvals_for_tui(
     actions: &TuiSurfaceActions,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) -> usize {
-    let Ok((tasks, recovered_tools)) = actions.recoverable_background_approval_projection() else {
+    let Ok((projection, recovered_tools)) = actions.recoverable_background_approval_projection()
+    else {
         return 0;
     };
 
@@ -83,7 +75,7 @@ pub(crate) fn notify_recovered_background_approvals_for_tui(
     }
 
     let count = recovered_tools.len();
-    let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
+    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
     let summary = if count == 1 {
         format!(
             "Recovered background session waiting for approval for {}.",

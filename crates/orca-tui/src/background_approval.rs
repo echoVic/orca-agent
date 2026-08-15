@@ -19,8 +19,8 @@ pub(crate) fn submit_background_approval_response_for_tui(
     };
 
     match actions.resolve_background_approval(approval_id, approved, control, event_tx) {
-        Ok((task_id, tasks)) => {
-            let _ = event_tx.send(TuiEvent::WorkflowTasksUpdated { tasks });
+        Ok((task_id, projection)) => {
+            let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
             let decision = if approved { "approved" } else { "denied" };
             let _ = event_tx.send(TuiEvent::Notice(format!(
                 "Background approval {decision} for {task_id}."

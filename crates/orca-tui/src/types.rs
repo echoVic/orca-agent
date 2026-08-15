@@ -11,6 +11,7 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
+#[cfg(test)]
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_file_search::{SearchPhase, SearchProgress, SessionGeneration};
 use orca_runtime::history::SessionSummary;
@@ -33,7 +34,7 @@ use crate::surface_projection::{
     SurfaceGoalProjectionEffect, SurfaceGoalProjectionState, SurfaceMetricsState,
     SurfaceOperationProjectionApply, SurfaceOperationProjectionEffect,
     SurfaceOperationProjectionState, SurfaceSessionProjectionApply, SurfaceSessionProjectionEffect,
-    SurfaceSessionProjectionState,
+    SurfaceSessionProjectionState, SurfaceWorkflowTaskProjectionState,
 };
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
@@ -303,12 +304,6 @@ pub enum TuiEvent {
         activity: String,
         turn: Option<u32>,
         usage: Option<UsageTotals>,
-    },
-    WorkflowTasksUpdated {
-        tasks: Vec<BackgroundTaskSummary>,
-    },
-    WorkflowTaskUpdated {
-        task: BackgroundTaskSummary,
     },
     BackgroundTaskOutputAttached {
         task_id: String,
@@ -853,6 +848,7 @@ pub struct AppState {
     assistant_stream_tail: Option<usize>,
     pub(crate) surface_goal: SurfaceGoalProjectionState,
     pub(crate) surface_operation: SurfaceOperationProjectionState,
+    pub(crate) surface_workflow_tasks: SurfaceWorkflowTaskProjectionState,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
@@ -1010,6 +1006,7 @@ impl AppState {
             assistant_stream_tail: None,
             surface_goal: SurfaceGoalProjectionState::default(),
             surface_operation: SurfaceOperationProjectionState::default(),
+            surface_workflow_tasks: SurfaceWorkflowTaskProjectionState::default(),
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,
             panel_mode: PanelMode::Conversation,
@@ -1265,8 +1262,11 @@ impl AppState {
         let session_apply = surface_session.apply_projection(&projection);
         let mut surface_operation = self.surface_operation.clone();
         let operation_apply = surface_operation.apply_projection(&projection);
+        let mut surface_workflow_tasks = self.surface_workflow_tasks.clone();
+        let workflow_tasks_accepted = surface_workflow_tasks.apply_projection(&projection);
         if matches!(session_apply, SurfaceSessionProjectionApply::Rejected)
             || matches!(operation_apply, SurfaceOperationProjectionApply::Rejected)
+            || !workflow_tasks_accepted
             || self
                 .surface_metrics
                 .rejects_usage_revision(projection.usage_revision)
@@ -1275,6 +1275,7 @@ impl AppState {
         }
         self.surface_session = surface_session;
         self.surface_operation = surface_operation;
+        self.surface_workflow_tasks = surface_workflow_tasks;
         self.surface_metrics.apply_projection(&projection);
         let goal_effect = self.surface_goal.apply_projection(&projection);
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
@@ -1339,6 +1340,8 @@ impl AppState {
     fn assert_surface_projection_consistent(&self, projection: &SurfaceProjectionState) {
         self.surface_session.assert_matches_projection(projection);
         self.surface_metrics.assert_matches_projection(projection);
+        self.surface_workflow_tasks
+            .assert_matches_projection(projection);
         debug_assert_eq!(
             self.workflow_tasks(),
             sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
@@ -1412,6 +1415,7 @@ impl AppState {
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
         self.surface_goal.reset();
         self.surface_operation.reset();
+        self.surface_workflow_tasks.reset();
         self.recovery_prompt_visible = false;
         self.recovery_prompt_selected = 0;
         self.surface_metrics.reset();
@@ -2130,16 +2134,6 @@ impl AppState {
                         }
                     });
                 }
-            }
-            TuiEvent::WorkflowTasksUpdated { tasks } => self.apply_workflow_tasks_update(tasks),
-            TuiEvent::WorkflowTaskUpdated { task } => {
-                let mut tasks = self.workflow_tasks().to_vec();
-                if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == task.id) {
-                    *existing = task;
-                } else {
-                    tasks.push(task);
-                }
-                self.apply_workflow_tasks_update(tasks);
             }
             TuiEvent::WorkflowNotification {
                 id,
@@ -4653,6 +4647,36 @@ mod tests {
     }
 
     #[test]
+    fn workflow_task_projection_fences_contradictory_equal_cursor() {
+        let mut state = state();
+        let projection = |tasks| SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(1),
+            session_id: Some("workflow-task-session".to_string()),
+            title: "Workflow task session".to_string(),
+            usage_revision: 1,
+            usage: UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: tasks,
+            current_goal: None,
+            foreground_operation_id: None,
+            recoverable_operation_id: None,
+            goal_presentation: None,
+            session_presentation: None,
+        };
+        let accepted = projection(vec![workflow_task_summary("task-a", "Accepted task")]);
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            accepted.clone(),
+        )));
+
+        let contradictory = projection(vec![workflow_task_summary("task-b", "Contradictory task")]);
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(contradictory)));
+
+        assert_eq!(state.workflow_tasks(), accepted.workflow_tasks);
+    }
+
+    #[test]
     fn flushable_prefix_stops_at_a_running_tool_call() {
         let mut state = state();
         state.messages.push(ChatMessage::User("hi".to_string()));
@@ -5895,42 +5919,40 @@ mod tests {
     #[test]
     fn workflow_events_update_panel_and_queue_model_notification() {
         let mut state = state();
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![BackgroundTaskSummary {
-                id: "task-1".to_string(),
-                task_type: TaskType::Workflow,
-                status: TaskStatus::Completed,
-                is_backgrounded: false,
-                description: "demo".to_string(),
-                created_at_ms: 1_000,
-                started_at_ms: Some(1_000),
-                completed_at_ms: Some(2_000),
-                command: None,
-                agent_type: None,
-                server: None,
-                tool: None,
-                pending_tool_call: None,
-                name: Some("audit".to_string()),
-                workflow_run_id: Some("workflow-run-1".to_string()),
-                phase_count: Some(2),
-                workflow_progress: None,
-                workflow_phases: Vec::new(),
-                workflow_agents: Vec::new(),
-                workflow_script_path: None,
-                workflow_launch_input: None,
-                workflow_final_summary: None,
-                workflow_failure_count: 0,
-                usage: None,
-                subagent_current_activity: None,
-                subagent_turn: None,
-                last_activity_at_ms: None,
-                result: None,
-                error: None,
-                retry_count: 0,
-                output_truncated: false,
-                publication_revision: None,
-            }],
-        });
+        state.apply_workflow_tasks_for_test(vec![BackgroundTaskSummary {
+            id: "task-1".to_string(),
+            task_type: TaskType::Workflow,
+            status: TaskStatus::Completed,
+            is_backgrounded: false,
+            description: "demo".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: Some(2_000),
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: Some("audit".to_string()),
+            workflow_run_id: Some("workflow-run-1".to_string()),
+            phase_count: Some(2),
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+            publication_revision: None,
+        }]);
         state.update(TuiEvent::WorkflowNotification {
             id: "notification-1".to_string(),
             prompt: "<task-notification>done</task-notification>".to_string(),
@@ -6050,9 +6072,7 @@ mod tests {
         approval.is_backgrounded = true;
         approval.last_activity_at_ms = Some(1_000);
 
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![completed, running, approval],
-        });
+        state.apply_workflow_tasks_for_test(vec![completed, running, approval]);
 
         assert_eq!(
             state
@@ -6078,9 +6098,7 @@ mod tests {
         state.select_workflow_index_for_test(1);
 
         running.last_activity_at_ms = Some(10_000);
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![completed, running],
-        });
+        state.apply_workflow_tasks_for_test(vec![completed, running]);
 
         assert_eq!(
             state.selected_workflow_task().map(|task| task.id.as_str()),
@@ -6098,9 +6116,7 @@ mod tests {
         completed.status = TaskStatus::Completed;
         completed.completed_at_ms = Some(9_000);
         completed.last_activity_at_ms = Some(9_000);
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![running.clone(), completed.clone()],
-        });
+        state.apply_workflow_tasks_for_test(vec![running.clone(), completed.clone()]);
         state.show_workflows();
         state.select_next_workflow_task();
         assert_eq!(
@@ -6110,7 +6126,7 @@ mod tests {
 
         completed.status = TaskStatus::Failed;
         completed.last_activity_at_ms = Some(10_000);
-        state.update(TuiEvent::WorkflowTaskUpdated { task: completed });
+        state.apply_workflow_tasks_for_test(vec![running.clone(), completed]);
 
         assert_eq!(
             state
@@ -6140,9 +6156,7 @@ mod tests {
         workflow.status = TaskStatus::Running;
         workflow.last_activity_at_ms = Some(9_000);
 
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![workflow.clone(), backgrounded.clone()],
-        });
+        state.apply_workflow_tasks_for_test(vec![workflow.clone(), backgrounded.clone()]);
 
         assert_eq!(state.panel_mode, PanelMode::Workflows);
         assert_eq!(
@@ -6157,9 +6171,7 @@ mod tests {
             .expect("workflow task remains visible");
         state.select_workflow_index_for_test(selected);
         backgrounded.last_activity_at_ms = Some(10_000);
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![workflow, backgrounded],
-        });
+        state.apply_workflow_tasks_for_test(vec![workflow, backgrounded]);
 
         assert_eq!(
             state.selected_workflow_task().map(|task| task.id.as_str()),
@@ -6186,9 +6198,7 @@ mod tests {
         workflow.status = TaskStatus::Running;
         workflow.last_activity_at_ms = Some(9_000);
 
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![workflow.clone(), approval.clone()],
-        });
+        state.apply_workflow_tasks_for_test(vec![workflow.clone(), approval.clone()]);
 
         assert_eq!(state.panel_mode, PanelMode::Workflows);
         assert_eq!(
@@ -6203,9 +6213,7 @@ mod tests {
             .expect("workflow task remains visible");
         state.select_workflow_index_for_test(selected);
         approval.last_activity_at_ms = Some(10_000);
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![workflow, approval],
-        });
+        state.apply_workflow_tasks_for_test(vec![workflow, approval]);
 
         assert_eq!(
             state.selected_workflow_task().map(|task| task.id.as_str()),
@@ -6216,42 +6224,40 @@ mod tests {
     #[test]
     fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
         let mut state = state();
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![BackgroundTaskSummary {
-                id: "task-main".to_string(),
-                task_type: TaskType::MainSession,
-                status: TaskStatus::Running,
-                is_backgrounded: true,
-                description: "long answer".to_string(),
-                created_at_ms: 1_000,
-                started_at_ms: Some(1_000),
-                completed_at_ms: None,
-                command: None,
-                agent_type: Some("main-session".to_string()),
-                server: None,
-                tool: None,
-                pending_tool_call: None,
-                name: None,
-                workflow_run_id: None,
-                phase_count: None,
-                workflow_progress: None,
-                workflow_phases: Vec::new(),
-                workflow_agents: Vec::new(),
-                workflow_script_path: None,
-                workflow_launch_input: None,
-                workflow_final_summary: None,
-                workflow_failure_count: 0,
-                usage: None,
-                subagent_current_activity: None,
-                subagent_turn: None,
-                last_activity_at_ms: None,
-                result: None,
-                error: None,
-                retry_count: 0,
-                output_truncated: false,
-                publication_revision: None,
-            }],
-        });
+        state.apply_workflow_tasks_for_test(vec![BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Running,
+            is_backgrounded: true,
+            description: "long answer".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+            publication_revision: None,
+        }]);
 
         state.update(TuiEvent::MessageDelta(
             "hidden background output".to_string(),
@@ -6284,7 +6290,7 @@ mod tests {
         task.task_type = TaskType::MainSession;
         task.status = TaskStatus::Running;
         task.is_backgrounded = false;
-        state.update(TuiEvent::WorkflowTasksUpdated { tasks: vec![task] });
+        state.apply_workflow_tasks_for_test(vec![task]);
 
         assert!(!state.suppress_background_main_session_output);
     }
@@ -6326,9 +6332,7 @@ mod tests {
         state.select_workflow_index_for_test(0);
 
         selected.is_backgrounded = false;
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![selected, other],
-        });
+        state.apply_workflow_tasks_for_test(vec![selected, other]);
 
         assert_eq!(state.panel_mode, PanelMode::Conversation);
         assert!(!state.suppress_background_main_session_output);
@@ -6337,42 +6341,40 @@ mod tests {
     #[test]
     fn backgrounded_main_session_completion_adds_system_notice() {
         let mut state = state();
-        state.update(TuiEvent::WorkflowTasksUpdated {
-            tasks: vec![BackgroundTaskSummary {
-                id: "task-main".to_string(),
-                task_type: TaskType::MainSession,
-                status: TaskStatus::Running,
-                is_backgrounded: true,
-                description: "long answer".to_string(),
-                created_at_ms: 1_000,
-                started_at_ms: Some(1_000),
-                completed_at_ms: None,
-                command: None,
-                agent_type: Some("main-session".to_string()),
-                server: None,
-                tool: None,
-                pending_tool_call: None,
-                name: None,
-                workflow_run_id: None,
-                phase_count: None,
-                workflow_progress: None,
-                workflow_phases: Vec::new(),
-                workflow_agents: Vec::new(),
-                workflow_script_path: None,
-                workflow_launch_input: None,
-                workflow_final_summary: None,
-                workflow_failure_count: 0,
-                usage: None,
-                subagent_current_activity: None,
-                subagent_turn: None,
-                last_activity_at_ms: None,
-                result: None,
-                error: None,
-                retry_count: 0,
-                output_truncated: false,
-                publication_revision: None,
-            }],
-        });
+        state.apply_workflow_tasks_for_test(vec![BackgroundTaskSummary {
+            id: "task-main".to_string(),
+            task_type: TaskType::MainSession,
+            status: TaskStatus::Running,
+            is_backgrounded: true,
+            description: "long answer".to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: Some("main-session".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+            publication_revision: None,
+        }]);
 
         state.update(TuiEvent::SessionCompleted {
             status: "success".to_string(),

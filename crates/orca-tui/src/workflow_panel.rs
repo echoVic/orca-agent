@@ -206,6 +206,11 @@ impl AppState {
     }
 
     #[cfg(test)]
+    pub(crate) fn apply_workflow_tasks_for_test(&mut self, tasks: Vec<BackgroundTaskSummary>) {
+        self.apply_workflow_tasks_update(tasks);
+    }
+
+    #[cfg(test)]
     pub(crate) fn select_workflow_index_for_test(&mut self, selected: usize) {
         self.workflow_panel.select_index(selected);
     }

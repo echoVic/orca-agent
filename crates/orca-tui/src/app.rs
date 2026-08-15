@@ -2209,8 +2209,11 @@ done
             assert!(
                 events.iter().any(|event| matches!(
                     event,
-                    TuiEvent::WorkflowTasksUpdated { tasks }
-                        if tasks.iter().any(|task| task.name.as_deref() == Some("runtime-owned"))
+                    TuiEvent::SurfaceProjectionSynced(projection)
+                        if projection
+                            .workflow_tasks
+                            .iter()
+                            .any(|task| task.name.as_deref() == Some("runtime-owned"))
                 )),
                 "saved workflow should publish a typed task projection: {events:?}"
             );
@@ -2376,8 +2379,8 @@ done
             let events = event_rx.try_iter().collect::<Vec<_>>();
             assert!(events.iter().any(|event| matches!(
                 event,
-                TuiEvent::WorkflowTasksUpdated { tasks }
-                    if tasks.iter().any(|task| {
+                TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection.workflow_tasks.iter().any(|task| {
                         task.name.as_deref() == Some("restart-visible")
                             && task.status == orca_core::task_types::TaskStatus::Completed
                     })
@@ -2623,8 +2626,9 @@ done
         predicate: impl Fn(&orca_core::task_types::BackgroundTaskSummary) -> bool,
     ) -> Option<orca_core::task_types::BackgroundTaskSummary> {
         match event {
-            TuiEvent::WorkflowTasksUpdated { tasks } => tasks.into_iter().find(predicate),
-            TuiEvent::WorkflowTaskUpdated { task } if predicate(&task) => Some(task),
+            TuiEvent::SurfaceProjectionSynced(projection) => {
+                projection.workflow_tasks.into_iter().find(predicate)
+            }
             _ => None,
         }
     }
@@ -2712,9 +2716,6 @@ done
                 plan: None,
                 label: "loaded-b".to_string(),
             },
-            TuiEvent::WorkflowTasksUpdated {
-                tasks: vec![workflow_task("task-b", "workflow-b")],
-            },
             TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(20),
                 session_id: Some("session-b".to_string()),
@@ -2770,9 +2771,6 @@ done
                 messages: vec![ChatMessage::Assistant("stale-transcript-a".to_string())],
                 plan: None,
                 label: "stale-loaded-a".to_string(),
-            },
-            TuiEvent::WorkflowTasksUpdated {
-                tasks: vec![workflow_task("task-a", "stale-workflow-a")],
             },
             TuiEvent::SurfaceProjectionSynced(Box::new(SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(99),
@@ -3200,8 +3198,11 @@ done
                     {
                         panic!("registry-only approval was advertised as actionable");
                     }
-                    Ok(TuiEvent::WorkflowTasksUpdated { tasks })
-                        if tasks.iter().any(|task| task.id == task_id) =>
+                    Ok(TuiEvent::SurfaceProjectionSynced(projection))
+                        if projection
+                            .workflow_tasks
+                            .iter()
+                            .any(|task| task.id == task_id) =>
                     {
                         panic!("registry-only approval leaked into typed task projection");
                     }
@@ -3284,8 +3285,8 @@ done
             for _ in 0..20 {
                 let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 match event {
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        stopped |= tasks.iter().any(|task| {
+                    TuiEvent::SurfaceProjectionSynced(projection) => {
+                        stopped |= projection.workflow_tasks.iter().any(|task| {
                             task.id == task_id
                                 && matches!(
                                     task.status,
@@ -3978,6 +3979,127 @@ done
             )
             .expect("terminal side task update after reentry");
             assert!(terminal.is_backgrounded);
+        });
+    }
+
+    #[test]
+    fn hosted_side_background_task_foreground_uses_surface_projection() {
+        with_orca_home(|_| {
+            let mut harness = AttachedHostedTuiHarness::start(test_config(HistoryMode::Record));
+            harness.send(UserAction::Submit("parent identity prompt".to_string()));
+            harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+
+            harness.send(UserAction::StartSideConversation {
+                prompt: Some("mock_stream_delay_ms 3000".to_string()),
+            });
+            harness.recv_until(|event| {
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
+            });
+
+            harness.send(UserAction::BackgroundCurrentTurn);
+            let task = matching_task_update(
+                harness.recv_until(|event| {
+                    matching_task_update(event.clone(), |task| {
+                        task.task_type == orca_core::task_types::TaskType::MainSession
+                            && task.status == orca_core::task_types::TaskStatus::Running
+                            && task.is_backgrounded
+                    })
+                    .is_some()
+                }),
+                |task| {
+                    task.task_type == orca_core::task_types::TaskType::MainSession
+                        && task.status == orca_core::task_types::TaskStatus::Running
+                        && task.is_backgrounded
+                },
+            )
+            .expect("captured backgrounded side task");
+
+            harness.send(UserAction::ForegroundTask {
+                task_id: task.id.clone(),
+            });
+            let mut saw_output_handoff = false;
+            let mut saw_foreground_projection = false;
+            let mut saw_completed_delta = false;
+            let mut saw_terminal_projection = false;
+            let mut saw_session_completed = false;
+            let returned = harness.recv_until(|event| match event {
+                TuiEvent::BackgroundTaskOutputAttached { task_id } if task_id == &task.id => {
+                    saw_output_handoff = true;
+                    false
+                }
+                TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection.workflow_tasks.iter().any(|candidate| {
+                        candidate.id == task.id
+                            && candidate.status == orca_core::task_types::TaskStatus::Running
+                            && !candidate.is_backgrounded
+                    }) =>
+                {
+                    saw_foreground_projection = true;
+                    false
+                }
+                TuiEvent::MessageDelta(text) if text.contains("Mock slow stream completed.") => {
+                    saw_completed_delta = true;
+                    false
+                }
+                TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection.workflow_tasks.iter().any(|candidate| {
+                        candidate.id == task.id
+                            && !candidate.is_backgrounded
+                            && matches!(
+                                candidate.status,
+                                orca_core::task_types::TaskStatus::Completed
+                                    | orca_core::task_types::TaskStatus::Failed
+                                    | orca_core::task_types::TaskStatus::Cancelled
+                                    | orca_core::task_types::TaskStatus::Stopped
+                            )
+                    }) =>
+                {
+                    saw_terminal_projection = true;
+                    false
+                }
+                TuiEvent::SessionCompleted { .. } => {
+                    saw_session_completed = true;
+                    false
+                }
+                TuiEvent::Notice(message)
+                    if message == &format!("Task {} returned to foreground.", task.id) =>
+                {
+                    true
+                }
+                TuiEvent::Error(message) => panic!("foreground task failed: {message}"),
+                _ => false,
+            });
+            assert!(matches!(returned, TuiEvent::Notice(_)));
+            assert!(
+                saw_output_handoff,
+                "ephemeral foreground must attach output before reporting success"
+            );
+            assert!(
+                saw_foreground_projection,
+                "ephemeral foreground must publish its accepted surface task projection"
+            );
+
+            if !saw_session_completed {
+                harness.recv_until(|event| match event {
+                    TuiEvent::SessionCompleted { .. } => {
+                        saw_session_completed = true;
+                        true
+                    }
+                    TuiEvent::Error(message) => {
+                        panic!("foreground task continuation failed: {message}")
+                    }
+                    _ => false,
+                });
+            }
+            assert!(saw_session_completed);
+            assert!(
+                saw_completed_delta,
+                "foreground task must continue through its terminal output"
+            );
+            assert!(
+                saw_terminal_projection,
+                "foreground task must publish its terminal surface projection"
+            );
         });
     }
 
@@ -6322,7 +6444,6 @@ done
 
             let mut task_id = None;
             let mut title = None;
-            let mut legacy_task_update_seen = false;
             loop {
                 let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 match event {
@@ -6332,7 +6453,6 @@ done
                         task_id = Some(task.id);
                     }
                     TuiEvent::SurfaceProjectionSynced(projection) => title = Some(projection.title),
-                    TuiEvent::WorkflowTaskUpdated { .. } => legacy_task_update_seen = true,
                     TuiEvent::SessionCompleted { .. } => break,
                     _ => {}
                 }
@@ -6348,10 +6468,6 @@ done
             assert_eq!(
                 title.as_deref(),
                 Some("Workflow notification notification-1")
-            );
-            assert!(
-                !legacy_task_update_seen,
-                "foreground notifications must not publish a second legacy task rail"
             );
         });
     }
@@ -6703,8 +6819,9 @@ done
                     TuiEvent::Notice(message) => {
                         seen.push(format!("notice: {message}"));
                     }
-                    TuiEvent::WorkflowTasksUpdated { tasks } => {
-                        let statuses = tasks
+                    TuiEvent::SurfaceProjectionSynced(projection) => {
+                        let statuses = projection
+                            .workflow_tasks
                             .into_iter()
                             .filter(|task| {
                                 task.task_type == orca_core::task_types::TaskType::MainSession
@@ -6712,11 +6829,6 @@ done
                             .map(|task| format!("{:?}", task.status))
                             .collect::<Vec<_>>();
                         seen.push(format!("tasks: {}", statuses.join(",")));
-                    }
-                    TuiEvent::WorkflowTaskUpdated { task }
-                        if task.task_type == orca_core::task_types::TaskType::MainSession =>
-                    {
-                        seen.push(format!("task: {:?}", task.status));
                     }
                     event => seen.push(format!("{event:?}")),
                 }
@@ -6812,17 +6924,11 @@ done
                         }
                         seen.push(format!("delta: {text}"));
                     }
-                    Ok(TuiEvent::WorkflowTasksUpdated { tasks }) => {
-                        saw_completed_task |= tasks.into_iter().any(|task| {
+                    Ok(TuiEvent::SurfaceProjectionSynced(projection)) => {
+                        saw_completed_task |= projection.workflow_tasks.into_iter().any(|task| {
                             task.id == task_id
                                 && task.status == orca_core::task_types::TaskStatus::Completed
                         });
-                    }
-                    Ok(TuiEvent::WorkflowTaskUpdated { task })
-                        if task.id == task_id
-                            && task.status == orca_core::task_types::TaskStatus::Completed =>
-                    {
-                        saw_completed_task = true;
                     }
                     Ok(TuiEvent::BackgroundTaskOutputAttached { task_id: attached })
                         if attached == task_id =>
@@ -8359,7 +8465,6 @@ fn hosted_tui_controller_loop(
                     | UserAction::GoalResume
                     | UserAction::RunWorkflow { .. }
                     | UserAction::StopTask { .. }
-                    | UserAction::ForegroundTask { .. }
                     | UserAction::Backtrack)
             );
         if side_disallowed {
@@ -9816,12 +9921,6 @@ fn emit_typed_history_snapshot(
             },
         )))
         .map_err(|error| error.to_string())?;
-    let tasks = crate::surface_projection::workflow_task_summaries(&snapshot);
-    if !tasks.is_empty() {
-        event_tx
-            .send(TuiEvent::WorkflowTasksUpdated { tasks })
-            .map_err(|error| error.to_string())?;
-    }
     Ok(())
 }
 

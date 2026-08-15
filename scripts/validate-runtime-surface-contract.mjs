@@ -863,7 +863,7 @@ const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
   ],
   [
     "crates/orca-tui/src/surface_client.rs:stop_task",
-    "c78e87931908996735954aa9335937c4c713d67ef672ab51370ed0eaa33024d8",
+    "8cf51d0e4f98d7a31791546397e1729bbb1e37c451de6af6dd1088979891bce0",
   ],
 ]);
 const BASELINE_UNRESOLVED_USER_ACTION_SEND_FUNCTION_SHA256 = new Map([]);

@@ -160,9 +160,9 @@ snapshots, while newly started durable threads must pass a snapshot/id preflight
 before installation. The granular identity/rename/fork events, public mutable
 AppState fields, caller-authored reset titles, and app-loop identity shadow are
 deleted; renderers, commands, picker actions, and exit policy use immutable
-queries. Workflow and operation projection remain open. CLI, server/JSONL,
-ACP, runtime surface events, session persistence, and transcript formats are
-unchanged.
+queries. Operation and live workflow-task projection are completed by the
+following slices. CLI, server/JSONL, ACP, runtime surface events, session
+persistence, and transcript formats are unchanged.
 
 The foreground and recoverable operation projection convergence slice makes the
 authoritative runtime surface snapshot the only production TUI source for the
@@ -174,11 +174,24 @@ observations before any projection owner changes; reset validation prevents an
 invalid recovery pair from clearing a live session. Recovery prompt visibility
 and its notice are presentation effects of an accepted snapshot, so the
 granular `RecoveryAvailable` event and mutable AppState operation fields are
-deleted. Commands use immutable queries. Workflow task projection remains open:
-non-recorded runtime threads still expose live `TaskRegistry` summaries and
-have no production `TaskPatch::Reconciled` snapshot path, so this slice does
-not introduce a TUI cache. CLI, server/JSONL, ACP, runtime surface events,
-operation persistence, and transcript formats are unchanged.
+deleted. Commands use immutable queries. Pre-surface registry rows remain a
+separate cold-migration boundary: non-recorded runtime threads still have no
+production `TaskPatch::Reconciled` path, so this slice deliberately keeps those
+rows hidden and non-actionable instead of adding a TUI cache. CLI, server/JSONL,
+ACP, runtime surface events, operation persistence, and transcript formats are
+unchanged.
+
+The 2026-08-16 workflow-task projection slice makes the accepted runtime surface
+snapshot the only production TUI source for task, workflow, and subagent rows.
+`SurfaceProjectionSynced` now carries the one post-commit task replacement;
+`WorkflowTasksUpdated`, `WorkflowTaskUpdated`, startup/monitor list duplication,
+and registry-derived TUI fallbacks are deleted. Stop, foreground, background
+approval, and approval-resolution actions return or publish post-commit snapshots,
+and ephemeral Side foregrounding uses the same typed task fence, hydration, and
+presentation ownership as recorded sessions. The task panel remains process-local
+for sorting, selection, reveal, and foreground return. Cold reconciliation of
+legacy registry-only records remains open and fail-closed. CLI, server/JSONL, ACP,
+runtime surface events, task persistence, and transcript formats are unchanged.
 
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
@@ -188,15 +201,12 @@ hydration has not moved into the runtime surface. This deliberately changes no
 runtime plan persistence, history format, surface projection, protocol, or
 renderer behavior.
 
-The 2026-08-15 workflow-panel ownership slice moves task-row presentation and
-selection behind one private `WorkflowPanelState`. Renderers and task controls
-use immutable AppState queries, while every accepted full or single-task
-projection still routes through the existing sort, selected-id retention,
-background/approval reveal, and foreground-return transition. This does not
-reconcile task sources: non-recorded runtime threads still expose live
-`TaskRegistry` summaries and have no production `TaskPatch::Reconciled`
-surface producer, so no TUI task cache, protocol, persistence, or runtime
-workflow behavior is introduced.
+The 2026-08-15 workflow-panel ownership slice moved task-row presentation and
+selection behind one private `WorkflowPanelState`; its earlier wording about
+full/single-task event inputs is superseded by the 2026-08-16 snapshot-only task
+projection slice above. The panel still owns sorting, selected-id retention,
+background/approval reveal, and foreground-return effects, while cold legacy
+registry reconciliation remains outside the TUI boundary.
 
 The 2026-08-15 Side background reentry slice keeps attachment rotation strict
 while restoring the active Side task panel after a return from main. Parent to
@@ -1379,15 +1389,15 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established fifteen focused owners/boundaries so far (insert-escape, presentation,
+   stream has established sixteen focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection, and
-   session-identity projection); `app.rs` is down from 10,186 to 10,117 lines
-   and `types.rs` from 9,442 to 8,607. Renderer-owned orchestration and the
-   remaining workflow/operation projection duplication
-   (`surface_projection.rs`, 3,036 lines) remain the open core of this matrix
-   row.
+   session-identity projection, and workflow-task projection); `app.rs` is
+   currently 10,559 lines and `types.rs` 8,806 lines. Renderer-owned
+   orchestration and cold legacy registry reconciliation remain open; live
+   task/operation projection duplication has been removed from the TUI event
+   boundary (`surface_projection.rs`, 3,280 lines).
 4. **P2.4 context/cache identity is not a release slice.** DeepSeek usage
    already parses `prompt_cache_hit_tokens` (`crates/orca-provider/src/deepseek_http.rs:192`),
    but deterministic cache-critical prefixes (stable system prompt, tool
@@ -1996,12 +2006,13 @@ commands and consume versioned events without owning turn execution details.
      through the adapter without losing UI fidelity.
    - Workflow terminal notifications now flow through runtime
      `workflow.result.available` / `workflow.failed` events with workflow name,
-     tool-use id, status, and summary metadata. Workflow task-list/progress
-     refreshes now flow through a runtime `workflow.tasks.updated` event before
-     adapting back to `TuiEvent::WorkflowTasksUpdated`. Declared workflow
-     lifecycle events for resume, phase start/completion, agent start/cache/
-     completion/failure, pause, and stop now have `EventFactory`, server
-     protocol, and TUI notice coverage.
+     tool-use id, status, and summary metadata. The server/runtime event schema
+     retains `workflow.tasks.updated`; TUI task-list/progress facts now derive
+     from committed surface task/workflow patches and arrive in the final
+     `SurfaceProjectionSynced` snapshot. Declared workflow lifecycle events for
+     resume, phase start/completion, agent start/cache/completion/failure,
+     pause, and stop now have `EventFactory`, server protocol, and TUI notice
+     coverage.
    - Keep JSONL output names stable for this release unless explicitly versioned.
 3. Move more turn-loop orchestration behind runtime-owned APIs. Seeded after v0.1.42.
    - The TUI may still render and request approvals.

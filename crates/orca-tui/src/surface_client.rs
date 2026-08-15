@@ -527,10 +527,7 @@ pub(crate) fn stop_task(
     task_id: &str,
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<Vec<BackgroundTaskSummary>, String> {
-    if thread.session_id().is_none() {
-        return thread.stop_task(task_id);
-    }
+) -> Result<SurfaceProjectionState, String> {
     let surface = thread.surface();
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
@@ -633,9 +630,7 @@ pub(crate) fn stop_task(
             guard.terminal_observed();
         }
         let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-        return Ok(crate::surface_projection::workflow_task_summaries(
-            &snapshot,
-        ));
+        return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
     }
     if task.task_type != orca_runtime::surface::SurfaceTaskType::Workflow
         && task.workflow_run_id.is_none()
@@ -685,18 +680,7 @@ pub(crate) fn stop_task(
     }
 
     let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-    let mut summaries = crate::surface_projection::workflow_task_summaries(&snapshot);
-    let surface_ids = summaries
-        .iter()
-        .map(|task| task.id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    summaries.extend(
-        thread
-            .task_summaries()
-            .into_iter()
-            .filter(|task| !surface_ids.contains(&task.id)),
-    );
-    Ok(summaries)
+    Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot))
 }
 
 pub(crate) fn foreground_task(
@@ -704,10 +688,7 @@ pub(crate) fn foreground_task(
     task_id: &str,
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<Vec<BackgroundTaskSummary>, String> {
-    if thread.session_id().is_none() {
-        return thread.foreground_task(task_id);
-    }
+) -> Result<SurfaceProjectionState, String> {
     let mut activation =
         SurfaceActivationGuard::begin(controller).map_err(|error| error.to_string())?;
     let surface = thread.surface();
@@ -847,7 +828,7 @@ pub(crate) fn foreground_task(
         let _ = event_tx.send(TuiEvent::SessionCompleted {
             status: status.to_string(),
         });
-        return Ok(crate::surface_projection::workflow_task_summaries(
+        return Ok(SurfaceProjectionState::from_surface_snapshot(
             &attachment.baseline.snapshot,
         ));
     }
@@ -873,9 +854,7 @@ pub(crate) fn foreground_task(
         guard.terminal_observed();
     }
     let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-    Ok(crate::surface_projection::workflow_task_summaries(
-        &snapshot,
-    ))
+    Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot))
 }
 
 pub(crate) fn resolve_background_approval(
@@ -884,7 +863,7 @@ pub(crate) fn resolve_background_approval(
     approved: bool,
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<(String, Vec<BackgroundTaskSummary>), String> {
+) -> Result<(String, SurfaceProjectionState), String> {
     let surface = thread.surface();
     let deadline = Instant::now() + Duration::from_secs(5);
     let (attachment, interaction) = loop {
@@ -1082,7 +1061,7 @@ pub(crate) fn resolve_background_approval(
     let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
     Ok((
         task_id,
-        crate::surface_projection::workflow_task_summaries(&snapshot),
+        SurfaceProjectionState::from_surface_snapshot(&snapshot),
     ))
 }
 
@@ -2422,10 +2401,20 @@ fn monitor_background_presentation(
         };
         let mut projection =
             TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
+        let baseline_projection =
+            SurfaceProjectionState::from_surface_snapshot(&attachment.baseline.snapshot);
+        if !send_background_presentation_event(
+            event_tx,
+            controller,
+            cancellation,
+            TuiEvent::SurfaceProjectionSynced(Box::new(baseline_projection)),
+        ) {
+            detach(surface, &attachment.client);
+            return Ok(());
+        }
         let snapshot_task = projection.background_task_summary_for_operation(operation_id);
         if last_task.as_ref() != Some(&snapshot_task) {
-            if !publish_background_task_projection(
-                projection.workflow_task_summaries(),
+            if !publish_background_approval_notice(
                 snapshot_task.clone(),
                 controller,
                 cancellation,
@@ -2469,19 +2458,6 @@ fn monitor_background_presentation(
                         .find(|event| matches!(event, TuiEvent::SurfaceProjectionSynced(_)));
                     let current_task =
                         projection.background_task_summary_for_operation(operation_id);
-                    if last_task.as_ref() != Some(&current_task) {
-                        if !publish_background_task_projection(
-                            projection.workflow_task_summaries(),
-                            current_task.clone(),
-                            controller,
-                            cancellation,
-                            event_tx,
-                            &mut approval_notice_sent,
-                        ) {
-                            break false;
-                        }
-                        last_task = Some(current_task);
-                    }
                     if let Some(event) = projection_sync
                         && !send_background_presentation_event(
                             event_tx,
@@ -2491,6 +2467,18 @@ fn monitor_background_presentation(
                         )
                     {
                         break false;
+                    }
+                    if last_task.as_ref() != Some(&current_task) {
+                        if !publish_background_approval_notice(
+                            current_task.clone(),
+                            controller,
+                            cancellation,
+                            event_tx,
+                            &mut approval_notice_sent,
+                        ) {
+                            break false;
+                        }
+                        last_task = Some(current_task);
                     }
                     if terminal {
                         break false;
@@ -2505,31 +2493,6 @@ fn monitor_background_presentation(
             return Ok(());
         }
     }
-}
-
-fn publish_background_task_projection(
-    tasks: Vec<BackgroundTaskSummary>,
-    task: Option<BackgroundTaskSummary>,
-    controller: &TuiSurfaceTaskControl,
-    cancellation: &SurfacePresentationCancellation,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    approval_notice_sent: &mut bool,
-) -> bool {
-    if !send_background_presentation_event(
-        event_tx,
-        controller,
-        cancellation,
-        TuiEvent::WorkflowTasksUpdated { tasks },
-    ) {
-        return false;
-    }
-    publish_background_approval_notice(
-        task,
-        controller,
-        cancellation,
-        event_tx,
-        approval_notice_sent,
-    )
 }
 
 fn publish_background_approval_notice(
@@ -3082,9 +3045,7 @@ mod tests {
         assert!(
             background_monitor_events.iter().all(|event| matches!(
                 event,
-                TuiEvent::WorkflowTasksUpdated { .. }
-                    | TuiEvent::Notice(_)
-                    | TuiEvent::SurfaceProjectionSynced(_)
+                TuiEvent::Notice(_) | TuiEvent::SurfaceProjectionSynced(_)
             )),
             "background observer must not project a later foreground operation: \
              {background_monitor_events:?}"
@@ -3125,7 +3086,7 @@ mod tests {
     }
 
     #[test]
-    fn sessionless_foreground_preserves_legacy_task_control() {
+    fn sessionless_foreground_requires_runtime_surface() {
         let _guard = crate::test_support::lock_process_env();
         let home = tempfile::tempdir().unwrap();
         let mut config = crate::test_support::test_run_config();
@@ -3144,14 +3105,9 @@ mod tests {
         let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, _event_rx) = mpsc::unbounded();
 
-        let summaries = foreground_task(&thread.typed_surface(), &task.id, &controller, &event_tx)
-            .expect("sessionless foreground fallback");
-
-        assert!(
-            summaries
-                .iter()
-                .any(|summary| summary.id == task.id && !summary.is_backgrounded)
-        );
+        let error = foreground_task(&thread.typed_surface(), &task.id, &controller, &event_tx)
+            .expect_err("sessionless task must not bypass the typed surface");
+        assert!(error.contains("attachment unavailable"), "{error}");
 
         thread.shutdown().expect("thread shutdown");
         host.shutdown().expect("host shutdown");
@@ -3424,7 +3380,7 @@ mod tests {
             "foreground attach must install the TUI controller"
         );
         assert!(controller.request_background_current());
-        let summaries = match foreground_rx.recv_timeout(Duration::from_secs(2)) {
+        let projection = match foreground_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(result) => result.expect("second background handoff"),
             Err(error) => {
                 let _ = controller.interrupt_current();
@@ -3439,7 +3395,8 @@ mod tests {
             .join()
             .expect("foreground re-background worker");
         assert!(
-            summaries
+            projection
+                .workflow_tasks
                 .iter()
                 .any(|task| task.id == task_id && task.is_backgrounded)
         );
@@ -3656,10 +3613,10 @@ mod tests {
         };
 
         let controller = TuiSurfaceTaskControl::isolated_for_test();
-        let summaries = stop_task(&thread.typed_surface(), &task_id, &controller, &event_tx)
+        let projection = stop_task(&thread.typed_surface(), &task_id, &controller, &event_tx)
             .expect("typed workflow stop");
         assert!(
-            summaries.iter().any(|task| {
+            projection.workflow_tasks.iter().any(|task| {
                 task.id == task_id
                     && matches!(
                         task.status,

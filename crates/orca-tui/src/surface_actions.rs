@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use orca_core::config::RunConfig;
 use orca_core::goal_types::ThreadGoal;
-use orca_core::task_types::BackgroundTaskSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCatalog};
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
@@ -288,7 +287,7 @@ impl TuiSurfaceActions {
 
     pub(crate) fn recoverable_background_approval_projection(
         &self,
-    ) -> Result<(Vec<BackgroundTaskSummary>, Vec<String>), String> {
+    ) -> Result<(SurfaceProjectionState, Vec<String>), String> {
         let snapshot = crate::surface_client::read_snapshot(&self.thread)
             .map_err(|error| error.to_string())?;
         let tools = snapshot
@@ -310,7 +309,7 @@ impl TuiSurfaceActions {
             })
             .collect();
         Ok((
-            crate::surface_projection::workflow_task_summaries(&snapshot),
+            SurfaceProjectionState::from_surface_snapshot(&snapshot),
             tools,
         ))
     }
@@ -320,7 +319,7 @@ impl TuiSurfaceActions {
         task_id: &str,
         control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
-    ) -> Result<Vec<BackgroundTaskSummary>, String> {
+    ) -> Result<SurfaceProjectionState, String> {
         crate::surface_client::stop_task(&self.thread, task_id, control, event_tx)
     }
 
@@ -329,7 +328,7 @@ impl TuiSurfaceActions {
         task_id: &str,
         control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
-    ) -> Result<Vec<BackgroundTaskSummary>, String> {
+    ) -> Result<SurfaceProjectionState, String> {
         crate::surface_client::foreground_task(&self.thread, task_id, control, event_tx)
     }
 
@@ -339,7 +338,7 @@ impl TuiSurfaceActions {
         approved: bool,
         control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
-    ) -> Result<(String, Vec<BackgroundTaskSummary>), String> {
+    ) -> Result<(String, SurfaceProjectionState), String> {
         let (task_id, tasks) = crate::surface_client::resolve_background_approval(
             &self.thread,
             approval_id,
