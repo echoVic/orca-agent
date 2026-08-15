@@ -661,12 +661,24 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.backtrack_last_user",
     1,
   ],
-  ["crates/orca-tui/src/app.rs:ensure_hosted_thread:host.start_thread_with_request", 1],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:ensure_hosted_thread:host.start_thread_with_request",
+    1,
+  ],
   ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:host.start_thread_with_request", 1],
-  ["crates/orca-tui/src/app.rs:start_new_hosted_session:host.start_thread_with_request", 1],
-  ["crates/orca-tui/src/app.rs:start_forked_hosted_session:host.start_thread_with_request", 1],
-  ["crates/orca-tui/src/app.rs:switch_saved_hosted_session:host.start_thread_with_request", 1],
-  ["crates/orca-tui/src/app.rs:reap_hosted_thread:thread.shutdown", 2],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:start_new_hosted_session:host.start_thread_with_request",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:start_forked_hosted_session:host.start_thread_with_request",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:switch_saved_hosted_session:host.start_thread_with_request",
+    1,
+  ],
+  ["crates/orca-tui/src/hosted_session_lifecycle.rs:reap_hosted_thread:thread.shutdown", 2],
   ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 2],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
   [
@@ -713,12 +725,24 @@ const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
-  ["crates/orca-tui/src/app.rs:install_hosted_session:pending_workflow_notifications.clear", 1],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:install_hosted_session:pending_workflow_notifications.clear",
+    1,
+  ],
   ["crates/orca-tui/src/app.rs:run_tui_inner:mention_search.shutdown", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:terminal.clear", 1],
-  ["crates/orca-tui/src/app.rs:start_forked_hosted_session:next_config.prompt.clear", 1],
-  ["crates/orca-tui/src/app.rs:start_new_hosted_session:next_config.prompt.clear", 1],
-  ["crates/orca-tui/src/app.rs:switch_saved_hosted_session:next_config.prompt.clear", 1],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:start_forked_hosted_session:next_config.prompt.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:start_new_hosted_session:next_config.prompt.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:switch_saved_hosted_session:next_config.prompt.clear",
+    1,
+  ],
   ["crates/orca-tui/src/capability_backend.rs:clear:self.inner.clear", 1],
   ["crates/orca-tui/src/commands/mod.rs:builtin_command_names:names.insert", 1],
   ["crates/orca-tui/src/commands/mod.rs:collect_workflow_dir:seen.insert", 1],

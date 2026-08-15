@@ -26,6 +26,7 @@ mod global_actions;
 mod hosted_goal;
 mod hosted_runtime;
 mod hosted_session;
+mod hosted_session_lifecycle;
 mod hosted_side;
 mod idle_key_actions;
 mod idle_navigation_actions;
