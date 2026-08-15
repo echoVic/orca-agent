@@ -1667,6 +1667,27 @@ done
         )
     }
 
+    fn recovery_projection_for_test(
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+    ) -> SurfaceProjectionState {
+        SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(1),
+            session_id: Some("recovery-projection-session".to_string()),
+            title: "Recovery projection".to_string(),
+            usage_revision: 1,
+            usage: orca_core::cost_types::UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: Vec::new(),
+            current_goal: None,
+            foreground_operation_id: Some(operation_id.clone()),
+            recoverable_operation_id: Some(operation_id),
+            goal_presentation: None,
+            session_presentation: None,
+        }
+    }
+
     const POLL_EDIT_DIFF: &str = "\
 --- a/src/item.py
 +++ b/src/item.py
@@ -2070,6 +2091,38 @@ done
             .expect("runtime thread");
         let actions = TuiSurfaceActions::new(thread.typed_surface());
         (host, thread, actions)
+    }
+
+    #[test]
+    fn runtime_ready_emits_only_attachment_and_snapshot_projection() {
+        with_orca_home(|home| {
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(home.to_path_buf());
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .handle()
+                .start_thread(config, "runtime-ready projection")
+                .expect("runtime thread");
+            let (event_tx, event_rx) = mpsc::unbounded();
+
+            announce_runtime_ready(&thread, &event_tx);
+
+            let events = event_rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(events.len(), 2, "runtime-ready events: {events:?}");
+            assert!(
+                matches!(events[0], TuiEvent::MentionRuntimeReady(_)),
+                "first runtime-ready event: {:?}",
+                events[0]
+            );
+            assert!(
+                matches!(events[1], TuiEvent::SurfaceProjectionSynced(_)),
+                "second runtime-ready event: {:?}",
+                events[1]
+            );
+
+            thread.shutdown().expect("runtime thread shutdown");
+            host.shutdown().expect("runtime host shutdown");
+        });
     }
 
     #[test]
@@ -2678,16 +2731,14 @@ done
                 context_limit_tokens: 128_000,
                 workflow_tasks: vec![workflow_task("task-b", "workflow-b")],
                 current_goal: Some(goal_b.clone()),
-                foreground_operation_id: None,
+                foreground_operation_id: Some(operation_b.clone()),
+                recoverable_operation_id: Some(operation_b.clone()),
                 goal_presentation: None,
                 session_presentation: None,
             })),
             TuiEvent::TurnStarted {
                 turn: 3,
                 task: None,
-            },
-            TuiEvent::RecoveryAvailable {
-                operation_id: operation_b,
             },
         ] {
             assert!(apply(&mut state, attachment_b, event));
@@ -2702,7 +2753,7 @@ done
             state.current_session_title().map(ToOwned::to_owned),
         );
         let status = state.status;
-        let recovery = state.recoverable_operation_id.clone();
+        let recovery = state.recoverable_operation_id().cloned();
 
         let goal_a = orca_core::goal_types::ThreadGoal {
             session_id: "session-a".to_string(),
@@ -2740,6 +2791,7 @@ done
                 workflow_tasks: vec![workflow_task("task-a", "stale-workflow-a")],
                 current_goal: Some(goal_a.clone()),
                 foreground_operation_id: None,
+                recoverable_operation_id: None,
                 goal_presentation: None,
                 session_presentation: None,
             })),
@@ -2763,7 +2815,7 @@ done
             identity
         );
         assert_eq!(state.status, status);
-        assert_eq!(state.recoverable_operation_id, recovery);
+        assert_eq!(state.recoverable_operation_id(), recovery.as_ref());
     }
 
     #[test]
@@ -4639,12 +4691,14 @@ done
             let shared_config = Arc::new(Mutex::new(config.clone()));
             let (mut state, _) = test_state();
             let (action_tx, action_rx) = mpsc::unbounded();
-            state.recoverable_operation_id = Some(
-                orca_runtime::surface::SurfaceOperationId::try_from_bytes([
-                    0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
-                ])
-                .unwrap(),
-            );
+            state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+                recovery_projection_for_test(
+                    orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+                        0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
+                    ])
+                    .unwrap(),
+                ),
+            )));
 
             handle_slash_command(
                 "/resume",
@@ -4674,7 +4728,9 @@ done
             0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2,
         ])
         .unwrap();
-        cancel_state.recoverable_operation_id = Some(cancel_operation_id.clone());
+        cancel_state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            recovery_projection_for_test(cancel_operation_id.clone()),
+        )));
         handle_slash_command(
             "/cancel-operation",
             &mut config,
@@ -9487,15 +9543,6 @@ fn announce_runtime_ready(thread: &RuntimeThreadHandle, event_tx: &mpsc::Sender<
             let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(
                 SurfaceProjectionState::from_surface_snapshot(&snapshot),
             )));
-            if let Some(recovery) = snapshot.recoverable_user_operation() {
-                let _ = event_tx.send(TuiEvent::RecoveryAvailable {
-                    operation_id: recovery.operation_id().clone(),
-                });
-                let _ = event_tx.send(TuiEvent::Notice(
-                "A recoverable operation is suspended. Use the recovery controls to continue it or /cancel-operation to close it."
-                    .to_string(),
-            ));
-            }
         }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(format!(

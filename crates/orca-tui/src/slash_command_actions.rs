@@ -214,7 +214,7 @@ pub(crate) fn handle_slash_command(
             }
         }
         SlashCommand::CancelOperation => {
-            if let Some(operation_id) = state.recoverable_operation_id.clone() {
+            if let Some(operation_id) = state.recoverable_operation_id().cloned() {
                 state.enter_running();
                 let _ = action_tx.send(UserAction::CancelOperation { operation_id });
             } else {
@@ -316,7 +316,7 @@ fn format_status(state: &AppState) -> String {
         usage.output_tokens,
         usage.cache_tokens,
         usage.estimated_cost_usd,
-        if state.recoverable_operation_id.is_some() {
+        if state.recoverable_operation_id().is_some() {
             "yes"
         } else {
             "no"
@@ -463,6 +463,10 @@ mod tests {
     #[test]
     fn status_slash_command_reports_session_snapshot() {
         let mut state = state();
+        let recoverable_operation_id = orca_runtime::surface::SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,
+        ])
+        .unwrap();
         state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
             SurfaceProjectionState {
                 cursor: crate::surface_projection::test_surface_cursor(1),
@@ -480,17 +484,12 @@ mod tests {
                 context_limit_tokens: 1_000,
                 workflow_tasks: Vec::new(),
                 current_goal: None,
-                foreground_operation_id: None,
+                foreground_operation_id: Some(recoverable_operation_id.clone()),
+                recoverable_operation_id: Some(recoverable_operation_id),
                 goal_presentation: None,
                 session_presentation: None,
             },
         )));
-        state.recoverable_operation_id = Some(
-            orca_runtime::surface::SurfaceOperationId::try_from_bytes([
-                0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,
-            ])
-            .unwrap(),
-        );
         let mut config = test_run_config();
         config.approval_mode = ApprovalMode::Suggest;
         state.approval_mode = ApprovalMode::Plan;

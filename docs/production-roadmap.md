@@ -164,6 +164,22 @@ queries. Workflow and operation projection remain open. CLI, server/JSONL,
 ACP, runtime surface events, session persistence, and transcript formats are
 unchanged.
 
+The foreground and recoverable operation projection convergence slice makes the
+authoritative runtime surface snapshot the only production TUI source for the
+active and recoverable operation ids. `SurfaceProjectionState` derives
+recovery eligibility from `SurfaceSnapshot::recoverable_user_operation()`, and
+one private `SurfaceOperationProjectionState` owns both ids with its accepted
+cursor. It rejects stale, cross-identity, and contradictory equal-cursor
+observations before any projection owner changes; reset validation prevents an
+invalid recovery pair from clearing a live session. Recovery prompt visibility
+and its notice are presentation effects of an accepted snapshot, so the
+granular `RecoveryAvailable` event and mutable AppState operation fields are
+deleted. Commands use immutable queries. Workflow task projection remains open:
+non-recorded runtime threads still expose live `TaskRegistry` summaries and
+have no production `TaskPatch::Reconciled` snapshot path, so this slice does
+not introduce a TUI cache. CLI, server/JSONL, ACP, runtime surface events,
+operation persistence, and transcript formats are unchanged.
+
 The Windows sandbox uses restricted tokens or AppContainer according to the
 requested filesystem and network policy. The PowerShell installer verifies the
 release checksum, installs the runner and setup helper, and can provision,

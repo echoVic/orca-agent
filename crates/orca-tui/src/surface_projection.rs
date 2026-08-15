@@ -40,6 +40,7 @@ pub struct SurfaceProjectionState {
     pub(crate) workflow_tasks: Vec<BackgroundTaskSummary>,
     pub(crate) current_goal: Option<ThreadGoal>,
     pub(crate) foreground_operation_id: Option<SurfaceOperationId>,
+    pub(crate) recoverable_operation_id: Option<SurfaceOperationId>,
     pub(crate) goal_presentation: Option<GoalProjectionPresentation>,
     pub(crate) session_presentation: Option<SessionProjectionPresentation>,
 }
@@ -251,6 +252,118 @@ impl SurfaceGoalProjectionState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceOperationProjectionEffect {
+    RecoveryPromptShown,
+    RecoveryPromptCleared,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceOperationProjectionApply {
+    Rejected,
+    Accepted(Option<SurfaceOperationProjectionEffect>),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SurfaceOperationProjectionState {
+    foreground_operation_id: Option<SurfaceOperationId>,
+    recoverable_operation_id: Option<SurfaceOperationId>,
+    cursor: Option<SurfaceCursor>,
+}
+
+impl SurfaceOperationProjectionState {
+    pub(crate) fn accepts_reset(projection: &SurfaceProjectionState) -> bool {
+        projection
+            .recoverable_operation_id
+            .as_ref()
+            .is_none_or(|recovery| projection.foreground_operation_id.as_ref() == Some(recovery))
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn foreground_operation_id(&self) -> Option<&SurfaceOperationId> {
+        self.foreground_operation_id.as_ref()
+    }
+
+    pub(crate) fn recoverable_operation_id(&self) -> Option<&SurfaceOperationId> {
+        self.recoverable_operation_id.as_ref()
+    }
+
+    pub(crate) fn apply_projection(
+        &mut self,
+        projection: &SurfaceProjectionState,
+    ) -> SurfaceOperationProjectionApply {
+        if !Self::accepts_reset(projection) {
+            return SurfaceOperationProjectionApply::Rejected;
+        }
+        match self.cursor.as_ref() {
+            None => {}
+            Some(current)
+                if current.thread_id != projection.cursor.thread_id
+                    || current.incarnation != projection.cursor.incarnation
+                    || projection.cursor.next_seq < current.next_seq =>
+            {
+                return SurfaceOperationProjectionApply::Rejected;
+            }
+            Some(current) if projection.cursor.next_seq == current.next_seq => {
+                if current != &projection.cursor
+                    || self.foreground_operation_id != projection.foreground_operation_id
+                    || self.recoverable_operation_id != projection.recoverable_operation_id
+                {
+                    return SurfaceOperationProjectionApply::Rejected;
+                }
+                return SurfaceOperationProjectionApply::Accepted(None);
+            }
+            Some(_) => {}
+        }
+
+        let recovery_changed = self.recoverable_operation_id != projection.recoverable_operation_id;
+        self.foreground_operation_id
+            .clone_from(&projection.foreground_operation_id);
+        self.recoverable_operation_id
+            .clone_from(&projection.recoverable_operation_id);
+        self.cursor = Some(projection.cursor.clone());
+        let effect = recovery_changed.then(|| {
+            if self.recoverable_operation_id.is_some() {
+                SurfaceOperationProjectionEffect::RecoveryPromptShown
+            } else {
+                SurfaceOperationProjectionEffect::RecoveryPromptCleared
+            }
+        });
+        SurfaceOperationProjectionApply::Accepted(effect)
+    }
+
+    pub(crate) fn assert_matches_projection(&self, projection: &SurfaceProjectionState) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            debug_assert_eq!(self.cursor.as_ref(), Some(&projection.cursor));
+            debug_assert_eq!(
+                self.foreground_operation_id,
+                projection.foreground_operation_id
+            );
+            debug_assert_eq!(
+                self.recoverable_operation_id,
+                projection.recoverable_operation_id
+            );
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = projection;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_for_test(
+        &mut self,
+        foreground_operation_id: Option<SurfaceOperationId>,
+        recoverable_operation_id: Option<SurfaceOperationId>,
+    ) {
+        self.foreground_operation_id = foreground_operation_id;
+        self.recoverable_operation_id = recoverable_operation_id;
+        self.cursor = None;
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SurfaceMetricsState {
     usage: UsageTotals,
@@ -340,9 +453,29 @@ impl AppState {
         self.surface_goal.current()
     }
 
+    /// Returns the foreground operation from the latest accepted surface snapshot.
+    pub fn foreground_operation_id(&self) -> Option<&SurfaceOperationId> {
+        self.surface_operation.foreground_operation_id()
+    }
+
+    /// Returns the recoverable operation from the latest accepted surface snapshot.
+    pub fn recoverable_operation_id(&self) -> Option<&SurfaceOperationId> {
+        self.surface_operation.recoverable_operation_id()
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_current_goal_for_test(&mut self, goal: Option<ThreadGoal>) {
         self.surface_goal.replace_for_test(goal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_surface_operation_for_test(
+        &mut self,
+        foreground_operation_id: Option<SurfaceOperationId>,
+        recoverable_operation_id: Option<SurfaceOperationId>,
+    ) {
+        self.surface_operation
+            .replace_for_test(foreground_operation_id, recoverable_operation_id);
     }
 
     #[cfg(test)]
@@ -546,6 +679,9 @@ impl SurfaceProjectionState {
                 .foreground_operation
                 .as_ref()
                 .map(|operation| operation.operation_id.clone()),
+            recoverable_operation_id: snapshot
+                .recoverable_user_operation()
+                .map(|operation| operation.operation_id().clone()),
             goal_presentation: None,
             session_presentation: None,
         }

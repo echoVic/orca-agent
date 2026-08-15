@@ -30,7 +30,9 @@ use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssemb
 pub use crate::surface_projection::SurfaceProjectionState;
 use crate::surface_projection::{
     SurfaceGoalProjectionEffect, SurfaceGoalProjectionState, SurfaceMetricsState,
-    SurfaceSessionProjectionApply, SurfaceSessionProjectionEffect, SurfaceSessionProjectionState,
+    SurfaceOperationProjectionApply, SurfaceOperationProjectionEffect,
+    SurfaceOperationProjectionState, SurfaceSessionProjectionApply, SurfaceSessionProjectionEffect,
+    SurfaceSessionProjectionState,
 };
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
@@ -364,9 +366,6 @@ pub enum TuiEvent {
         generation: u64,
     },
     MentionRuntimeReady(RuntimeSurfaceThreadHandle),
-    RecoveryAvailable {
-        operation_id: SurfaceOperationId,
-    },
     SubmissionRejected {
         queued_id: Option<u64>,
         prompt: String,
@@ -861,8 +860,7 @@ pub struct AppState {
     /// showing outdated statuses. Cleared by the next successful update.
     pub plan_update_failed: bool,
     pub(crate) surface_goal: SurfaceGoalProjectionState,
-    active_surface_operation_id: Option<SurfaceOperationId>,
-    pub recoverable_operation_id: Option<SurfaceOperationId>,
+    pub(crate) surface_operation: SurfaceOperationProjectionState,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
@@ -1020,8 +1018,7 @@ impl AppState {
             assistant_stream_tail: None,
             plan_update_failed: false,
             surface_goal: SurfaceGoalProjectionState::default(),
-            active_surface_operation_id: None,
-            recoverable_operation_id: None,
+            surface_operation: SurfaceOperationProjectionState::default(),
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,
             panel_mode: PanelMode::Conversation,
@@ -1275,7 +1272,10 @@ impl AppState {
     fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
         let mut surface_session = self.surface_session.clone();
         let session_apply = surface_session.apply_projection(&projection);
+        let mut surface_operation = self.surface_operation.clone();
+        let operation_apply = surface_operation.apply_projection(&projection);
         if matches!(session_apply, SurfaceSessionProjectionApply::Rejected)
+            || matches!(operation_apply, SurfaceOperationProjectionApply::Rejected)
             || self
                 .surface_metrics
                 .rejects_usage_revision(projection.usage_revision)
@@ -1283,10 +1283,28 @@ impl AppState {
             return;
         }
         self.surface_session = surface_session;
+        self.surface_operation = surface_operation;
         self.surface_metrics.apply_projection(&projection);
         let goal_effect = self.surface_goal.apply_projection(&projection);
-        self.active_surface_operation_id = projection.foreground_operation_id.clone();
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
+        match operation_apply {
+            SurfaceOperationProjectionApply::Rejected => unreachable!("projection was rejected"),
+            SurfaceOperationProjectionApply::Accepted(operation_effect) => match operation_effect {
+                Some(SurfaceOperationProjectionEffect::RecoveryPromptShown) => {
+                    self.recovery_prompt_visible = true;
+                    self.recovery_prompt_selected = 0;
+                    self.push_message(ChatMessage::System(
+                    "A recoverable operation is suspended. Use the recovery controls to continue it or /cancel-operation to close it."
+                        .to_string(),
+                ));
+                }
+                Some(SurfaceOperationProjectionEffect::RecoveryPromptCleared) => {
+                    self.recovery_prompt_visible = false;
+                    self.recovery_prompt_selected = 0;
+                }
+                None => {}
+            },
+        }
         match goal_effect {
             Some(SurfaceGoalProjectionEffect::Updated(goal)) => {
                 let should_keep_running =
@@ -1335,10 +1353,7 @@ impl AppState {
             sort_workflow_tasks_for_panel(projection.workflow_tasks.clone())
         );
         self.surface_goal.assert_matches_projection(projection);
-        debug_assert_eq!(
-            self.active_surface_operation_id,
-            projection.foreground_operation_id
-        );
+        self.surface_operation.assert_matches_projection(projection);
     }
 
     #[cfg(not(any(test, debug_assertions)))]
@@ -1406,9 +1421,9 @@ impl AppState {
         self.proposed_plan_parser = ProposedPlanStreamParser::default();
         self.plan_update_failed = false;
         self.surface_goal.reset();
-        self.active_surface_operation_id = None;
-        self.recoverable_operation_id = None;
+        self.surface_operation.reset();
         self.recovery_prompt_visible = false;
+        self.recovery_prompt_selected = 0;
         self.surface_metrics.reset();
         self.approval_dialog = None;
         self.pending_input = None;
@@ -1756,7 +1771,9 @@ impl AppState {
             }
             TuiEvent::NewSessionStarted => {}
             TuiEvent::SessionProjectionReset(projection) => {
-                if !SurfaceSessionProjectionState::accepts_reset(&projection) {
+                if !SurfaceSessionProjectionState::accepts_reset(&projection)
+                    || !SurfaceOperationProjectionState::accepts_reset(&projection)
+                {
                     return;
                 }
                 self.reset_session_projection();
@@ -1787,7 +1804,6 @@ impl AppState {
                 plan,
                 label,
             } => {
-                self.recoverable_operation_id = None;
                 self.replace_messages(messages);
                 if let Some(plan) = plan {
                     self.current_plan = Some(plan);
@@ -1797,7 +1813,6 @@ impl AppState {
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::TurnStarted { .. } => {
-                self.recoverable_operation_id = None;
                 self.suppress_background_main_session_output = false;
                 self.enter_running();
             }
@@ -2273,11 +2288,6 @@ impl AppState {
                 self.finish_assistant_stream();
                 self.push_message(ChatMessage::System(msg));
             }
-            TuiEvent::RecoveryAvailable { operation_id } => {
-                self.recoverable_operation_id = Some(operation_id);
-                self.recovery_prompt_visible = true;
-                self.recovery_prompt_selected = 0;
-            }
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
             | TuiEvent::MentionRuntimeReady(_) => {}
@@ -2314,8 +2324,6 @@ impl AppState {
                 self.scroll_to_bottom();
             }
             TuiEvent::SessionCompleted { status } => {
-                self.recoverable_operation_id = None;
-                self.recovery_prompt_visible = false;
                 let was_backgrounded = self.suppress_background_main_session_output;
                 self.suppress_background_main_session_output = false;
                 self.approval_dialog = None;
@@ -3175,6 +3183,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: None,
                 foreground_operation_id: None,
+                recoverable_operation_id: None,
                 goal_presentation: None,
                 session_presentation: None,
             },
@@ -3209,6 +3218,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: None,
                 foreground_operation_id: None,
+                recoverable_operation_id: None,
                 goal_presentation: None,
                 session_presentation: None,
             },
@@ -3254,6 +3264,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: None,
                 foreground_operation_id: None,
+                recoverable_operation_id: None,
                 goal_presentation: None,
                 session_presentation: None,
             },
@@ -4495,31 +4506,165 @@ mod tests {
     }
 
     #[test]
-    fn recovery_projection_keeps_exact_operation_until_start_or_terminal() {
+    fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
         let mut state = state();
         let operation_id = SurfaceOperationId::try_from_bytes([
             0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,
         ])
         .unwrap();
 
-        state.update(TuiEvent::RecoveryAvailable {
-            operation_id: operation_id.clone(),
-        });
-        assert_eq!(state.recoverable_operation_id.as_ref(), Some(&operation_id));
+        let projection = |next_seq: u64, recoverable_operation_id: Option<SurfaceOperationId>| {
+            SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(next_seq),
+                session_id: Some("recovery-session".to_string()),
+                title: "Recovery session".to_string(),
+                usage_revision: next_seq,
+                usage: UsageTotals::default(),
+                context_revision: next_seq,
+                context_used_tokens: 0,
+                context_limit_tokens: 128_000,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: recoverable_operation_id.clone(),
+                recoverable_operation_id,
+                goal_presentation: None,
+                session_presentation: None,
+            }
+        };
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            1,
+            Some(operation_id.clone()),
+        ))));
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_id));
+        assert!(state.recovery_prompt_visible);
 
         state.update(TuiEvent::TurnStarted {
             turn: 2,
             task: None,
         });
-        assert!(state.recoverable_operation_id.is_none());
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_id));
 
-        state.update(TuiEvent::RecoveryAvailable {
-            operation_id: operation_id.clone(),
+        state.update(TuiEvent::HistoryLoaded {
+            messages: Vec::new(),
+            plan: None,
+            label: "Resumed saved conversation.".to_string(),
         });
         state.update(TuiEvent::SessionCompleted {
             status: "cancelled".to_string(),
         });
-        assert!(state.recoverable_operation_id.is_none());
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_id));
+        assert!(state.recovery_prompt_visible);
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            2, None,
+        ))));
+        assert!(state.recoverable_operation_id().is_none());
+        assert!(!state.recovery_prompt_visible);
+    }
+
+    #[test]
+    fn surface_operation_projection_fences_conflicts_and_resets() {
+        let mut state = state();
+        let operation_a = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 4,
+        ])
+        .unwrap();
+        let operation_b = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 5,
+        ])
+        .unwrap();
+        let projection =
+            |next_seq: u64, operation: Option<SurfaceOperationId>| SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(next_seq),
+                session_id: Some("operation-session".to_string()),
+                title: "Operation session".to_string(),
+                usage_revision: next_seq,
+                usage: UsageTotals::default(),
+                context_revision: next_seq,
+                context_used_tokens: 0,
+                context_limit_tokens: 128_000,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: operation.clone(),
+                recoverable_operation_id: operation,
+                goal_presentation: None,
+                session_presentation: None,
+            };
+        let recovery_notice_count = |state: &AppState| {
+            state
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(message, ChatMessage::System(text) if text.starts_with("A recoverable operation is suspended."))
+                })
+                .count()
+        };
+
+        let accepted = projection(1, Some(operation_a.clone()));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            accepted.clone(),
+        )));
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(accepted)));
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_a));
+        assert_eq!(recovery_notice_count(&state), 1);
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            1,
+            Some(operation_b.clone()),
+        ))));
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_a));
+        assert_eq!(recovery_notice_count(&state), 1);
+
+        let mut mismatched = projection(2, Some(operation_b.clone()));
+        mismatched.foreground_operation_id = Some(operation_a.clone());
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(mismatched)));
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_a));
+        assert_eq!(recovery_notice_count(&state), 1);
+
+        let mut mismatched_reset = projection(2, Some(operation_b.clone()));
+        mismatched_reset.foreground_operation_id = Some(operation_a.clone());
+        mismatched_reset.session_id = Some("invalid-reset-session".to_string());
+        state.update(TuiEvent::SessionProjectionReset(Box::new(mismatched_reset)));
+        assert_eq!(state.current_session_id(), Some("operation-session"));
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_a));
+        assert_eq!(recovery_notice_count(&state), 1);
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            2,
+            Some(operation_b.clone()),
+        ))));
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_b));
+        assert_eq!(recovery_notice_count(&state), 2);
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            3, None,
+        ))));
+        assert!(state.recoverable_operation_id().is_none());
+        assert!(!state.recovery_prompt_visible);
+
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection(
+            2,
+            Some(operation_b.clone()),
+        ))));
+        assert!(state.recoverable_operation_id().is_none());
+
+        let mut other_session = projection(4, Some(operation_b.clone()));
+        other_session.cursor.incarnation =
+            orca_runtime::surface::SurfaceIncarnation::try_from_bytes([
+                0x02, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 6,
+            ])
+            .unwrap();
+        other_session.session_id = Some("other-operation-session".to_string());
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            other_session.clone(),
+        )));
+        assert!(state.recoverable_operation_id().is_none());
+
+        state.update(TuiEvent::SessionProjectionReset(Box::new(other_session)));
+        assert_eq!(state.current_session_id(), Some("other-operation-session"));
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_b));
+        assert!(state.recovery_prompt_visible);
     }
 
     #[test]
@@ -4758,6 +4903,7 @@ mod tests {
             workflow_tasks: Vec::new(),
             current_goal: None,
             foreground_operation_id: None,
+            recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
         };
@@ -4792,6 +4938,7 @@ mod tests {
             workflow_tasks: Vec::new(),
             current_goal: None,
             foreground_operation_id: None,
+            recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
         };
@@ -4871,6 +5018,7 @@ mod tests {
             workflow_tasks: Vec::new(),
             current_goal: None,
             foreground_operation_id: None,
+            recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation,
         };
@@ -4935,6 +5083,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: None,
                 foreground_operation_id: None,
+                recoverable_operation_id: None,
                 goal_presentation: None,
                 session_presentation: None,
             },
@@ -4954,6 +5103,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: None,
                 foreground_operation_id: None,
+                recoverable_operation_id: None,
                 goal_presentation: None,
                 session_presentation: Some(
                     crate::surface_projection::SessionProjectionPresentation::Renamed,
@@ -5003,6 +5153,7 @@ mod tests {
             workflow_tasks: Vec::new(),
             current_goal: goal,
             foreground_operation_id: None,
+            recoverable_operation_id: None,
             goal_presentation,
             session_presentation: None,
         };
@@ -5109,6 +5260,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: Some(goal.clone()),
                 foreground_operation_id: None,
+                recoverable_operation_id: None,
                 goal_presentation: None,
                 session_presentation: None,
             },
@@ -5143,6 +5295,7 @@ mod tests {
             workflow_tasks: Vec::new(),
             current_goal: goal,
             foreground_operation_id: None,
+            recoverable_operation_id: None,
             goal_presentation,
             session_presentation: None,
         };
@@ -5216,6 +5369,7 @@ mod tests {
             workflow_tasks: vec![workflow_task_summary("task-1", "Canonical task")],
             current_goal: Some(goal),
             foreground_operation_id: Some(operation_id),
+            recoverable_operation_id: None,
             goal_presentation: None,
             session_presentation: None,
         };
@@ -5230,8 +5384,8 @@ mod tests {
         assert_eq!(state.workflow_panel.tasks, expected.workflow_tasks);
         assert_eq!(state.current_goal(), expected.current_goal.as_ref());
         assert_eq!(
-            state.active_surface_operation_id,
-            expected.foreground_operation_id
+            state.foreground_operation_id(),
+            expected.foreground_operation_id.as_ref()
         );
         state.assert_surface_projection_consistent(&expected);
 
@@ -5276,8 +5430,8 @@ mod tests {
         assert_eq!(state.current_session_title(), Some("canonical title"));
         assert_eq!(state.usage().input_tokens, 800);
         assert_eq!(
-            state.active_surface_operation_id,
-            expected.foreground_operation_id
+            state.foreground_operation_id(),
+            expected.foreground_operation_id.as_ref()
         );
 
         let mut next_session = expected.clone();
@@ -6278,6 +6432,7 @@ mod tests {
                 workflow_tasks: Vec::new(),
                 current_goal: Some(goal),
                 foreground_operation_id: None,
+                recoverable_operation_id: None,
                 goal_presentation: Some(
                     crate::surface_projection::GoalProjectionPresentation::Updated,
                 ),

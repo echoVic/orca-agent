@@ -163,7 +163,7 @@ fn handle_recovery_prompt_key(
         KeyCode::Left | KeyCode::Up => state.recovery_prompt_selected = 0,
         KeyCode::Right | KeyCode::Down => state.recovery_prompt_selected = 1,
         KeyCode::Enter => {
-            let Some(operation_id) = state.recoverable_operation_id.clone() else {
+            let Some(operation_id) = state.recoverable_operation_id().cloned() else {
                 state.recovery_prompt_visible = false;
                 return;
             };
@@ -853,9 +853,8 @@ mod tests {
             0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 4,
         ])
         .unwrap();
-        state.update(crate::types::TuiEvent::RecoveryAvailable {
-            operation_id: operation_id.clone(),
-        });
+        state.replace_surface_operation_for_test(None, Some(operation_id.clone()));
+        state.recovery_prompt_visible = true;
         let mut config = config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let mut textarea = TextArea::default();
@@ -907,7 +906,7 @@ mod tests {
             &theme,
         );
         assert!(!state.recovery_prompt_visible);
-        assert_eq!(state.recoverable_operation_id, Some(operation_id));
+        assert_eq!(state.recoverable_operation_id(), Some(&operation_id));
     }
 
     #[test]

@@ -440,6 +440,7 @@ mod tests {
                     workflow_tasks: Vec::new(),
                     current_goal: None,
                     foreground_operation_id: None,
+                    recoverable_operation_id: None,
                     goal_presentation: None,
                     session_presentation: None,
                 },
