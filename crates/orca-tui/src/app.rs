@@ -47,7 +47,7 @@ use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iter
 use crate::hosted_goal::run_hosted_goal_run;
 use crate::hosted_goal::{
     current_hosted_goal_session_id, existing_hosted_goal_session_id, goal_continuation_prompt,
-    send_goal_history_error, show_hosted_goal,
+    show_hosted_goal,
 };
 #[cfg(test)]
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -62,8 +62,8 @@ use crate::hosted_session::{
 use crate::hosted_session::{chat_message_from_history, load_saved_history_fallback};
 use crate::hosted_session_lifecycle::{
     ensure_hosted_thread, preflight_started_session, reap_hosted_thread,
-    refresh_saved_session_picker, start_forked_hosted_session, start_new_hosted_session,
-    switch_saved_hosted_session,
+    refresh_saved_session_picker, resume_latest_active_goal_hosted, start_forked_hosted_session,
+    start_new_hosted_session, switch_saved_hosted_session,
 };
 use crate::hosted_settings::{
     apply_hosted_settings_action, settings_intent_patches, surface_approval_mode,
@@ -9515,99 +9515,4 @@ fn hosted_tui_controller_loop(
 
 fn send_hosted_action_failure(event_tx: &mpsc::Sender<TuiEvent>, message: String) {
     let _ = event_tx.send(TuiEvent::OperationRejected(message));
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resume_latest_active_goal_hosted(
-    thread: &mut Option<RuntimeThreadHandle>,
-    host: &RuntimeHostHandle,
-    config: &Arc<Mutex<RunConfig>>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    control: &TuiSurfaceTaskControl,
-    _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-) {
-    if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
-        send_goal_history_error(event_tx);
-        return;
-    }
-    let goal = match RuntimeSurfaceHostHandle::latest_active_saved_goal() {
-        Ok(Some(goal)) => goal,
-        Ok(None) => {
-            let _ = event_tx.send(TuiEvent::GoalStatus(None));
-            return;
-        }
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!("failed to read goals: {error}")));
-            return;
-        }
-    };
-    let transcript = match RuntimeSurfaceHostHandle::load_saved_session(&goal.session_id) {
-        Ok(transcript) => transcript,
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!(
-                "failed to load goal session {}: {error}",
-                goal.session_id
-            )));
-            return;
-        }
-    };
-    let mut cfg = config.lock().unwrap().clone();
-    cfg.history_mode = HistoryMode::Resume(goal.session_id.clone());
-    let request =
-        RuntimeThreadStartRequest::new(cfg.clone(), &goal.objective).with_preloaded(transcript);
-    let resumed = match host.start_thread_with_request(request) {
-        Ok(thread) => thread,
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!(
-                "failed to initialize resumed goal session: {error}"
-            )));
-            return;
-        }
-    };
-    let resumed_actions = TuiSurfaceActions::new(resumed.typed_surface());
-    let active_goal = match resumed_actions.goal(&goal.session_id) {
-        Ok(Some(goal)) => goal,
-        Ok(None) => {
-            let _ = event_tx.send(TuiEvent::Error(
-                "goal disappeared while restoring its session".to_string(),
-            ));
-            let _ = resumed.shutdown();
-            return;
-        }
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!(
-                "failed to project goal in restored session: {error}"
-            )));
-            let _ = resumed.shutdown();
-            return;
-        }
-    };
-    if let Some(previous) = thread.take() {
-        reap_hosted_thread(previous);
-    }
-    notify_recovered_background_approvals_for_tui(
-        &TuiSurfaceActions::new(resumed.typed_surface()),
-        event_tx,
-    );
-    *thread = Some(resumed);
-    *preloaded.lock().unwrap() = None;
-    if let Ok(mut shared) = config.lock() {
-        shared.history_mode = cfg.history_mode.clone();
-    }
-    if let Some(runtime_thread) = thread.as_ref() {
-        let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-        if let Err(error) = actions.resume_goal_and_run_with_started(
-            goal_continuation_prompt(&active_goal.objective, 1),
-            control,
-            event_tx,
-            || {
-                let _ = event_tx.send(TuiEvent::Notice(
-                    "Resumed latest active goal in a restored session.".to_string(),
-                ));
-            },
-        ) {
-            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
-        }
-    }
 }

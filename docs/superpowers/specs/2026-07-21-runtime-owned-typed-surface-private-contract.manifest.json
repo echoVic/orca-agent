@@ -5027,9 +5027,9 @@
     [
       "goal_callbacks",
       [
-        "crates/orca-tui/src/app.rs:4359",
-        "crates/orca-tui/src/app.rs:5215",
-        "crates/orca-tui/src/app.rs:5266"
+        "crates/orca-tui/src/hosted_session_lifecycle.rs:307",
+        "crates/orca-tui/src/hosted_goal.rs:133",
+        "crates/orca-tui/src/app.rs:9307"
       ],
       "goal_session_operation_authority",
       "competing_goal_actor_reread_history_and_thread_shutdown",

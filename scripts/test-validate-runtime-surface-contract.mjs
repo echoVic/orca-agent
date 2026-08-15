@@ -452,6 +452,34 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutGoalShowCallback = source.replace(
+    /^\s*show_hosted_goal\(&thread, &preloaded, &config, &event_tx\);\r?\n/m,
+    "",
+  );
+  assert.notEqual(
+    withoutGoalShowCallback,
+    source,
+    "goal callback mutation fixture must remove the production call",
+  );
+  assert.match(
+    withoutGoalShowCallback,
+    /show_hosted_goal,/,
+    "goal callback mutation fixture must preserve the import",
+  );
+  expectFailure(
+    "goal callback validation rejects a removed production call even when the import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutGoalShowCallback]]),
+      }),
+    /goal_callbacks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
   const manifest = cloneManifest();
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\

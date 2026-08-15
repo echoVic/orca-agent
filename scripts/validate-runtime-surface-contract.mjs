@@ -403,7 +403,7 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["session_picker_transition", /fn handle_session_picker_key|Session picker/],
   [
     "goal_callbacks",
-    /fn update_goal_status_for_session|fn show_hosted_goal|fn resume_latest_active_goal_hosted/,
+    /fn update_goal_status_for_session|fn show_hosted_goal|fn resume_latest_active_goal_hosted|\bshow_hosted_goal\s*\(/,
   ],
   [
     "mention_catalog_expansion",
@@ -652,7 +652,10 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.shutdown",
     1,
   ],
-  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:thread.shutdown", 2],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:resume_latest_active_goal_hosted:thread.shutdown",
+    2,
+  ],
   [
     "crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.launch_workflow",
     1,
@@ -665,7 +668,10 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     "crates/orca-tui/src/hosted_session_lifecycle.rs:ensure_hosted_thread:host.start_thread_with_request",
     1,
   ],
-  ["crates/orca-tui/src/app.rs:resume_latest_active_goal_hosted:host.start_thread_with_request", 1],
+  [
+    "crates/orca-tui/src/hosted_session_lifecycle.rs:resume_latest_active_goal_hosted:host.start_thread_with_request",
+    1,
+  ],
   [
     "crates/orca-tui/src/hosted_session_lifecycle.rs:start_new_hosted_session:host.start_thread_with_request",
     1,

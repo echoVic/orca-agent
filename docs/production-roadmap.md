@@ -197,25 +197,24 @@ The 2026-08-16 hosted Goal orchestration ownership slice moves stateless
 turn-request construction, typed ordinary-turn dispatch, operation-error
 shaping, and Goal lookup/run adapters into `hosted_runtime.rs` and
 `hosted_goal.rs`. The controller still owns the action loop, Side/session
-attachments, and latest-active Goal recovery because runtime-thread
-installation, shutdown, preloaded-session clearing, and config updates must
-remain one transaction. This changes no runtime surface, persistence, CLI,
-server/JSONL, ACP, or user-visible Goal behavior.
+attachments, and lifecycle decisions. Runtime-thread installation, shutdown,
+preloaded-session clearing, and config updates remain one transaction in the
+hosted session lifecycle owner. This changes no runtime surface, persistence,
+CLI, server/JSONL, ACP, or user-visible Goal behavior.
 
 The 2026-08-16 hosted session projection ownership slice moves stateless typed
 snapshot conversion, attached reset/history publication, runtime-ready
 publication, and saved-history eligibility/fallback into `hosted_session.rs`.
 The controller still owns thread installation, replacement, shutdown/reaping,
-attachments, and latest-active Goal recovery. This changes no runtime surface,
-persistence, CLI, server/JSONL, ACP, or user-visible session behavior.
+and attachments. This changes no runtime surface, persistence, CLI,
+server/JSONL, ACP, or user-visible session behavior.
 
 The 2026-08-16 hosted session lifecycle ownership slice moves hosted thread
 startup, replacement preflight, installation, asynchronous reaping, new/fork/
 saved-session switching, and saved-session list refresh into
 `hosted_session_lifecycle.rs`. The controller still owns event routing,
-attachments, the controller loop, final shutdown, and latest-active Goal
-recovery. This changes no runtime surface, persistence, CLI, server/JSONL, ACP,
-or user-visible session behavior.
+attachments, the controller loop, and final shutdown. This changes no runtime
+surface, persistence, CLI, server/JSONL, ACP, or user-visible session behavior.
 
 The 2026-08-16 hosted settings ownership slice moves settings-intent patch
 translation and the attached/unattached settings application transaction into
@@ -230,9 +229,17 @@ transaction into `hosted_submission.rs`: missing-thread startup, readiness
 publication, bound-mention expansion, queued rejection identity, ordinary or
 Goal-aware typed dispatch, and the existing desktop completion notification.
 The controller keeps action selection, Side/config selection, queued-input
-scheduling, plan gating, latest-active Goal recovery, and final shutdown. This
-changes no runtime surface, persistence, CLI, server/JSONL, ACP, or user-visible
-submission behavior.
+scheduling, plan gating, and final shutdown. This changes no runtime surface,
+persistence, CLI, server/JSONL, ACP, or user-visible submission behavior.
+
+The 2026-08-16 hosted latest-active Goal recovery ownership slice moves the
+candidate-session recovery transaction into `hosted_session_lifecycle.rs`.
+Latest active Goal discovery, transcript loading, candidate runtime startup,
+typed Goal validation, old-thread retirement, config/preloaded mutation,
+recovered-approval publication, and continuation launch remain one ordered
+transaction. The controller still chooses when Goal resume runs and owns
+attachments, action routing, and final shutdown. This changes no runtime
+surface, persistence, CLI, server/JSONL, ACP, or user-visible Goal behavior.
 
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
@@ -1436,8 +1443,8 @@ end state.
    queued-submission, edit-highlight, surface-metrics, Goal projection,
    session-identity projection, workflow-task projection, hosted Goal
    orchestration, hosted session projection, hosted session lifecycle, hosted
-   settings, and hosted submission); `app.rs` is currently 9,613 lines and
-   `types.rs` 8,806 lines. Renderer-owned
+   settings, hosted submission, and hosted latest-active Goal recovery);
+   `app.rs` is currently 9,518 lines and `types.rs` 8,806 lines. Renderer-owned
    orchestration and cold legacy registry reconciliation remain open; live
    task/operation projection duplication has been removed from the TUI event
    boundary (`surface_projection.rs`, 3,280 lines).
