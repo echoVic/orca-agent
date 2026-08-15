@@ -202,6 +202,13 @@ installation, shutdown, preloaded-session clearing, and config updates must
 remain one transaction. This changes no runtime surface, persistence, CLI,
 server/JSONL, ACP, or user-visible Goal behavior.
 
+The 2026-08-16 hosted session projection ownership slice moves stateless typed
+snapshot conversion, attached reset/history publication, runtime-ready
+publication, and saved-history eligibility/fallback into `hosted_session.rs`.
+The controller still owns thread installation, replacement, shutdown/reaping,
+attachments, and latest-active Goal recovery. This changes no runtime surface,
+persistence, CLI, server/JSONL, ACP, or user-visible session behavior.
+
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
 plan and its failed-update marker. Existing `PlanUpdated` and legacy
@@ -1398,13 +1405,13 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established seventeen focused owners/boundaries so far (insert-escape, presentation,
+   stream has established eighteen focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection,
-   session-identity projection, workflow-task projection, and hosted Goal
-   orchestration); `app.rs` is
-   currently 10,348 lines and `types.rs` 8,806 lines. Renderer-owned
+   session-identity projection, workflow-task projection, hosted Goal
+   orchestration, and hosted session projection); `app.rs` is
+   currently 10,120 lines and `types.rs` 8,806 lines. Renderer-owned
    orchestration and cold legacy registry reconciliation remain open; live
    task/operation projection duplication has been removed from the TUI event
    boundary (`surface_projection.rs`, 3,280 lines).
