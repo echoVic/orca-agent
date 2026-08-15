@@ -193,6 +193,15 @@ for sorting, selection, reveal, and foreground return. Cold reconciliation of
 legacy registry-only records remains open and fail-closed. CLI, server/JSONL, ACP,
 runtime surface events, task persistence, and transcript formats are unchanged.
 
+The 2026-08-16 hosted Goal orchestration ownership slice moves stateless
+turn-request construction, typed ordinary-turn dispatch, operation-error
+shaping, and Goal lookup/run adapters into `hosted_runtime.rs` and
+`hosted_goal.rs`. The controller still owns the action loop, Side/session
+attachments, and latest-active Goal recovery because runtime-thread
+installation, shutdown, preloaded-session clearing, and config updates must
+remain one transaction. This changes no runtime surface, persistence, CLI,
+server/JSONL, ACP, or user-visible Goal behavior.
+
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
 plan and its failed-update marker. Existing `PlanUpdated` and legacy
@@ -1389,12 +1398,13 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established sixteen focused owners/boundaries so far (insert-escape, presentation,
+   stream has established seventeen focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
-   queued-submission, edit-highlight, surface-metrics, Goal projection, and
-   session-identity projection, and workflow-task projection); `app.rs` is
-   currently 10,559 lines and `types.rs` 8,806 lines. Renderer-owned
+   queued-submission, edit-highlight, surface-metrics, Goal projection,
+   session-identity projection, workflow-task projection, and hosted Goal
+   orchestration); `app.rs` is
+   currently 10,348 lines and `types.rs` 8,806 lines. Renderer-owned
    orchestration and cold legacy registry reconciliation remain open; live
    task/operation projection duplication has been removed from the TUI event
    boundary (`surface_projection.rs`, 3,280 lines).

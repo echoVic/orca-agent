@@ -17,8 +17,7 @@ use orca_core::conversation::Message;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_runtime::history;
 use orca_runtime::runtime_host::{
-    HostedOperationKind, HostedTurnRequest, RuntimeHostHandle, RuntimeThreadHandle,
-    RuntimeThreadStartRequest,
+    HostedOperationKind, RuntimeHostHandle, RuntimeThreadHandle, RuntimeThreadStartRequest,
 };
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
@@ -44,7 +43,16 @@ use crate::composer_textarea::{
 use crate::exit_policy::TuiExit;
 use crate::exit_policy::{exit_resume_hint, exit_session_id};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
+use crate::hosted_goal::{
+    current_hosted_goal_session_id, existing_hosted_goal_session_id, goal_continuation_prompt,
+    run_hosted_goal_run, send_goal_history_error, show_hosted_goal,
+};
+#[cfg(test)]
 use crate::hosted_runtime::TuiHostedOperationOutcome;
+use crate::hosted_runtime::{
+    emit_hosted_operation_error, hosted_turn_request, run_hosted_ordinary_turn,
+    send_submission_error,
+};
 use crate::hosted_side::{
     HostedSideParent, hosted_config_for_active, rotate_attached_event_sender,
     rotate_side_event_sender, shutdown_attached_side_on_controller_exit,
@@ -8347,29 +8355,6 @@ done
     }
 }
 
-fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
-    format!(
-        "[Goal continuation #{continuation}]\nContinue working on this persistent goal:\n{objective}\n\nWork from current evidence. Preserve the full objective, verify every requirement before completion, and call update_goal only with status \"complete\" when the goal is actually finished or status \"blocked\" after the same blocker has repeated for at least three consecutive goal turns."
-    )
-}
-
-fn send_submission_error(
-    event_tx: &mpsc::Sender<TuiEvent>,
-    queued_id: Option<u64>,
-    rejection_prompt: Option<&str>,
-    message: String,
-) {
-    if let Some(prompt) = rejection_prompt {
-        let _ = event_tx.send(TuiEvent::SubmissionRejected {
-            queued_id,
-            prompt: prompt.to_string(),
-            message,
-        });
-    } else {
-        let _ = event_tx.send(TuiEvent::Error(message));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
@@ -10023,202 +10008,6 @@ fn handle_hosted_submitted_turn(
 
 fn send_hosted_action_failure(event_tx: &mpsc::Sender<TuiEvent>, message: String) {
     let _ = event_tx.send(TuiEvent::OperationRejected(message));
-}
-
-fn send_hosted_operation_terminal_failure(
-    event_tx: &mpsc::Sender<TuiEvent>,
-    _operation_kind: &HostedOperationKind,
-) {
-    let _ = event_tx.send(TuiEvent::SessionCompleted {
-        status: "failed".to_string(),
-    });
-}
-
-fn emit_hosted_operation_error(
-    event_tx: &mpsc::Sender<TuiEvent>,
-    error: io::Error,
-    operation_kind: &HostedOperationKind,
-) {
-    let recovery_required = crate::surface_client::is_terminal_recovery_error(&error);
-    let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-    if !recovery_required {
-        send_hosted_operation_terminal_failure(event_tx, operation_kind);
-    }
-}
-
-fn run_hosted_goal_run(
-    config: &RunConfig,
-    thread: &RuntimeThreadHandle,
-    submitted_turn: SubmittedTurn,
-    origin: orca_core::goal_runtime::GoalTurnOrigin,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    control: &TuiSurfaceTaskControl,
-) {
-    let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
-    let queued_id = submitted_turn.queued_id();
-    let Some(session_id) = thread.session_id().map(str::to_string) else {
-        if queued_id.is_some() {
-            send_submission_error(
-                event_tx,
-                queued_id,
-                rejection_prompt.as_deref(),
-                goal_history_error_message().to_string(),
-            );
-        } else {
-            send_goal_history_error(event_tx);
-        }
-        return;
-    };
-    let actions = TuiSurfaceActions::new(thread.typed_surface());
-    let active_goal = match actions.goal(&session_id) {
-        Ok(goal) => goal.filter(|goal| goal.status.should_continue()),
-        Err(error) => {
-            if queued_id.is_some() {
-                send_submission_error(
-                    event_tx,
-                    queued_id,
-                    rejection_prompt.as_deref(),
-                    error.to_string(),
-                );
-            } else {
-                let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-            }
-            return;
-        }
-    };
-    if let Some(goal) = active_goal.as_ref() {
-        let _ = event_tx.send(TuiEvent::GoalStatus(Some(goal.clone())));
-        if let Some(id) = queued_id {
-            let _ = event_tx.send(TuiEvent::QueuedSubmissionStarted { id });
-        }
-        if let Err(error) =
-            actions.resume_goal_and_run(submitted_turn.prompt().to_string(), control, event_tx)
-        {
-            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
-        }
-        return;
-    }
-    let _ = origin;
-    if let Some(id) = queued_id {
-        let _ = event_tx.send(TuiEvent::QueuedSubmissionStarted { id });
-    }
-    let request = hosted_turn_request(&submitted_turn, false);
-    let outcome = run_hosted_ordinary_turn(config, thread, request, event_tx, control);
-    let status = match outcome {
-        Ok(TuiHostedOperationOutcome::Turn { status }) => status,
-        Ok(TuiHostedOperationOutcome::ManualCompaction) => {
-            let _ = event_tx.send(TuiEvent::Error(
-                "goal run returned a compaction result".to_string(),
-            ));
-            return;
-        }
-        Err(error) => {
-            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::Turn);
-            return;
-        }
-    };
-    let _ = status;
-}
-
-fn run_hosted_ordinary_turn(
-    config: &RunConfig,
-    thread: &RuntimeThreadHandle,
-    request: HostedTurnRequest,
-    event_tx: &mpsc::Sender<TuiEvent>,
-    control: &TuiSurfaceTaskControl,
-) -> io::Result<TuiHostedOperationOutcome> {
-    TuiSurfaceActions::new(thread.typed_surface()).run_turn(
-        request,
-        config.clone(),
-        control,
-        event_tx,
-    )
-}
-
-fn hosted_turn_request(
-    submitted_turn: &SubmittedTurn,
-    goal_mode_active: bool,
-) -> HostedTurnRequest {
-    HostedTurnRequest::new(submitted_turn.prompt().to_string())
-        .with_goal_tools(goal_mode_active)
-        .with_goal_usage_tracking(goal_mode_active)
-        .with_backtrack_target(submitted_turn.is_backtrack_target())
-        .with_task_description(
-            submitted_turn
-                .task_label()
-                .unwrap_or_else(|| submitted_turn.prompt()),
-        )
-}
-
-fn current_hosted_goal_session_id(
-    thread: Option<&RuntimeThreadHandle>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-) -> Option<String> {
-    thread
-        .and_then(RuntimeThreadHandle::session_id)
-        .map(str::to_string)
-        .or_else(|| {
-            preloaded
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|transcript| transcript.meta.session_id.clone())
-        })
-}
-
-fn existing_hosted_goal_session_id(
-    thread: Option<&RuntimeThreadHandle>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    config: &Arc<Mutex<RunConfig>>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> Option<String> {
-    if let Some(session_id) = current_hosted_goal_session_id(thread, preloaded) {
-        return Some(session_id);
-    }
-    let history_mode = config.lock().unwrap().history_mode.clone();
-    let message = if matches!(history_mode, HistoryMode::Disabled) {
-        "persistent goals require recorded history; enable history before using /goal"
-    } else {
-        "The session must start before you can change a goal."
-    };
-    let _ = event_tx.send(TuiEvent::Error(message.to_string()));
-    None
-}
-fn show_hosted_goal(
-    thread: &Option<RuntimeThreadHandle>,
-    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
-    config: &Arc<Mutex<RunConfig>>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) {
-    let Some(session_id) = current_hosted_goal_session_id(thread.as_ref(), preloaded) else {
-        if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
-            send_goal_history_error(event_tx);
-        } else {
-            let _ = event_tx.send(TuiEvent::GoalStatus(None));
-        }
-        return;
-    };
-    let result = match thread.as_ref() {
-        Some(thread) => TuiSurfaceActions::new(thread.typed_surface()).goal(&session_id),
-        None => RuntimeSurfaceHostHandle::project_saved_goal(&session_id)
-            .map_err(|error| error.to_string()),
-    };
-    match result {
-        Ok(goal) => {
-            let _ = event_tx.send(TuiEvent::GoalStatus(goal));
-        }
-        Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(format!("failed to read goal: {error}")));
-        }
-    }
-}
-
-fn send_goal_history_error(event_tx: &mpsc::Sender<TuiEvent>) {
-    let _ = event_tx.send(TuiEvent::Error(goal_history_error_message().to_string()));
-}
-
-fn goal_history_error_message() -> &'static str {
-    "persistent goals require recorded history; enable history before using /goal"
 }
 
 #[allow(clippy::too_many_arguments)]
