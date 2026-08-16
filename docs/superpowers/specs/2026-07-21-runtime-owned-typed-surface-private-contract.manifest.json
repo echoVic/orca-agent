@@ -4505,10 +4505,11 @@
       "RespondToInteraction",
       "current",
       [
-        "crates/orca-tui/src/types.rs:352",
+        "crates/orca-tui/src/types.rs:475",
         "crates/orca-tui/src/approval_actions.rs:65",
-        "crates/orca-tui/src/idle_submit_actions.rs:62",
-        "crates/orca-tui/src/runtime_event_actions.rs:30"
+        "crates/orca-tui/src/idle_submit_actions.rs:115",
+        "crates/orca-tui/src/runtime_event_actions.rs:66",
+        "crates/orca-tui/src/action_dispatcher.rs:146"
       ],
       "interaction_mutation",
       "UserAction::RespondToInteraction{key,response}",

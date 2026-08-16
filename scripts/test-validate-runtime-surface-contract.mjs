@@ -1019,6 +1019,66 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/idle_submit_actions.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const pattern =
+    /\blet\s+_\s*=\s*action_tx\.send\(UserAction::RespondToInteraction\s*\{\s*key\s*,\s*response\s*\}\);/;
+  const withoutPendingInputDispatch = source.replace(
+    pattern,
+    "let _ = action_tx.send(UserAction::RemovedRespondToInteraction { key, response });",
+  );
+  assert.notEqual(
+    withoutPendingInputDispatch,
+    source,
+    "RespondToInteraction fixture must remove its pending-input production dispatch",
+  );
+  assert.match(
+    withoutPendingInputDispatch,
+    /RespondToInteraction/,
+    "RespondToInteraction fixture must preserve its tests and other references",
+  );
+  expectFailure(
+    "RespondToInteraction validation rejects removed pending-input dispatch while tests remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutPendingInputDispatch]]),
+      }),
+    /RespondToInteraction source does not contain its reviewed action anchor: crates\/orca-tui\/src\/idle_submit_actions\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/action_dispatcher.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const pattern =
+    /\bUserAction::RespondToInteraction\s*\{\s*key\s*,\s*response\s*\}\s*=>/;
+  const withoutPrioritizedOwner = source.replace(
+    pattern,
+    "UserAction::RemovedRespondToInteraction { key, response } =>",
+  );
+  assert.notEqual(
+    withoutPrioritizedOwner,
+    source,
+    "RespondToInteraction fixture must remove its prioritized owner branch",
+  );
+  assert.match(
+    withoutPrioritizedOwner,
+    /RespondToInteraction/,
+    "RespondToInteraction fixture must preserve its tests and other references",
+  );
+  expectFailure(
+    "RespondToInteraction validation rejects removed prioritized owner while tests remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutPrioritizedOwner]]),
+      }),
+    /RespondToInteraction source does not contain its reviewed action anchor: crates\/orca-tui\/src\/action_dispatcher\.rs/,
+  );
+}
+
+{
   const manifest = cloneManifest();
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\

@@ -579,6 +579,19 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
       ],
     ]),
   ],
+  [
+    "RespondToInteraction",
+    new Map([
+      [
+        "crates/orca-tui/src/idle_submit_actions.rs",
+        /\blet\s+_\s*=\s*action_tx\.send\(UserAction::RespondToInteraction\s*\{\s*key\s*,\s*response\s*\}\);/,
+      ],
+      [
+        "crates/orca-tui/src/action_dispatcher.rs",
+        /\bUserAction::RespondToInteraction\s*\{\s*key\s*,\s*response\s*\}\s*=>/,
+      ],
+    ]),
+  ],
 ]);
 
 function tuiEntrypointAnchor(entrypoint, relativePath) {

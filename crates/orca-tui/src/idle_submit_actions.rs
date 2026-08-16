@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
+use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 
 use crate::commands;
 use crate::composer_textarea::{
@@ -33,11 +34,23 @@ pub(crate) fn handle_idle_submit(
     state.mention_bindings.reconcile(&expanded_text);
     let text = expanded_text.trim().to_string();
     state.mention_bindings.reconcile(&text);
-    if text.is_empty() {
+    let empty_mcp_url_response = text.is_empty()
+        && state.status == AppStatus::WaitingUserInput
+        && matches!(
+            state.pending_input,
+            Some(PendingTuiInput::McpElicitation(_))
+        )
+        && matches!(
+            state.pending_mcp_elicitation_mode,
+            Some(RuntimeMcpElicitationMode::Url)
+        );
+    if text.is_empty() && !empty_mcp_url_response {
         return false;
     }
 
-    if let Some(outcome) = handle_slash_command(&text, config, shared_config, state, action_tx) {
+    if state.status != AppStatus::WaitingUserInput
+        && let Some(outcome) = handle_slash_command(&text, config, shared_config, state, action_tx)
+    {
         match outcome {
             SlashOutcome::Continue => {
                 state.pending_pastes.clear();
@@ -68,19 +81,37 @@ pub(crate) fn handle_idle_submit(
     }
 
     if state.status == AppStatus::WaitingUserInput {
-        state.enter_running();
-        state.scroll_to_bottom();
-        if let Some(pending) = state.pending_input.take() {
-            let (key, response) = match pending {
-                PendingTuiInput::UserInput(key) => (key, TuiInteractionResponse::UserInput(text)),
-                PendingTuiInput::McpElicitation(key) => (
-                    key,
+        let response = match state.pending_input.as_ref() {
+            Some(PendingTuiInput::UserInput(key)) => {
+                Some((key.clone(), TuiInteractionResponse::UserInput(text)))
+            }
+            Some(PendingTuiInput::McpElicitation(key)) => {
+                let content_json = if text.is_empty() {
+                    "{}".to_string()
+                } else {
+                    if let Err(error) = serde_json::from_str::<serde_json::Value>(&text) {
+                        state.push_message(ChatMessage::Error(format!(
+                            "invalid typed MCP elicitation content: {error}"
+                        )));
+                        return true;
+                    }
+                    text
+                };
+                Some((
+                    key.clone(),
                     TuiInteractionResponse::McpElicitation {
                         accepted: true,
-                        content_json: Some(text),
+                        content_json: Some(content_json),
                     },
-                ),
-            };
+                ))
+            }
+            None => None,
+        };
+        state.enter_running();
+        state.scroll_to_bottom();
+        if let Some((key, response)) = response {
+            state.pending_input = None;
+            state.pending_mcp_elicitation_mode = None;
             let _ = action_tx.send(UserAction::RespondToInteraction { key, response });
         }
     } else {
@@ -110,9 +141,16 @@ fn reset_composer_after_submit(textarea: &mut TextArea, vim_state: &mut VimState
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composer_textarea::make_textarea_with_text;
+    use crate::composer_textarea::{make_textarea_with_text, textarea_text};
     use crate::test_support::test_run_config;
+    use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind};
+    use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::ThemeName;
+    use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
+
+    fn interaction_key(kind: TuiInteractionKind, request_id: &str) -> TuiInteractionKey {
+        TuiInteractionKey::new(OperationIdAllocator::default().allocate(), request_id, kind)
+    }
 
     #[test]
     fn idle_submit_resumes_queued_autosend() {
@@ -208,5 +246,209 @@ mod tests {
             state.messages.last(),
             Some(ChatMessage::Error(message)) if message.contains("unknown slash command")
         ));
+    }
+
+    #[test]
+    fn waiting_user_input_treats_known_slash_command_as_literal_answer() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let key = interaction_key(TuiInteractionKind::UserInput, "input-slash");
+        state.update(TuiEvent::UserInputRequested {
+            key: key.clone(),
+            question: "Which path?".to_string(),
+            choices: Vec::new(),
+        });
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("/new", &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RespondToInteraction {
+                key: actual_key,
+                response: TuiInteractionResponse::UserInput(answer),
+            }) if actual_key == key && answer == "/new"
+        ));
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(state.pending_input.is_none());
+        assert_eq!(textarea_text(&textarea), "");
+    }
+
+    #[test]
+    fn invalid_mcp_form_json_preserves_pending_input_and_composer() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let key = interaction_key(TuiInteractionKind::McpElicitation, "mcp-form");
+        state.update(TuiEvent::McpElicitationRequested {
+            key: key.clone(),
+            server_name: "fixture".to_string(),
+            mode: RuntimeMcpElicitationMode::Form,
+            message: "Provide fields".to_string(),
+            url: None,
+            requested_schema_json: Some(r#"{"type":"object"}"#.to_string()),
+        });
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("not-json", &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+
+        assert!(action_rx.try_recv().is_err());
+        assert_eq!(state.status, AppStatus::WaitingUserInput);
+        assert!(matches!(
+            state.pending_input.as_ref(),
+            Some(PendingTuiInput::McpElicitation(actual_key)) if actual_key == &key
+        ));
+        assert_eq!(textarea_text(&textarea), "not-json");
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Error(message))
+                if message.starts_with("invalid typed MCP elicitation content:")
+        ));
+    }
+
+    #[test]
+    fn empty_mcp_url_accepts_with_empty_json_object() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let key = interaction_key(TuiInteractionKind::McpElicitation, "mcp-url");
+        state.update(TuiEvent::McpElicitationRequested {
+            key: key.clone(),
+            server_name: "fixture".to_string(),
+            mode: RuntimeMcpElicitationMode::Url,
+            message: "Authorize device".to_string(),
+            url: Some("https://example.test/device".to_string()),
+            requested_schema_json: None,
+        });
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("", &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RespondToInteraction {
+                key: actual_key,
+                response: TuiInteractionResponse::McpElicitation {
+                    accepted: true,
+                    content_json: Some(content),
+                },
+            }) if actual_key == key && content == "{}"
+        ));
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(state.pending_input.is_none());
+        assert_eq!(textarea_text(&textarea), "");
+    }
+
+    #[test]
+    fn empty_user_and_mcp_form_inputs_remain_pending() {
+        let user_key = interaction_key(TuiInteractionKind::UserInput, "empty-user");
+        let form_key = interaction_key(TuiInteractionKind::McpElicitation, "empty-form");
+        let cases = [
+            (
+                TuiEvent::UserInputRequested {
+                    key: user_key.clone(),
+                    question: "Continue?".to_string(),
+                    choices: Vec::new(),
+                },
+                user_key,
+                None,
+            ),
+            (
+                TuiEvent::McpElicitationRequested {
+                    key: form_key.clone(),
+                    server_name: "fixture".to_string(),
+                    mode: RuntimeMcpElicitationMode::Form,
+                    message: "Provide fields".to_string(),
+                    url: None,
+                    requested_schema_json: None,
+                },
+                form_key,
+                Some(RuntimeMcpElicitationMode::Form),
+            ),
+        ];
+
+        for (event, key, expected_mode) in cases {
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let mut state = AppState::new(
+                action_tx.clone(),
+                "test".to_string(),
+                "mock".to_string(),
+                "/tmp".to_string(),
+            );
+            state.update(event);
+            let mut config = test_run_config();
+            let shared = Arc::new(Mutex::new(config.clone()));
+            let theme = Theme::named(ThemeName::Dark);
+            let mut vim = VimState::new(false);
+            let mut textarea = make_textarea_with_text("", &vim, &theme);
+
+            assert!(!handle_idle_submit(
+                &mut textarea,
+                &mut vim,
+                &theme,
+                &mut state,
+                &mut config,
+                &shared,
+                &action_tx,
+            ));
+
+            assert!(action_rx.try_recv().is_err());
+            assert_eq!(state.status, AppStatus::WaitingUserInput);
+            assert_eq!(
+                state.pending_input.as_ref().map(PendingTuiInput::key),
+                Some(&key)
+            );
+            assert_eq!(state.pending_mcp_elicitation_mode, expected_mode);
+            assert_eq!(textarea_text(&textarea), "");
+        }
     }
 }

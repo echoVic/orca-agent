@@ -818,6 +818,7 @@ pub struct AppState {
     pub approval_dialog: Option<ApprovalDialog>,
     pub plan_approval_dialog: Option<PlanApprovalDialog>,
     pub pending_input: Option<PendingTuiInput>,
+    pub(crate) pending_mcp_elicitation_mode: Option<RuntimeMcpElicitationMode>,
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
@@ -978,6 +979,7 @@ impl AppState {
             approval_dialog: None,
             plan_approval_dialog: None,
             pending_input: None,
+            pending_mcp_elicitation_mode: None,
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
             show_shortcuts: false,
@@ -1421,6 +1423,7 @@ impl AppState {
         self.surface_metrics.reset();
         self.approval_dialog = None;
         self.pending_input = None;
+        self.pending_mcp_elicitation_mode = None;
         self.approval_allowlist.clear();
         self.session_picker_sessions.clear();
         self.session_picker_selected = 0;
@@ -2198,6 +2201,7 @@ impl AppState {
             } => {
                 self.set_status(AppStatus::WaitingUserInput);
                 self.pending_input = Some(PendingTuiInput::UserInput(key));
+                self.pending_mcp_elicitation_mode = None;
                 self.finish_assistant_stream();
                 let mut message = question;
                 if !choices.is_empty() {
@@ -2216,6 +2220,7 @@ impl AppState {
             } => {
                 self.set_status(AppStatus::WaitingUserInput);
                 self.pending_input = Some(PendingTuiInput::McpElicitation(key));
+                self.pending_mcp_elicitation_mode = Some(mode.clone());
                 self.finish_assistant_stream();
                 let mut lines = vec![format!("MCP {server_name} requests input: {message}")];
                 match mode {
@@ -2307,6 +2312,7 @@ impl AppState {
                 self.suppress_background_main_session_output = false;
                 self.approval_dialog = None;
                 self.pending_input = None;
+                self.pending_mcp_elicitation_mode = None;
                 self.clear_receiving_tool_progress();
                 self.flush_proposed_plan_parser();
                 self.finish_assistant_stream();
@@ -3589,6 +3595,7 @@ mod tests {
             state.pending_input.as_ref(),
             Some(PendingTuiInput::UserInput(key)) if key.request_id == "ask-1"
         ));
+        assert!(state.pending_mcp_elicitation_mode.is_none());
     }
 
     #[test]
@@ -3612,6 +3619,10 @@ mod tests {
             Some(PendingTuiInput::McpElicitation(key))
                 if key.request_id == "mcp_elicitation:github:42"
         ));
+        assert_eq!(
+            state.pending_mcp_elicitation_mode,
+            Some(RuntimeMcpElicitationMode::Url)
+        );
         assert!(matches!(
             state.messages.last(),
             Some(ChatMessage::System(message))
@@ -3624,10 +3635,13 @@ mod tests {
     #[test]
     fn session_completion_clears_pending_interaction_projection() {
         let mut input_state = state();
-        input_state.update(TuiEvent::UserInputRequested {
-            key: interaction_key(TuiInteractionKind::UserInput, "ask-1"),
-            question: "Continue?".to_string(),
-            choices: Vec::new(),
+        input_state.update(TuiEvent::McpElicitationRequested {
+            key: interaction_key(TuiInteractionKind::McpElicitation, "mcp-1"),
+            server_name: "fixture".to_string(),
+            mode: RuntimeMcpElicitationMode::Form,
+            message: "Provide fields".to_string(),
+            url: None,
+            requested_schema_json: None,
         });
 
         input_state.update(TuiEvent::SessionCompleted {
@@ -3636,6 +3650,7 @@ mod tests {
 
         assert_eq!(input_state.status, AppStatus::Idle);
         assert!(input_state.pending_input.is_none());
+        assert!(input_state.pending_mcp_elicitation_mode.is_none());
 
         let mut approval_state = state();
         approval_state.update(TuiEvent::ApprovalNeeded {
@@ -3651,6 +3666,24 @@ mod tests {
 
         assert_eq!(approval_state.status, AppStatus::Idle);
         assert!(approval_state.approval_dialog.is_none());
+    }
+
+    #[test]
+    fn session_reset_clears_pending_mcp_mode_with_the_interaction_key() {
+        let mut state = state();
+        state.update(TuiEvent::McpElicitationRequested {
+            key: interaction_key(TuiInteractionKind::McpElicitation, "mcp-reset"),
+            server_name: "fixture".to_string(),
+            mode: RuntimeMcpElicitationMode::Url,
+            message: "Authorize".to_string(),
+            url: Some("https://example.test/device".to_string()),
+            requested_schema_json: None,
+        });
+
+        state.reset_session_projection();
+
+        assert!(state.pending_input.is_none());
+        assert!(state.pending_mcp_elicitation_mode.is_none());
     }
 
     #[test]
