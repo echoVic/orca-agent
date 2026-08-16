@@ -413,6 +413,7 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["app_state_update", /fn update\(&mut self, event: TuiEvent\)/],
   ["input_history", /fn load_input_history|fn append_input_history|fn record_prompt/],
   ["terminal_clipboard_notifications", /MouseEventKind::Up|pending_clipboard_copy|desktop_notifications/],
+  ["renderer_runtime_events", /RendererRuntimeEventOwner|renderer_runtime\.handle\s*\(/],
 ]);
 
 const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
@@ -442,6 +443,16 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
         /pub\(crate\)\s+fn\s+handle_hosted_goal_action\s*\(/,
       ],
       ["crates/orca-tui/src/hosted_controller.rs", /\bhandle_hosted_goal_action\s*\(/],
+    ]),
+  ],
+  [
+    "renderer_runtime_events",
+    new Map([
+      ["crates/orca-tui/src/app.rs", /\brenderer_runtime\.handle\s*\(/],
+      [
+        "crates/orca-tui/src/renderer_runtime.rs",
+        /pub\(crate\)\s+fn\s+handle\s*\([\s\S]*?match\s+accept_attached_tui_event\s*\([\s\S]*?self\.pending_initial_prompt\.take\(\)[\s\S]*?tui_event\s*=>\s*\{\s*handle_runtime_event\s*\(/,
+      ],
     ]),
   ],
 ]);
@@ -892,7 +903,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     1,
   ],
   ["crates/orca-tui/src/hosted_session_lifecycle.rs:reap_hosted_thread:thread.shutdown", 2],
-  ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 2],
+  ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
   ["crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:task.mutate", 2],
   [
@@ -911,6 +922,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/running_actions.rs:handle_running_shortcut:user_action.route", 2],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:user_action.route", 1],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:workflow.continue", 2],
+  ["crates/orca-tui/src/renderer_runtime.rs:handle:user_action.route", 1],
   ["crates/orca-tui/src/session_picker_actions.rs:handle_session_picker_key:user_action.route", 3],
   ["crates/orca-tui/src/session_picker_actions.rs:activate_action:user_action.route", 2],
   ["crates/orca-tui/src/session_picker_actions.rs:dispatch_selected_resume:user_action.route", 1],
@@ -935,11 +947,12 @@ const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
+  ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_runtime.shutdown", 1],
   [
     "crates/orca-tui/src/hosted_session_lifecycle.rs:install_hosted_session:pending_workflow_notifications.clear",
     1,
   ],
-  ["crates/orca-tui/src/app.rs:run_tui_inner:mention_search.shutdown", 1],
+  ["crates/orca-tui/src/renderer_runtime.rs:shutdown:self.mention_search.shutdown", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:terminal.clear", 1],
   [
     "crates/orca-tui/src/hosted_session_lifecycle.rs:start_forked_hosted_session:next_config.prompt.clear",

@@ -23,11 +23,11 @@ use orca_runtime::runtime_host::{RuntimeThreadHandle, RuntimeThreadStartRequest}
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::agent_runtime::TuiAgentRuntime;
-use crate::attachment_routing::accept_attached_tui_event;
 #[cfg(test)]
 use crate::attachment_routing::{
-    AttachmentRouting, reduce_attached_tui_event, rotate_attached_event_sender,
-    spawn_attached_event_sender, spawn_attached_event_sender_with_routing,
+    AttachmentRouting, accept_attached_tui_event, reduce_attached_tui_event,
+    rotate_attached_event_sender, spawn_attached_event_sender,
+    spawn_attached_event_sender_with_routing,
 };
 #[cfg(test)]
 use crate::background_tasks::notify_recovered_background_approvals_for_tui;
@@ -36,9 +36,7 @@ use crate::capability_backend::CapabilityBackend;
 use crate::channels::{tui_event_channel, user_action_channel};
 use crate::clipboard;
 use crate::composer_input_actions::refresh_input_menus;
-use crate::composer_textarea::{
-    make_setup_textarea, make_textarea, textarea_cursor_byte_index, textarea_text,
-};
+use crate::composer_textarea::{make_setup_textarea, make_textarea};
 use crate::exit_policy::TuiExit;
 use crate::exit_policy::{exit_resume_hint, exit_session_id};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
@@ -82,12 +80,16 @@ use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::presentation::InlineTerminal;
-use crate::runtime_event_actions::{handle_interaction_response_ack, handle_runtime_event};
+use crate::renderer_runtime::RendererRuntimeEventOwner;
+use crate::runtime_event_actions::handle_interaction_response_ack;
+#[cfg(test)]
+use crate::runtime_event_actions::handle_runtime_event;
 use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::stdio_guard::RetryWriter;
 #[cfg(test)]
 use crate::submitted_turn::SubmittedTurn;
+#[cfg(test)]
 use crate::surface_actions::TuiSurfaceActions;
 #[cfg(test)]
 use crate::surface_projection::SessionProjectionPresentation;
@@ -158,7 +160,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let workspace_root = syntax_workspace_root(&config);
     let (event_tx, pending_event_rx) = tui_event_channel();
     let (action_tx, action_rx) = user_action_channel();
-    let mut mention_search = MentionSearchManager::new_roots(
+    let mention_search = MentionSearchManager::new_roots(
         mention_search_roots(&config, &workspace_root),
         event_tx.clone(),
     );
@@ -252,7 +254,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
             return Err(error);
         }
     };
-    let mut pending_initial_prompt =
+    let pending_initial_prompt =
         if typed_history_startup_eligible(&config.history_mode, &preloaded_transcript) {
             initial_prompt.clone()
         } else {
@@ -279,6 +281,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
         }
         make_textarea(&vim_state, &theme)
     };
+    let mut renderer_runtime =
+        RendererRuntimeEventOwner::new(mention_search, pending_initial_prompt);
 
     // Fullscreen viewport inside the alternate screen: the UI owns the whole
     // terminal and is fully repainted every frame. Mouse capture is on — the
@@ -536,114 +540,27 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                                 }
                             },
                             IterationEvent::Runtime(tui_event) => {
-                                let tui_event =
-                                    match accept_attached_tui_event(&mut state, tui_event) {
-                                        Ok(Some(tui_event)) => tui_event,
-                                        Ok(None) | Err(()) => return Ok(None),
-                                    };
-                                match tui_event {
-                                    TuiEvent::HistoryLoaded { .. } => {
-                                        handle_runtime_event(
-                                            tui_event,
-                                            &mut state,
-                                            &action_tx,
-                                            &pending_workflow_notifications,
-                                            &mut textarea,
-                                            &mut vim_state,
-                                            &theme,
-                                            presentation,
-                                        );
-                                        if let Some(prompt) = pending_initial_prompt.take() {
-                                            state.push_message(ChatMessage::User(prompt.clone()));
-                                            state.enter_running();
-                                            let _ = action_tx.send(UserAction::Submit(prompt));
-                                        }
-                                    }
-                                    TuiEvent::MentionSearchDirty { generation } => {
-                                        let text = textarea_text(&textarea);
-                                        let cursor = textarea_cursor_byte_index(&textarea);
-                                        mention_search.consume_dirty_at_cursor(
-                                            generation, &text, cursor, &mut state,
-                                        );
-                                    }
-                                    TuiEvent::MentionCatalogDirty { generation } => {
-                                        mention_search
-                                            .consume_catalog_dirty(generation, &mut state);
-                                    }
-                                    TuiEvent::MentionRuntimeReady(thread) => {
-                                        mention_search.install_runtime_actions(
-                                            TuiSurfaceActions::new(thread),
-                                        );
-                                    }
-                                    TuiEvent::NewSessionStarted => {
-                                        config.history_mode = HistoryMode::Record;
-                                        handle_runtime_event(
-                                            TuiEvent::NewSessionStarted,
-                                            &mut state,
-                                            &action_tx,
-                                            &pending_workflow_notifications,
-                                            &mut textarea,
-                                            &mut vim_state,
-                                            &theme,
-                                            presentation,
-                                        );
-                                    }
-                                    TuiEvent::SettingsUpdated {
-                                        model,
-                                        reasoning_effort,
-                                        approval_mode,
-                                    } => {
-                                        config.model =
-                                            orca_core::model::ModelSelection::from_unchecked(Some(
-                                                model.clone(),
-                                            ));
-                                        config.reasoning_effort = reasoning_effort;
-                                        config.approval_mode = approval_mode;
-                                        handle_runtime_event(
-                                            TuiEvent::SettingsUpdated {
-                                                model,
-                                                reasoning_effort,
-                                                approval_mode,
-                                            },
-                                            &mut state,
-                                            &action_tx,
-                                            &pending_workflow_notifications,
-                                            &mut textarea,
-                                            &mut vim_state,
-                                            &theme,
-                                            presentation,
-                                        );
-                                    }
-                                    tui_event => {
-                                        handle_runtime_event(
-                                            tui_event,
-                                            &mut state,
-                                            &action_tx,
-                                            &pending_workflow_notifications,
-                                            &mut textarea,
-                                            &mut vim_state,
-                                            &theme,
-                                            presentation,
-                                        );
-                                    }
-                                }
+                                renderer_runtime.handle(
+                                    tui_event,
+                                    &mut state,
+                                    &mut config,
+                                    &action_tx,
+                                    &pending_workflow_notifications,
+                                    &mut textarea,
+                                    &mut vim_state,
+                                    &theme,
+                                    presentation,
+                                );
                             }
                         }
                         Ok(None)
                     },
                 )?;
-                let mention_enabled = MentionSearchManager::is_enabled(&state);
-                mention_search
-                    .set_roots(mention_search_roots(&config, &workspace_root), &mut state);
-                let text = textarea_text(&textarea);
-                let cursor = textarea_cursor_byte_index(&textarea);
-                state.mention_bindings.reconcile(&text);
-                state.atomic_skill_tokens.reconcile(&text);
-                mention_search.sync_at_cursor(
-                    &text,
-                    cursor,
-                    mention_enabled,
+                renderer_runtime.sync_composer(
+                    &config,
+                    &workspace_root,
                     &mut state,
+                    &textarea,
                     Instant::now(),
                 );
                 if let Some(code) = iteration.exit_code {
@@ -676,7 +593,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
             )
         },
     )?;
-    mention_search.shutdown();
+    renderer_runtime.shutdown();
     drop(event_rx);
     agent_runtime.shutdown()?;
 

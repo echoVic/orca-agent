@@ -5143,6 +5143,19 @@
       [],
       "typed snapshot/read consumer",
       "retain"
+    ],
+    [
+      "renderer_runtime_events",
+      [
+        "crates/orca-tui/src/app.rs:543",
+        "crates/orca-tui/src/renderer_runtime.rs:37"
+      ],
+      "presentation_event_coordination",
+      "renderer_owned_attachment_prompt_config_and_mention_routing",
+      "typed admission plus pure presentation reducer",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
     ]
   ],
   "pure_tui_presentation_categories": [

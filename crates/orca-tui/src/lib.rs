@@ -52,6 +52,7 @@ mod plan_panel;
 mod presentation;
 mod queued_input;
 mod queued_input_actions;
+mod renderer_runtime;
 mod running_actions;
 mod runtime_event_actions;
 mod scrollback;

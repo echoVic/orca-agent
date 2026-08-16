@@ -107,6 +107,10 @@ function appSourceOverride(extraSource) {
   return new Map([[relativePath, `${readFileSync(absolutePath, "utf8")}\n${extraSource}\n`]]);
 }
 
+function sourceOverride(relativePath, source) {
+  return new Map([[relativePath, source]]);
+}
+
 function expectUnlistedRuntimeMutation(label, functionName, body) {
   expectFailure(
     label,
@@ -1374,6 +1378,80 @@ expectFailure(
     }),
   /unresolved possible UserAction send synthetic_unresolved_user_action_send/,
 );
+
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutOwnerCall = source.replace(
+    /\brenderer_runtime\.handle\s*\(/,
+    "removed_renderer_runtime.handle(",
+  );
+  assert.notEqual(
+    withoutOwnerCall,
+    source,
+    "renderer runtime fixture must remove the production app caller",
+  );
+  assert.match(
+    withoutOwnerCall,
+    /RendererRuntimeEventOwner/,
+    "renderer runtime fixture must preserve the owner import and construction",
+  );
+  expectFailure(
+    "renderer runtime validation rejects a removed app caller while the owner import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, withoutOwnerCall),
+      }),
+    /renderer_runtime_events source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_runtime.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "attachment admission",
+      /match\s+accept_attached_tui_event\s*\(/,
+      "match removed_accept_attached_tui_event(",
+      /use crate::attachment_routing::accept_attached_tui_event/,
+    ],
+    [
+      "deferred prompt consumption",
+      /self\.pending_initial_prompt\.take\(\)/,
+      "self.pending_initial_prompt.removed_take()",
+      /pending_initial_prompt/,
+    ],
+    [
+      "general reducer delegation",
+      /tui_event\s*=>\s*\{\s*handle_runtime_event\s*\(/,
+      "tui_event => { removed_handle_runtime_event(",
+      /use crate::runtime_event_actions::handle_runtime_event/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking import, field, or test reference`,
+    );
+    expectFailure(
+      `renderer runtime validation rejects removed ${label} while other references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_runtime_events source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_runtime\.rs/,
+    );
+  }
+}
 
 for (const [label, functionName, parameter, body] of [
   [

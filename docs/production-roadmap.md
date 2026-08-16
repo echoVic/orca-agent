@@ -336,6 +336,17 @@ newer-interaction, terminal, and reset paths retire the snapshot. Runtime
 interaction mutation/fencing and all action/event, persistence, server, ACP,
 CLI, and public API contracts remain unchanged.
 
+The 2026-08-16 renderer runtime-event ownership slice gives attachment
+admission, deferred initial-prompt consumption, special renderer event routing,
+and mention-search synchronization one `RendererRuntimeEventOwner`. The frame
+loop still owns terminal/input scheduling and drawing, while
+`runtime_event_actions` remains the admitted-event reducer. Stale attachments
+cannot consume the deferred prompt or mirror settings; the first admitted
+history event still hydrates before submitting that prompt exactly once.
+Mention workers retain their existing generation fences and shutdown path.
+This changes no runtime surface, event/action payload, persistence, CLI,
+server/JSONL, ACP, public API, or visible TUI behavior.
+
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
 plan and its failed-update marker. Existing `PlanUpdated` and legacy
@@ -1532,7 +1543,7 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established thirty-three focused owners/boundaries so far (insert-escape, presentation,
+   stream has established thirty-four focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection,
@@ -1543,9 +1554,9 @@ end state.
    ownership, hosted context action ownership, hosted workflow action
    ownership, hosted operation recovery ownership, hosted plan implementation
    ownership, hosted task action ownership, pending interaction input
-   admission, interaction response acknowledgement, and hosted controller
-   ownership); `app.rs` is currently 8,319 lines and `hosted_controller.rs`
-   683 lines,
+   admission, interaction response acknowledgement, hosted controller
+   ownership, and renderer runtime-event ownership); `app.rs` is currently
+   8,237 lines, `renderer_runtime.rs` 395 lines, and `hosted_controller.rs` 683 lines,
    `hosted_plan.rs` 247 lines, `hosted_operation.rs` 132 lines,
    `hosted_workflow.rs` 132 lines,
    `hosted_context.rs` 252 lines, `hosted_side.rs` 495 lines,
