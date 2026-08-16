@@ -9,6 +9,8 @@ use super::{
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::tasks::LegacyTerminalTaskReconciliationReceipt;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ManualCompactionItemKey {
     System {
@@ -618,6 +620,13 @@ enum OwnerLeaseAuthority<'owner> {
 
 enum BatchCommitAuthority<'permit> {
     Single(&'permit SurfacePublisherPermit),
+    TaskReconciliation {
+        actor: &'permit SurfacePublisherPermit,
+        receipt: &'permit LegacyTerminalTaskReconciliationReceipt,
+    },
+    RecoveredTaskReconciliation {
+        actor: &'permit SurfacePublisherPermit,
+    },
     ActorGoal {
         actor: &'permit SurfacePublisherPermit,
         goal: &'permit SurfacePublisherPermit,
@@ -692,6 +701,9 @@ enum BatchCommitAuthority<'permit> {
 
 enum RecoveredBatchAuthority {
     Single(SurfacePublisherPermit),
+    TaskReconciliation {
+        actor: SurfacePublisherPermit,
+    },
     ActorGoal {
         actor: SurfacePublisherPermit,
         goal: SurfacePublisherPermit,
@@ -986,6 +998,13 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
                 RecoveredBatchAuthority::Single(permit) => {
                     coordinator.commit_batch(&permit, &batch)?;
                 }
+                RecoveredBatchAuthority::TaskReconciliation { actor } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::RecoveredTaskReconciliation { actor: &actor },
+                        &batch,
+                        None,
+                    )?;
+                }
                 RecoveredBatchAuthority::ActorGoal { actor, goal } => {
                     coordinator.commit_batch_with_authority(
                         BatchCommitAuthority::ActorGoal {
@@ -1187,6 +1206,12 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         let authority = self.issue_exact_recovered_authority(&batch)?;
         let applied = match authority {
             RecoveredBatchAuthority::Single(permit) => self.commit_batch(&permit, &batch)?,
+            RecoveredBatchAuthority::TaskReconciliation { actor } => self
+                .commit_batch_with_authority(
+                    BatchCommitAuthority::RecoveredTaskReconciliation { actor: &actor },
+                    &batch,
+                    None,
+                )?,
             RecoveredBatchAuthority::ActorGoal { actor, goal } => self
                 .commit_batch_with_authority(
                     BatchCommitAuthority::ActorGoal {
@@ -1341,6 +1366,22 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         batch: &SurfaceCommitBatch,
     ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
         self.commit_batch(&self.actor_control_permit.clone(), batch)
+    }
+
+    pub(crate) fn commit_terminal_task_reconciliation_batch(
+        &mut self,
+        receipt: &LegacyTerminalTaskReconciliationReceipt,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::TaskReconciliation {
+                actor: &actor,
+                receipt,
+            },
+            batch,
+            None,
+        )
     }
 
     pub fn commit_actor_batch_for_projection(
@@ -2935,6 +2976,15 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         {
             return Ok(RecoveredBatchAuthority::Single(actor));
         }
+        if recovered_terminal_task_reconciliation_authorized(
+            &self.state,
+            &self.issued_permits,
+            &actor,
+            batch,
+            self.owner_epoch,
+        ) {
+            return Ok(RecoveredBatchAuthority::TaskReconciliation { actor });
+        }
 
         let events = batch.events.as_slice();
         if let [task_event, terminal_event] = events
@@ -4336,6 +4386,25 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     && recovery_capability_completion_matches_state(&self.state, permit, batch)
                     && recovery_manual_compaction_matches_state(&self.state, permit, batch)
             }
+            BatchCommitAuthority::TaskReconciliation { actor, receipt } => {
+                terminal_task_reconciliation_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    receipt,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
+            BatchCommitAuthority::RecoveredTaskReconciliation { actor } => {
+                recovered_terminal_task_reconciliation_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
             BatchCommitAuthority::ActorGoal { actor, goal } => actor_goal_run_start_authorized(
                 &self.issued_permits,
                 actor,
@@ -4696,6 +4765,154 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
     }
 }
 
+fn task_reconciliation_payload(
+    batch: &SurfaceCommitBatch,
+) -> Option<(super::TaskRevision, &[super::SurfaceTask])> {
+    let [event] = batch.events.as_slice() else {
+        return None;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::Reconciled {
+            source_revision,
+            tasks,
+        }),
+    ) = (&event.scope, &event.event)
+    else {
+        return None;
+    };
+    Some((*source_revision, tasks))
+}
+
+fn actor_identity_authorizes_thread_batch(
+    issued_permits: &[SurfacePublisherPermit],
+    actor: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    matches!(
+        actor,
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: permit_epoch,
+            ..
+        } if issued_permits.contains(actor)
+            && *permit_epoch == owner_epoch
+            && thread_id == &batch.cursor_before.thread_id
+            && thread_id == &batch.cursor_after.thread_id
+    )
+}
+
+fn historical_terminal_task_is_non_actionable(task: &super::SurfaceTask) -> bool {
+    task.revision.get() == 1
+        && task.task_type == super::SurfaceTaskType::MainSession
+        && matches!(
+            task.status,
+            super::SurfaceTaskStatus::Completed
+                | super::SurfaceTaskStatus::Stopped
+                | super::SurfaceTaskStatus::Cancelled
+        )
+        && task.completed_at.is_some()
+        && !task.backgrounded
+        && task.parent_operation.is_none()
+        && task.background_fence.is_none()
+        && task.workflow_run_id.is_none()
+        && task.subagent_id.is_none()
+        && task.pending_interaction_id.is_none()
+}
+
+fn recovered_terminal_task_reconciliation_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !actor_identity_authorizes_thread_batch(issued_permits, actor, batch, owner_epoch)
+        || !matches!(batch.commit_class, CommitClass::Recorded { .. })
+        || !matches!(
+            state.snapshot().thread.persistence,
+            super::ThreadPersistence::RecordedCatalogued
+        )
+    {
+        return false;
+    }
+    let Some((source_revision, tasks)) = task_reconciliation_payload(batch) else {
+        return false;
+    };
+    let unique_ids = tasks
+        .iter()
+        .map(|task| &task.task_id)
+        .collect::<BTreeSet<_>>()
+        .len()
+        == tasks.len();
+    if !unique_ids
+        || tasks.iter().any(|task| task.revision > source_revision)
+        || state.snapshot().tasks.iter().any(|current| {
+            tasks.iter().find(|task| task.task_id == current.task_id) != Some(current)
+        })
+    {
+        return false;
+    }
+    let additions = tasks
+        .iter()
+        .filter(|task| {
+            !state
+                .snapshot()
+                .tasks
+                .iter()
+                .any(|current| current.task_id == task.task_id)
+        })
+        .collect::<Vec<_>>();
+    !additions.is_empty()
+        && additions
+            .into_iter()
+            .all(historical_terminal_task_is_non_actionable)
+}
+
+fn terminal_task_reconciliation_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor: &SurfacePublisherPermit,
+    receipt: &LegacyTerminalTaskReconciliationReceipt,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !receipt.is_valid()
+        || receipt.session_id()
+            != uuid::Uuid::from_bytes(*state.snapshot().thread.thread_id.as_bytes()).to_string()
+        || !recovered_terminal_task_reconciliation_authorized(
+            state,
+            issued_permits,
+            actor,
+            batch,
+            owner_epoch,
+        )
+    {
+        return false;
+    }
+    let Some((source_revision, tasks)) = task_reconciliation_payload(batch) else {
+        return false;
+    };
+    if source_revision.get() < receipt.publication_horizon() {
+        return false;
+    }
+    let mut expected = state.snapshot().tasks.clone();
+    expected.extend(
+        receipt
+            .reconciled_surface_tasks()
+            .into_iter()
+            .filter(|candidate| {
+                !state
+                    .snapshot()
+                    .tasks
+                    .iter()
+                    .any(|current| current.task_id == candidate.task_id)
+            }),
+    );
+    tasks == expected
+}
+
 fn permit_authorizes(
     issued_permits: &[SurfacePublisherPermit],
     permit: &SurfacePublisherPermit,
@@ -4729,6 +4946,10 @@ fn permit_authorizes(
                                     | super::OperationPatch::FinalizationDegraded { .. }
                                     | super::OperationPatch::Terminal { .. }
                             )
+                        )
+                        && !matches!(
+                            &event.event,
+                            super::SurfaceEvent::Task(super::TaskPatch::Reconciled { .. })
                         )
                 }) || actor_control_workflow_launch_authorized(batch)
                     || actor_control_main_session_transfer_authorized(batch)
@@ -9701,6 +9922,7 @@ mod tests {
     use crate::runtime_surface::reducer::tests::{
         digest, reducer_snapshot, thread_id, uuid_v7_bytes,
     };
+    use crate::tasks::TaskRegistry;
 
     #[derive(Default)]
     struct TestLedger {
@@ -9856,6 +10078,259 @@ mod tests {
             suspended_cause: None,
             expected_settlements: Vec::new(),
         }
+    }
+
+    fn terminal_history_task(
+        task_id: super::super::SurfaceTaskId,
+        status: super::super::SurfaceTaskStatus,
+    ) -> super::super::SurfaceTask {
+        super::super::SurfaceTask {
+            task_id,
+            revision: super::super::TaskRevision::try_new(1).unwrap(),
+            task_type: super::super::SurfaceTaskType::MainSession,
+            status,
+            backgrounded: false,
+            description: super::super::DisplayText::new("legacy terminal history"),
+            created_at: super::super::UnixMillis::new(1),
+            started_at: Some(super::super::UnixMillis::new(2)),
+            completed_at: Some(super::super::UnixMillis::new(3)),
+            parent_operation: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: Some(super::super::DisplayText::new("done")),
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        }
+    }
+
+    #[test]
+    fn actor_permit_cannot_commit_task_reconciliation() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let task = terminal_history_task(
+            super::super::SurfaceTaskId::try_new("legacy-terminal").unwrap(),
+            super::super::SurfaceTaskStatus::Completed,
+        );
+        let batch = test_batch_with_events(
+            &state,
+            vec![(
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Task(super::super::TaskPatch::Reconciled {
+                    source_revision: super::super::TaskRevision::try_new(1).unwrap(),
+                    tasks: vec![task],
+                }),
+            )],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+
+        assert!(matches!(
+            coordinator.commit_actor_batch(&batch),
+            Err(SurfaceCommitError::StalePublisherPermit)
+        ));
+    }
+
+    #[test]
+    fn terminal_task_receipt_authorizes_exact_append_only_batch() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+        let registry = TaskRegistry::new_persistent(
+            uuid::Uuid::from_bytes(*thread_id().as_bytes()).to_string(),
+            dir.path().join("tasks"),
+        )
+        .unwrap();
+        let legacy = registry.create_main_session("legacy terminal history".to_string());
+        registry.mark_running(&legacy.id).unwrap();
+        registry.complete(&legacy.id, "done".to_string()).unwrap();
+
+        let committed = registry
+            .with_terminal_main_session_reconciliation(|receipt| {
+                let batch = test_batch_with_events(
+                    coordinator.state(),
+                    vec![(
+                        SurfaceScope::Thread,
+                        super::super::SurfaceEvent::Task(super::super::TaskPatch::Reconciled {
+                            source_revision: super::super::TaskRevision::try_new(
+                                receipt.publication_horizon(),
+                            )
+                            .unwrap(),
+                            tasks: receipt.reconciled_surface_tasks(),
+                        }),
+                    )],
+                );
+                coordinator.commit_terminal_task_reconciliation_batch(receipt, &batch)
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(committed.is_ok());
+        assert_eq!(coordinator.state().snapshot().tasks.len(), 1);
+        assert_eq!(
+            coordinator.state().snapshot().tasks[0].task_id.as_str(),
+            legacy.id
+        );
+    }
+
+    #[test]
+    fn terminal_task_receipt_rejects_substitution_omission_and_active_rows() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+        let registry = TaskRegistry::new_persistent(
+            uuid::Uuid::from_bytes(*thread_id().as_bytes()).to_string(),
+            dir.path().join("tasks"),
+        )
+        .unwrap();
+        let legacy = registry.create_main_session("legacy terminal history".to_string());
+        registry.mark_running(&legacy.id).unwrap();
+        registry.complete(&legacy.id, "done".to_string()).unwrap();
+
+        registry
+            .with_terminal_main_session_reconciliation(|receipt| {
+                let mut substituted = receipt.reconciled_surface_tasks();
+                substituted[0].description = super::super::DisplayText::new("substituted");
+                let substituted = test_batch_with_events(
+                    coordinator.state(),
+                    vec![(
+                        SurfaceScope::Thread,
+                        super::super::SurfaceEvent::Task(super::super::TaskPatch::Reconciled {
+                            source_revision: super::super::TaskRevision::try_new(
+                                receipt.publication_horizon(),
+                            )
+                            .unwrap(),
+                            tasks: substituted,
+                        }),
+                    )],
+                );
+                assert!(matches!(
+                    coordinator.commit_terminal_task_reconciliation_batch(receipt, &substituted),
+                    Err(SurfaceCommitError::StalePublisherPermit)
+                ));
+
+                let omitted = test_batch_with_events(
+                    coordinator.state(),
+                    vec![(
+                        SurfaceScope::Thread,
+                        super::super::SurfaceEvent::Task(super::super::TaskPatch::Reconciled {
+                            source_revision: super::super::TaskRevision::try_new(
+                                receipt.publication_horizon(),
+                            )
+                            .unwrap(),
+                            tasks: Vec::new(),
+                        }),
+                    )],
+                );
+                assert!(matches!(
+                    coordinator.commit_terminal_task_reconciliation_batch(receipt, &omitted),
+                    Err(SurfaceCommitError::StalePublisherPermit)
+                ));
+
+                let mut active = receipt.reconciled_surface_tasks();
+                active[0].status = super::super::SurfaceTaskStatus::Running;
+                active[0].completed_at = None;
+                let active = test_batch_with_events(
+                    coordinator.state(),
+                    vec![(
+                        SurfaceScope::Thread,
+                        super::super::SurfaceEvent::Task(super::super::TaskPatch::Reconciled {
+                            source_revision: super::super::TaskRevision::try_new(
+                                receipt.publication_horizon(),
+                            )
+                            .unwrap(),
+                            tasks: active,
+                        }),
+                    )],
+                );
+                assert!(matches!(
+                    coordinator.commit_terminal_task_reconciliation_batch(receipt, &active),
+                    Err(SurfaceCommitError::StalePublisherPermit)
+                ));
+            })
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn prepared_terminal_task_reconciliation_recovers_only_safe_shape() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let terminal = terminal_history_task(
+            super::super::SurfaceTaskId::try_new("prepared-terminal").unwrap(),
+            super::super::SurfaceTaskStatus::Stopped,
+        );
+        let safe = test_batch_with_events(
+            &state,
+            vec![(
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Task(super::super::TaskPatch::Reconciled {
+                    source_revision: super::super::TaskRevision::try_new(1).unwrap(),
+                    tasks: vec![terminal.clone()],
+                }),
+            )],
+        );
+        let mut active = terminal;
+        active.status = super::super::SurfaceTaskStatus::Running;
+        active.completed_at = None;
+        let active = test_batch_with_events(
+            &state,
+            vec![(
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Task(super::super::TaskPatch::Reconciled {
+                    source_revision: super::super::TaskRevision::try_new(1).unwrap(),
+                    tasks: vec![active],
+                }),
+            )],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+
+        assert!(matches!(
+            coordinator.issue_exact_recovered_authority(&safe),
+            Ok(RecoveredBatchAuthority::TaskReconciliation { .. })
+        ));
+        assert!(matches!(
+            coordinator.issue_exact_recovered_authority(&active),
+            Err(SurfaceCommitError::StalePublisherPermit)
+        ));
     }
 
     #[test]

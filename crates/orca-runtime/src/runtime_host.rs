@@ -7514,6 +7514,84 @@ fn reconcile_main_session_task_mirrors_on_start(
     }
 }
 
+fn reconcile_legacy_terminal_main_session_tasks_on_start(
+    thread: &RuntimeThread,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<(), RuntimeHostError> {
+    let task_registry = thread.session().task_registry();
+    let reconciliation = task_registry
+        .with_terminal_main_session_reconciliation(|receipt| {
+            let snapshot = coordinator.state().snapshot().clone();
+            let current_task_ids = snapshot
+                .tasks
+                .iter()
+                .map(|task| task.task_id.clone())
+                .collect::<BTreeSet<_>>();
+            let additions = receipt
+                .reconciled_surface_tasks()
+                .into_iter()
+                .filter(|task| !current_task_ids.contains(&task.task_id))
+                .collect::<Vec<_>>();
+            if additions.is_empty() {
+                return Ok(());
+            }
+
+            let mut tasks = snapshot.tasks.clone();
+            tasks.extend(additions);
+            let source_revision = tasks
+                .iter()
+                .map(|task| task.revision.get())
+                .max()
+                .unwrap_or(1)
+                .max(receipt.publication_horizon());
+            let batch = runtime_surface_event_batch(
+                &snapshot,
+                vec![(
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::Reconciled {
+                        source_revision: surface::TaskRevision::try_new(source_revision)
+                            .expect("legacy publication horizon is non-zero"),
+                        tasks,
+                    }),
+                )],
+                None,
+            );
+            for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+                match coordinator.commit_terminal_task_reconciliation_batch(receipt, &batch) {
+                    Ok(_) => return Ok(()),
+                    Err(surface::SurfaceCommitError::Ledger(error))
+                        if matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) =>
+                    {
+                        if attempt + 1 == SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        return Err(RuntimeHostError::ThreadStartFailed {
+                            message: format!(
+                                "failed to reconcile legacy terminal main-session tasks: {error:?}"
+                            ),
+                        });
+                    }
+                }
+            }
+            Err(RuntimeHostError::ThreadStartFailed {
+                message:
+                    "legacy terminal main-session task reconciliation exhausted bounded retries"
+                        .to_string(),
+            })
+        })
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to read legacy terminal main-session tasks: {error}"),
+        })?;
+    reconciliation.unwrap_or(Ok(()))
+}
+
 fn recover_background_approval_routes_on_start(
     coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
 ) -> Result<(), RuntimeHostError> {
@@ -7910,6 +7988,7 @@ fn bootstrap_recorded_surface(
         reconcile_terminal_main_session_tasks(thread.session().task_registry(), &mut coordinator)?;
         reconcile_interrupted_workflow_surfaces_on_start(&mut coordinator)?;
     }
+    reconcile_legacy_terminal_main_session_tasks_on_start(thread, &mut coordinator)?;
     recover_background_approval_routes_on_start(&mut coordinator)?;
     reconcile_goal_surface_outbox_on_start(thread, &mut coordinator)?;
     reconcile_main_session_task_mirrors_on_start(thread, coordinator.state().snapshot());
@@ -43400,6 +43479,396 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown resumed foreground recovery host");
+    }
+
+    #[test]
+    fn recorded_restart_reconciles_registry_only_terminal_main_session_task_once() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("create isolated ORCA_HOME");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let cwd = tempfile::tempdir().expect("create runtime cwd");
+            let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start recorded runtime host");
+            let thread = host
+                .start_thread(config.clone(), "legacy terminal reconciliation")
+                .expect("start recorded runtime thread");
+            let session_id = thread.thread_id().to_string();
+            let initial_cursor = fresh_surface_attachment_with_capabilities(
+                &thread.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+            .cursor
+            .clone();
+            let transcript_path = SessionStore::new()
+                .load_session(&session_id)
+                .expect("load recorded reconciliation transcript")
+                .path;
+            host.shutdown().expect("shutdown recorded runtime host");
+
+            let registry =
+                TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
+                    .expect("open recorded task registry");
+            let legacy = registry.create_main_session("completed before surface ownership".into());
+            registry
+                .complete(&legacy.id, "durable legacy result".into())
+                .expect("complete registry-only task");
+
+            let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start first recovery host");
+            let resumed = resumed_host
+                .start_thread(
+                    RunConfig {
+                        history_mode: HistoryMode::Resume(session_id.clone()),
+                        ..config.clone()
+                    },
+                    "first legacy terminal reconciliation",
+                )
+                .expect("resume registry-only terminal task");
+            let first_snapshot = fresh_surface_attachment_with_capabilities(
+                &resumed.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let imported = first_snapshot
+                .tasks
+                .iter()
+                .find(|task| task.task_id.as_str() == legacy.id)
+                .expect("registry-only terminal task must be projected");
+            assert_eq!(imported.revision.get(), 1);
+            assert_eq!(imported.task_type, surface::SurfaceTaskType::MainSession);
+            assert_eq!(imported.status, surface::SurfaceTaskStatus::Completed);
+            assert_eq!(
+                imported.description.as_str(),
+                "completed before surface ownership"
+            );
+            assert_eq!(
+                imported.result.as_ref().map(|result| result.as_str()),
+                Some("durable legacy result")
+            );
+            assert!(imported.completed_at.is_some());
+            assert!(!imported.backgrounded);
+            assert!(imported.parent_operation.is_none());
+            assert!(imported.background_fence.is_none());
+            resumed_host
+                .shutdown()
+                .expect("shutdown first recovery host");
+
+            let second_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start second recovery host");
+            let second = second_host
+                .start_thread(
+                    RunConfig {
+                        history_mode: HistoryMode::Resume(session_id),
+                        ..config
+                    },
+                    "second legacy terminal reconciliation",
+                )
+                .expect("resume already reconciled terminal task");
+            let second_snapshot = fresh_surface_attachment_with_capabilities(
+                &second.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            assert_eq!(
+                second_snapshot
+                    .tasks
+                    .iter()
+                    .filter(|task| task.task_id.as_str() == legacy.id)
+                    .count(),
+                1,
+                "repeated restart must not duplicate an imported terminal task"
+            );
+            let recovered = surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor)
+                .recover_batches()
+                .expect("recover terminal reconciliation batches");
+            assert_eq!(
+                recovered
+                    .committed
+                    .iter()
+                    .flat_map(|batch| batch.events.as_slice().iter())
+                    .filter(|envelope| {
+                        matches!(
+                            envelope.event,
+                            surface::SurfaceEvent::Task(surface::TaskPatch::Reconciled { .. })
+                        )
+                    })
+                    .count(),
+                1,
+                "repeated restart must not commit another reconciliation batch"
+            );
+            second_host
+                .shutdown()
+                .expect("shutdown second recovery host");
+        });
+    }
+
+    #[test]
+    fn recorded_restart_does_not_reconcile_active_approval_failed_or_rich_tasks() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("create isolated ORCA_HOME");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let cwd = tempfile::tempdir().expect("create runtime cwd");
+            let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start recorded runtime host");
+            let thread = host
+                .start_thread(config.clone(), "excluded legacy task reconciliation")
+                .expect("start recorded runtime thread");
+            let session_id = thread.thread_id().to_string();
+            host.shutdown().expect("shutdown recorded runtime host");
+
+            let registry =
+                TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
+                    .expect("open recorded task registry");
+            let active = registry.create_main_session("active legacy task".into());
+            registry
+                .mark_running(&active.id)
+                .expect("mark legacy task running");
+            let approval = registry.create_main_session("approval legacy task".into());
+            registry
+                .apply_main_session_terminal_update(
+                    &approval.id,
+                    MainSessionTerminalUpdate::ApprovalRequired {
+                        summary: "approval required".into(),
+                        pending_tool_call: None,
+                        pending_provider_response: None,
+                    },
+                    None,
+                )
+                .expect("mark legacy task approval required");
+            let failed = registry.create_main_session("failed legacy task".into());
+            registry
+                .fail(&failed.id, "legacy failure".into())
+                .expect("fail legacy task");
+            let rich = registry.create_subagent("completed subagent".into(), Some("worker".into()));
+            registry
+                .complete(&rich.id, "subagent result".into())
+                .expect("complete legacy subagent");
+
+            let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start excluded-task recovery host");
+            let resumed = resumed_host
+                .start_thread(
+                    RunConfig {
+                        history_mode: HistoryMode::Resume(session_id),
+                        ..config
+                    },
+                    "exclude unsafe legacy tasks",
+                )
+                .expect("resume excluded legacy tasks");
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &resumed.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            for excluded in [&active.id, &approval.id, &failed.id, &rich.id] {
+                assert!(
+                    snapshot
+                        .tasks
+                        .iter()
+                        .all(|task| task.task_id.as_str() != excluded),
+                    "unsafe registry-only task {excluded} must not be projected"
+                );
+            }
+            resumed_host
+                .shutdown()
+                .expect("shutdown excluded-task recovery host");
+        });
+    }
+
+    #[test]
+    fn recorded_restart_terminal_reconciliation_append_failure_is_bounded_and_non_mutating() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("create isolated ORCA_HOME");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let cwd = tempfile::tempdir().expect("create runtime cwd");
+            let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start recorded runtime host");
+            let thread = host
+                .start_thread(config.clone(), "failed legacy reconciliation")
+                .expect("start recorded runtime thread");
+            let session_id = thread.thread_id().to_string();
+            let initial_cursor = fresh_surface_attachment_with_capabilities(
+                &thread.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+            .cursor
+            .clone();
+            let transcript_path = SessionStore::new()
+                .load_session(&session_id)
+                .expect("load failed-reconciliation transcript")
+                .path;
+            host.shutdown().expect("shutdown recorded runtime host");
+
+            let registry =
+                TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
+                    .expect("open recorded task registry");
+            let legacy = registry.create_main_session("must survive failed import".into());
+            registry
+                .complete(&legacy.id, "unchanged durable result".into())
+                .expect("complete registry-only terminal task");
+            let before = registry
+                .get(&legacy.id)
+                .expect("terminal task before import");
+            surface::JsonlSurfaceCommitLedger::inject_terminal_task_reconciliation_append_failures(
+                transcript_path.clone(),
+                SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
+            );
+
+            let failed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start failed-reconciliation host");
+            let error = match failed_host.start_thread(
+                RunConfig {
+                    history_mode: HistoryMode::Resume(session_id.clone()),
+                    ..config.clone()
+                },
+                "reject failed legacy reconciliation",
+            ) {
+                Ok(_) => panic!("exhausted reconciliation append failures must reject startup"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                RuntimeHostError::ThreadStartFailed { ref message }
+                    if message.contains("reconciliation exhausted bounded retries")
+            ));
+            failed_host
+                .shutdown()
+                .expect("shutdown failed-reconciliation host");
+
+            let after =
+                TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
+                    .expect("reopen terminal task after failed import")
+                    .get(&legacy.id)
+                    .expect("terminal task after failed import");
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.task_type, before.task_type);
+            assert_eq!(after.status, before.status);
+            assert_eq!(after.description, before.description);
+            assert_eq!(after.started_at_ms, before.started_at_ms);
+            assert_eq!(after.completed_at_ms, before.completed_at_ms);
+            assert_eq!(after.result, before.result);
+            assert_eq!(after.error, before.error);
+            assert_eq!(after.publication_revision, before.publication_revision);
+            let recovered = surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor)
+                .recover_batches()
+                .expect("recover failed reconciliation ledger");
+            assert!(recovered.committed.iter().all(|batch| {
+                batch.events.as_slice().iter().all(|envelope| {
+                    !matches!(
+                        &envelope.event,
+                        surface::SurfaceEvent::Task(surface::TaskPatch::Reconciled { .. })
+                    )
+                })
+            }));
+
+            let recovery_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start post-failure recovery host");
+            let recovered_thread = recovery_host
+                .start_thread(
+                    RunConfig {
+                        history_mode: HistoryMode::Resume(session_id),
+                        ..config
+                    },
+                    "retry legacy reconciliation",
+                )
+                .expect("retry terminal reconciliation after bounded failure");
+            assert!(
+                fresh_surface_attachment_with_capabilities(
+                    &recovered_thread.surface(),
+                    BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+                )
+                .baseline
+                .snapshot
+                .tasks
+                .iter()
+                .any(|task| task.task_id.as_str() == legacy.id)
+            );
+            recovery_host
+                .shutdown()
+                .expect("shutdown post-failure recovery host");
+        });
+    }
+
+    #[test]
+    fn recorded_restart_rejects_unreadable_terminal_reconciliation_receipt() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("create isolated ORCA_HOME");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let cwd = tempfile::tempdir().expect("create runtime cwd");
+            let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start recorded runtime host");
+            let thread = host
+                .start_thread(config.clone(), "unreadable legacy reconciliation")
+                .expect("start recorded runtime thread");
+            let session_id = thread.thread_id().to_string();
+            let initial_cursor = fresh_surface_attachment_with_capabilities(
+                &thread.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+            .cursor
+            .clone();
+            let transcript_path = SessionStore::new()
+                .load_session(&session_id)
+                .expect("load unreadable-receipt transcript")
+                .path;
+            host.shutdown().expect("shutdown recorded runtime host");
+
+            let registry =
+                TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
+                    .expect("open recorded task registry");
+            let legacy = registry.create_main_session("unreadable receipt task".into());
+            registry
+                .complete(&legacy.id, "must not be projected".into())
+                .expect("complete registry-only terminal task");
+            drop(registry);
+            std::fs::write(
+                home.join("task-sessions")
+                    .join(&session_id)
+                    .join("tasks.json"),
+                b"{not valid task json",
+            )
+            .expect("corrupt terminal reconciliation source");
+
+            let failed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start unreadable-receipt host");
+            assert!(matches!(
+                failed_host.start_thread(
+                    RunConfig {
+                        history_mode: HistoryMode::Resume(session_id),
+                        ..config
+                    },
+                    "reject unreadable legacy reconciliation",
+                ),
+                Err(RuntimeHostError::ThreadStartFailed { .. })
+            ));
+            failed_host
+                .shutdown()
+                .expect("shutdown unreadable-receipt host");
+            let recovered = surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor)
+                .recover_batches()
+                .expect("recover unreadable-receipt ledger");
+            assert!(recovered.committed.iter().all(|batch| {
+                batch.events.as_slice().iter().all(|envelope| {
+                    !matches!(
+                        &envelope.event,
+                        surface::SurfaceEvent::Task(surface::TaskPatch::Reconciled { .. })
+                    )
+                })
+            }));
+        });
     }
 
     #[test]

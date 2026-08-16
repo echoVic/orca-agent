@@ -1887,12 +1887,22 @@
     [
       "task.registry",
       "crates/orca-runtime/src/tasks.rs",
-      1230,
+      613,
       "task.registry",
       "Task",
       "TaskPatchSet",
-      "typed_projection",
-      "store_receipt_revision_and_coordinator_intent"
+      "typed_receipt",
+      "locked_terminal_receipt_and_canonical_digest"
+    ],
+    [
+      "task.reconciliation_commit_authority",
+      "crates/orca-runtime/src/runtime_surface/commit.rs",
+      1371,
+      "commit_terminal_task_reconciliation_batch",
+      "Task",
+      "TaskPatchSet",
+      "typed_receipt",
+      "exact_receipt_for_fresh_commit_and_safe_shape_for_prepared_recovery"
     ],
     [
       "workflow.store",
@@ -6431,6 +6441,21 @@
   ],
   "critical_test_vectors": [
     {
+      "id": "task.legacy_terminal_reconciliation",
+      "given": "recorded thread with registry-only terminal MainSession history plus active approval failed and rich rows",
+      "when": "cold startup issues a locked TaskRegistry receipt and commits TaskPatch.Reconciled",
+      "expect": [
+        "only Completed Stopped and Cancelled MainSession rows are eligible",
+        "ordinary actor authority rejects reconciliation",
+        "current surface tasks remain byte-identical",
+        "imported rows have revision one and no operation interaction or background fence",
+        "repeated restart creates no second reconciliation commit",
+        "unreadable receipt or exhausted bounded ledger retry fails startup",
+        "prepared recovery accepts only the same append-only non-actionable shape",
+        "TUI consumes only SurfaceProjectionSynced"
+      ]
+    },
+    {
       "id": "operation.reserve_cancel_before_admission",
       "given": "recorded thread with free reservation capacity",
       "when": "ReserveOperation commits then CancelOperation is actor-ordered before AdmitReserved",
@@ -9656,7 +9681,8 @@
     "interaction_reverse_response_failure_authority": "RuntimeInteractionBrokerUnavailableDispositionOnly",
     "capability_ledger_failure_authority": "RuntimeCapabilityLedgerToolSettlementMayFailOwningOperation",
     "acp_transport_terminal_authority": "TransportNeverPublishesOperationTerminal",
-    "runtime_finalizer_terminal_authority": "OnlyFinalizerWithTerminalPermit"
+    "runtime_finalizer_terminal_authority": "OnlyFinalizerWithTerminalPermit",
+    "task_reconciliation_authority": "LockedTaskRegistryReceiptOrExactPreparedRecoveryOnly"
   },
   "session_health_issue_id_variants": [
     "Mutation(SurfaceSettlementId)",
@@ -9902,7 +9928,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "4b4f5acae8681ee77a0f7602f408ec2e69d9297b71fa6c82455087ec816c3cc5",
+    "private_contract_sha256": "112a6311b4873926bc8af3311ab5858a56de34c33ac3849699857d3cb400cccd",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",

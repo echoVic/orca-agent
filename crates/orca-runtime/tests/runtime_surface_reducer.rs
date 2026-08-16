@@ -8473,6 +8473,120 @@ fn task_reconciliation_cannot_replace_a_task_identity() {
 }
 
 #[test]
+fn task_reconciliation_accepts_constrained_terminal_history() {
+    for (seed, status) in [
+        (12_243, SurfaceTaskStatus::Completed),
+        (12_244, SurfaceTaskStatus::Stopped),
+        (12_245, SurfaceTaskStatus::Cancelled),
+    ] {
+        let initial = state();
+        let mut historical = task(status, 1);
+        historical.completed_at = Some(UnixMillis::new(3));
+        historical.result = Some(DisplayText::new("legacy terminal history"));
+        let reconciled = batch(
+            &initial,
+            seed,
+            vec![(
+                SurfaceScope::Thread,
+                SurfaceEvent::Task(TaskPatch::Reconciled {
+                    source_revision: TaskRevision::try_new(1).unwrap(),
+                    tasks: vec![historical.clone()],
+                }),
+            )],
+        );
+
+        let next = applied(reduce_batch(SurfaceReduceMode::Live, &initial, &reconciled));
+        assert!(next.snapshot().tasks == vec![historical]);
+    }
+}
+
+#[test]
+fn task_reconciliation_cannot_omit_or_change_current_tasks() {
+    let current = task(SurfaceTaskStatus::Running, 1);
+    let mut initial_snapshot = snapshot();
+    initial_snapshot.tasks.push(current.clone());
+    let initial = SurfaceReducerState::new(initial_snapshot);
+    let omitted = batch(
+        &initial,
+        12_246,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::Reconciled {
+                source_revision: TaskRevision::try_new(1).unwrap(),
+                tasks: Vec::new(),
+            }),
+        )],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &initial, &omitted),
+        SurfaceReducerErrorCode::IllegalTransition,
+    );
+
+    let mut changed = current;
+    changed.description = DisplayText::new("changed identity");
+    let changed = batch(
+        &initial,
+        12_247,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::Reconciled {
+                source_revision: TaskRevision::try_new(1).unwrap(),
+                tasks: vec![changed],
+            }),
+        )],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &initial, &changed),
+        SurfaceReducerErrorCode::IllegalTransition,
+    );
+}
+
+#[test]
+fn task_reconciliation_rejects_actionable_terminal_history() {
+    let mut candidates = Vec::new();
+
+    let mut backgrounded = task(SurfaceTaskStatus::Completed, 1);
+    backgrounded.backgrounded = true;
+    candidates.push(backgrounded);
+
+    let mut operation_owned = task(SurfaceTaskStatus::Stopped, 1);
+    operation_owned.parent_operation = Some(operation_fence().operation_id);
+    candidates.push(operation_owned);
+
+    let mut workflow_owned = task(SurfaceTaskStatus::Cancelled, 1);
+    workflow_owned.workflow_run_id = Some(SurfaceWorkflowRunId::try_new("legacy-run").unwrap());
+    candidates.push(workflow_owned);
+
+    let mut subagent_owned = task(SurfaceTaskStatus::Completed, 1);
+    subagent_owned.subagent_id = Some(SurfaceSubagentId::try_new("legacy-agent").unwrap());
+    candidates.push(subagent_owned);
+
+    let mut interaction_owned = task(SurfaceTaskStatus::Stopped, 1);
+    interaction_owned.pending_interaction_id =
+        Some(SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(12_248)).unwrap());
+    candidates.push(interaction_owned);
+
+    for (offset, candidate) in candidates.into_iter().enumerate() {
+        let initial = state();
+        let invalid = batch(
+            &initial,
+            12_249 + u32::try_from(offset).unwrap(),
+            vec![(
+                SurfaceScope::Thread,
+                SurfaceEvent::Task(TaskPatch::Reconciled {
+                    source_revision: TaskRevision::try_new(1).unwrap(),
+                    tasks: vec![candidate],
+                }),
+            )],
+        );
+        rejected(
+            reduce_batch(SurfaceReduceMode::Live, &initial, &invalid),
+            SurfaceReducerErrorCode::IllegalTransition,
+        );
+    }
+}
+
+#[test]
 fn workflow_agent_patch_discriminant_must_match_the_target_state() {
     let mut initial_snapshot = snapshot();
     let mut running_workflow = workflow(SurfaceWorkflowStatus::Running);

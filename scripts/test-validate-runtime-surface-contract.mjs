@@ -123,6 +123,33 @@ function expectUnlistedRuntimeMutation(label, functionName, body) {
   );
 }
 
+for (const [id, relativePath, anchor, replacement] of [
+  [
+    "task.registry",
+    "crates/orca-runtime/src/tasks.rs",
+    /pub\(crate\)\s+fn\s+with_terminal_main_session_reconciliation\s*</,
+    "pub(crate) fn removed_terminal_main_session_reconciliation<",
+  ],
+  [
+    "task.reconciliation_commit_authority",
+    "crates/orca-runtime/src/runtime_surface/commit.rs",
+    /pub\(crate\)\s+fn\s+commit_terminal_task_reconciliation_batch\s*\(/,
+    "pub(crate) fn removed_terminal_task_reconciliation_batch(",
+  ],
+]) {
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  assert.match(source, anchor, `${id} production fixture must contain its anchor`);
+  expectFailure(
+    `${id} production anchor cannot disappear while manifest references remain`,
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, source.replace(anchor, replacement)),
+      }),
+    new RegExp(`${id.replaceAll(".", "\\.")} source does not contain its reviewed production anchor`),
+  );
+}
+
 for (const relativePath of [
   "crates/orca-runtime/tests/runtime_surface_manifest.rs",
   "crates/orca-tui/src/surface_boundary_tests.rs",

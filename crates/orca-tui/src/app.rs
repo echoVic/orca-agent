@@ -2531,6 +2531,96 @@ done
     }
 
     #[test]
+    fn resumed_tui_projects_reconciled_terminal_legacy_task_as_non_actionable() {
+        with_orca_home(|home| {
+            let session_id = "019c6f42-9a21-7e30-8c4d-5e6f708192a3";
+            let fixture = transcript(session_id);
+            let mut writer = history::SessionWriter::start_from_meta(fixture.meta)
+                .expect("create resumable terminal-task transcript");
+            writer.complete("completed").unwrap();
+            let preloaded =
+                history::load_session(session_id).expect("load resumable terminal-task transcript");
+
+            let registry = orca_runtime::tasks::TaskRegistry::new_persistent(
+                session_id.to_string(),
+                home.join("task-sessions"),
+            )
+            .expect("open persistent terminal-task registry");
+            let task = registry.create_main_session("completed before typed recovery".to_string());
+            let task_id = task.id.clone();
+            registry
+                .complete(&task.id, "durable terminal result".to_string())
+                .expect("complete registry-only terminal task");
+            drop(registry);
+
+            let mut harness = HostedTuiHarness::start(
+                test_config(HistoryMode::Resume(session_id.to_string())),
+                Some(preloaded),
+            );
+            let projection = match harness.recv_until(|event| {
+                matches!(event, TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection.workflow_tasks.iter().any(|task| task.id == task_id))
+            }) {
+                TuiEvent::SurfaceProjectionSynced(projection) => projection,
+                _ => unreachable!(),
+            };
+            let projected = projection
+                .workflow_tasks
+                .iter()
+                .filter(|task| task.id == task_id)
+                .collect::<Vec<_>>();
+            assert_eq!(projected.len(), 1);
+            assert_eq!(
+                projected[0].task_type,
+                orca_core::task_types::TaskType::MainSession
+            );
+            assert_eq!(
+                projected[0].status,
+                orca_core::task_types::TaskStatus::Completed
+            );
+            assert!(!projected[0].is_backgrounded);
+            assert!(projected[0].pending_tool_call.is_none());
+            assert_eq!(
+                projected[0].result.as_deref(),
+                Some("durable terminal result")
+            );
+            let accepted_cursor = projection.cursor.clone();
+
+            harness.send(UserAction::StopTask {
+                task_id: task_id.clone(),
+            });
+            harness.send(UserAction::ForegroundTask {
+                task_id: task_id.clone(),
+            });
+            let mut errors = 0;
+            while errors < 2 {
+                match harness
+                    .event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("terminal task action rejection")
+                {
+                    TuiEvent::Error(_) => errors += 1,
+                    TuiEvent::Notice(message)
+                        if message.contains(&task_id)
+                            && (message.contains("stop requested")
+                                || message.contains("returned to foreground")) =>
+                    {
+                        panic!("terminal task action fabricated success notice: {message}");
+                    }
+                    TuiEvent::SurfaceProjectionSynced(next)
+                        if next.cursor != accepted_cursor
+                            && next.workflow_tasks.iter().any(|task| task.id == task_id) =>
+                    {
+                        panic!("terminal task action fabricated a new success projection");
+                    }
+                    _ => {}
+                }
+            }
+            harness.shutdown();
+        });
+    }
+
+    #[test]
     fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
         with_orca_home(|_| {
             let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));

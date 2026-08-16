@@ -2781,6 +2781,9 @@ static PROVIDER_COMPLETION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usiz
 static PROVIDER_TERMINAL_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
+static TERMINAL_TASK_RECONCILIATION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
 static GENERATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
@@ -3155,6 +3158,18 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_terminal_task_reconciliation_append_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        TERMINAL_TASK_RECONCILIATION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_admission_repair_append_failure_once(path: impl Into<PathBuf>) {
         Self::inject_admission_repair_append_failures(path, 1);
     }
@@ -3215,6 +3230,32 @@ impl JsonlSurfaceCommitLedger {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&self.path)
+    }
+
+    #[cfg(test)]
+    fn take_terminal_task_reconciliation_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let reconciles_terminal_tasks = batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                SurfaceEvent::Task(TaskPatch::Reconciled { .. })
+            )
+        });
+        if !reconciles_terminal_tasks {
+            return false;
+        }
+        let mut failures = TERMINAL_TASK_RECONCILIATION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
     }
 
     #[cfg(test)]
@@ -3910,6 +3951,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_provider_terminal_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_terminal_task_reconciliation_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }
         let (commit_id, durable_revision) = match &batch.commit_class {

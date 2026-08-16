@@ -7835,14 +7835,22 @@ fn task_revision_is_contiguous(expected: TaskRevision, next: TaskRevision) -> bo
     expected.get().checked_add(1) == Some(next.get())
 }
 
-fn task_identity_matches(current: &SurfaceTask, next: &SurfaceTask) -> bool {
-    current.task_id == next.task_id
-        && current.task_type == next.task_type
-        && current.description == next.description
-        && current.created_at == next.created_at
-        && current.parent_operation == next.parent_operation
-        && current.workflow_run_id == next.workflow_run_id
-        && current.subagent_id == next.subagent_id
+fn historical_terminal_task_creation_allowed(task: &SurfaceTask) -> bool {
+    task.revision.get() == 1
+        && task.task_type == SurfaceTaskType::MainSession
+        && matches!(
+            task.status,
+            SurfaceTaskStatus::Completed
+                | SurfaceTaskStatus::Stopped
+                | SurfaceTaskStatus::Cancelled
+        )
+        && task.completed_at.is_some()
+        && !task.backgrounded
+        && task.parent_operation.is_none()
+        && task.background_fence.is_none()
+        && task.workflow_run_id.is_none()
+        && task.subagent_id.is_none()
+        && task.pending_interaction_id.is_none()
 }
 
 fn apply_task_patch(
@@ -8001,28 +8009,27 @@ fn apply_task_patch(
                     "task reconciliation source revision is stale",
                 ));
             }
+            if snapshot.tasks.iter().any(|current| {
+                tasks.iter().find(|next| next.task_id == current.task_id) != Some(current)
+            }) {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "task reconciliation cannot omit or change existing tasks",
+                ));
+            }
             for next in tasks {
-                if let Some(current) = snapshot
+                let already_present = snapshot
                     .tasks
                     .iter()
-                    .find(|task| task.task_id == next.task_id)
-                {
-                    if !task_identity_matches(current, next)
-                        || (current != next
-                            && (!task_revision_is_contiguous(current.revision, next.revision)
-                                || !task_status_transition_allowed(current.status, next.status)))
-                    {
-                        return Err(event_error(
-                            envelope,
-                            SurfaceReducerErrorCode::IllegalTransition,
-                            "task reconciliation transition is not allowed",
-                        ));
-                    }
-                } else if next.revision.get() != 1
-                    || !matches!(
-                        next.status,
-                        SurfaceTaskStatus::Queued | SurfaceTaskStatus::Running
-                    )
+                    .any(|current| current.task_id == next.task_id);
+                if !already_present
+                    && !((next.revision.get() == 1
+                        && matches!(
+                            next.status,
+                            SurfaceTaskStatus::Queued | SurfaceTaskStatus::Running
+                        ))
+                        || historical_terminal_task_creation_allowed(next))
                 {
                     return Err(event_error(
                         envelope,

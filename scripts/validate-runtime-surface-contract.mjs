@@ -824,6 +824,23 @@ function tuiActionSourceAnchor(action, relativePath) {
   return TUI_ACTION_SOURCE_ANCHORS.get(action)?.get(relativePath);
 }
 
+const NON_EVENT_SOURCE_ANCHORS = new Map([
+  [
+    "task.registry",
+    {
+      relativePath: "crates/orca-runtime/src/tasks.rs",
+      anchor: /pub\(crate\)\s+fn\s+with_terminal_main_session_reconciliation\s*</,
+    },
+  ],
+  [
+    "task.reconciliation_commit_authority",
+    {
+      relativePath: "crates/orca-runtime/src/runtime_surface/commit.rs",
+      anchor: /pub\(crate\)\s+fn\s+commit_terminal_task_reconciliation_batch\s*\(/,
+    },
+  ],
+]);
+
 const TUI_RUNTIME_MUTATION_APIS = new Map([
   [
     "thread.mutate",
@@ -4315,6 +4332,16 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
     const lineCount = readFileSync(absolute, "utf8").split(/\r?\n/).length;
     if (!Number.isInteger(sourceLine) || sourceLine < 1 || sourceLine > lineCount) {
       fail(`${id} source line ${sourceLine} has drifted`);
+    }
+    const reviewed = NON_EVENT_SOURCE_ANCHORS.get(id);
+    if (reviewed) {
+      if (sourcePath !== reviewed.relativePath) {
+        fail(`${id} source path has drifted: ${sourcePath}`);
+      }
+      const source = maskCfgTestItems(readRepoSource(repoRoot, sourcePath, sourceOverrides));
+      if (!reviewed.anchor.test(source)) {
+        fail(`${id} source does not contain its reviewed production anchor: ${sourcePath}`);
+      }
     }
   }
   validateTuiMutationScan(repoRoot, sourceOverrides);

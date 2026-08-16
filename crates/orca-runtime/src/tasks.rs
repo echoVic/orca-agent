@@ -32,6 +32,10 @@ use crate::lifecycle::{
     RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord, RuntimeUsageTotals,
 };
 use crate::model_response::RuntimeModelResponse;
+use crate::runtime_surface::{
+    DisplayText, Sha256Digest, SurfaceTask, SurfaceTaskId, SurfaceTaskStatus, SurfaceTaskType,
+    TaskRevision, UnixMillis, UsageTotals as SurfaceUsageTotals,
+};
 use crate::thread_store::redact_sensitive_text;
 
 #[cfg(test)]
@@ -97,6 +101,7 @@ pub struct TaskRegistry {
     cancelled_roots: Arc<Mutex<HashSet<String>>>,
     typed_provider_outcomes: Arc<Mutex<HashMap<String, DurableTypedProviderOutcome>>>,
     persistence: Option<Arc<TaskPersistence>>,
+    persistent_open_error: Option<Arc<str>>,
     recover_persisted_active_tasks: bool,
     artifact_storage: Arc<TaskArtifactStorage>,
 }
@@ -134,6 +139,127 @@ pub enum MainSessionTerminalUpdate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskTerminalTransition {
     pub is_backgrounded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct LegacyTerminalTaskReconciliationRecord {
+    id: String,
+    status: TaskStatus,
+    description: String,
+    created_at_ms: i64,
+    started_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+    usage: Option<UsageTotals>,
+    result: Option<String>,
+    error: Option<String>,
+    retry_count: u32,
+    output_truncated: bool,
+    publication_revision: u64,
+}
+
+impl LegacyTerminalTaskReconciliationRecord {
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> TaskStatus {
+        self.status
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publication_revision(&self) -> u64 {
+        self.publication_revision
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LegacyTerminalTaskReconciliationReceipt {
+    session_id: String,
+    publication_horizon: u64,
+    digest: Sha256Digest,
+    records: Vec<LegacyTerminalTaskReconciliationRecord>,
+}
+
+impl LegacyTerminalTaskReconciliationReceipt {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn publication_horizon(&self) -> u64 {
+        self.publication_horizon
+    }
+
+    #[cfg(test)]
+    pub(crate) fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> &[LegacyTerminalTaskReconciliationRecord] {
+        &self.records
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        legacy_terminal_reconciliation_digest(
+            &self.session_id,
+            self.publication_horizon,
+            &self.records,
+        )
+        .is_ok_and(|digest| digest == self.digest)
+    }
+
+    pub(crate) fn reconciled_surface_tasks(&self) -> Vec<SurfaceTask> {
+        self.records
+            .iter()
+            .map(|record| {
+                let status = match record.status {
+                    TaskStatus::Completed => SurfaceTaskStatus::Completed,
+                    TaskStatus::Stopped => SurfaceTaskStatus::Stopped,
+                    TaskStatus::Cancelled => SurfaceTaskStatus::Cancelled,
+                    _ => unreachable!("receipt contains only non-retryable terminal tasks"),
+                };
+                SurfaceTask {
+                    task_id: SurfaceTaskId::try_new(record.id.clone())
+                        .expect("receipt validated the surface task id"),
+                    revision: TaskRevision::try_new(1).expect("one is a valid task revision"),
+                    task_type: SurfaceTaskType::MainSession,
+                    status,
+                    backgrounded: false,
+                    description: DisplayText::new(&record.description),
+                    created_at: UnixMillis::new(record.created_at_ms),
+                    started_at: record.started_at_ms.map(UnixMillis::new),
+                    completed_at: record.completed_at_ms.map(UnixMillis::new),
+                    parent_operation: None,
+                    background_fence: None,
+                    workflow_run_id: None,
+                    subagent_id: None,
+                    pending_interaction_id: None,
+                    usage: record.usage.map(|usage| SurfaceUsageTotals {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cache_tokens: usage.cache_tokens,
+                        estimated_cost_usd_micros: crate::cost::usd_to_micros(
+                            usage.estimated_cost_usd,
+                        ),
+                    }),
+                    result: record.result.as_deref().map(DisplayText::new),
+                    error: record.error.as_deref().map(DisplayText::new),
+                    retry_count: record.retry_count,
+                    output_truncated: record.output_truncated,
+                }
+            })
+            .collect()
+    }
+}
+
+fn legacy_terminal_reconciliation_digest(
+    session_id: &str,
+    publication_horizon: u64,
+    records: &[LegacyTerminalTaskReconciliationRecord],
+) -> Result<Sha256Digest, serde_json::Error> {
+    serde_json::to_vec(&(session_id, publication_horizon, records)).map(Sha256Digest::digest)
 }
 
 #[derive(Clone, Debug)]
@@ -356,6 +482,7 @@ impl TaskRegistry {
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
             persistence: None,
+            persistent_open_error: None,
             recover_persisted_active_tasks: false,
             artifact_storage: Arc::new(TaskArtifactStorage::ProcessLocal {
                 scratch: Mutex::new(None),
@@ -400,6 +527,7 @@ impl TaskRegistry {
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
             persistence: Some(persistence),
+            persistent_open_error: None,
             recover_persisted_active_tasks: recover_interrupted,
             artifact_storage: Arc::new(TaskArtifactStorage::Recorded),
         })
@@ -413,8 +541,9 @@ impl TaskRegistry {
         };
         let legacy_root = legacy_project_task_sessions_root(cwd);
         let _ = migrate_legacy_task_sessions(&legacy_root, &root);
-        Self::new_persistent_attached(session_id.clone(), root).unwrap_or_else(|_| {
+        Self::new_persistent_attached(session_id.clone(), root).unwrap_or_else(|error| {
             let mut registry = Self::new(session_id);
+            registry.persistent_open_error = Some(Arc::from(error.to_string()));
             registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
             registry
         })
@@ -428,8 +557,9 @@ impl TaskRegistry {
         };
         let legacy_root = legacy_project_task_sessions_root(cwd);
         let _ = migrate_legacy_task_sessions(&legacy_root, &root);
-        Self::new_persistent(session_id.clone(), root).unwrap_or_else(|_| {
+        Self::new_persistent(session_id.clone(), root).unwrap_or_else(|error| {
             let mut registry = Self::new(session_id);
+            registry.persistent_open_error = Some(Arc::from(error.to_string()));
             registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
             registry
         })
@@ -478,6 +608,60 @@ impl TaskRegistry {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub(crate) fn with_terminal_main_session_reconciliation<R>(
+        &self,
+        reconcile: impl FnOnce(&LegacyTerminalTaskReconciliationReceipt) -> R,
+    ) -> Result<Option<R>, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(None);
+        };
+        let _session_lock =
+            ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                .map_err(|error| error.to_string())?;
+        let persisted = persistence
+            .load_session_records_unlocked(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        let mut records = persisted
+            .into_values()
+            .filter(terminal_main_session_reconciliation_eligible)
+            .map(|record| LegacyTerminalTaskReconciliationRecord {
+                id: record.id,
+                status: record.status,
+                description: record.description,
+                created_at_ms: record.created_at_ms,
+                started_at_ms: record.started_at_ms,
+                completed_at_ms: record.completed_at_ms,
+                usage: record.usage,
+                result: record.result,
+                error: record.error,
+                retry_count: record.retry_count,
+                output_truncated: record.output_truncated,
+                publication_revision: record.publication_revision,
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        let publication_horizon = records
+            .iter()
+            .map(|record| record.publication_revision)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "legacy task publication revision exhausted".to_string())?;
+        let digest =
+            legacy_terminal_reconciliation_digest(&self.session_id, publication_horizon, &records)
+                .map_err(|error| error.to_string())?;
+        let receipt = LegacyTerminalTaskReconciliationReceipt {
+            session_id: self.session_id.clone(),
+            publication_horizon,
+            digest,
+            records,
+        };
+        Ok(Some(reconcile(&receipt)))
     }
 
     pub fn acquire_task_lease(&self, id: &str) -> Result<TaskLease, TaskLeaseError> {
@@ -3042,6 +3226,21 @@ fn is_terminal(status: TaskStatus) -> bool {
     )
 }
 
+fn terminal_main_session_reconciliation_eligible(record: &TaskRecord) -> bool {
+    record.task_type == TaskType::MainSession
+        && matches!(
+            record.status,
+            TaskStatus::Completed | TaskStatus::Stopped | TaskStatus::Cancelled
+        )
+        && SurfaceTaskId::try_new(record.id.clone()).is_ok()
+        && record.completed_at_ms.is_some()
+        && record.worker_pid.is_none()
+        && record.lease_owner.is_none()
+        && record.pending_tool_call.is_none()
+        && record.pending_provider_response.is_none()
+        && record.pending_tool_approval_response.is_none()
+}
+
 fn pending_tool_call_from_provider_response(
     response: &ProviderResponse,
 ) -> Option<PendingToolCallSummary> {
@@ -3205,6 +3404,194 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_terminal_reconciliation_receipt_filters_and_sorts_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let session_id = "terminal-reconciliation".to_string();
+        let registry = TaskRegistry::new_persistent_attached(session_id.clone(), root).unwrap();
+        let template_id = registry.create_main_session("template".to_string()).id;
+        let template = registry.get(&template_id).expect("template record");
+
+        let insert = |id: &str,
+                      task_type: TaskType,
+                      status: TaskStatus,
+                      publication_revision: u64,
+                      unsafe_state: bool| {
+            let mut record = template.clone();
+            record.id = id.to_string();
+            record.task_type = task_type;
+            record.status = status;
+            record.description = format!("history {id}");
+            record.started_at_ms = Some(20);
+            record.completed_at_ms = is_terminal(status).then_some(30);
+            record.result = is_terminal(status).then(|| format!("result {id}"));
+            record.publication_revision = publication_revision;
+            record.worker_pid = unsafe_state.then_some(42);
+            record.lease_owner = unsafe_state.then(|| "legacy-owner".to_string());
+            record.pending_tool_approval_response = unsafe_state.then_some(true);
+            registry
+                .insert_task(id.to_string(), record)
+                .expect("persist reconciliation fixture");
+        };
+
+        insert(
+            "legacy-z-completed",
+            TaskType::MainSession,
+            TaskStatus::Completed,
+            7,
+            false,
+        );
+        insert(
+            "legacy-a-stopped",
+            TaskType::MainSession,
+            TaskStatus::Stopped,
+            2,
+            false,
+        );
+        insert(
+            "legacy-m-cancelled",
+            TaskType::MainSession,
+            TaskStatus::Cancelled,
+            5,
+            false,
+        );
+        for (id, status) in [
+            ("legacy-queued", TaskStatus::Queued),
+            ("legacy-running", TaskStatus::Running),
+            ("legacy-paused", TaskStatus::Paused),
+            ("legacy-stopping", TaskStatus::Stopping),
+            ("legacy-approval", TaskStatus::ApprovalRequired),
+            ("legacy-failed", TaskStatus::Failed),
+        ] {
+            insert(id, TaskType::MainSession, status, 3, false);
+        }
+        insert(
+            "legacy-workflow",
+            TaskType::Workflow,
+            TaskStatus::Completed,
+            4,
+            false,
+        );
+        insert(
+            "legacy-unsafe-terminal",
+            TaskType::MainSession,
+            TaskStatus::Completed,
+            8,
+            true,
+        );
+        insert("", TaskType::MainSession, TaskStatus::Completed, 9, false);
+
+        let mut missing_completion = template.clone();
+        missing_completion.id = "legacy-missing-completion".to_string();
+        missing_completion.status = TaskStatus::Completed;
+        missing_completion.completed_at_ms = None;
+        missing_completion.publication_revision = 10;
+        registry
+            .insert_task(missing_completion.id.clone(), missing_completion)
+            .expect("persist missing-completion fixture");
+
+        let mut worker_owned = template.clone();
+        worker_owned.id = "legacy-worker-owned".to_string();
+        worker_owned.status = TaskStatus::Completed;
+        worker_owned.completed_at_ms = Some(30);
+        worker_owned.worker_pid = Some(42);
+        worker_owned.publication_revision = 11;
+        registry
+            .insert_task(worker_owned.id.clone(), worker_owned)
+            .expect("persist worker-owned fixture");
+
+        let mut leased = template.clone();
+        leased.id = "legacy-leased".to_string();
+        leased.status = TaskStatus::Completed;
+        leased.completed_at_ms = Some(30);
+        leased.lease_owner = Some("legacy-owner".to_string());
+        leased.publication_revision = 12;
+        registry
+            .insert_task(leased.id.clone(), leased)
+            .expect("persist leased fixture");
+
+        let mut pending_tool = template.clone();
+        pending_tool.id = "legacy-pending-tool".to_string();
+        pending_tool.status = TaskStatus::Completed;
+        pending_tool.completed_at_ms = Some(30);
+        pending_tool.pending_tool_call = Some(PendingToolCallSummary {
+            id: "legacy-tool-call".to_string(),
+            name: "task_list".to_string(),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            arguments: "{}".to_string(),
+        });
+        pending_tool.publication_revision = 13;
+        registry
+            .insert_task(pending_tool.id.clone(), pending_tool)
+            .expect("persist pending-tool fixture");
+
+        let mut pending_provider = template.clone();
+        pending_provider.id = "legacy-pending-provider".to_string();
+        pending_provider.status = TaskStatus::Completed;
+        pending_provider.completed_at_ms = Some(30);
+        pending_provider.pending_provider_response = Some(runtime_response(ProviderResponse {
+            steps: Vec::new(),
+            assistant_content: Some("legacy pending provider response".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        }));
+        pending_provider.publication_revision = 14;
+        registry
+            .insert_task(pending_provider.id.clone(), pending_provider)
+            .expect("persist pending-provider fixture");
+
+        let mut pending_approval = template.clone();
+        pending_approval.id = "legacy-pending-approval".to_string();
+        pending_approval.status = TaskStatus::Completed;
+        pending_approval.completed_at_ms = Some(30);
+        pending_approval.pending_tool_approval_response = Some(true);
+        pending_approval.publication_revision = 15;
+        registry
+            .insert_task(pending_approval.id.clone(), pending_approval)
+            .expect("persist pending-approval fixture");
+
+        let first = registry
+            .with_terminal_main_session_reconciliation(|receipt| {
+                (
+                    receipt.session_id().to_string(),
+                    receipt.publication_horizon(),
+                    receipt.digest(),
+                    receipt
+                        .records()
+                        .iter()
+                        .map(|record| {
+                            (
+                                record.id().to_string(),
+                                record.status(),
+                                record.publication_revision(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .expect("issue terminal reconciliation receipt")
+            .expect("persistent registries issue receipts");
+        let second_digest = registry
+            .with_terminal_main_session_reconciliation(|receipt| receipt.digest())
+            .expect("reissue terminal reconciliation receipt")
+            .expect("persistent registries issue receipts");
+
+        assert_eq!(first.0, session_id);
+        assert_eq!(first.1, 8);
+        assert_eq!(first.2, second_digest);
+        assert_eq!(
+            first.3,
+            vec![
+                ("legacy-a-stopped".to_string(), TaskStatus::Stopped, 2,),
+                ("legacy-m-cancelled".to_string(), TaskStatus::Cancelled, 5,),
+                ("legacy-z-completed".to_string(), TaskStatus::Completed, 7,),
+            ]
+        );
+    }
 
     #[test]
     fn persistent_typed_provider_outcome_round_trips_budget_terminal() {

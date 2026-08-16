@@ -3342,14 +3342,41 @@ TaskStatusTransition =
   | Stopping -> Cancelled
 ```
 
-`Reconciled` is accepted only from a coordinator-wrapped Task store receipt and
-performs a revision-checked identity diff. It is not direct assignment from an
-event payload. Live `Upserted(expected_revision=None)` is creation-only and may
-construct only Queued or Running; `expected_revision=Some` is legal only during
-receipt-backed reconciliation and each changed task must prove one listed edge.
-Stopped, Completed, Failed, and Cancelled are absorbing. `OwnershipChanged`
-changes no status and is legal only for a nonterminal task with the exact
-background fence. Every omitted edge is `IllegalTransition`.
+`Reconciled` has two closed commit authorities. A fresh recorded-thread import
+requires an opaque receipt issued while `TaskRegistry` holds the session lock;
+the coordinator verifies the session/thread identity, canonical receipt digest,
+publication horizon, exact receipt-derived additions, and byte-identical
+retention of every current surface task. Ordinary actor authority rejects this
+patch. Recovery may replay an already prepared reconciliation without reopening
+the registry only when the ledger batch is append-only and every new row is a
+revision-one, non-backgrounded, operation-free, interaction-free MainSession in
+Completed, Stopped, or Cancelled state. The recovery authority cannot create a
+fresh batch, active/failed/approval task, or rich workflow/subagent identity.
+Its input is only the single immutable prepared batch returned by
+`JsonlSurfaceCommitLedger::recover_batches`: stored-batch decoding reruns batch
+preflight, recomputes and matches the canonical digest and event count, and
+checks the recorded cursor chain before the coordinator records that exact
+batch as `recovered_prepared` and evaluates the constrained shape. No public or
+fresh commit path accepts a caller-supplied prepared reconciliation identity.
+
+Already committed reconciliation batches follow the ordinary commit-id
+idempotency rule. Ledger recovery materializes each committed batch from the
+validated committed prefix and never sends it through prepared authority. An
+exact retry with the same commit id and canonical digest returns the existing
+`CommitProbe::Present` receipt without a second reducer application or append;
+a conflicting identity/digest is rejected. A later cold start also subtracts
+surface task ids before building a fresh batch, so an already imported legacy
+row consumes no new commit.
+
+The reducer independently requires unique ids, source revision coverage, and
+byte-identical retention of every current task. It permits constrained terminal
+history creation only in the shape above; omission or replacement of an
+existing task is `IllegalTransition`. Live `Upserted(expected_revision=None)` is
+creation-only and may construct only Queued or Running; each later changed task
+must prove one listed edge. Stopped, Completed, Failed, and Cancelled are
+absorbing. `OwnershipChanged` changes no status and is legal only for a
+nonterminal task with the exact background fence. Every omitted edge is
+`IllegalTransition`.
 
 ```text
 SurfaceWorkflowStatus =
