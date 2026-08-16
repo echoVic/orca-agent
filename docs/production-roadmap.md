@@ -1631,7 +1631,7 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established forty-two focused owners/boundaries so far (insert-escape, presentation,
+   stream has established forty-three focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection,
@@ -1647,12 +1647,14 @@ end state.
    terminal session startup ownership, renderer input-wake ownership,
    renderer input-routing ownership, renderer interaction-acknowledgement
    ownership, renderer runtime-inbox ownership, renderer iteration-event
-   routing ownership, and foreground renderer-loop ownership); `app.rs` is
-   currently 7,712 lines, `renderer_loop.rs` 438 lines,
+   routing ownership, foreground renderer-loop ownership, and active terminal
+   lifecycle ownership); `app.rs` is currently 7,609 lines,
+   `renderer_loop.rs` 438 lines,
    `renderer_event_router.rs` 273 lines, `renderer_runtime_inbox.rs` 104 lines,
    `renderer_interaction_acks.rs` 182 lines,
    `renderer_input_router.rs` 461 lines, `renderer_input_wake.rs` 298 lines,
-   `terminal_session.rs` 220 lines, `renderer_frame.rs` 525 lines,
+   `terminal_session.rs` 357 lines, `presentation.rs` 203 lines,
+   `tui_run_lifecycle.rs` 69 lines, `renderer_frame.rs` 525 lines,
    `renderer_runtime.rs` 395 lines, and `hosted_controller.rs` 683 lines,
    `hosted_plan.rs` 247 lines, `hosted_operation.rs` 132 lines,
    `hosted_workflow.rs` 132 lines,
@@ -1660,10 +1662,13 @@ end state.
    `hosted_session_lifecycle.rs` 852 lines, `hosted_goal.rs` 404 lines,
    `background_tasks.rs` 239 lines, `idle_submit_actions.rs` 470 lines,
    `action_dispatcher.rs` 815 lines, `agent_runtime.rs` 262 lines,
-   `runtime_event_actions.rs` 1,248 lines, and `types.rs` 8,936 lines. Foreground
-   renderer-loop orchestration is now focused; initial terminal bootstrap and
-   cleanup composition require a fresh ownership audit before any further move,
-   while cold legacy registry reconciliation remains open. Live
+   `runtime_event_actions.rs` 1,248 lines, and `types.rs` 8,936 lines. The
+   activated terminal session now uniquely retains terminal, presentation,
+   input runtime, and input-wake lifetime; reset failure cannot skip terminal
+   retirement or input finish, and renderer, inbox, and agent shutdown run
+   after every terminal outcome with explicit error precedence. The remaining
+   `run_tui_inner` startup/state/host composition requires a fresh ownership
+   audit before another move, while cold legacy registry reconciliation remains open. Live
    task/operation projection duplication has been removed from the TUI event
    boundary (`surface_projection.rs`, 3,280 lines).
 4. **P2.4 context/cache identity is not a release slice.** DeepSeek usage

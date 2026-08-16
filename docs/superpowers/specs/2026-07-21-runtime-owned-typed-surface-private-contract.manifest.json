@@ -5160,16 +5160,16 @@
     [
       "renderer_runtime_inbox",
       [
-        "crates/orca-tui/src/app.rs:254",
+        "crates/orca-tui/src/app.rs:249",
         "crates/orca-tui/src/renderer_loop.rs:145",
-        "crates/orca-tui/src/app.rs:339",
+        "crates/orca-tui/src/app.rs:322",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:6",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:11",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:15",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:19"
       ],
       "presentation_runtime_event_inbox_coordination",
-      "loop_owned_try_iteration_with_app_receiver_construction_and_pre_agent_close",
+      "loop_owned_try_iteration_with_app_receiver_construction_and_total_pre_agent_close",
       "private_renderer_runtime_inbox_owner",
       [],
       "typed snapshot/read consumer",
@@ -5215,17 +5215,42 @@
     [
       "terminal_session_startup",
       [
-        "crates/orca-tui/src/app.rs:132",
-        "crates/orca-tui/src/app.rs:233",
-        "crates/orca-tui/src/app.rs:262",
-        "crates/orca-tui/src/terminal_session.rs:36",
-        "crates/orca-tui/src/terminal_session.rs:45",
-        "crates/orca-tui/src/terminal_session.rs:81",
-        "crates/orca-tui/src/terminal_session.rs:85"
+        "crates/orca-tui/src/app.rs:137",
+        "crates/orca-tui/src/app.rs:219",
+        "crates/orca-tui/src/app.rs:238",
+        "crates/orca-tui/src/app.rs:268",
+        "crates/orca-tui/src/terminal_session.rs:51",
+        "crates/orca-tui/src/terminal_session.rs:60",
+        "crates/orca-tui/src/terminal_session.rs:96",
+        "crates/orca-tui/src/terminal_session.rs:100",
+        "crates/orca-tui/src/terminal_session.rs:108"
       ],
       "presentation_session_startup_coordination",
-      "app_owned_input_profile_backend_and_activation_locals",
+      "pending_owner_input_profile_backend_and_activation_transition",
       "private_pending_to_activated_terminal_session_owner",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
+    ],
+    [
+      "terminal_session_lifecycle",
+      [
+        "crates/orca-tui/src/app.rs:268",
+        "crates/orca-tui/src/app.rs:322",
+        "crates/orca-tui/src/terminal_session.rs:125",
+        "crates/orca-tui/src/terminal_session.rs:135",
+        "crates/orca-tui/src/terminal_session.rs:155",
+        "crates/orca-tui/src/terminal_session.rs:156",
+        "crates/orca-tui/src/terminal_session.rs:160",
+        "crates/orca-tui/src/terminal_session.rs:172",
+        "crates/orca-tui/src/presentation.rs:53",
+        "crates/orca-tui/src/presentation.rs:65",
+        "crates/orca-tui/src/tui_run_lifecycle.rs:3",
+        "crates/orca-tui/src/tui_run_lifecycle.rs:9"
+      ],
+      "presentation_terminal_and_runtime_lifecycle_coordination",
+      "activated_owner_total_terminal_cleanup_then_total_renderer_inbox_agent_shutdown",
+      "private_activated_terminal_session_and_tui_run_lifecycle_owners",
       [],
       "typed snapshot/read consumer",
       "retain"
@@ -5233,7 +5258,7 @@
     [
       "renderer_input_wake",
       [
-        "crates/orca-tui/src/app.rs:276",
+        "crates/orca-tui/src/terminal_session.rs:155",
         "crates/orca-tui/src/renderer_loop.rs:137",
         "crates/orca-tui/src/renderer_input_wake.rs:12",
         "crates/orca-tui/src/renderer_input_wake.rs:20",
@@ -5265,7 +5290,7 @@
     [
       "renderer_interaction_acks",
       [
-        "crates/orca-tui/src/app.rs:253",
+        "crates/orca-tui/src/app.rs:247",
         "crates/orca-tui/src/renderer_loop.rs:139",
         "crates/orca-tui/src/renderer_loop.rs:140",
         "crates/orca-tui/src/renderer_interaction_acks.rs:10",
@@ -5283,8 +5308,8 @@
     [
       "renderer_loop",
       [
-        "crates/orca-tui/src/app.rs:294",
-        "crates/orca-tui/src/app.rs:316",
+        "crates/orca-tui/src/app.rs:286",
+        "crates/orca-tui/src/app.rs:308",
         "crates/orca-tui/src/renderer_loop.rs:28",
         "crates/orca-tui/src/renderer_loop.rs:51",
         "crates/orca-tui/src/renderer_loop.rs:74",

@@ -88,7 +88,7 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
     }
 }
 
-const TUI_ENTRYPOINTS: [&str; 40] = [
+const TUI_ENTRYPOINTS: [&str; 41] = [
     "slash.new",
     "slash.model_write",
     "slash.model_read",
@@ -125,6 +125,7 @@ const TUI_ENTRYPOINTS: [&str; 40] = [
     "renderer_event_routing",
     "renderer_frame",
     "terminal_session_startup",
+    "terminal_session_lifecycle",
     "renderer_input_wake",
     "renderer_input_routing",
     "renderer_interaction_acks",

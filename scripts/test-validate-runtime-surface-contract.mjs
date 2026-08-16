@@ -1464,9 +1464,9 @@ expectFailure(
     ],
     [
       "mention-inbox-agent shutdown order",
-      /renderer_runtime\.shutdown\(\);\s*renderer_runtime_inbox\.shutdown\(\);\s*agent_runtime\.shutdown\(\)\?;/,
-      "renderer_runtime.shutdown(); agent_runtime.shutdown()?; renderer_runtime_inbox.shutdown();",
-      /renderer_runtime_inbox\.shutdown\(\)/,
+      /finish_tui_run\(\s*renderer_result,\s*\|\|\s*renderer_runtime\.shutdown\(\),\s*\|\|\s*renderer_runtime_inbox\.shutdown\(\),\s*\|\|\s*agent_runtime\.shutdown\(\),\s*\)\?;/,
+      "finish_tui_run(renderer_result, || renderer_runtime_inbox.shutdown(), || renderer_runtime.shutdown(), || agent_runtime.shutdown())?;",
+      /RendererRuntimeInboxOwner::new\(pending_event_rx\)/,
     ],
   ]) {
     const withoutProductionPath = source.replace(pattern, replacement);
@@ -1802,6 +1802,196 @@ expectFailure(
 }
 
 {
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "activated-session run delegation",
+      /terminal_session\.run\(/,
+      "removed_terminal_session_run(",
+      /pending_terminal_session\.activate\(\)/,
+    ],
+    [
+      "activation error folding",
+      /(Ok\(terminal_session\)\s*=>\s*terminal_session\.run\([\s\S]*?\),\s*)Err\(error\)\s*=>\s*Err\(error\),(\s*\};\s*let\s+exit_code\s*=\s*finish_tui_run)/,
+      "$1Err(error) => return Err(error),$2",
+      /finish_tui_run\(/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production app path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking lifecycle reference`,
+    );
+    expectFailure(
+      `terminal session lifecycle validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /terminal_session_lifecycle source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/terminal_session.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "activated resource retention",
+      /terminal:\s*Terminal,/,
+      "terminal: RemovedTerminal,",
+      /ActivatedTerminalSession::<Vec<&str>,\s*Vec<&str>>/,
+    ],
+    [
+      "body cleanup scope",
+      /with_terminal_presentation_cleanup\(/,
+      "removed_terminal_presentation_cleanup(",
+      /use\s+crate::presentation::\{/,
+    ],
+    [
+      "total presentation finish",
+      /finish_terminal_presentation\(/,
+      "removed_total_finish(",
+      /activated_session_owns_input_wake_body_and_total_cleanup/,
+    ],
+    [
+      "production input finish",
+      /(self\.run_with\([\s\S]*?\n\s*)InputRuntime::finish,(\n\s*\)\n\s*\})/,
+      "$1removed_input_finish,$2",
+      /finish_startup_failure_with\(&mut self\.input_runtime,\s*error,\s*InputRuntime::finish\)/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production terminal-session path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking owner, import, or test reference`,
+    );
+    expectFailure(
+      `terminal session lifecycle validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /terminal_session_lifecycle source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/terminal_session\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/presentation.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "recorded reset result",
+      /let\s+reset_result\s*=\s*reset_title\(&mut terminal\);/,
+      "reset_title(&mut terminal)?; let reset_result = Ok(());",
+      /reset_failure_still_drops_terminal_and_finishes_input/,
+    ],
+    [
+      "terminal drop before input finish",
+      /drop_terminal\(terminal\);\s*let\s+finish_result\s*=\s*finish_input\(\);/,
+      "let finish_result = finish_input(); drop_terminal(terminal);",
+      /presentation_exit_resets_drops_then_finishes_input/,
+    ],
+    [
+      "reset error precedence",
+      /reset_result\.and\(finish_result\)/,
+      "finish_result.and(reset_result)",
+      /reset_failure_still_drops_terminal_and_finishes_input/,
+    ],
+    [
+      "body error precedence",
+      /Err\(error\)\s*=>\s*Err\(error\),\s*Ok\(value\)\s*=>\s*cleanup_result\.map\(\|\(\)\|\s*value\),/,
+      "Err(error) => cleanup_result.and(Err(error)), Ok(value) => Ok(value),",
+      /presentation_exit_cleanup_runs_after_body_error/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove or reorder its production presentation path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve masking presentation evidence`,
+    );
+    expectFailure(
+      `terminal session lifecycle validation rejects removed ${label} while tests remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /terminal_session_lifecycle source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/presentation\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/tui_run_lifecycle.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "renderer-inbox-agent shutdown order",
+      /shutdown_renderer\(\);\s*shutdown_inbox\(\);\s*let\s+agent_result\s*=\s*shutdown_agent\(\);/,
+      "shutdown_inbox(); shutdown_renderer(); let agent_result = shutdown_agent();",
+      /renderer_error_still_runs_all_shutdown_and_remains_primary/,
+    ],
+    [
+      "renderer error precedence",
+      /Err\(error\)\s*=>\s*Err\(error\),/,
+      "Err(_) => agent_result.and(Err(io::Error::other(\"removed renderer error\"))),",
+      /renderer failed/,
+    ],
+    [
+      "agent error propagation after renderer success",
+      /Ok\(value\)\s*=>\s*agent_result\.map\(\|\(\)\|\s*value\),/,
+      "Ok(value) => Ok(value),",
+      /successful_renderer_returns_agent_shutdown_error_after_all_cleanup/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove or reorder its production lifecycle path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve masking lifecycle test evidence`,
+    );
+    expectFailure(
+      `terminal session lifecycle validation rejects removed ${label} while tests remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /terminal_session_lifecycle source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/tui_run_lifecycle\.rs/,
+    );
+  }
+}
+
+{
   const relativePath = "crates/orca-tui/src/terminal_session.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   for (const [label, pattern, replacement, preserved] of [
@@ -1854,16 +2044,16 @@ expectFailure(
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/terminal_session.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const withoutOwnerConstruction = source.replace(
-    /RendererInputWakeOwner::new\(input_receivers,\s*MAX_INPUT_EVENTS_PER_BATCH\)/,
-    "RemovedInputWakeOwner::new(input_receivers, MAX_INPUT_EVENTS_PER_BATCH)",
+    /RendererInputWakeOwner::new\(input_receivers,\s*max_input_events\)/,
+    "RemovedInputWakeOwner::new(input_receivers, max_input_events)",
   );
   assert.notEqual(
     withoutOwnerConstruction,
     source,
-    "renderer input wake fixture must remove production app construction",
+    "renderer input wake fixture must remove production terminal-session construction",
   );
   assert.match(
     withoutOwnerConstruction,
@@ -1871,13 +2061,13 @@ expectFailure(
     "renderer input wake fixture must preserve the masking owner import",
   );
   expectFailure(
-    "renderer input wake validation rejects removed app construction while the import remains",
+    "renderer input wake validation rejects removed terminal-session construction while the import remains",
     () =>
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
         sourceOverrides: sourceOverride(relativePath, withoutOwnerConstruction),
       }),
-    /renderer_input_wake source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    /renderer_input_wake source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/terminal_session\.rs/,
   );
 }
 

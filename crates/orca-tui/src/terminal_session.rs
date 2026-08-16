@@ -7,13 +7,15 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::capability_backend::CapabilityBackend;
 use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions};
-use crate::presentation::InlineTerminal;
+use crate::presentation::{
+    InlineTerminal, finish_terminal_presentation, with_terminal_presentation_cleanup,
+};
+use crate::renderer_input_wake::RendererInputWakeOwner;
 use crate::stdio_guard::RetryWriter;
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
 
 type InlineBackend = CapabilityBackend<CrosstermBackend<RetryWriter<std::io::Stdout>>>;
-type TerminalPresentationResources = (InlineTerminal, TerminalPresentation, InputRuntime);
 
 pub(crate) struct TerminalInputReceivers {
     events: mpsc::Receiver<Event>,
@@ -113,22 +115,80 @@ impl PendingTerminalSession {
         Ok(ActivatedTerminalSession {
             theme,
             input_receivers,
-            resources: (terminal, presentation, input_runtime),
+            terminal,
+            presentation,
+            input: input_runtime,
         })
     }
 }
 
-pub(crate) struct ActivatedTerminalSession {
+pub(crate) struct ActivatedTerminalSession<Terminal = InlineTerminal, Input = InputRuntime> {
     theme: Theme,
     input_receivers: TerminalInputReceivers,
-    resources: TerminalPresentationResources,
+    terminal: Terminal,
+    presentation: TerminalPresentation,
+    input: Input,
+}
+
+impl<Terminal, Input> ActivatedTerminalSession<Terminal, Input> {
+    #[allow(clippy::too_many_arguments)]
+    fn run_with<R>(
+        self,
+        max_input_events: usize,
+        body: impl FnOnce(
+            &mut Terminal,
+            &mut TerminalPresentation,
+            &RendererInputWakeOwner,
+            &Theme,
+        ) -> io::Result<R>,
+        reset_title: impl FnOnce(&mut Terminal, &mut TerminalPresentation) -> io::Result<()>,
+        drop_terminal: impl FnOnce(Terminal),
+        finish_input: impl FnOnce(&mut Input) -> io::Result<()>,
+    ) -> io::Result<R> {
+        let Self {
+            theme,
+            input_receivers,
+            terminal,
+            presentation,
+            input,
+        } = self;
+        let input_wake = RendererInputWakeOwner::new(input_receivers, max_input_events);
+        with_terminal_presentation_cleanup(
+            (terminal, presentation, input),
+            |(terminal, presentation, _input)| body(terminal, presentation, &input_wake, &theme),
+            |(terminal, mut presentation, mut input)| {
+                finish_terminal_presentation(
+                    terminal,
+                    |terminal| reset_title(terminal, &mut presentation),
+                    drop_terminal,
+                    || finish_input(&mut input),
+                )
+            },
+        )
+    }
 }
 
 impl ActivatedTerminalSession {
-    pub(crate) fn into_parts(
+    pub(crate) fn run<R>(
         self,
-    ) -> (Theme, TerminalInputReceivers, TerminalPresentationResources) {
-        (self.theme, self.input_receivers, self.resources)
+        max_input_events: usize,
+        body: impl FnOnce(
+            &mut InlineTerminal,
+            &mut TerminalPresentation,
+            &RendererInputWakeOwner,
+            &Theme,
+        ) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.run_with(
+            max_input_events,
+            body,
+            |terminal, presentation| {
+                let _ = presentation.write_reset_title(terminal.backend_mut().inner_mut());
+                Ok(())
+            },
+            drop,
+            InputRuntime::finish,
+        )
     }
 }
 
@@ -158,8 +218,18 @@ mod tests {
     use std::cell::RefCell;
     use std::io;
     use std::rc::Rc;
+    use std::time::Duration;
 
-    use super::{activate_terminal_session_with, finish_startup_failure_with};
+    use crossbeam_channel as mpsc;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use orca_core::config::ThemeName;
+
+    use super::{
+        ActivatedTerminalSession, TerminalInputReceivers, activate_terminal_session_with,
+        finish_startup_failure_with,
+    };
+    use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
+    use crate::theme::Theme;
 
     #[test]
     fn activation_creates_then_clears_and_preserves_owned_resources() {
@@ -216,5 +286,72 @@ mod tests {
         .expect_err("finish error should preserve existing question-mark precedence");
         assert_eq!(input, ["finish"]);
         assert_eq!(error.to_string(), "finish failed");
+    }
+
+    #[test]
+    fn activated_session_owns_input_wake_body_and_total_cleanup() {
+        let (event_tx, event_rx) = mpsc::bounded(1);
+        let (_focus_tx, focus_rx) = mpsc::bounded(1);
+        let (_control_tx, control_rx) = mpsc::bounded(1);
+        event_tx
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .expect("queued input");
+
+        let session = ActivatedTerminalSession::<Vec<&str>, Vec<&str>> {
+            theme: Theme::named(ThemeName::Dark),
+            input_receivers: TerminalInputReceivers::from_parts_for_test(
+                event_rx, focus_rx, control_rx,
+            ),
+            terminal: Vec::new(),
+            presentation: TerminalPresentation::new(
+                false,
+                TerminalPresentationProfile {
+                    osc9_supported: false,
+                    tmux_passthrough: false,
+                },
+            ),
+            input: Vec::new(),
+        };
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let body_calls = Rc::clone(&calls);
+        let reset_calls = Rc::clone(&calls);
+        let drop_calls = Rc::clone(&calls);
+        let finish_calls = Rc::clone(&calls);
+
+        let error = session
+            .run_with(
+                1,
+                move |terminal, _presentation, input_wake, _theme| {
+                    let input = input_wake.receive(Duration::ZERO, || Ok(()))?;
+                    assert!(matches!(
+                        input.as_slice(),
+                        [Event::Key(key)] if key.code == KeyCode::Char('x')
+                    ));
+                    terminal.push("body");
+                    body_calls.borrow_mut().push("body");
+                    Err::<(), _>(io::Error::other("body failed"))
+                },
+                move |terminal, _presentation| {
+                    assert_eq!(terminal.as_slice(), ["body"]);
+                    reset_calls.borrow_mut().push("reset");
+                    Ok(())
+                },
+                move |terminal| {
+                    assert_eq!(terminal.as_slice(), ["body"]);
+                    drop_calls.borrow_mut().push("drop");
+                },
+                move |input| {
+                    input.push("finish");
+                    finish_calls.borrow_mut().push("finish");
+                    Ok(())
+                },
+            )
+            .expect_err("body error should survive total cleanup");
+
+        assert_eq!(error.to_string(), "body failed");
+        assert_eq!(*calls.borrow(), ["body", "reset", "drop", "finish"]);
     }
 }

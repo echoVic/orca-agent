@@ -86,6 +86,7 @@ mod terminal_session;
 pub mod theme;
 mod transcript_search;
 mod transcript_view;
+mod tui_run_lifecycle;
 pub mod types;
 pub mod ui;
 pub mod vim;

@@ -428,6 +428,10 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
     /PendingTerminalSession|pending_terminal_session\.activate\s*\(/,
   ],
   [
+    "terminal_session_lifecycle",
+    /ActivatedTerminalSession|finish_tui_run\s*\(/,
+  ],
+  [
     "renderer_input_wake",
     /RendererInputWakeOwner|renderer_input_wake\.receive\s*\(/,
   ],
@@ -510,7 +514,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
     new Map([
       [
         "crates/orca-tui/src/app.rs",
-        /let\s+renderer_runtime_inbox\s*=\s*RendererRuntimeInboxOwner::new\(pending_event_rx\);[\s\S]*?renderer_runtime\.shutdown\(\);\s*renderer_runtime_inbox\.shutdown\(\);\s*agent_runtime\.shutdown\(\)\?;/,
+        /let\s+renderer_runtime_inbox\s*=\s*RendererRuntimeInboxOwner::new\(pending_event_rx\);[\s\S]*?finish_tui_run\(\s*renderer_result,\s*\|\|\s*renderer_runtime\.shutdown\(\),\s*\|\|\s*renderer_runtime_inbox\.shutdown\(\),\s*\|\|\s*agent_runtime\.shutdown\(\),\s*\)\?;/,
       ],
       [
         "crates/orca-tui/src/renderer_loop.rs",
@@ -562,11 +566,32 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
     ]),
   ],
   [
-    "renderer_input_wake",
+    "terminal_session_lifecycle",
     new Map([
       [
         "crates/orca-tui/src/app.rs",
-        /let\s+renderer_input_wake\s*=\s*RendererInputWakeOwner::new\(input_receivers,\s*MAX_INPUT_EVENTS_PER_BATCH\);/,
+        /let\s+renderer_result\s*=\s*match\s+pending_terminal_session\.activate\(\)\s*\{\s*Ok\(terminal_session\)\s*=>\s*terminal_session\.run\([\s\S]*?\),\s*Err\(error\)\s*=>\s*Err\(error\),\s*\};\s*let\s+exit_code\s*=\s*finish_tui_run\(\s*renderer_result,\s*\|\|\s*renderer_runtime\.shutdown\(\),\s*\|\|\s*renderer_runtime_inbox\.shutdown\(\),\s*\|\|\s*agent_runtime\.shutdown\(\),\s*\)\?;/,
+      ],
+      [
+        "crates/orca-tui/src/terminal_session.rs",
+        /pub\(crate\)\s+struct\s+ActivatedTerminalSession<[\s\S]*?input_receivers:\s*TerminalInputReceivers,[\s\S]*?terminal:\s*Terminal,[\s\S]*?presentation:\s*TerminalPresentation,[\s\S]*?input:\s*Input,[\s\S]*?fn\s+run_with<R>\([\s\S]*?let\s+input_wake\s*=[\s\S]*?with_terminal_presentation_cleanup\([\s\S]*?body\(terminal,\s*presentation,\s*&input_wake,\s*&theme\)[\s\S]*?finish_terminal_presentation\([\s\S]*?pub\(crate\)\s+fn\s+run<R>\([\s\S]*?self\.run_with\([\s\S]*?InputRuntime::finish/,
+      ],
+      [
+        "crates/orca-tui/src/presentation.rs",
+        /pub\(crate\)\s+fn\s+finish_terminal_presentation<T>\([\s\S]*?let\s+reset_result\s*=\s*reset_title\(&mut terminal\);\s*drop_terminal\(terminal\);\s*let\s+finish_result\s*=\s*finish_input\(\);\s*reset_result\.and\(finish_result\)[\s\S]*?pub\(crate\)\s+fn\s+with_terminal_presentation_cleanup<T,\s*R>\([\s\S]*?let\s+result\s*=\s*body\(&mut resource\);\s*let\s+cleanup_result\s*=\s*cleanup\(resource\);\s*match\s+result\s*\{\s*Err\(error\)\s*=>\s*Err\(error\),\s*Ok\(value\)\s*=>\s*cleanup_result\.map\(\|\(\)\|\s*value\),\s*\}/,
+      ],
+      [
+        "crates/orca-tui/src/tui_run_lifecycle.rs",
+        /pub\(crate\)\s+fn\s+finish_tui_run<R>\([\s\S]*?shutdown_renderer\(\);\s*shutdown_inbox\(\);\s*let\s+agent_result\s*=\s*shutdown_agent\(\);\s*match\s+renderer_result\s*\{\s*Err\(error\)\s*=>\s*Err\(error\),\s*Ok\(value\)\s*=>\s*agent_result\.map\(\|\(\)\|\s*value\),\s*\}/,
+      ],
+    ]),
+  ],
+  [
+    "renderer_input_wake",
+    new Map([
+      [
+        "crates/orca-tui/src/terminal_session.rs",
+        /let\s+input_wake\s*=\s*RendererInputWakeOwner::new\(input_receivers,\s*max_input_events\);[\s\S]*?body\(terminal,\s*presentation,\s*&input_wake,\s*&theme\)/,
       ],
       [
         "crates/orca-tui/src/renderer_loop.rs",
@@ -613,7 +638,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
     new Map([
       [
         "crates/orca-tui/src/app.rs",
-        /let\s+exit_code\s*=\s*RendererLoopOwner::new\(\s*Instant::now\(\),\s*FRAME_INTERVAL,\s*ANIMATION_INTERVAL,\s*MAX_RUNTIME_EVENTS_PER_BATCH,\s*&renderer_input_wake,\s*&renderer_interaction_acks,\s*&renderer_runtime_inbox,\s*&mut\s+renderer_runtime,\s*&mut\s+state,\s*&mut\s+config,\s*&shared_config,\s*&action_tx,\s*&pending_workflow_notifications,\s*&preloaded_transcript,\s*&mut\s+textarea,\s*&mut\s+vim_state,\s*&theme,\s*presentation,\s*&initial_prompt,\s*&workspace_root,\s*\)\s*\.run\(\s*terminal,\s*clear_terminal_scrollback,\s*clipboard::copy_to_clipboard,\s*\|terminal, presentation, status\|\s*\{\s*let _ = presentation\.write_pending\(terminal\.backend_mut\(\)\.inner_mut\(\), status\);\s*\},\s*\)\?;/,
+        /let\s+exit_code\s*=\s*RendererLoopOwner::new\(\s*Instant::now\(\),\s*FRAME_INTERVAL,\s*ANIMATION_INTERVAL,\s*MAX_RUNTIME_EVENTS_PER_BATCH,\s*renderer_input_wake,\s*&renderer_interaction_acks,\s*&renderer_runtime_inbox,\s*&mut\s+renderer_runtime,\s*&mut\s+state,\s*&mut\s+config,\s*&shared_config,\s*&action_tx,\s*&pending_workflow_notifications,\s*&preloaded_transcript,\s*&mut\s+textarea,\s*&mut\s+vim_state,\s*theme,\s*presentation,\s*&initial_prompt,\s*&workspace_root,\s*\)\s*\.run\(\s*terminal,\s*clear_terminal_scrollback,\s*clipboard::copy_to_clipboard,\s*\|terminal, presentation, status\|\s*\{\s*let\s+_\s*=\s*presentation\.write_pending\(terminal\.backend_mut\(\)\.inner_mut\(\), status\);\s*\},\s*\)\?;/,
       ],
       [
         "crates/orca-tui/src/renderer_loop.rs",
@@ -1275,7 +1300,7 @@ const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
   ],
   [
     "crates/orca-tui/src/terminal_session.rs:activate",
-    "5d088b5e4d237218da39556f4edde68645b341ff3c01c434f8aee36d620cc966",
+    "f9eca3b48295a42fe97b0be295fa564d9116adf58b6c0f2b2242f73af6ed1567",
   ],
   [
     "crates/orca-tui/src/surface_actions.rs:launch_workflow",

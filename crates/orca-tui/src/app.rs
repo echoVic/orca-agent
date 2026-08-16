@@ -81,7 +81,6 @@ use crate::insert_escape::{
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
-use crate::renderer_input_wake::RendererInputWakeOwner;
 use crate::renderer_interaction_acks::RendererInteractionAckOwner;
 use crate::renderer_loop::RendererLoopOwner;
 use crate::renderer_runtime::RendererRuntimeEventOwner;
@@ -106,6 +105,7 @@ use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationPro
 use crate::terminal_session::PendingTerminalSession;
 #[cfg(test)]
 use crate::theme::Theme;
+use crate::tui_run_lifecycle::finish_tui_run;
 use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
 #[cfg(test)]
 use crate::types::{AttachedTuiEvent, SessionAttachmentId, SideParentStatus, TuiEvent};
@@ -116,12 +116,7 @@ use crate::workspace_config::{configure_and_preload_tui_state, configure_tui_syn
 use crate::workspace_config::{mention_search_roots, syntax_workspace_root};
 use crate::workspace_status;
 
-#[cfg(test)]
-use crate::presentation::complete_presentation_resume;
-use crate::presentation::{
-    finish_terminal_presentation, initialize_terminal_presentation,
-    with_terminal_presentation_cleanup,
-};
+use crate::presentation::initialize_terminal_presentation;
 
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
@@ -270,74 +265,66 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let mut renderer_runtime =
         RendererRuntimeEventOwner::new(mention_search, pending_initial_prompt);
 
-    let activated_terminal_session = pending_terminal_session.activate()?;
-    let (theme, input_receivers, resources) = activated_terminal_session.into_parts();
-    let renderer_input_wake =
-        RendererInputWakeOwner::new(input_receivers, MAX_INPUT_EVENTS_PER_BATCH);
-    let exit_code = with_terminal_presentation_cleanup(
-        resources,
-        |(terminal, presentation, _terminal_input)| {
-            let initial_status = state.status;
-            initialize_terminal_presentation(
-                terminal,
-                |terminal| {
-                    let _ = presentation
-                        .write_pending(terminal.backend_mut().inner_mut(), initial_status);
-                    Ok(())
-                },
-                |terminal| {
-                    terminal
-                        .draw(|f| ui::render(f, &mut state, &textarea, &theme))
-                        .map(|_| ())
-                },
-            )?;
-            let exit_code = RendererLoopOwner::new(
-                Instant::now(),
-                FRAME_INTERVAL,
-                ANIMATION_INTERVAL,
-                MAX_RUNTIME_EVENTS_PER_BATCH,
-                &renderer_input_wake,
-                &renderer_interaction_acks,
-                &renderer_runtime_inbox,
-                &mut renderer_runtime,
-                &mut state,
-                &mut config,
-                &shared_config,
-                &action_tx,
-                &pending_workflow_notifications,
-                &preloaded_transcript,
-                &mut textarea,
-                &mut vim_state,
-                &theme,
-                presentation,
-                &initial_prompt,
-                &workspace_root,
-            )
-            .run(
-                terminal,
-                clear_terminal_scrollback,
-                clipboard::copy_to_clipboard,
-                |terminal, presentation, status| {
-                    let _ = presentation.write_pending(terminal.backend_mut().inner_mut(), status);
-                },
-            )?;
-            Ok(exit_code)
-        },
-        |(terminal, mut presentation, mut terminal_input)| {
-            finish_terminal_presentation(
-                terminal,
-                |terminal| {
-                    let _ = presentation.write_reset_title(terminal.backend_mut().inner_mut());
-                    Ok(())
-                },
-                drop,
-                || terminal_input.finish(),
-            )
-        },
+    let renderer_result = match pending_terminal_session.activate() {
+        Ok(terminal_session) => terminal_session.run(
+            MAX_INPUT_EVENTS_PER_BATCH,
+            |terminal, presentation, renderer_input_wake, theme| {
+                let initial_status = state.status;
+                initialize_terminal_presentation(
+                    terminal,
+                    |terminal| {
+                        let _ = presentation
+                            .write_pending(terminal.backend_mut().inner_mut(), initial_status);
+                        Ok(())
+                    },
+                    |terminal| {
+                        terminal
+                            .draw(|f| ui::render(f, &mut state, &textarea, theme))
+                            .map(|_| ())
+                    },
+                )?;
+                let exit_code = RendererLoopOwner::new(
+                    Instant::now(),
+                    FRAME_INTERVAL,
+                    ANIMATION_INTERVAL,
+                    MAX_RUNTIME_EVENTS_PER_BATCH,
+                    renderer_input_wake,
+                    &renderer_interaction_acks,
+                    &renderer_runtime_inbox,
+                    &mut renderer_runtime,
+                    &mut state,
+                    &mut config,
+                    &shared_config,
+                    &action_tx,
+                    &pending_workflow_notifications,
+                    &preloaded_transcript,
+                    &mut textarea,
+                    &mut vim_state,
+                    theme,
+                    presentation,
+                    &initial_prompt,
+                    &workspace_root,
+                )
+                .run(
+                    terminal,
+                    clear_terminal_scrollback,
+                    clipboard::copy_to_clipboard,
+                    |terminal, presentation, status| {
+                        let _ =
+                            presentation.write_pending(terminal.backend_mut().inner_mut(), status);
+                    },
+                )?;
+                Ok(exit_code)
+            },
+        ),
+        Err(error) => Err(error),
+    };
+    let exit_code = finish_tui_run(
+        renderer_result,
+        || renderer_runtime.shutdown(),
+        || renderer_runtime_inbox.shutdown(),
+        || agent_runtime.shutdown(),
     )?;
-    renderer_runtime.shutdown();
-    renderer_runtime_inbox.shutdown();
-    agent_runtime.shutdown()?;
 
     Ok(TuiExit {
         code: exit_code,
@@ -928,96 +915,6 @@ mod tests {
 
         assert_eq!(event_rx.len(), 64);
         assert!(focus_rx.is_empty());
-    }
-
-    #[test]
-    fn terminal_title_writes_before_initial_draw() {
-        let mut calls = Vec::new();
-        initialize_terminal_presentation(
-            &mut calls,
-            |calls| {
-                calls.push("write-start");
-                Ok(())
-            },
-            |calls| {
-                calls.push("draw-start");
-                Ok(())
-            },
-        )
-        .expect("startup presentation");
-        assert_eq!(calls, ["write-start", "draw-start"]);
-    }
-
-    #[test]
-    fn presentation_resume_clears_invalidates_then_marks_dirty() {
-        let mut calls = Vec::new();
-        complete_presentation_resume(
-            &mut calls,
-            |calls| {
-                calls.push("clear");
-                Ok(())
-            },
-            |calls| calls.push("invalidate"),
-            |calls| calls.push("dirty"),
-        )
-        .expect("resume presentation");
-        assert_eq!(calls, ["clear", "invalidate", "dirty"]);
-
-        let mut calls = Vec::new();
-        let error = complete_presentation_resume(
-            &mut calls,
-            |_| Err(io::Error::other("clear failed")),
-            |calls| calls.push("invalidate"),
-            |calls| calls.push("dirty"),
-        )
-        .expect_err("clear failure should stop resume");
-        assert_eq!(error.to_string(), "clear failed");
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn presentation_exit_resets_drops_then_finishes_input() {
-        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let reset_exit = std::rc::Rc::clone(&calls);
-        let drop_exit = std::rc::Rc::clone(&calls);
-        let finish_exit = std::rc::Rc::clone(&calls);
-        finish_terminal_presentation(
-            (),
-            move |_| {
-                reset_exit.borrow_mut().push("reset");
-                Ok(())
-            },
-            move |_| drop_exit.borrow_mut().push("drop"),
-            move || {
-                finish_exit.borrow_mut().push("finish");
-                Ok(())
-            },
-        )
-        .expect("exit presentation");
-        assert_eq!(*calls.borrow(), ["reset", "drop", "finish"]);
-    }
-
-    #[test]
-    fn presentation_exit_cleanup_runs_after_body_error() {
-        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let body = std::rc::Rc::clone(&calls);
-        let cleanup = std::rc::Rc::clone(&calls);
-
-        let error = with_terminal_presentation_cleanup(
-            (),
-            move |_| {
-                body.borrow_mut().push("body");
-                Err::<i32, _>(io::Error::other("body failed"))
-            },
-            move |_| {
-                cleanup.borrow_mut().push("cleanup");
-                Ok(())
-            },
-        )
-        .expect_err("body error should be preserved");
-
-        assert_eq!(error.to_string(), "body failed");
-        assert_eq!(*calls.borrow(), ["body", "cleanup"]);
     }
 
     #[test]
