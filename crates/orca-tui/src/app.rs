@@ -86,8 +86,8 @@ use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::renderer_frame::RendererFrameOwner;
 use crate::renderer_input_router::RendererInputRouter;
 use crate::renderer_input_wake::RendererInputWakeOwner;
+use crate::renderer_interaction_acks::RendererInteractionAckOwner;
 use crate::renderer_runtime::RendererRuntimeEventOwner;
-use crate::runtime_event_actions::handle_interaction_response_ack;
 #[cfg(test)]
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
@@ -247,7 +247,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
         } else {
             None
         };
-    let interaction_ack_rx = agent_runtime.interaction_ack_receiver();
+    let renderer_interaction_acks =
+        RendererInteractionAckOwner::new(agent_runtime.interaction_ack_receiver());
     let event_rx = pending_event_rx;
 
     let mut vim_state =
@@ -308,18 +309,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                     renderer_frame.resume(terminal, presentation)
                 })?;
 
-                let mut interaction_acknowledged = false;
-                for ack in interaction_ack_rx.try_iter() {
-                    handle_interaction_response_ack(
-                        ack,
-                        &mut state,
-                        &mut textarea,
-                        &mut vim_state,
-                        &theme,
-                    );
-                    interaction_acknowledged = true;
-                }
-                if interaction_acknowledged {
+                if renderer_interaction_acks.drain(
+                    &mut state,
+                    &mut textarea,
+                    &mut vim_state,
+                    &theme,
+                ) {
                     renderer_frame.mark_dirty();
                 }
 

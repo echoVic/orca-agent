@@ -4511,7 +4511,7 @@
         "crates/orca-tui/src/runtime_event_actions.rs:127",
         "crates/orca-tui/src/action_dispatcher.rs:181",
         "crates/orca-tui/src/agent_runtime.rs:85",
-        "crates/orca-tui/src/app.rs:404",
+        "crates/orca-tui/src/renderer_interaction_acks.rs:19",
         "crates/orca-tui/src/runtime_event_actions.rs:19"
       ],
       "interaction_mutation",
@@ -5221,6 +5221,24 @@
       "presentation_input_routing_coordination",
       "app_owned_scroll_focus_insert_escape_paste_resize_mouse_and_key_order",
       "private_renderer_input_router",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
+    ],
+    [
+      "renderer_interaction_acks",
+      [
+        "crates/orca-tui/src/app.rs:250",
+        "crates/orca-tui/src/app.rs:312",
+        "crates/orca-tui/src/app.rs:318",
+        "crates/orca-tui/src/renderer_interaction_acks.rs:10",
+        "crates/orca-tui/src/renderer_interaction_acks.rs:15",
+        "crates/orca-tui/src/renderer_interaction_acks.rs:19",
+        "crates/orca-tui/src/renderer_interaction_acks.rs:27"
+      ],
+      "presentation_interaction_acknowledgement_coordination",
+      "app_owned_receiver_fifo_drain_and_nonempty_batch_activity",
+      "private_renderer_interaction_ack_owner",
       [],
       "typed snapshot/read consumer",
       "retain"

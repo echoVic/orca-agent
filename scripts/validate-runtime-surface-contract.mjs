@@ -427,6 +427,10 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
     "renderer_input_routing",
     /RendererInputRouter|RendererInputRouter::new\s*\(/,
   ],
+  [
+    "renderer_interaction_acks",
+    /RendererInteractionAckOwner|renderer_interaction_acks\.drain\s*\(/,
+  ],
 ]);
 
 const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
@@ -538,6 +542,19 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       [
         "crates/orca-tui/src/renderer_input_router.rs",
         /pub\(crate\)\s+struct\s+RendererInputRouter[\s\S]*?pub\(crate\)\s+fn\s+new\s*\([\s\S]*?pub\(crate\)\s+fn\s+route\s*\([\s\S]*?match\s+input\s*\{[\s\S]*?BatchedInputEvent::ScrollLines\(lines\)\s*=>\s*\{[\s\S]*?flush_pending_insert_escape_before_non_key\([\s\S]*?self\.vim_state\.cancel_pending_command\(\);[\s\S]*?handle_scroll_lines\(self\.state,\s*lines,\s*now\);[\s\S]*?BatchedInputEvent::Event\(event\)\s*=>\s*\{[\s\S]*?consume_focus_event\(&event,\s*self\.presentation\)[\s\S]*?return\s+Ok\(None\);[\s\S]*?resolve_pending_insert_escape_before_routing\([\s\S]*?==\s*PendingInsertEscapeRouting::Consumed[\s\S]*?return\s+Ok\(None\);[\s\S]*?matches!\(event,\s*Event::Paste\(_\)\)[\s\S]*?flush_pending_insert_escape_before_non_key\([\s\S]*?handle_paste_event\([\s\S]*?self\.vim_state\.cancel_pending_command\(\);[\s\S]*?return\s+Ok\(None\);[\s\S]*?handle_resize_event\(&event,\s*self\.state\)[\s\S]*?return\s+Ok\(None\);[\s\S]*?matches!\(event,\s*Event::Mouse\(_\)\)[\s\S]*?flush_pending_insert_escape_before_non_key\([\s\S]*?match\s+handle_mouse_event\([\s\S]*?MouseFlow::Handled\s*=>\s*\{\s*self\.vim_state\.cancel_pending_command\(\);\s*return\s+Ok\(None\);[\s\S]*?MouseFlow::SyntheticEnter\s*=>\s*\{\s*self\.vim_state\.cancel_pending_command\(\);\s*let\s+key\s*=\s*KeyEvent::new\(KeyCode::Enter,\s*KeyModifiers::NONE\);\s*let\s+event\s*=\s*Event::Key\(key\);\s*return\s+self\.route_status_key\(&event,\s*&key,\s*&mut\s+clear_terminal\);[\s\S]*?let\s+Event::Key\(key\)\s*=\s*&event\s+else[\s\S]*?match\s+handle_key_event_preflight\([\s\S]*?KeyEventFlow::Continue\s*=>\s*return\s+Ok\(None\),\s*KeyEventFlow::Exit\(code\)\s*=>\s*return\s+Ok\(Some\(code\)\),\s*KeyEventFlow::Unhandled\s*=>\s*\{\}[\s\S]*?self\.route_status_key\(&event,\s*key,\s*&mut\s+clear_terminal\)[\s\S]*?fn\s+route_status_key\s*\([\s\S]*?match\s+handle_status_key\([\s\S]*?StatusKeyFlow::Continue\s*=>\s*Ok\(None\),\s*StatusKeyFlow::Exit\(code\)\s*=>\s*Ok\(Some\(code\)\),[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
+      ],
+    ]),
+  ],
+  [
+    "renderer_interaction_acks",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /let\s+renderer_interaction_acks\s*=\s*RendererInteractionAckOwner::new\(agent_runtime\.interaction_ack_receiver\(\)\);[\s\S]*?if\s+renderer_interaction_acks\.drain\(\s*&mut\s+state,\s*&mut\s+textarea,\s*&mut\s+vim_state,\s*&theme,\s*\)\s*\{\s*renderer_frame\.mark_dirty\(\);\s*\}/,
+      ],
+      [
+        "crates/orca-tui/src/renderer_interaction_acks.rs",
+        /pub\(crate\)\s+struct\s+RendererInteractionAckOwner\s*\{\s*acknowledgements:\s*Receiver<InteractionResponseAck>,\s*\}[\s\S]*?pub\(crate\)\s+fn\s+new\(acknowledgements:\s*Receiver<InteractionResponseAck>\)\s*->\s*Self\s*\{\s*Self\s*\{\s*acknowledgements\s*\}\s*\}[\s\S]*?pub\(crate\)\s+fn\s+drain\s*\([\s\S]*?let\s+mut\s+received\s*=\s*false;\s*for\s+acknowledgement\s+in\s+self\.acknowledgements\.try_iter\(\)\s*\{\s*handle_interaction_response_ack\(acknowledgement,\s*state,\s*textarea,\s*vim_state,\s*theme\);\s*received\s*=\s*true;\s*\}\s*received\s*\}[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
       ],
     ]),
   ],
@@ -701,8 +718,8 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
         /\bUserAction::RespondToInteraction\s*\{\s*key\s*,\s*response\s*\}\s*=>/,
       ],
       [
-        "crates/orca-tui/src/app.rs",
-        /for\s+ack\s+in\s+interaction_ack_rx\.try_iter\(\)\s*\{\s*handle_interaction_response_ack\s*\(/,
+        "crates/orca-tui/src/renderer_interaction_acks.rs",
+        /use\s+crate::runtime_event_actions::handle_interaction_response_ack;[\s\S]*?for\s+acknowledgement\s+in\s+self\.acknowledgements\.try_iter\(\)\s*\{\s*handle_interaction_response_ack\(acknowledgement,\s*state,\s*textarea,\s*vim_state,\s*theme\);/,
       ],
     ]),
   ],

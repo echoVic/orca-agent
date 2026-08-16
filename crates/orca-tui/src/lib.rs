@@ -55,6 +55,7 @@ mod queued_input_actions;
 mod renderer_frame;
 mod renderer_input_router;
 mod renderer_input_wake;
+mod renderer_interaction_acks;
 mod renderer_runtime;
 mod running_actions;
 mod runtime_event_actions;

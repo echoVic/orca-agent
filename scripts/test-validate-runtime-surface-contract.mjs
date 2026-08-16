@@ -1112,13 +1112,12 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/renderer_interaction_acks.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
-  const pattern =
-    /for\s+ack\s+in\s+interaction_ack_rx\.try_iter\(\)\s*\{\s*handle_interaction_response_ack\s*\(/;
+  const pattern = /use\s+crate::runtime_event_actions::handle_interaction_response_ack;/;
   const withoutInteractionAckDrain = source.replace(
     pattern,
-    "for ack in interaction_ack_rx.try_iter() { handle_removed_interaction_response_ack(",
+    "use crate::runtime_event_actions::removed_interaction_response_ack;",
   );
   assert.notEqual(
     withoutInteractionAckDrain,
@@ -1127,8 +1126,8 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
   );
   assert.match(
     withoutInteractionAckDrain,
-    /RespondToInteraction/,
-    "RespondToInteraction fixture must preserve its tests and other references",
+    /handle_interaction_response_ack\(acknowledgement,\s*state,\s*textarea,\s*vim_state,\s*theme\);/,
+    "RespondToInteraction fixture must preserve its masking production reducer call",
   );
   expectFailure(
     "RespondToInteraction validation rejects removed acknowledgement drain while tests remain",
@@ -1137,7 +1136,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
         repoRoot,
         sourceOverrides: new Map([[relativePath, withoutInteractionAckDrain]]),
       }),
-    /RespondToInteraction source does not contain its reviewed action anchor: crates\/orca-tui\/src\/app\.rs/,
+    /RespondToInteraction source does not contain its reviewed action anchor: crates\/orca-tui\/src\/renderer_interaction_acks\.rs/,
   );
 }
 
@@ -1864,6 +1863,116 @@ expectFailure(
           sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
         }),
       /renderer_input_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_input_router\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "owner construction",
+      /RendererInteractionAckOwner::new\(agent_runtime\.interaction_ack_receiver\(\)\)/,
+      "RemovedInteractionAckOwner::new(agent_runtime.interaction_ack_receiver())",
+      /use\s+crate::renderer_interaction_acks::RendererInteractionAckOwner;/,
+    ],
+    [
+      "owner drain",
+      /if\s+renderer_interaction_acks\.drain\(/,
+      "if renderer_interaction_acks.removed_drain(",
+      /RendererInteractionAckOwner::new/,
+    ],
+    [
+      "nonempty batch dirty marking",
+      /if\s+renderer_interaction_acks\.drain\([\s\S]*?\)\s*\{\s*renderer_frame\.mark_dirty\(\);\s*\}/,
+      "if renderer_interaction_acks.drain(&mut state, &mut textarea, &mut vim_state, &theme) { removed_ack_dirty(); }",
+      /renderer_frame\.mark_dirty\(\)/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production app path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking import, construction, or unrelated dirty call`,
+    );
+    expectFailure(
+      `renderer interaction acknowledgement validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_interaction_acks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_interaction_acks.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "receiver retention",
+      /acknowledgements:\s*Receiver<InteractionResponseAck>,/,
+      "acknowledgements: RemovedInteractionAckReceiver,",
+      /Receiver<InteractionResponseAck>/,
+    ],
+    [
+      "receiver construction",
+      /Self\s*\{\s*acknowledgements\s*\}/,
+      "Self { acknowledgements: removed_receiver(acknowledgements) }",
+      /RendererInteractionAckOwner::new\(ack_rx\)/,
+    ],
+    [
+      "nonblocking queue iteration",
+      /self\.acknowledgements\.try_iter\(\)/,
+      "removed_nonblocking_iteration()",
+      /empty_and_disconnected_drains_are_inert/,
+    ],
+    [
+      "existing reducer delegation",
+      /handle_interaction_response_ack\(acknowledgement,\s*state,\s*textarea,\s*vim_state,\s*theme\);/,
+      "removed_ack_reducer(acknowledgement, state, textarea, vim_state, theme);",
+      /handle_interaction_response_ack/,
+    ],
+    [
+      "nonempty activity tracking",
+      /received\s*=\s*true;/,
+      "removed_batch_activity = true;",
+      /no_op_acknowledgement_still_reports_batch_activity/,
+    ],
+    [
+      "batch activity return",
+      /\n\s*received\n\s*\}\n\}/,
+      "\n        removed_batch_result\n    }\n}",
+      /assert!\(fixture\.drain\(&owner\)\)/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production owner path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking import, helper, or owner test`,
+    );
+    expectFailure(
+      `renderer interaction acknowledgement validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_interaction_acks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_interaction_acks\.rs/,
     );
   }
 }
