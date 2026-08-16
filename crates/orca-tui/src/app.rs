@@ -88,6 +88,7 @@ use crate::renderer_input_router::RendererInputRouter;
 use crate::renderer_input_wake::RendererInputWakeOwner;
 use crate::renderer_interaction_acks::RendererInteractionAckOwner;
 use crate::renderer_runtime::RendererRuntimeEventOwner;
+use crate::renderer_runtime_inbox::RendererRuntimeInboxOwner;
 #[cfg(test)]
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
@@ -249,7 +250,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
         };
     let renderer_interaction_acks =
         RendererInteractionAckOwner::new(agent_runtime.interaction_ack_receiver());
-    let event_rx = pending_event_rx;
+    let renderer_runtime_inbox = RendererRuntimeInboxOwner::new(pending_event_rx);
 
     let mut vim_state =
         VimState::with_insert_escape(config.vim_mode, config.vim_insert_escape.clone());
@@ -320,7 +321,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
 
                 let iteration = renderer_frame.run_iteration(
                     coalesce_input_events(input_events, 3),
-                    event_rx.try_iter(),
+                    renderer_runtime_inbox.pending(),
                     usize::MAX,
                     MAX_RUNTIME_EVENTS_PER_BATCH,
                     Instant::now,
@@ -401,7 +402,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
         },
     )?;
     renderer_runtime.shutdown();
-    drop(event_rx);
+    renderer_runtime_inbox.shutdown();
     agent_runtime.shutdown()?;
 
     Ok(TuiExit {

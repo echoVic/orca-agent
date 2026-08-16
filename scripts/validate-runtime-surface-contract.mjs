@@ -414,6 +414,10 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["input_history", /fn load_input_history|fn append_input_history|fn record_prompt/],
   ["terminal_clipboard_notifications", /MouseEventKind::Up|pending_clipboard_copy|desktop_notifications/],
   ["renderer_runtime_events", /RendererRuntimeEventOwner|renderer_runtime\.handle\s*\(/],
+  [
+    "renderer_runtime_inbox",
+    /RendererRuntimeInboxOwner|renderer_runtime_inbox\.pending\s*\(/,
+  ],
   ["renderer_frame", /RendererFrameOwner|renderer_frame\.prepare_iteration\s*\(/],
   [
     "terminal_session_startup",
@@ -490,6 +494,19 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       [
         "crates/orca-tui/src/renderer_runtime.rs",
         /pub\(crate\)\s+fn\s+handle\s*\([\s\S]*?match\s+accept_attached_tui_event\s*\([\s\S]*?self\.pending_initial_prompt\.take\(\)[\s\S]*?tui_event\s*=>\s*\{\s*handle_runtime_event\s*\(/,
+      ],
+    ]),
+  ],
+  [
+    "renderer_runtime_inbox",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /let\s+renderer_runtime_inbox\s*=\s*RendererRuntimeInboxOwner::new\(pending_event_rx\);[\s\S]*?renderer_frame\.run_iteration\([\s\S]*?renderer_runtime_inbox\.pending\(\)[\s\S]*?renderer_runtime\.shutdown\(\);\s*renderer_runtime_inbox\.shutdown\(\);\s*agent_runtime\.shutdown\(\)\?;/,
+      ],
+      [
+        "crates/orca-tui/src/renderer_runtime_inbox.rs",
+        /pub\(crate\)\s+struct\s+RendererRuntimeInboxOwner\s*\{\s*events:\s*TuiEventReceiver,\s*\}[\s\S]*?pub\(crate\)\s+fn\s+new\(events:\s*TuiEventReceiver\)\s*->\s*Self\s*\{\s*Self\s*\{\s*events\s*\}\s*\}[\s\S]*?pub\(crate\)\s+fn\s+pending\(&self\)\s*->\s*TryIter<'_,\s*TuiEvent>\s*\{\s*self\.events\.try_iter\(\)\s*\}[\s\S]*?pub\(crate\)\s+fn\s+shutdown\(self\)\s*\{\s*drop\(self\.events\);\s*\}[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
       ],
     ]),
   ],
@@ -1053,6 +1070,7 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_frame.resume", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_runtime.shutdown", 1],
+  ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_runtime_inbox.shutdown", 1],
   [
     "crates/orca-tui/src/hosted_session_lifecycle.rs:install_hosted_session:pending_workflow_notifications.clear",
     1,

@@ -5158,6 +5158,24 @@
       "retain"
     ],
     [
+      "renderer_runtime_inbox",
+      [
+        "crates/orca-tui/src/app.rs:253",
+        "crates/orca-tui/src/app.rs:324",
+        "crates/orca-tui/src/app.rs:405",
+        "crates/orca-tui/src/renderer_runtime_inbox.rs:6",
+        "crates/orca-tui/src/renderer_runtime_inbox.rs:11",
+        "crates/orca-tui/src/renderer_runtime_inbox.rs:15",
+        "crates/orca-tui/src/renderer_runtime_inbox.rs:19"
+      ],
+      "presentation_runtime_event_inbox_coordination",
+      "app_owned_receiver_try_iteration_and_pre_agent_close",
+      "private_renderer_runtime_inbox_owner",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
+    ],
+    [
       "renderer_frame",
       [
         "crates/orca-tui/src/app.rs:318",

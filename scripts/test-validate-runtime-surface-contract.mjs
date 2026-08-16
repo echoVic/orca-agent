@@ -1455,6 +1455,104 @@ expectFailure(
 {
   const relativePath = "crates/orca-tui/src/app.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "owner construction",
+      /RendererRuntimeInboxOwner::new\(pending_event_rx\)/,
+      "RemovedRuntimeInboxOwner::new(pending_event_rx)",
+      /use\s+crate::renderer_runtime_inbox::RendererRuntimeInboxOwner;/,
+    ],
+    [
+      "pending iterator delegation",
+      /renderer_runtime_inbox\.pending\(\)/,
+      "renderer_runtime_inbox.removed_pending()",
+      /RendererRuntimeInboxOwner::new/,
+    ],
+    [
+      "mention-inbox-agent shutdown order",
+      /renderer_runtime\.shutdown\(\);\s*renderer_runtime_inbox\.shutdown\(\);\s*agent_runtime\.shutdown\(\)\?;/,
+      "renderer_runtime.shutdown(); agent_runtime.shutdown()?; renderer_runtime_inbox.shutdown();",
+      /renderer_runtime_inbox\.shutdown\(\)/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production app path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking import, construction, or shutdown call`,
+    );
+    expectFailure(
+      `renderer runtime inbox validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_runtime_inbox source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_runtime_inbox.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "receiver retention",
+      /events:\s*TuiEventReceiver,/,
+      "events: RemovedTuiEventReceiver,",
+      /use\s+crate::channels::TuiEventReceiver;/,
+    ],
+    [
+      "receiver construction",
+      /Self\s*\{\s*events\s*\}/,
+      "Self { events: removed_receiver(events) }",
+      /RendererRuntimeInboxOwner::new\(event_rx\)/,
+    ],
+    [
+      "nonblocking pending iteration",
+      /self\.events\.try_iter\(\)/,
+      "removed_nonblocking_iteration()",
+      /pending_events_preserve_fifo_partial_consumption_and_receiver_identity/,
+    ],
+    [
+      "explicit receiver close",
+      /drop\(self\.events\);/,
+      "removed_receiver_close(self.events);",
+      /shutdown_releases_a_capacity_blocked_runtime_producer/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production owner path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking import or owner test`,
+    );
+    expectFailure(
+      `renderer runtime inbox validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_runtime_inbox source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_runtime_inbox\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const withoutOwnerCall = source.replace(
     /\brenderer_frame\.prepare_iteration\s*\(/,
     "renderer_frame.removed_prepare_iteration(",
