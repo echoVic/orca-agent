@@ -76,6 +76,7 @@ use crate::hosted_side::{
     shutdown_attached_side_on_controller_exit,
 };
 use crate::hosted_submission::handle_hosted_submitted_turn;
+use crate::hosted_workflow::{HostedWorkflowAction, handle_hosted_workflow_action};
 use crate::input_event_actions::{
     BatchedInputEvent, MouseFlow, coalesce_input_events, consume_focus_event, handle_mouse_event,
     handle_paste_event, handle_resize_event, handle_scroll_lines, should_queue_input_event,
@@ -8641,35 +8642,14 @@ fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::RunWorkflow { name, args }) => {
-                let cfg = config.lock().unwrap().clone();
-                let thread_was_missing = thread.is_none();
-                if let Err(error) = ensure_hosted_thread(
+                handle_hosted_workflow_action(
+                    HostedWorkflowAction::Run { name, args },
                     &mut thread,
                     &host,
-                    &cfg,
+                    &config,
                     &preloaded,
-                    &format!("Run saved workflow `{name}`"),
                     &event_tx,
-                ) {
-                    send_hosted_action_failure(&event_tx, error);
-                    continue;
-                }
-                if thread_was_missing {
-                    announce_runtime_ready(thread.as_ref().expect("workflow thread"), &event_tx);
-                }
-                if let Some(runtime_thread) = thread.as_ref() {
-                    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                    if let Err(error) = actions.launch_workflow(&name, args.as_deref(), &event_tx) {
-                        let _ = event_tx.send(TuiEvent::OperationRejected(error));
-                        continue;
-                    }
-                }
-                let _ = event_tx.send(TuiEvent::SessionCompleted {
-                    status: "success".to_string(),
-                });
-                if cfg.desktop_notifications {
-                    let _ = orca_runtime::notify::notify("Orca", "Workflow launched");
-                }
+                );
             }
             Ok(UserAction::Interrupt) | Ok(UserAction::BackgroundCurrentTurn) => {}
             Ok(UserAction::ResumeOperation { operation_id }) => {
@@ -8851,8 +8831,4 @@ fn hosted_tui_controller_loop(
     } else if let Some(runtime_thread) = thread {
         let _ = runtime_thread.shutdown();
     }
-}
-
-fn send_hosted_action_failure(event_tx: &mpsc::Sender<TuiEvent>, message: String) {
-    let _ = event_tx.send(TuiEvent::OperationRejected(message));
 }

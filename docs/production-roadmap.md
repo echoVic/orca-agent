@@ -278,6 +278,14 @@ while typed runtime surface actions remain the only mutation authority. This
 changes no memory/transcript schema, runtime surface, persistence, CLI,
 server/JSONL, ACP, or user-visible context behavior.
 
+The 2026-08-16 hosted workflow action ownership slice moves saved-workflow
+launch into one `hosted_workflow.rs` entry point. Hosted thread startup and
+title selection, readiness publication, typed launch rejection, immediate
+success completion, and desktop-notification policy now stay together while
+workflow admission, task state, and terminal notifications remain runtime-owned.
+This changes no workflow schema, runtime surface, persistence, CLI,
+server/JSONL, ACP, or user-visible workflow behavior.
+
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
 plan and its failed-update marker. Existing `PlanUpdated` and legacy
@@ -1474,7 +1482,7 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established twenty-six focused owners/boundaries so far (insert-escape, presentation,
+   stream has established twenty-seven focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection,
@@ -1482,8 +1490,9 @@ end state.
    orchestration, hosted session projection, hosted session lifecycle, hosted
    settings, hosted submission, hosted latest-active Goal recovery, hosted
    Goal action ownership, hosted session action ownership, hosted Side action
-   ownership, and hosted context action ownership); `app.rs` is currently
-   8,858 lines, `hosted_context.rs` 252 lines, `hosted_side.rs` 495 lines,
+   ownership, hosted context action ownership, and hosted workflow action
+   ownership); `app.rs` is currently 8,834 lines, `hosted_workflow.rs` 132
+   lines, `hosted_context.rs` 252 lines, `hosted_side.rs` 495 lines,
    `hosted_session_lifecycle.rs` 852 lines, `hosted_goal.rs` 404 lines, and
    `types.rs` 8,806 lines. Other
    renderer-owned orchestration plus cold legacy registry reconciliation remain open; live

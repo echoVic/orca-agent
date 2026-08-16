@@ -736,6 +736,58 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutDispatch = source.replace(
+    /\bHostedWorkflowAction::Run\s*\{\s*name\s*,\s*args\s*\}/,
+    "HostedWorkflowAction::RemovedRun { name, args }",
+  );
+  assert.notEqual(withoutDispatch, source, "RunWorkflow fixture must remove its production dispatch");
+  assert.match(
+    withoutDispatch,
+    /handle_hosted_workflow_action/,
+    "RunWorkflow fixture must preserve the owner import",
+  );
+  expectFailure(
+    "RunWorkflow validation rejects removed production dispatch while the import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutDispatch]]),
+      }),
+    /RunWorkflow source does not contain its reviewed action anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/hosted_workflow.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutOwnerBranch = source.replace(
+    /\bHostedWorkflowAction::Run\s*\{\s*name\s*,\s*args\s*\}\s*=>/,
+    "HostedWorkflowAction::RemovedRun { name, args } =>",
+  );
+  assert.notEqual(
+    withoutOwnerBranch,
+    source,
+    "RunWorkflow fixture must remove its production owner branch",
+  );
+  assert.match(
+    withoutOwnerBranch,
+    /\bRun\b/,
+    "RunWorkflow fixture must preserve an enum or test reference",
+  );
+  expectFailure(
+    "RunWorkflow validation rejects removed production owner while other references remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutOwnerBranch]]),
+      }),
+    /RunWorkflow source does not contain its reviewed action anchor: crates\/orca-tui\/src\/hosted_workflow\.rs/,
+  );
+}
+
+{
   const manifest = cloneManifest();
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\

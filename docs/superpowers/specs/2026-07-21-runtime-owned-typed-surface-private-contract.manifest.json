@@ -4200,11 +4200,13 @@
       "RunWorkflow",
       "current",
       [
-        "crates/orca-tui/src/types.rs:329",
-        "crates/orca-tui/src/slash_command_actions.rs:164"
+        "crates/orca-tui/src/types.rs:449",
+        "crates/orca-tui/src/slash_command_actions.rs:164",
+        "crates/orca-tui/src/hosted_workflow.rs:28",
+        "crates/orca-tui/src/app.rs:8646"
       ],
       "workflow_mutation",
-      "UserAction::RunWorkflow{name,args}",
+      "UserAction::RunWorkflow { name, args }",
       "WorkflowControl(Launch)",
       "WorkflowControl(Launch)",
       [

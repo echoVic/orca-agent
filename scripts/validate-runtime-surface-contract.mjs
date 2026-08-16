@@ -494,6 +494,16 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
       ["crates/orca-tui/src/hosted_context.rs", /\bHostedContextAction::Backtrack\s*=>/],
     ]),
   ],
+  [
+    "RunWorkflow",
+    new Map([
+      ["crates/orca-tui/src/app.rs", /\bHostedWorkflowAction::Run\s*\{\s*name\s*,\s*args\s*\}/],
+      [
+        "crates/orca-tui/src/hosted_workflow.rs",
+        /\bHostedWorkflowAction::Run\s*\{\s*name\s*,\s*args\s*\}\s*=>/,
+      ],
+    ]),
+  ],
 ]);
 
 function tuiEntrypointAnchor(entrypoint, relativePath) {
@@ -749,7 +759,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     2,
   ],
   [
-    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.launch_workflow",
+    "crates/orca-tui/src/hosted_workflow.rs:handle_hosted_workflow_action:thread.launch_workflow",
     1,
   ],
   [
