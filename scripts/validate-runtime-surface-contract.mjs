@@ -442,11 +442,42 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
   ],
 ]);
 
+const TUI_ACTION_SOURCE_ANCHORS = new Map([
+  [
+    "StartSideConversation",
+    new Map([
+      ["crates/orca-tui/src/app.rs", /\bHostedSideAction::Start\s*\{\s*prompt\s*\}/],
+      [
+        "crates/orca-tui/src/hosted_side.rs",
+        /\bHostedSideAction::Start\s*\{\s*prompt\s*\}\s*=>/,
+      ],
+    ]),
+  ],
+  [
+    "ToggleSideConversation",
+    new Map([
+      ["crates/orca-tui/src/app.rs", /\bHostedSideAction::Toggle\b/],
+      ["crates/orca-tui/src/hosted_side.rs", /\bHostedSideAction::Toggle\s*=>/],
+    ]),
+  ],
+  [
+    "CloseSideConversation",
+    new Map([
+      ["crates/orca-tui/src/app.rs", /\bHostedSideAction::Close\b/],
+      ["crates/orca-tui/src/hosted_side.rs", /\bHostedSideAction::Close\s*=>/],
+    ]),
+  ],
+]);
+
 function tuiEntrypointAnchor(entrypoint, relativePath) {
   return (
     TUI_ENTRYPOINT_SOURCE_ANCHORS.get(entrypoint)?.get(relativePath) ??
     TUI_ENTRYPOINT_ANCHORS.get(entrypoint)
   );
+}
+
+function tuiActionSourceAnchor(action, relativePath) {
+  return TUI_ACTION_SOURCE_ANCHORS.get(action)?.get(relativePath);
 }
 
 const TUI_RUNTIME_MUTATION_APIS = new Map([
@@ -3917,7 +3948,16 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
   }
   for (const row of manifest.tui_actions) {
     for (const reference of requireArray(row[2], `${row[0]} sources`)) {
-      validateSourceReference(repoRoot, reference, `${row[0]} source`, sourceOverrides);
+      const source = validateSourceReference(
+        repoRoot,
+        reference,
+        `${row[0]} source`,
+        sourceOverrides,
+      );
+      const anchor = tuiActionSourceAnchor(row[0], source.relativePath);
+      if (anchor && !anchor.test(source.source)) {
+        fail(`${row[0]} source does not contain its reviewed action anchor: ${reference}`);
+      }
     }
   }
   for (const [id, sourcePath, sourceLine] of manifest.non_event_sources) {

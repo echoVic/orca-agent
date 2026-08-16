@@ -11,13 +11,12 @@ use orca_runtime::runtime_host::{
 };
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
-use crate::attachment_routing::AttachmentRouting;
+use crate::attachment_routing::{AttachmentRouting, rotate_attached_event_sender};
 use crate::background_tasks::notify_recovered_background_approvals_for_tui;
 use crate::bridge;
 use crate::hosted_goal::{goal_continuation_prompt, send_goal_history_error};
 use crate::hosted_runtime::emit_hosted_operation_error;
 use crate::hosted_session::{announce_runtime_ready, emit_typed_history_snapshot};
-use crate::hosted_side::rotate_attached_event_sender;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};

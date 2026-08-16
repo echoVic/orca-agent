@@ -169,6 +169,27 @@ pub(crate) fn spawn_attached_event_sender(
     spawn_attached_event_sender_with_routing(root_event_tx, attachment, None)
 }
 
+pub(crate) fn rotate_attached_event_sender(
+    root_event_tx: &mpsc::Sender<TuiEvent>,
+    attachment: &mut SessionAttachmentId,
+    event_tx: &mut mpsc::Sender<TuiEvent>,
+    routing: Option<&Arc<Mutex<AttachmentRouting>>>,
+) {
+    *attachment = attachment.next();
+    *event_tx = match routing {
+        Some(routing) => {
+            let event_tx = spawn_attached_event_sender_with_routing(
+                root_event_tx.clone(),
+                *attachment,
+                Some(routing.clone()),
+            );
+            AttachmentRouting::switch_attachment(routing, root_event_tx, *attachment, None, false);
+            event_tx
+        }
+        None => spawn_attached_event_sender(root_event_tx.clone(), *attachment),
+    };
+}
+
 pub(crate) fn spawn_attached_event_sender_with_routing(
     root_event_tx: mpsc::Sender<TuiEvent>,
     attachment: SessionAttachmentId,

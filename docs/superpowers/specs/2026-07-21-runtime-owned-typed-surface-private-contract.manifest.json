@@ -3829,9 +3829,10 @@
       "StartSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs:541",
-        "crates/orca-tui/src/slash_command_actions.rs:187",
-        "crates/orca-tui/src/app.rs:8203"
+        "crates/orca-tui/src/types.rs:406",
+        "crates/orca-tui/src/slash_command_actions.rs:188",
+        "crates/orca-tui/src/hosted_side.rs:107",
+        "crates/orca-tui/src/app.rs:8475"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::StartSideConversation{prompt}",
@@ -3852,9 +3853,10 @@
       "ToggleSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs:544",
+        "crates/orca-tui/src/types.rs:409",
         "crates/orca-tui/src/global_actions.rs:52",
-        "crates/orca-tui/src/app.rs:8323"
+        "crates/orca-tui/src/hosted_side.rs:247",
+        "crates/orca-tui/src/app.rs:8491"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ToggleSideConversation",
@@ -3875,9 +3877,10 @@
       "CloseSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs:545",
+        "crates/orca-tui/src/types.rs:410",
         "crates/orca-tui/src/global_actions.rs:25",
-        "crates/orca-tui/src/app.rs:8374"
+        "crates/orca-tui/src/hosted_side.rs:359",
+        "crates/orca-tui/src/app.rs:8507"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::CloseSideConversation",
@@ -5014,7 +5017,7 @@
         "crates/orca-tui/src/session_picker_actions.rs:48",
         "crates/orca-tui/src/input_event_actions.rs:232",
         "crates/orca-tui/src/hosted_session_lifecycle.rs:321",
-        "crates/orca-tui/src/app.rs:8815"
+        "crates/orca-tui/src/app.rs:8522"
       ],
       "session_transition",
       "direct_transcript_load_without_switching_runtime_thread",
@@ -5031,7 +5034,7 @@
       [
         "crates/orca-tui/src/hosted_session_lifecycle.rs:560",
         "crates/orca-tui/src/hosted_goal.rs:184",
-        "crates/orca-tui/src/app.rs:9181"
+        "crates/orca-tui/src/app.rs:8888"
       ],
       "goal_session_operation_authority",
       "competing_goal_actor_reread_history_and_thread_shutdown",
