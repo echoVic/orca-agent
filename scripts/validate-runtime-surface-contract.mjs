@@ -530,6 +530,19 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
       ],
     ]),
   ],
+  [
+    "ImplementApprovedPlan",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /\bHostedPlanAction::ImplementApproved\s*\{\s*prompt\s*,\s*approval_mode\s*,?\s*\}/,
+      ],
+      [
+        "crates/orca-tui/src/hosted_plan.rs",
+        /\bHostedPlanAction::ImplementApproved\s*\{\s*prompt\s*,\s*approval_mode\s*,?\s*\}\s*=>/,
+      ],
+    ]),
+  ],
 ]);
 
 function tuiEntrypointAnchor(entrypoint, relativePath) {

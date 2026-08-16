@@ -870,6 +870,62 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutDispatch = source.replace(
+    /\bHostedPlanAction::ImplementApproved\s*\{\s*prompt\s*,\s*approval_mode\s*,?\s*\}/,
+    "HostedPlanAction::RemovedImplementApproved { prompt, approval_mode }",
+  );
+  assert.notEqual(
+    withoutDispatch,
+    source,
+    "ImplementApprovedPlan fixture must remove its production dispatch",
+  );
+  assert.match(
+    withoutDispatch,
+    /handle_hosted_plan_action/,
+    "ImplementApprovedPlan fixture must preserve the owner import",
+  );
+  expectFailure(
+    "ImplementApprovedPlan validation rejects removed dispatch while the import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutDispatch]]),
+      }),
+    /ImplementApprovedPlan source does not contain its reviewed action anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/hosted_plan.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutOwnerBranch = source.replace(
+    /\bHostedPlanAction::ImplementApproved\s*\{\s*prompt\s*,\s*approval_mode\s*,?\s*\}\s*=>/,
+    "HostedPlanAction::RemovedImplementApproved { prompt, approval_mode } =>",
+  );
+  assert.notEqual(
+    withoutOwnerBranch,
+    source,
+    "ImplementApprovedPlan fixture must remove its production owner branch",
+  );
+  assert.match(
+    withoutOwnerBranch,
+    /HostedPlanAction::ImplementApproved/,
+    "ImplementApprovedPlan fixture must preserve its enum or test reference",
+  );
+  expectFailure(
+    "ImplementApprovedPlan validation rejects removed owner while other references remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutOwnerBranch]]),
+      }),
+    /ImplementApprovedPlan source does not contain its reviewed action anchor: crates\/orca-tui\/src\/hosted_plan\.rs/,
+  );
+}
+
+{
   const manifest = cloneManifest();
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\

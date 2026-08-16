@@ -50,6 +50,7 @@ use crate::hosted_context::{HostedContextAction, handle_hosted_context_action};
 use crate::hosted_goal::run_hosted_goal_run;
 use crate::hosted_goal::{HostedGoalAction, handle_hosted_goal_action};
 use crate::hosted_operation::{HostedOperationAction, handle_hosted_operation_action};
+use crate::hosted_plan::{HostedPlanAction, handle_hosted_plan_action};
 #[cfg(test)]
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 #[cfg(test)]
@@ -69,9 +70,7 @@ use crate::hosted_session_lifecycle::start_new_hosted_session;
 use crate::hosted_session_lifecycle::{
     HostedSessionAction, ensure_hosted_thread, handle_hosted_session_action,
 };
-use crate::hosted_settings::{
-    apply_hosted_settings_action, settings_intent_patches, surface_approval_mode,
-};
+use crate::hosted_settings::{apply_hosted_settings_action, settings_intent_patches};
 use crate::hosted_side::{
     HostedSideAction, HostedSideParent, handle_hosted_side_action, hosted_config_for_active,
     shutdown_attached_side_on_controller_exit,
@@ -8564,33 +8563,19 @@ fn hosted_tui_controller_loop(
                 prompt,
                 approval_mode,
             }) => {
-                let settings_applied = apply_hosted_settings_action(
-                    thread.as_ref(),
+                handle_hosted_plan_action(
+                    HostedPlanAction::ImplementApproved {
+                        prompt,
+                        approval_mode,
+                    },
+                    &mut thread,
+                    &host,
                     &config,
+                    &preloaded,
                     &event_tx,
-                    vec![
-                        orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
-                            mode: surface_approval_mode(approval_mode),
-                        },
-                    ],
+                    &control,
+                    &pending_workflow_notifications,
                 );
-                if settings_applied {
-                    let _ = event_tx.send(TuiEvent::PlanImplementationStarted {
-                        prompt: prompt.clone(),
-                    });
-                    handle_hosted_submitted_turn(
-                        SubmittedTurn::user(prompt),
-                        &config,
-                        &preloaded,
-                        &mut thread,
-                        &event_tx,
-                        &control,
-                        &pending_workflow_notifications,
-                        &host,
-                    );
-                } else {
-                    control.cancel_surface_activation();
-                }
             }
             Ok(UserAction::Submit(prompt)) => handle_hosted_submitted_turn(
                 SubmittedTurn::user(prompt),

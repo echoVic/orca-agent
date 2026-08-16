@@ -4153,12 +4153,13 @@
       "ImplementApprovedPlan",
       "current",
       [
-        "crates/orca-tui/src/types.rs:564",
+        "crates/orca-tui/src/types.rs:444",
         "crates/orca-tui/src/plan_approval_actions.rs:55",
-        "crates/orca-tui/src/app.rs:8448"
+        "crates/orca-tui/src/hosted_plan.rs:37",
+        "crates/orca-tui/src/app.rs:8567"
       ],
       "runtime_mutation",
-      "UserAction::ImplementApprovedPlan{prompt,approval_mode}",
+      "UserAction::ImplementApprovedPlan { prompt, approval_mode }",
       "UpdateRuntimeSettings(SetApprovalMode)+ReserveOperation+AdmitReserved",
       "UpdateRuntimeSettings(SetApprovalMode)+ReserveOperation+AdmitReserved",
       [
