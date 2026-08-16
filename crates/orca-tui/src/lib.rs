@@ -25,6 +25,7 @@ mod frame_scheduler;
 mod global_actions;
 mod hosted_context;
 mod hosted_goal;
+mod hosted_operation;
 mod hosted_runtime;
 mod hosted_session;
 mod hosted_session_lifecycle;

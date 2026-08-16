@@ -4613,10 +4613,13 @@
       "ResumeOperation",
       "current",
       [
-        "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md:1599"
+        "crates/orca-tui/src/types.rs:483",
+        "crates/orca-tui/src/status_key_actions.rs:171",
+        "crates/orca-tui/src/hosted_operation.rs:30",
+        "crates/orca-tui/src/app.rs:8658"
       ],
       "recovery_mutation",
-      "UserAction::ResumeOperation",
+      "UserAction::ResumeOperation { operation_id }",
       "ResumeOperation(exact visible operation)",
       "ResumeOperation(exact visible operation)",
       [
@@ -4635,10 +4638,14 @@
       "CancelOperation",
       "current",
       [
-        "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md:1601"
+        "crates/orca-tui/src/types.rs:486",
+        "crates/orca-tui/src/status_key_actions.rs:173",
+        "crates/orca-tui/src/slash_command_actions.rs:219",
+        "crates/orca-tui/src/hosted_operation.rs:37",
+        "crates/orca-tui/src/app.rs:8666"
       ],
       "recovery_mutation",
-      "UserAction::CancelOperation",
+      "UserAction::CancelOperation { operation_id }",
       "CancelOperation(exact visible operation)",
       "CancelOperation(exact visible operation)",
       [

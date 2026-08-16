@@ -504,6 +504,32 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
       ],
     ]),
   ],
+  [
+    "ResumeOperation",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /\bHostedOperationAction::Resume\s*\{\s*operation_id\s*\}/,
+      ],
+      [
+        "crates/orca-tui/src/hosted_operation.rs",
+        /\bHostedOperationAction::Resume\s*\{\s*operation_id\s*\}\s*=>/,
+      ],
+    ]),
+  ],
+  [
+    "CancelOperation",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /\bHostedOperationAction::Cancel\s*\{\s*operation_id\s*\}/,
+      ],
+      [
+        "crates/orca-tui/src/hosted_operation.rs",
+        /\bHostedOperationAction::Cancel\s*\{\s*operation_id\s*\}\s*=>/,
+      ],
+    ]),
+  ],
 ]);
 
 function tuiEntrypointAnchor(entrypoint, relativePath) {

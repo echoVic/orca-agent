@@ -49,6 +49,7 @@ use crate::hosted_context::{HostedContextAction, handle_hosted_context_action};
 #[cfg(test)]
 use crate::hosted_goal::run_hosted_goal_run;
 use crate::hosted_goal::{HostedGoalAction, handle_hosted_goal_action};
+use crate::hosted_operation::{HostedOperationAction, handle_hosted_operation_action};
 #[cfg(test)]
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 #[cfg(test)]
@@ -8653,32 +8654,20 @@ fn hosted_tui_controller_loop(
             }
             Ok(UserAction::Interrupt) | Ok(UserAction::BackgroundCurrentTurn) => {}
             Ok(UserAction::ResumeOperation { operation_id }) => {
-                let Some(runtime_thread) = thread.as_ref() else {
-                    let _ = event_tx.send(TuiEvent::OperationRejected(
-                        "no recoverable operation is available".to_string(),
-                    ));
-                    continue;
-                };
-                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.resume_operation(&operation_id, &control, &event_tx) {
-                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
-                        "failed to resume operation: {error}"
-                    )));
-                }
+                handle_hosted_operation_action(
+                    HostedOperationAction::Resume { operation_id },
+                    thread.as_ref(),
+                    &control,
+                    &event_tx,
+                );
             }
             Ok(UserAction::CancelOperation { operation_id }) => {
-                let Some(runtime_thread) = thread.as_ref() else {
-                    let _ = event_tx.send(TuiEvent::OperationRejected(
-                        "no recoverable operation is available".to_string(),
-                    ));
-                    continue;
-                };
-                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.cancel_operation(&operation_id, &control, &event_tx) {
-                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
-                        "failed to cancel operation: {error}"
-                    )));
-                }
+                handle_hosted_operation_action(
+                    HostedOperationAction::Cancel { operation_id },
+                    thread.as_ref(),
+                    &control,
+                    &event_tx,
+                );
             }
             Ok(UserAction::SetModel(model)) => {
                 let patches = decode_settings_intent(&model)
