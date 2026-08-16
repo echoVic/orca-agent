@@ -23,6 +23,7 @@ mod edit_highlight_worker;
 mod exit_policy;
 mod frame_scheduler;
 mod global_actions;
+mod hosted_context;
 mod hosted_goal;
 mod hosted_runtime;
 mod hosted_session;

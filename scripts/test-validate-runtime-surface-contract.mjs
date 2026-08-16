@@ -651,6 +651,91 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [actionId, pattern, replacement] of [
+    [
+      "Remember",
+      /\bHostedContextAction::Remember\s*\{\s*scope\s*,\s*note\s*\}/,
+      "HostedContextAction::RemovedRemember { scope, note }",
+    ],
+    ["Compact", /\bHostedContextAction::Compact\b/, "HostedContextAction::RemovedCompact"],
+    ["Backtrack", /\bHostedContextAction::Backtrack\b/, "HostedContextAction::RemovedBacktrack"],
+  ]) {
+    const withoutDispatch = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutDispatch,
+      source,
+      `${actionId} mutation fixture must remove its production dispatch`,
+    );
+    assert.match(
+      withoutDispatch,
+      /handle_hosted_context_action/,
+      `${actionId} mutation fixture must preserve the owner import`,
+    );
+    expectFailure(
+      `${actionId} validation rejects removed production dispatch while the import remains`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: new Map([[relativePath, withoutDispatch]]),
+        }),
+      new RegExp(
+        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/app\\.rs`,
+      ),
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/hosted_context.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [actionId, variant, pattern, replacement] of [
+    [
+      "Remember",
+      "Remember",
+      /\bHostedContextAction::Remember\s*\{\s*scope\s*,\s*note\s*\}\s*=>/,
+      "HostedContextAction::RemovedRemember { scope, note } =>",
+    ],
+    [
+      "Compact",
+      "Compact",
+      /\bHostedContextAction::Compact\s*=>/,
+      "HostedContextAction::RemovedCompact =>",
+    ],
+    [
+      "Backtrack",
+      "Backtrack",
+      /\bHostedContextAction::Backtrack\s*=>/,
+      "HostedContextAction::RemovedBacktrack =>",
+    ],
+  ]) {
+    const withoutOwnerBranch = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutOwnerBranch,
+      source,
+      `${actionId} mutation fixture must remove its production owner branch`,
+    );
+    assert.match(
+      withoutOwnerBranch,
+      new RegExp(`\\b${variant}\\b`),
+      `${actionId} mutation fixture must preserve its enum or test reference`,
+    );
+    expectFailure(
+      `${actionId} validation rejects removed production owner while other references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: new Map([[relativePath, withoutOwnerBranch]]),
+        }),
+      new RegExp(
+        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/hosted_context\\.rs`,
+      ),
+    );
+  }
+}
+
+{
   const manifest = cloneManifest();
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\

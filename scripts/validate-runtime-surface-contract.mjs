@@ -467,6 +467,33 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
       ["crates/orca-tui/src/hosted_side.rs", /\bHostedSideAction::Close\s*=>/],
     ]),
   ],
+  [
+    "Remember",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /\bHostedContextAction::Remember\s*\{\s*scope\s*,\s*note\s*\}/,
+      ],
+      [
+        "crates/orca-tui/src/hosted_context.rs",
+        /\bHostedContextAction::Remember\s*\{\s*scope\s*,\s*note\s*\}\s*=>/,
+      ],
+    ]),
+  ],
+  [
+    "Compact",
+    new Map([
+      ["crates/orca-tui/src/app.rs", /\bHostedContextAction::Compact\b/],
+      ["crates/orca-tui/src/hosted_context.rs", /\bHostedContextAction::Compact\s*=>/],
+    ]),
+  ],
+  [
+    "Backtrack",
+    new Map([
+      ["crates/orca-tui/src/app.rs", /\bHostedContextAction::Backtrack\b/],
+      ["crates/orca-tui/src/hosted_context.rs", /\bHostedContextAction::Backtrack\s*=>/],
+    ]),
+  ],
 ]);
 
 function tuiEntrypointAnchor(entrypoint, relativePath) {
@@ -726,7 +753,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
     1,
   ],
   [
-    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.backtrack_last_user",
+    "crates/orca-tui/src/hosted_context.rs:handle_hosted_context_action:thread.backtrack_last_user",
     1,
   ],
   [

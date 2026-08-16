@@ -270,6 +270,14 @@ sender rotation helper moves to `attachment_routing.rs`, avoiding a new
 production dependency cycle with session lifecycle. This changes no runtime
 surface, persistence, CLI, server/JSONL, ACP, or user-visible Side behavior.
 
+The 2026-08-16 hosted context action ownership slice moves Remember, Compact,
+and Backtrack into one `hosted_context.rs` entry point. Recorded-thread startup,
+runtime-ready publication, memory/pin partial-success ordering, manual
+compaction error shaping, and restored-prompt translation now stay together
+while typed runtime surface actions remain the only mutation authority. This
+changes no memory/transcript schema, runtime surface, persistence, CLI,
+server/JSONL, ACP, or user-visible context behavior.
+
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
 plan and its failed-update marker. Existing `PlanUpdated` and legacy
@@ -1466,17 +1474,18 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established twenty-five focused owners/boundaries so far (insert-escape, presentation,
+   stream has established twenty-six focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection,
    session-identity projection, workflow-task projection, hosted Goal
    orchestration, hosted session projection, hosted session lifecycle, hosted
    settings, hosted submission, hosted latest-active Goal recovery, hosted
-   Goal action ownership, hosted session action ownership, and hosted Side
-   action ownership); `app.rs` is currently 8,973 lines, `hosted_side.rs` 495
-   lines, `hosted_session_lifecycle.rs` 852 lines, `hosted_goal.rs` 404 lines,
-   and `types.rs` 8,806 lines. Other
+   Goal action ownership, hosted session action ownership, hosted Side action
+   ownership, and hosted context action ownership); `app.rs` is currently
+   8,858 lines, `hosted_context.rs` 252 lines, `hosted_side.rs` 495 lines,
+   `hosted_session_lifecycle.rs` 852 lines, `hosted_goal.rs` 404 lines, and
+   `types.rs` 8,806 lines. Other
    renderer-owned orchestration plus cold legacy registry reconciliation remain open; live
    task/operation projection duplication has been removed from the TUI event
    boundary (`surface_projection.rs`, 3,280 lines).

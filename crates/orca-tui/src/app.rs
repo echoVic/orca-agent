@@ -45,6 +45,7 @@ use crate::composer_textarea::{
 use crate::exit_policy::TuiExit;
 use crate::exit_policy::{exit_resume_hint, exit_session_id};
 use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
+use crate::hosted_context::{HostedContextAction, handle_hosted_context_action};
 #[cfg(test)]
 use crate::hosted_goal::run_hosted_goal_run;
 use crate::hosted_goal::{HostedGoalAction, handle_hosted_goal_action};
@@ -4865,79 +4866,6 @@ done
     }
 
     #[test]
-    fn remember_without_thread_commits_through_typed_surface() {
-        with_orca_home(|home| {
-            let mut config = test_config(HistoryMode::Record);
-            config.cwd = Some(home.to_path_buf());
-            let preloaded = Arc::new(Mutex::new(None));
-            let event_tx = mpsc::unbounded().0;
-            let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
-            let host_handle = host.handle();
-            let mut thread = None;
-
-            ensure_hosted_thread(
-                &mut thread,
-                &host_handle,
-                &config,
-                &preloaded,
-                "remembered context",
-                &event_tx,
-            )
-            .expect("runtime-owned thread starts for remember");
-            let runtime_thread = thread.as_ref().expect("thread is initialized");
-            let typed_thread = runtime_thread.typed_surface();
-            let actions = TuiSurfaceActions::new(typed_thread.clone());
-            let memory_path = actions
-                .remember(
-                    crate::types::TuiMemoryScope::User,
-                    home,
-                    "prefer durable runtime ownership",
-                )
-                .expect("runtime-owned memory mutation");
-            assert!(
-                std::fs::read_to_string(memory_path)
-                    .expect("saved memory")
-                    .contains("prefer durable runtime ownership")
-            );
-            actions
-                .add_pinned_context("[Pinned remembered note]\nprefer durable runtime ownership")
-                .expect("typed pinned context mutation");
-
-            let attachment = match typed_thread.surface().attach_fresh(
-                orca_runtime::surface::FreshAttachRequest {
-                    request_id: orca_runtime::surface::SurfaceRequestId::new(),
-                    role: orca_runtime::surface::SurfaceAttachmentRole::Tui,
-                    requested_capabilities: std::collections::BTreeSet::from([
-                        orca_runtime::surface::SurfaceCapability::ReadSnapshot,
-                    ]),
-                    interaction_capabilities: std::collections::BTreeSet::new(),
-                },
-            ) {
-                orca_runtime::surface::AttachResult::FreshAttached { attachment } => attachment,
-                _ => panic!("typed pinned context attach failed"),
-            };
-            assert!(
-                attachment
-                    .baseline
-                    .snapshot
-                    .pinned_context
-                    .entries
-                    .iter()
-                    .any(|entry| entry.content.as_str().contains("durable runtime ownership"))
-            );
-            typed_thread.surface().detach(
-                &attachment.client,
-                orca_runtime::surface::DetachRequest {
-                    request_id: orca_runtime::surface::SurfaceRequestId::new(),
-                },
-            );
-
-            thread.unwrap().shutdown().unwrap();
-            host.shutdown().unwrap();
-        });
-    }
-
-    #[test]
     fn remember_slash_command_dispatches_scope_without_writing_memory() {
         with_orca_home(|home| {
             let mut config = test_config(HistoryMode::Record);
@@ -8785,80 +8713,37 @@ fn hosted_tui_controller_loop(
                 apply_hosted_settings_action(thread.as_ref(), &config, &event_tx, patches);
             }
             Ok(UserAction::Remember { scope, note }) => {
-                let context = format!("[Pinned remembered note]\n{}", note.trim());
-                let thread_was_missing = thread.is_none();
-                let cfg = config.lock().unwrap().clone();
-                if thread.is_none() {
-                    if let Err(error) = ensure_hosted_thread(
-                        &mut thread,
-                        &host,
-                        &cfg,
-                        &preloaded,
-                        "Remembered context",
-                        &event_tx,
-                    ) {
-                        let _ = event_tx.send(TuiEvent::Error(error));
-                        continue;
-                    }
-                }
-                if thread_was_missing {
-                    announce_runtime_ready(thread.as_ref().expect("remember thread"), &event_tx);
-                }
-                if let Some(runtime_thread) = thread.as_ref() {
-                    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                    let cwd = cfg
-                        .cwd
-                        .clone()
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    match actions.remember(scope, &cwd, &note) {
-                        Ok(path) => {
-                            let _ = event_tx.send(TuiEvent::Notice(format!(
-                                "Remembered in {}.",
-                                path.display()
-                            )));
-                            if let Err(error) = actions.add_pinned_context(&context) {
-                                let _ = event_tx.send(TuiEvent::Error(format!(
-                                    "memory was saved but could not be pinned: {error}"
-                                )));
-                            }
-                        }
-                        Err(error) => {
-                            let _ = event_tx
-                                .send(TuiEvent::Error(format!("failed to remember: {error}")));
-                        }
-                    }
-                }
+                handle_hosted_context_action(
+                    HostedContextAction::Remember { scope, note },
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &event_tx,
+                    &control,
+                );
             }
             Ok(UserAction::Compact) => {
-                let Some(runtime_thread) = thread.as_ref() else {
-                    let _ = event_tx.send(TuiEvent::Error("nothing to compact".to_string()));
-                    continue;
-                };
-                let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-                if let Err(error) = actions.manual_compact(&control, &event_tx) {
-                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
-                        "manual compaction failed: {error}"
-                    )));
-                }
+                handle_hosted_context_action(
+                    HostedContextAction::Compact,
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &event_tx,
+                    &control,
+                );
             }
             Ok(UserAction::Backtrack) => {
-                let result = thread
-                    .as_ref()
-                    .map(|runtime_thread| {
-                        TuiSurfaceActions::new(runtime_thread.typed_surface()).backtrack_last_user()
-                    })
-                    .transpose();
-                match result {
-                    Ok(Some(Some(prompt))) => {
-                        let _ = event_tx.send(TuiEvent::Backtracked { prompt });
-                    }
-                    Ok(Some(None)) | Ok(None) => {
-                        let _ = event_tx.send(TuiEvent::Error("nothing to backtrack".to_string()));
-                    }
-                    Err(error) => {
-                        let _ = event_tx.send(TuiEvent::Error(error.to_string()));
-                    }
-                }
+                handle_hosted_context_action(
+                    HostedContextAction::Backtrack,
+                    &mut thread,
+                    &host,
+                    &config,
+                    &preloaded,
+                    &event_tx,
+                    &control,
+                );
             }
             Ok(UserAction::StopTask { task_id }) => {
                 let actions = thread

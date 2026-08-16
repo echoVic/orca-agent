@@ -4246,11 +4246,13 @@
       "Remember",
       "current",
       [
-        "crates/orca-tui/src/types.rs:334",
-        "crates/orca-tui/src/slash_command_actions.rs:196"
+        "crates/orca-tui/src/types.rs:454",
+        "crates/orca-tui/src/slash_command_actions.rs:147",
+        "crates/orca-tui/src/hosted_context.rs:33",
+        "crates/orca-tui/src/app.rs:8717"
       ],
       "host_store_and_thread_mutation",
-      "UserAction::Remember(String)",
+      "UserAction::Remember { scope, note }",
       "RememberMemory(typed scope and optional pin)",
       "RememberMemory(typed scope and optional pin)",
       [
@@ -4269,8 +4271,10 @@
       "Compact",
       "current",
       [
-        "crates/orca-tui/src/types.rs:335",
-        "crates/orca-tui/src/slash_command_actions.rs:199"
+        "crates/orca-tui/src/types.rs:458",
+        "crates/orca-tui/src/slash_command_actions.rs:151",
+        "crates/orca-tui/src/hosted_context.rs:78",
+        "crates/orca-tui/src/app.rs:8728"
       ],
       "runtime_mutation",
       "UserAction::Compact",
@@ -4517,8 +4521,10 @@
       "Backtrack",
       "current",
       [
-        "crates/orca-tui/src/types.rs:356",
-        "crates/orca-tui/src/idle_navigation_actions.rs:59"
+        "crates/orca-tui/src/types.rs:479",
+        "crates/orca-tui/src/idle_navigation_actions.rs:59",
+        "crates/orca-tui/src/hosted_context.rs:90",
+        "crates/orca-tui/src/app.rs:8739"
       ],
       "history_mutation",
       "UserAction::Backtrack",
@@ -5017,7 +5023,7 @@
         "crates/orca-tui/src/session_picker_actions.rs:48",
         "crates/orca-tui/src/input_event_actions.rs:232",
         "crates/orca-tui/src/hosted_session_lifecycle.rs:321",
-        "crates/orca-tui/src/app.rs:8522"
+        "crates/orca-tui/src/app.rs:8450"
       ],
       "session_transition",
       "direct_transcript_load_without_switching_runtime_thread",
@@ -5034,7 +5040,7 @@
       [
         "crates/orca-tui/src/hosted_session_lifecycle.rs:560",
         "crates/orca-tui/src/hosted_goal.rs:184",
-        "crates/orca-tui/src/app.rs:8888"
+        "crates/orca-tui/src/app.rs:8773"
       ],
       "goal_session_operation_authority",
       "competing_goal_actor_reread_history_and_thread_shutdown",
