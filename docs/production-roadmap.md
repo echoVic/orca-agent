@@ -306,6 +306,16 @@ the existing user action. This changes no plan prompt, settings or operation
 authority, runtime surface, persistence, CLI, server/JSONL, ACP, or user-visible
 plan behavior.
 
+The 2026-08-16 hosted task action ownership slice consolidates task stop,
+foreground return, and background approval resolution in
+`background_tasks.rs`. The controller now only maps the existing user actions;
+task/interaction fences, response routing, operation presentation, retries,
+timeouts, and terminal settlement remain runtime-surface owned. Denied or
+failed background approval paths now release the dispatcher-prearmed surface
+activation, preventing an idle interrupt from leaking into the next operation.
+This changes no task or interaction schema, persistence, CLI, server/JSONL,
+ACP, or public API.
+
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
 plan and its failed-update marker. Existing `PlanUpdated` and legacy
@@ -1502,7 +1512,7 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established twenty-nine focused owners/boundaries so far (insert-escape, presentation,
+   stream has established thirty focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection,
@@ -1511,13 +1521,13 @@ end state.
    settings, hosted submission, hosted latest-active Goal recovery, hosted
    Goal action ownership, hosted session action ownership, hosted Side action
    ownership, hosted context action ownership, hosted workflow action
-   ownership, hosted operation recovery ownership, and hosted plan
-   implementation ownership); `app.rs` is currently 8,808 lines,
+   ownership, hosted operation recovery ownership, hosted plan implementation
+   ownership, and hosted task action ownership); `app.rs` is currently 8,826 lines,
    `hosted_plan.rs` 247 lines, `hosted_operation.rs` 132 lines,
    `hosted_workflow.rs` 132 lines,
    `hosted_context.rs` 252 lines, `hosted_side.rs` 495 lines,
-   `hosted_session_lifecycle.rs` 852 lines, `hosted_goal.rs` 404 lines, and
-   `types.rs` 8,806 lines. Other
+   `hosted_session_lifecycle.rs` 852 lines, `hosted_goal.rs` 404 lines,
+   `background_tasks.rs` 239 lines, and `types.rs` 8,806 lines. Other
    renderer-owned orchestration plus cold legacy registry reconciliation remain open; live
    task/operation projection duplication has been removed from the TUI event
    boundary (`surface_projection.rs`, 3,280 lines).

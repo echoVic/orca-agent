@@ -30,9 +30,8 @@ use crate::attachment_routing::{
 };
 #[cfg(test)]
 use crate::attachment_routing::{reduce_attached_tui_event, rotate_attached_event_sender};
-use crate::background_approval::submit_background_approval_response_for_tui;
 use crate::background_tasks::{
-    foreground_task_for_tui, notify_recovered_background_approvals_for_tui, stop_task_for_tui,
+    HostedTaskAction, handle_hosted_task_action, notify_recovered_background_approvals_for_tui,
 };
 use crate::bridge;
 use crate::capability_backend::CapabilityBackend;
@@ -3325,8 +3324,6 @@ done
                     break;
                 }
             }
-            action_tx.send(UserAction::Cancel).unwrap();
-            handle.join().unwrap();
             assert!(
                 stopped,
                 "denied background task was not stopped; saw {seen:?}"
@@ -3335,6 +3332,27 @@ done
                 denied_notice,
                 "denied background approval notice was not emitted; saw {seen:?}"
             );
+
+            action_tx.send(UserAction::Interrupt).unwrap();
+            action_tx
+                .send(UserAction::Submit(
+                    "turn after denied background approval".to_string(),
+                ))
+                .unwrap();
+            let mut next_turn_started = false;
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    TuiEvent::TurnStarted { .. } => next_turn_started = true,
+                    TuiEvent::SessionCompleted { status } if next_turn_started => {
+                        assert_eq!(status, "success");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            action_tx.send(UserAction::Cancel).unwrap();
+            handle.join().unwrap();
         });
     }
 
@@ -8700,25 +8718,25 @@ fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::StopTask { task_id }) => {
-                let actions = thread
-                    .as_ref()
-                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let _ = stop_task_for_tui(actions.as_ref(), &task_id, &control, &event_tx);
+                handle_hosted_task_action(
+                    HostedTaskAction::Stop { task_id },
+                    thread.as_ref(),
+                    &control,
+                    &event_tx,
+                );
             }
             Ok(UserAction::ForegroundTask { task_id }) => {
-                let actions = thread
-                    .as_ref()
-                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                let _ = foreground_task_for_tui(actions.as_ref(), &task_id, &control, &event_tx);
+                handle_hosted_task_action(
+                    HostedTaskAction::Foreground { task_id },
+                    thread.as_ref(),
+                    &control,
+                    &event_tx,
+                );
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
-                let actions = thread
-                    .as_ref()
-                    .map(|thread| TuiSurfaceActions::new(thread.typed_surface()));
-                submit_background_approval_response_for_tui(
-                    actions.as_ref(),
-                    &id,
-                    approved,
+                handle_hosted_task_action(
+                    HostedTaskAction::ResolveBackgroundApproval { id, approved },
+                    thread.as_ref(),
                     &control,
                     &event_tx,
                 );

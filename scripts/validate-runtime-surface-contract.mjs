@@ -543,6 +543,42 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
       ],
     ]),
   ],
+  [
+    "ResolveBackgroundApproval",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /\bHostedTaskAction::ResolveBackgroundApproval\s*\{\s*id\s*,\s*approved\s*,?\s*\}/,
+      ],
+      [
+        "crates/orca-tui/src/background_tasks.rs",
+        /\bHostedTaskAction::ResolveBackgroundApproval\s*\{\s*id\s*,\s*approved\s*,?\s*\}\s*=>/,
+      ],
+    ]),
+  ],
+  [
+    "StopTask",
+    new Map([
+      ["crates/orca-tui/src/app.rs", /\bHostedTaskAction::Stop\s*\{\s*task_id\s*\}/],
+      [
+        "crates/orca-tui/src/background_tasks.rs",
+        /\bHostedTaskAction::Stop\s*\{\s*task_id\s*\}\s*=>/,
+      ],
+    ]),
+  ],
+  [
+    "ForegroundTask",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /\bHostedTaskAction::Foreground\s*\{\s*task_id\s*\}/,
+      ],
+      [
+        "crates/orca-tui/src/background_tasks.rs",
+        /\bHostedTaskAction::Foreground\s*\{\s*task_id\s*\}\s*=>/,
+      ],
+    ]),
+  ],
 ]);
 
 function tuiEntrypointAnchor(entrypoint, relativePath) {
@@ -828,12 +864,9 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/hosted_session_lifecycle.rs:reap_hosted_thread:thread.shutdown", 2],
   ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 2],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
+  ["crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:task.mutate", 2],
   [
-    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop:task.mutate",
-    2,
-  ],
-  [
-    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop:background_approval.respond",
+    "crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:background_approval.respond",
     1,
   ],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval:user_action.route", 2],

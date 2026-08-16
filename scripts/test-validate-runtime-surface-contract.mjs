@@ -926,6 +926,99 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [actionId, pattern, replacement] of [
+    [
+      "ResolveBackgroundApproval",
+      /\bHostedTaskAction::ResolveBackgroundApproval\s*\{\s*id\s*,\s*approved\s*,?\s*\}/,
+      "HostedTaskAction::RemovedResolveBackgroundApproval { id, approved }",
+    ],
+    [
+      "StopTask",
+      /\bHostedTaskAction::Stop\s*\{\s*task_id\s*\}/,
+      "HostedTaskAction::RemovedStop { task_id }",
+    ],
+    [
+      "ForegroundTask",
+      /\bHostedTaskAction::Foreground\s*\{\s*task_id\s*\}/,
+      "HostedTaskAction::RemovedForeground { task_id }",
+    ],
+  ]) {
+    const withoutDispatch = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutDispatch,
+      source,
+      `${actionId} fixture must remove its production dispatch`,
+    );
+    assert.match(
+      withoutDispatch,
+      /handle_hosted_task_action/,
+      `${actionId} fixture must preserve the owner import`,
+    );
+    expectFailure(
+      `${actionId} validation rejects removed production dispatch while the import remains`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: new Map([[relativePath, withoutDispatch]]),
+        }),
+      new RegExp(
+        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/app\\.rs`,
+      ),
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/background_tasks.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [actionId, variant, pattern, replacement] of [
+    [
+      "ResolveBackgroundApproval",
+      "ResolveBackgroundApproval",
+      /\bHostedTaskAction::ResolveBackgroundApproval\s*\{\s*id\s*,\s*approved\s*,?\s*\}\s*=>/,
+      "HostedTaskAction::RemovedResolveBackgroundApproval { id, approved } =>",
+    ],
+    [
+      "StopTask",
+      "Stop",
+      /\bHostedTaskAction::Stop\s*\{\s*task_id\s*\}\s*=>/,
+      "HostedTaskAction::RemovedStop { task_id } =>",
+    ],
+    [
+      "ForegroundTask",
+      "Foreground",
+      /\bHostedTaskAction::Foreground\s*\{\s*task_id\s*\}\s*=>/,
+      "HostedTaskAction::RemovedForeground { task_id } =>",
+    ],
+  ]) {
+    const withoutOwnerBranch = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutOwnerBranch,
+      source,
+      `${actionId} fixture must remove its production owner branch`,
+    );
+    assert.match(
+      withoutOwnerBranch,
+      new RegExp(`HostedTaskAction::${variant}`),
+      `${actionId} fixture must preserve its enum or test reference`,
+    );
+    expectFailure(
+      `${actionId} validation rejects removed production owner while other references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: new Map([[relativePath, withoutOwnerBranch]]),
+        }),
+      new RegExp(
+        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/background_tasks\\.rs`,
+      ),
+    );
+  }
+}
+
+{
   const manifest = cloneManifest();
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\

@@ -1876,8 +1876,8 @@
     ],
     [
       "interaction.background_approval",
-      "crates/orca-tui/src/background_approval.rs",
-      8,
+      "crates/orca-tui/src/background_tasks.rs",
+      100,
       "interaction.background_approval",
       "Interaction",
       "LifecyclePatchSet",
@@ -4434,8 +4434,10 @@
       "ResolveBackgroundApproval",
       "current",
       [
-        "crates/orca-tui/src/types.rs:342",
-        "crates/orca-tui/src/approval_actions.rs:50"
+        "crates/orca-tui/src/types.rs:465",
+        "crates/orca-tui/src/approval_actions.rs:50",
+        "crates/orca-tui/src/background_tasks.rs:30",
+        "crates/orca-tui/src/app.rs:8738"
       ],
       "interaction_mutation",
       "UserAction::ResolveBackgroundApproval{id,approved}",
@@ -4457,8 +4459,10 @@
       "StopTask",
       "current",
       [
-        "crates/orca-tui/src/types.rs:346",
-        "crates/orca-tui/src/workflow_panel_actions.rs:32"
+        "crates/orca-tui/src/types.rs:469",
+        "crates/orca-tui/src/workflow_panel_actions.rs:32",
+        "crates/orca-tui/src/background_tasks.rs:24",
+        "crates/orca-tui/src/app.rs:8722"
       ],
       "task_mutation",
       "UserAction::StopTask{task_id}",
@@ -4478,8 +4482,10 @@
       "ForegroundTask",
       "current",
       [
-        "crates/orca-tui/src/types.rs:349",
-        "crates/orca-tui/src/workflow_panel_actions.rs:41"
+        "crates/orca-tui/src/types.rs:472",
+        "crates/orca-tui/src/workflow_panel_actions.rs:41",
+        "crates/orca-tui/src/background_tasks.rs:27",
+        "crates/orca-tui/src/app.rs:8730"
       ],
       "task_ownership_mutation",
       "UserAction::ForegroundTask{task_id}",
@@ -4984,9 +4990,9 @@
     [
       "background_task_callbacks",
       [
-        "crates/orca-tui/src/background_approval.rs:8",
-        "crates/orca-tui/src/background_tasks.rs:8",
-        "crates/orca-tui/src/background_tasks.rs:54"
+        "crates/orca-tui/src/background_tasks.rs:45",
+        "crates/orca-tui/src/background_tasks.rs:72",
+        "crates/orca-tui/src/background_tasks.rs:100"
       ],
       "task_and_interaction_mutation",
       "direct_task_registry_writes",
@@ -5001,7 +5007,7 @@
     [
       "recovered_background_scan",
       [
-        "crates/orca-tui/src/background_tasks.rs:83"
+        "crates/orca-tui/src/background_tasks.rs:130"
       ],
       "authoritative_read",
       "direct_task_registry_list",
