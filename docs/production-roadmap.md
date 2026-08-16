@@ -326,6 +326,16 @@ interaction fencing, response mutation, retries, disconnect handling, and
 terminal settlement remain unchanged; no action/event, persistence, server,
 ACP, CLI, or public API changed.
 
+The 2026-08-16 interaction response acknowledgement slice closes the remaining
+renderer loss window after local input admission. The prioritized dispatcher
+publishes a bounded non-blocking crate-private committed/stale/failed receipt, while the
+frame loop retains at most one key-matched pre-expansion composer snapshot.
+Runtime/uncommitted failures restore the exact pending key, MCP mode, visible
+text, mentions, paste payloads, and atomic skill tokens; committed, stale,
+newer-interaction, terminal, and reset paths retire the snapshot. Runtime
+interaction mutation/fencing and all action/event, persistence, server, ACP,
+CLI, and public API contracts remain unchanged.
+
 The 2026-08-15 plan-panel ownership slice moves only process-local TUI
 presentation facts behind one private `PlanPanelState`: the live structured
 plan and its failed-update marker. Existing `PlanUpdated` and legacy
@@ -1522,7 +1532,7 @@ end state.
    The focused task lifecycle and recovered-worker tests cover these claims;
    the cross-process PTY and full workspace gates remain release evidence.
 3. **TUI/runtime protocol drift is being sliced.** The `codex/tui-convergence`
-   stream has established thirty-one focused owners/boundaries so far (insert-escape, presentation,
+   stream has established thirty-two focused owners/boundaries so far (insert-escape, presentation,
    input-wake, workspace-config, scrollback, exit-policy, hosted-side,
    workflow-panel, transcript-search-orchestration, input-history,
    queued-submission, edit-highlight, surface-metrics, Goal projection,
@@ -1532,14 +1542,16 @@ end state.
    Goal action ownership, hosted session action ownership, hosted Side action
    ownership, hosted context action ownership, hosted workflow action
    ownership, hosted operation recovery ownership, hosted plan implementation
-   ownership, hosted task action ownership, and pending interaction input
-   admission); `app.rs` is currently 8,826 lines,
+   ownership, hosted task action ownership, pending interaction input
+   admission, and interaction response acknowledgement); `app.rs` is currently
+   8,842 lines,
    `hosted_plan.rs` 247 lines, `hosted_operation.rs` 132 lines,
    `hosted_workflow.rs` 132 lines,
    `hosted_context.rs` 252 lines, `hosted_side.rs` 495 lines,
    `hosted_session_lifecycle.rs` 852 lines, `hosted_goal.rs` 404 lines,
-   `background_tasks.rs` 239 lines, `idle_submit_actions.rs` 454 lines, and
-   `types.rs` 8,839 lines. Other
+   `background_tasks.rs` 239 lines, `idle_submit_actions.rs` 470 lines,
+   `action_dispatcher.rs` 815 lines, `agent_runtime.rs` 262 lines,
+   `runtime_event_actions.rs` 1,248 lines, and `types.rs` 8,936 lines. Other
    renderer-owned orchestration plus cold legacy registry reconciliation remain open; live
    task/operation projection duplication has been removed from the TUI event
    boundary (`surface_projection.rs`, 3,280 lines).

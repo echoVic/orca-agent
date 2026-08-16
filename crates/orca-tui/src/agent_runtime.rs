@@ -4,7 +4,7 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{Receiver, Sender};
 use orca_runtime::runtime_host::{RuntimeHost, RuntimeHostHandle};
 
-use crate::action_dispatcher::TuiActionDispatcher;
+use crate::action_dispatcher::{InteractionResponseAck, TuiActionDispatcher};
 use crate::channels::USER_ACTION_CAPACITY;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::types::{TuiEvent, UserAction};
@@ -80,6 +80,10 @@ impl TuiAgentRuntime {
     #[cfg(test)]
     pub(crate) fn controller(&self) -> &TuiSurfaceTaskControl {
         &self.controller
+    }
+
+    pub(crate) fn interaction_ack_receiver(&self) -> Receiver<InteractionResponseAck> {
+        self.dispatcher.interaction_ack_receiver()
     }
 
     pub(crate) fn shutdown(&mut self) -> io::Result<()> {

@@ -590,6 +590,10 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
         "crates/orca-tui/src/action_dispatcher.rs",
         /\bUserAction::RespondToInteraction\s*\{\s*key\s*,\s*response\s*\}\s*=>/,
       ],
+      [
+        "crates/orca-tui/src/app.rs",
+        /for\s+ack\s+in\s+interaction_ack_rx\.try_iter\(\)\s*\{\s*handle_interaction_response_ack\s*\(/,
+      ],
     ]),
   ],
 ]);

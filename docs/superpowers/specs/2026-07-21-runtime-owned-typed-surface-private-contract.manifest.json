@@ -4388,7 +4388,7 @@
       [
         "crates/orca-tui/src/types.rs:340",
         "crates/orca-tui/src/slash_command_actions.rs:111",
-        "crates/orca-tui/src/action_dispatcher.rs:149"
+        "crates/orca-tui/src/action_dispatcher.rs:205"
       ],
       "goal_and_operation_mutation",
       "UserAction::GoalPause",
@@ -4505,11 +4505,14 @@
       "RespondToInteraction",
       "current",
       [
-        "crates/orca-tui/src/types.rs:475",
+        "crates/orca-tui/src/types.rs:486",
         "crates/orca-tui/src/approval_actions.rs:65",
-        "crates/orca-tui/src/idle_submit_actions.rs:115",
-        "crates/orca-tui/src/runtime_event_actions.rs:66",
-        "crates/orca-tui/src/action_dispatcher.rs:146"
+        "crates/orca-tui/src/idle_submit_actions.rs:131",
+        "crates/orca-tui/src/runtime_event_actions.rs:127",
+        "crates/orca-tui/src/action_dispatcher.rs:181",
+        "crates/orca-tui/src/agent_runtime.rs:85",
+        "crates/orca-tui/src/app.rs:404",
+        "crates/orca-tui/src/runtime_event_actions.rs:19"
       ],
       "interaction_mutation",
       "UserAction::RespondToInteraction{key,response}",
@@ -4557,7 +4560,7 @@
       [
         "crates/orca-tui/src/types.rs:357",
         "crates/orca-tui/src/running_actions.rs:15",
-        "crates/orca-tui/src/action_dispatcher.rs:146"
+        "crates/orca-tui/src/action_dispatcher.rs:202"
       ],
       "operation_ownership_mutation",
       "UserAction::BackgroundCurrentTurn",
@@ -4927,7 +4930,7 @@
     [
       "dispatcher.route_action",
       [
-        "crates/orca-tui/src/action_dispatcher.rs:131"
+        "crates/orca-tui/src/action_dispatcher.rs:168"
       ],
       "mutation_router",
       "owns_broker_cancel_background_pause_shutdown_and_drops_errors",

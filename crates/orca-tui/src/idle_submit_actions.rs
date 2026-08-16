@@ -30,6 +30,13 @@ pub(crate) fn handle_idle_submit(
     state.slash_menu = None;
     let visible_text = textarea_text(textarea);
     state.mention_bindings.reconcile(&visible_text);
+    let pending_interaction_composer = (state.status == AppStatus::WaitingUserInput).then(|| {
+        (
+            state.mention_bindings.clone(),
+            state.atomic_skill_tokens.clone(),
+            state.pending_pastes.clone(),
+        )
+    });
     let expanded_text = expand_pending_pastes(&visible_text, &state.pending_pastes);
     state.mention_bindings.reconcile(&expanded_text);
     let text = expanded_text.trim().to_string();
@@ -110,6 +117,15 @@ pub(crate) fn handle_idle_submit(
         state.enter_running();
         state.scroll_to_bottom();
         if let Some((key, response)) = response {
+            let (mention_bindings, atomic_skill_tokens, pending_pastes) =
+                pending_interaction_composer.expect("waiting interaction captured composer state");
+            let staged_key = state.stage_pending_interaction_submission_with_composer(
+                visible_text.clone(),
+                mention_bindings,
+                atomic_skill_tokens,
+                pending_pastes,
+            );
+            debug_assert_eq!(staged_key.as_ref(), Some(&key));
             state.pending_input = None;
             state.pending_mcp_elicitation_mode = None;
             let _ = action_tx.send(UserAction::RespondToInteraction { key, response });

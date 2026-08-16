@@ -92,7 +92,7 @@ use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::presentation::InlineTerminal;
-use crate::runtime_event_actions::handle_runtime_event;
+use crate::runtime_event_actions::{handle_interaction_response_ack, handle_runtime_event};
 use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
 use crate::slash_command_actions::decode_settings_intent;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
@@ -153,7 +153,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     const FRAME_INTERVAL: Duration = Duration::from_millis(16);
     const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
     const MAX_INPUT_EVENTS_PER_BATCH: usize = 64;
-    const MAX_RUNTIME_EVENTS_PER_BATCH: usize = 256;
+    const MAX_RUNTIME_EVENTS_PER_BATCH: usize = crate::channels::TUI_EVENT_CAPACITY;
     const MAX_SUPERVISED_TUI_TASKS: usize = 32;
 
     // Wrap stdout in RetryWriter so a transient EAGAIN/WouldBlock (e.g. a
@@ -268,6 +268,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
         } else {
             None
         };
+    let interaction_ack_rx = agent_runtime.interaction_ack_receiver();
     // Declare terminal ownership after the agent runtime. The cleanup wrapper
     // below resets presentation output, drops ratatui, and then joins qwertty
     // on every non-panic return from the frame loop.
@@ -398,6 +399,21 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                         ));
                     }
                 };
+
+                let mut interaction_acknowledged = false;
+                for ack in interaction_ack_rx.try_iter() {
+                    handle_interaction_response_ack(
+                        ack,
+                        &mut state,
+                        &mut textarea,
+                        &mut vim_state,
+                        &theme,
+                    );
+                    interaction_acknowledged = true;
+                }
+                if interaction_acknowledged {
+                    scheduler.mark_dirty();
+                }
 
                 let iteration = run_event_loop_iteration(
                     &mut scheduler,

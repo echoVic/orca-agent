@@ -1079,6 +1079,36 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const pattern =
+    /for\s+ack\s+in\s+interaction_ack_rx\.try_iter\(\)\s*\{\s*handle_interaction_response_ack\s*\(/;
+  const withoutInteractionAckDrain = source.replace(
+    pattern,
+    "for ack in interaction_ack_rx.try_iter() { handle_removed_interaction_response_ack(",
+  );
+  assert.notEqual(
+    withoutInteractionAckDrain,
+    source,
+    "RespondToInteraction fixture must remove its production acknowledgement drain",
+  );
+  assert.match(
+    withoutInteractionAckDrain,
+    /RespondToInteraction/,
+    "RespondToInteraction fixture must preserve its tests and other references",
+  );
+  expectFailure(
+    "RespondToInteraction validation rejects removed acknowledgement drain while tests remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutInteractionAckDrain]]),
+      }),
+    /RespondToInteraction source does not contain its reviewed action anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
   const manifest = cloneManifest();
   const appPath = path.join(repoRoot, "crates/orca-tui/src/app.rs");
   const syntheticApp = `${readFileSync(appPath, "utf8")}\n\

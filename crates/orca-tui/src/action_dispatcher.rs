@@ -5,12 +5,35 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
+use crate::channels::{TUI_EVENT_CAPACITY, USER_ACTION_CAPACITY};
 use crate::operation_controller::TuiSurfaceTaskControl;
-use crate::types::{TuiEvent, UserAction};
+use crate::types::{TuiEvent, TuiInteractionKey, UserAction};
+
+// One runtime-event batch, one already-full action mailbox, and one direct
+// interaction response can be produced before the frame loop drains acks.
+const INTERACTION_ACK_CAPACITY: usize = TUI_EVENT_CAPACITY + USER_ACTION_CAPACITY + 1;
+const INTERACTION_ACK_OVERFLOW: &str =
+    "TUI interaction acknowledgement queue is full; response result discarded";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InteractionResponseAck {
+    Committed {
+        key: TuiInteractionKey,
+    },
+    NoLongerPending {
+        key: TuiInteractionKey,
+        message: String,
+    },
+    Failed {
+        key: TuiInteractionKey,
+        message: String,
+    },
+}
 
 pub(crate) struct TuiActionDispatcher {
     shutdown_tx: Sender<()>,
     handle: Option<JoinHandle<()>>,
+    interaction_ack_rx: Receiver<InteractionResponseAck>,
 }
 
 impl TuiActionDispatcher {
@@ -29,6 +52,8 @@ impl TuiActionDispatcher {
         }
         let (command_tx, command_rx) = crossbeam_channel::bounded(command_capacity);
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+        let (interaction_ack_tx, interaction_ack_rx) =
+            crossbeam_channel::bounded(INTERACTION_ACK_CAPACITY);
         let handle = thread::Builder::new()
             .name("orca-tui-action-dispatcher".to_string())
             .spawn(move || {
@@ -36,6 +61,7 @@ impl TuiActionDispatcher {
                     action_rx,
                     event_tx,
                     command_tx,
+                    interaction_ack_tx,
                     shutdown_rx,
                     controller,
                     backlog_capacity,
@@ -45,6 +71,7 @@ impl TuiActionDispatcher {
             Self {
                 shutdown_tx,
                 handle: Some(handle),
+                interaction_ack_rx,
             },
             command_rx,
         ))
@@ -59,6 +86,10 @@ impl TuiActionDispatcher {
             .join()
             .map_err(|_| io::Error::other("TUI action dispatcher panicked during shutdown"))
     }
+
+    pub(crate) fn interaction_ack_receiver(&self) -> Receiver<InteractionResponseAck> {
+        self.interaction_ack_rx.clone()
+    }
 }
 
 impl Drop for TuiActionDispatcher {
@@ -71,6 +102,7 @@ fn run_dispatcher(
     action_rx: Receiver<UserAction>,
     event_tx: Sender<TuiEvent>,
     command_tx: Sender<UserAction>,
+    interaction_ack_tx: Sender<InteractionResponseAck>,
     shutdown_rx: Receiver<()>,
     surface_control: TuiSurfaceTaskControl,
     backlog_capacity: usize,
@@ -100,6 +132,7 @@ fn run_dispatcher(
                         action,
                         &command_tx,
                         &event_tx,
+                        &interaction_ack_tx,
                         &controller,
                         &mut backlog,
                         backlog_capacity,
@@ -117,6 +150,7 @@ fn run_dispatcher(
                         action,
                         &command_tx,
                         &event_tx,
+                        &interaction_ack_tx,
                         &controller,
                         &mut backlog,
                         backlog_capacity,
@@ -135,6 +169,7 @@ fn route_action(
     action: UserAction,
     command_tx: &Sender<UserAction>,
     event_tx: &Sender<TuiEvent>,
+    interaction_ack_tx: &Sender<InteractionResponseAck>,
     surface_control: &TuiSurfaceTaskControl,
     backlog: &mut VecDeque<UserAction>,
     backlog_capacity: usize,
@@ -148,16 +183,15 @@ fn route_action(
             // family name. This alias is the typed surface control itself; it
             // owns no waiter or response state.
             let broker = surface_control;
-            match broker.respond(&key, &response) {
-                Ok(true) => {}
-                Ok(false) => {
-                    let _ = event_tx.try_send(TuiEvent::OperationRejected(
-                        "runtime-owned interaction is no longer pending".to_string(),
-                    ));
+            let result = broker.respond(&key, &response);
+            let ack = interaction_response_ack(key, result);
+            match interaction_ack_tx.try_send(ack) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    let _ =
+                        event_tx.try_send(TuiEvent::Error(INTERACTION_ACK_OVERFLOW.to_string()));
                 }
-                Err(error) => {
-                    let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
-                }
+                Err(TrySendError::Disconnected(_)) => return false,
             }
         }
         UserAction::Interrupt => {
@@ -213,6 +247,23 @@ fn route_action(
         }
     }
     true
+}
+
+fn interaction_response_ack(
+    key: TuiInteractionKey,
+    result: io::Result<bool>,
+) -> InteractionResponseAck {
+    match result {
+        Ok(true) => InteractionResponseAck::Committed { key },
+        Ok(false) => InteractionResponseAck::NoLongerPending {
+            key,
+            message: "runtime-owned interaction is no longer pending".to_string(),
+        },
+        Err(error) => InteractionResponseAck::Failed {
+            key,
+            message: error.to_string(),
+        },
+    }
 }
 
 enum EnqueueResult {
@@ -301,7 +352,7 @@ mod tests {
         SurfaceOperationId, SurfaceRequestId,
     };
 
-    use super::TuiActionDispatcher;
+    use super::{InteractionResponseAck, TuiActionDispatcher, interaction_response_ack};
     use crate::operation_controller::TuiSurfaceTaskControl;
     use crate::types::{
         TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse, UserAction,
@@ -319,6 +370,7 @@ mod tests {
         );
         let (mut dispatcher, command_rx) =
             TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+        let interaction_ack_rx = dispatcher.interaction_ack_receiver();
 
         raw_tx
             .send(UserAction::Submit("first".to_string()))
@@ -334,10 +386,11 @@ mod tests {
             .expect("queue interaction response");
 
         assert!(matches!(
-            event_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(TuiEvent::OperationRejected(message))
+            interaction_ack_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(InteractionResponseAck::NoLongerPending { message, .. })
                 if message.contains("runtime-owned interaction")
         ));
+        assert!(event_rx.try_recv().is_err());
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_secs(1)),
             Ok(UserAction::Submit(prompt)) if prompt == "first"
@@ -347,6 +400,199 @@ mod tests {
             Ok(UserAction::Submit(prompt)) if prompt == "second"
         ));
         dispatcher.shutdown().expect("shutdown dispatcher");
+    }
+
+    #[test]
+    fn interaction_response_failure_preserves_key_and_exact_error() {
+        let key = TuiInteractionKey::new(
+            OperationIdAllocator::default().allocate(),
+            "retry",
+            TuiInteractionKind::McpElicitation,
+        );
+
+        assert_eq!(
+            interaction_response_ack(key.clone(), Err(io::Error::other("runtime unavailable")),),
+            InteractionResponseAck::Failed {
+                key,
+                message: "runtime unavailable".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn undrained_ack_lane_retains_each_interaction_response() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let first_key = TuiInteractionKey::new(
+            OperationIdAllocator::default().allocate(),
+            "first",
+            TuiInteractionKind::UserInput,
+        );
+        let second_key = TuiInteractionKey::new(
+            OperationIdAllocator::default().allocate(),
+            "second",
+            TuiInteractionKind::UserInput,
+        );
+        let (mut dispatcher, _command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+        let interaction_ack_rx = dispatcher.interaction_ack_receiver();
+
+        for key in [first_key.clone(), second_key.clone()] {
+            raw_tx
+                .send(UserAction::RespondToInteraction {
+                    key,
+                    response: TuiInteractionResponse::UserInput("answer".to_string()),
+                })
+                .expect("queue interaction response");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !raw_tx.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            raw_tx.is_empty(),
+            "dispatcher did not consume both responses"
+        );
+
+        assert!(matches!(
+            interaction_ack_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(InteractionResponseAck::NoLongerPending { key, .. }) if key == first_key
+        ));
+        assert!(matches!(
+            interaction_ack_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(InteractionResponseAck::NoLongerPending { key, .. }) if key == second_key
+        ));
+        dispatcher.shutdown().expect("shutdown dispatcher");
+    }
+
+    #[test]
+    fn undrained_acknowledgements_do_not_block_interrupt() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        control
+            .begin_surface_activation()
+            .expect("arm typed surface activation");
+        let (mut dispatcher, _command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control.clone(), 1, 1)
+                .expect("spawn dispatcher");
+        let _interaction_ack_rx = dispatcher.interaction_ack_receiver();
+
+        for id in ["first", "second"] {
+            raw_tx
+                .send(UserAction::RespondToInteraction {
+                    key: TuiInteractionKey::new(
+                        OperationIdAllocator::default().allocate(),
+                        id,
+                        TuiInteractionKind::UserInput,
+                    ),
+                    response: TuiInteractionResponse::UserInput("answer".to_string()),
+                })
+                .expect("queue interaction response");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !raw_tx.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            raw_tx.is_empty(),
+            "dispatcher did not consume both responses"
+        );
+
+        raw_tx.send(UserAction::Interrupt).expect("queue interrupt");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !control.has_pending_interrupt() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(control.has_pending_interrupt());
+        dispatcher.shutdown().expect("shutdown dispatcher");
+    }
+
+    #[test]
+    fn acknowledgement_lane_caps_illegal_bursts_without_blocking_interrupt() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        control
+            .begin_surface_activation()
+            .expect("arm typed surface activation");
+        let (mut dispatcher, _command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control.clone(), 1, 1)
+                .expect("spawn dispatcher");
+        let interaction_ack_rx = dispatcher.interaction_ack_receiver();
+        let ack_capacity =
+            crate::channels::TUI_EVENT_CAPACITY + crate::channels::USER_ACTION_CAPACITY + 1;
+
+        for index in 0..=ack_capacity {
+            raw_tx
+                .send(UserAction::RespondToInteraction {
+                    key: TuiInteractionKey::new(
+                        OperationIdAllocator::default().allocate(),
+                        format!("burst-{index}"),
+                        TuiInteractionKind::UserInput,
+                    ),
+                    response: TuiInteractionResponse::UserInput("answer".to_string()),
+                })
+                .expect("queue interaction response");
+        }
+        raw_tx.send(UserAction::Interrupt).expect("queue interrupt");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while (!raw_tx.is_empty() || !control.has_pending_interrupt())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+
+        assert_eq!(interaction_ack_rx.len(), ack_capacity);
+        assert!(control.has_pending_interrupt());
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::Error(message))
+                if message == "TUI interaction acknowledgement queue is full; response result discarded"
+        ));
+        dispatcher.shutdown().expect("shutdown dispatcher");
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_for_undrained_acknowledgements() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (dispatcher, _command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+        let _interaction_ack_rx = dispatcher.interaction_ack_receiver();
+
+        for id in ["first", "second"] {
+            raw_tx
+                .send(UserAction::RespondToInteraction {
+                    key: TuiInteractionKey::new(
+                        OperationIdAllocator::default().allocate(),
+                        id,
+                        TuiInteractionKind::UserInput,
+                    ),
+                    response: TuiInteractionResponse::UserInput("answer".to_string()),
+                })
+                .expect("queue interaction response");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !raw_tx.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            raw_tx.is_empty(),
+            "dispatcher did not consume both responses"
+        );
+
+        let (done_tx, done_rx) = mpsc::bounded(1);
+        std::thread::spawn(move || {
+            let mut dispatcher = dispatcher;
+            let _ = done_tx.send(dispatcher.shutdown());
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(()))
+        ));
     }
 
     #[test]

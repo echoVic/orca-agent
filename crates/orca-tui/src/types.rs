@@ -113,6 +113,17 @@ impl PendingTuiInput {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingInteractionSubmission {
+    key: TuiInteractionKey,
+    pending_input: PendingTuiInput,
+    mcp_mode: Option<RuntimeMcpElicitationMode>,
+    visible_text: String,
+    mention_bindings: MentionBindings,
+    atomic_skill_tokens: MentionBindings,
+    pending_pastes: Vec<(String, String)>,
+}
+
 fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
     use orca_core::goal_types::{
         format_goal_elapsed_seconds, format_tokens_compact, goal_status_label,
@@ -819,6 +830,7 @@ pub struct AppState {
     pub plan_approval_dialog: Option<PlanApprovalDialog>,
     pub pending_input: Option<PendingTuiInput>,
     pub(crate) pending_mcp_elicitation_mode: Option<RuntimeMcpElicitationMode>,
+    pub(crate) pending_interaction_submission: Option<PendingInteractionSubmission>,
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
@@ -934,6 +946,78 @@ impl ScrollAmount for i32 {
 }
 
 impl AppState {
+    #[cfg(test)]
+    pub(crate) fn stage_pending_interaction_submission(
+        &mut self,
+        visible_text: String,
+    ) -> Option<TuiInteractionKey> {
+        self.stage_pending_interaction_submission_with_composer(
+            visible_text,
+            self.mention_bindings.clone(),
+            self.atomic_skill_tokens.clone(),
+            self.pending_pastes.clone(),
+        )
+    }
+
+    pub(crate) fn stage_pending_interaction_submission_with_composer(
+        &mut self,
+        visible_text: String,
+        mention_bindings: MentionBindings,
+        atomic_skill_tokens: MentionBindings,
+        pending_pastes: Vec<(String, String)>,
+    ) -> Option<TuiInteractionKey> {
+        let pending_input = self.pending_input.clone()?;
+        let key = pending_input.key().clone();
+        self.pending_interaction_submission = Some(PendingInteractionSubmission {
+            key: key.clone(),
+            pending_input,
+            mcp_mode: self.pending_mcp_elicitation_mode.clone(),
+            visible_text,
+            mention_bindings,
+            atomic_skill_tokens,
+            pending_pastes,
+        });
+        Some(key)
+    }
+
+    pub(crate) fn discard_pending_interaction_submission(
+        &mut self,
+        key: &TuiInteractionKey,
+    ) -> bool {
+        if self
+            .pending_interaction_submission
+            .as_ref()
+            .is_some_and(|submission| &submission.key == key)
+        {
+            self.pending_interaction_submission = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn restore_pending_interaction_submission(
+        &mut self,
+        key: &TuiInteractionKey,
+        message: String,
+    ) -> Option<String> {
+        let submission = self.pending_interaction_submission.take()?;
+        if submission.key != *key {
+            self.pending_interaction_submission = Some(submission);
+            return None;
+        }
+        self.pending_input = Some(submission.pending_input);
+        self.pending_mcp_elicitation_mode = submission.mcp_mode;
+        self.mention_bindings = submission.mention_bindings;
+        self.atomic_skill_tokens = submission.atomic_skill_tokens;
+        self.pending_pastes = submission.pending_pastes;
+        self.reset_assistant_stream();
+        self.clear_receiving_tool_progress();
+        self.push_message(ChatMessage::Error(message));
+        self.set_status(AppStatus::WaitingUserInput);
+        Some(submission.visible_text)
+    }
+
     pub(crate) fn side_conversation_active(&self) -> bool {
         self.side_conversation_visible
     }
@@ -980,6 +1064,7 @@ impl AppState {
             plan_approval_dialog: None,
             pending_input: None,
             pending_mcp_elicitation_mode: None,
+            pending_interaction_submission: None,
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
             show_shortcuts: false,
@@ -1424,6 +1509,7 @@ impl AppState {
         self.approval_dialog = None;
         self.pending_input = None;
         self.pending_mcp_elicitation_mode = None;
+        self.pending_interaction_submission = None;
         self.approval_allowlist.clear();
         self.session_picker_sessions.clear();
         self.session_picker_selected = 0;
@@ -2157,6 +2243,7 @@ impl AppState {
                 target,
                 preview,
             } => {
+                self.pending_interaction_submission = None;
                 self.close_transcript_search();
                 self.set_status(AppStatus::WaitingApproval);
                 let options = ApprovalDialog::options_for(&tool, target.as_deref());
@@ -2179,6 +2266,7 @@ impl AppState {
                 preview,
                 permission_kind,
             } => {
+                self.pending_interaction_submission = None;
                 self.close_transcript_search();
                 self.set_status(AppStatus::WaitingApproval);
                 let options = ApprovalDialog::options_for(&tool, target.as_deref());
@@ -2202,6 +2290,7 @@ impl AppState {
                 self.set_status(AppStatus::WaitingUserInput);
                 self.pending_input = Some(PendingTuiInput::UserInput(key));
                 self.pending_mcp_elicitation_mode = None;
+                self.pending_interaction_submission = None;
                 self.finish_assistant_stream();
                 let mut message = question;
                 if !choices.is_empty() {
@@ -2221,6 +2310,7 @@ impl AppState {
                 self.set_status(AppStatus::WaitingUserInput);
                 self.pending_input = Some(PendingTuiInput::McpElicitation(key));
                 self.pending_mcp_elicitation_mode = Some(mode.clone());
+                self.pending_interaction_submission = None;
                 self.finish_assistant_stream();
                 let mut lines = vec![format!("MCP {server_name} requests input: {message}")];
                 match mode {
@@ -2313,6 +2403,7 @@ impl AppState {
                 self.approval_dialog = None;
                 self.pending_input = None;
                 self.pending_mcp_elicitation_mode = None;
+                self.pending_interaction_submission = None;
                 self.clear_receiving_tool_progress();
                 self.flush_proposed_plan_parser();
                 self.finish_assistant_stream();
@@ -3643,6 +3734,8 @@ mod tests {
             url: None,
             requested_schema_json: None,
         });
+        input_state.stage_pending_interaction_submission("answer".to_string());
+        assert!(input_state.pending_interaction_submission.is_some());
 
         input_state.update(TuiEvent::SessionCompleted {
             status: "interrupted".to_string(),
@@ -3651,6 +3744,7 @@ mod tests {
         assert_eq!(input_state.status, AppStatus::Idle);
         assert!(input_state.pending_input.is_none());
         assert!(input_state.pending_mcp_elicitation_mode.is_none());
+        assert!(input_state.pending_interaction_submission.is_none());
 
         let mut approval_state = state();
         approval_state.update(TuiEvent::ApprovalNeeded {
@@ -3679,11 +3773,14 @@ mod tests {
             url: Some("https://example.test/device".to_string()),
             requested_schema_json: None,
         });
+        state.stage_pending_interaction_submission("answer".to_string());
+        assert!(state.pending_interaction_submission.is_some());
 
         state.reset_session_projection();
 
         assert!(state.pending_input.is_none());
         assert!(state.pending_mcp_elicitation_mode.is_none());
+        assert!(state.pending_interaction_submission.is_none());
     }
 
     #[test]
