@@ -1453,6 +1453,97 @@ expectFailure(
   }
 }
 
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutOwnerCall = source.replace(
+    /\brenderer_frame\.prepare_iteration\s*\(/,
+    "renderer_frame.removed_prepare_iteration(",
+  );
+  assert.notEqual(
+    withoutOwnerCall,
+    source,
+    "renderer frame fixture must remove the production app caller",
+  );
+  assert.match(
+    withoutOwnerCall,
+    /RendererFrameOwner/,
+    "renderer frame fixture must preserve the owner import and construction",
+  );
+  expectFailure(
+    "renderer frame validation rejects a removed app caller while the owner import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, withoutOwnerCall),
+      }),
+    /renderer_frame source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_frame.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved, expected] of [
+    [
+      "iteration preparation",
+      /state\.poll_edit_highlight_results\(\)/,
+      "state.removed_poll_edit_highlight_results()",
+      /fn\s+prepare_iteration/,
+      /renderer_frame source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_frame\.rs/,
+    ],
+    [
+      "clipboard consumption",
+      /state\.pending_clipboard_copy\.take\(\)/,
+      "state.pending_clipboard_copy.removed_take()",
+      /pending_clipboard_copy/,
+      /(?:terminal_clipboard_notifications|renderer_frame) source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_frame\.rs/,
+    ],
+    [
+      "pending presentation output",
+      /write_pending\(terminal,\s*presentation,\s*state\.status\);/,
+      "removed_pending_output(terminal, presentation, state.status);",
+      /WritePending/,
+      /renderer_frame source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_frame\.rs/,
+    ],
+    [
+      "terminal draw",
+      /terminal\.draw\(/,
+      "terminal.removed_draw(",
+      /\.draw\(/,
+      /renderer_frame source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_frame\.rs/,
+    ],
+    [
+      "successful draw acknowledgement",
+      /self\.scheduler\.did_draw\(draw_at\);/,
+      "self.scheduler.removed_did_draw(draw_at);",
+      /scheduler\.did_draw\(initial_draw_at\)/,
+      /renderer_frame source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_frame\.rs/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking import, parameter, constructor, or test reference`,
+    );
+    expectFailure(
+      `renderer frame validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      expected,
+    );
+  }
+}
+
 for (const [label, functionName, parameter, body] of [
   [
     "operation controller shutdown retains runtime authority",

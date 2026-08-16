@@ -414,9 +414,31 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["input_history", /fn load_input_history|fn append_input_history|fn record_prompt/],
   ["terminal_clipboard_notifications", /MouseEventKind::Up|pending_clipboard_copy|desktop_notifications/],
   ["renderer_runtime_events", /RendererRuntimeEventOwner|renderer_runtime\.handle\s*\(/],
+  ["renderer_frame", /RendererFrameOwner|renderer_frame\.prepare_iteration\s*\(/],
 ]);
 
 const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
+  [
+    "terminal_clipboard_notifications",
+    new Map([
+      [
+        "crates/orca-tui/src/input_event_actions.rs",
+        /MouseEventKind::Up\(MouseButton::Left\)\s*=>/,
+      ],
+      [
+        "crates/orca-tui/src/renderer_frame.rs",
+        /pub\(crate\)\s+fn\s+present_iteration[\s\S]*?state\.pending_clipboard_copy\.take\(\)[\s\S]*?copy_clipboard\(&text\)/,
+      ],
+      [
+        "crates/orca-tui/src/hosted_submission.rs",
+        /if\s+cfg\.desktop_notifications\s*\{\s*let\s+_\s*=\s*orca_runtime::notify::notify\("Orca",\s*"Task completed"\)/,
+      ],
+      [
+        "crates/orca-tui/src/hosted_workflow.rs",
+        /if\s+cfg\.desktop_notifications\s*\{\s*let\s+_\s*=\s*orca_runtime::notify::notify\("Orca",\s*"Workflow launched"\)/,
+      ],
+    ]),
+  ],
   [
     "session_picker_transition",
     new Map([
@@ -452,6 +474,19 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       [
         "crates/orca-tui/src/renderer_runtime.rs",
         /pub\(crate\)\s+fn\s+handle\s*\([\s\S]*?match\s+accept_attached_tui_event\s*\([\s\S]*?self\.pending_initial_prompt\.take\(\)[\s\S]*?tui_event\s*=>\s*\{\s*handle_runtime_event\s*\(/,
+      ],
+    ]),
+  ],
+  [
+    "renderer_frame",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /let\s+mut\s+renderer_frame\s*=\s*RendererFrameOwner::new\([\s\S]*?\brenderer_frame\.prepare_iteration\([\s\S]*?\brenderer_frame\.run_iteration\([\s\S]*?\brenderer_frame\.present_iteration\(/,
+      ],
+      [
+        "crates/orca-tui/src/renderer_frame.rs",
+        /pub\(crate\)\s+fn\s+prepare_iteration\s*\([\s\S]*?state\.poll_edit_highlight_results\(\)[\s\S]*?let\s+animation_active\s*=[\s\S]*?state\.copy_notice_at\(now\)\.is_none\(\)[\s\S]*?state\.advance_tick\(\)[\s\S]*?presentation\.advance_tick\(\)[\s\S]*?state\.apply_drag_edge_scroll\(\)[\s\S]*?self\.scheduler\.did_animate\(now\)[\s\S]*?self\.scheduler\.poll_timeout\(now,\s*animation_active\)[\s\S]*?pub\(crate\)\s+fn\s+run_iteration[\s\S]*?run_event_loop_iteration\([\s\S]*?pub\(crate\)\s+fn\s+present_iteration[\s\S]*?state\.pending_clipboard_copy\.take\(\)[\s\S]*?write_pending\(terminal,\s*presentation,\s*state\.status\)[\s\S]*?terminal\.draw\([\s\S]*?self\.scheduler\.did_draw\(draw_at\)/,
       ],
     ]),
   ],
@@ -947,6 +982,7 @@ const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
+  ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_frame.resume", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_runtime.shutdown", 1],
   [
     "crates/orca-tui/src/hosted_session_lifecycle.rs:install_hosted_session:pending_workflow_notifications.clear",

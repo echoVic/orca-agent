@@ -5132,10 +5132,10 @@
     [
       "terminal_clipboard_notifications",
       [
-        "crates/orca-tui/src/input_event_actions.rs:400",
-        "crates/orca-tui/src/app.rs:421",
-        "crates/orca-tui/src/app.rs:4554",
-        "crates/orca-tui/src/app.rs:4978"
+        "crates/orca-tui/src/input_event_actions.rs:588",
+        "crates/orca-tui/src/renderer_frame.rs:118",
+        "crates/orca-tui/src/hosted_submission.rs:81",
+        "crates/orca-tui/src/hosted_workflow.rs:55"
       ],
       "presentation_side_effect",
       "tty_clipboard_desktop_notification",
@@ -5147,12 +5147,29 @@
     [
       "renderer_runtime_events",
       [
-        "crates/orca-tui/src/app.rs:543",
+        "crates/orca-tui/src/app.rs:524",
         "crates/orca-tui/src/renderer_runtime.rs:37"
       ],
       "presentation_event_coordination",
       "renderer_owned_attachment_prompt_config_and_mention_routing",
       "typed admission plus pure presentation reducer",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
+    ],
+    [
+      "renderer_frame",
+      [
+        "crates/orca-tui/src/app.rs:318",
+        "crates/orca-tui/src/app.rs:331",
+        "crates/orca-tui/src/app.rs:550",
+        "crates/orca-tui/src/renderer_frame.rs:22",
+        "crates/orca-tui/src/renderer_frame.rs:33",
+        "crates/orca-tui/src/renderer_frame.rs:102"
+      ],
+      "presentation_frame_coordination",
+      "app_owned_scheduler_animation_clipboard_title_and_draw_order",
+      "pure_renderer_frame_owner",
       [],
       "typed snapshot/read consumer",
       "retain"
