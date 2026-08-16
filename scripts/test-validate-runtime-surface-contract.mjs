@@ -136,6 +136,18 @@ for (const [id, relativePath, anchor, replacement] of [
     /pub\(crate\)\s+fn\s+commit_terminal_task_reconciliation_batch\s*\(/,
     "pub(crate) fn removed_terminal_task_reconciliation_batch(",
   ],
+  [
+    "task.active_adoption_registry_receipt",
+    "crates/orca-runtime/src/tasks.rs",
+    /pub\(crate\)\s+fn\s+with_active_main_session_adoption\s*</,
+    "pub(crate) fn removed_active_main_session_adoption<",
+  ],
+  [
+    "task.active_adoption_commit_authority",
+    "crates/orca-runtime/src/runtime_surface/commit.rs",
+    /pub\(crate\)\s+fn\s+commit_active_task_adoption_batch\s*\(/,
+    "pub(crate) fn removed_active_task_adoption_batch(",
+  ],
 ]) {
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   assert.match(source, anchor, `${id} production fixture must contain its anchor`);
@@ -145,6 +157,18 @@ for (const [id, relativePath, anchor, replacement] of [
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
         sourceOverrides: sourceOverride(relativePath, source.replace(anchor, replacement)),
+      }),
+    new RegExp(`${id.replaceAll(".", "\\.")} source does not contain its reviewed production anchor`),
+  );
+  expectFailure(
+    `${id} import test and enum decoys cannot replace the production anchor`,
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(
+          relativePath,
+          `${source.replace(anchor, replacement)}\nuse crate::${id.replaceAll(".", "_")};\n#[cfg(test)] fn ${id.replaceAll(".", "_")}() {}\nenum ${id.replaceAll(".", "_")}Marker { Present }`,
+        ),
       }),
     new RegExp(`${id.replaceAll(".", "\\.")} source does not contain its reviewed production anchor`),
   );

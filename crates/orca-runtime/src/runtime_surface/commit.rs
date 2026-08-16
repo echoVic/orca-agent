@@ -9,7 +9,10 @@ use super::{
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::tasks::LegacyTerminalTaskReconciliationReceipt;
+use crate::tasks::{
+    LegacyActiveTaskAdoptionReceipt, LegacyActiveTaskAdoptionRecord,
+    LegacyTerminalTaskReconciliationReceipt,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ManualCompactionItemKey {
@@ -620,6 +623,13 @@ enum OwnerLeaseAuthority<'owner> {
 
 enum BatchCommitAuthority<'permit> {
     Single(&'permit SurfacePublisherPermit),
+    ActiveTaskAdoption {
+        actor: &'permit SurfacePublisherPermit,
+        receipt: &'permit LegacyActiveTaskAdoptionReceipt,
+    },
+    RecoveredActiveTaskAdoption {
+        actor: &'permit SurfacePublisherPermit,
+    },
     TaskReconciliation {
         actor: &'permit SurfacePublisherPermit,
         receipt: &'permit LegacyTerminalTaskReconciliationReceipt,
@@ -701,6 +711,9 @@ enum BatchCommitAuthority<'permit> {
 
 enum RecoveredBatchAuthority {
     Single(SurfacePublisherPermit),
+    ActiveTaskAdoption {
+        actor: SurfacePublisherPermit,
+    },
     TaskReconciliation {
         actor: SurfacePublisherPermit,
     },
@@ -998,6 +1011,13 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
                 RecoveredBatchAuthority::Single(permit) => {
                     coordinator.commit_batch(&permit, &batch)?;
                 }
+                RecoveredBatchAuthority::ActiveTaskAdoption { actor } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::RecoveredActiveTaskAdoption { actor: &actor },
+                        &batch,
+                        None,
+                    )?;
+                }
                 RecoveredBatchAuthority::TaskReconciliation { actor } => {
                     coordinator.commit_batch_with_authority(
                         BatchCommitAuthority::RecoveredTaskReconciliation { actor: &actor },
@@ -1206,6 +1226,12 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         let authority = self.issue_exact_recovered_authority(&batch)?;
         let applied = match authority {
             RecoveredBatchAuthority::Single(permit) => self.commit_batch(&permit, &batch)?,
+            RecoveredBatchAuthority::ActiveTaskAdoption { actor } => self
+                .commit_batch_with_authority(
+                    BatchCommitAuthority::RecoveredActiveTaskAdoption { actor: &actor },
+                    &batch,
+                    None,
+                )?,
             RecoveredBatchAuthority::TaskReconciliation { actor } => self
                 .commit_batch_with_authority(
                     BatchCommitAuthority::RecoveredTaskReconciliation { actor: &actor },
@@ -1376,6 +1402,22 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         let actor = self.actor_control_permit.clone();
         self.commit_batch_with_authority(
             BatchCommitAuthority::TaskReconciliation {
+                actor: &actor,
+                receipt,
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_active_task_adoption_batch(
+        &mut self,
+        receipt: &LegacyActiveTaskAdoptionReceipt,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ActiveTaskAdoption {
                 actor: &actor,
                 receipt,
             },
@@ -2985,6 +3027,15 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         ) {
             return Ok(RecoveredBatchAuthority::TaskReconciliation { actor });
         }
+        if recovered_active_task_adoption_authorized(
+            &self.state,
+            &self.issued_permits,
+            &actor,
+            batch,
+            self.owner_epoch,
+        ) {
+            return Ok(RecoveredBatchAuthority::ActiveTaskAdoption { actor });
+        }
 
         let events = batch.events.as_slice();
         if let [task_event, terminal_event] = events
@@ -4362,6 +4413,11 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         batch: &SurfaceCommitBatch,
         projection_context: Option<&SurfaceProjectionContext>,
     ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let extends_cold_recovery = matches!(
+            &authority,
+            BatchCommitAuthority::ActiveTaskAdoption { .. }
+                | BatchCommitAuthority::RecoveredActiveTaskAdoption { .. }
+        );
         if !self
             .owner_lease
             .lease()
@@ -4385,6 +4441,25 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     && recovery_stream_dispositions_match_state(&self.state, permit, batch)
                     && recovery_capability_completion_matches_state(&self.state, permit, batch)
                     && recovery_manual_compaction_matches_state(&self.state, permit, batch)
+            }
+            BatchCommitAuthority::ActiveTaskAdoption { actor, receipt } => {
+                active_task_adoption_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    receipt,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
+            BatchCommitAuthority::RecoveredActiveTaskAdoption { actor } => {
+                recovered_active_task_adoption_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    batch,
+                    self.owner_epoch,
+                )
             }
             BatchCommitAuthority::TaskReconciliation { actor, receipt } => {
                 terminal_task_reconciliation_authorized(
@@ -4680,6 +4755,20 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         } else {
             self.recovered_publications.push(batch);
         }
+        if extends_cold_recovery && let Some(authority) = self.cold_takeover_authority.as_mut() {
+            for operation_id in batch.events.as_slice().iter().filter_map(|event| {
+                let super::SurfaceEvent::Operation(super::OperationPatch::Requested { operation }) =
+                    &event.event
+                else {
+                    return None;
+                };
+                Some(operation.operation_id.clone())
+            }) {
+                if !authority.recoverable_operations.contains(&operation_id) {
+                    authority.recoverable_operations.push(operation_id);
+                }
+            }
+        }
         Ok(SurfaceCommitApplied { receipt })
     }
 
@@ -4819,6 +4908,339 @@ fn historical_terminal_task_is_non_actionable(task: &super::SurfaceTask) -> bool
         && task.workflow_run_id.is_none()
         && task.subagent_id.is_none()
         && task.pending_interaction_id.is_none()
+}
+
+pub(crate) fn legacy_active_task_adoption_capability_fingerprint() -> super::Sha256Digest {
+    super::Sha256Digest::digest(b"orca.runtime.legacy-active-task-adoption.v1")
+}
+
+fn active_task_adoption_record_matches_task(
+    record: &LegacyActiveTaskAdoptionRecord,
+    task: &super::SurfaceTask,
+) -> bool {
+    let expected_usage = record.usage().map(|usage| super::UsageTotals {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_tokens: usage.cache_tokens,
+        estimated_cost_usd_micros: crate::cost::usd_to_micros(usage.estimated_cost_usd),
+    });
+    task.task_id.as_str() == record.id()
+        && task.description == super::DisplayText::new(record.description())
+        && task.created_at == super::UnixMillis::new(record.created_at_ms())
+        && task.started_at == record.started_at_ms().map(super::UnixMillis::new)
+        && task.usage == expected_usage
+        && task.retry_count == record.retry_count()
+        && task.output_truncated == record.output_truncated()
+}
+
+fn active_task_adoption_shape(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> Option<Vec<super::SurfaceTask>> {
+    let snapshot = state.snapshot();
+    if !actor_identity_authorizes_thread_batch(issued_permits, actor, batch, owner_epoch)
+        || !matches!(
+            batch.commit_class,
+            CommitClass::Recorded {
+                thread_owner_epoch,
+                ..
+            } if thread_owner_epoch == owner_epoch
+        )
+        || !matches!(
+            snapshot.thread.persistence,
+            super::ThreadPersistence::RecordedCatalogued
+        )
+        || snapshot.foreground_operation.is_some()
+        || !snapshot.queued_operations.is_empty()
+        || !snapshot.operation_history.is_empty()
+        || !snapshot.background_operations.is_empty()
+    {
+        return None;
+    }
+
+    let events = batch.events.as_slice();
+    if events.is_empty() || events.len() % 5 != 0 || batch.event_count as usize != events.len() {
+        return None;
+    }
+
+    let existing_operations = snapshot
+        .foreground_operation
+        .iter()
+        .chain(snapshot.queued_operations.iter())
+        .chain(snapshot.operation_history.iter())
+        .collect::<Vec<_>>();
+    let mut operation_ids = existing_operations
+        .iter()
+        .map(|operation| operation.operation_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut request_ids = existing_operations
+        .iter()
+        .map(|operation| operation.request_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut last_reservation_sequence = existing_operations
+        .iter()
+        .map(|operation| operation.reservation.reservation_sequence.get())
+        .max()
+        .unwrap_or(0);
+    let mut task_ids = snapshot
+        .tasks
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut background_fences = snapshot
+        .background_operations
+        .iter()
+        .map(|operation| operation.fence.clone())
+        .collect::<Vec<_>>();
+    let mut tasks = Vec::with_capacity(events.len() / 5);
+    let mut previous_task_id: Option<super::SurfaceTaskId> = None;
+    let canonical_fingerprint = legacy_active_task_adoption_capability_fingerprint();
+    let canonical_replayability = super::Replayability::NonReplayable {
+        reason: super::NonReplayableReason::Missing,
+        live_capsule: super::LiveOperationCapsule::Unavailable,
+    };
+    let expected_replayability_digest =
+        super::canonical_replayability_digest(&canonical_replayability);
+    let started_commit_id = commit_id(&batch.commit_class);
+
+    for group in events.chunks_exact(5) {
+        let [
+            requested_event,
+            admitted_event,
+            started_event,
+            task_event,
+            transferred_event,
+        ] = group
+        else {
+            return None;
+        };
+        let (
+            SurfaceScope::Operation {
+                operation_id: requested_scope_id,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::Requested { operation }),
+        ) = (&requested_event.scope, &requested_event.event)
+        else {
+            return None;
+        };
+        let (
+            SurfaceScope::Operation {
+                operation_id: admitted_scope_id,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::Admitted {
+                operation_id: admitted_operation_id,
+                logical_turn_id,
+                input,
+                first_generation,
+            }),
+        ) = (&admitted_event.scope, &admitted_event.event)
+        else {
+            return None;
+        };
+        let (
+            SurfaceScope::Generation {
+                fence: started_scope_fence,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::GenerationStarted {
+                fence: started_fence,
+                witness,
+            }),
+        ) = (&started_event.scope, &started_event.event)
+        else {
+            return None;
+        };
+        let (
+            SurfaceScope::Thread,
+            super::SurfaceEvent::Task(super::TaskPatch::Upserted {
+                expected_revision,
+                task,
+            }),
+        ) = (&task_event.scope, &task_event.event)
+        else {
+            return None;
+        };
+        let (
+            SurfaceScope::Generation {
+                fence: transferred_scope_fence,
+            },
+            super::SurfaceEvent::Operation(super::OperationPatch::GenerationTransferred {
+                fence: transferred_fence,
+                background_fence,
+                task_id: transferred_task_id,
+            }),
+        ) = (&transferred_event.scope, &transferred_event.event)
+        else {
+            return None;
+        };
+
+        let next_reservation_sequence = last_reservation_sequence.checked_add(1)?;
+        let settings_match = matches!(
+            &operation.intent.settings_receipt,
+            super::OperationSettingsPreparationReceipt::Current {
+                settings_revision,
+                policy_epoch,
+            } if *settings_revision == snapshot.settings.thread_revision
+                && *policy_epoch == snapshot.settings.effective.policy_epoch
+        );
+        let canonical_operation = requested_scope_id == &operation.operation_id
+            && admitted_scope_id == &operation.operation_id
+            && admitted_operation_id == &operation.operation_id
+            && operation.reservation.operation_id == operation.operation_id
+            && operation.reservation.reservation_sequence.get() == next_reservation_sequence
+            && matches!(operation.phase, super::OperationPhase::Requested)
+            && !operation.ready_for_admission
+            && operation.initial_logical_turn_id.is_none()
+            && operation.initial_input_item_id.is_none()
+            && operation.generations.is_empty()
+            && operation.agent_loop_turns.is_empty()
+            && operation.pending_control.is_none()
+            && operation.finalization.is_none()
+            && operation.terminal.is_none()
+            && matches!(operation.intent.origin, super::OperationOrigin::TuiUser)
+            && matches!(operation.intent.kind, super::OperationKind::UserTurn)
+            && operation.intent.initial_replayability == canonical_replayability
+            && matches!(
+                operation.intent.busy_disposition,
+                super::BusyDisposition::Queue
+            )
+            && matches!(
+                operation.intent.interrupt_settlement,
+                super::InterruptSettlement::SuspendUntilExplicitControl
+            )
+            && matches!(
+                operation.intent.legacy_visibility,
+                super::LegacyVisibility::PublishAfterAdmitted
+            )
+            && operation.intent.settings_revision == snapshot.settings.thread_revision
+            && operation.intent.policy_epoch == snapshot.settings.effective.policy_epoch
+            && operation.intent.required_capabilities.is_empty()
+            && operation.intent.capability_fingerprint == canonical_fingerprint
+            && settings_match;
+        let canonical_generation = matches!(input, super::AdmittedInput::NotApplicable)
+            && first_generation.fence.thread_id == snapshot.thread.thread_id
+            && first_generation.fence.thread_owner_epoch == owner_epoch
+            && first_generation.fence.operation_id == operation.operation_id
+            && first_generation.fence.generation_id.get() == 0
+            && first_generation.logical_turn_id == *logical_turn_id
+            && matches!(
+                first_generation.input,
+                super::GenerationInputState::NotApplicable
+            )
+            && first_generation.predecessor.is_none()
+            && matches!(first_generation.attempt, super::GenerationAttempt::Initial)
+            && first_generation.goal_identity.is_none()
+            && first_generation.replayability == canonical_replayability
+            && first_generation.required_capabilities.is_empty()
+            && first_generation.capability_fingerprint == canonical_fingerprint
+            && matches!(first_generation.phase, super::GenerationPhase::Reserved)
+            && first_generation.started_witness.is_none()
+            && first_generation.stop_reason.is_none();
+        let canonical_start = started_scope_fence == &first_generation.fence
+            && started_fence == &first_generation.fence
+            && witness.started_commit_id == *started_commit_id
+            && witness.settings_revision == snapshot.settings.thread_revision
+            && witness.policy_epoch == snapshot.settings.effective.policy_epoch
+            && witness.durable_replayability_digest == expected_replayability_digest
+            && witness.capability_fingerprint == canonical_fingerprint;
+        let canonical_task = expected_revision.is_none()
+            && task.revision.get() == 1
+            && matches!(task.task_type, super::SurfaceTaskType::MainSession)
+            && matches!(task.status, super::SurfaceTaskStatus::Running)
+            && task.backgrounded
+            && task.started_at.is_some()
+            && task.completed_at.is_none()
+            && task.parent_operation.as_ref() == Some(&operation.operation_id)
+            && task.background_fence.as_ref() == Some(background_fence)
+            && task.workflow_run_id.is_none()
+            && task.subagent_id.is_none()
+            && task.pending_interaction_id.is_none()
+            && task.result.is_none()
+            && task.error.is_none();
+        let canonical_transfer = transferred_scope_fence == &first_generation.fence
+            && transferred_fence == &first_generation.fence
+            && background_fence.operation_fence == first_generation.fence
+            && transferred_task_id.as_ref() == Some(&task.task_id);
+        let identities_are_fresh = operation_ids.insert(operation.operation_id.clone())
+            && request_ids.insert(operation.request_id.clone())
+            && task_ids.insert(task.task_id.clone())
+            && !background_fences.contains(background_fence)
+            && previous_task_id
+                .as_ref()
+                .is_none_or(|previous| previous < &task.task_id);
+        if !canonical_operation
+            || !canonical_generation
+            || !canonical_start
+            || !canonical_task
+            || !canonical_transfer
+            || !identities_are_fresh
+        {
+            return None;
+        }
+
+        last_reservation_sequence = next_reservation_sequence;
+        previous_task_id = Some(task.task_id.clone());
+        background_fences.push(background_fence.clone());
+        tasks.push(task.clone());
+    }
+    Some(tasks)
+}
+
+fn recovered_active_task_adoption_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    active_task_adoption_shape(state, issued_permits, actor, batch, owner_epoch).is_some()
+}
+
+fn active_task_adoption_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor: &SurfacePublisherPermit,
+    receipt: &LegacyActiveTaskAdoptionReceipt,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !receipt.is_valid()
+        || receipt.session_id()
+            != uuid::Uuid::from_bytes(*state.snapshot().thread.thread_id.as_bytes()).to_string()
+        || receipt
+            .records()
+            .windows(2)
+            .any(|records| records[0].id() >= records[1].id())
+        || receipt.records().iter().any(|record| {
+            record.publication_revision() == 0
+                || record.publication_revision() >= receipt.publication_horizon()
+        })
+    {
+        return false;
+    }
+    let Some(tasks) = active_task_adoption_shape(state, issued_permits, actor, batch, owner_epoch)
+    else {
+        return false;
+    };
+    let missing_records = receipt
+        .records()
+        .iter()
+        .filter(|record| {
+            !state
+                .snapshot()
+                .tasks
+                .iter()
+                .any(|task| task.task_id.as_str() == record.id())
+        })
+        .collect::<Vec<_>>();
+    !missing_records.is_empty()
+        && tasks.len() == missing_records.len()
+        && missing_records
+            .into_iter()
+            .zip(tasks.iter())
+            .all(|(record, task)| active_task_adoption_record_matches_task(record, task))
 }
 
 fn recovered_terminal_task_reconciliation_authorized(
@@ -9922,7 +10344,7 @@ mod tests {
     use crate::runtime_surface::reducer::tests::{
         digest, reducer_snapshot, thread_id, uuid_v7_bytes,
     };
-    use crate::tasks::TaskRegistry;
+    use crate::tasks::{LegacyActiveTaskAdoptionRecord, TaskRegistry};
 
     #[derive(Default)]
     struct TestLedger {
@@ -9989,16 +10411,37 @@ mod tests {
         }
     }
 
+    fn next_test_commit_identity(
+        state: &SurfaceReducerState,
+    ) -> (super::super::DurableRevision, SurfaceCommitId) {
+        let super::super::CursorSourceRevision::Recorded { durable_revision } =
+            state.snapshot().cursor.source_revision
+        else {
+            panic!("commit test batch requires a recorded cursor");
+        };
+        let next_revision =
+            super::super::DurableRevision::try_new(durable_revision.get().checked_add(1).unwrap())
+                .unwrap();
+        let seed = 90 + u8::try_from(durable_revision.get()).unwrap();
+        (
+            next_revision,
+            SurfaceCommitId::try_from_bytes(uuid_v7_bytes(seed)).unwrap(),
+        )
+    }
+
     fn test_batch(state: &SurfaceReducerState) -> SurfaceCommitBatch {
-        let durable_revision = super::super::DurableRevision::try_new(2).unwrap();
+        let (durable_revision, commit_id) = next_test_commit_identity(state);
         let commit_class = CommitClass::Recorded {
             thread_owner_epoch: ThreadOwnerEpoch::new(1),
             durable_revision,
-            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(91)).unwrap(),
+            commit_id,
         };
         let event = super::super::SurfaceEventEnvelope {
             ordinal: 0,
-            event_id: super::super::SurfaceEventId::try_from_bytes(uuid_v7_bytes(92)).unwrap(),
+            event_id: super::super::SurfaceEventId::try_from_bytes(uuid_v7_bytes(
+                92 + u8::try_from(state.snapshot().cursor.next_seq.get()).unwrap(),
+            ))
+            .unwrap(),
             commit_class: commit_class.clone(),
             scope: SurfaceScope::Thread,
             event: super::super::SurfaceEvent::Session(super::super::SessionPatch::RuntimeFault {
@@ -10010,7 +10453,9 @@ mod tests {
         let mut batch = SurfaceCommitBatch {
             cursor_before: state.snapshot().cursor.clone(),
             cursor_after: super::super::SurfaceCursor {
-                next_seq: super::super::SequenceNumber::new(1),
+                next_seq: super::super::SequenceNumber::new(
+                    state.snapshot().cursor.next_seq.get() + 1,
+                ),
                 source_revision: super::super::CursorSourceRevision::Recorded { durable_revision },
                 ..state.snapshot().cursor.clone()
             },
@@ -10037,7 +10482,8 @@ mod tests {
                     |(ordinal, (scope, event))| super::super::SurfaceEventEnvelope {
                         ordinal: ordinal as u32,
                         event_id: super::super::SurfaceEventId::try_from_bytes(uuid_v7_bytes(
-                            100 + ordinal as u8,
+                            100 + u8::try_from(state.snapshot().cursor.next_seq.get()).unwrap()
+                                + ordinal as u8,
                         ))
                         .unwrap(),
                         commit_class: batch.commit_class.clone(),
@@ -10049,7 +10495,9 @@ mod tests {
         )
         .unwrap();
         batch.event_count = event_count;
-        batch.cursor_after.next_seq = super::super::SequenceNumber::new(event_count as u64);
+        batch.cursor_after.next_seq = super::super::SequenceNumber::new(
+            batch.cursor_before.next_seq.get() + event_count as u64,
+        );
         batch.batch_digest = super::super::canonical_batch_digest(&batch);
         batch
     }
@@ -10105,6 +10553,482 @@ mod tests {
             retry_count: 0,
             output_truncated: false,
         }
+    }
+
+    fn active_task_adoption_events(
+        state: &SurfaceReducerState,
+        record: &LegacyActiveTaskAdoptionRecord,
+        index: u8,
+    ) -> Vec<(SurfaceScope, super::super::SurfaceEvent)> {
+        let snapshot = state.snapshot();
+        let prior_reservation_sequence = snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .map(|operation| operation.reservation.reservation_sequence.get())
+            .max()
+            .unwrap_or(0);
+        let prior_operation_count = snapshot.foreground_operation.iter().count()
+            + snapshot.queued_operations.len()
+            + snapshot.operation_history.len();
+        let seed = 140 + (u8::try_from(prior_operation_count).unwrap() + index) * 6;
+        let operation_id =
+            super::super::SurfaceOperationId::try_from_bytes(uuid_v7_bytes(seed)).unwrap();
+        let logical_turn_id = super::super::SurfaceTurnId::new();
+        let replayability = super::super::Replayability::NonReplayable {
+            reason: super::super::NonReplayableReason::Missing,
+            live_capsule: super::super::LiveOperationCapsule::Unavailable,
+        };
+        let capability_fingerprint = legacy_active_task_adoption_capability_fingerprint();
+        let fence = super::super::SurfaceOperationFence {
+            thread_id: snapshot.thread.thread_id.clone(),
+            thread_owner_epoch: snapshot.thread.owner_epoch,
+            operation_id: operation_id.clone(),
+            generation_id: super::super::SurfaceGenerationId::new(0),
+        };
+        let generation = super::super::GenerationRecord {
+            fence: fence.clone(),
+            logical_turn_id: logical_turn_id.clone(),
+            input: super::super::GenerationInputState::NotApplicable,
+            predecessor: None,
+            attempt: super::super::GenerationAttempt::Initial,
+            goal_identity: None,
+            replayability: replayability.clone(),
+            required_capabilities: Default::default(),
+            capability_fingerprint: capability_fingerprint.clone(),
+            phase: super::super::GenerationPhase::Reserved,
+            started_witness: None,
+            stop_reason: None,
+        };
+        let operation = super::super::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: super::super::SurfaceRequestId::try_from_bytes(uuid_v7_bytes(seed + 1))
+                .unwrap(),
+            intent: super::super::OperationIntent {
+                origin: super::super::OperationOrigin::TuiUser,
+                kind: super::super::OperationKind::UserTurn,
+                initial_replayability: replayability.clone(),
+                busy_disposition: super::super::BusyDisposition::Queue,
+                interrupt_settlement:
+                    super::super::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: super::super::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision: snapshot.settings.thread_revision,
+                policy_epoch: snapshot.settings.effective.policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint: capability_fingerprint.clone(),
+                settings_receipt: super::super::OperationSettingsPreparationReceipt::Current {
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                },
+            },
+            phase: super::super::OperationPhase::Requested,
+            reservation: super::super::ReservationLease::new(
+                super::super::SurfaceAdmissionLeaseId::try_from_bytes(uuid_v7_bytes(seed + 2))
+                    .unwrap(),
+                operation_id.clone(),
+                super::super::SequenceNumber::new(
+                    prior_reservation_sequence + u64::from(index) + 1,
+                ),
+                super::super::HostIncarnation::try_from_bytes(uuid_v7_bytes(seed + 3)).unwrap(),
+                super::super::MonotonicInstant {
+                    clock_id: super::super::HostMonotonicClockId::try_from_bytes(uuid_v7_bytes(
+                        seed + 4,
+                    ))
+                    .unwrap(),
+                    tick: super::super::MonotonicTick::new(0),
+                },
+            ),
+            ready_for_admission: false,
+            initial_logical_turn_id: None,
+            initial_input_item_id: None,
+            generations: Vec::new(),
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        };
+        let background_fence = super::super::SurfaceBackgroundFence {
+            operation_fence: fence.clone(),
+            background_owner_token: super::super::SurfaceBackgroundOwnerToken::new([seed + 5; 32]),
+        };
+        let task_id = super::super::SurfaceTaskId::try_new(record.id()).unwrap();
+        let task = super::super::SurfaceTask {
+            task_id: task_id.clone(),
+            revision: super::super::TaskRevision::try_new(1).unwrap(),
+            task_type: super::super::SurfaceTaskType::MainSession,
+            status: super::super::SurfaceTaskStatus::Running,
+            backgrounded: true,
+            description: super::super::DisplayText::new(record.description()),
+            created_at: super::super::UnixMillis::new(record.created_at_ms()),
+            started_at: record.started_at_ms().map(super::super::UnixMillis::new),
+            completed_at: None,
+            parent_operation: Some(operation_id.clone()),
+            background_fence: Some(background_fence.clone()),
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: record.retry_count(),
+            output_truncated: record.output_truncated(),
+        };
+        vec![
+            (
+                SurfaceScope::Operation {
+                    operation_id: operation_id.clone(),
+                },
+                super::super::SurfaceEvent::Operation(super::super::OperationPatch::Requested {
+                    operation,
+                }),
+            ),
+            (
+                SurfaceScope::Operation {
+                    operation_id: operation_id.clone(),
+                },
+                super::super::SurfaceEvent::Operation(super::super::OperationPatch::Admitted {
+                    operation_id: operation_id.clone(),
+                    logical_turn_id,
+                    input: super::super::AdmittedInput::NotApplicable,
+                    first_generation: generation,
+                }),
+            ),
+            (
+                SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                super::super::SurfaceEvent::Operation(
+                    super::super::OperationPatch::GenerationStarted {
+                        fence: fence.clone(),
+                        witness: super::super::GenerationStartedWitness {
+                            started_commit_id: next_test_commit_identity(state).1,
+                            settings_revision: snapshot.settings.thread_revision,
+                            policy_epoch: snapshot.settings.effective.policy_epoch,
+                            durable_replayability_digest:
+                                super::super::canonical_replayability_digest(&replayability),
+                            capability_fingerprint,
+                        },
+                    },
+                ),
+            ),
+            (
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Task(super::super::TaskPatch::Upserted {
+                    expected_revision: None,
+                    task,
+                }),
+            ),
+            (
+                SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                super::super::SurfaceEvent::Operation(
+                    super::super::OperationPatch::GenerationTransferred {
+                        fence,
+                        background_fence,
+                        task_id: Some(task_id),
+                    },
+                ),
+            ),
+        ]
+    }
+
+    fn active_task_adoption_batch(
+        state: &SurfaceReducerState,
+        records: &[LegacyActiveTaskAdoptionRecord],
+    ) -> SurfaceCommitBatch {
+        let events = records
+            .iter()
+            .enumerate()
+            .flat_map(|(index, record)| {
+                active_task_adoption_events(state, record, u8::try_from(index).unwrap())
+            })
+            .collect();
+        test_batch_with_events(state, events)
+    }
+
+    fn replace_batch_events(
+        batch: &mut SurfaceCommitBatch,
+        mut events: Vec<super::super::SurfaceEventEnvelope>,
+    ) {
+        for (ordinal, event) in events.iter_mut().enumerate() {
+            event.ordinal = ordinal as u32;
+        }
+        batch.event_count = events.len() as u32;
+        batch.cursor_after.next_seq = super::super::SequenceNumber::new(
+            batch.cursor_before.next_seq.get() + events.len() as u64,
+        );
+        batch.events = super::super::NonEmptyVec::try_new(events).unwrap();
+        batch.batch_digest = super::super::canonical_batch_digest(batch);
+    }
+
+    #[test]
+    fn active_task_receipt_authorizes_exact_operation_transfer_batch() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+        let registry = TaskRegistry::new_persistent(
+            uuid::Uuid::from_bytes(*thread_id().as_bytes()).to_string(),
+            dir.path().join("tasks"),
+        )
+        .unwrap();
+        let legacy = registry.create_main_session("legacy active".to_string());
+        registry.mark_running(&legacy.id).unwrap();
+
+        let committed = registry
+            .with_active_main_session_adoption(|receipt| {
+                let batch = active_task_adoption_batch(coordinator.state(), receipt.records());
+                coordinator.commit_active_task_adoption_batch(receipt, &batch)
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(committed.is_ok());
+        assert_eq!(coordinator.state().snapshot().tasks.len(), 1);
+        assert_eq!(
+            coordinator.state().snapshot().background_operations.len(),
+            1
+        );
+        assert_eq!(
+            coordinator.state().snapshot().tasks[0].task_id.as_str(),
+            legacy.id
+        );
+    }
+
+    #[test]
+    fn active_task_receipt_rejects_ambiguous_existing_operation_lineage() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+        let registry = TaskRegistry::new_persistent(
+            uuid::Uuid::from_bytes(*thread_id().as_bytes()).to_string(),
+            dir.path().join("tasks"),
+        )
+        .unwrap();
+        let first = registry.create_main_session("first legacy active".to_string());
+        registry.mark_running(&first.id).unwrap();
+        registry
+            .with_active_main_session_adoption(|receipt| {
+                let batch = active_task_adoption_batch(coordinator.state(), receipt.records());
+                coordinator
+                    .commit_active_task_adoption_batch(receipt, &batch)
+                    .unwrap();
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordinator.state().snapshot().background_operations.len(),
+            1
+        );
+
+        let ambiguous_snapshot = coordinator.state().snapshot().clone();
+        assert_eq!(ambiguous_snapshot.operation_history.len(), 1);
+        let ambiguous_owner_dir = tempfile::tempdir().unwrap();
+        let ambiguous_owner = ExclusiveOwnerLease::acquire_thread(
+            ambiguous_owner_dir.path().join("thread.lock"),
+            ambiguous_owner_dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator = RuntimeCommitCoordinator::new_with_owned_lease(
+            TestLedger::default(),
+            SurfaceReducerState::new(ambiguous_snapshot),
+            ambiguous_owner,
+        )
+        .unwrap();
+
+        let second = registry.create_main_session("ambiguous legacy active".to_string());
+        registry.mark_running(&second.id).unwrap();
+        let rejected = registry
+            .with_active_main_session_adoption(|receipt| {
+                let missing = receipt
+                    .records()
+                    .iter()
+                    .filter(|record| record.id() == second.id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let batch = active_task_adoption_batch(coordinator.state(), &missing);
+                coordinator.commit_active_task_adoption_batch(receipt, &batch)
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(rejected, Err(SurfaceCommitError::StalePublisherPermit));
+        assert_eq!(coordinator.state().snapshot().tasks.len(), 1);
+    }
+
+    #[test]
+    fn active_task_receipt_rejects_substitution_omission_and_fence_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent(
+            uuid::Uuid::from_bytes(*thread_id().as_bytes()).to_string(),
+            dir.path().join("tasks"),
+        )
+        .unwrap();
+        let first = registry.create_main_session("active a".to_string());
+        let second = registry.create_main_session("active z".to_string());
+        registry.mark_running(&first.id).unwrap();
+        registry.mark_running(&second.id).unwrap();
+
+        registry
+            .with_active_main_session_adoption(|receipt| {
+                assert_eq!(receipt.records().len(), 2);
+                let state = SurfaceReducerState::new(reducer_snapshot());
+                let exact = active_task_adoption_batch(&state, receipt.records());
+                let mut variants = Vec::new();
+
+                let mut substituted = exact.clone();
+                let mut events = substituted.events.as_slice().to_vec();
+                let super::super::SurfaceEvent::Task(super::super::TaskPatch::Upserted {
+                    task,
+                    ..
+                }) = &mut events[3].event
+                else {
+                    unreachable!();
+                };
+                task.description = super::super::DisplayText::new("substituted");
+                replace_batch_events(&mut substituted, events);
+                variants.push(substituted);
+
+                variants.push(active_task_adoption_batch(&state, &receipt.records()[..1]));
+
+                let mut mismatched_fence = exact.clone();
+                let mut events = mismatched_fence.events.as_slice().to_vec();
+                let super::super::SurfaceEvent::Operation(
+                    super::super::OperationPatch::GenerationTransferred { task_id, .. },
+                ) = &mut events[4].event
+                else {
+                    unreachable!();
+                };
+                *task_id = None;
+                replace_batch_events(&mut mismatched_fence, events);
+                variants.push(mismatched_fence);
+
+                let mut replayability = exact.clone();
+                let mut events = replayability.events.as_slice().to_vec();
+                let super::super::SurfaceEvent::Operation(
+                    super::super::OperationPatch::Requested { operation },
+                ) = &mut events[0].event
+                else {
+                    unreachable!();
+                };
+                operation.intent.initial_replayability =
+                    super::super::Replayability::NonReplayable {
+                        reason: super::super::NonReplayableReason::Redacted,
+                        live_capsule: super::super::LiveOperationCapsule::Unavailable,
+                    };
+                replace_batch_events(&mut replayability, events);
+                variants.push(replayability);
+
+                let mut settings = exact.clone();
+                let mut events = settings.events.as_slice().to_vec();
+                let super::super::SurfaceEvent::Operation(
+                    super::super::OperationPatch::Requested { operation },
+                ) = &mut events[0].event
+                else {
+                    unreachable!();
+                };
+                operation.intent.settings_revision =
+                    super::super::SettingsRevision::try_new(99).unwrap();
+                replace_batch_events(&mut settings, events);
+                variants.push(settings);
+
+                let mut fingerprint = exact.clone();
+                let mut events = fingerprint.events.as_slice().to_vec();
+                let super::super::SurfaceEvent::Operation(
+                    super::super::OperationPatch::GenerationStarted { witness, .. },
+                ) = &mut events[2].event
+                else {
+                    unreachable!();
+                };
+                witness.capability_fingerprint = digest(222);
+                replace_batch_events(&mut fingerprint, events);
+                variants.push(fingerprint);
+
+                let mut extra_event = exact.clone();
+                let mut events = extra_event.events.as_slice().to_vec();
+                events.push(events[0].clone());
+                replace_batch_events(&mut extra_event, events);
+                variants.push(extra_event);
+
+                for (index, batch) in variants.iter().enumerate() {
+                    let owner_dir = tempfile::tempdir().unwrap();
+                    let owner = ExclusiveOwnerLease::acquire_thread(
+                        owner_dir.path().join("thread.lock"),
+                        owner_dir.path().join("thread.epoch"),
+                        thread_id(),
+                        &TestClock,
+                    )
+                    .unwrap();
+                    let mut coordinator = RuntimeCommitCoordinator::new_with_owned_lease(
+                        TestLedger::default(),
+                        SurfaceReducerState::new(reducer_snapshot()),
+                        owner,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        coordinator.commit_active_task_adoption_batch(receipt, batch),
+                        Err(SurfaceCommitError::StalePublisherPermit),
+                        "variant {index} unexpectedly committed"
+                    );
+                }
+            })
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn actor_permit_cannot_commit_active_task_adoption_batch() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent(
+            uuid::Uuid::from_bytes(*thread_id().as_bytes()).to_string(),
+            dir.path().join("tasks"),
+        )
+        .unwrap();
+        let legacy = registry.create_main_session("legacy active".to_string());
+        registry.mark_running(&legacy.id).unwrap();
+        let batch = registry
+            .with_active_main_session_adoption(|receipt| {
+                active_task_adoption_batch(&state, receipt.records())
+            })
+            .unwrap()
+            .unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+
+        assert_eq!(
+            coordinator.commit_actor_batch(&batch),
+            Err(SurfaceCommitError::StalePublisherPermit)
+        );
     }
 
     #[test]
@@ -10331,6 +11255,89 @@ mod tests {
             coordinator.issue_exact_recovered_authority(&active),
             Err(SurfaceCommitError::StalePublisherPermit)
         ));
+    }
+
+    #[test]
+    fn prepared_active_task_adoption_recovers_only_canonical_shape() {
+        let state = SurfaceReducerState::new(reducer_snapshot());
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent(
+            uuid::Uuid::from_bytes(*thread_id().as_bytes()).to_string(),
+            dir.path().join("tasks"),
+        )
+        .unwrap();
+        let legacy = registry.create_main_session("prepared active".to_string());
+        registry.mark_running(&legacy.id).unwrap();
+        let canonical = registry
+            .with_active_main_session_adoption(|receipt| {
+                active_task_adoption_batch(&state, receipt.records())
+            })
+            .unwrap()
+            .unwrap();
+
+        let mut replayability = canonical.clone();
+        let mut events = replayability.events.as_slice().to_vec();
+        let super::super::SurfaceEvent::Operation(super::super::OperationPatch::Requested {
+            operation,
+        }) = &mut events[0].event
+        else {
+            unreachable!();
+        };
+        operation.intent.initial_replayability = super::super::Replayability::NonReplayable {
+            reason: super::super::NonReplayableReason::SecretInput,
+            live_capsule: super::super::LiveOperationCapsule::Unavailable,
+        };
+        replace_batch_events(&mut replayability, events);
+
+        let mut missing_task = canonical.clone();
+        let mut events = missing_task.events.as_slice().to_vec();
+        events.remove(3);
+        replace_batch_events(&mut missing_task, events);
+
+        let mut wrong_fence = canonical.clone();
+        let mut events = wrong_fence.events.as_slice().to_vec();
+        let super::super::SurfaceEvent::Operation(
+            super::super::OperationPatch::GenerationTransferred {
+                background_fence, ..
+            },
+        ) = &mut events[4].event
+        else {
+            unreachable!();
+        };
+        background_fence.background_owner_token =
+            super::super::SurfaceBackgroundOwnerToken::new([201; 32]);
+        replace_batch_events(&mut wrong_fence, events);
+
+        let mut non_main = canonical.clone();
+        let mut events = non_main.events.as_slice().to_vec();
+        let super::super::SurfaceEvent::Task(super::super::TaskPatch::Upserted { task, .. }) =
+            &mut events[3].event
+        else {
+            unreachable!();
+        };
+        task.task_type = super::super::SurfaceTaskType::Workflow;
+        replace_batch_events(&mut non_main, events);
+
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owned_lease(TestLedger::default(), state, owner)
+                .unwrap();
+        assert!(matches!(
+            coordinator.issue_exact_recovered_authority(&canonical),
+            Ok(RecoveredBatchAuthority::ActiveTaskAdoption { .. })
+        ));
+        for batch in [replayability, missing_task, wrong_fence, non_main] {
+            assert!(matches!(
+                coordinator.issue_exact_recovered_authority(&batch),
+                Err(SurfaceCommitError::StalePublisherPermit)
+            ));
+        }
     }
 
     #[test]

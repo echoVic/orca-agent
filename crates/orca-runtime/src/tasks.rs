@@ -182,6 +182,96 @@ pub(crate) struct LegacyTerminalTaskReconciliationReceipt {
     records: Vec<LegacyTerminalTaskReconciliationRecord>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct LegacyActiveTaskAdoptionRecord {
+    id: String,
+    description: String,
+    created_at_ms: i64,
+    started_at_ms: Option<i64>,
+    usage: Option<UsageTotals>,
+    retry_count: u32,
+    output_truncated: bool,
+    publication_revision: u64,
+}
+
+impl LegacyActiveTaskAdoptionRecord {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub(crate) fn created_at_ms(&self) -> i64 {
+        self.created_at_ms
+    }
+
+    pub(crate) fn started_at_ms(&self) -> Option<i64> {
+        self.started_at_ms
+    }
+
+    pub(crate) fn usage(&self) -> Option<&UsageTotals> {
+        self.usage.as_ref()
+    }
+
+    pub(crate) fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    pub(crate) fn output_truncated(&self) -> bool {
+        self.output_truncated
+    }
+
+    pub(crate) fn publication_revision(&self) -> u64 {
+        self.publication_revision
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LegacyActiveTaskAdoptionReceipt {
+    session_id: String,
+    publication_horizon: u64,
+    digest: Sha256Digest,
+    records: Vec<LegacyActiveTaskAdoptionRecord>,
+}
+
+impl LegacyActiveTaskAdoptionReceipt {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn publication_horizon(&self) -> u64 {
+        self.publication_horizon
+    }
+
+    pub(crate) fn records(&self) -> &[LegacyActiveTaskAdoptionRecord] {
+        &self.records
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        legacy_active_task_adoption_digest(
+            &self.session_id,
+            self.publication_horizon,
+            &self.records,
+        )
+        .is_ok_and(|digest| digest == self.digest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn digest(&self) -> Sha256Digest {
+        self.digest.clone()
+    }
+}
+
+fn legacy_active_task_adoption_digest(
+    session_id: &str,
+    publication_horizon: u64,
+    records: &[LegacyActiveTaskAdoptionRecord],
+) -> Result<Sha256Digest, serde_json::Error> {
+    serde_json::to_vec(&(session_id, publication_horizon, records)).map(Sha256Digest::digest)
+}
+
 impl LegacyTerminalTaskReconciliationReceipt {
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
@@ -662,6 +752,62 @@ impl TaskRegistry {
             records,
         };
         Ok(Some(reconcile(&receipt)))
+    }
+
+    pub(crate) fn with_active_main_session_adoption<R>(
+        &self,
+        adopt: impl FnOnce(&LegacyActiveTaskAdoptionReceipt) -> R,
+    ) -> Result<Option<R>, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(None);
+        };
+        let _session_lock =
+            ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                .map_err(|error| error.to_string())?;
+        let persisted = persistence
+            .load_session_records_unlocked(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        let typed_provider_outcomes = persistence
+            .load_typed_provider_outcomes_unlocked(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        let mut records = persisted
+            .into_values()
+            .filter(|record| {
+                active_main_session_adoption_eligible(record)
+                    && !typed_provider_outcomes.contains_key(&record.id)
+            })
+            .map(|record| LegacyActiveTaskAdoptionRecord {
+                id: record.id,
+                description: record.description,
+                created_at_ms: record.created_at_ms,
+                started_at_ms: record.started_at_ms,
+                usage: record.usage,
+                retry_count: record.retry_count,
+                output_truncated: record.output_truncated,
+                publication_revision: record.publication_revision,
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        let publication_horizon = records
+            .iter()
+            .map(|record| record.publication_revision)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "legacy task publication revision exhausted".to_string())?;
+        let digest =
+            legacy_active_task_adoption_digest(&self.session_id, publication_horizon, &records)
+                .map_err(|error| error.to_string())?;
+        let receipt = LegacyActiveTaskAdoptionReceipt {
+            session_id: self.session_id.clone(),
+            publication_horizon,
+            digest,
+            records,
+        };
+        Ok(Some(adopt(&receipt)))
     }
 
     pub fn acquire_task_lease(&self, id: &str) -> Result<TaskLease, TaskLeaseError> {
@@ -2519,6 +2665,15 @@ impl TaskPersistence {
         &self,
         session_id: &str,
     ) -> io::Result<HashMap<String, DurableTypedProviderOutcome>> {
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(session_id))
+            .map_err(io::Error::other)?;
+        self.load_typed_provider_outcomes_unlocked(session_id)
+    }
+
+    fn load_typed_provider_outcomes_unlocked(
+        &self,
+        session_id: &str,
+    ) -> io::Result<HashMap<String, DurableTypedProviderOutcome>> {
         let path = self.session_typed_provider_outcomes_path(session_id);
         if !path.exists() {
             return Ok(HashMap::new());
@@ -2533,6 +2688,16 @@ impl TaskPersistence {
     }
 
     fn write_typed_provider_outcomes(
+        &self,
+        session_id: &str,
+        outcomes: &HashMap<String, DurableTypedProviderOutcome>,
+    ) -> io::Result<()> {
+        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(session_id))
+            .map_err(io::Error::other)?;
+        self.write_typed_provider_outcomes_unlocked(session_id, outcomes)
+    }
+
+    fn write_typed_provider_outcomes_unlocked(
         &self,
         session_id: &str,
         outcomes: &HashMap<String, DurableTypedProviderOutcome>,
@@ -3241,6 +3406,24 @@ fn terminal_main_session_reconciliation_eligible(record: &TaskRecord) -> bool {
         && record.pending_tool_approval_response.is_none()
 }
 
+fn active_main_session_adoption_eligible(record: &TaskRecord) -> bool {
+    record.task_type == TaskType::MainSession
+        && record.status == TaskStatus::Running
+        && SurfaceTaskId::try_new(record.id.clone()).is_ok()
+        && record.started_at_ms.is_some()
+        && record.completed_at_ms.is_none()
+        && record.worker_pid.is_none()
+        && record.lease_owner.is_none()
+        && record.lease_expires_at_ms.is_none()
+        && !record.stop_requested
+        && record.tool.is_none()
+        && record.pending_tool_call.is_none()
+        && record.pending_provider_response.is_none()
+        && record.pending_tool_approval_response.is_none()
+        && record.result.is_none()
+        && record.error.is_none()
+}
+
 fn pending_tool_call_from_provider_response(
     response: &ProviderResponse,
 ) -> Option<PendingToolCallSummary> {
@@ -3590,6 +3773,253 @@ mod tests {
                 ("legacy-m-cancelled".to_string(), TaskStatus::Cancelled, 5,),
                 ("legacy-z-completed".to_string(), TaskStatus::Completed, 7,),
             ]
+        );
+    }
+
+    #[test]
+    fn persistent_active_main_session_adoption_receipt_filters_and_sorts_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let session_id = "active-adoption".to_string();
+        let registry = TaskRegistry::new_persistent_attached(session_id.clone(), root).unwrap();
+        let template_id = registry.create_main_session("template".to_string()).id;
+        let template = registry.get(&template_id).expect("template record");
+
+        let insert = |id: &str, status: TaskStatus, publication_revision: u64| {
+            let mut record = template.clone();
+            record.id = id.to_string();
+            record.status = status;
+            record.description = format!("active {id}");
+            record.started_at_ms = Some(20);
+            record.completed_at_ms = None;
+            record.publication_revision = publication_revision;
+            registry
+                .insert_task(id.to_string(), record)
+                .expect("persist active-adoption fixture");
+        };
+
+        insert("legacy-z-running", TaskStatus::Running, 7);
+        insert("legacy-a-running", TaskStatus::Running, 2);
+        insert("legacy-provider-outcome", TaskStatus::Running, 6);
+        for (id, status) in [
+            ("legacy-queued", TaskStatus::Queued),
+            ("legacy-paused", TaskStatus::Paused),
+            ("legacy-stopping", TaskStatus::Stopping),
+            ("legacy-approval", TaskStatus::ApprovalRequired),
+            ("legacy-failed", TaskStatus::Failed),
+        ] {
+            insert(id, status, 3);
+        }
+        for (id, task_type) in [
+            ("legacy-workflow", TaskType::Workflow),
+            ("legacy-subagent", TaskType::Subagent),
+            ("legacy-shell", TaskType::Shell),
+            ("legacy-monitor", TaskType::Monitor),
+        ] {
+            let mut record = template.clone();
+            record.id = id.to_string();
+            record.task_type = task_type;
+            record.status = TaskStatus::Running;
+            record.started_at_ms = Some(20);
+            record.publication_revision = 4;
+            registry.insert_task(record.id.clone(), record).unwrap();
+        }
+
+        let mut no_started_at = template.clone();
+        no_started_at.id = "legacy-no-start".to_string();
+        no_started_at.status = TaskStatus::Running;
+        no_started_at.publication_revision = 8;
+        registry
+            .insert_task(no_started_at.id.clone(), no_started_at)
+            .unwrap();
+
+        let mut residual_result = template.clone();
+        residual_result.id = "legacy-result".to_string();
+        residual_result.status = TaskStatus::Running;
+        residual_result.started_at_ms = Some(20);
+        residual_result.result = Some("stale result".to_string());
+        residual_result.publication_revision = 9;
+        registry
+            .insert_task(residual_result.id.clone(), residual_result)
+            .unwrap();
+
+        let mut residual_error = template.clone();
+        residual_error.id = "legacy-error".to_string();
+        residual_error.status = TaskStatus::Running;
+        residual_error.started_at_ms = Some(20);
+        residual_error.error = Some("stale error".to_string());
+        residual_error.publication_revision = 9;
+        registry
+            .insert_task(residual_error.id.clone(), residual_error)
+            .unwrap();
+
+        let mut residual_tool = template.clone();
+        residual_tool.id = "legacy-tool".to_string();
+        residual_tool.status = TaskStatus::Running;
+        residual_tool.started_at_ms = Some(20);
+        residual_tool.tool = Some("task_list".to_string());
+        residual_tool.publication_revision = 9;
+        registry
+            .insert_task(residual_tool.id.clone(), residual_tool)
+            .unwrap();
+
+        let mut completed_at = template.clone();
+        completed_at.id = "legacy-completed-at".to_string();
+        completed_at.status = TaskStatus::Running;
+        completed_at.started_at_ms = Some(20);
+        completed_at.completed_at_ms = Some(30);
+        completed_at.publication_revision = 9;
+        registry
+            .insert_task(completed_at.id.clone(), completed_at)
+            .unwrap();
+
+        let mut worker_owned = template.clone();
+        worker_owned.id = "legacy-worker".to_string();
+        worker_owned.status = TaskStatus::Running;
+        worker_owned.started_at_ms = Some(20);
+        worker_owned.worker_pid = Some(42);
+        worker_owned.publication_revision = 10;
+        registry
+            .insert_task(worker_owned.id.clone(), worker_owned)
+            .unwrap();
+
+        let mut leased = template.clone();
+        leased.id = "legacy-lease".to_string();
+        leased.status = TaskStatus::Running;
+        leased.started_at_ms = Some(20);
+        leased.lease_owner = Some("legacy-owner".to_string());
+        leased.lease_expires_at_ms = Some(now_ms().saturating_add(10_000));
+        leased.publication_revision = 11;
+        registry.insert_task(leased.id.clone(), leased).unwrap();
+
+        let mut stop_requested = template.clone();
+        stop_requested.id = "legacy-stop-requested".to_string();
+        stop_requested.status = TaskStatus::Running;
+        stop_requested.started_at_ms = Some(20);
+        stop_requested.stop_requested = true;
+        stop_requested.publication_revision = 12;
+        registry
+            .insert_task(stop_requested.id.clone(), stop_requested)
+            .unwrap();
+
+        let mut pending_tool = template.clone();
+        pending_tool.id = "legacy-pending-tool".to_string();
+        pending_tool.status = TaskStatus::Running;
+        pending_tool.started_at_ms = Some(20);
+        pending_tool.pending_tool_call = Some(PendingToolCallSummary {
+            id: "tool-call".to_string(),
+            name: "task_list".to_string(),
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            arguments: "{}".to_string(),
+        });
+        pending_tool.publication_revision = 13;
+        registry
+            .insert_task(pending_tool.id.clone(), pending_tool)
+            .unwrap();
+
+        let mut pending_approval = template.clone();
+        pending_approval.id = "legacy-pending-approval".to_string();
+        pending_approval.status = TaskStatus::Running;
+        pending_approval.started_at_ms = Some(20);
+        pending_approval.pending_tool_approval_response = Some(true);
+        pending_approval.publication_revision = 13;
+        registry
+            .insert_task(pending_approval.id.clone(), pending_approval)
+            .unwrap();
+
+        let mut pending_provider = template.clone();
+        pending_provider.id = "legacy-pending-provider".to_string();
+        pending_provider.status = TaskStatus::Running;
+        pending_provider.started_at_ms = Some(20);
+        pending_provider.pending_provider_response = Some(runtime_response(ProviderResponse {
+            steps: Vec::new(),
+            assistant_content: Some("pending provider".to_string()),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        }));
+        pending_provider.publication_revision = 13;
+        registry
+            .insert_task(pending_provider.id.clone(), pending_provider)
+            .unwrap();
+
+        let mut malformed_id = template.clone();
+        malformed_id.id = String::new();
+        malformed_id.status = TaskStatus::Running;
+        malformed_id.started_at_ms = Some(20);
+        malformed_id.publication_revision = 14;
+        registry
+            .insert_task(malformed_id.id.clone(), malformed_id)
+            .unwrap();
+
+        registry
+            .record_typed_provider_outcome(
+                "legacy-provider-outcome",
+                DurableTypedProviderOutcome {
+                    status: TaskStatus::Stopped,
+                    response: None,
+                    error: Some("terminal provider outcome".to_string()),
+                    usage: None,
+                    operation_terminal: None,
+                    completed_at_ms: 40,
+                },
+            )
+            .unwrap();
+
+        let observed = registry
+            .with_active_main_session_adoption(|receipt| {
+                assert!(receipt.is_valid());
+                (
+                    receipt.session_id().to_string(),
+                    receipt.publication_horizon(),
+                    receipt.digest(),
+                    receipt
+                        .records()
+                        .iter()
+                        .map(|record| {
+                            (
+                                record.id().to_string(),
+                                record.description().to_string(),
+                                record.started_at_ms(),
+                                record.publication_revision(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .expect("issue active-adoption receipt")
+            .expect("persistent registries issue receipts");
+        let second_digest = registry
+            .with_active_main_session_adoption(|receipt| receipt.digest())
+            .expect("reissue active-adoption receipt")
+            .expect("persistent registries issue receipts");
+
+        assert_eq!(observed.0, session_id);
+        assert_eq!(observed.1, 8);
+        assert_eq!(observed.2, second_digest);
+        assert_eq!(
+            observed.3,
+            vec![
+                (
+                    "legacy-a-running".to_string(),
+                    "active legacy-a-running".to_string(),
+                    Some(20),
+                    2,
+                ),
+                (
+                    "legacy-z-running".to_string(),
+                    "active legacy-z-running".to_string(),
+                    Some(20),
+                    7,
+                ),
+            ]
+        );
+        assert!(
+            TaskRegistry::new("process-local-active-adoption".to_string())
+                .with_active_main_session_adoption(|_| ())
+                .unwrap()
+                .is_none()
         );
     }
 

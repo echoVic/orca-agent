@@ -2784,6 +2784,9 @@ static PROVIDER_TERMINAL_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>
 static TERMINAL_TASK_RECONCILIATION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
+static ACTIVE_TASK_ADOPTION_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
 static GENERATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static ADMISSION_REPAIR_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
@@ -3170,6 +3173,18 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_active_task_adoption_append_failures(
+        path: impl Into<PathBuf>,
+        count: usize,
+    ) {
+        ACTIVE_TASK_ADOPTION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_admission_repair_append_failure_once(path: impl Into<PathBuf>) {
         Self::inject_admission_repair_append_failures(path, 1);
     }
@@ -3244,6 +3259,55 @@ impl JsonlSurfaceCommitLedger {
             return false;
         }
         let mut failures = TERMINAL_TASK_RECONCILIATION_APPEND_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = failures.get_mut(&self.path) else {
+            return false;
+        };
+        if *count <= 1 {
+            failures.remove(&self.path);
+        } else {
+            *count -= 1;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn take_active_task_adoption_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        let events = batch.events.as_slice();
+        let is_active_task_adoption = !events.is_empty()
+            && events.len() % 5 == 0
+            && events.chunks_exact(5).all(|group| {
+                matches!(
+                    (
+                        &group[0].event,
+                        &group[1].event,
+                        &group[2].event,
+                        &group[3].event,
+                        &group[4].event,
+                    ),
+                    (
+                        SurfaceEvent::Operation(OperationPatch::Requested { .. }),
+                        SurfaceEvent::Operation(OperationPatch::Admitted { .. }),
+                        SurfaceEvent::Operation(OperationPatch::GenerationStarted { .. }),
+                        SurfaceEvent::Task(TaskPatch::Upserted {
+                            task: SurfaceTask {
+                                task_type: SurfaceTaskType::MainSession,
+                                status: SurfaceTaskStatus::Running,
+                                backgrounded: true,
+                                ..
+                            },
+                            ..
+                        }),
+                        SurfaceEvent::Operation(OperationPatch::GenerationTransferred { .. }),
+                    )
+                )
+            });
+        if !is_active_task_adoption {
+            return false;
+        }
+        let mut failures = ACTIVE_TASK_ADOPTION_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3955,6 +4019,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_terminal_task_reconciliation_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_active_task_adoption_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }
         let (commit_id, durable_revision) = match &batch.commit_class {

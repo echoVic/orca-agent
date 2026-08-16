@@ -3368,6 +3368,36 @@ a conflicting identity/digest is rejected. A later cold start also subtracts
 surface task ids before building a fresh batch, so an already imported legacy
 row consumes no new commit.
 
+Legacy active-task adoption has a separate closed commit authority. For a
+recorded thread, `TaskRegistry` may issue an opaque receipt while holding the
+session lock over safe registry-only MainSession rows in exact Running state.
+The coordinator admits every missing receipt row, and no other row, as one
+canonical five-event group: `OperationRequested`, `OperationAdmitted`,
+`GenerationStarted`, `TaskPatch::Upserted`, then `GenerationTransferred`. The
+operation is non-replayable with an unavailable capsule, the generation and
+task share the same fresh operation identity, and the transfer installs the
+exact background fence recorded on the task. The fixed capability fingerprint
+is the SHA-256 of `orca.runtime.legacy-active-task-adoption.v1`; current thread
+owner, settings, and policy revisions are required. Ordinary actor authority
+and terminal reconciliation authority cannot commit this shape. Because the
+legacy row has no typed operation id, both the startup producer and fresh or
+prepared authority reject the entire adoption when the recovered snapshot
+already contains any foreground, queued, historical, or background operation
+lineage; a Running compatibility mirror is otherwise indistinguishable from a
+truly registry-only row.
+
+Cold startup subtracts task ids already present in the recovered surface,
+commits all remaining receipt-backed groups in one batch, and then applies the
+existing non-replayable runtime-restart recovery. That recovery terminalizes
+the operation as `AbortedByRuntimeRestart`; only the subsequent terminal task
+reconciliation changes the adopted task to Stopped and then mirrors Stopped to
+the legacy registry. An append failure exhausts bounded semantic retries and
+leaves the registry row Running. Prepared-ledger recovery may reuse the active
+adoption authority only for the same exact append-only five-event shape; it
+cannot create a replayable continuation, approval, failed/retryable task, rich
+task graph, or omission/replacement of current state. Already committed and
+repeated-start batches follow ordinary commit-id and surface-task idempotency.
+
 The reducer independently requires unique ids, source revision coverage, and
 byte-identical retention of every current task. It permits constrained terminal
 history creation only in the shape above; omission or replacement of an

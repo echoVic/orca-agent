@@ -1905,6 +1905,26 @@
       "exact_receipt_for_fresh_commit_and_safe_shape_for_prepared_recovery"
     ],
     [
+      "task.active_adoption_registry_receipt",
+      "crates/orca-runtime/src/tasks.rs",
+      757,
+      "with_active_main_session_adoption",
+      "Task",
+      "TaskPatchSet",
+      "typed_receipt",
+      "locked_safe_running_main_session_receipt_and_canonical_digest"
+    ],
+    [
+      "task.active_adoption_commit_authority",
+      "crates/orca-runtime/src/runtime_surface/commit.rs",
+      1413,
+      "commit_active_task_adoption_batch",
+      "Task",
+      "TaskPatchSet",
+      "typed_receipt",
+      "exact_five_event_adoption_for_fresh_commit_and_prepared_recovery"
+    ],
+    [
       "workflow.store",
       "crates/orca-runtime/src/workflow/state.rs",
       244,
@@ -6456,6 +6476,24 @@
       ]
     },
     {
+      "id": "task.legacy_active_main_session_adoption",
+      "given": "recorded thread with one safe registry-only Running MainSession plus excluded active phases and rich rows",
+      "when": "cold startup issues a locked adoption receipt and commits canonical five-event groups before cold recovery",
+      "expect": [
+        "every missing receipt row is adopted exactly once",
+        "ordinary actor and terminal reconciliation authorities reject adoption",
+        "operation generation task and background fence identities agree",
+        "input capsule is unavailable and non-replayable",
+        "any existing typed operation lineage rejects the whole adoption receipt",
+        "cold recovery terminalizes the operation as AbortedByRuntimeRestart",
+        "terminal reconciliation stops the surface task before the registry mirror",
+        "append failure is bounded and leaves the registry row Running",
+        "prepared recovery accepts only the same canonical five-event shape",
+        "repeated restart creates no second adoption group",
+        "TUI consumes only SurfaceProjectionSynced"
+      ]
+    },
+    {
       "id": "operation.reserve_cancel_before_admission",
       "given": "recorded thread with free reservation capacity",
       "when": "ReserveOperation commits then CancelOperation is actor-ordered before AdmitReserved",
@@ -9682,7 +9720,8 @@
     "capability_ledger_failure_authority": "RuntimeCapabilityLedgerToolSettlementMayFailOwningOperation",
     "acp_transport_terminal_authority": "TransportNeverPublishesOperationTerminal",
     "runtime_finalizer_terminal_authority": "OnlyFinalizerWithTerminalPermit",
-    "task_reconciliation_authority": "LockedTaskRegistryReceiptOrExactPreparedRecoveryOnly"
+    "task_reconciliation_authority": "LockedTaskRegistryReceiptOrExactPreparedRecoveryOnly",
+    "task_active_adoption_authority": "LockedActiveTaskAdoptionReceiptOrCanonicalPreparedRecoveryOnly"
   },
   "session_health_issue_id_variants": [
     "Mutation(SurfaceSettlementId)",
@@ -9928,7 +9967,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "112a6311b4873926bc8af3311ab5858a56de34c33ac3849699857d3cb400cccd",
+    "private_contract_sha256": "4fabe7db5467c2e469a7768c89d13ab5f54d6a37fa07af4d52b285bf22e83530",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",

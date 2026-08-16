@@ -94,6 +94,7 @@ pub use commands::{
 };
 pub(crate) use commands::{AcpAttachmentCapabilityProfile, RuntimeSurfaceCommandDispatcher};
 
+pub(crate) use commit::legacy_active_task_adoption_capability_fingerprint;
 pub(crate) use commit::manual_compaction_item_patches;
 pub use commit::{
     ImmutableShutdownLedger, RecoveryAction, RecoveryDegradedCause, RecoveryMaterialization,

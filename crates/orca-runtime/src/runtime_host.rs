@@ -7592,6 +7592,268 @@ fn reconcile_legacy_terminal_main_session_tasks_on_start(
     reconciliation.unwrap_or(Ok(()))
 }
 
+fn adopt_legacy_active_main_session_tasks_on_start(
+    thread: &RuntimeThread,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+    host_incarnation: &surface::HostIncarnation,
+) -> Result<(), RuntimeHostError> {
+    let task_registry = thread.session().task_registry();
+    let adoption = task_registry
+        .with_active_main_session_adoption(|receipt| {
+            let snapshot = coordinator.state().snapshot().clone();
+            // Legacy task rows carry no typed operation identity. Any recovered
+            // operation makes a Running row ambiguous with its compatibility mirror.
+            if snapshot.foreground_operation.is_some()
+                || !snapshot.queued_operations.is_empty()
+                || !snapshot.operation_history.is_empty()
+                || !snapshot.background_operations.is_empty()
+            {
+                return Ok(());
+            }
+            let current_task_ids = snapshot
+                .tasks
+                .iter()
+                .map(|task| task.task_id.clone())
+                .collect::<BTreeSet<_>>();
+            let records = receipt
+                .records()
+                .iter()
+                .filter(|record| {
+                    surface::SurfaceTaskId::try_new(record.id())
+                        .is_ok_and(|task_id| !current_task_ids.contains(&task_id))
+                })
+                .collect::<Vec<_>>();
+            if records.is_empty() {
+                return Ok(());
+            }
+
+            let commit_id =
+                surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let fingerprint = surface::legacy_active_task_adoption_capability_fingerprint();
+            let replayability = surface::Replayability::NonReplayable {
+                reason: surface::NonReplayableReason::Missing,
+                live_capsule: surface::LiveOperationCapsule::Unavailable,
+            };
+            let replayability_digest = surface::canonical_replayability_digest(&replayability);
+            let mut reservation_sequence = snapshot
+                .foreground_operation
+                .iter()
+                .chain(snapshot.queued_operations.iter())
+                .chain(snapshot.operation_history.iter())
+                .map(|operation| operation.reservation.reservation_sequence.get())
+                .max()
+                .unwrap_or(0);
+            let mut events = Vec::with_capacity(records.len() * 5);
+
+            for record in records {
+                reservation_sequence = reservation_sequence.checked_add(1).ok_or_else(|| {
+                    RuntimeHostError::ThreadStartFailed {
+                        message: "legacy active-task reservation sequence exhausted".to_string(),
+                    }
+                })?;
+                let operation_id =
+                    surface::SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                        .expect("generated UUID is v7");
+                let logical_turn_id = surface::SurfaceTurnId::new();
+                let fence = surface::SurfaceOperationFence {
+                    thread_id: snapshot.thread.thread_id.clone(),
+                    thread_owner_epoch: snapshot.thread.owner_epoch,
+                    operation_id: operation_id.clone(),
+                    generation_id: surface::SurfaceGenerationId::new(0),
+                };
+                let generation = surface::GenerationRecord {
+                    fence: fence.clone(),
+                    logical_turn_id: logical_turn_id.clone(),
+                    input: surface::GenerationInputState::NotApplicable,
+                    predecessor: None,
+                    attempt: surface::GenerationAttempt::Initial,
+                    goal_identity: None,
+                    replayability: replayability.clone(),
+                    required_capabilities: BTreeSet::new(),
+                    capability_fingerprint: fingerprint.clone(),
+                    phase: surface::GenerationPhase::Reserved,
+                    started_witness: None,
+                    stop_reason: None,
+                };
+                let operation = surface::OperationRecord {
+                    operation_id: operation_id.clone(),
+                    request_id: surface::SurfaceRequestId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .expect("generated UUID is v7"),
+                    intent: surface::OperationIntent {
+                        origin: surface::OperationOrigin::TuiUser,
+                        kind: surface::OperationKind::UserTurn,
+                        initial_replayability: replayability.clone(),
+                        busy_disposition: surface::BusyDisposition::Queue,
+                        interrupt_settlement:
+                            surface::InterruptSettlement::SuspendUntilExplicitControl,
+                        legacy_visibility: surface::LegacyVisibility::PublishAfterAdmitted,
+                        settings_revision: snapshot.settings.thread_revision,
+                        policy_epoch: snapshot.settings.effective.policy_epoch,
+                        required_capabilities: BTreeSet::new(),
+                        capability_fingerprint: fingerprint.clone(),
+                        settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
+                            settings_revision: snapshot.settings.thread_revision,
+                            policy_epoch: snapshot.settings.effective.policy_epoch,
+                        },
+                    },
+                    phase: surface::OperationPhase::Requested,
+                    reservation: surface::ReservationLease::new(
+                        surface::SurfaceAdmissionLeaseId::try_from_bytes(
+                            *uuid::Uuid::now_v7().as_bytes(),
+                        )
+                        .expect("generated UUID is v7"),
+                        operation_id.clone(),
+                        surface::SequenceNumber::new(reservation_sequence),
+                        host_incarnation.clone(),
+                        surface::MonotonicInstant {
+                            clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                                *uuid::Uuid::now_v7().as_bytes(),
+                            )
+                            .expect("generated UUID is v7"),
+                            tick: surface::MonotonicTick::new(0),
+                        },
+                    ),
+                    ready_for_admission: false,
+                    initial_logical_turn_id: None,
+                    initial_input_item_id: None,
+                    generations: Vec::new(),
+                    agent_loop_turns: Vec::new(),
+                    pending_control: None,
+                    finalization: None,
+                    terminal: None,
+                };
+                let background_fence = surface::SurfaceBackgroundFence {
+                    operation_fence: fence.clone(),
+                    background_owner_token: surface::SurfaceBackgroundOwnerToken::new(
+                        random_token_bytes(),
+                    ),
+                };
+                let task_id = surface::SurfaceTaskId::try_new(record.id())
+                    .expect("active-task receipt validates task identities");
+                let task = surface::SurfaceTask {
+                    task_id: task_id.clone(),
+                    revision: surface::TaskRevision::try_new(1)
+                        .expect("one is a valid task revision"),
+                    task_type: surface::SurfaceTaskType::MainSession,
+                    status: surface::SurfaceTaskStatus::Running,
+                    backgrounded: true,
+                    description: surface::DisplayText::new(record.description()),
+                    created_at: surface::UnixMillis::new(record.created_at_ms()),
+                    started_at: record.started_at_ms().map(surface::UnixMillis::new),
+                    completed_at: None,
+                    parent_operation: Some(operation_id.clone()),
+                    background_fence: Some(background_fence.clone()),
+                    workflow_run_id: None,
+                    subagent_id: None,
+                    pending_interaction_id: None,
+                    usage: record.usage().map(|usage| surface::UsageTotals {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cache_tokens: usage.cache_tokens,
+                        estimated_cost_usd_micros: crate::cost::usd_to_micros(
+                            usage.estimated_cost_usd,
+                        ),
+                    }),
+                    result: None,
+                    error: None,
+                    retry_count: record.retry_count(),
+                    output_truncated: record.output_truncated(),
+                };
+                events.extend([
+                    (
+                        surface::SurfaceScope::Operation {
+                            operation_id: operation_id.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(surface::OperationPatch::Requested {
+                            operation,
+                        }),
+                    ),
+                    (
+                        surface::SurfaceScope::Operation {
+                            operation_id: operation_id.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(surface::OperationPatch::Admitted {
+                            operation_id: operation_id.clone(),
+                            logical_turn_id,
+                            input: surface::AdmittedInput::NotApplicable,
+                            first_generation: generation,
+                        }),
+                    ),
+                    (
+                        surface::SurfaceScope::Generation {
+                            fence: fence.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::GenerationStarted {
+                                fence: fence.clone(),
+                                witness: surface::GenerationStartedWitness {
+                                    started_commit_id: commit_id.clone(),
+                                    settings_revision: snapshot.settings.thread_revision,
+                                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                                    durable_replayability_digest: replayability_digest.clone(),
+                                    capability_fingerprint: fingerprint.clone(),
+                                },
+                            },
+                        ),
+                    ),
+                    (
+                        surface::SurfaceScope::Thread,
+                        surface::SurfaceEvent::Task(surface::TaskPatch::Upserted {
+                            expected_revision: None,
+                            task,
+                        }),
+                    ),
+                    (
+                        surface::SurfaceScope::Generation {
+                            fence: fence.clone(),
+                        },
+                        surface::SurfaceEvent::Operation(
+                            surface::OperationPatch::GenerationTransferred {
+                                fence,
+                                background_fence,
+                                task_id: Some(task_id),
+                            },
+                        ),
+                    ),
+                ]);
+            }
+
+            let batch = runtime_surface_event_batch(&snapshot, events, Some(commit_id));
+            for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+                match coordinator.commit_active_task_adoption_batch(receipt, &batch) {
+                    Ok(_) => return Ok(()),
+                    Err(surface::SurfaceCommitError::Ledger(error))
+                        if matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) =>
+                    {
+                        if attempt + 1 == SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        return Err(RuntimeHostError::ThreadStartFailed {
+                            message: format!("failed to adopt legacy active task: {error:?}"),
+                        });
+                    }
+                }
+            }
+            Err(RuntimeHostError::ThreadStartFailed {
+                message: "legacy active-task adoption exhausted bounded retries".to_string(),
+            })
+        })
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to read legacy active main-session tasks: {error}"),
+        })?;
+    adoption.unwrap_or(Ok(()))
+}
+
 fn recover_background_approval_routes_on_start(
     coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
 ) -> Result<(), RuntimeHostError> {
@@ -7908,6 +8170,11 @@ fn bootstrap_recorded_surface(
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
                 message: format!("failed to materialize typed surface owner: {error:?}"),
             })?;
+        adopt_legacy_active_main_session_tasks_on_start(
+            thread,
+            &mut coordinator,
+            &host_incarnation,
+        )?;
         reconcile_main_session_task_mirrors_on_start(thread, coordinator.state().snapshot());
         reconcile_durable_workflow_outcomes_on_start(thread, config, &mut coordinator)?;
         reconcile_durable_provider_outcomes_on_start(thread, &mut coordinator, &host_incarnation)?;
@@ -43608,6 +43875,196 @@ mod tests {
     }
 
     #[test]
+    fn recorded_restart_adopts_and_stops_registry_only_running_main_session_once() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("create isolated ORCA_HOME");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let cwd = tempfile::tempdir().expect("create runtime cwd");
+            let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start recorded runtime host");
+            let thread = host
+                .start_thread(config.clone(), "legacy active adoption")
+                .expect("start recorded runtime thread");
+            let session_id = thread.thread_id().to_string();
+            let initial_cursor = fresh_surface_attachment_with_capabilities(
+                &thread.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+            .cursor
+            .clone();
+            let transcript_path = SessionStore::new()
+                .load_session(&session_id)
+                .expect("load active-adoption transcript")
+                .path;
+            host.shutdown().expect("shutdown recorded runtime host");
+
+            let registry =
+                TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
+                    .expect("open recorded task registry");
+            let legacy = registry.create_main_session("running before surface ownership".into());
+            registry
+                .mark_running(&legacy.id)
+                .expect("mark registry-only task running");
+            registry
+                .mark_output_truncated(&legacy.id)
+                .expect("preserve registry-only truncation");
+            let before = registry
+                .get(&legacy.id)
+                .expect("active task before adoption");
+            drop(registry);
+
+            let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start first active-adoption host");
+            let resumed = resumed_host
+                .start_thread(
+                    RunConfig {
+                        history_mode: HistoryMode::Resume(session_id.clone()),
+                        ..config.clone()
+                    },
+                    "first active adoption",
+                )
+                .expect("resume registry-only active task");
+            let first_snapshot = fresh_surface_attachment_with_capabilities(
+                &resumed.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let adopted = first_snapshot
+                .tasks
+                .iter()
+                .find(|task| task.task_id.as_str() == legacy.id)
+                .expect("registry-only active task must be adopted");
+            assert_eq!(adopted.revision.get(), 2);
+            assert_eq!(adopted.task_type, surface::SurfaceTaskType::MainSession);
+            assert_eq!(adopted.status, surface::SurfaceTaskStatus::Stopped);
+            assert_eq!(
+                adopted.description.as_str(),
+                "running before surface ownership"
+            );
+            assert_eq!(adopted.created_at.get(), before.created_at_ms);
+            assert_eq!(
+                adopted.started_at.map(|started| started.get()),
+                before.started_at_ms
+            );
+            assert_eq!(adopted.retry_count, before.retry_count);
+            assert!(adopted.output_truncated);
+            assert_eq!(
+                adopted.result.as_ref().map(|result| result.as_str()),
+                Some("Background turn stopped during runtime recovery")
+            );
+            let parent_operation = adopted
+                .parent_operation
+                .as_ref()
+                .expect("adopted task parent operation");
+            let historical_fence = adopted
+                .background_fence
+                .as_ref()
+                .expect("adopted task historical background fence");
+            assert_eq!(
+                &historical_fence.operation_fence.operation_id,
+                parent_operation
+            );
+            let operation = first_snapshot
+                .operation_history
+                .iter()
+                .find(|operation| &operation.operation_id == parent_operation)
+                .expect("adopted parent operation history");
+            assert_eq!(operation.generations.len(), 1);
+            assert_eq!(operation.generations[0].fence.generation_id.get(), 0);
+            assert_eq!(
+                operation.generations[0].phase,
+                surface::GenerationPhase::Stopped
+            );
+            assert!(matches!(
+                operation.terminal.as_ref().map(|terminal| &terminal.terminal),
+                Some(surface::OperationTerminal::AbortedByRuntimeRestart {
+                    last_generation
+                }) if last_generation.get() == 0
+            ));
+            assert!(first_snapshot.background_operations.is_empty());
+            let mirrored =
+                TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
+                    .expect("reopen mirrored active task registry")
+                    .get(&legacy.id)
+                    .expect("mirrored active task");
+            assert_eq!(mirrored.status, TaskStatus::Stopped);
+            assert_eq!(
+                mirrored.result.as_deref(),
+                Some("Background turn stopped during runtime recovery")
+            );
+            resumed_host
+                .shutdown()
+                .expect("shutdown first active-adoption host");
+
+            let second_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start second active-adoption host");
+            let second = second_host
+                .start_thread(
+                    RunConfig {
+                        history_mode: HistoryMode::Resume(session_id),
+                        ..config
+                    },
+                    "second active adoption",
+                )
+                .expect("resume already adopted task");
+            let second_snapshot = fresh_surface_attachment_with_capabilities(
+                &second.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            assert_eq!(
+                second_snapshot
+                    .tasks
+                    .iter()
+                    .filter(|task| task.task_id.as_str() == legacy.id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                second_snapshot
+                    .operation_history
+                    .iter()
+                    .filter(|operation| {
+                        adopted.parent_operation.as_ref() == Some(&operation.operation_id)
+                    })
+                    .count(),
+                1
+            );
+            let recovered = surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor)
+                .recover_batches()
+                .expect("recover active-adoption batches");
+            assert_eq!(
+                recovered
+                    .committed
+                    .iter()
+                    .filter(|batch| {
+                        batch.events.as_slice().len() == 5
+                            && batch.events.as_slice().iter().any(|envelope| {
+                                matches!(
+                                    &envelope.event,
+                                    surface::SurfaceEvent::Task(surface::TaskPatch::Upserted {
+                                        task,
+                                        ..
+                                    }) if task.task_id.as_str() == legacy.id
+                                )
+                            })
+                    })
+                    .count(),
+                1,
+                "repeated restart must retain exactly one adoption group"
+            );
+            second_host
+                .shutdown()
+                .expect("shutdown second active-adoption host");
+        });
+    }
+
+    #[test]
     fn recorded_restart_does_not_reconcile_active_approval_failed_or_rich_tasks() {
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().expect("create isolated ORCA_HOME");
@@ -43625,10 +44082,15 @@ mod tests {
             let registry =
                 TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
                     .expect("open recorded task registry");
-            let active = registry.create_main_session("active legacy task".into());
+            let queued = registry.create_main_session("queued legacy task".into());
+            let paused = registry.create_main_session("paused legacy task".into());
             registry
-                .mark_running(&active.id)
-                .expect("mark legacy task running");
+                .request_pause(&paused.id)
+                .expect("pause legacy task");
+            let stopping = registry.create_main_session("stopping legacy task".into());
+            registry
+                .request_stop(&stopping.id)
+                .expect("stop legacy task");
             let approval = registry.create_main_session("approval legacy task".into());
             registry
                 .apply_main_session_terminal_update(
@@ -43667,7 +44129,14 @@ mod tests {
             )
             .baseline
             .snapshot;
-            for excluded in [&active.id, &approval.id, &failed.id, &rich.id] {
+            for excluded in [
+                &queued.id,
+                &paused.id,
+                &stopping.id,
+                &approval.id,
+                &failed.id,
+                &rich.id,
+            ] {
                 assert!(
                     snapshot
                         .tasks
@@ -43796,6 +44265,148 @@ mod tests {
             recovery_host
                 .shutdown()
                 .expect("shutdown post-failure recovery host");
+        });
+    }
+
+    #[test]
+    fn recorded_restart_active_adoption_append_failure_is_bounded_and_non_mutating() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().expect("create isolated ORCA_HOME");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let cwd = tempfile::tempdir().expect("create runtime cwd");
+            let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+            let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start recorded runtime host");
+            let thread = host
+                .start_thread(config.clone(), "failed active adoption")
+                .expect("start recorded runtime thread");
+            let session_id = thread.thread_id().to_string();
+            let initial_cursor = fresh_surface_attachment_with_capabilities(
+                &thread.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+            .cursor
+            .clone();
+            let transcript_path = SessionStore::new()
+                .load_session(&session_id)
+                .expect("load failed-adoption transcript")
+                .path;
+            host.shutdown().expect("shutdown recorded runtime host");
+
+            let registry =
+                TaskRegistry::new_persistent(session_id.clone(), home.join("task-sessions"))
+                    .expect("open recorded task registry");
+            let legacy = registry.create_main_session("must survive failed adoption".into());
+            registry
+                .mark_running(&legacy.id)
+                .expect("mark registry-only task running");
+            let before = registry
+                .get(&legacy.id)
+                .expect("active task before failure");
+            drop(registry);
+            surface::JsonlSurfaceCommitLedger::inject_active_task_adoption_append_failures(
+                transcript_path.clone(),
+                SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
+            );
+
+            let failed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start failed-adoption host");
+            let error = match failed_host.start_thread(
+                RunConfig {
+                    history_mode: HistoryMode::Resume(session_id.clone()),
+                    ..config.clone()
+                },
+                "reject failed active adoption",
+            ) {
+                Ok(_) => panic!("exhausted adoption append failures must reject startup"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                RuntimeHostError::ThreadStartFailed { ref message }
+                    if message.contains("active-task adoption exhausted bounded retries")
+            ));
+            failed_host
+                .shutdown()
+                .expect("shutdown failed-adoption host");
+
+            let after = TaskRegistry::attach_for_cwd(session_id.clone(), cwd.path())
+                .get(&legacy.id)
+                .expect("active task after failed adoption");
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.task_type, before.task_type);
+            assert_eq!(after.status, TaskStatus::Running);
+            assert_eq!(after.description, before.description);
+            assert_eq!(after.started_at_ms, before.started_at_ms);
+            assert_eq!(after.completed_at_ms, before.completed_at_ms);
+            assert_eq!(after.result, before.result);
+            assert_eq!(after.error, before.error);
+            assert_eq!(after.publication_revision, before.publication_revision);
+            let failed_recovery = surface::JsonlSurfaceCommitLedger::new(
+                transcript_path.clone(),
+                initial_cursor.clone(),
+            )
+            .recover_batches()
+            .expect("recover failed-adoption ledger");
+            assert!(failed_recovery.committed.iter().all(|batch| {
+                batch.events.as_slice().iter().all(|envelope| {
+                    !matches!(
+                        &envelope.event,
+                        surface::SurfaceEvent::Task(surface::TaskPatch::Upserted { task, .. })
+                            if task.task_id.as_str() == legacy.id
+                    )
+                })
+            }));
+
+            let recovery_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
+                .expect("start post-failure adoption host");
+            let recovered_thread = recovery_host
+                .start_thread(
+                    RunConfig {
+                        history_mode: HistoryMode::Resume(session_id),
+                        ..config
+                    },
+                    "recover failed active adoption",
+                )
+                .expect("adopt active task after failures clear");
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &recovered_thread.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let adopted = snapshot
+                .tasks
+                .iter()
+                .filter(|task| task.task_id.as_str() == legacy.id)
+                .collect::<Vec<_>>();
+            assert_eq!(adopted.len(), 1);
+            assert_eq!(adopted[0].status, surface::SurfaceTaskStatus::Stopped);
+            let recovered = surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor)
+                .recover_batches()
+                .expect("recover successful adoption ledger");
+            assert_eq!(
+                recovered
+                    .committed
+                    .iter()
+                    .flat_map(|batch| batch.events.as_slice().iter())
+                    .filter(|envelope| {
+                        matches!(
+                            &envelope.event,
+                            surface::SurfaceEvent::Task(surface::TaskPatch::Upserted {
+                                task,
+                                ..
+                            }) if task.task_id.as_str() == legacy.id
+                        )
+                    })
+                    .count(),
+                1
+            );
+            recovery_host
+                .shutdown()
+                .expect("shutdown post-failure adoption host");
         });
     }
 

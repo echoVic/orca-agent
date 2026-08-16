@@ -839,6 +839,20 @@ const NON_EVENT_SOURCE_ANCHORS = new Map([
       anchor: /pub\(crate\)\s+fn\s+commit_terminal_task_reconciliation_batch\s*\(/,
     },
   ],
+  [
+    "task.active_adoption_registry_receipt",
+    {
+      relativePath: "crates/orca-runtime/src/tasks.rs",
+      anchor: /pub\(crate\)\s+fn\s+with_active_main_session_adoption\s*</,
+    },
+  ],
+  [
+    "task.active_adoption_commit_authority",
+    {
+      relativePath: "crates/orca-runtime/src/runtime_surface/commit.rs",
+      anchor: /pub\(crate\)\s+fn\s+commit_active_task_adoption_batch\s*\(/,
+    },
+  ],
 ]);
 
 const TUI_RUNTIME_MUTATION_APIS = new Map([
