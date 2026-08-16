@@ -31,6 +31,19 @@ impl TerminalInputReceivers {
     ) {
         (self.events, self.focus_events, self.controls)
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        events: mpsc::Receiver<Event>,
+        focus_events: mpsc::Receiver<Event>,
+        controls: mpsc::Receiver<InputControl>,
+    ) -> Self {
+        Self {
+            events,
+            focus_events,
+            controls,
+        }
+    }
 }
 
 pub(crate) struct PendingTerminalSession {

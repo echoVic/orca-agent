@@ -1642,6 +1642,110 @@ expectFailure(
   }
 }
 
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutOwnerCall = source.replace(
+    /renderer_input_wake\.receive\s*\(/,
+    "renderer_input_wake.removed_receive(",
+  );
+  assert.notEqual(
+    withoutOwnerCall,
+    source,
+    "renderer input wake fixture must remove the production app caller",
+  );
+  assert.match(
+    withoutOwnerCall,
+    /RendererInputWakeOwner::new/,
+    "renderer input wake fixture must preserve owner construction",
+  );
+  expectFailure(
+    "renderer input wake validation rejects a removed app caller while owner construction remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, withoutOwnerCall),
+      }),
+    /renderer_input_wake source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_input_wake.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "receiver transfer",
+      /receivers\.into_parts\(\)/,
+      "receivers.removed_into_parts()",
+      /pub\(crate\)\s+fn\s+new/,
+    ],
+    [
+      "priority selection",
+      /receive_prioritized_input_or_control\(/,
+      "removed_priority_selection(",
+      /pub\(crate\)\s+fn\s+receive/,
+    ],
+    [
+      "motion filtering",
+      /filter\(should_queue_input_event\)/,
+      "removed_motion_filter()",
+      /should_queue_input_event/,
+    ],
+    [
+      "first suspend acknowledgement",
+      /acknowledge\.send\(\(\)\)\.map_err\(/,
+      "removed_first_ack.map_err(",
+      /acknowledged\.blocking_recv/,
+    ],
+    [
+      "resumed callback",
+      /Ok\(InputControl::Resumed\)\s*=>\s*\{\s*resume\(\)\?;/,
+      "Ok(InputControl::Resumed) => { removed_resume();",
+      /resume failed/,
+    ],
+    [
+      "repeated suspend acknowledgement",
+      /Ok\(InputControl::Suspend\s*\{\s*acknowledge\s*\}\)\s*=>\s*\{\s*let _ = acknowledge\.send\(\(\)\);/,
+      "Ok(InputControl::Suspend { acknowledge }) => { removed_repeat_ack();",
+      /InputControl::Suspend \{/,
+    ],
+    [
+      "suspended disconnect",
+      /terminal input runtime disconnected while suspended/,
+      "removed_suspended_disconnect",
+      /suspended_control_disconnect_keeps_exact_error/,
+    ],
+    [
+      "ordinary disconnect",
+      /terminal input runtime disconnected"/,
+      "removed ordinary disconnect",
+      /disconnected_control_wake_keeps_exact_error/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production owner path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking owner or test reference`,
+    );
+    expectFailure(
+      `renderer input wake validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_input_wake source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_input_wake\.rs/,
+    );
+  }
+}
+
 for (const [label, functionName, parameter, body] of [
   [
     "operation controller shutdown retains runtime authority",

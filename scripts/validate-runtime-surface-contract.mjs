@@ -419,6 +419,10 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
     "terminal_session_startup",
     /PendingTerminalSession|pending_terminal_session\.activate\s*\(/,
   ],
+  [
+    "renderer_input_wake",
+    /RendererInputWakeOwner|renderer_input_wake\.receive\s*\(/,
+  ],
 ]);
 
 const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
@@ -504,6 +508,19 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       [
         "crates/orca-tui/src/terminal_session.rs",
         /pub\(crate\)\s+struct\s+PendingTerminalSession[\s\S]*?pub\(crate\)\s+fn\s+start\s*\([\s\S]*?InputRuntime::start\([\s\S]*?Theme::resolve\([\s\S]*?input_runtime\.events\(\)\.clone\(\)[\s\S]*?input_runtime\.focus_events\(\)\.clone\(\)[\s\S]*?input_runtime\.controls\(\)\.clone\(\)[\s\S]*?TerminalPresentationProfile::from_identity\([\s\S]*?TerminalPresentation::new\([\s\S]*?CapabilityBackend::new\([\s\S]*?pub\(crate\)\s+fn\s+fail_after_agent_startup[\s\S]*?finish_startup_failure_with\([\s\S]*?pub\(crate\)\s+fn\s+activate\s*\([\s\S]*?InlineTerminal::new[\s\S]*?InlineTerminal::clear/,
+      ],
+    ]),
+  ],
+  [
+    "renderer_input_wake",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /let\s+renderer_input_wake\s*=\s*RendererInputWakeOwner::new\([\s\S]*?let\s+input_events\s*=\s*renderer_input_wake\.receive\([\s\S]*?renderer_frame\.resume\(/,
+      ],
+      [
+        "crates/orca-tui/src/renderer_input_wake.rs",
+        /pub\(crate\)\s+struct\s+RendererInputWakeOwner[\s\S]*?pub\(crate\)\s+fn\s+new\s*\([\s\S]*?receivers\.into_parts\(\)[\s\S]*?pub\(crate\)\s+fn\s+receive\s*\([\s\S]*?receive_prioritized_input_or_control\([\s\S]*?filter\(should_queue_input_event\)[\s\S]*?InputWake::Suspend[\s\S]*?acknowledge\.send\(\(\)\)\.map_err[\s\S]*?self\.controls\.recv\(\)[\s\S]*?InputControl::Resumed[\s\S]*?resume\(\)\?[\s\S]*?Ok\(InputControl::Suspend\s*\{\s*acknowledge\s*\}\)\s*=>\s*\{\s*let _ = acknowledge\.send\(\(\)\);[\s\S]*?terminal input runtime disconnected while suspended[\s\S]*?InputWake::Resumed[\s\S]*?terminal input runtime disconnected[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
       ],
     ]),
   ],

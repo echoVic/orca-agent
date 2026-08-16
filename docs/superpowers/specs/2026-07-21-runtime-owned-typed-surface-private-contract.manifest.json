@@ -5191,6 +5191,22 @@
       [],
       "typed snapshot/read consumer",
       "retain"
+    ],
+    [
+      "renderer_input_wake",
+      [
+        "crates/orca-tui/src/app.rs:268",
+        "crates/orca-tui/src/app.rs:303",
+        "crates/orca-tui/src/renderer_input_wake.rs:12",
+        "crates/orca-tui/src/renderer_input_wake.rs:20",
+        "crates/orca-tui/src/renderer_input_wake.rs:30"
+      ],
+      "presentation_input_wake_coordination",
+      "app_owned_receiver_poll_suspend_handshake_and_disconnect_translation",
+      "private_renderer_input_wake_owner",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
     ]
   ],
   "pure_tui_presentation_categories": [
