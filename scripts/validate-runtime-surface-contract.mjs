@@ -423,6 +423,10 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
     "renderer_input_wake",
     /RendererInputWakeOwner|renderer_input_wake\.receive\s*\(/,
   ],
+  [
+    "renderer_input_routing",
+    /RendererInputRouter|RendererInputRouter::new\s*\(/,
+  ],
 ]);
 
 const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
@@ -521,6 +525,19 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       [
         "crates/orca-tui/src/renderer_input_wake.rs",
         /pub\(crate\)\s+struct\s+RendererInputWakeOwner[\s\S]*?pub\(crate\)\s+fn\s+new\s*\([\s\S]*?receivers\.into_parts\(\)[\s\S]*?pub\(crate\)\s+fn\s+receive\s*\([\s\S]*?receive_prioritized_input_or_control\([\s\S]*?filter\(should_queue_input_event\)[\s\S]*?InputWake::Suspend[\s\S]*?acknowledge\.send\(\(\)\)\.map_err[\s\S]*?self\.controls\.recv\(\)[\s\S]*?InputControl::Resumed[\s\S]*?resume\(\)\?[\s\S]*?Ok\(InputControl::Suspend\s*\{\s*acknowledge\s*\}\)\s*=>\s*\{\s*let _ = acknowledge\.send\(\(\)\);[\s\S]*?terminal input runtime disconnected while suspended[\s\S]*?InputWake::Resumed[\s\S]*?terminal input runtime disconnected[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
+      ],
+    ]),
+  ],
+  [
+    "renderer_input_routing",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /IterationEvent::Input\(input_event\)\s*=>\s*\{\s*return\s+RendererInputRouter::new\([\s\S]*?&mut\s+state,[\s\S]*?&mut\s+config,[\s\S]*?&shared_config,[\s\S]*?&action_tx,[\s\S]*?&preloaded_transcript,[\s\S]*?&mut\s+textarea,[\s\S]*?&mut\s+vim_state,[\s\S]*?&theme,[\s\S]*?presentation,[\s\S]*?&initial_prompt,[\s\S]*?\)\s*\.route\(\s*input_event,\s*Instant::now\(\),\s*\|\|\s*clear_terminal_scrollback\(terminal\),\s*\);/,
+      ],
+      [
+        "crates/orca-tui/src/renderer_input_router.rs",
+        /pub\(crate\)\s+struct\s+RendererInputRouter[\s\S]*?pub\(crate\)\s+fn\s+new\s*\([\s\S]*?pub\(crate\)\s+fn\s+route\s*\([\s\S]*?match\s+input\s*\{[\s\S]*?BatchedInputEvent::ScrollLines\(lines\)\s*=>\s*\{[\s\S]*?flush_pending_insert_escape_before_non_key\([\s\S]*?self\.vim_state\.cancel_pending_command\(\);[\s\S]*?handle_scroll_lines\(self\.state,\s*lines,\s*now\);[\s\S]*?BatchedInputEvent::Event\(event\)\s*=>\s*\{[\s\S]*?consume_focus_event\(&event,\s*self\.presentation\)[\s\S]*?return\s+Ok\(None\);[\s\S]*?resolve_pending_insert_escape_before_routing\([\s\S]*?==\s*PendingInsertEscapeRouting::Consumed[\s\S]*?return\s+Ok\(None\);[\s\S]*?matches!\(event,\s*Event::Paste\(_\)\)[\s\S]*?flush_pending_insert_escape_before_non_key\([\s\S]*?handle_paste_event\([\s\S]*?self\.vim_state\.cancel_pending_command\(\);[\s\S]*?return\s+Ok\(None\);[\s\S]*?handle_resize_event\(&event,\s*self\.state\)[\s\S]*?return\s+Ok\(None\);[\s\S]*?matches!\(event,\s*Event::Mouse\(_\)\)[\s\S]*?flush_pending_insert_escape_before_non_key\([\s\S]*?match\s+handle_mouse_event\([\s\S]*?MouseFlow::Handled\s*=>\s*\{\s*self\.vim_state\.cancel_pending_command\(\);\s*return\s+Ok\(None\);[\s\S]*?MouseFlow::SyntheticEnter\s*=>\s*\{\s*self\.vim_state\.cancel_pending_command\(\);\s*let\s+key\s*=\s*KeyEvent::new\(KeyCode::Enter,\s*KeyModifiers::NONE\);\s*let\s+event\s*=\s*Event::Key\(key\);\s*return\s+self\.route_status_key\(&event,\s*&key,\s*&mut\s+clear_terminal\);[\s\S]*?let\s+Event::Key\(key\)\s*=\s*&event\s+else[\s\S]*?match\s+handle_key_event_preflight\([\s\S]*?KeyEventFlow::Continue\s*=>\s*return\s+Ok\(None\),\s*KeyEventFlow::Exit\(code\)\s*=>\s*return\s+Ok\(Some\(code\)\),\s*KeyEventFlow::Unhandled\s*=>\s*\{\}[\s\S]*?self\.route_status_key\(&event,\s*key,\s*&mut\s+clear_terminal\)[\s\S]*?fn\s+route_status_key\s*\([\s\S]*?match\s+handle_status_key\([\s\S]*?StatusKeyFlow::Continue\s*=>\s*Ok\(None\),\s*StatusKeyFlow::Exit\(code\)\s*=>\s*Ok\(Some\(code\)\),[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
       ],
     ]),
   ],

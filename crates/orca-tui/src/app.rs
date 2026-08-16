@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use crossbeam_channel as mpsc;
 use crossterm::ExecutableCommand;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyModifiers};
 use tui_textarea::{Input, TextArea};
 
 #[cfg(test)]
@@ -64,31 +64,35 @@ use crate::hosted_session_lifecycle::start_new_hosted_session;
 use crate::hosted_side::{HostedSideParent, shutdown_attached_side_on_controller_exit};
 #[cfg(test)]
 use crate::hosted_submission::handle_hosted_submitted_turn;
-use crate::input_event_actions::{
-    BatchedInputEvent, MouseFlow, coalesce_input_events, consume_focus_event, handle_mouse_event,
-    handle_paste_event, handle_resize_event, handle_scroll_lines,
-};
+use crate::input_event_actions::coalesce_input_events;
+#[cfg(test)]
+use crate::input_event_actions::handle_paste_event;
 #[cfg(test)]
 use crate::input_runtime::InputControl;
 #[cfg(test)]
 use crate::input_wake::{
     InputWake, receive_input_batch, receive_input_or_control, receive_prioritized_input_or_control,
 };
+use crate::insert_escape::flush_expired_insert_escape;
+#[cfg(test)]
 use crate::insert_escape::{
-    PendingInsertEscapeRouting, flush_expired_insert_escape,
-    flush_pending_insert_escape_before_non_key, resolve_pending_insert_escape_before_routing,
+    PendingInsertEscapeRouting, flush_pending_insert_escape_before_non_key,
+    resolve_pending_insert_escape_before_routing,
 };
+#[cfg(test)]
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::renderer_frame::RendererFrameOwner;
+use crate::renderer_input_router::RendererInputRouter;
 use crate::renderer_input_wake::RendererInputWakeOwner;
 use crate::renderer_runtime::RendererRuntimeEventOwner;
 use crate::runtime_event_actions::handle_interaction_response_ack;
 #[cfg(test)]
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
-use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
+#[cfg(test)]
+use crate::status_key_actions::handle_status_key;
 #[cfg(test)]
 use crate::submitted_turn::SubmittedTurn;
 #[cfg(test)]
@@ -327,127 +331,25 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                     Instant::now,
                     |event| -> io::Result<Option<i32>> {
                         match event {
-                            IterationEvent::Input(input_event) => match input_event {
-                                BatchedInputEvent::ScrollLines(lines) => {
-                                    flush_pending_insert_escape_before_non_key(
-                                        &mut vim_state,
-                                        &mut textarea,
-                                        &mut state,
-                                        &config,
-                                    );
-                                    vim_state.cancel_pending_command();
-                                    handle_scroll_lines(&mut state, lines, Instant::now());
-                                }
-                                BatchedInputEvent::Event(ev) => {
-                                    if consume_focus_event(&ev, presentation) {
-                                        return Ok(None);
-                                    }
-                                    if resolve_pending_insert_escape_before_routing(
-                                        &ev,
-                                        Instant::now(),
-                                        &mut vim_state,
-                                        &mut textarea,
-                                        &mut state,
-                                        &config,
-                                        &theme,
-                                    ) == PendingInsertEscapeRouting::Consumed
-                                    {
-                                        return Ok(None);
-                                    }
-                                    if matches!(ev, Event::Paste(_)) {
-                                        flush_pending_insert_escape_before_non_key(
-                                            &mut vim_state,
-                                            &mut textarea,
-                                            &mut state,
-                                            &config,
-                                        );
-                                    }
-                                    if handle_paste_event(&ev, &mut state, &config, &mut textarea) {
-                                        vim_state.cancel_pending_command();
-                                        return Ok(None);
-                                    }
-                                    if handle_resize_event(&ev, &mut state) {
-                                        return Ok(None);
-                                    }
-                                    if matches!(ev, Event::Mouse(_)) {
-                                        flush_pending_insert_escape_before_non_key(
-                                            &mut vim_state,
-                                            &mut textarea,
-                                            &mut state,
-                                            &config,
-                                        );
-                                    }
-                                    match handle_mouse_event(
-                                        &ev,
-                                        &mut state,
-                                        &mut textarea,
-                                        Instant::now(),
-                                    ) {
-                                        MouseFlow::NotMouse => {}
-                                        MouseFlow::Handled => {
-                                            vim_state.cancel_pending_command();
-                                            return Ok(None);
-                                        }
-                                        MouseFlow::SyntheticEnter => {
-                                            vim_state.cancel_pending_command();
-                                            // A click confirmed the focused row; run
-                                            // the exact same path a real Enter takes.
-                                            let enter_key =
-                                                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-                                            let enter_event = Event::Key(enter_key);
-                                            if let StatusKeyFlow::Exit(code) = handle_status_key(
-                                                &enter_event,
-                                                &enter_key,
-                                                &mut state,
-                                                &mut config,
-                                                &shared_config,
-                                                &action_tx,
-                                                &preloaded_transcript,
-                                                &mut textarea,
-                                                &mut vim_state,
-                                                &theme,
-                                                initial_prompt.clone(),
-                                                || clear_terminal_scrollback(terminal),
-                                            )? {
-                                                return Ok(Some(code));
-                                            }
-                                            return Ok(None);
-                                        }
-                                    }
-                                    let Event::Key(key) = &ev else {
-                                        return Ok(None);
-                                    };
-                                    match handle_key_event_preflight(
-                                        *key,
-                                        &mut state,
-                                        &config,
-                                        &action_tx,
-                                        &mut vim_state,
-                                        || clear_terminal_scrollback(terminal),
-                                    )? {
-                                        KeyEventFlow::Continue => return Ok(None),
-                                        KeyEventFlow::Exit(code) => return Ok(Some(code)),
-                                        KeyEventFlow::Unhandled => {}
-                                    }
-
-                                    if let StatusKeyFlow::Exit(code) = handle_status_key(
-                                        &ev,
-                                        key,
-                                        &mut state,
-                                        &mut config,
-                                        &shared_config,
-                                        &action_tx,
-                                        &preloaded_transcript,
-                                        &mut textarea,
-                                        &mut vim_state,
-                                        &theme,
-                                        initial_prompt.clone(),
-                                        || clear_terminal_scrollback(terminal),
-                                    )? {
-                                        return Ok(Some(code));
-                                    }
-                                }
-                            },
+                            IterationEvent::Input(input_event) => {
+                                return RendererInputRouter::new(
+                                    &mut state,
+                                    &mut config,
+                                    &shared_config,
+                                    &action_tx,
+                                    &preloaded_transcript,
+                                    &mut textarea,
+                                    &mut vim_state,
+                                    &theme,
+                                    presentation,
+                                    &initial_prompt,
+                                )
+                                .route(
+                                    input_event,
+                                    Instant::now(),
+                                    || clear_terminal_scrollback(terminal),
+                                );
+                            }
                             IterationEvent::Runtime(tui_event) => {
                                 renderer_runtime.handle(
                                     tui_event,

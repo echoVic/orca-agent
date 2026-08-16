@@ -1746,6 +1746,128 @@ expectFailure(
   }
 }
 
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutOwnerCall = source.replace(
+    /return\s+RendererInputRouter::new\s*\(/,
+    "return RemovedRendererInputRouter::new(",
+  );
+  assert.notEqual(
+    withoutOwnerCall,
+    source,
+    "renderer input routing fixture must remove the production app delegation",
+  );
+  assert.match(
+    withoutOwnerCall,
+    /use\s+crate::renderer_input_router::RendererInputRouter;/,
+    "renderer input routing fixture must preserve the masking owner import",
+  );
+  expectFailure(
+    "renderer input routing validation rejects removed app delegation while the import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, withoutOwnerCall),
+      }),
+    /renderer_input_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_input_router.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "scroll flush order",
+      /handle_scroll_lines\(self\.state,\s*lines,\s*now\);/,
+      "removed_scroll(self.state, lines, now);",
+      /scroll_flushes_insert_escape_and_cancels_pending_vim_command_first/,
+    ],
+    [
+      "focus short circuit",
+      /if\s+consume_focus_event\(&event,\s*self\.presentation\)\s*\{/,
+      "if removed_focus_event(&event, self.presentation) {",
+      /focus_is_consumed_before_other_semantic_routing/,
+    ],
+    [
+      "insert escape resolution",
+      /if\s+resolve_pending_insert_escape_before_routing\(\s*&event,/,
+      "if removed_insert_escape_resolution(\n                    &event,",
+      /resolve_pending_insert_escape_before_routing/,
+    ],
+    [
+      "paste preflush",
+      /if\s+matches!\(event,\s*Event::Paste\(_\)\)\s*\{\s*flush_pending_insert_escape_before_non_key\(/,
+      "if matches!(event, Event::Paste(_)) {\n                    removed_paste_preflush(",
+      /paste_flushes_insert_escape_before_paste_ownership/,
+    ],
+    [
+      "resize short circuit",
+      /if\s+handle_resize_event\(&event,\s*self\.state\)\s*\{/,
+      "if removed_resize_event(&event, self.state) {",
+      /resize_invalidates_selection_without_key_fallthrough/,
+    ],
+    [
+      "mouse preflush",
+      /if\s+matches!\(event,\s*Event::Mouse\(_\)\)\s*\{\s*flush_pending_insert_escape_before_non_key\(/,
+      "if matches!(event, Event::Mouse(_)) {\n                    removed_mouse_preflush(",
+      /mouse_confirmation_dispatches_the_selected_plan_action/,
+    ],
+    [
+      "handled mouse cancellation",
+      /MouseFlow::Handled\s*=>\s*\{\s*self\.vim_state\.cancel_pending_command\(\);/,
+      "MouseFlow::Handled => { removed_mouse_cancel();",
+      /MouseFlow::Handled/,
+    ],
+    [
+      "synthetic Enter direct status routing",
+      /return\s+self\.route_status_key\(&event,\s*&key,\s*&mut\s+clear_terminal\);/,
+      "return removed_synthetic_status(&event, &key, &mut clear_terminal);",
+      /KeyEvent::new\(KeyCode::Enter,\s*KeyModifiers::NONE\)/,
+    ],
+    [
+      "real key preflight",
+      /match\s+handle_key_event_preflight\(\s*\*key,/,
+      "match removed_key_preflight(\n                    *key,",
+      /handle_key_event_preflight/,
+    ],
+    [
+      "preflight exit folding",
+      /KeyEventFlow::Exit\(code\)\s*=>\s*return\s+Ok\(Some\(code\)\),/,
+      "KeyEventFlow::Exit(code) => return removed_preflight_exit(code),",
+      /KeyEventFlow::Exit/,
+    ],
+    [
+      "status exit folding",
+      /StatusKeyFlow::Exit\(code\)\s*=>\s*Ok\(Some\(code\)\),/,
+      "StatusKeyFlow::Exit(code) => removed_status_exit(code),",
+      /StatusKeyFlow::Exit/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production owner path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking import, branch, or owner test`,
+    );
+    expectFailure(
+      `renderer input routing validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_input_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_input_router\.rs/,
+    );
+  }
+}
+
 for (const [label, functionName, parameter, body] of [
   [
     "operation controller shutdown retains runtime authority",

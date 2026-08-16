@@ -53,6 +53,7 @@ mod presentation;
 mod queued_input;
 mod queued_input_actions;
 mod renderer_frame;
+mod renderer_input_router;
 mod renderer_input_wake;
 mod renderer_runtime;
 mod running_actions;

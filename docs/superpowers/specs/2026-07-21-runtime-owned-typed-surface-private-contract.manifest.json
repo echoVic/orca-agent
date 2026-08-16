@@ -5207,6 +5207,23 @@
       [],
       "typed snapshot/read consumer",
       "retain"
+    ],
+    [
+      "renderer_input_routing",
+      [
+        "crates/orca-tui/src/app.rs:334",
+        "crates/orca-tui/src/app.rs:335",
+        "crates/orca-tui/src/app.rs:347",
+        "crates/orca-tui/src/renderer_input_router.rs:27",
+        "crates/orca-tui/src/renderer_input_router.rs:68",
+        "crates/orca-tui/src/renderer_input_router.rs:158"
+      ],
+      "presentation_input_routing_coordination",
+      "app_owned_scroll_focus_insert_escape_paste_resize_mouse_and_key_order",
+      "private_renderer_input_router",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
     ]
   ],
   "pure_tui_presentation_categories": [
