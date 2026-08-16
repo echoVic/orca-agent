@@ -3832,7 +3832,7 @@
         "crates/orca-tui/src/types.rs:406",
         "crates/orca-tui/src/slash_command_actions.rs:188",
         "crates/orca-tui/src/hosted_side.rs:107",
-        "crates/orca-tui/src/app.rs:8475"
+        "crates/orca-tui/src/hosted_controller.rs:144"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::StartSideConversation{prompt}",
@@ -3856,7 +3856,7 @@
         "crates/orca-tui/src/types.rs:409",
         "crates/orca-tui/src/global_actions.rs:52",
         "crates/orca-tui/src/hosted_side.rs:247",
-        "crates/orca-tui/src/app.rs:8491"
+        "crates/orca-tui/src/hosted_controller.rs:160"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ToggleSideConversation",
@@ -3880,7 +3880,7 @@
         "crates/orca-tui/src/types.rs:410",
         "crates/orca-tui/src/global_actions.rs:25",
         "crates/orca-tui/src/hosted_side.rs:359",
-        "crates/orca-tui/src/app.rs:8507"
+        "crates/orca-tui/src/hosted_controller.rs:176"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::CloseSideConversation",
@@ -3904,7 +3904,7 @@
         "crates/orca-tui/src/types.rs:457",
         "crates/orca-tui/src/slash_command_actions.rs:31",
         "crates/orca-tui/src/app.rs:7596",
-        "crates/orca-tui/src/app.rs:8096"
+        "crates/orca-tui/src/hosted_controller.rs:192"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::NewSession",
@@ -3927,7 +3927,7 @@
       [
         "crates/orca-tui/src/types.rs:510",
         "crates/orca-tui/src/slash_command_actions.rs:203",
-        "crates/orca-tui/src/app.rs:8209"
+        "crates/orca-tui/src/hosted_controller.rs:206"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ForkCurrentSession{title}",
@@ -3950,7 +3950,7 @@
       [
         "crates/orca-tui/src/types.rs:513",
         "crates/orca-tui/src/slash_command_actions.rs:214",
-        "crates/orca-tui/src/app.rs:8248"
+        "crates/orca-tui/src/hosted_controller.rs:220"
       ],
       "host_store_mutation",
       "UserAction::RenameCurrentSession{title}",
@@ -3972,7 +3972,7 @@
       [
         "crates/orca-tui/src/types.rs:516",
         "crates/orca-tui/src/session_picker_actions.rs:215",
-        "crates/orca-tui/src/app.rs:8281"
+        "crates/orca-tui/src/hosted_controller.rs:234"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ResumeSavedSession{session_id}",
@@ -3995,7 +3995,7 @@
       [
         "crates/orca-tui/src/types.rs:519",
         "crates/orca-tui/src/session_picker_actions.rs:244",
-        "crates/orca-tui/src/app.rs:8323"
+        "crates/orca-tui/src/hosted_controller.rs:248"
       ],
       "host_session_lifecycle_mutation",
       "UserAction::ForkSavedSession{session_id}",
@@ -4018,7 +4018,7 @@
       [
         "crates/orca-tui/src/types.rs:522",
         "crates/orca-tui/src/session_picker_actions.rs:119",
-        "crates/orca-tui/src/app.rs:8374"
+        "crates/orca-tui/src/hosted_controller.rs:262"
       ],
       "host_store_mutation",
       "UserAction::RenameSavedSession{session_id,title}",
@@ -4040,7 +4040,7 @@
       [
         "crates/orca-tui/src/types.rs:526",
         "crates/orca-tui/src/session_picker_actions.rs:155",
-        "crates/orca-tui/src/app.rs:8387"
+        "crates/orca-tui/src/hosted_controller.rs:276"
       ],
       "host_store_mutation",
       "UserAction::ArchiveSavedSession{session_id}",
@@ -4062,7 +4062,7 @@
       [
         "crates/orca-tui/src/types.rs:529",
         "crates/orca-tui/src/session_picker_actions.rs:188",
-        "crates/orca-tui/src/app.rs:8410"
+        "crates/orca-tui/src/hosted_controller.rs:290"
       ],
       "host_store_mutation",
       "UserAction::DeleteSavedSession{session_id}",
@@ -4156,7 +4156,7 @@
         "crates/orca-tui/src/types.rs:444",
         "crates/orca-tui/src/plan_approval_actions.rs:55",
         "crates/orca-tui/src/hosted_plan.rs:37",
-        "crates/orca-tui/src/app.rs:8567"
+        "crates/orca-tui/src/hosted_controller.rs:307"
       ],
       "runtime_mutation",
       "UserAction::ImplementApprovedPlan { prompt, approval_mode }",
@@ -4204,7 +4204,7 @@
         "crates/orca-tui/src/types.rs:449",
         "crates/orca-tui/src/slash_command_actions.rs:164",
         "crates/orca-tui/src/hosted_workflow.rs:28",
-        "crates/orca-tui/src/app.rs:8646"
+        "crates/orca-tui/src/hosted_controller.rs:372"
       ],
       "workflow_mutation",
       "UserAction::RunWorkflow { name, args }",
@@ -4252,7 +4252,7 @@
         "crates/orca-tui/src/types.rs:454",
         "crates/orca-tui/src/slash_command_actions.rs:147",
         "crates/orca-tui/src/hosted_context.rs:33",
-        "crates/orca-tui/src/app.rs:8717"
+        "crates/orca-tui/src/hosted_controller.rs:419"
       ],
       "host_store_and_thread_mutation",
       "UserAction::Remember { scope, note }",
@@ -4277,7 +4277,7 @@
         "crates/orca-tui/src/types.rs:458",
         "crates/orca-tui/src/slash_command_actions.rs:151",
         "crates/orca-tui/src/hosted_context.rs:78",
-        "crates/orca-tui/src/app.rs:8728"
+        "crates/orca-tui/src/hosted_controller.rs:430"
       ],
       "runtime_mutation",
       "UserAction::Compact",
@@ -4437,7 +4437,7 @@
         "crates/orca-tui/src/types.rs:465",
         "crates/orca-tui/src/approval_actions.rs:50",
         "crates/orca-tui/src/background_tasks.rs:30",
-        "crates/orca-tui/src/app.rs:8738"
+        "crates/orca-tui/src/hosted_controller.rs:468"
       ],
       "interaction_mutation",
       "UserAction::ResolveBackgroundApproval{id,approved}",
@@ -4462,7 +4462,7 @@
         "crates/orca-tui/src/types.rs:469",
         "crates/orca-tui/src/workflow_panel_actions.rs:32",
         "crates/orca-tui/src/background_tasks.rs:24",
-        "crates/orca-tui/src/app.rs:8722"
+        "crates/orca-tui/src/hosted_controller.rs:452"
       ],
       "task_mutation",
       "UserAction::StopTask{task_id}",
@@ -4485,7 +4485,7 @@
         "crates/orca-tui/src/types.rs:472",
         "crates/orca-tui/src/workflow_panel_actions.rs:41",
         "crates/orca-tui/src/background_tasks.rs:27",
-        "crates/orca-tui/src/app.rs:8730"
+        "crates/orca-tui/src/hosted_controller.rs:460"
       ],
       "task_ownership_mutation",
       "UserAction::ForegroundTask{task_id}",
@@ -4537,7 +4537,7 @@
         "crates/orca-tui/src/types.rs:479",
         "crates/orca-tui/src/idle_navigation_actions.rs:59",
         "crates/orca-tui/src/hosted_context.rs:90",
-        "crates/orca-tui/src/app.rs:8739"
+        "crates/orca-tui/src/hosted_controller.rs:441"
       ],
       "history_mutation",
       "UserAction::Backtrack",
@@ -4627,7 +4627,7 @@
         "crates/orca-tui/src/types.rs:483",
         "crates/orca-tui/src/status_key_actions.rs:171",
         "crates/orca-tui/src/hosted_operation.rs:30",
-        "crates/orca-tui/src/app.rs:8658"
+        "crates/orca-tui/src/hosted_controller.rs:383"
       ],
       "recovery_mutation",
       "UserAction::ResumeOperation { operation_id }",
@@ -4653,7 +4653,7 @@
         "crates/orca-tui/src/status_key_actions.rs:173",
         "crates/orca-tui/src/slash_command_actions.rs:219",
         "crates/orca-tui/src/hosted_operation.rs:37",
-        "crates/orca-tui/src/app.rs:8666"
+        "crates/orca-tui/src/hosted_controller.rs:391"
       ],
       "recovery_mutation",
       "UserAction::CancelOperation { operation_id }",
@@ -5043,7 +5043,8 @@
         "crates/orca-tui/src/session_picker_actions.rs:48",
         "crates/orca-tui/src/input_event_actions.rs:232",
         "crates/orca-tui/src/hosted_session_lifecycle.rs:321",
-        "crates/orca-tui/src/app.rs:8450"
+        "crates/orca-tui/src/hosted_controller.rs:191",
+        "crates/orca-tui/src/app.rs:237"
       ],
       "session_transition",
       "direct_transcript_load_without_switching_runtime_thread",
@@ -5060,7 +5061,7 @@
       [
         "crates/orca-tui/src/hosted_session_lifecycle.rs:560",
         "crates/orca-tui/src/hosted_goal.rs:184",
-        "crates/orca-tui/src/app.rs:8773"
+        "crates/orca-tui/src/hosted_controller.rs:475"
       ],
       "goal_session_operation_authority",
       "competing_goal_actor_reread_history_and_thread_shutdown",

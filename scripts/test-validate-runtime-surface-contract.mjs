@@ -452,7 +452,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/hosted_controller.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const goalActionCalls = source.match(/\bhandle_hosted_goal_action\s*\(/g) ?? [];
   assert.equal(
@@ -476,7 +476,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
         repoRoot,
         sourceOverrides: new Map([[relativePath, withoutGoalActionDispatch]]),
       }),
-    /goal_callbacks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    /goal_callbacks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/hosted_controller\.rs/,
   );
 }
 
@@ -509,7 +509,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/hosted_controller.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const sessionActionCalls = source.match(/\bhandle_hosted_session_action\s*\(/g) ?? [];
   assert.equal(
@@ -533,7 +533,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
         repoRoot,
         sourceOverrides: new Map([[relativePath, withoutSessionActionDispatch]]),
       }),
-    /session_picker_transition source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    /session_picker_transition source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/hosted_controller\.rs/,
   );
 }
 
@@ -568,6 +568,35 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 {
   const relativePath = "crates/orca-tui/src/app.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const productionCaller =
+    /TuiAgentRuntime::spawn_hosted\(\s*action_rx,\s*event_tx\.clone\(\),\s*MAX_SUPERVISED_TUI_TASKS,\s*agent_controller,\s*move \|agent_controller, command_rx, host\| \{\s*hosted_tui_controller_loop\s*\(/;
+  const withoutProductionCaller = source.replace(productionCaller, (matched) =>
+    matched.replace("hosted_tui_controller_loop(", "removed_hosted_tui_controller_loop("),
+  );
+  assert.notEqual(
+    withoutProductionCaller,
+    source,
+    "controller caller fixture must remove the production controller call",
+  );
+  assert.match(
+    withoutProductionCaller,
+    /\bhosted_tui_controller_loop\s*\(/,
+    "controller caller fixture must preserve test-harness calls",
+  );
+  expectFailure(
+    "session transition validation rejects a removed production controller caller while tests remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: new Map([[relativePath, withoutProductionCaller]]),
+      }),
+    /session_picker_transition source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/hosted_controller.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   for (const [actionId, pattern, replacement] of [
     [
       "StartSideConversation",
@@ -596,7 +625,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
           sourceOverrides: new Map([[relativePath, withoutDispatch]]),
         }),
       new RegExp(
-        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/app\\.rs`,
+        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/hosted_controller\\.rs`,
       ),
     );
   }
@@ -651,7 +680,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/hosted_controller.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   for (const [actionId, pattern, replacement] of [
     [
@@ -681,7 +710,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
           sourceOverrides: new Map([[relativePath, withoutDispatch]]),
         }),
       new RegExp(
-        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/app\\.rs`,
+        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/hosted_controller\\.rs`,
       ),
     );
   }
@@ -736,7 +765,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/hosted_controller.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const withoutDispatch = source.replace(
     /\bHostedWorkflowAction::Run\s*\{\s*name\s*,\s*args\s*\}/,
@@ -755,7 +784,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
         repoRoot,
         sourceOverrides: new Map([[relativePath, withoutDispatch]]),
       }),
-    /RunWorkflow source does not contain its reviewed action anchor: crates\/orca-tui\/src\/app\.rs/,
+    /RunWorkflow source does not contain its reviewed action anchor: crates\/orca-tui\/src\/hosted_controller\.rs/,
   );
 }
 
@@ -788,7 +817,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/hosted_controller.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   for (const [actionId, pattern, replacement] of [
     [
@@ -821,7 +850,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
           sourceOverrides: new Map([[relativePath, withoutDispatch]]),
         }),
       new RegExp(
-        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/app\\.rs`,
+        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/hosted_controller\\.rs`,
       ),
     );
   }
@@ -870,7 +899,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/hosted_controller.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const withoutDispatch = source.replace(
     /\bHostedPlanAction::ImplementApproved\s*\{\s*prompt\s*,\s*approval_mode\s*,?\s*\}/,
@@ -893,7 +922,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
         repoRoot,
         sourceOverrides: new Map([[relativePath, withoutDispatch]]),
       }),
-    /ImplementApprovedPlan source does not contain its reviewed action anchor: crates\/orca-tui\/src\/app\.rs/,
+    /ImplementApprovedPlan source does not contain its reviewed action anchor: crates\/orca-tui\/src\/hosted_controller\.rs/,
   );
 }
 
@@ -926,7 +955,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/hosted_controller.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   for (const [actionId, pattern, replacement] of [
     [
@@ -964,7 +993,7 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
           sourceOverrides: new Map([[relativePath, withoutDispatch]]),
         }),
       new RegExp(
-        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/app\\.rs`,
+        `${actionId} source does not contain its reviewed action anchor: crates\\/orca-tui\\/src\\/hosted_controller\\.rs`,
       ),
     );
   }

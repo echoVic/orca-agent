@@ -23,6 +23,7 @@ mod exit_policy;
 mod frame_scheduler;
 mod global_actions;
 mod hosted_context;
+mod hosted_controller;
 mod hosted_goal;
 mod hosted_operation;
 mod hosted_plan;

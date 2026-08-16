@@ -423,7 +423,11 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
         "crates/orca-tui/src/hosted_session_lifecycle.rs",
         /pub\(crate\)\s+fn\s+handle_hosted_session_action\s*\(/,
       ],
-      ["crates/orca-tui/src/app.rs", /\bhandle_hosted_session_action\s*\(/],
+      ["crates/orca-tui/src/hosted_controller.rs", /\bhandle_hosted_session_action\s*\(/],
+      [
+        "crates/orca-tui/src/app.rs",
+        /TuiAgentRuntime::spawn_hosted\(\s*action_rx,\s*event_tx\.clone\(\),\s*MAX_SUPERVISED_TUI_TASKS,\s*agent_controller,\s*move \|agent_controller, command_rx, host\| \{\s*hosted_tui_controller_loop\s*\(/,
+      ],
     ]),
   ],
   [
@@ -437,7 +441,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
         "crates/orca-tui/src/hosted_goal.rs",
         /pub\(crate\)\s+fn\s+handle_hosted_goal_action\s*\(/,
       ],
-      ["crates/orca-tui/src/app.rs", /\bhandle_hosted_goal_action\s*\(/],
+      ["crates/orca-tui/src/hosted_controller.rs", /\bhandle_hosted_goal_action\s*\(/],
     ]),
   ],
 ]);
@@ -446,7 +450,10 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
   [
     "StartSideConversation",
     new Map([
-      ["crates/orca-tui/src/app.rs", /\bHostedSideAction::Start\s*\{\s*prompt\s*\}/],
+      [
+        "crates/orca-tui/src/hosted_controller.rs",
+        /\bHostedSideAction::Start\s*\{\s*prompt\s*\}/,
+      ],
       [
         "crates/orca-tui/src/hosted_side.rs",
         /\bHostedSideAction::Start\s*\{\s*prompt\s*\}\s*=>/,
@@ -456,14 +463,14 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
   [
     "ToggleSideConversation",
     new Map([
-      ["crates/orca-tui/src/app.rs", /\bHostedSideAction::Toggle\b/],
+      ["crates/orca-tui/src/hosted_controller.rs", /\bHostedSideAction::Toggle\b/],
       ["crates/orca-tui/src/hosted_side.rs", /\bHostedSideAction::Toggle\s*=>/],
     ]),
   ],
   [
     "CloseSideConversation",
     new Map([
-      ["crates/orca-tui/src/app.rs", /\bHostedSideAction::Close\b/],
+      ["crates/orca-tui/src/hosted_controller.rs", /\bHostedSideAction::Close\b/],
       ["crates/orca-tui/src/hosted_side.rs", /\bHostedSideAction::Close\s*=>/],
     ]),
   ],
@@ -471,7 +478,7 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
     "Remember",
     new Map([
       [
-        "crates/orca-tui/src/app.rs",
+        "crates/orca-tui/src/hosted_controller.rs",
         /\bHostedContextAction::Remember\s*\{\s*scope\s*,\s*note\s*\}/,
       ],
       [
@@ -483,21 +490,24 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
   [
     "Compact",
     new Map([
-      ["crates/orca-tui/src/app.rs", /\bHostedContextAction::Compact\b/],
+      ["crates/orca-tui/src/hosted_controller.rs", /\bHostedContextAction::Compact\b/],
       ["crates/orca-tui/src/hosted_context.rs", /\bHostedContextAction::Compact\s*=>/],
     ]),
   ],
   [
     "Backtrack",
     new Map([
-      ["crates/orca-tui/src/app.rs", /\bHostedContextAction::Backtrack\b/],
+      ["crates/orca-tui/src/hosted_controller.rs", /\bHostedContextAction::Backtrack\b/],
       ["crates/orca-tui/src/hosted_context.rs", /\bHostedContextAction::Backtrack\s*=>/],
     ]),
   ],
   [
     "RunWorkflow",
     new Map([
-      ["crates/orca-tui/src/app.rs", /\bHostedWorkflowAction::Run\s*\{\s*name\s*,\s*args\s*\}/],
+      [
+        "crates/orca-tui/src/hosted_controller.rs",
+        /\bHostedWorkflowAction::Run\s*\{\s*name\s*,\s*args\s*\}/,
+      ],
       [
         "crates/orca-tui/src/hosted_workflow.rs",
         /\bHostedWorkflowAction::Run\s*\{\s*name\s*,\s*args\s*\}\s*=>/,
@@ -508,7 +518,7 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
     "ResumeOperation",
     new Map([
       [
-        "crates/orca-tui/src/app.rs",
+        "crates/orca-tui/src/hosted_controller.rs",
         /\bHostedOperationAction::Resume\s*\{\s*operation_id\s*\}/,
       ],
       [
@@ -521,7 +531,7 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
     "CancelOperation",
     new Map([
       [
-        "crates/orca-tui/src/app.rs",
+        "crates/orca-tui/src/hosted_controller.rs",
         /\bHostedOperationAction::Cancel\s*\{\s*operation_id\s*\}/,
       ],
       [
@@ -534,7 +544,7 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
     "ImplementApprovedPlan",
     new Map([
       [
-        "crates/orca-tui/src/app.rs",
+        "crates/orca-tui/src/hosted_controller.rs",
         /\bHostedPlanAction::ImplementApproved\s*\{\s*prompt\s*,\s*approval_mode\s*,?\s*\}/,
       ],
       [
@@ -547,7 +557,7 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
     "ResolveBackgroundApproval",
     new Map([
       [
-        "crates/orca-tui/src/app.rs",
+        "crates/orca-tui/src/hosted_controller.rs",
         /\bHostedTaskAction::ResolveBackgroundApproval\s*\{\s*id\s*,\s*approved\s*,?\s*\}/,
       ],
       [
@@ -559,7 +569,10 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
   [
     "StopTask",
     new Map([
-      ["crates/orca-tui/src/app.rs", /\bHostedTaskAction::Stop\s*\{\s*task_id\s*\}/],
+      [
+        "crates/orca-tui/src/hosted_controller.rs",
+        /\bHostedTaskAction::Stop\s*\{\s*task_id\s*\}/,
+      ],
       [
         "crates/orca-tui/src/background_tasks.rs",
         /\bHostedTaskAction::Stop\s*\{\s*task_id\s*\}\s*=>/,
@@ -570,7 +583,7 @@ const TUI_ACTION_SOURCE_ANCHORS = new Map([
     "ForegroundTask",
     new Map([
       [
-        "crates/orca-tui/src/app.rs",
+        "crates/orca-tui/src/hosted_controller.rs",
         /\bHostedTaskAction::Foreground\s*\{\s*task_id\s*\}/,
       ],
       [
@@ -843,7 +856,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/agent_runtime.rs:shutdown:controller.control", 3],
   ["crates/orca-tui/src/agent_runtime.rs:drop:host.shutdown", 1],
   [
-    "crates/orca-tui/src/app.rs:hosted_tui_controller_loop:thread.shutdown",
+    "crates/orca-tui/src/hosted_controller.rs:hosted_tui_controller_loop:thread.shutdown",
     1,
   ],
   [
