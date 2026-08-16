@@ -1812,6 +1812,18 @@ expectFailure(
       /pending_terminal_session\.activate\(\)/,
     ],
     [
+      "bootstrap status and shared context delegation",
+      /state\.status,\s*\(&mut state, &mut textarea\),/,
+      "removed_initial_status, (&mut state, &mut textarea),",
+      /ui::render\(/,
+    ],
+    [
+      "first-frame render delegation",
+      /ui::render\(f, state, textarea, theme\)/,
+      "removed_first_frame_render(f, state, textarea, theme)",
+      /RendererLoopOwner::new\(/,
+    ],
+    [
       "activation error folding",
       /(Ok\(terminal_session\)\s*=>\s*terminal_session\.run\([\s\S]*?\),\s*)Err\(error\)\s*=>\s*Err\(error\),(\s*\};\s*let\s+exit_code\s*=\s*finish_tui_run)/,
       "$1Err(error) => return Err(error),$2",
@@ -1839,6 +1851,17 @@ expectFailure(
       /terminal_session_lifecycle source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
     );
   }
+
+  const withRestoredAppInitializer = `${source}\nfn restored_app_initializer() { initialize_terminal_presentation(); }\n`;
+  expectFailure(
+    "terminal session lifecycle validation rejects a restored direct app initializer",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, withRestoredAppInitializer),
+      }),
+    /terminal_session_lifecycle source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
 }
 
 {
@@ -1856,6 +1879,30 @@ expectFailure(
       /with_terminal_presentation_cleanup\(/,
       "removed_terminal_presentation_cleanup(",
       /use\s+crate::presentation::\{/,
+    ],
+    [
+      "initializer before renderer body",
+      /initialize\(terminal, presentation, &theme, &mut context\)\?;/,
+      "skipped_bootstrap(terminal, presentation, &theme, &mut context)?;",
+      /body\(terminal, presentation, &input_wake, &theme, &mut context\)/,
+    ],
+    [
+      "production presentation initializer",
+      /initialize_terminal_presentation\(\s*terminal,/,
+      "removed_terminal_presentation_initializer(terminal,",
+      /use\s+crate::presentation::\{[\s\S]*?initialize_terminal_presentation/,
+    ],
+    [
+      "initial pending title",
+      /\.write_pending\(terminal\.backend_mut\(\)\.inner_mut\(\), initial_status\)/,
+      ".removed_write_pending(terminal.backend_mut().inner_mut(), initial_status)",
+      /initialize_terminal_presentation\(/,
+    ],
+    [
+      "initial draw delegation",
+      /draw_initial\(terminal, theme, context\)/,
+      "removed_initial_draw(terminal, theme, context)",
+      /initialize_terminal_presentation\(/,
     ],
     [
       "total presentation finish",

@@ -8,12 +8,14 @@ use ratatui::backend::CrosstermBackend;
 use crate::capability_backend::CapabilityBackend;
 use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions};
 use crate::presentation::{
-    InlineTerminal, finish_terminal_presentation, with_terminal_presentation_cleanup,
+    InlineTerminal, finish_terminal_presentation, initialize_terminal_presentation,
+    with_terminal_presentation_cleanup,
 };
 use crate::renderer_input_wake::RendererInputWakeOwner;
 use crate::stdio_guard::RetryWriter;
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::theme::Theme;
+use crate::types::AppStatus;
 
 type InlineBackend = CapabilityBackend<CrosstermBackend<RetryWriter<std::io::Stdout>>>;
 
@@ -132,14 +134,22 @@ pub(crate) struct ActivatedTerminalSession<Terminal = InlineTerminal, Input = In
 
 impl<Terminal, Input> ActivatedTerminalSession<Terminal, Input> {
     #[allow(clippy::too_many_arguments)]
-    fn run_with<R>(
+    fn run_with<R, Context>(
         self,
         max_input_events: usize,
+        mut context: Context,
+        initialize: impl FnOnce(
+            &mut Terminal,
+            &mut TerminalPresentation,
+            &Theme,
+            &mut Context,
+        ) -> io::Result<()>,
         body: impl FnOnce(
             &mut Terminal,
             &mut TerminalPresentation,
             &RendererInputWakeOwner,
             &Theme,
+            &mut Context,
         ) -> io::Result<R>,
         reset_title: impl FnOnce(&mut Terminal, &mut TerminalPresentation) -> io::Result<()>,
         drop_terminal: impl FnOnce(Terminal),
@@ -155,7 +165,10 @@ impl<Terminal, Input> ActivatedTerminalSession<Terminal, Input> {
         let input_wake = RendererInputWakeOwner::new(input_receivers, max_input_events);
         with_terminal_presentation_cleanup(
             (terminal, presentation, input),
-            |(terminal, presentation, _input)| body(terminal, presentation, &input_wake, &theme),
+            |(terminal, presentation, _input)| {
+                initialize(terminal, presentation, &theme, &mut context)?;
+                body(terminal, presentation, &input_wake, &theme, &mut context)
+            },
             |(terminal, mut presentation, mut input)| {
                 finish_terminal_presentation(
                     terminal,
@@ -169,18 +182,34 @@ impl<Terminal, Input> ActivatedTerminalSession<Terminal, Input> {
 }
 
 impl ActivatedTerminalSession {
-    pub(crate) fn run<R>(
+    pub(crate) fn run<R, Context>(
         self,
         max_input_events: usize,
+        initial_status: AppStatus,
+        context: Context,
+        draw_initial: impl FnOnce(&mut InlineTerminal, &Theme, &mut Context) -> io::Result<()>,
         body: impl FnOnce(
             &mut InlineTerminal,
             &mut TerminalPresentation,
             &RendererInputWakeOwner,
             &Theme,
+            &mut Context,
         ) -> io::Result<R>,
     ) -> io::Result<R> {
         self.run_with(
             max_input_events,
+            context,
+            |terminal, presentation, theme, context| {
+                initialize_terminal_presentation(
+                    terminal,
+                    |terminal| {
+                        let _ = presentation
+                            .write_pending(terminal.backend_mut().inner_mut(), initial_status);
+                        Ok(())
+                    },
+                    |terminal| draw_initial(terminal, theme, context),
+                )
+            },
             body,
             |terminal, presentation| {
                 let _ = presentation.write_reset_title(terminal.backend_mut().inner_mut());
@@ -316,6 +345,7 @@ mod tests {
             input: Vec::new(),
         };
         let calls = Rc::new(RefCell::new(Vec::new()));
+        let initialize_calls = Rc::clone(&calls);
         let body_calls = Rc::clone(&calls);
         let reset_calls = Rc::clone(&calls);
         let drop_calls = Rc::clone(&calls);
@@ -324,7 +354,17 @@ mod tests {
         let error = session
             .run_with(
                 1,
-                move |terminal, _presentation, input_wake, _theme| {
+                Vec::<&str>::new(),
+                move |terminal, _presentation, _theme, context| {
+                    terminal.push("initialized");
+                    context.push("initialize");
+                    initialize_calls.borrow_mut().push("initialize");
+                    Ok(())
+                },
+                move |terminal, _presentation, input_wake, _theme, context| {
+                    assert_eq!(terminal.as_slice(), ["initialized"]);
+                    assert_eq!(context.as_slice(), ["initialize"]);
+                    context.push("body");
                     let input = input_wake.receive(Duration::ZERO, || Ok(()))?;
                     assert!(matches!(
                         input.as_slice(),
@@ -335,12 +375,12 @@ mod tests {
                     Err::<(), _>(io::Error::other("body failed"))
                 },
                 move |terminal, _presentation| {
-                    assert_eq!(terminal.as_slice(), ["body"]);
+                    assert_eq!(terminal.as_slice(), ["initialized", "body"]);
                     reset_calls.borrow_mut().push("reset");
                     Ok(())
                 },
                 move |terminal| {
-                    assert_eq!(terminal.as_slice(), ["body"]);
+                    assert_eq!(terminal.as_slice(), ["initialized", "body"]);
                     drop_calls.borrow_mut().push("drop");
                 },
                 move |input| {
@@ -352,6 +392,69 @@ mod tests {
             .expect_err("body error should survive total cleanup");
 
         assert_eq!(error.to_string(), "body failed");
-        assert_eq!(*calls.borrow(), ["body", "reset", "drop", "finish"]);
+        assert_eq!(
+            *calls.borrow(),
+            ["initialize", "body", "reset", "drop", "finish"]
+        );
+    }
+
+    #[test]
+    fn initialization_failure_skips_body_and_still_cleans() {
+        let (_event_tx, event_rx) = mpsc::bounded(1);
+        let (_focus_tx, focus_rx) = mpsc::bounded(1);
+        let (_control_tx, control_rx) = mpsc::bounded(1);
+        let session = ActivatedTerminalSession::<Vec<&str>, Vec<&str>> {
+            theme: Theme::named(ThemeName::Dark),
+            input_receivers: TerminalInputReceivers::from_parts_for_test(
+                event_rx, focus_rx, control_rx,
+            ),
+            terminal: Vec::new(),
+            presentation: TerminalPresentation::new(
+                false,
+                TerminalPresentationProfile {
+                    osc9_supported: false,
+                    tmux_passthrough: false,
+                },
+            ),
+            input: Vec::new(),
+        };
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let initialize_calls = Rc::clone(&calls);
+        let reset_calls = Rc::clone(&calls);
+        let drop_calls = Rc::clone(&calls);
+        let finish_calls = Rc::clone(&calls);
+
+        let error = session
+            .run_with(
+                1,
+                Vec::<&str>::new(),
+                move |terminal, _presentation, _theme, context| {
+                    terminal.push("initialized");
+                    context.push("initialize");
+                    initialize_calls.borrow_mut().push("initialize");
+                    Err(io::Error::other("initialize failed"))
+                },
+                |_terminal, _presentation, _input_wake, _theme, _context| -> io::Result<()> {
+                    panic!("renderer body must not run after initialization failure")
+                },
+                move |terminal, _presentation| {
+                    assert_eq!(terminal.as_slice(), ["initialized"]);
+                    reset_calls.borrow_mut().push("reset");
+                    Ok(())
+                },
+                move |terminal| {
+                    assert_eq!(terminal.as_slice(), ["initialized"]);
+                    drop_calls.borrow_mut().push("drop");
+                },
+                move |input| {
+                    input.push("finish");
+                    finish_calls.borrow_mut().push("finish");
+                    Ok(())
+                },
+            )
+            .expect_err("initialization error should survive total cleanup");
+
+        assert_eq!(error.to_string(), "initialize failed");
+        assert_eq!(*calls.borrow(), ["initialize", "reset", "drop", "finish"]);
     }
 }

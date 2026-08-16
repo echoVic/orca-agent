@@ -570,11 +570,11 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
     new Map([
       [
         "crates/orca-tui/src/app.rs",
-        /let\s+renderer_result\s*=\s*match\s+pending_terminal_session\.activate\(\)\s*\{\s*Ok\(terminal_session\)\s*=>\s*terminal_session\.run\([\s\S]*?\),\s*Err\(error\)\s*=>\s*Err\(error\),\s*\};\s*let\s+exit_code\s*=\s*finish_tui_run\(\s*renderer_result,\s*\|\|\s*renderer_runtime\.shutdown\(\),\s*\|\|\s*renderer_runtime_inbox\.shutdown\(\),\s*\|\|\s*agent_runtime\.shutdown\(\),\s*\)\?;/,
+        /^(?![\s\S]*\binitialize_terminal_presentation\b)[\s\S]*?let\s+renderer_result\s*=\s*match\s+pending_terminal_session\.activate\(\)\s*\{\s*Ok\(terminal_session\)\s*=>\s*terminal_session\.run\(\s*MAX_INPUT_EVENTS_PER_BATCH,\s*state\.status,\s*\(&mut\s+state,\s*&mut\s+textarea\),\s*\|terminal,\s*theme,\s*context\|\s*\{\s*let\s+\(state,\s*textarea\)\s*=\s*context;\s*terminal\s*\.draw\(\|f\|\s*ui::render\(f,\s*state,\s*textarea,\s*theme\)\)\s*\.map\(\|_\|\s*\(\)\)\s*\},\s*\|terminal,\s*presentation,\s*renderer_input_wake,\s*theme,\s*context\|\s*\{[\s\S]*?\},\s*\),\s*Err\(error\)\s*=>\s*Err\(error\),\s*\};\s*let\s+exit_code\s*=\s*finish_tui_run\(\s*renderer_result,\s*\|\|\s*renderer_runtime\.shutdown\(\),\s*\|\|\s*renderer_runtime_inbox\.shutdown\(\),\s*\|\|\s*agent_runtime\.shutdown\(\),\s*\)\?;/,
       ],
       [
         "crates/orca-tui/src/terminal_session.rs",
-        /pub\(crate\)\s+struct\s+ActivatedTerminalSession<[\s\S]*?input_receivers:\s*TerminalInputReceivers,[\s\S]*?terminal:\s*Terminal,[\s\S]*?presentation:\s*TerminalPresentation,[\s\S]*?input:\s*Input,[\s\S]*?fn\s+run_with<R>\([\s\S]*?let\s+input_wake\s*=[\s\S]*?with_terminal_presentation_cleanup\([\s\S]*?body\(terminal,\s*presentation,\s*&input_wake,\s*&theme\)[\s\S]*?finish_terminal_presentation\([\s\S]*?pub\(crate\)\s+fn\s+run<R>\([\s\S]*?self\.run_with\([\s\S]*?InputRuntime::finish/,
+        /pub\(crate\)\s+struct\s+ActivatedTerminalSession<[\s\S]*?input_receivers:\s*TerminalInputReceivers,[\s\S]*?terminal:\s*Terminal,[\s\S]*?presentation:\s*TerminalPresentation,[\s\S]*?input:\s*Input,[\s\S]*?fn\s+run_with<R,\s*Context>\([\s\S]*?mut\s+context:\s*Context,[\s\S]*?let\s+input_wake\s*=[\s\S]*?with_terminal_presentation_cleanup\([\s\S]*?initialize\(terminal,\s*presentation,\s*&theme,\s*&mut\s+context\)\?;\s*body\(terminal,\s*presentation,\s*&input_wake,\s*&theme,\s*&mut\s+context\)[\s\S]*?finish_terminal_presentation\([\s\S]*?pub\(crate\)\s+fn\s+run<R,\s*Context>\([\s\S]*?initial_status:\s*AppStatus,[\s\S]*?context:\s*Context,[\s\S]*?draw_initial:[\s\S]*?self\.run_with\(\s*max_input_events,\s*context,\s*\|terminal,\s*presentation,\s*theme,\s*context\|\s*\{\s*initialize_terminal_presentation\(\s*terminal,\s*\|terminal\|\s*\{\s*let\s+_\s*=\s*presentation\s*\.write_pending\(terminal\.backend_mut\(\)\.inner_mut\(\),\s*initial_status\);\s*Ok\(\(\)\)\s*\},\s*\|terminal\|\s*draw_initial\(terminal,\s*theme,\s*context\),\s*\)\s*\},\s*body,[\s\S]*?InputRuntime::finish/,
       ],
       [
         "crates/orca-tui/src/presentation.rs",
@@ -591,7 +591,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
     new Map([
       [
         "crates/orca-tui/src/terminal_session.rs",
-        /let\s+input_wake\s*=\s*RendererInputWakeOwner::new\(input_receivers,\s*max_input_events\);[\s\S]*?body\(terminal,\s*presentation,\s*&input_wake,\s*&theme\)/,
+        /let\s+input_wake\s*=\s*RendererInputWakeOwner::new\(input_receivers,\s*max_input_events\);[\s\S]*?body\(terminal,\s*presentation,\s*&input_wake,\s*&theme,\s*&mut\s+context\)/,
       ],
       [
         "crates/orca-tui/src/renderer_loop.rs",
@@ -638,7 +638,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
     new Map([
       [
         "crates/orca-tui/src/app.rs",
-        /let\s+exit_code\s*=\s*RendererLoopOwner::new\(\s*Instant::now\(\),\s*FRAME_INTERVAL,\s*ANIMATION_INTERVAL,\s*MAX_RUNTIME_EVENTS_PER_BATCH,\s*renderer_input_wake,\s*&renderer_interaction_acks,\s*&renderer_runtime_inbox,\s*&mut\s+renderer_runtime,\s*&mut\s+state,\s*&mut\s+config,\s*&shared_config,\s*&action_tx,\s*&pending_workflow_notifications,\s*&preloaded_transcript,\s*&mut\s+textarea,\s*&mut\s+vim_state,\s*theme,\s*presentation,\s*&initial_prompt,\s*&workspace_root,\s*\)\s*\.run\(\s*terminal,\s*clear_terminal_scrollback,\s*clipboard::copy_to_clipboard,\s*\|terminal, presentation, status\|\s*\{\s*let\s+_\s*=\s*presentation\.write_pending\(terminal\.backend_mut\(\)\.inner_mut\(\), status\);\s*\},\s*\)\?;/,
+        /let\s+\(state,\s*textarea\)\s*=\s*context;\s*let\s+exit_code\s*=\s*RendererLoopOwner::new\(\s*Instant::now\(\),\s*FRAME_INTERVAL,\s*ANIMATION_INTERVAL,\s*MAX_RUNTIME_EVENTS_PER_BATCH,\s*renderer_input_wake,\s*&renderer_interaction_acks,\s*&renderer_runtime_inbox,\s*&mut\s+renderer_runtime,\s*state,\s*&mut\s+config,\s*&shared_config,\s*&action_tx,\s*&pending_workflow_notifications,\s*&preloaded_transcript,\s*textarea,\s*&mut\s+vim_state,\s*theme,\s*presentation,\s*&initial_prompt,\s*&workspace_root,\s*\)\s*\.run\(\s*terminal,\s*clear_terminal_scrollback,\s*clipboard::copy_to_clipboard,\s*\|terminal, presentation, status\|\s*\{\s*let\s+_\s*=\s*presentation\.write_pending\(terminal\.backend_mut\(\)\.inner_mut\(\), status\);\s*\},\s*\)\?;/,
       ],
       [
         "crates/orca-tui/src/renderer_loop.rs",

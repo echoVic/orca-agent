@@ -116,8 +116,6 @@ use crate::workspace_config::{configure_and_preload_tui_state, configure_tui_syn
 use crate::workspace_config::{mention_search_roots, syntax_workspace_root};
 use crate::workspace_status;
 
-use crate::presentation::initialize_terminal_presentation;
-
 pub fn run_tui(config: RunConfig) -> i32 {
     match run_tui_inner(config) {
         Ok(exit) => {
@@ -268,21 +266,16 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let renderer_result = match pending_terminal_session.activate() {
         Ok(terminal_session) => terminal_session.run(
             MAX_INPUT_EVENTS_PER_BATCH,
-            |terminal, presentation, renderer_input_wake, theme| {
-                let initial_status = state.status;
-                initialize_terminal_presentation(
-                    terminal,
-                    |terminal| {
-                        let _ = presentation
-                            .write_pending(terminal.backend_mut().inner_mut(), initial_status);
-                        Ok(())
-                    },
-                    |terminal| {
-                        terminal
-                            .draw(|f| ui::render(f, &mut state, &textarea, theme))
-                            .map(|_| ())
-                    },
-                )?;
+            state.status,
+            (&mut state, &mut textarea),
+            |terminal, theme, context| {
+                let (state, textarea) = context;
+                terminal
+                    .draw(|f| ui::render(f, state, textarea, theme))
+                    .map(|_| ())
+            },
+            |terminal, presentation, renderer_input_wake, theme, context| {
+                let (state, textarea) = context;
                 let exit_code = RendererLoopOwner::new(
                     Instant::now(),
                     FRAME_INTERVAL,
@@ -292,13 +285,13 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                     &renderer_interaction_acks,
                     &renderer_runtime_inbox,
                     &mut renderer_runtime,
-                    &mut state,
+                    state,
                     &mut config,
                     &shared_config,
                     &action_tx,
                     &pending_workflow_notifications,
                     &preloaded_transcript,
-                    &mut textarea,
+                    textarea,
                     &mut vim_state,
                     theme,
                     presentation,
