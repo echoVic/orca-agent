@@ -52,6 +52,7 @@ mod plan_panel;
 mod presentation;
 mod queued_input;
 mod queued_input_actions;
+mod renderer_event_router;
 mod renderer_frame;
 mod renderer_input_router;
 mod renderer_input_wake;

@@ -5147,7 +5147,7 @@
     [
       "renderer_runtime_events",
       [
-        "crates/orca-tui/src/app.rs:524",
+        "crates/orca-tui/src/renderer_event_router.rs:89",
         "crates/orca-tui/src/renderer_runtime.rs:37"
       ],
       "presentation_event_coordination",
@@ -5160,9 +5160,9 @@
     [
       "renderer_runtime_inbox",
       [
-        "crates/orca-tui/src/app.rs:253",
-        "crates/orca-tui/src/app.rs:324",
-        "crates/orca-tui/src/app.rs:405",
+        "crates/orca-tui/src/app.rs:252",
+        "crates/orca-tui/src/app.rs:323",
+        "crates/orca-tui/src/app.rs:386",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:6",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:11",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:15",
@@ -5171,6 +5171,25 @@
       "presentation_runtime_event_inbox_coordination",
       "app_owned_receiver_try_iteration_and_pre_agent_close",
       "private_renderer_runtime_inbox_owner",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
+    ],
+    [
+      "renderer_event_routing",
+      [
+        "crates/orca-tui/src/app.rs:328",
+        "crates/orca-tui/src/app.rs:342",
+        "crates/orca-tui/src/renderer_event_router.rs:21",
+        "crates/orca-tui/src/renderer_event_router.rs:38",
+        "crates/orca-tui/src/renderer_event_router.rs:68",
+        "crates/orca-tui/src/renderer_event_router.rs:75",
+        "crates/orca-tui/src/renderer_event_router.rs:88",
+        "crates/orca-tui/src/renderer_event_router.rs:100"
+      ],
+      "presentation_iteration_event_routing_coordination",
+      "app_owned_input_runtime_branch_and_result_translation",
+      "private_renderer_iteration_event_router",
       [],
       "typed snapshot/read consumer",
       "retain"
@@ -5229,9 +5248,8 @@
     [
       "renderer_input_routing",
       [
-        "crates/orca-tui/src/app.rs:334",
-        "crates/orca-tui/src/app.rs:335",
-        "crates/orca-tui/src/app.rs:347",
+        "crates/orca-tui/src/renderer_event_router.rs:75",
+        "crates/orca-tui/src/renderer_event_router.rs:87",
         "crates/orca-tui/src/renderer_input_router.rs:27",
         "crates/orca-tui/src/renderer_input_router.rs:68",
         "crates/orca-tui/src/renderer_input_router.rs:158"

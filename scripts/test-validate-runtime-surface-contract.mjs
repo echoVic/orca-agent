@@ -1379,30 +1379,30 @@ expectFailure(
 );
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/renderer_event_router.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const withoutOwnerCall = source.replace(
-    /\brenderer_runtime\.handle\s*\(/,
-    "removed_renderer_runtime.handle(",
+    /\bself\.runtime\.handle\s*\(/,
+    "self.removed_runtime.handle(",
   );
   assert.notEqual(
     withoutOwnerCall,
     source,
-    "renderer runtime fixture must remove the production app caller",
+    "renderer runtime fixture must remove the production event-router delegation",
   );
   assert.match(
     withoutOwnerCall,
-    /RendererRuntimeEventOwner/,
-    "renderer runtime fixture must preserve the owner import and construction",
+    /use\s+crate::renderer_runtime::RendererRuntimeEventOwner;/,
+    "renderer runtime fixture must preserve the owner import",
   );
   expectFailure(
-    "renderer runtime validation rejects a removed app caller while the owner import remains",
+    "renderer runtime validation rejects a removed event-router delegation while the owner import remains",
     () =>
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
         sourceOverrides: sourceOverride(relativePath, withoutOwnerCall),
       }),
-    /renderer_runtime_events source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    /renderer_runtime_events source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_event_router\.rs/,
   );
 }
 
@@ -1546,6 +1546,98 @@ expectFailure(
           sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
         }),
       /renderer_runtime_inbox source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_runtime_inbox\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "owner construction",
+      /RendererIterationEventRouter::new\s*\(/,
+      "RemovedIterationEventRouter::new(",
+      /use\s+crate::renderer_event_router::RendererIterationEventRouter;/,
+    ],
+    [
+      "iteration delegation",
+      /\.route\(event,\s*Instant::now\(\),/,
+      ".removed_route(event, Instant::now(),",
+      /RendererIterationEventRouter::new/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production app path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking owner reference`,
+    );
+    expectFailure(
+      `renderer event routing validation rejects removed ${label} while owner references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_event_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_event_router.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "route entry",
+      /pub\(crate\)\s+fn\s+route\s*\(/,
+      "pub(crate) fn removed_route(",
+      /RendererIterationEventRouter::new/,
+    ],
+    [
+      "input branch",
+      /IterationEvent::Input\(input\)\s*=>/,
+      "RemovedInputEvent(input) =>",
+      /RendererInputRouter::new/,
+    ],
+    [
+      "runtime branch",
+      /IterationEvent::Runtime\(tui_event\)\s*=>/,
+      "RemovedRuntimeEvent(tui_event) =>",
+      /self\.runtime\.handle/,
+    ],
+    [
+      "runtime continuation",
+      /Ok\(None\)/,
+      "Ok(Some(removed_runtime_exit_code()))",
+      /runtime_event_delegates_once_and_never_fabricates_an_exit/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production owner path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking lower-owner or test reference`,
+    );
+    expectFailure(
+      `renderer event routing validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_event_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_event_router\.rs/,
     );
   }
 }
@@ -1844,16 +1936,16 @@ expectFailure(
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/renderer_event_router.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const withoutOwnerCall = source.replace(
-    /return\s+RendererInputRouter::new\s*\(/,
-    "return RemovedRendererInputRouter::new(",
+    /RendererInputRouter::new\s*\(/,
+    "RemovedInputRouter::new(",
   );
   assert.notEqual(
     withoutOwnerCall,
     source,
-    "renderer input routing fixture must remove the production app delegation",
+    "renderer input routing fixture must remove the production event-router delegation",
   );
   assert.match(
     withoutOwnerCall,
@@ -1861,13 +1953,13 @@ expectFailure(
     "renderer input routing fixture must preserve the masking owner import",
   );
   expectFailure(
-    "renderer input routing validation rejects removed app delegation while the import remains",
+    "renderer input routing validation rejects removed event-router delegation while the import remains",
     () =>
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
         sourceOverrides: sourceOverride(relativePath, withoutOwnerCall),
       }),
-    /renderer_input_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    /renderer_input_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_event_router\.rs/,
   );
 }
 

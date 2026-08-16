@@ -37,9 +37,8 @@ use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{make_setup_textarea, make_textarea};
 use crate::exit_policy::TuiExit;
 use crate::exit_policy::{exit_resume_hint, exit_session_id};
-use crate::frame_scheduler::IterationEvent;
 #[cfg(test)]
-use crate::frame_scheduler::{FrameScheduler, run_event_loop_iteration};
+use crate::frame_scheduler::{FrameScheduler, IterationEvent, run_event_loop_iteration};
 use crate::hosted_controller::hosted_tui_controller_loop;
 #[cfg(test)]
 use crate::hosted_goal::run_hosted_goal_run;
@@ -83,8 +82,8 @@ use crate::insert_escape::{
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::renderer_event_router::RendererIterationEventRouter;
 use crate::renderer_frame::RendererFrameOwner;
-use crate::renderer_input_router::RendererInputRouter;
 use crate::renderer_input_wake::RendererInputWakeOwner;
 use crate::renderer_interaction_acks::RendererInteractionAckOwner;
 use crate::renderer_runtime::RendererRuntimeEventOwner;
@@ -325,42 +324,24 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                     usize::MAX,
                     MAX_RUNTIME_EVENTS_PER_BATCH,
                     Instant::now,
-                    |event| -> io::Result<Option<i32>> {
-                        match event {
-                            IterationEvent::Input(input_event) => {
-                                return RendererInputRouter::new(
-                                    &mut state,
-                                    &mut config,
-                                    &shared_config,
-                                    &action_tx,
-                                    &preloaded_transcript,
-                                    &mut textarea,
-                                    &mut vim_state,
-                                    &theme,
-                                    presentation,
-                                    &initial_prompt,
-                                )
-                                .route(
-                                    input_event,
-                                    Instant::now(),
-                                    || clear_terminal_scrollback(terminal),
-                                );
-                            }
-                            IterationEvent::Runtime(tui_event) => {
-                                renderer_runtime.handle(
-                                    tui_event,
-                                    &mut state,
-                                    &mut config,
-                                    &action_tx,
-                                    &pending_workflow_notifications,
-                                    &mut textarea,
-                                    &mut vim_state,
-                                    &theme,
-                                    presentation,
-                                );
-                            }
-                        }
-                        Ok(None)
+                    |event| {
+                        RendererIterationEventRouter::new(
+                            &mut renderer_runtime,
+                            &mut state,
+                            &mut config,
+                            &shared_config,
+                            &action_tx,
+                            &pending_workflow_notifications,
+                            &preloaded_transcript,
+                            &mut textarea,
+                            &mut vim_state,
+                            &theme,
+                            presentation,
+                            &initial_prompt,
+                        )
+                        .route(event, Instant::now(), || {
+                            clear_terminal_scrollback(terminal)
+                        })
                     },
                 )?;
                 renderer_runtime.sync_composer(

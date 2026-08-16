@@ -418,6 +418,10 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
     "renderer_runtime_inbox",
     /RendererRuntimeInboxOwner|renderer_runtime_inbox\.pending\s*\(/,
   ],
+  [
+    "renderer_event_routing",
+    /RendererIterationEventRouter|RendererIterationEventRouter::new\s*\(/,
+  ],
   ["renderer_frame", /RendererFrameOwner|renderer_frame\.prepare_iteration\s*\(/],
   [
     "terminal_session_startup",
@@ -490,7 +494,10 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
   [
     "renderer_runtime_events",
     new Map([
-      ["crates/orca-tui/src/app.rs", /\brenderer_runtime\.handle\s*\(/],
+      [
+        "crates/orca-tui/src/renderer_event_router.rs",
+        /self\.runtime\.handle\(\s*tui_event,\s*self\.state,\s*self\.config,\s*self\.action_tx,\s*self\.pending_workflow_notifications,\s*self\.textarea,\s*self\.vim_state,\s*self\.theme,\s*self\.presentation,\s*\);/,
+      ],
       [
         "crates/orca-tui/src/renderer_runtime.rs",
         /pub\(crate\)\s+fn\s+handle\s*\([\s\S]*?match\s+accept_attached_tui_event\s*\([\s\S]*?self\.pending_initial_prompt\.take\(\)[\s\S]*?tui_event\s*=>\s*\{\s*handle_runtime_event\s*\(/,
@@ -507,6 +514,19 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       [
         "crates/orca-tui/src/renderer_runtime_inbox.rs",
         /pub\(crate\)\s+struct\s+RendererRuntimeInboxOwner\s*\{\s*events:\s*TuiEventReceiver,\s*\}[\s\S]*?pub\(crate\)\s+fn\s+new\(events:\s*TuiEventReceiver\)\s*->\s*Self\s*\{\s*Self\s*\{\s*events\s*\}\s*\}[\s\S]*?pub\(crate\)\s+fn\s+pending\(&self\)\s*->\s*TryIter<'_,\s*TuiEvent>\s*\{\s*self\.events\.try_iter\(\)\s*\}[\s\S]*?pub\(crate\)\s+fn\s+shutdown\(self\)\s*\{\s*drop\(self\.events\);\s*\}[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
+      ],
+    ]),
+  ],
+  [
+    "renderer_event_routing",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /RendererIterationEventRouter::new\(\s*&mut\s+renderer_runtime,\s*&mut\s+state,\s*&mut\s+config,\s*&shared_config,\s*&action_tx,\s*&pending_workflow_notifications,\s*&preloaded_transcript,\s*&mut\s+textarea,\s*&mut\s+vim_state,\s*&theme,\s*presentation,\s*&initial_prompt,\s*\)\s*\.route\(event,\s*Instant::now\(\),\s*\|\|\s*\{\s*clear_terminal_scrollback\(terminal\)\s*\}\)/,
+      ],
+      [
+        "crates/orca-tui/src/renderer_event_router.rs",
+        /pub\(crate\)\s+struct\s+RendererIterationEventRouter[\s\S]*?pub\(crate\)\s+fn\s+new\([\s\S]*?Self\s*\{\s*runtime,[\s\S]*?initial_prompt,\s*\}[\s\S]*?pub\(crate\)\s+fn\s+route\([\s\S]*?match\s+event\s*\{\s*IterationEvent::Input\(input\)\s*=>[\s\S]*?IterationEvent::Runtime\(tui_event\)\s*=>\s*\{[\s\S]*?Ok\(None\)\s*\}[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
       ],
     ]),
   ],
@@ -553,8 +573,8 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
     "renderer_input_routing",
     new Map([
       [
-        "crates/orca-tui/src/app.rs",
-        /IterationEvent::Input\(input_event\)\s*=>\s*\{\s*return\s+RendererInputRouter::new\([\s\S]*?&mut\s+state,[\s\S]*?&mut\s+config,[\s\S]*?&shared_config,[\s\S]*?&action_tx,[\s\S]*?&preloaded_transcript,[\s\S]*?&mut\s+textarea,[\s\S]*?&mut\s+vim_state,[\s\S]*?&theme,[\s\S]*?presentation,[\s\S]*?&initial_prompt,[\s\S]*?\)\s*\.route\(\s*input_event,\s*Instant::now\(\),\s*\|\|\s*clear_terminal_scrollback\(terminal\),\s*\);/,
+        "crates/orca-tui/src/renderer_event_router.rs",
+        /RendererInputRouter::new\(\s*self\.state,\s*self\.config,\s*self\.shared_config,\s*self\.action_tx,\s*self\.preloaded_transcript,\s*self\.textarea,\s*self\.vim_state,\s*self\.theme,\s*self\.presentation,\s*self\.initial_prompt,\s*\)\s*\.route\(input,\s*now,\s*clear_terminal\)/,
       ],
       [
         "crates/orca-tui/src/renderer_input_router.rs",
