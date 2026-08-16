@@ -1463,12 +1463,6 @@ expectFailure(
       /use\s+crate::renderer_runtime_inbox::RendererRuntimeInboxOwner;/,
     ],
     [
-      "pending iterator delegation",
-      /renderer_runtime_inbox\.pending\(\)/,
-      "renderer_runtime_inbox.removed_pending()",
-      /RendererRuntimeInboxOwner::new/,
-    ],
-    [
       "mention-inbox-agent shutdown order",
       /renderer_runtime\.shutdown\(\);\s*renderer_runtime_inbox\.shutdown\(\);\s*agent_runtime\.shutdown\(\)\?;/,
       "renderer_runtime.shutdown(); agent_runtime.shutdown()?; renderer_runtime_inbox.shutdown();",
@@ -1496,6 +1490,34 @@ expectFailure(
       /renderer_runtime_inbox source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
     );
   }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_loop.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutPendingDelegation = source.replace(
+    /runtime_inbox\.pending\(\)/,
+    "runtime_inbox.removed_pending()",
+  );
+  assert.notEqual(
+    withoutPendingDelegation,
+    source,
+    "renderer runtime inbox fixture must remove loop pending delegation",
+  );
+  assert.match(
+    withoutPendingDelegation,
+    /RendererRuntimeInboxOwner/,
+    "renderer runtime inbox fixture must preserve the masking owner field and import",
+  );
+  expectFailure(
+    "renderer runtime inbox validation rejects removed loop delegation while owner references remain",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, withoutPendingDelegation),
+      }),
+    /renderer_runtime_inbox source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_loop\.rs/,
+  );
 }
 
 {
@@ -1551,7 +1573,7 @@ expectFailure(
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/renderer_loop.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   for (const [label, pattern, replacement, preserved] of [
     [
@@ -1571,7 +1593,7 @@ expectFailure(
     assert.notEqual(
       withoutProductionPath,
       source,
-      `${label} fixture must remove its production app path`,
+      `${label} fixture must remove its production loop path`,
     );
     assert.match(
       withoutProductionPath,
@@ -1585,7 +1607,7 @@ expectFailure(
           repoRoot,
           sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
         }),
-      /renderer_event_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+      /renderer_event_routing source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_loop\.rs/,
     );
   }
 }
@@ -1643,30 +1665,30 @@ expectFailure(
 }
 
 {
-  const relativePath = "crates/orca-tui/src/app.rs";
+  const relativePath = "crates/orca-tui/src/renderer_loop.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const withoutOwnerCall = source.replace(
-    /\brenderer_frame\.prepare_iteration\s*\(/,
-    "renderer_frame.removed_prepare_iteration(",
+    /\bframe\.prepare_iteration\s*\(/,
+    "frame.removed_prepare_iteration(",
   );
   assert.notEqual(
     withoutOwnerCall,
     source,
-    "renderer frame fixture must remove the production app caller",
+    "renderer frame fixture must remove the production loop caller",
   );
   assert.match(
     withoutOwnerCall,
-    /RendererFrameOwner/,
+    /frame:\s*RendererFrameOwner::new/,
     "renderer frame fixture must preserve the owner import and construction",
   );
   expectFailure(
-    "renderer frame validation rejects a removed app caller while the owner import remains",
+    "renderer frame validation rejects a removed loop caller while the owner construction remains",
     () =>
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
         sourceOverrides: sourceOverride(relativePath, withoutOwnerCall),
       }),
-    /renderer_frame source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    /renderer_frame source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_loop\.rs/,
   );
 }
 
@@ -1834,28 +1856,56 @@ expectFailure(
 {
   const relativePath = "crates/orca-tui/src/app.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutOwnerConstruction = source.replace(
+    /RendererInputWakeOwner::new\(input_receivers,\s*MAX_INPUT_EVENTS_PER_BATCH\)/,
+    "RemovedInputWakeOwner::new(input_receivers, MAX_INPUT_EVENTS_PER_BATCH)",
+  );
+  assert.notEqual(
+    withoutOwnerConstruction,
+    source,
+    "renderer input wake fixture must remove production app construction",
+  );
+  assert.match(
+    withoutOwnerConstruction,
+    /use\s+crate::renderer_input_wake::RendererInputWakeOwner;/,
+    "renderer input wake fixture must preserve the masking owner import",
+  );
+  expectFailure(
+    "renderer input wake validation rejects removed app construction while the import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, withoutOwnerConstruction),
+      }),
+    /renderer_input_wake source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_loop.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   const withoutOwnerCall = source.replace(
-    /renderer_input_wake\.receive\s*\(/,
-    "renderer_input_wake.removed_receive(",
+    /input_wake\.receive\s*\(/,
+    "input_wake.removed_receive(",
   );
   assert.notEqual(
     withoutOwnerCall,
     source,
-    "renderer input wake fixture must remove the production app caller",
+    "renderer input wake fixture must remove the production loop caller",
   );
   assert.match(
     withoutOwnerCall,
-    /RendererInputWakeOwner::new/,
-    "renderer input wake fixture must preserve owner construction",
+    /RendererInputWakeOwner/,
+    "renderer input wake fixture must preserve the masking owner import and field",
   );
   expectFailure(
-    "renderer input wake validation rejects a removed app caller while owner construction remains",
+    "renderer input wake validation rejects a removed loop caller while owner references remain",
     () =>
       validateCurrentInventories(cloneManifest(), {
         repoRoot,
         sourceOverrides: sourceOverride(relativePath, withoutOwnerCall),
       }),
-    /renderer_input_wake source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    /renderer_input_wake source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_loop\.rs/,
   );
 }
 
@@ -2060,36 +2110,58 @@ expectFailure(
 {
   const relativePath = "crates/orca-tui/src/app.rs";
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  const withoutOwnerConstruction = source.replace(
+    /RendererInteractionAckOwner::new\(agent_runtime\.interaction_ack_receiver\(\)\)/,
+    "RemovedInteractionAckOwner::new(agent_runtime.interaction_ack_receiver())",
+  );
+  assert.notEqual(
+    withoutOwnerConstruction,
+    source,
+    "renderer interaction acknowledgement fixture must remove app construction",
+  );
+  assert.match(
+    withoutOwnerConstruction,
+    /use\s+crate::renderer_interaction_acks::RendererInteractionAckOwner;/,
+    "renderer interaction acknowledgement fixture must preserve the masking import",
+  );
+  expectFailure(
+    "renderer interaction acknowledgement validation rejects removed app construction while the import remains",
+    () =>
+      validateCurrentInventories(cloneManifest(), {
+        repoRoot,
+        sourceOverrides: sourceOverride(relativePath, withoutOwnerConstruction),
+      }),
+    /renderer_interaction_acks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+  );
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_loop.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   for (const [label, pattern, replacement, preserved] of [
     [
-      "owner construction",
-      /RendererInteractionAckOwner::new\(agent_runtime\.interaction_ack_receiver\(\)\)/,
-      "RemovedInteractionAckOwner::new(agent_runtime.interaction_ack_receiver())",
-      /use\s+crate::renderer_interaction_acks::RendererInteractionAckOwner;/,
-    ],
-    [
       "owner drain",
-      /if\s+renderer_interaction_acks\.drain\(/,
-      "if renderer_interaction_acks.removed_drain(",
-      /RendererInteractionAckOwner::new/,
+      /if\s+interaction_acks\.drain\(/,
+      "if interaction_acks.removed_drain(",
+      /RendererInteractionAckOwner/,
     ],
     [
       "nonempty batch dirty marking",
-      /if\s+renderer_interaction_acks\.drain\([\s\S]*?\)\s*\{\s*renderer_frame\.mark_dirty\(\);\s*\}/,
-      "if renderer_interaction_acks.drain(&mut state, &mut textarea, &mut vim_state, &theme) { removed_ack_dirty(); }",
-      /renderer_frame\.mark_dirty\(\)/,
+      /if\s+interaction_acks\.drain\(state,\s*textarea,\s*vim_state,\s*theme\)\s*\{\s*frame\.mark_dirty\(\);\s*\}/,
+      "if interaction_acks.drain(state, textarea, vim_state, theme) { removed_ack_dirty(); }",
+      /frame\.mark_dirty\(\)/,
     ],
   ]) {
     const withoutProductionPath = source.replace(pattern, replacement);
     assert.notEqual(
       withoutProductionPath,
       source,
-      `${label} fixture must remove its production app path`,
+      `${label} fixture must remove its production loop path`,
     );
     assert.match(
       withoutProductionPath,
       preserved,
-      `${label} fixture must preserve a masking import, construction, or unrelated dirty call`,
+      `${label} fixture must preserve a masking owner or unrelated dirty call`,
     );
     expectFailure(
       `renderer interaction acknowledgement validation rejects removed ${label} while masking references remain`,
@@ -2098,7 +2170,7 @@ expectFailure(
           repoRoot,
           sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
         }),
-      /renderer_interaction_acks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+      /renderer_interaction_acks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_loop\.rs/,
     );
   }
 }
@@ -2163,6 +2235,122 @@ expectFailure(
           sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
         }),
       /renderer_interaction_acks source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_interaction_acks\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "owner construction",
+      /RendererLoopOwner::new\s*\(/,
+      "RemovedLoopOwner::new(",
+      /use\s+crate::renderer_loop::RendererLoopOwner;/,
+    ],
+    [
+      "owner run delegation",
+      /(\n\s*&workspace_root,\n\s*\)\n\s*)\.run\s*\(/,
+      "$1.removed_run(",
+      /RendererLoopOwner::new/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production app path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking import or constructor`,
+    );
+    expectFailure(
+      `renderer loop validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_loop source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/renderer_loop.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "owner declaration",
+      /pub\(crate\)\s+struct\s+RendererLoopOwner/,
+      "pub(crate) struct RemovedLoopOwner",
+      /RendererLoopOwner::new/,
+    ],
+    [
+      "run entry",
+      /pub\(crate\)\s+fn\s+run</,
+      "pub(crate) fn removed_run<",
+      /pub\(crate\)\s+struct\s+RendererLoopOwner/,
+    ],
+    [
+      "expired insert escape before frame preparation",
+      /if\s+flush_expired_insert_escape\(/,
+      "if removed_expired_insert_escape(",
+      /use\s+crate::insert_escape::flush_expired_insert_escape;/,
+    ],
+    [
+      "frame preparation before input wake",
+      /let\s+poll_timeout\s*=\s*frame\.prepare_iteration\(now,\s*state,\s*presentation\);\s*let\s+input_events\s*=\s*input_wake\.receive\(poll_timeout,\s*\|\|\s*frame\.resume\(terminal,\s*presentation\)\)\?;/,
+      "let input_events = input_wake.receive(poll_timeout, || frame.resume(terminal, presentation))?;\n            let poll_timeout = frame.prepare_iteration(now, state, presentation);",
+      /frame\.prepare_iteration/,
+    ],
+    [
+      "input coalescing distance",
+      /coalesce_input_events\(input_events,\s*3\)/,
+      "coalesce_input_events(input_events, 4)",
+      /use\s+crate::input_event_actions::coalesce_input_events;/,
+    ],
+    [
+      "input and runtime admission limits",
+      /runtime_inbox\.pending\(\),\s*usize::MAX,\s*max_runtime_events,/,
+      "runtime_inbox.pending(), max_runtime_events, usize::MAX,",
+      /max_runtime_events:\s*usize/,
+    ],
+    [
+      "composer synchronization after dispatch",
+      /runtime\.sync_composer\(/,
+      "runtime.removed_sync_composer(",
+      /input_exit_syncs_then_skips_presentation/,
+    ],
+    [
+      "exit folding before presentation",
+      /if\s+let\s+Some\(code\)\s*=\s*iteration\.exit_code/,
+      "if let Some(code) = removed_iteration_exit_code",
+      /input_exit_syncs_then_skips_presentation/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove or reorder its production loop path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking owner, lower call, import, or test reference`,
+    );
+    expectFailure(
+      `renderer loop validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /renderer_loop source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_loop\.rs/,
     );
   }
 }

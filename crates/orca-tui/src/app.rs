@@ -1,13 +1,13 @@
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use crossbeam_channel as mpsc;
-use crossterm::ExecutableCommand;
-use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyModifiers};
-use tui_textarea::{Input, TextArea};
+#[cfg(test)]
+use crossterm::event::{Event, KeyEvent, KeyModifiers};
 
 #[cfg(test)]
 use orca_core::cancel::CancelToken;
@@ -33,7 +33,6 @@ use crate::background_tasks::notify_recovered_background_approvals_for_tui;
 use crate::bridge;
 use crate::channels::{tui_event_channel, user_action_channel};
 use crate::clipboard;
-use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{make_setup_textarea, make_textarea};
 use crate::exit_policy::TuiExit;
 use crate::exit_policy::{exit_resume_hint, exit_session_id};
@@ -63,7 +62,6 @@ use crate::hosted_session_lifecycle::start_new_hosted_session;
 use crate::hosted_side::{HostedSideParent, shutdown_attached_side_on_controller_exit};
 #[cfg(test)]
 use crate::hosted_submission::handle_hosted_submitted_turn;
-use crate::input_event_actions::coalesce_input_events;
 #[cfg(test)]
 use crate::input_event_actions::handle_paste_event;
 #[cfg(test)]
@@ -72,6 +70,7 @@ use crate::input_runtime::InputControl;
 use crate::input_wake::{
     InputWake, receive_input_batch, receive_input_or_control, receive_prioritized_input_or_control,
 };
+#[cfg(test)]
 use crate::insert_escape::flush_expired_insert_escape;
 #[cfg(test)]
 use crate::insert_escape::{
@@ -82,15 +81,16 @@ use crate::insert_escape::{
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
-use crate::renderer_event_router::RendererIterationEventRouter;
-use crate::renderer_frame::RendererFrameOwner;
 use crate::renderer_input_wake::RendererInputWakeOwner;
 use crate::renderer_interaction_acks::RendererInteractionAckOwner;
+use crate::renderer_loop::RendererLoopOwner;
 use crate::renderer_runtime::RendererRuntimeEventOwner;
 use crate::renderer_runtime_inbox::RendererRuntimeInboxOwner;
 #[cfg(test)]
 use crate::runtime_event_actions::handle_runtime_event;
-use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
+use crate::scrollback::clear_terminal_scrollback;
+#[cfg(test)]
+use crate::scrollback::clear_terminal_scrollback_with;
 #[cfg(test)]
 use crate::status_key_actions::handle_status_key;
 #[cfg(test)]
@@ -99,25 +99,27 @@ use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
 #[cfg(test)]
 use crate::surface_projection::SessionProjectionPresentation;
+#[cfg(test)]
 use crate::surface_projection::SurfaceProjectionState;
 #[cfg(test)]
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
 use crate::terminal_session::PendingTerminalSession;
 #[cfg(test)]
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
+use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
 #[cfg(test)]
-use crate::types::{AttachedTuiEvent, SessionAttachmentId, SideParentStatus};
+use crate::types::{AttachedTuiEvent, SessionAttachmentId, SideParentStatus, TuiEvent};
 use crate::ui;
-use crate::vim::{PendingInsertEscapeFlow, VimState};
-use crate::workspace_config::{
-    configure_and_preload_tui_state, configure_tui_syntax_state, mention_search_roots,
-    syntax_workspace_root,
-};
+use crate::vim::VimState;
+#[cfg(test)]
+use crate::workspace_config::{configure_and_preload_tui_state, configure_tui_syntax_state};
+use crate::workspace_config::{mention_search_roots, syntax_workspace_root};
 use crate::workspace_status;
 
+#[cfg(test)]
+use crate::presentation::complete_presentation_resume;
 use crate::presentation::{
-    complete_presentation_resume, finish_terminal_presentation, initialize_terminal_presentation,
+    finish_terminal_presentation, initialize_terminal_presentation,
     with_terminal_presentation_cleanup,
 };
 
@@ -289,85 +291,36 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
                         .map(|_| ())
                 },
             )?;
-            let mut renderer_frame =
-                RendererFrameOwner::new(Instant::now(), FRAME_INTERVAL, ANIMATION_INTERVAL);
-
-            let exit_code = 'main: loop {
-                let now = Instant::now();
-                if flush_expired_insert_escape(
-                    now,
-                    &mut vim_state,
-                    &mut textarea,
-                    &mut state,
-                    &config,
-                ) {
-                    renderer_frame.mark_dirty();
-                }
-                let poll_timeout = renderer_frame.prepare_iteration(now, &mut state, presentation);
-
-                let input_events = renderer_input_wake.receive(poll_timeout, || {
-                    renderer_frame.resume(terminal, presentation)
-                })?;
-
-                if renderer_interaction_acks.drain(
-                    &mut state,
-                    &mut textarea,
-                    &mut vim_state,
-                    &theme,
-                ) {
-                    renderer_frame.mark_dirty();
-                }
-
-                let iteration = renderer_frame.run_iteration(
-                    coalesce_input_events(input_events, 3),
-                    renderer_runtime_inbox.pending(),
-                    usize::MAX,
-                    MAX_RUNTIME_EVENTS_PER_BATCH,
-                    Instant::now,
-                    |event| {
-                        RendererIterationEventRouter::new(
-                            &mut renderer_runtime,
-                            &mut state,
-                            &mut config,
-                            &shared_config,
-                            &action_tx,
-                            &pending_workflow_notifications,
-                            &preloaded_transcript,
-                            &mut textarea,
-                            &mut vim_state,
-                            &theme,
-                            presentation,
-                            &initial_prompt,
-                        )
-                        .route(event, Instant::now(), || {
-                            clear_terminal_scrollback(terminal)
-                        })
-                    },
-                )?;
-                renderer_runtime.sync_composer(
-                    &config,
-                    &workspace_root,
-                    &mut state,
-                    &textarea,
-                    Instant::now(),
-                );
-                if let Some(code) = iteration.exit_code {
-                    break 'main code;
-                }
-                renderer_frame.present_iteration(
-                    terminal,
-                    presentation,
-                    &mut state,
-                    &textarea,
-                    &theme,
-                    iteration.draw_at,
-                    clipboard::copy_to_clipboard,
-                    |terminal, presentation, status| {
-                        let _ =
-                            presentation.write_pending(terminal.backend_mut().inner_mut(), status);
-                    },
-                )?;
-            };
+            let exit_code = RendererLoopOwner::new(
+                Instant::now(),
+                FRAME_INTERVAL,
+                ANIMATION_INTERVAL,
+                MAX_RUNTIME_EVENTS_PER_BATCH,
+                &renderer_input_wake,
+                &renderer_interaction_acks,
+                &renderer_runtime_inbox,
+                &mut renderer_runtime,
+                &mut state,
+                &mut config,
+                &shared_config,
+                &action_tx,
+                &pending_workflow_notifications,
+                &preloaded_transcript,
+                &mut textarea,
+                &mut vim_state,
+                &theme,
+                presentation,
+                &initial_prompt,
+                &workspace_root,
+            )
+            .run(
+                terminal,
+                clear_terminal_scrollback,
+                clipboard::copy_to_clipboard,
+                |terminal, presentation, status| {
+                    let _ = presentation.write_pending(terminal.backend_mut().inner_mut(), status);
+                },
+            )?;
             Ok(exit_code)
         },
         |(terminal, mut presentation, mut terminal_input)| {

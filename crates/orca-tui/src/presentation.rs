@@ -8,7 +8,7 @@ use std::io;
 use crate::frame_scheduler::FrameScheduler;
 use crate::terminal_presentation::TerminalPresentation;
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::capability_backend::CapabilityBackend;
 use crate::stdio_guard::RetryWriter;
@@ -16,8 +16,8 @@ use crate::stdio_guard::RetryWriter;
 pub(crate) type InlineTerminal =
     Terminal<CapabilityBackend<CrosstermBackend<RetryWriter<std::io::Stdout>>>>;
 
-pub(crate) fn resume_terminal_render(
-    terminal: &mut InlineTerminal,
+pub(crate) fn resume_terminal_render<B: Backend>(
+    terminal: &mut Terminal<B>,
     scheduler: &mut FrameScheduler,
     presentation: &mut TerminalPresentation,
 ) -> io::Result<()> {

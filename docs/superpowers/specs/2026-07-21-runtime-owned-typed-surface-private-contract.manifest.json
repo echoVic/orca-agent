@@ -5160,16 +5160,16 @@
     [
       "renderer_runtime_inbox",
       [
-        "crates/orca-tui/src/app.rs:252",
-        "crates/orca-tui/src/app.rs:323",
-        "crates/orca-tui/src/app.rs:386",
+        "crates/orca-tui/src/app.rs:254",
+        "crates/orca-tui/src/renderer_loop.rs:145",
+        "crates/orca-tui/src/app.rs:339",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:6",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:11",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:15",
         "crates/orca-tui/src/renderer_runtime_inbox.rs:19"
       ],
       "presentation_runtime_event_inbox_coordination",
-      "app_owned_receiver_try_iteration_and_pre_agent_close",
+      "loop_owned_try_iteration_with_app_receiver_construction_and_pre_agent_close",
       "private_renderer_runtime_inbox_owner",
       [],
       "typed snapshot/read consumer",
@@ -5178,8 +5178,8 @@
     [
       "renderer_event_routing",
       [
-        "crates/orca-tui/src/app.rs:328",
-        "crates/orca-tui/src/app.rs:342",
+        "crates/orca-tui/src/renderer_loop.rs:150",
+        "crates/orca-tui/src/renderer_loop.rs:164",
         "crates/orca-tui/src/renderer_event_router.rs:21",
         "crates/orca-tui/src/renderer_event_router.rs:38",
         "crates/orca-tui/src/renderer_event_router.rs:68",
@@ -5188,7 +5188,7 @@
         "crates/orca-tui/src/renderer_event_router.rs:100"
       ],
       "presentation_iteration_event_routing_coordination",
-      "app_owned_input_runtime_branch_and_result_translation",
+      "loop_owned_input_runtime_branch_delegation_and_result_translation",
       "private_renderer_iteration_event_router",
       [],
       "typed snapshot/read consumer",
@@ -5197,15 +5197,16 @@
     [
       "renderer_frame",
       [
-        "crates/orca-tui/src/app.rs:318",
-        "crates/orca-tui/src/app.rs:331",
-        "crates/orca-tui/src/app.rs:550",
+        "crates/orca-tui/src/renderer_loop.rs:74",
+        "crates/orca-tui/src/renderer_loop.rs:134",
+        "crates/orca-tui/src/renderer_loop.rs:143",
+        "crates/orca-tui/src/renderer_loop.rs:171",
         "crates/orca-tui/src/renderer_frame.rs:22",
         "crates/orca-tui/src/renderer_frame.rs:33",
         "crates/orca-tui/src/renderer_frame.rs:102"
       ],
       "presentation_frame_coordination",
-      "app_owned_scheduler_animation_clipboard_title_and_draw_order",
+      "loop_owned_scheduler_animation_clipboard_title_and_draw_order",
       "pure_renderer_frame_owner",
       [],
       "typed snapshot/read consumer",
@@ -5232,14 +5233,14 @@
     [
       "renderer_input_wake",
       [
-        "crates/orca-tui/src/app.rs:268",
-        "crates/orca-tui/src/app.rs:303",
+        "crates/orca-tui/src/app.rs:276",
+        "crates/orca-tui/src/renderer_loop.rs:137",
         "crates/orca-tui/src/renderer_input_wake.rs:12",
         "crates/orca-tui/src/renderer_input_wake.rs:20",
         "crates/orca-tui/src/renderer_input_wake.rs:30"
       ],
       "presentation_input_wake_coordination",
-      "app_owned_receiver_poll_suspend_handshake_and_disconnect_translation",
+      "loop_owned_poll_resume_with_receiver_suspend_handshake_and_disconnect_translation",
       "private_renderer_input_wake_owner",
       [],
       "typed snapshot/read consumer",
@@ -5264,17 +5265,44 @@
     [
       "renderer_interaction_acks",
       [
-        "crates/orca-tui/src/app.rs:250",
-        "crates/orca-tui/src/app.rs:312",
-        "crates/orca-tui/src/app.rs:318",
+        "crates/orca-tui/src/app.rs:253",
+        "crates/orca-tui/src/renderer_loop.rs:139",
+        "crates/orca-tui/src/renderer_loop.rs:140",
         "crates/orca-tui/src/renderer_interaction_acks.rs:10",
         "crates/orca-tui/src/renderer_interaction_acks.rs:15",
         "crates/orca-tui/src/renderer_interaction_acks.rs:19",
         "crates/orca-tui/src/renderer_interaction_acks.rs:27"
       ],
       "presentation_interaction_acknowledgement_coordination",
-      "app_owned_receiver_fifo_drain_and_nonempty_batch_activity",
+      "loop_owned_fifo_drain_and_nonempty_batch_dirtying_with_app_receiver_construction",
       "private_renderer_interaction_ack_owner",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
+    ],
+    [
+      "renderer_loop",
+      [
+        "crates/orca-tui/src/app.rs:294",
+        "crates/orca-tui/src/app.rs:316",
+        "crates/orca-tui/src/renderer_loop.rs:28",
+        "crates/orca-tui/src/renderer_loop.rs:51",
+        "crates/orca-tui/src/renderer_loop.rs:74",
+        "crates/orca-tui/src/renderer_loop.rs:95",
+        "crates/orca-tui/src/renderer_loop.rs:129",
+        "crates/orca-tui/src/renderer_loop.rs:131",
+        "crates/orca-tui/src/renderer_loop.rs:134",
+        "crates/orca-tui/src/renderer_loop.rs:137",
+        "crates/orca-tui/src/renderer_loop.rs:139",
+        "crates/orca-tui/src/renderer_loop.rs:143",
+        "crates/orca-tui/src/renderer_loop.rs:150",
+        "crates/orca-tui/src/renderer_loop.rs:167",
+        "crates/orca-tui/src/renderer_loop.rs:168",
+        "crates/orca-tui/src/renderer_loop.rs:171"
+      ],
+      "presentation_renderer_loop_coordination",
+      "app_constructed_foreground_iteration_owner_with_exact_exit_before_presentation_order",
+      "private_renderer_loop_owner",
       [],
       "typed snapshot/read consumer",
       "retain"

@@ -8,7 +8,7 @@ use tui_textarea::TextArea;
 use crate::frame_scheduler::{
     FrameScheduler, IterationEvent, IterationOutcome, run_event_loop_iteration,
 };
-use crate::presentation::{InlineTerminal, resume_terminal_render};
+use crate::presentation::resume_terminal_render;
 use crate::terminal_presentation::TerminalPresentation;
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus};
@@ -64,9 +64,9 @@ impl RendererFrameOwner {
         self.scheduler.mark_dirty();
     }
 
-    pub(crate) fn resume(
+    pub(crate) fn resume<B: Backend>(
         &mut self,
-        terminal: &mut InlineTerminal,
+        terminal: &mut Terminal<B>,
         presentation: &mut TerminalPresentation,
     ) -> io::Result<()> {
         resume_terminal_render(terminal, &mut self.scheduler, presentation)
