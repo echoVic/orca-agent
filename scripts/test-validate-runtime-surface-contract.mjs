@@ -1544,6 +1544,104 @@ expectFailure(
   }
 }
 
+{
+  const relativePath = "crates/orca-tui/src/app.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "pending owner construction",
+      /PendingTerminalSession::start\(/,
+      "PendingTerminalSession::removed_start(",
+      /use\s+crate::terminal_session::PendingTerminalSession/,
+    ],
+    [
+      "agent startup failure route",
+      /pending_terminal_session\.fail_after_agent_startup\(error\)/,
+      "pending_terminal_session.removed_agent_failure_route(error)",
+      /pending_terminal_session\.activate\(\)/,
+    ],
+    [
+      "terminal activation",
+      /pending_terminal_session\.activate\(\)/,
+      "pending_terminal_session.removed_activate()",
+      /PendingTerminalSession/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production app path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking owner reference`,
+    );
+    expectFailure(
+      `terminal session startup validation rejects removed ${label} while owner references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /terminal_session_startup source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/app\.rs/,
+    );
+  }
+}
+
+{
+  const relativePath = "crates/orca-tui/src/terminal_session.rs";
+  const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
+  for (const [label, pattern, replacement, preserved] of [
+    [
+      "production input start",
+      /InputRuntime::start\(/,
+      "InputRuntime::removed_start(",
+      /InputRuntime::finish/,
+    ],
+    [
+      "agent failure finish delegation",
+      /finish_startup_failure_with\(&mut self\.input_runtime,\s*error,\s*InputRuntime::finish\)/,
+      "removed_finish_route(&mut self.input_runtime, error, InputRuntime::finish)",
+      /finish_startup_failure_with::<\(\), _>/,
+    ],
+    [
+      "terminal construction",
+      /InlineTerminal::new,/,
+      "InlineTerminal::removed_new,",
+      /activate_terminal_session_with\(/,
+    ],
+    [
+      "startup clear",
+      /InlineTerminal::clear,/,
+      "InlineTerminal::removed_clear,",
+      /clear_calls/,
+    ],
+  ]) {
+    const withoutProductionPath = source.replace(pattern, replacement);
+    assert.notEqual(
+      withoutProductionPath,
+      source,
+      `${label} fixture must remove its production owner path`,
+    );
+    assert.match(
+      withoutProductionPath,
+      preserved,
+      `${label} fixture must preserve a masking type, helper, or test reference`,
+    );
+    expectFailure(
+      `terminal session startup validation rejects removed ${label} while masking references remain`,
+      () =>
+        validateCurrentInventories(cloneManifest(), {
+          repoRoot,
+          sourceOverrides: sourceOverride(relativePath, withoutProductionPath),
+        }),
+      /terminal_session_startup source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/terminal_session\.rs/,
+    );
+  }
+}
+
 for (const [label, functionName, parameter, body] of [
   [
     "operation controller shutdown retains runtime authority",

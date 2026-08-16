@@ -5173,6 +5173,24 @@
       [],
       "typed snapshot/read consumer",
       "retain"
+    ],
+    [
+      "terminal_session_startup",
+      [
+        "crates/orca-tui/src/app.rs:132",
+        "crates/orca-tui/src/app.rs:233",
+        "crates/orca-tui/src/app.rs:262",
+        "crates/orca-tui/src/terminal_session.rs:36",
+        "crates/orca-tui/src/terminal_session.rs:45",
+        "crates/orca-tui/src/terminal_session.rs:81",
+        "crates/orca-tui/src/terminal_session.rs:85"
+      ],
+      "presentation_session_startup_coordination",
+      "app_owned_input_profile_backend_and_activation_locals",
+      "private_pending_to_activated_terminal_session_owner",
+      [],
+      "typed snapshot/read consumer",
+      "retain"
     ]
   ],
   "pure_tui_presentation_categories": [

@@ -6,8 +6,6 @@ use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use tui_textarea::{Input, TextArea};
 
 #[cfg(test)]
@@ -32,7 +30,6 @@ use crate::attachment_routing::{
 #[cfg(test)]
 use crate::background_tasks::notify_recovered_background_approvals_for_tui;
 use crate::bridge;
-use crate::capability_backend::CapabilityBackend;
 use crate::channels::{tui_event_channel, user_action_channel};
 use crate::clipboard;
 use crate::composer_input_actions::refresh_input_menus;
@@ -70,7 +67,7 @@ use crate::input_event_actions::{
     BatchedInputEvent, MouseFlow, coalesce_input_events, consume_focus_event, handle_mouse_event,
     handle_paste_event, handle_resize_event, handle_scroll_lines, should_queue_input_event,
 };
-use crate::input_runtime::{InputControl, InputRuntime, InputRuntimeOptions};
+use crate::input_runtime::InputControl;
 use crate::input_wake::{InputWake, receive_prioritized_input_or_control};
 #[cfg(test)]
 use crate::input_wake::{receive_input_batch, receive_input_or_control};
@@ -81,7 +78,6 @@ use crate::insert_escape::{
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
 use crate::mention_search_manager::MentionSearchManager;
 use crate::operation_controller::TuiSurfaceTaskControl;
-use crate::presentation::InlineTerminal;
 use crate::renderer_frame::RendererFrameOwner;
 use crate::renderer_runtime::RendererRuntimeEventOwner;
 use crate::runtime_event_actions::handle_interaction_response_ack;
@@ -89,7 +85,6 @@ use crate::runtime_event_actions::handle_interaction_response_ack;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::scrollback::{clear_terminal_scrollback, clear_terminal_scrollback_with};
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
-use crate::stdio_guard::RetryWriter;
 #[cfg(test)]
 use crate::submitted_turn::SubmittedTurn;
 #[cfg(test)]
@@ -97,7 +92,10 @@ use crate::surface_actions::TuiSurfaceActions;
 #[cfg(test)]
 use crate::surface_projection::SessionProjectionPresentation;
 use crate::surface_projection::SurfaceProjectionState;
+#[cfg(test)]
 use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
+use crate::terminal_session::PendingTerminalSession;
+#[cfg(test)]
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
 #[cfg(test)]
@@ -131,34 +129,14 @@ pub fn run_tui(config: RunConfig) -> i32 {
 }
 
 fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
-    let pending_input_runtime = InputRuntime::start(InputRuntimeOptions {
-        theme: config.theme,
-        focus_events: config.terminal_notifications,
-    })?;
-    let theme = Theme::resolve(config.theme, pending_input_runtime.profile());
-    let input_rx = pending_input_runtime.events().clone();
-    let focus_rx = pending_input_runtime.focus_events().clone();
-    let input_control_rx = pending_input_runtime.controls().clone();
-    let presentation_profile = TerminalPresentationProfile::from_identity(
-        &qwertty::caps::identity_from_env(None, qwertty::caps::std_env_source),
-    );
-    let presentation =
-        TerminalPresentation::new(config.terminal_notifications, presentation_profile);
+    let pending_terminal_session =
+        PendingTerminalSession::start(config.theme, config.terminal_notifications)?;
 
     const FRAME_INTERVAL: Duration = Duration::from_millis(16);
     const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
     const MAX_INPUT_EVENTS_PER_BATCH: usize = 64;
     const MAX_RUNTIME_EVENTS_PER_BATCH: usize = crate::channels::TUI_EVENT_CAPACITY;
     const MAX_SUPERVISED_TUI_TASKS: usize = 32;
-
-    // Wrap stdout in RetryWriter so a transient EAGAIN/WouldBlock (e.g. a
-    // resize redraw storm on a tty left non-blocking by the npm wrapper) is
-    // retried instead of aborting the draw. `clear_stdio_nonblocking` in
-    // `cli::run` is the primary defense; this is the belt-and-braces fallback.
-    let backend = CapabilityBackend::new(
-        CrosstermBackend::new(RetryWriter::new(io::stdout())),
-        theme.color_level,
-    );
 
     let workspace_root = syntax_workspace_root(&config);
     let (event_tx, pending_event_rx) = tui_event_channel();
@@ -252,9 +230,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
-            let mut terminal_input = pending_input_runtime;
-            terminal_input.finish()?;
-            return Err(error);
+            return pending_terminal_session.fail_after_agent_startup(error);
         }
     };
     let pending_initial_prompt =
@@ -264,16 +240,12 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
             None
         };
     let interaction_ack_rx = agent_runtime.interaction_ack_receiver();
-    // Declare terminal ownership after the agent runtime. The cleanup wrapper
-    // below resets presentation output, drops ratatui, and then joins qwertty
-    // on every non-panic return from the frame loop.
-    let terminal_input = pending_input_runtime;
     let event_rx = pending_event_rx;
 
     let mut vim_state =
         VimState::with_insert_escape(config.vim_mode, config.vim_insert_escape.clone());
     let mut textarea = if needs_setup {
-        make_setup_textarea(&theme)
+        make_setup_textarea(pending_terminal_session.theme())
     } else {
         if let Some(prompt) = initial_prompt.clone()
             && pending_initial_prompt.is_none()
@@ -282,21 +254,14 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
             state.enter_running();
             let _ = action_tx.send(UserAction::Submit(prompt));
         }
-        make_textarea(&vim_state, &theme)
+        make_textarea(&vim_state, pending_terminal_session.theme())
     };
     let mut renderer_runtime =
         RendererRuntimeEventOwner::new(mention_search, pending_initial_prompt);
 
-    // Fullscreen viewport inside the alternate screen: the UI owns the whole
-    // terminal and is fully repainted every frame. Mouse capture is on — the
-    // wheel scrolls the conversation and drag-select/copy is implemented
-    // in-app (the terminal's modifier-drag still bypasses capture if wanted).
-    let mut terminal = Terminal::new(backend)?;
-    // Clear once on startup so the first diffing draw starts from a known
-    // blank canvas rather than whatever the alt screen came up with.
-    terminal.clear()?;
-
-    let resources = (terminal, presentation, terminal_input);
+    let activated_terminal_session = pending_terminal_session.activate()?;
+    let (theme, input_receivers, resources) = activated_terminal_session.into_parts();
+    let (input_rx, focus_rx, input_control_rx) = input_receivers.into_parts();
     let exit_code = with_terminal_presentation_cleanup(
         resources,
         |(terminal, presentation, _terminal_input)| {

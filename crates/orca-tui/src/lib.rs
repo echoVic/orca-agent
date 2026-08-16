@@ -76,6 +76,7 @@ mod surface_projection;
 mod syntax_highlight;
 mod terminal_capabilities;
 mod terminal_presentation;
+mod terminal_session;
 pub mod theme;
 mod transcript_search;
 mod transcript_view;

@@ -415,6 +415,10 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["terminal_clipboard_notifications", /MouseEventKind::Up|pending_clipboard_copy|desktop_notifications/],
   ["renderer_runtime_events", /RendererRuntimeEventOwner|renderer_runtime\.handle\s*\(/],
   ["renderer_frame", /RendererFrameOwner|renderer_frame\.prepare_iteration\s*\(/],
+  [
+    "terminal_session_startup",
+    /PendingTerminalSession|pending_terminal_session\.activate\s*\(/,
+  ],
 ]);
 
 const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
@@ -487,6 +491,19 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       [
         "crates/orca-tui/src/renderer_frame.rs",
         /pub\(crate\)\s+fn\s+prepare_iteration\s*\([\s\S]*?state\.poll_edit_highlight_results\(\)[\s\S]*?let\s+animation_active\s*=[\s\S]*?state\.copy_notice_at\(now\)\.is_none\(\)[\s\S]*?state\.advance_tick\(\)[\s\S]*?presentation\.advance_tick\(\)[\s\S]*?state\.apply_drag_edge_scroll\(\)[\s\S]*?self\.scheduler\.did_animate\(now\)[\s\S]*?self\.scheduler\.poll_timeout\(now,\s*animation_active\)[\s\S]*?pub\(crate\)\s+fn\s+run_iteration[\s\S]*?run_event_loop_iteration\([\s\S]*?pub\(crate\)\s+fn\s+present_iteration[\s\S]*?state\.pending_clipboard_copy\.take\(\)[\s\S]*?write_pending\(terminal,\s*presentation,\s*state\.status\)[\s\S]*?terminal\.draw\([\s\S]*?self\.scheduler\.did_draw\(draw_at\)/,
+      ],
+    ]),
+  ],
+  [
+    "terminal_session_startup",
+    new Map([
+      [
+        "crates/orca-tui/src/app.rs",
+        /let\s+pending_terminal_session\s*=\s*PendingTerminalSession::start\([\s\S]*?TuiAgentRuntime::spawn_hosted\([\s\S]*?pending_terminal_session\.fail_after_agent_startup\(error\)[\s\S]*?pending_terminal_session\.activate\(\)/,
+      ],
+      [
+        "crates/orca-tui/src/terminal_session.rs",
+        /pub\(crate\)\s+struct\s+PendingTerminalSession[\s\S]*?pub\(crate\)\s+fn\s+start\s*\([\s\S]*?InputRuntime::start\([\s\S]*?Theme::resolve\([\s\S]*?input_runtime\.events\(\)\.clone\(\)[\s\S]*?input_runtime\.focus_events\(\)\.clone\(\)[\s\S]*?input_runtime\.controls\(\)\.clone\(\)[\s\S]*?TerminalPresentationProfile::from_identity\([\s\S]*?TerminalPresentation::new\([\s\S]*?CapabilityBackend::new\([\s\S]*?pub\(crate\)\s+fn\s+fail_after_agent_startup[\s\S]*?finish_startup_failure_with\([\s\S]*?pub\(crate\)\s+fn\s+activate\s*\([\s\S]*?InlineTerminal::new[\s\S]*?InlineTerminal::clear/,
       ],
     ]),
   ],
@@ -982,6 +999,7 @@ const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
+  ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_frame.resume", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:renderer_runtime.shutdown", 1],
   [
@@ -989,7 +1007,6 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     1,
   ],
   ["crates/orca-tui/src/renderer_runtime.rs:shutdown:self.mention_search.shutdown", 1],
-  ["crates/orca-tui/src/app.rs:run_tui_inner:terminal.clear", 1],
   [
     "crates/orca-tui/src/hosted_session_lifecycle.rs:start_forked_hosted_session:next_config.prompt.clear",
     1,
@@ -1120,6 +1137,7 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
 const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_ITEM_SITES = new Map([
   ["crates/orca-tui/src/scrollback.rs:clear_terminal_scrollback:Terminal::clear", 1],
   ["crates/orca-tui/src/presentation.rs:resume_terminal_render:Terminal::clear", 1],
+  ["crates/orca-tui/src/terminal_session.rs:activate:InlineTerminal::clear", 1],
   [
     "crates/orca-tui/src/surface_actions.rs:launch_workflow:crate::surface_client::launch_workflow",
     1,
@@ -1139,6 +1157,10 @@ const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
   [
     "crates/orca-tui/src/presentation.rs:resume_terminal_render",
     "8ff17eeb9d82b6b0f014b64e21d1813e4f26880ffeddee8971da8aac661813dc",
+  ],
+  [
+    "crates/orca-tui/src/terminal_session.rs:activate",
+    "5d088b5e4d237218da39556f4edde68645b341ff3c01c434f8aee36d620cc966",
   ],
   [
     "crates/orca-tui/src/surface_actions.rs:launch_workflow",
