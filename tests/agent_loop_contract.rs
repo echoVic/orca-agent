@@ -97,13 +97,13 @@ fn headless_unlimited_run_completes_128_tool_cycles() {
             "--save-history",
             "--provider",
             "mock",
-            "mock_repeat_read 256",
+            "mock_repeat_read 128",
         ])
         .output()
         .expect("run unlimited fixture");
 
     // The hidden 128-turn ceiling is gone: an unlimited run admits every
-    // requested tool cycle (256) plus one final terminal turn, and finishes
+    // requested tool cycle (128) plus one final terminal turn, and finishes
     // with success.
     assert_eq!(output.status.code(), Some(0));
     let events = parse_jsonl(&output.stdout);
@@ -112,7 +112,7 @@ fn headless_unlimited_run_completes_128_tool_cycles() {
         .filter(|event| event["type"] == "turn.started")
         .count();
     assert_eq!(
-        started_turns, 257,
+        started_turns, 129,
         "unlimited run admits every requested tool cycle plus the terminal turn"
     );
     let completed_tools = events
@@ -121,7 +121,7 @@ fn headless_unlimited_run_completes_128_tool_cycles() {
         .collect::<Vec<_>>();
     assert_eq!(
         completed_tools.len(),
-        256,
+        128,
         "each fixture turn must settle one tool call"
     );
     assert!(completed_tools.iter().enumerate().all(|(index, event)| {
@@ -146,7 +146,7 @@ fn headless_unlimited_run_completes_128_tool_cycles() {
             record["type"] == "conversation.message" && record["message"]["role"] == "tool"
         })
         .collect::<Vec<_>>();
-    assert_eq!(tool_messages.len(), 256);
+    assert_eq!(tool_messages.len(), 128);
     assert!(tool_messages.iter().all(|record| {
         record["message"]["status"] == "completed"
             && record["message"]["kind"] == "success"

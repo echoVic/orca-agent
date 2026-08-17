@@ -18,6 +18,9 @@ The v0.3.21 main-branch Windows gate exposed three independent release blockers:
 - the native ARM64 full suite reached 2,195 of 2,664 tests before the workflow's
   45-minute step timeout interrupted it, and the x64 suite later reached 1,506
   of 2,664 tests before hitting the same timeout.
+- after the workflow timeout was fixed, ARM64 completed 2,663 of 2,664 tests;
+  the remaining unlimited-loop contract timed out because its nominal
+  128-cycle fixture actually exercised 256 tool cycles.
 
 This is a lifecycle and release-gate defect. It does not require a public API,
 protocol, npm layout, or persistence-format change.
@@ -40,6 +43,9 @@ protocol, npm layout, or persistence-format change.
   for bounded eventual cleanup instead of requiring same-instant cleanup.
 - Native Windows x64 and ARM64 keep the complete workspace test gate, with
   enough wall-clock budget to finish the measured suite.
+- The unlimited headless contract exercises exactly 128 tool cycles plus the
+  required terminal turn. That crosses the removed 128-turn ceiling without
+  doubling the platform-sensitive end-to-end persistence workload.
 
 ## Ownership And Failure Semantics
 
