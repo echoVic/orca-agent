@@ -56,13 +56,13 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.3.20 adds durable project-scoped automatic memory to
-recorded sessions. Successful verified root turns enqueue bounded redacted
-extraction behind a leased, fenced job ledger; later turns receive only relevant
-provenance-bearing facts as non-transcript context. The JSONL candidate ledger
-is authoritative, while Markdown and SQLite FTS5 are repairable projections;
-manual `/remember` stays separate and `auto_memory = false` disables automatic
-capture and recall. This builds on v0.3.19's bounded release gate, v0.3.13's
+Current baseline: v0.3.21 gives TUI interaction, rendering, terminal lifecycle,
+and session, operation, Goal, plan, workflow, and metrics projections explicit
+state owners. Side re-entry rotates attachment fencing before authoritative
+history projection, queued input and approval acknowledgements remain ordered,
+and legacy active or terminal workflow tasks are reconciled into the current
+durable task model after restart. This builds on v0.3.20's bounded,
+project-scoped automatic memory, v0.3.19's bounded release gate, v0.3.13's
 headless resume, and v0.3.12's runtime-owned Side Conversations. Prior releases
 added v0.3.8's remaining-context
 visibility, one-to-one

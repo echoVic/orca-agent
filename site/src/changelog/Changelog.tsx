@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.21":
+        "Makes interactive session state more reliable by assigning queued input, approvals, terminal startup, renderer events, and session, operation, Goal, plan, workflow, and metrics projections to explicit owners. Side re-entry preserves background presentation without replaying stale events, while restarted sessions reconcile legacy active and terminal workflow tasks into the current durable task model.",
       "v0.3.20":
         "Adds durable, project-scoped automatic memory for recorded sessions. After a successful verifier-gated root turn, Orca queues bounded and redacted extraction work behind a leased, fenced job ledger. Later turns receive only relevant, provenance-bearing facts as non-transcript context; the repairable SQLite FTS index falls back to lexical recall. Manual /remember remains separate, while auto_memory = false disables automatic capture and recall.",
       "v0.3.19":
@@ -602,6 +604,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.21":
+        "通过明确的状态所有者提升交互会话可靠性：排队输入、审批、终端启动、渲染事件，以及 session、operation、Goal、plan、workflow 和 metrics 投影各自只由一个边界负责。重新进入 Side 时会保留后台任务展示且不重放陈旧事件；重启后的会话会把旧格式的活动与终态 workflow task 归并到当前持久化任务模型。",
       "v0.3.20":
         "为录制会话加入持久化、项目级的自动记忆。通过 verifier 的根 turn 在 transcript 成功提交后，会把有界且已脱敏的提取任务写入带 lease 与 fencing 的 job ledger；后续 turn 只把相关、带来源信息的事实作为非 transcript 上下文注入。可修复的 SQLite FTS 索引失效时会回退到词法召回。手动 /remember 仍独立，auto_memory = false 会关闭自动采集和召回。",
       "v0.3.19":

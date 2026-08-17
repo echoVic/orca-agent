@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.20";
+export const releaseVersion = "v0.3.21";
 
 export const releases = [
+  {
+    version: "v0.3.21",
+    date: "2026-08-17",
+    title: "Reliable TUI state ownership and legacy task recovery",
+    body: "Keeps interactive state consistent across Side switching, queued input, approvals, terminal startup, and renderer wakeups by giving each concern one projection or lifecycle owner. Restarted sessions now reconcile legacy active and terminal workflow tasks into the current durable task model instead of losing or duplicating their visible state.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.21",
+  },
   {
     version: "v0.3.20",
     date: "2026-08-13",
