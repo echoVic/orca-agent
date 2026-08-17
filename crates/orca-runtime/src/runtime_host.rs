@@ -31211,16 +31211,43 @@ impl ThreadActor {
             GoalBlockingCompletion::Pause {
                 operation_id,
                 result,
-            } => {
-                if !self
-                    .goal_controller
-                    .schedule_pause_settlement(operation_id, result)
-                {
-                    eprintln!(
-                        "orca: ignored stale or duplicate goal pause settlement for {operation_id:?}"
-                    );
+            } => match result {
+                Ok(event) => {
+                    if self
+                        .goal_controller
+                        .schedule_pause_settlement(operation_id, Ok(event))
+                    {
+                        if let Some(active) = self
+                            .active
+                            .as_mut()
+                            .filter(|active| active.operation_id == operation_id)
+                        {
+                            active.generation.cancel.cancel();
+                        } else {
+                            eprintln!(
+                                "orca: goal pause settled after its active operation disappeared"
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "orca: ignored stale or duplicate goal pause settlement for {operation_id:?}"
+                        );
+                    }
                 }
-            }
+                Err(error) => {
+                    if let Some(active) = self
+                        .active
+                        .as_mut()
+                        .filter(|active| active.operation_id == operation_id)
+                    {
+                        Self::settle_goal_pause_replies(active, Some(&error));
+                    } else {
+                        eprintln!(
+                            "orca: goal pause failed after its active operation disappeared: {error}"
+                        );
+                    }
+                }
+            },
             GoalBlockingCompletion::SurfaceMutation { settlement }
             | GoalBlockingCompletion::PauseResume { settlement }
             | GoalBlockingCompletion::PreviewCommit { settlement }
@@ -34131,7 +34158,6 @@ impl ThreadActor {
         }
         let already_requested = active.generation.cancel.is_cancelled();
         self.pause_active_goal(active, "paused by user")?;
-        active.generation.cancel.cancel();
         Ok(if already_requested {
             PauseGoalRunResult::AlreadyRequested { generation }
         } else {

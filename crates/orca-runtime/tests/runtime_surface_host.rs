@@ -1522,13 +1522,13 @@ fn cold_owner_takeover_preserves_durable_workflow_success_before_projection() {
     run_state["status"] = serde_json::Value::String("completed".to_string());
     run_state["finalSummary"] = serde_json::Value::String("durable workflow result".to_string());
     run_state["error"] = serde_json::Value::Null;
+    child.kill().expect("crash held workflow fixture");
+    child.wait().expect("reap held workflow fixture");
     fs::write(
         &run_state_path,
         serde_json::to_vec_pretty(&run_state).expect("serialize durable workflow outcome"),
     )
     .expect("persist workflow outcome before TaskRegistry projection");
-    child.kill().expect("crash held workflow fixture");
-    child.wait().expect("reap held workflow fixture");
 
     let previous_home = std::env::var_os("ORCA_HOME");
     unsafe { std::env::set_var("ORCA_HOME", home.path()) };
@@ -1554,13 +1554,16 @@ fn cold_owner_takeover_preserves_durable_workflow_success_before_projection() {
         AttachResult::FreshAttached { attachment } => attachment.baseline.snapshot,
         _ => panic!("takeover snapshot attachment failed"),
     };
-    assert!(recovered.operation_history.iter().any(|operation| {
-        operation.operation_id == operation_id
-            && matches!(
-                operation.terminal.as_ref().map(|record| &record.terminal),
-                Some(OperationTerminal::Succeeded { .. })
-            )
-    }));
+    assert!(
+        recovered.operation_history.iter().any(|operation| {
+            operation.operation_id == operation_id
+                && matches!(
+                    operation.terminal.as_ref().map(|record| &record.terminal),
+                    Some(OperationTerminal::Succeeded { .. })
+                )
+        }),
+        "durable workflow success was not projected into its operation"
+    );
     assert!(recovered.workflows.iter().any(|workflow| {
         workflow.workflow_run_id.as_str() == workflow_run_id
             && workflow.status == orca_runtime::surface::SurfaceWorkflowStatus::Completed

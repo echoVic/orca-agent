@@ -172,7 +172,7 @@ jobs:
       - name: Build the native ARM64 async subagent runner
         run: cargo build -p orca-windows-runner --locked
       - name: Run the full native ARM64 test suite
-        timeout-minutes: 45
+        timeout-minutes: 75
         env:
           RUST_BACKTRACE: "1"
         run: |

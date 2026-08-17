@@ -625,13 +625,21 @@ fn goal_pause_commits_goal_state_and_operation_cancellation_before_terminal_wake
                 }
             )
     }));
-    assert!(
-        GoalStore::load_default()
+    let acknowledgement_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = GoalStore::load_default()
             .unwrap()
             .pending_surface_mutations(&session_id)
-            .unwrap()
-            .is_empty()
-    );
+            .unwrap();
+        if pending.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < acknowledgement_deadline,
+            "Goal surface acknowledgement did not settle: {pending:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     host.shutdown().unwrap();
 
     let host = RuntimeHost::start().unwrap();

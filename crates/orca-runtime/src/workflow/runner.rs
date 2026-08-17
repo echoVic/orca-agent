@@ -574,6 +574,7 @@ impl WorkflowRunner {
                     "interrupted before completion; async task execution is process-local",
                 )
             });
+        let active_task = task.status.is_active();
         let mut state = match self.state.load_run(run_id) {
             Ok(state) => state,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -609,7 +610,7 @@ impl WorkflowRunner {
                 | WorkflowRunStatus::Stopped
                 | WorkflowRunStatus::Cancelled
         );
-        if state_terminal && interrupted_task {
+        if state_terminal && (interrupted_task || active_task) {
             match state.status {
                 WorkflowRunStatus::Completed => self
                     .tasks
