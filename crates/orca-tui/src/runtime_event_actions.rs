@@ -315,6 +315,7 @@ mod tests {
         assert_eq!(state.mention_bindings, bindings);
         assert_eq!(state.atomic_skill_tokens, bindings);
         assert_eq!(state.pending_pastes, pending_pastes);
+        assert!(state.user_input_dialog.is_none());
         assert!(!vim.has_pending_command_for_test());
         assert!(state.messages.iter().any(
             |message| matches!(message, ChatMessage::Error(text) if text == "runtime unavailable")

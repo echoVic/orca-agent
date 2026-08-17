@@ -239,9 +239,10 @@ Tools are registered through a canonical registry. Each tool spec declares its c
 `header` of at most 12 characters, a non-empty `question`, and 2-4 distinct
 `options` containing `label` and `description`; `preview` and `multiSelect` are
 optional. Orca asks the questions in order through the runtime-owned interaction
-broker. In the TUI, the user submits one answer per question from the composer,
-may type a custom answer, and can separate multi-select labels with commas. A
-completed call returns compact JSON as `{"answers":{"question":"answer"}}`.
+broker. In the TUI, questions with options open a focused choice dialog: arrow
+keys move, Enter submits a single choice, and Space toggles multi-select choices.
+Typing switches to the composer for a custom answer. A completed call returns
+compact JSON as `{"answers":{"question":"answer"}}`.
 Dismissal cancels the whole tool call. Headless execution fails deterministically
 instead of waiting for input. `ask_user_question` is the only registered and
 model-visible user-question tool.

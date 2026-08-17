@@ -221,6 +221,19 @@ health_check_interval_s = 60
 
 ---
 
+## Interactive TUI Configuration
+
+Run `/config` in the TUI to open the current-session settings panel. It edits the active model, reasoning effort, and approval mode without writing the global or project configuration files.
+
+- Up / Down: select a setting
+- Left / Right: change the selected value
+- Enter: apply the settings patch
+- Esc: close without applying
+
+This replaces the old read-only `/config show` slash command. The standalone `orca config show` CLI command below remains available for inspecting merged file, environment, and CLI configuration.
+
+---
+
 ## Validation and Inspection Commands
 
 | Command | Description |

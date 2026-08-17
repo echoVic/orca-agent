@@ -9,6 +9,7 @@ use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
 
 use crate::approval_dialog_actions::handle_approval_dialog_key;
+use crate::config_dialog_actions::handle_config_dialog_key;
 use crate::idle_key_actions::handle_idle_key;
 use crate::plan_approval_actions::handle_plan_approval_key;
 use crate::queued_input_actions::handle_running_key;
@@ -18,6 +19,7 @@ use crate::setup_actions::{SetupFlow, handle_setup_key};
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, UserAction};
+use crate::user_input_dialog::{UserInputDialogKeyFlow, handle_user_input_dialog_key};
 use crate::vim::{VimState, VimTranscriptSearchIntent};
 
 pub(crate) enum StatusKeyFlow {
@@ -84,6 +86,21 @@ where
         vim_state.cancel_pending_command();
         handle_recovery_prompt_key(key, state, action_tx);
         return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.config_dialog.is_some() {
+        vim_state.cancel_pending_command();
+        handle_config_dialog_key(key, state, action_tx);
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.user_input_dialog.is_some() {
+        vim_state.cancel_pending_command();
+        if handle_user_input_dialog_key(key, state, textarea, action_tx)
+            == UserInputDialogKeyFlow::Handled
+        {
+            return Ok(StatusKeyFlow::Continue);
+        }
     }
 
     if matches!(

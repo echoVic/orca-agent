@@ -7,7 +7,8 @@ use tui_textarea::TextArea;
 use orca_core::config::RunConfig;
 
 use crate::composer_input_actions::{
-    apply_composer_key_input, insert_composer_newline, recall_next_history, recall_previous_history,
+    apply_composer_key_input, handle_composer_editor_shortcut, insert_composer_newline,
+    recall_next_history, recall_previous_history,
 };
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
@@ -64,6 +65,10 @@ pub(crate) fn handle_idle_key(
         return;
     }
 
+    if handle_composer_editor_shortcut(ev, key, state, config, textarea, vim_state, theme) {
+        return;
+    }
+
     match resolve_shortcut(ShortcutContext::Idle, *key) {
         Some(ShortcutAction::Idle(IdleShortcut::EditLatestQueued)) => {
             vim_state.cancel_pending_command();
@@ -105,6 +110,9 @@ pub(crate) fn handle_idle_key(
             | IdleShortcut::Backtrack
             | IdleShortcut::ExpandToolOutput),
         )) => {
+            if shortcut == IdleShortcut::Backtrack && !textarea.is_empty() {
+                return;
+            }
             if shortcut != IdleShortcut::ExpandToolOutput {
                 vim_state.cancel_pending_command();
             }
@@ -121,10 +129,145 @@ pub(crate) fn handle_idle_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composer_textarea::{make_textarea_with_text, textarea_text};
     use crate::test_support::test_run_config;
     use crate::types::TuiEvent;
     use crossterm::event::KeyModifiers;
     use orca_core::config::{ThemeName, VimInsertEscapeSequence};
+
+    #[test]
+    fn ctrl_u_clears_non_empty_composer_before_half_page_scroll() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.total_lines = 100;
+        state.visible_height = 20;
+        state.scroll_offset = 40;
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("draft\nmessage", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(textarea_text(&textarea), "");
+        assert_eq!(state.scroll_offset, 40);
+    }
+
+    #[test]
+    fn ctrl_u_keeps_half_page_scroll_when_composer_is_empty() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.total_lines = 100;
+        state.visible_height = 20;
+        state.scroll_offset = 40;
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+        let key = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(textarea.is_empty());
+        assert_eq!(state.scroll_offset, 30);
+    }
+
+    #[test]
+    fn escape_does_not_backtrack_over_a_non_empty_draft() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("draft", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(textarea_text(&textarea), "draft");
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn vim_normal_escape_stays_in_editor_instead_of_backtracking() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(true);
+        let mut textarea = make_textarea_with_text("draft", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert_eq!(textarea_text(&textarea), "draft");
+        assert!(action_rx.try_recv().is_err());
+    }
 
     #[test]
     fn empty_skill_picker_consumes_enter_without_submitting_dollar_prompt() {

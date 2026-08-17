@@ -93,7 +93,7 @@ const TUI_ENTRYPOINTS: [&str; 41] = [
     "slash.model_write",
     "slash.model_read",
     "slash.mode_plan_and_backtab",
-    "slash.config_show",
+    "slash.config",
     "slash.cost",
     "slash.goal",
     "slash.workflow_run",

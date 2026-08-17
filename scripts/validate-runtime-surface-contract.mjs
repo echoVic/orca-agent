@@ -371,7 +371,7 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
     "slash.mode_plan_and_backtab",
     /SlashCommand::Mode|SlashCommand::Plan|KeyCode::BackTab|cycle_approval_mode|title == "\/mode"/,
   ],
-  ["slash.config_show", /SlashCommand::ConfigShow/],
+  ["slash.config", /SlashCommand::Config|handle_config_dialog_key/],
   ["slash.cost", /SlashCommand::Cost/],
   ["slash.goal", /SlashCommand::Goal/],
   ["slash.workflow_run", /saved workflow|SlashCommand::WorkflowRun/],
@@ -1135,9 +1135,14 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval:user_action.route", 2],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval_option:approval_allowlist.insert", 2],
   ["crates/orca-tui/src/approval_mode_actions.rs:cycle_approval_mode:user_action.route", 1],
+  ["crates/orca-tui/src/config_dialog_actions.rs:apply_dialog:user_action.route", 1],
   ["crates/orca-tui/src/global_actions.rs:handle_global_shortcut:user_action.route", 4],
   ["crates/orca-tui/src/idle_navigation_actions.rs:handle_idle_navigation_shortcut:user_action.route", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:user_action.route", 2],
+  [
+    "crates/orca-tui/src/idle_submit_actions.rs:submit_pending_user_input_choice:user_action.route",
+    1,
+  ],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:input_history.record", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:settings.update", 1],
   ["crates/orca-tui/src/plan_approval_actions.rs:implement:user_action.route", 1],
@@ -1202,6 +1207,18 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/edit_highlight_worker.rs:coalesce_jobs_until_shutdown:positions.insert", 2],
   ["crates/orca-tui/src/edit_highlight_worker.rs:submit:self.pending.clear", 1],
   ["crates/orca-tui/src/edit_highlight_worker.rs:submit:self.pending.insert", 1],
+  [
+    "crates/orca-tui/src/composer_input_actions.rs:clear_composer_input:state.atomic_skill_tokens.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/composer_input_actions.rs:clear_composer_input:state.mention_bindings.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/composer_input_actions.rs:clear_composer_input:state.pending_pastes.clear",
+    1,
+  ],
   [
     "crates/orca-tui/src/composer_input_actions.rs:recall_previous_history:state.atomic_skill_tokens.clear",
     1,

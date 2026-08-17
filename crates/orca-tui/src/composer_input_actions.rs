@@ -5,9 +5,10 @@ use orca_core::config::RunConfig;
 use orca_runtime::mentions;
 
 use crate::composer_textarea::{
-    make_textarea_with_text, make_textarea_with_text_at_cursor, textarea_cursor_byte_index,
-    textarea_text,
+    make_textarea, make_textarea_with_text, make_textarea_with_text_at_cursor,
+    textarea_cursor_byte_index, textarea_text,
 };
+use crate::shortcuts::{EditorShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::slash_menu_actions::update_slash_menu;
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus};
@@ -24,6 +25,80 @@ pub(crate) fn refresh_input_menus(textarea: &TextArea, state: &mut AppState, con
 pub(crate) fn insert_composer_newline(textarea: &mut TextArea, state: &mut AppState) {
     textarea.insert_newline();
     state.reset_history_navigation();
+}
+
+pub(crate) fn clear_composer_input(
+    textarea: &mut TextArea,
+    state: &mut AppState,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool {
+    if textarea.is_empty() || (vim_state.enabled && vim_state.mode != crate::vim::VimMode::Insert) {
+        return false;
+    }
+
+    state.slash_menu = None;
+    state.mention.clear_projection();
+    state.pending_pastes.clear();
+    state.mention_bindings.clear();
+    state.atomic_skill_tokens.clear();
+    state.reset_history_navigation();
+    vim_state.cancel_pending_command();
+    *textarea = make_textarea(vim_state, theme);
+    true
+}
+
+pub(crate) fn composer_editor_shortcut_is_active(
+    key: KeyEvent,
+    composer_has_text: bool,
+    vim_state: &VimState,
+) -> bool {
+    match resolve_shortcut(ShortcutContext::Editor, key) {
+        Some(ShortcutAction::Editor(EditorShortcut::VimEscape)) => vim_state.enabled,
+        Some(ShortcutAction::Editor(_)) => {
+            (!vim_state.enabled || vim_state.mode == crate::vim::VimMode::Insert)
+                && composer_has_text
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn handle_composer_editor_shortcut(
+    ev: &Event,
+    key: &KeyEvent,
+    state: &mut AppState,
+    config: &RunConfig,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool {
+    if !composer_editor_shortcut_is_active(*key, !textarea.is_empty(), vim_state) {
+        return false;
+    }
+
+    let Some(ShortcutAction::Editor(shortcut)) = resolve_shortcut(ShortcutContext::Editor, *key)
+    else {
+        return false;
+    };
+
+    // Up/Down retain shell-style history or transcript navigation for a
+    // single-line draft. In a multiline draft the textarea owns them.
+    if matches!(key.code, KeyCode::Up | KeyCode::Down) && textarea.lines().len() <= 1 {
+        return false;
+    }
+
+    match shortcut {
+        EditorShortcut::ClearInput => {
+            clear_composer_input(textarea, state, vim_state, theme);
+        }
+        _ => {
+            // Ownership is semantic, not based on whether the cursor moved. At
+            // a line boundary the editor still consumes Ctrl+B/F/K/D instead
+            // of allowing an unrelated application action to run.
+            apply_composer_key_input(ev, key, state, config, textarea, vim_state, theme);
+        }
+    }
+    true
 }
 
 pub(crate) fn recall_previous_history(
@@ -229,6 +304,98 @@ mod tests {
                 },
             }],
         );
+    }
+
+    fn editor_fixture(
+        text: &str,
+        cursor: usize,
+        vim_enabled: bool,
+    ) -> (AppState, RunConfig, Theme, VimState, TextArea<'static>) {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let state = AppState::new(
+            tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let config = crate::test_support::test_run_config();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(vim_enabled);
+        if vim_enabled {
+            vim.mode = crate::vim::VimMode::Insert;
+        }
+        let textarea = make_textarea_with_text_at_cursor(text, cursor, &vim, &theme);
+        (state, config, theme, vim, textarea)
+    }
+
+    #[test]
+    fn editor_shortcuts_apply_readline_navigation_and_deletion() {
+        let (mut state, config, theme, mut vim, mut textarea) =
+            editor_fixture("first second", "first second".len(), false);
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(handle_composer_editor_shortcut(
+            &Event::Key(ctrl_b),
+            &ctrl_b,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert_eq!(textarea_cursor_byte_index(&textarea), "first secon".len());
+
+        let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(handle_composer_editor_shortcut(
+            &Event::Key(ctrl_w),
+            &ctrl_w,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert_eq!(textarea_text(&textarea), "first d");
+
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(handle_composer_editor_shortcut(
+            &Event::Key(ctrl_a),
+            &ctrl_a,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert_eq!(textarea_cursor_byte_index(&textarea), 0);
+
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(handle_composer_editor_shortcut(
+            &Event::Key(ctrl_d),
+            &ctrl_d,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert_eq!(textarea_text(&textarea), "irst d");
+    }
+
+    #[test]
+    fn vim_insert_escape_is_owned_by_editor_even_when_draft_is_empty() {
+        let (mut state, config, theme, mut vim, mut textarea) = editor_fixture("", 0, true);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(handle_composer_editor_shortcut(
+            &Event::Key(esc),
+            &esc,
+            &mut state,
+            &config,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert_eq!(vim.mode, crate::vim::VimMode::Normal);
     }
 
     #[test]

@@ -65,6 +65,7 @@ impl MentionSearchManager {
                 AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
             )
             && state.slash_menu.is_none()
+            && state.user_input_dialog.is_none()
     }
 
     #[cfg(test)]
@@ -582,6 +583,13 @@ mod tests {
                 "{status:?}"
             );
         }
+        state.status = AppStatus::WaitingUserInput;
+        state.user_input_dialog = Some(crate::user_input_dialog::UserInputDialog::new(
+            "Choose?",
+            vec!["A - First".to_string(), "B - Second".to_string()],
+        ));
+        assert!(!MentionSearchManager::is_enabled(&state));
+        state.user_input_dialog = None;
         state.status = AppStatus::Running;
         for panel in [PanelMode::Workflows, PanelMode::Agents] {
             state.panel_mode = panel;
