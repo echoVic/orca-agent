@@ -329,6 +329,10 @@ pub(crate) fn handle_paste_event(
     let Event::Paste(pasted) = ev else {
         return false;
     };
+    if state.config_dialog.is_some() {
+        return true;
+    }
+    state.user_input_dialog = None;
     if state.transcript_search.open {
         state.transcript_search.insert_paste(pasted);
         state.refresh_transcript_search();
@@ -370,6 +374,10 @@ pub(crate) fn handle_mouse_event(
     let Event::Mouse(mouse) = ev else {
         return MouseFlow::NotMouse;
     };
+    if state.config_dialog.is_some() || state.user_input_dialog.is_some() {
+        state.selection = None;
+        return MouseFlow::Handled;
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let lines = if mouse.kind == MouseEventKind::ScrollUp {

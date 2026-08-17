@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.21";
+export const releaseVersion = "v0.3.22";
 
 export const releases = [
+  {
+    version: "v0.3.22",
+    date: "2026-08-17",
+    title: "Interactive configuration, structured questions, and terminal-native editing",
+    body: "Adds an interactive /config panel for session model, reasoning, and approval settings; presents ask_user_question choices as an owned selection dialog with multi-select and custom-answer support; and separates editor shortcuts from global, idle, and running actions so readline and Vim keys edit drafts without triggering transcript search, help, scrolling, backtracking, or background-task actions.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.22",
+  },
   {
     version: "v0.3.21",
     date: "2026-08-17",

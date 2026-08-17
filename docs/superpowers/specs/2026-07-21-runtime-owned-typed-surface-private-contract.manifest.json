@@ -4775,16 +4775,20 @@
       "delete_direct_mutation"
     ],
     [
-      "slash.config_show",
+      "slash.config",
       [
-        "crates/orca-tui/src/slash_command_actions.rs:58"
+        "crates/orca-tui/src/slash_command_actions.rs:66-79",
+        "crates/orca-tui/src/config_dialog_actions.rs:13-108"
       ],
-      "authoritative_read",
-      "mutable_local_config",
-      "ReadRuntimeSettings",
-      [],
-      "typed snapshot/read consumer",
-      "read_typed_revision"
+      "settings_mutation",
+      "dialog_local_draft_without_user_action",
+      "UpdateRuntimeSettings(SetModel+SetReasoning+SetApprovalMode)",
+      [
+        "SurfaceBoundCaller",
+        "ThreadOwnerEpoch"
+      ],
+      "typed command result consumer",
+      "delete_direct_mutation"
     ],
     [
       "slash.cost",

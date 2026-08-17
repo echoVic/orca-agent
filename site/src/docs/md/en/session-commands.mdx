@@ -16,10 +16,37 @@ Orca provides a rich set of session management commands accessible via the `/` p
 | `/fork <spec>` | Fork from a session checkpoint | `/fork 42:turn-17` |
 | `/rename <name>` | Rename the current session | `/rename Fix auth bug` |
 | `/status` | Show session status and budget | `/status` |
+| `/config` | Configure current-session model, reasoning, and approval settings | `/config` |
 | `/copy` | Copy the last assistant message | `/copy` |
 | `/export` | Export session as JSON | `/export` |
 | `/delete <id>` | Permanently delete a session | `/delete 42` |
 | `/sessions` | List all sessions in the picker | `/sessions` |
+
+### Composer Editing Shortcuts
+
+When the composer contains a draft, editing owns terminal-native readline keys before global or transcript actions:
+
+| Key | Draft action | Empty-composer fallback |
+|-----|--------------|-------------------------|
+| `Ctrl+A` / `Ctrl+E` | Move to line start / end | Same editor action |
+| `Ctrl+B` / `Ctrl+F` | Move left / right | `Ctrl+F` opens transcript search |
+| `Alt+B` / `Alt+F` | Move one word left / right | Same editor action |
+| `Ctrl+P` / `Ctrl+N` | Move up / down | Browse prompt history |
+| `Ctrl+W` | Delete previous word | No application action |
+| `Ctrl+D` | Delete forward | Scroll transcript half a page down |
+| `Ctrl+K` | Delete to line end | Open shortcut help |
+| `Ctrl+U` | Clear the composer | Scroll transcript half a page up |
+| `Esc` | Exit Vim Insert/command state | Backtrack only when the composer is empty |
+
+In a running turn, `Ctrl+B` backgrounds the turn only when the composer is empty. Multiline drafts own Up and Down; otherwise those keys scroll the running transcript. `Ctrl+C` remains the process-level cancel/quit control.
+
+### `/config` — Configure the Current Session
+
+```
+/config
+```
+
+The interactive panel edits the current session's model, reasoning effort, and approval mode. Use Up and Down to select a setting, Left and Right to change it, Enter to apply all changes, and Esc to close without applying.
 
 ### `/new` — Start a New Session
 

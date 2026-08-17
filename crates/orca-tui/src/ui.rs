@@ -27,8 +27,10 @@ use crate::theme::Theme;
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
 use crate::types::{
-    AppState, AppStatus, ApprovalOption, ChatMessage, CopyNotice, PanelMode, SessionPickerPhase,
+    AppState, AppStatus, ApprovalOption, ChatMessage, ConfigDialog, CopyNotice, PanelMode,
+    SessionPickerPhase,
 };
+use crate::user_input_dialog::UserInputDialog;
 use crate::workspace_status::{GitIdentity, compact_cwd};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
@@ -119,11 +121,17 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
     render_status(frame, chunks[7], state, theme);
 
-    if !state.transcript_search.open && state.slash_menu.is_some() {
+    if state.user_input_dialog.is_none()
+        && !state.transcript_search.open
+        && state.slash_menu.is_some()
+    {
         render_slash_menu(frame, chunks[6], state, theme);
     }
 
-    if !state.transcript_search.open && state.mention.phase.is_some() && state.slash_menu.is_none()
+    if state.user_input_dialog.is_none()
+        && !state.transcript_search.open
+        && state.mention.phase.is_some()
+        && state.slash_menu.is_none()
     {
         render_mention_candidates(frame, chunks[6], state, theme);
     }
@@ -138,6 +146,16 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 
     if state.status == AppStatus::Idle && state.recovery_prompt_visible {
         render_recovery_prompt(frame, state, theme);
+    }
+
+    if state.config_dialog.is_some() {
+        render_config_dialog(frame, state, theme);
+    }
+
+    if let Some(dialog) = state.user_input_dialog.as_ref()
+        && state.status == AppStatus::WaitingUserInput
+    {
+        render_user_input_dialog(frame, dialog, theme);
     }
 
     if state.show_shortcuts {
@@ -262,17 +280,188 @@ fn composer_visible(state: &AppState) -> bool {
 }
 
 fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
-    composer_visible(state) && !state.show_shortcuts
+    composer_visible(state)
+        && !state.show_shortcuts
+        && state.config_dialog.is_none()
+        && state.user_input_dialog.is_none()
 }
 
 fn search_visible(state: &AppState) -> bool {
     state.transcript_search.open
+        && state.config_dialog.is_none()
+        && state.user_input_dialog.is_none()
         && state.plan_approval_dialog.is_none()
         && state.panel_mode == PanelMode::Conversation
         && matches!(
             state.status,
             AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
         )
+}
+
+fn render_user_input_dialog(frame: &mut Frame, dialog: &UserInputDialog, theme: &Theme) {
+    let width = 82u16.min(frame.area().width.saturating_sub(4));
+    let question_width = width.saturating_sub(6) as usize;
+    let question_lines = wrap_text(dialog.question(), question_width);
+    let preview_rows = dialog
+        .selected_preview()
+        .map_or(0, |preview| preview.lines().count().clamp(1, 4) + 1);
+    let content_rows = question_lines.len() + dialog.choices().len() + preview_rows + 5;
+    let height = (content_rows as u16 + 2)
+        .min(frame.area().height.saturating_sub(2))
+        .max(8);
+    let popup = centered_rect(frame.area(), width, height);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = question_lines
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.text),
+            ))
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    for (index, choice) in dialog.choices().iter().enumerate() {
+        let focused = dialog.selected() == index;
+        let checked = dialog.is_checked(index);
+        let marker = if dialog.multi_select() {
+            if checked { "[x]" } else { "[ ]" }
+        } else if focused {
+            "▸"
+        } else {
+            " "
+        };
+        let style = if focused {
+            Style::default()
+                .fg(theme.border)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let detail = truncate_to_display_width(
+            choice.description(),
+            width.saturating_sub(12 + choice.label().len() as u16) as usize,
+        );
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {marker} {}. {}", index + 1, choice.label()),
+                style,
+            ),
+            Span::styled(format!("  {detail}"), Style::default().fg(theme.muted)),
+        ]));
+    }
+    let custom_focused = dialog.selected() == dialog.choices().len();
+    lines.push(Line::from(Span::styled(
+        if custom_focused {
+            "  ▸ Type a custom answer"
+        } else {
+            "    Type a custom answer"
+        },
+        if custom_focused {
+            Style::default()
+                .fg(theme.border)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted)
+        },
+    )));
+    if let Some(preview) = dialog.selected_preview() {
+        lines.push(Line::from(""));
+        for line in preview.lines().take(4) {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.muted),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if dialog.multi_select() {
+            "  ↑↓ select · Space toggle · Enter submit · type for custom answer"
+        } else {
+            "  ↑↓ select · Enter choose · type for custom answer"
+        },
+        Style::default().fg(theme.muted),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" User question ")
+        .border_style(Style::default().fg(theme.border));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_config_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let Some(dialog) = state.config_dialog.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(
+        frame.area(),
+        72u16.min(frame.area().width.saturating_sub(4)),
+        10u16.min(frame.area().height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, popup);
+
+    let rows = [
+        ("Model", dialog.model.as_str()),
+        ("Reasoning effort", dialog.reasoning_effort.as_str()),
+        ("Approval mode", dialog.approval_mode.as_str()),
+    ];
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "  Changes apply to the current session.",
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(""),
+    ];
+    for (index, (label, value)) in rows.into_iter().enumerate() {
+        lines.push(config_dialog_row(dialog, index, label, value, theme));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ↑↓ select · ←→ change · Enter apply · Esc cancel",
+            Style::default().fg(theme.muted),
+        )),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Runtime Configuration ")
+        .border_style(Style::default().fg(theme.border));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn config_dialog_row<'a>(
+    dialog: &ConfigDialog,
+    index: usize,
+    label: &'a str,
+    value: &'a str,
+    theme: &Theme,
+) -> Line<'a> {
+    let selected = dialog.selected == index;
+    let style = if selected {
+        Style::default()
+            .fg(theme.border)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    Line::from(vec![
+        Span::styled(if selected { "▸ " } else { "  " }, style),
+        Span::styled(format!("{label:<20}"), style),
+        Span::styled(if selected { "‹ " } else { "  " }, style),
+        Span::styled(value, style),
+        Span::styled(if selected { " ›" } else { "  " }, style),
+    ])
 }
 
 fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line<'static>> {
@@ -3292,12 +3481,24 @@ fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
 fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
     match state.status {
-        AppStatus::Idle => vec![ShortcutScope::Global, ShortcutScope::Idle],
+        AppStatus::Idle => vec![
+            ShortcutScope::Global,
+            ShortcutScope::Editor,
+            ShortcutScope::Idle,
+        ],
         AppStatus::Running | AppStatus::Compacting => {
-            vec![ShortcutScope::Global, ShortcutScope::Running]
+            vec![
+                ShortcutScope::Global,
+                ShortcutScope::Editor,
+                ShortcutScope::Running,
+            ]
         }
         AppStatus::WaitingApproval => vec![ShortcutScope::Global, ShortcutScope::Approval],
-        AppStatus::WaitingUserInput => vec![ShortcutScope::Global, ShortcutScope::Idle],
+        AppStatus::WaitingUserInput => vec![
+            ShortcutScope::Global,
+            ShortcutScope::Editor,
+            ShortcutScope::Idle,
+        ],
         AppStatus::Setup | AppStatus::SessionPicker => vec![ShortcutScope::Global],
     }
 }
@@ -5173,6 +5374,68 @@ mod tests {
         assert!(rendered.contains("1/2"));
         let cursor = terminal.get_cursor_position().expect("hardware cursor");
         assert!(state.search_area.expect("search area").contains(cursor));
+    }
+
+    #[test]
+    fn config_dialog_renders_runtime_settings_and_hides_composer_cursor() {
+        let mut state = test_state();
+        state.config_dialog = Some(ConfigDialog {
+            selected: 1,
+            model: "deepseek-v4-pro".to_string(),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            approval_mode: ApprovalMode::AutoEdit,
+        });
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::from(["/config"]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Runtime Configuration"));
+        assert!(rendered.contains("deepseek-v4-pro"));
+        assert!(rendered.contains("Reasoning effort"));
+        assert!(rendered.contains("auto-edit"));
+        assert!(
+            !terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| { cell.modifier.contains(Modifier::REVERSED) && cell.symbol() == " " })
+        );
+    }
+
+    #[test]
+    fn user_input_dialog_renders_choices_without_skill_popup() {
+        let mut state = test_state();
+        state.set_status(AppStatus::WaitingUserInput);
+        state.user_input_dialog = Some(UserInputDialog::new(
+            "Task: Which path?",
+            vec![
+                "Audit - Run existing checks".to_string(),
+                "Improve - Replace placeholders\nPreview:\nfeature_list.json".to_string(),
+            ],
+        ));
+        state.mention.phase = Some(SearchPhase::Complete);
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::from(["$harness-creator: reply in Chinese"]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("User question"));
+        assert!(rendered.contains("Task: Which path?"));
+        assert!(rendered.contains("Audit"));
+        assert!(rendered.contains("Improve"));
+        assert!(!rendered.contains("No matching skills"));
     }
 
     #[test]

@@ -40,6 +40,7 @@ use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
 use crate::transcript_view::TranscriptRenderContext;
+use crate::user_input_dialog::UserInputDialog;
 use crate::workflow_panel::{
     WorkflowPanelState, push_pending_workflow_notification_unique, sort_workflow_tasks_for_panel,
 };
@@ -122,6 +123,7 @@ pub(crate) struct PendingInteractionSubmission {
     mention_bindings: MentionBindings,
     atomic_skill_tokens: MentionBindings,
     pending_pastes: Vec<(String, String)>,
+    user_input_dialog: Option<UserInputDialog>,
 }
 
 fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
@@ -613,6 +615,14 @@ pub struct PlanApprovalDialog {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDialog {
+    pub selected: usize,
+    pub model: String,
+    pub reasoning_effort: orca_core::config::ReasoningEffort,
+    pub approval_mode: ApprovalMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOption {
     /// Approve this single call.
@@ -828,6 +838,8 @@ pub struct AppState {
     pub event_tx: mpsc::Sender<UserAction>,
     pub approval_dialog: Option<ApprovalDialog>,
     pub plan_approval_dialog: Option<PlanApprovalDialog>,
+    pub config_dialog: Option<ConfigDialog>,
+    pub(crate) user_input_dialog: Option<UserInputDialog>,
     pub pending_input: Option<PendingTuiInput>,
     pub(crate) pending_mcp_elicitation_mode: Option<RuntimeMcpElicitationMode>,
     pub(crate) pending_interaction_submission: Option<PendingInteractionSubmission>,
@@ -976,6 +988,7 @@ impl AppState {
             mention_bindings,
             atomic_skill_tokens,
             pending_pastes,
+            user_input_dialog: self.user_input_dialog.clone(),
         });
         Some(key)
     }
@@ -1011,6 +1024,7 @@ impl AppState {
         self.mention_bindings = submission.mention_bindings;
         self.atomic_skill_tokens = submission.atomic_skill_tokens;
         self.pending_pastes = submission.pending_pastes;
+        self.user_input_dialog = submission.user_input_dialog;
         self.reset_assistant_stream();
         self.clear_receiving_tool_progress();
         self.push_message(ChatMessage::Error(message));
@@ -1062,6 +1076,8 @@ impl AppState {
             event_tx,
             approval_dialog: None,
             plan_approval_dialog: None,
+            config_dialog: None,
+            user_input_dialog: None,
             pending_input: None,
             pending_mcp_elicitation_mode: None,
             pending_interaction_submission: None,
@@ -1521,6 +1537,8 @@ impl AppState {
         self.mention_bindings.clear();
         self.atomic_skill_tokens.clear();
         self.plan_approval_dialog = None;
+        self.config_dialog = None;
+        self.user_input_dialog = None;
         self.pre_plan_approval_mode = None;
         self.pending_pastes.clear();
         self.reset_history_navigation();
@@ -1679,6 +1697,7 @@ impl AppState {
 
     pub fn enter_running(&mut self) {
         self.plan_approval_dialog = None;
+        self.config_dialog = None;
         if self.running_started_at.is_none() {
             self.running_started_at = Some(Instant::now());
         }
@@ -2243,6 +2262,7 @@ impl AppState {
                 target,
                 preview,
             } => {
+                self.user_input_dialog = None;
                 self.pending_interaction_submission = None;
                 self.close_transcript_search();
                 self.set_status(AppStatus::WaitingApproval);
@@ -2266,6 +2286,7 @@ impl AppState {
                 preview,
                 permission_kind,
             } => {
+                self.user_input_dialog = None;
                 self.pending_interaction_submission = None;
                 self.close_transcript_search();
                 self.set_status(AppStatus::WaitingApproval);
@@ -2292,12 +2313,11 @@ impl AppState {
                 self.pending_mcp_elicitation_mode = None;
                 self.pending_interaction_submission = None;
                 self.finish_assistant_stream();
-                let mut message = question;
-                if !choices.is_empty() {
-                    message.push_str("\nChoices: ");
-                    message.push_str(&choices.join(", "));
-                }
-                self.push_message(ChatMessage::System(message));
+                self.slash_menu = None;
+                self.mention.clear_projection();
+                self.user_input_dialog =
+                    (!choices.is_empty()).then(|| UserInputDialog::new(&question, choices));
+                self.push_message(ChatMessage::System(question));
             }
             TuiEvent::McpElicitationRequested {
                 key,
@@ -2307,6 +2327,7 @@ impl AppState {
                 url,
                 requested_schema_json,
             } => {
+                self.user_input_dialog = None;
                 self.set_status(AppStatus::WaitingUserInput);
                 self.pending_input = Some(PendingTuiInput::McpElicitation(key));
                 self.pending_mcp_elicitation_mode = Some(mode.clone());
@@ -2348,6 +2369,7 @@ impl AppState {
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::OperationRejected(message) => {
+                self.user_input_dialog = None;
                 self.reset_assistant_stream();
                 self.clear_receiving_tool_progress();
                 self.push_message(ChatMessage::Error(message));
@@ -2404,6 +2426,7 @@ impl AppState {
                 self.pending_input = None;
                 self.pending_mcp_elicitation_mode = None;
                 self.pending_interaction_submission = None;
+                self.user_input_dialog = None;
                 self.clear_receiving_tool_progress();
                 self.flush_proposed_plan_parser();
                 self.finish_assistant_stream();
@@ -3675,10 +3698,19 @@ mod tests {
     #[test]
     fn user_input_requested_event_tracks_pending_runtime_interaction_id() {
         let mut state = state();
+        state.slash_menu = Some(SlashMenu {
+            items: vec![SlashMenuItem {
+                command: "/config".to_string(),
+                description: "Configure".to_string(),
+            }],
+            selected: 0,
+            sub_menu: None,
+        });
+        state.mention.phase = Some(SearchPhase::Complete);
         state.update(TuiEvent::UserInputRequested {
             key: interaction_key(TuiInteractionKind::UserInput, "ask-1"),
             question: "Continue?".to_string(),
-            choices: vec!["yes".to_string(), "no".to_string()],
+            choices: vec!["yes - Continue".to_string(), "no - Stop".to_string()],
         });
 
         assert_eq!(state.status, AppStatus::WaitingUserInput);
@@ -3687,6 +3719,11 @@ mod tests {
             Some(PendingTuiInput::UserInput(key)) if key.request_id == "ask-1"
         ));
         assert!(state.pending_mcp_elicitation_mode.is_none());
+        let dialog = state.user_input_dialog.as_ref().expect("choice dialog");
+        assert_eq!(dialog.question(), "Continue?");
+        assert_eq!(dialog.choices()[0].label(), "yes");
+        assert!(state.slash_menu.is_none());
+        assert!(state.mention.phase.is_none());
     }
 
     #[test]

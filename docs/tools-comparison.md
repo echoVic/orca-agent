@@ -68,7 +68,7 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 | MCP | 支持 | 支持 | MCP 客户端工具路由与 resources list/templates/read 已接入 |
 | 自定义工具 | 插件/扩展 | MCP/插件 | TOML external tools + MCP |
 | Skills | skills / slash 工作流 | Codex skills / plugins | Markdown `SKILL.md` discovery + `$skill` 显式注入 |
-| 用户输入 | `AskUserQuestion` 多问题问卷 | `request_user_input` 多问题结构 | TUI `ask_user_question` 逐题 answer loop |
+| 用户输入 | `AskUserQuestion` 多问题问卷 | `request_user_input` 多问题结构 | TUI `ask_user_question` 逐题选择框，支持多选与自定义回答 |
 | 审批 | 工具能力/策略 | 工具能力/策略 | 从 `ToolSpec.capabilities` 推导 |
 | 上下文工具 | 按模式暴露 | 按模式暴露 | `get_goal` / `create_goal` / `update_goal` 等按 runtime context 过滤 |
 

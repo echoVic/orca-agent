@@ -149,6 +149,36 @@ pub(crate) fn handle_idle_submit(
     true
 }
 
+pub(crate) fn submit_pending_user_input_choice(
+    answer: String,
+    textarea: &TextArea,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> bool {
+    let Some(PendingTuiInput::UserInput(key)) = state.pending_input.as_ref() else {
+        return false;
+    };
+    let key = key.clone();
+    let visible_text = textarea_text(textarea);
+    let staged_key = state.stage_pending_interaction_submission_with_composer(
+        visible_text,
+        state.mention_bindings.clone(),
+        state.atomic_skill_tokens.clone(),
+        state.pending_pastes.clone(),
+    );
+    debug_assert_eq!(staged_key.as_ref(), Some(&key));
+    state.pending_input = None;
+    state.pending_mcp_elicitation_mode = None;
+    state.user_input_dialog = None;
+    state.enter_running();
+    state.scroll_to_bottom();
+    let _ = action_tx.send(UserAction::RespondToInteraction {
+        key,
+        response: TuiInteractionResponse::UserInput(answer),
+    });
+    true
+}
+
 fn reset_composer_after_submit(textarea: &mut TextArea, vim_state: &mut VimState, theme: &Theme) {
     vim_state.reset_insert(textarea, theme);
     *textarea = make_textarea(vim_state, theme);

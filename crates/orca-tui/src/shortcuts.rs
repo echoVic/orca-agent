@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShortcutScope {
     Global,
+    Editor,
     Idle,
     Running,
     Approval,
@@ -28,6 +29,7 @@ pub struct ResolvedShortcutHint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShortcutContext {
     Global,
+    Editor,
     Idle,
     Running,
     Approval,
@@ -36,6 +38,7 @@ pub enum ShortcutContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShortcutAction {
     Global(GlobalShortcut),
+    Editor(EditorShortcut),
     Idle(IdleShortcut),
     Running(RunningShortcut),
     Approval(ApprovalShortcut),
@@ -71,6 +74,26 @@ pub enum GlobalShortcut {
     ScrollBottom,
     ScrollTop,
     ClearScreen,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditorShortcut {
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    MoveWordLeft,
+    MoveWordRight,
+    MoveLineStart,
+    MoveLineEnd,
+    DeleteBackward,
+    DeleteForward,
+    DeleteBackwardWord,
+    DeleteForwardWord,
+    ClearInput,
+    DeleteToLineEnd,
+    Yank,
+    VimEscape,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,6 +170,137 @@ const GLOBAL_BINDINGS: &[(GlobalShortcut, KeyBinding)] = &[
     (
         GlobalShortcut::ClearScreen,
         KeyBinding::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+    ),
+];
+
+const EDITOR_BINDINGS: &[(EditorShortcut, KeyBinding)] = &[
+    (
+        EditorShortcut::MoveLeft,
+        KeyBinding::new(KeyCode::Left, KeyModifiers::NONE),
+    ),
+    (
+        EditorShortcut::MoveLeft,
+        KeyBinding::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::MoveRight,
+        KeyBinding::new(KeyCode::Right, KeyModifiers::NONE),
+    ),
+    (
+        EditorShortcut::MoveRight,
+        KeyBinding::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::MoveUp,
+        KeyBinding::new(KeyCode::Up, KeyModifiers::NONE),
+    ),
+    (
+        EditorShortcut::MoveUp,
+        KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::MoveDown,
+        KeyBinding::new(KeyCode::Down, KeyModifiers::NONE),
+    ),
+    (
+        EditorShortcut::MoveDown,
+        KeyBinding::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::MoveWordLeft,
+        KeyBinding::new(KeyCode::Char('b'), KeyModifiers::ALT),
+    ),
+    (
+        EditorShortcut::MoveWordLeft,
+        KeyBinding::new(KeyCode::Left, KeyModifiers::ALT),
+    ),
+    (
+        EditorShortcut::MoveWordLeft,
+        KeyBinding::new(KeyCode::Left, KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::MoveWordRight,
+        KeyBinding::new(KeyCode::Char('f'), KeyModifiers::ALT),
+    ),
+    (
+        EditorShortcut::MoveWordRight,
+        KeyBinding::new(KeyCode::Right, KeyModifiers::ALT),
+    ),
+    (
+        EditorShortcut::MoveWordRight,
+        KeyBinding::new(KeyCode::Right, KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::MoveLineStart,
+        KeyBinding::new(KeyCode::Home, KeyModifiers::NONE),
+    ),
+    (
+        EditorShortcut::MoveLineStart,
+        KeyBinding::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::MoveLineEnd,
+        KeyBinding::new(KeyCode::End, KeyModifiers::NONE),
+    ),
+    (
+        EditorShortcut::MoveLineEnd,
+        KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::DeleteBackward,
+        KeyBinding::new(KeyCode::Backspace, KeyModifiers::NONE),
+    ),
+    (
+        EditorShortcut::DeleteBackward,
+        KeyBinding::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::DeleteForward,
+        KeyBinding::new(KeyCode::Delete, KeyModifiers::NONE),
+    ),
+    (
+        EditorShortcut::DeleteForward,
+        KeyBinding::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::DeleteBackwardWord,
+        KeyBinding::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::DeleteBackwardWord,
+        KeyBinding::new(KeyCode::Backspace, KeyModifiers::ALT),
+    ),
+    (
+        EditorShortcut::DeleteBackwardWord,
+        KeyBinding::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::DeleteForwardWord,
+        KeyBinding::new(KeyCode::Char('d'), KeyModifiers::ALT),
+    ),
+    (
+        EditorShortcut::DeleteForwardWord,
+        KeyBinding::new(KeyCode::Delete, KeyModifiers::ALT),
+    ),
+    (
+        EditorShortcut::DeleteForwardWord,
+        KeyBinding::new(KeyCode::Delete, KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::ClearInput,
+        KeyBinding::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::DeleteToLineEnd,
+        KeyBinding::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::Yank,
+        KeyBinding::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+    ),
+    (
+        EditorShortcut::VimEscape,
+        KeyBinding::new(KeyCode::Esc, KeyModifiers::NONE),
     ),
 ];
 
@@ -324,12 +478,9 @@ const APPROVAL_BINDINGS: &[(ApprovalShortcut, KeyBinding)] = &[
 ];
 
 pub fn resolve_shortcut(context: ShortcutContext, event: KeyEvent) -> Option<ShortcutAction> {
-    if let Some(shortcut) = global_shortcut(event) {
-        return Some(ShortcutAction::Global(shortcut));
-    }
-
     match context {
-        ShortcutContext::Global => None,
+        ShortcutContext::Global => global_shortcut(event).map(ShortcutAction::Global),
+        ShortcutContext::Editor => editor_shortcut(event).map(ShortcutAction::Editor),
         ShortcutContext::Idle => idle_shortcut(event).map(ShortcutAction::Idle),
         ShortcutContext::Running => running_shortcut(event).map(ShortcutAction::Running),
         ShortcutContext::Approval => approval_shortcut(event).map(ShortcutAction::Approval),
@@ -338,6 +489,10 @@ pub fn resolve_shortcut(context: ShortcutContext, event: KeyEvent) -> Option<Sho
 
 pub fn global_shortcut(event: KeyEvent) -> Option<GlobalShortcut> {
     match_binding(event, GLOBAL_BINDINGS)
+}
+
+pub fn editor_shortcut(event: KeyEvent) -> Option<EditorShortcut> {
+    match_binding(event, EDITOR_BINDINGS)
 }
 
 pub fn idle_shortcut(event: KeyEvent) -> Option<IdleShortcut> {
@@ -365,6 +520,7 @@ pub fn shortcut_lines(scopes: &[ShortcutScope]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let sections = [
         (ShortcutScope::Global, "Global"),
+        (ShortcutScope::Editor, "Editor"),
         (ShortcutScope::Idle, "Composer"),
         (ShortcutScope::Running, "Running"),
         (ShortcutScope::Approval, "Approval"),
@@ -405,12 +561,12 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     ShortcutHint {
         scope: ShortcutScope::Global,
         keys: "ctrl+f",
-        action: "find in transcript",
+        action: "find in transcript when input is empty",
     },
     ShortcutHint {
         scope: ShortcutScope::Global,
         keys: "F1 / ctrl+k",
-        action: "show or hide shortcuts",
+        action: "show shortcuts; ctrl+k requires empty input",
     },
     ShortcutHint {
         scope: ShortcutScope::Global,
@@ -433,6 +589,21 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
         action: "cycle approval mode",
     },
     ShortcutHint {
+        scope: ShortcutScope::Editor,
+        keys: "ctrl+a/e",
+        action: "move to line start or end",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Editor,
+        keys: "ctrl+b/f / alt+b/f",
+        action: "move by character or word",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Editor,
+        keys: "ctrl+w/d/k/u",
+        action: "delete word, character, line end, or clear input",
+    },
+    ShortcutHint {
         scope: ShortcutScope::Idle,
         keys: "enter",
         action: "send message",
@@ -450,7 +621,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     ShortcutHint {
         scope: ShortcutScope::Idle,
         keys: "up/down / ctrl+p/ctrl+n",
-        action: "previous or next prompt",
+        action: "history when empty; otherwise edit input",
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
@@ -459,13 +630,18 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
-        keys: "ctrl+u / ctrl+d",
-        action: "scroll half page",
+        keys: "ctrl+u",
+        action: "clear input, or scroll half page when empty",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Idle,
+        keys: "ctrl+d",
+        action: "delete forward, or scroll when input is empty",
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
         keys: "esc",
-        action: "backtrack previous prompt",
+        action: "backtrack only when input is empty",
     },
     ShortcutHint {
         scope: ShortcutScope::Idle,
@@ -475,7 +651,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     ShortcutHint {
         scope: ShortcutScope::Running,
         keys: "ctrl+b",
-        action: "background current turn",
+        action: "move left, or background when input is empty",
     },
     ShortcutHint {
         scope: ShortcutScope::Running,
@@ -500,7 +676,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     ShortcutHint {
         scope: ShortcutScope::Running,
         keys: "up/down",
-        action: "scroll one line",
+        action: "edit multiline input, otherwise scroll",
     },
     ShortcutHint {
         scope: ShortcutScope::Running,
@@ -509,8 +685,13 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Running,
-        keys: "ctrl+u / ctrl+d",
-        action: "scroll half page",
+        keys: "ctrl+u",
+        action: "clear input, or scroll half page when empty",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Running,
+        keys: "ctrl+d",
+        action: "delete forward, or scroll when input is empty",
     },
     ShortcutHint {
         scope: ShortcutScope::Approval,
@@ -547,6 +728,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
 fn scope_has_registered_binding(scope: ShortcutScope) -> bool {
     match scope {
         ShortcutScope::Global => !GLOBAL_BINDINGS.is_empty(),
+        ShortcutScope::Editor => !EDITOR_BINDINGS.is_empty(),
         ShortcutScope::Idle => !IDLE_BINDINGS.is_empty(),
         ShortcutScope::Running => !RUNNING_BINDINGS.is_empty(),
         ShortcutScope::Approval => !APPROVAL_BINDINGS.is_empty(),
@@ -724,14 +906,134 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_resolver_prioritizes_global_bindings() {
+    fn shortcut_resolver_keeps_global_and_editor_contexts_separate() {
         assert_eq!(
             resolve_shortcut(
                 ShortcutContext::Idle,
                 key(KeyCode::Char('k'), KeyModifiers::CONTROL)
             ),
+            None
+        );
+        assert_eq!(
+            resolve_shortcut(
+                ShortcutContext::Global,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL)
+            ),
             Some(ShortcutAction::Global(GlobalShortcut::ToggleShortcuts))
         );
+        assert_eq!(
+            resolve_shortcut(
+                ShortcutContext::Editor,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL)
+            ),
+            Some(ShortcutAction::Editor(EditorShortcut::DeleteToLineEnd))
+        );
+    }
+
+    #[test]
+    fn editor_shortcuts_cover_readline_navigation_and_deletion() {
+        for (code, modifiers, expected) in [
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                EditorShortcut::MoveLineStart,
+            ),
+            (
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                EditorShortcut::MoveLineEnd,
+            ),
+            (
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+                EditorShortcut::MoveLeft,
+            ),
+            (
+                KeyCode::Char('f'),
+                KeyModifiers::CONTROL,
+                EditorShortcut::MoveRight,
+            ),
+            (
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+                EditorShortcut::DeleteBackwardWord,
+            ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                EditorShortcut::ClearInput,
+            ),
+            (
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                EditorShortcut::DeleteForward,
+            ),
+        ] {
+            assert_eq!(editor_shortcut(key(code, modifiers)), Some(expected));
+        }
+    }
+
+    #[test]
+    fn known_cross_context_collisions_are_explicitly_classified() {
+        for (code, modifiers, context) in [
+            (
+                KeyCode::Char('f'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Global,
+            ),
+            (
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Global,
+            ),
+            (
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Idle,
+            ),
+            (
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Idle,
+            ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Idle,
+            ),
+            (
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Idle,
+            ),
+            (
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Running,
+            ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Running,
+            ),
+            (
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                ShortcutContext::Running,
+            ),
+            (KeyCode::Esc, KeyModifiers::NONE, ShortcutContext::Idle),
+            (KeyCode::Esc, KeyModifiers::NONE, ShortcutContext::Running),
+        ] {
+            let event = key(code, modifiers);
+            assert!(
+                resolve_shortcut(ShortcutContext::Editor, event).is_some(),
+                "{event:?} must have an editor meaning"
+            );
+            assert!(
+                resolve_shortcut(context, event).is_some(),
+                "{event:?} must keep its {context:?} fallback"
+            );
+        }
     }
 
     #[test]

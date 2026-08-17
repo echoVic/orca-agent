@@ -673,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_insert_escape_flushes_before_running_escape_interrupt() {
+    fn running_escape_exits_vim_insert_before_interrupting() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = AppState::new(
             action_tx.clone(),
@@ -726,7 +726,8 @@ mod tests {
 
         assert_eq!(textarea_text(&textarea), "j");
         assert_eq!(state.status, AppStatus::Running);
-        assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
+        assert_eq!(vim.mode, crate::vim::VimMode::Normal);
+        assert!(action_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1870,6 +1871,7 @@ done
             &config,
             &action_tx,
             &mut vim,
+            false,
             || Ok(()),
         )
         .expect("preflight");
@@ -1884,6 +1886,7 @@ done
             &config,
             &action_tx,
             &mut vim,
+            false,
             || Ok(()),
         )
         .expect("preflight");
@@ -6990,6 +6993,7 @@ done
             &mut config,
             &action_tx,
             &mut vim,
+            true,
             || Ok(()),
         )
         .unwrap();

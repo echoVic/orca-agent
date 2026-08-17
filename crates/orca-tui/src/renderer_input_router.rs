@@ -73,6 +73,10 @@ impl<'a, 'text> RendererInputRouter<'a, 'text> {
     ) -> io::Result<Option<i32>> {
         match input {
             BatchedInputEvent::ScrollLines(lines) => {
+                if self.state.config_dialog.is_some() {
+                    self.vim_state.cancel_pending_command();
+                    return Ok(None);
+                }
                 flush_pending_insert_escape_before_non_key(
                     self.vim_state,
                     self.textarea,
@@ -144,6 +148,7 @@ impl<'a, 'text> RendererInputRouter<'a, 'text> {
                     self.config,
                     self.action_tx,
                     self.vim_state,
+                    !self.textarea.is_empty(),
                     || clear_terminal(),
                 )? {
                     KeyEventFlow::Continue => return Ok(None),
@@ -338,6 +343,31 @@ mod tests {
 
         assert_eq!(textarea_text(&fixture.textarea), "j");
         assert!(!fixture.vim.has_pending_command_for_test());
+    }
+
+    #[test]
+    fn config_dialog_consumes_coalesced_scroll_without_moving_transcript() {
+        let mut fixture = Fixture::new();
+        fixture.state.total_lines = 100;
+        fixture.state.visible_height = 20;
+        fixture.state.scroll_offset = 40;
+        fixture.state.config_dialog = Some(crate::types::ConfigDialog {
+            selected: 0,
+            model: fixture.state.model_name.clone(),
+            reasoning_effort: fixture.state.reasoning_effort,
+            approval_mode: fixture.state.approval_mode,
+        });
+
+        fixture
+            .route(
+                BatchedInputEvent::ScrollLines(-3),
+                Instant::now(),
+                || Ok(()),
+            )
+            .expect("config scroll routing");
+
+        assert_eq!(fixture.state.scroll_offset, 40);
+        assert!(fixture.state.config_dialog.is_some());
     }
 
     #[test]

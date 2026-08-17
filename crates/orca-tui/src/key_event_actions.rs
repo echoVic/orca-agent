@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orca_core::config::RunConfig;
 
 use crate::approval_mode_actions::cycle_approval_mode;
+use crate::composer_input_actions::composer_editor_shortcut_is_active;
 use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
 use crate::shortcuts::{GlobalShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::types::{AppState, AppStatus, PanelMode, UserAction};
@@ -184,6 +185,7 @@ mod tests {
                 &config,
                 &action_tx,
                 &mut vim,
+                false,
                 || Ok(()),
             )
             .unwrap(),
@@ -192,8 +194,16 @@ mod tests {
         assert!(action_rx.try_recv().is_err());
 
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        handle_key_event_preflight(ctrl_c, &mut state, &config, &action_tx, &mut vim, || Ok(()))
-            .unwrap();
+        handle_key_event_preflight(
+            ctrl_c,
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
         assert!(matches!(action_rx.try_recv(), Ok(UserAction::Interrupt)));
     }
 
@@ -213,6 +223,7 @@ mod tests {
             &config,
             &action_tx,
             &mut vim,
+            false,
             || Ok(()),
         )
         .unwrap();
@@ -220,6 +231,72 @@ mod tests {
         assert!(!vim.has_pending_command_for_test());
         assert_eq!(vim.named_register_for_test(0), Some(("saved", false)));
         assert!(vim.has_repeat_for_test());
+    }
+
+    #[test]
+    fn config_dialog_owns_non_cancel_global_shortcuts() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.config_dialog = Some(crate::types::ConfigDialog {
+            selected: 0,
+            model: state.model_name.clone(),
+            reasoning_effort: state.reasoning_effort,
+            approval_mode: state.approval_mode,
+        });
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        let flow = handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(flow, KeyEventFlow::Unhandled));
+        assert!(!state.transcript_search.open);
+        assert!(state.config_dialog.is_some());
+    }
+
+    #[test]
+    fn draft_editor_shortcuts_precede_conflicting_global_actions() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+
+        let draft_flow = handle_key_event_preflight(
+            ctrl_f,
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            true,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(draft_flow, KeyEventFlow::Unhandled));
+        assert!(!state.transcript_search.open);
+
+        let empty_flow = handle_key_event_preflight(
+            ctrl_f,
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(empty_flow, KeyEventFlow::Continue));
+        assert!(state.transcript_search.open);
     }
 
     #[test]
@@ -251,6 +328,7 @@ pub(crate) fn handle_key_event_preflight<F>(
     config: &RunConfig,
     action_tx: &mpsc::Sender<UserAction>,
     vim_state: &mut VimState,
+    composer_has_text: bool,
     clear_terminal: F,
 ) -> io::Result<KeyEventFlow>
 where
@@ -280,12 +358,25 @@ where
         return Ok(KeyEventFlow::Unhandled);
     }
 
+    if state.config_dialog.is_some() {
+        vim_state.cancel_pending_command();
+        return Ok(KeyEventFlow::Unhandled);
+    }
+
+    if state.user_input_dialog.is_some() {
+        vim_state.cancel_pending_command();
+        return Ok(KeyEventFlow::Unhandled);
+    }
+
     if handle_transcript_search_key(key, state) == SearchKeyFlow::Handled {
         vim_state.cancel_pending_command();
         return Ok(KeyEventFlow::Continue);
     }
 
     if let Some(ShortcutAction::Global(shortcut)) = resolve_shortcut(ShortcutContext::Global, key) {
+        if composer_editor_shortcut_is_active(key, composer_has_text, vim_state) {
+            return Ok(KeyEventFlow::Unhandled);
+        }
         vim_state.cancel_pending_command();
         return match handle_global_shortcut(shortcut, state, action_tx, clear_terminal)? {
             GlobalShortcutFlow::Continue => Ok(KeyEventFlow::Continue),

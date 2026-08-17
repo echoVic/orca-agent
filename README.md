@@ -66,7 +66,8 @@ the `orca` commands are the same.
 
 In the TUI, `@` searches files, skills, plugins, and MCP resources. Session
 commands are `/new`, `/resume`, `/fork [name]`, `/rename [name]`, `/status`,
-and `/copy [N]`. The resume picker also supports fork, rename, archive, delete,
+`/config`, and `/copy [N]`. `/config` opens an interactive session settings
+panel. The resume picker also supports fork, rename, archive, delete,
 and copying a session ID. `/history` is retired; `/clear` remains a hidden
 compatibility alias for `/new`. `Ctrl+L` clears only the displayed transcript
 and terminal scrollback, keeping the current conversation context. On exit,

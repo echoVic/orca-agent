@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.22":
+        "Adds an interactive /config panel for current-session model, reasoning, and approval settings; presents ask_user_question choices as an owned dialog with descriptions, previews, multi-select, and custom-answer support; and separates Editor shortcuts from Global, Idle, and Running actions so readline and Vim keys edit drafts without accidentally opening search or help, scrolling the transcript, backtracking, or backgrounding work.",
       "v0.3.21":
         "Makes interactive session state more reliable by assigning queued input, approvals, terminal startup, renderer events, and session, operation, Goal, plan, workflow, and metrics projections to explicit owners. Side re-entry preserves background presentation without replaying stale events, while restarted sessions reconcile legacy active and terminal workflow tasks into the current durable task model.",
       "v0.3.20":
@@ -604,6 +606,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.22":
+        "新增交互式 /config 面板，可直接调整当前会话的模型、推理强度和审批模式；ask_user_question 现在使用独立选择对话框展示说明与预览，并支持多选和自定义答案；同时把 Editor 快捷键与 Global、Idle、Running 动作分离，让 readline 与 Vim 键在有草稿时优先编辑输入，不再误触搜索、帮助、滚动、回退或后台运行。",
       "v0.3.21":
         "通过明确的状态所有者提升交互会话可靠性：排队输入、审批、终端启动、渲染事件，以及 session、operation、Goal、plan、workflow 和 metrics 投影各自只由一个边界负责。重新进入 Side 时会保留后台任务展示且不重放陈旧事件；重启后的会话会把旧格式的活动与终态 workflow task 归并到当前持久化任务模型。",
       "v0.3.20":

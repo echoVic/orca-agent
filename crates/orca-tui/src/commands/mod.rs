@@ -11,7 +11,7 @@ pub enum SlashCommand {
     Copy(Option<String>),
     CancelOperation,
     Cost,
-    ConfigShow,
+    Config,
     Mode(Option<String>),
     Plan(Option<String>),
     Goal(GoalSlashCommand),
@@ -112,10 +112,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         "copy" => Some(SlashCommand::Copy(optional_argument(parts))),
         "cancel-operation" => no_arguments(parts).then_some(SlashCommand::CancelOperation),
         "cost" => no_arguments(parts).then_some(SlashCommand::Cost),
-        "config" => match optional_single_argument(parts)? {
-            Some("show") => Some(SlashCommand::ConfigShow),
-            _ => None,
-        },
+        "config" => no_arguments(parts).then_some(SlashCommand::Config),
         "mode" => {
             optional_single_argument(parts).map(|mode| SlashCommand::Mode(mode.map(str::to_string)))
         }
@@ -171,7 +168,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/copy", "Copy an assistant response"),
         ("/cancel-operation", "Cancel a recoverable operation"),
         ("/cost", "Show session cost"),
-        ("/config show", "Show merged config"),
+        ("/config", "Configure runtime settings"),
         ("/mode", "Switch approval mode"),
         ("/plan", "Plan first, then approve implementation"),
         ("/goal", "Manage a persistent goal"),
@@ -368,7 +365,7 @@ mod tests {
             "/status now",
             "/cancel-operation now",
             "/cost now",
-            "/config show extra",
+            "/config show",
             "/mode auto-edit extra",
             "/plan off extra",
             "/workflows now",
@@ -615,8 +612,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_config_show_command() {
-        assert_eq!(parse("/config show"), Some(SlashCommand::ConfigShow));
+    fn parses_config_command() {
+        assert_eq!(parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(parse("/config show"), None);
     }
 
     #[test]

@@ -16,10 +16,37 @@ Orca 通过 TUI 输入中的 `/` 前缀提供丰富的会话管理命令。本�
 | `/fork <spec>` | 从会话检查点分叉 | `/fork 42:turn-17` |
 | `/rename <name>` | 重命名当前会话 | `/rename 修复认证 bug` |
 | `/status` | 显示会话状态和预算 | `/status` |
+| `/config` | 配置当前会话的模型、推理强度和审批模式 | `/config` |
 | `/copy` | 复制最后一条智能体消息 | `/copy` |
 | `/export` | 将会话导出为 JSON | `/export` |
 | `/delete <id>` | 永久删除会话 | `/delete 42` |
 | `/sessions` | 在选择器中列出所有会话 | `/sessions` |
+
+### 输入框编辑快捷键
+
+输入框中存在草稿时，终端原生的 readline 编辑键优先于全局动作和 transcript 操作：
+
+| 按键 | 有草稿时 | 输入框为空时 |
+|------|----------|--------------|
+| `Ctrl+A` / `Ctrl+E` | 移到行首 / 行尾 | 保持编辑器语义 |
+| `Ctrl+B` / `Ctrl+F` | 向左 / 向右移动 | `Ctrl+F` 打开 transcript 搜索 |
+| `Alt+B` / `Alt+F` | 向左 / 向右移动一个单词 | 保持编辑器语义 |
+| `Ctrl+P` / `Ctrl+N` | 向上 / 向下移动 | 浏览历史输入 |
+| `Ctrl+W` | 删除前一个单词 | 无应用动作 |
+| `Ctrl+D` | 向前删除 | transcript 向下滚动半页 |
+| `Ctrl+K` | 删除到行尾 | 打开快捷键帮助 |
+| `Ctrl+U` | 清空输入框 | transcript 向上滚动半页 |
+| `Esc` | 退出 Vim Insert 或取消 Vim 命令状态 | 仅输入框为空时回退 |
+
+任务运行期间，只有输入框为空时 `Ctrl+B` 才会把当前任务转到后台。多行草稿优先使用 Up 和 Down 编辑，其他情况下这两个按键滚动运行中的 transcript。`Ctrl+C` 继续作为进程级取消和退出按键。
+
+### `/config` — 配置当前会话
+
+```
+/config
+```
+
+交互面板可以调整当前会话的模型、推理强度和审批模式。使用 Up 和 Down 选择设置，Left 和 Right 修改值，Enter 一次性应用，Esc 放弃修改并关闭。
 
 ### `/new` — 开始新会话
 

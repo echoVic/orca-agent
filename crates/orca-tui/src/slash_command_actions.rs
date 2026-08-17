@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
 use crate::session_picker_actions::open_session_picker;
 use crate::surface_actions::TuiHostActions;
-use crate::types::{AppState, AppStatus, ChatMessage, TuiMemoryScope, UserAction};
+use crate::types::{AppState, AppStatus, ChatMessage, ConfigDialog, TuiMemoryScope, UserAction};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::RunConfig;
 
@@ -63,10 +63,19 @@ pub(crate) fn handle_slash_command(
                 usage.estimated_cost_usd
             )));
         }
-        SlashCommand::ConfigShow => {
-            state.push_message(ChatMessage::System(orca_core::config::format_config_show(
-                config,
-            )));
+        SlashCommand::Config => {
+            if state.status == AppStatus::Idle {
+                state.config_dialog = Some(ConfigDialog {
+                    selected: 0,
+                    model: state.model_name.clone(),
+                    reasoning_effort: state.reasoning_effort,
+                    approval_mode: state.approval_mode,
+                });
+            } else {
+                state.push_message(ChatMessage::Error(
+                    "finish or cancel the current work before changing configuration".to_string(),
+                ));
+            }
         }
         SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {
@@ -588,6 +597,29 @@ mod tests {
             outcome,
             Some(SlashOutcome::Prefill(value)) if value == "$"
         ));
+        assert!(state.messages.is_empty());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn config_slash_command_opens_interactive_dialog_without_transcript_output() {
+        let mut state = state();
+        state.reasoning_effort = orca_core::config::ReasoningEffort::High;
+        state.approval_mode = ApprovalMode::AutoEdit;
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        let outcome = handle_slash_command("/config", &mut config, &shared, &mut state, &action_tx);
+
+        assert!(matches!(outcome, Some(SlashOutcome::Continue)));
+        let dialog = state.config_dialog.as_ref().expect("config dialog");
+        assert_eq!(dialog.model, "deepseek-v4-pro");
+        assert_eq!(
+            dialog.reasoning_effort,
+            orca_core::config::ReasoningEffort::High
+        );
+        assert_eq!(dialog.approval_mode, ApprovalMode::AutoEdit);
         assert!(state.messages.is_empty());
         assert!(action_rx.try_recv().is_err());
     }

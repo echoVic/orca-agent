@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use tui_textarea::TextArea;
 
 use crate::commands;
-use crate::composer_input_actions::{apply_composer_key_input, insert_composer_newline};
+use crate::composer_input_actions::{
+    apply_composer_key_input, handle_composer_editor_shortcut, insert_composer_newline,
+};
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::queued_input::QueuedUserMessage;
@@ -136,6 +138,12 @@ pub(crate) fn handle_running_key(
         return true;
     }
 
+    if state.panel_mode == PanelMode::Conversation
+        && handle_composer_editor_shortcut(ev, key, state, config, textarea, vim_state, theme)
+    {
+        return true;
+    }
+
     if let Some(ShortcutAction::Running(shortcut)) =
         resolve_shortcut(ShortcutContext::Running, *key)
     {
@@ -216,7 +224,9 @@ mod tests {
     use orca_runtime::mentions::MentionBindings;
 
     use super::*;
-    use crate::composer_textarea::{make_textarea_with_text, textarea_text};
+    use crate::composer_textarea::{
+        make_textarea_with_text, textarea_cursor_byte_index, textarea_text,
+    };
     use crate::queued_input::QueuedUserMessage;
     use crate::types::{AppState, AppStatus, ChatMessage};
     use crate::vim::VimState;
@@ -240,6 +250,65 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::named(ThemeName::Dark)
+    }
+
+    #[test]
+    fn running_ctrl_u_clears_non_empty_follow_up_before_half_page_scroll() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = state();
+        state.total_lines = 100;
+        state.visible_height = 20;
+        state.scroll_offset = 40;
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("follow up", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Char('u'), crossterm::event::KeyModifiers::CONTROL);
+
+        assert!(handle_running_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "");
+        assert_eq!(state.scroll_offset, 40);
+    }
+
+    #[test]
+    fn running_ctrl_b_moves_cursor_in_draft_before_background_action() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state();
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("follow up", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL);
+
+        assert!(handle_running_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "follow up");
+        assert_eq!(textarea_cursor_byte_index(&textarea), "follow u".len());
+        assert_eq!(state.status, AppStatus::Running);
+        assert!(action_rx.try_recv().is_err());
     }
 
     #[test]
