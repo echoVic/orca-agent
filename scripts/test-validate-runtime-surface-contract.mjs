@@ -2499,7 +2499,7 @@ expectFailure(
     ],
     [
       "batch activity return",
-      /\n\s*received\n\s*\}\n\}/,
+      /\r?\n\s*received\r?\n\s*\}\r?\n\}/,
       "\n        removed_batch_result\n    }\n}",
       /assert!\(fixture\.drain\(&owner\)\)/,
     ],
@@ -2539,7 +2539,7 @@ expectFailure(
     ],
     [
       "owner run delegation",
-      /(\n\s*&workspace_root,\n\s*\)\n\s*)\.run\s*\(/,
+      /(\r?\n\s*&workspace_root,\r?\n\s*\)\r?\n\s*)\.run\s*\(/,
       "$1.removed_run(",
       /RendererLoopOwner::new/,
     ],
