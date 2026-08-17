@@ -16,7 +16,8 @@ The v0.3.21 main-branch Windows gate exposed three independent release blockers:
   attached persistent task registry kept the task `Running` while recovery only
   reconciled terminal workflow state into tasks already marked interrupted.
 - the native ARM64 full suite reached 2,195 of 2,664 tests before the workflow's
-  45-minute step timeout interrupted it.
+  45-minute step timeout interrupted it, and the x64 suite later reached 1,506
+  of 2,664 tests before hitting the same timeout.
 
 This is a lifecycle and release-gate defect. It does not require a public API,
 protocol, npm layout, or persistence-format change.
@@ -37,8 +38,8 @@ protocol, npm layout, or persistence-format change.
   it with a generic runtime-restart failure.
 - Goal surface outbox acknowledgement remains asynchronous, so tests must wait
   for bounded eventual cleanup instead of requiring same-instant cleanup.
-- Native ARM64 keeps the complete workspace test gate, with enough wall-clock
-  budget to finish the measured suite.
+- Native Windows x64 and ARM64 keep the complete workspace test gate, with
+  enough wall-clock budget to finish the measured suite.
 
 ## Ownership And Failure Semantics
 

@@ -103,7 +103,7 @@ jobs:
       - name: Build the Windows async subagent runner
         run: cargo build -p orca-windows-runner --locked
       - name: Run the full Windows test suite
-        timeout-minutes: 45
+        timeout-minutes: 75
         env:
           RUST_BACKTRACE: "1"
         run: |
