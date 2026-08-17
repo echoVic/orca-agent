@@ -1963,7 +1963,7 @@ expectFailure(
     ],
     [
       "production input finish",
-      /(self\.run_with\([\s\S]*?\n\s*)InputRuntime::finish,(\n\s*\)\n\s*\})/,
+      /(self\.run_with\([\s\S]*?\r?\n\s*)InputRuntime::finish,(\r?\n\s*\)\r?\n\s*\})/,
       "$1removed_input_finish,$2",
       /finish_startup_failure_with\(&mut self\.input_runtime,\s*error,\s*InputRuntime::finish\)/,
     ],
