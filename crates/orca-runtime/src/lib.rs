@@ -61,6 +61,7 @@ pub(crate) mod runtime_special;
 pub mod runtime_state;
 mod runtime_steer;
 mod runtime_subagent_call;
+mod terminal_service;
 // The reviewed contract includes surface types exercised by external consumers and fixtures.
 #[allow(dead_code, unused_imports)]
 mod runtime_surface;

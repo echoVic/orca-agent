@@ -8,7 +8,7 @@ use crate::protocol::{self, ServerEvent};
 use crate::tool_item_projection::{
     ProjectedFileChangeItem, ProjectedToolCallCompletion, ProjectedToolCallItem,
     ProjectedWorkflowItem, mcp_result_from_content, mcp_tool_parts, parse_json_or_null,
-    tool_error_object_from_value, tool_status_is_completed,
+    tool_error_object_from_value, tool_status_is_completed, unified_exec_projection,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -318,22 +318,40 @@ impl RuntimeEventProjector {
                 payload["target"].as_str(),
             )
         });
+        let unified_exec = payload["output"].as_str().and_then(|content| {
+            unified_exec_projection(payload["name"].as_str().unwrap_or_default(), content)
+        });
         events.push(ServerEvent::ItemCompleted {
             thread_id: Value::Null,
             turn_id: Value::Null,
             item: item.completed_item(ProjectedToolCallCompletion {
                 status: payload["status"].as_str().unwrap_or_default().to_string(),
-                command_status: payload["status"].clone(),
+                command_status: unified_exec
+                    .as_ref()
+                    .map(|projection| projection.status.clone())
+                    .unwrap_or_else(|| payload["status"].clone()),
                 arguments: tool_arguments(payload),
                 result: mcp_tool_result(payload),
-                command_error: payload["error"].clone(),
+                command_error: unified_exec
+                    .as_ref()
+                    .map(|projection| projection.error.clone())
+                    .unwrap_or_else(|| payload["error"].clone()),
                 mcp_error: mcp_tool_error(payload),
                 dynamic_error: dynamic_tool_error(payload),
                 content_items: dynamic_tool_content_items(payload),
                 success: payload["status"].as_str() == Some("completed"),
-                aggregated_output: payload["output"].clone(),
-                exit_code: payload["exit_code"].clone(),
-                truncated: payload["truncated"].clone(),
+                aggregated_output: unified_exec
+                    .as_ref()
+                    .map(|projection| projection.output.clone())
+                    .unwrap_or_else(|| payload["output"].clone()),
+                exit_code: unified_exec
+                    .as_ref()
+                    .map(|projection| projection.exit_code.clone())
+                    .unwrap_or_else(|| payload["exit_code"].clone()),
+                truncated: unified_exec
+                    .as_ref()
+                    .map(|projection| projection.truncated.clone())
+                    .unwrap_or_else(|| payload["truncated"].clone()),
             }),
         });
     }
@@ -516,6 +534,8 @@ fn is_builtin_tool(tool: &str) -> bool {
             | "glob"
             | "grep"
             | "bash"
+            | "exec_command"
+            | "write_stdin"
             | "edit"
             | "write_file"
             | "git_status"
@@ -692,5 +712,13 @@ mod tests {
             )),
             "malformed canonical completion must not fabricate item lifecycle events: {projected:?}"
         );
+    }
+
+    #[test]
+    fn unified_exec_tools_are_projected_as_builtins() {
+        assert!(is_builtin_tool("exec_command"));
+        assert!(is_builtin_tool("write_stdin"));
+        assert!(!is_dynamic_tool("exec_command"));
+        assert!(!is_dynamic_tool("write_stdin"));
     }
 }

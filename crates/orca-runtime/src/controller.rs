@@ -44,6 +44,7 @@ use crate::runtime_host::{
 use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
 use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts};
 use crate::tasks::{MainSessionTerminalUpdate, TaskRegistry};
+use crate::terminal_service::TerminalService;
 #[cfg(test)]
 use crate::thread::RuntimeThread;
 use crate::tool_invocation::AgentToolPolicyContext;
@@ -1406,6 +1407,7 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
     thread_extensions: Option<Arc<ExtensionData>>,
     turn_extension_id: Option<String>,
 ) -> io::Result<ThreadTurnOutcome> {
+    drain_terminal_notifications(session, thread_extensions.as_deref());
     let context = ThreadTurnContext::prepare(config, session, request)?;
     if let Some(events) = events {
         let mut sink = EventSink::new(writer, config.output_format)
@@ -1455,6 +1457,20 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
         &mut execution.events,
         &mut execution.sink,
     )
+}
+
+fn drain_terminal_notifications(
+    session: &mut InteractiveSession,
+    thread_extensions: Option<&ExtensionData>,
+) {
+    let Some(service) = thread_extensions.and_then(ExtensionData::get::<TerminalService>) else {
+        return;
+    };
+    for completion in service.drain_completions() {
+        let message = Message::pinned_system(completion.model_notification());
+        session.append_message(&message);
+        session.conversation_mut().messages.push(message);
+    }
 }
 
 #[cfg(test)]
@@ -1637,6 +1653,66 @@ mod tests {
             terminal_notifications: false,
             auto_memory: false,
         }
+    }
+
+    #[test]
+    fn terminal_completion_is_injected_once_before_the_next_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(temp.path().to_path_buf());
+        let mut thread = RuntimeThread::start(&config, "terminal notification").expect("thread");
+        let extensions = thread.thread_extensions_handle();
+        let service = extensions
+            .get_or_init(|| TerminalService::new(thread.session().task_registry().clone()));
+        let overlay = crate::lifecycle::TurnPermissionOverlay::default();
+        let started = service
+            .exec(
+                crate::terminal_service::TerminalExecRequest {
+                    command: "sleep 0.1; printf notified",
+                    cwd: temp.path(),
+                    additional_roots: &[],
+                    config: None,
+                    permission_overlay: &overlay,
+                    terminal: crate::shell_session::ShellTerminalMode::pipe(),
+                    sandbox_override: Some(
+                        crate::shell_session::ShellSandboxMode::DangerFullAccess,
+                    ),
+                },
+                Duration::from_millis(10),
+                8 * 1024,
+                || false,
+            )
+            .expect("start background terminal");
+        assert_eq!(started.status, "running", "{started:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = thread
+                .session()
+                .task_registry()
+                .get(&started.task_id)
+                .map(|record| record.status);
+            if status == Some(orca_core::task_types::TaskStatus::Completed) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "observed {status:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref()));
+        let message_count = thread.session().conversation().messages.len();
+        assert!(matches!(
+            thread.session().conversation().messages.last(),
+            Some(Message::System { content, pinned: true })
+                if content.contains("<task-notification>")
+                    && content.contains("notified")
+                    && content.contains(&started.task_id)
+        ));
+
+        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref()));
+        assert_eq!(
+            thread.session().conversation().messages.len(),
+            message_count
+        );
     }
 
     #[test]

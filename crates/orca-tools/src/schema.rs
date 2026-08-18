@@ -176,6 +176,8 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
             .or_else(|| Some(".".to_string())),
         ToolName::Grep => arguments["pattern"].as_str().map(String::from),
         ToolName::Bash => arguments["command"].as_str().map(String::from),
+        ToolName::ExecCommand => arguments["cmd"].as_str().map(String::from),
+        ToolName::WriteStdin => arguments["session_id"].as_str().map(String::from),
         ToolName::GitStatus => Some(".".to_string()),
         ToolName::Subagent => arguments["description"]
             .as_str()
@@ -237,5 +239,23 @@ mod tests {
 
         assert_eq!(normalized["plan"][0]["status"], "completed");
         assert!(normalized["plan"][0].get("completed").is_none());
+    }
+
+    #[test]
+    fn unified_exec_tools_extract_command_and_session_targets() {
+        assert_eq!(
+            tool_target(
+                &ToolName::ExecCommand,
+                &serde_json::json!({"cmd": "vim README.md"}),
+            ),
+            Some("vim README.md".to_string())
+        );
+        assert_eq!(
+            tool_target(
+                &ToolName::WriteStdin,
+                &serde_json::json!({"session_id": "shell-1", "chars": "\\u0015"}),
+            ),
+            Some("shell-1".to_string())
+        );
     }
 }

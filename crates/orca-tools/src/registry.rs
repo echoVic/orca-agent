@@ -606,6 +606,86 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::Bash,
     ));
     registry.register(BuiltinTool::new(
+        cooperative_builtin_spec(
+            "exec_command",
+            "Start a command in the runtime-owned terminal service. Returns a session_id when the command is still running so it can be continued with write_stdin.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "cmd": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Optional working directory. Relative paths are resolved from the current workspace directory."
+                    },
+                    "tty": {
+                        "type": "boolean",
+                        "description": "Allocate a PTY for interactive programs such as vim, REPLs, and terminal UIs. Defaults to false."
+                    },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 30000,
+                        "description": "How long to wait before returning. Defaults to 10000ms. A running command is not terminated when this elapses."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20000,
+                        "description": "Maximum output returned by this call, measured approximately in model tokens. Defaults to 2000."
+                    }
+                },
+                "required": ["cmd"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::shell_execute(),
+            ToolExposure::Direct,
+            RendererHint::Shell,
+            false,
+        ),
+        BuiltinExecutor::ExecCommand,
+    ));
+    registry.register(BuiltinTool::new(
+        cooperative_builtin_spec(
+            "write_stdin",
+            "Write characters to a running exec_command session, or poll it by omitting chars. Control characters such as Ctrl-U may be sent with their Unicode escape.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The session_id returned by exec_command"
+                    },
+                    "chars": {
+                        "type": "string",
+                        "description": "Characters to write. Omit to poll without writing."
+                    },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 30000,
+                        "description": "How long to wait for output after writing or polling. Defaults to 250ms when writing and 5000ms when polling."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20000,
+                        "description": "Maximum output returned by this call, measured approximately in model tokens. Defaults to 2000."
+                    }
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::TerminalTransport]),
+            ToolExposure::Direct,
+            RendererHint::Shell,
+            false,
+        ),
+        BuiltinExecutor::WriteStdin,
+    ));
+    registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "edit",
             "Edit a file by replacing exact text. The old_text must match exactly one location in the file.",
@@ -1707,6 +1787,16 @@ impl Tool for BuiltinTool {
                 ctx.shell_timeout,
                 || ctx.is_cancelled(),
             ),
+            BuiltinExecutor::ExecCommand => ToolResult::failed(
+                request,
+                "exec_command must be executed by the runtime terminal service",
+                None,
+            ),
+            BuiltinExecutor::WriteStdin => ToolResult::failed(
+                request,
+                "write_stdin must be executed by the runtime terminal service",
+                None,
+            ),
             BuiltinExecutor::Edit => {
                 edit::execute_or_cancel(request, ctx.cwd, || ctx.is_cancelled())
             }
@@ -1794,6 +1884,8 @@ enum BuiltinExecutor {
     Glob,
     Grep,
     Bash,
+    ExecCommand,
+    WriteStdin,
     Edit,
     WriteFile,
     GitStatus,
@@ -2617,6 +2709,27 @@ mod tests {
                 .contains_key("shell_id"),
             "task_stop should accept package 3's deprecated shell_id alias"
         );
+    }
+
+    #[test]
+    fn unified_exec_tools_are_model_visible_and_serialized() {
+        let registry = default_tool_registry();
+        let exec = registry.resolve("exec_command").expect("exec_command");
+        let write = registry.resolve("write_stdin").expect("write_stdin");
+
+        assert!(exec.tool.spec().exposure.is_model_visible());
+        assert!(write.tool.spec().exposure.is_model_visible());
+        assert_eq!(exec.tool.action_kind(), ActionKind::Shell);
+        assert_eq!(write.tool.action_kind(), ActionKind::Read);
+        assert!(
+            !exec
+                .tool
+                .is_concurrent_safe(&request(ToolName::ExecCommand, r#"{"cmd":"sleep 1"}"#,))
+        );
+        assert!(!write.tool.is_concurrent_safe(&request(
+            ToolName::WriteStdin,
+            r#"{"session_id":"shell-1"}"#,
+        )));
     }
 
     #[test]

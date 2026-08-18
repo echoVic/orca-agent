@@ -26,6 +26,7 @@ use crate::runtime_permission::{
 #[cfg(test)]
 use crate::runtime_state::PermissionRuntimeState;
 use crate::tasks::TaskRegistry;
+use crate::terminal_service::TerminalService;
 
 const READONLY_TOOL_TIMEOUT_SECS: u64 = 120;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -51,6 +52,7 @@ pub(crate) struct RuntimeNormalToolInvocation {
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) shell_timeout_secs: u64,
     pub(crate) task_registry: Option<TaskRegistry>,
+    pub(crate) terminal_service: Option<Arc<TerminalService>>,
     pub(crate) permission_overlay: TurnPermissionOverlay,
     pub(crate) control: ToolControlSemantics,
 }
@@ -89,9 +91,18 @@ impl RuntimeNormalToolInvocation {
             output_truncation,
             shell_timeout_secs,
             task_registry: task_registry.cloned(),
+            terminal_service: None,
             permission_overlay,
             control,
         }
+    }
+
+    pub(crate) fn with_terminal_service(
+        mut self,
+        terminal_service: Option<Arc<TerminalService>>,
+    ) -> Self {
+        self.terminal_service = terminal_service;
+        self
     }
 }
 
@@ -1132,6 +1143,7 @@ mod tests {
             output_truncation: ToolOutputTruncation::default(),
             shell_timeout_secs: 120,
             task_registry: Some(TaskRegistry::new(format!("normal-{id}"))),
+            terminal_service: None,
             permission_overlay: TurnPermissionOverlay::default(),
             control: ToolControlSemantics {
                 interrupt,
