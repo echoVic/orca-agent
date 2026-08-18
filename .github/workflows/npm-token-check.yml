@@ -33,4 +33,5 @@ jobs:
 
           npm dist-tag add "${PACKAGE_NAME}@${PACKAGE_VERSION}" "$TEST_TAG"
           npm dist-tag ls "$PACKAGE_NAME"
-          npm dist-tag rm "$PACKAGE_NAME" "$TEST_TAG"
+          npm dist-tag rm "$PACKAGE_NAME" "$TEST_TAG" \
+            || echo "::warning::temporary dist-tag cleanup will be retried by the EXIT trap"
