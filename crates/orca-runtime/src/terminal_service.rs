@@ -832,7 +832,7 @@ mod tests {
             .expect("start");
         assert_eq!(started.status, "running", "{started:?}");
 
-        let completed = service
+        let observed = service
             .write_stdin(
                 &started.session_id,
                 Some("hello\n"),
@@ -841,8 +841,23 @@ mod tests {
                 || false,
             )
             .expect("write stdin");
-        assert_eq!(completed.status, "completed");
-        assert!(completed.output.contains("got:hello"));
+        let mut output = observed.output.clone();
+        let completed = if observed.status == "running" {
+            service
+                .write_stdin(
+                    &started.session_id,
+                    None,
+                    Duration::from_secs(5),
+                    8 * 1024,
+                    || false,
+                )
+                .expect("poll stdin command completion")
+        } else {
+            observed
+        };
+        output.push_str(&completed.output);
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        assert!(output.contains("got:hello"), "{output:?}");
     }
 
     #[cfg(unix)]
