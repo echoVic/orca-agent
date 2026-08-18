@@ -817,14 +817,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, _) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
+        let command = if cfg!(windows) {
+            r#"$line = [Console]::In.ReadLine(); [Console]::Out.Write("got:$line")"#
+        } else {
+            "read line; printf 'got:%s' \"$line\""
+        };
         let started = service
             .exec(
-                request(
-                    "read line; printf 'got:%s' \"$line\"",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
+                request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
                 Duration::from_millis(50),
                 8 * 1024,
                 || false,
@@ -835,7 +835,11 @@ mod tests {
         let observed = service
             .write_stdin(
                 &started.session_id,
-                Some("hello\n"),
+                Some(if cfg!(windows) {
+                    "hello\r\n"
+                } else {
+                    "hello\n"
+                }),
                 Duration::from_secs(2),
                 8 * 1024,
                 || false,
