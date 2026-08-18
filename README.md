@@ -84,7 +84,11 @@ by default; use `/remember` for explicit user or project facts. See
 - Uses DeepSeek's reasoning and tool-use semantics directly, with SSE streaming,
   prefix-cache-friendly prompts, automatic context management, and retry logic.
 - Reads, searches, edits, and writes code; runs shell commands; and can verify
-  the result with a command you choose.
+  the result with a command you choose. Runtime-owned `exec_command` sessions
+  can stay alive across tool calls, allocate a PTY, and receive input through
+  `write_stdin` for editors, REPLs, and terminal UIs. A background supervisor
+  settles exited or stopped sessions without polling and injects one bounded
+  completion notification before the next model turn.
 - Asks one to four structured clarification questions in interactive TUI
   sessions, including described choices, optional previews, and multi-select
   answers.

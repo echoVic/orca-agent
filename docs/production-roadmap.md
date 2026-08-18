@@ -56,12 +56,15 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.3.21 gives TUI interaction, rendering, terminal lifecycle,
-and session, operation, Goal, plan, workflow, and metrics projections explicit
-state owners. Side re-entry rotates attachment fencing before authoritative
-history projection, queued input and approval acknowledgements remain ordered,
-and legacy active or terminal workflow tasks are reconciled into the current
-durable task model after restart. This builds on v0.3.20's bounded,
+Current baseline: v0.3.23 adds thread-owned interactive `exec_command` and
+`write_stdin` sessions with optional PTY, raw control input, bounded output,
+task-based process-tree control, and a single-owner background supervisor that
+settles natural exits and external stop requests without another poll. It also
+injects exactly-once bounded completion notices before the next model turn
+unless the terminal result was already observed. This builds on v0.3.22's
+interactive configuration, structured question dialog, and terminal-native
+composer editing; v0.3.21's explicit TUI state ownership and legacy task
+recovery; and v0.3.20's bounded,
 project-scoped automatic memory, v0.3.19's bounded release gate, v0.3.13's
 headless resume, and v0.3.12's runtime-owned Side Conversations. Prior releases
 added v0.3.8's remaining-context
@@ -1579,7 +1582,7 @@ working baseline used to prioritize the next patch releases.
 | Tool approval | Action kind is derived from tool capabilities, with TOML allow/deny rules | Capability/policy driven approvals | Implemented |
 | File discovery | `glob` remains model-facing; interactive discovery now uses multi-root streaming `orca-file-search` with browse/fuzzy modes, exclude/Git-ignore controls, owned cancellation, million-path acceptance gates, and Codex-compatible app-server sessions | Claude `Glob`, Codex file search | Implemented |
 | Mention system | Files, Skills, Plugins, MCP Resources, and Resource Templates share one typed candidate model in TUI and thread-bound app-server search; visible tokens carry hidden atomic targets that survive preceding edits, invalidate on overlap, and expand against the selected root/registry | Codex atomic structured input and unified mentions; Claude resource/file typeahead | Implemented |
-| Shell execution | `bash` and server shell ops route through a runtime shell-session manager with task ids, stdin, kill, nonblocking incremental reads, optional Unix PTY mode, PTY resize, stdout/stderr collection, macOS Seatbelt path, configurable timeout, and observable requested/effective terminal modes with pipe fallback where PTY is unavailable | Codex `exec_command` sessions, PTY, stdin, timeout | Seeded; richer shell controls still open |
+| Shell execution | A thread-owned `TerminalService` exposes model-facing `exec_command` and `write_stdin` with retained session/task ids, optional PTY, raw control-character input, bounded incremental output, active permission-profile sandboxing, and immediate `task_stop` process-tree termination. A bounded-mailbox, single-owner supervisor actively reaps natural exits and registry stop requests without another poll, releases per-session resources, joins on shutdown, and injects exactly-once bounded completion notifications before the next model turn unless the terminal was already observed. Synchronous `bash` and JSONL server shell adapters remain compatible over the same low-level shell-session manager | Codex `exec_command` streaming/exit watcher; Grok Build exit watcher and completion notification | Implemented |
 | Context management | BPE token counting, local compaction, persisted collapse/summary records | Multi-level local/remote compaction | Partial |
 | Tool output control | Runtime task output uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output. v0.2.24 additionally caps ordinary child stdout/stderr at 1 MiB per stream before final tool-result truncation, preserves omission metadata, and bounds regular-file reads, exact edits, and committed TUI diff previews at admission | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial; v0.2.24 published, persistent offset polling remains open |
 | Model metadata | `ModelSelection` plus DeepSeek defaults | Codex `models-manager` with model capability metadata | Partial |

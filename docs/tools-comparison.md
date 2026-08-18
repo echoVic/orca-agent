@@ -57,11 +57,11 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 
 ## 与 Claude Code / Codex CLI 的设计对比
 
-| 维度 | Claude Code | Codex CLI | Orca v0.3.5 |
+| 维度 | Claude Code | Codex CLI | Orca v0.3.23 |
 |------|-------------|-----------|--------------|
 | 工具定义 | 类型化 schema | 规格/能力驱动 | `ToolSpec` 规格驱动，执行前校验支持 `oneOf` / `anyOf` |
 | 文件发现 | `Glob` | 文件搜索工具优先 | `glob` 优先，支持 glob/fuzzy 两种发现模式；`list_files` 兼容 |
-| Shell | `Bash`，支持后台任务 | `exec_command`/shell session | `bash` 同步执行，后台任务待增强 |
+| Shell | `Bash`，支持后台任务 | `exec_command`/shell session | `exec_command` + `write_stdin`，支持跨调用 session、PTY、增量输出和 task stop；单 owner supervisor 主动结算退出/停止任务并在下一轮注入一次完成通知；保留同步 `bash` 兼容 |
 | 文件写入 | `FileWrite`/`FileEdit` | patch/edit 类工具 | `write_file`/`edit` |
 | 子代理 | 同步/异步能力 | 多代理/任务能力 | 同步 `subagent`，深度受配置限制 |
 | 工作流 | workflow/task 能力 | 自动化/任务工具 | `Workflow` JS 动态 workflow |
@@ -161,7 +161,6 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
 | 能力 | 当前差距 | 建议优先级 |
 |------|----------|------------|
-| Bash 超时/PTY/session | 还没有 Codex CLI 风格的 `exec_command` + `write_stdin` 会话模型 | P1 |
 | 图片/PDF/Notebook 读取 | `read_file` 仍以 UTF-8 文本为主 | P2 |
 | apply_patch freeform | 仍以 JSON `edit` / `write_file` 为主 | P2 |
 
@@ -179,9 +178,7 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
 ### 短期
 
-1. 引入 Codex CLI 风格的 shell session 工具：`exec_command`、`write_stdin`、可选 PTY、超时和后台 session id。
-2. 保留 `bash` 作为兼容 alias，逐步让 prompt 推荐新 shell 工具。
-3. 为 `ask_user_question` 增加可配置自动超时和专用多选控件；当前答案通过 composer 逐题提交。
+1. 为 `ask_user_question` 增加可配置自动超时和专用多选控件；当前答案通过 composer 逐题提交。
 
 ### 中期
 
@@ -203,6 +200,7 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 - `crates/orca-tools/src/glob.rs` — 首选文件发现工具。
 - `crates/orca-tools/src/list_files.rs` — 兼容目录列表工具。
 - `crates/orca-runtime/src/tool_router.rs` — runtime-special/normal 工具路由与 turn disposition。
+- `crates/orca-runtime/src/terminal_service.rs` — thread-owned `exec_command` / `write_stdin` 会话、PTY、增量输出、task stop、后台退出监督和完成队列。
 - `crates/orca-runtime/src/runtime_special.rs` — Goal、workflow、task 等 runtime 控制面执行。
 - `crates/orca-runtime/src/runtime_host.rs` — hosted turn 准入、失败 Goal stall 和 context 清理。
 - `crates/orca-tools/src/update_goal.rs` — Goal 参数解析与模型结果格式化，不持有 session owner。

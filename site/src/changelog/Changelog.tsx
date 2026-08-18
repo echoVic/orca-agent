@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.23":
+        "Adds thread-owned exec_command and write_stdin sessions with optional PTY, raw control-character input, bounded incremental output, and task-based process-tree control. A bounded-mailbox, single-owner terminal supervisor actively settles natural exits and TaskRegistry stop requests without another poll, releases retained resources, and injects one bounded completion notification before the next model turn unless the terminal result was already observed.",
       "v0.3.22":
         "Adds an interactive /config panel for current-session model, reasoning, and approval settings; presents ask_user_question choices as an owned dialog with descriptions, previews, multi-select, and custom-answer support; and separates Editor shortcuts from Global, Idle, and Running actions so readline and Vim keys edit drafts without accidentally opening search or help, scrolling the transcript, backtracking, or backgrounding work.",
       "v0.3.21":
@@ -606,6 +608,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.23":
+        "新增线程持有的 exec_command 与 write_stdin 会话，支持可选 PTY、原始控制字符输入、有界增量输出和基于 task 的进程树控制。采用有界 mailbox 的单 owner 终端监督器会主动结算自然退出和 TaskRegistry 停止请求，无需再次轮询，同时释放会话资源；若模型尚未直接观察终态，下一轮执行前会注入一次有界完成通知。",
       "v0.3.22":
         "新增交互式 /config 面板，可直接调整当前会话的模型、推理强度和审批模式；ask_user_question 现在使用独立选择对话框展示说明与预览，并支持多选和自定义答案；同时把 Editor 快捷键与 Global、Idle、Running 动作分离，让 readline 与 Vim 键在有草稿时优先编辑输入，不再误触搜索、帮助、滚动、回退或后台运行。",
       "v0.3.21":

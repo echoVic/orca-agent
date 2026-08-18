@@ -260,9 +260,31 @@ impl<'a> RuntimeToolRouter<'a> {
             RuntimeSpecialToolDispatch::TaskList => Ok(self
                 .runtime
                 .execute_task_list_tool(execution_request, task_registry)),
-            RuntimeSpecialToolDispatch::TaskStop => Ok(self
-                .runtime
-                .execute_task_stop_tool(execution_request, task_registry)),
+            RuntimeSpecialToolDispatch::TaskStop => {
+                let result = self
+                    .runtime
+                    .execute_task_stop_tool(execution_request, task_registry);
+                if result.status == tool_types::ToolStatus::Completed
+                    && let Some(task_id) = task_stop_id(execution_request)
+                {
+                    let thread_store = extension_stores
+                        .map(|stores| stores.thread_store())
+                        .unwrap_or(&self.runtime.thread_extensions);
+                    if let Some(service) =
+                        thread_store.get::<crate::terminal_service::TerminalService>()
+                        && let Err(error) = service.stop_task(&task_id)
+                    {
+                        return Ok(RuntimeToolDispatchOutput::continue_model(
+                            tool_types::ToolResult::failed_after_start(
+                                execution_request,
+                                format!("failed to stop terminal task '{task_id}': {error}"),
+                                None,
+                            ),
+                        ));
+                    }
+                }
+                Ok(result)
+            }
             RuntimeSpecialToolDispatch::RequestPermissions => {
                 let result = self.runtime.execute_request_permissions_tool_with_policy(
                     execution_request,
@@ -315,6 +337,18 @@ impl<'a> RuntimeToolRouter<'a> {
                             .cloned(),
                     )
                     .collect::<Vec<_>>();
+                let terminal_service = matches!(
+                    execution_request.name,
+                    tool_types::ToolName::ExecCommand | tool_types::ToolName::WriteStdin
+                )
+                .then(|| {
+                    let thread_store = extension_stores
+                        .map(|stores| stores.thread_store())
+                        .unwrap_or(&self.runtime.thread_extensions);
+                    thread_store.get_or_init(|| {
+                        crate::terminal_service::TerminalService::new(task_registry.clone())
+                    })
+                });
                 let invocation = RuntimeNormalToolInvocation::snapshot(
                     Some(config),
                     execution_request,
@@ -326,7 +360,8 @@ impl<'a> RuntimeToolRouter<'a> {
                     config.tools.shell_timeout_secs,
                     Some(task_registry),
                     permission_overlay.clone(),
-                );
+                )
+                .with_terminal_service(terminal_service);
                 let output = {
                     let mut output_handler = |chunk: &str| {
                         sink.emit(events.tool_output_delta(&execution_request.id, chunk))
@@ -363,4 +398,13 @@ impl<'a> RuntimeToolRouter<'a> {
             child_budget_usage: dispatch_child_budget_usage,
         })
     }
+}
+
+fn task_stop_id(request: &tool_types::ToolRequest) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(request.raw_arguments.as_deref()?).ok()?;
+    args.get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| args.get("shell_id").and_then(serde_json::Value::as_str))
+        .filter(|task_id| !task_id.trim().is_empty())
+        .map(str::to_string)
 }

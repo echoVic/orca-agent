@@ -1106,6 +1106,7 @@ mod tests {
         assert!(chunks.join("").contains("completed"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn streaming_bash_keeps_polling_cancel_after_output_closes() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1113,10 +1114,9 @@ mod tests {
         let started = Instant::now();
         let mut output = String::new();
 
-        let result = execute_streaming_with_policy_roots_or_cancel(
+        let result = execute_host_test_streaming_with_policy_or_cancel(
             &request,
             dir.path(),
-            &[],
             ToolOutputTruncation::bytes(1024),
             Duration::from_secs(30),
             &mut |chunk| output.push_str(chunk),
@@ -1127,7 +1127,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "cancelled command with closed output should not block in wait"
         );
-        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(result.status, ToolStatus::Cancelled, "{result:?}");
         assert!(output.is_empty());
     }
 

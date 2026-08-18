@@ -190,6 +190,18 @@ impl RuntimeToolActorContext {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
+        let terminal_service = matches!(
+            request.name,
+            orca_core::tool_types::ToolName::ExecCommand
+                | orca_core::tool_types::ToolName::WriteStdin
+        )
+        .then(|| task_registry)
+        .flatten()
+        .map(|task_registry| {
+            self.thread_extensions.get_or_init(|| {
+                crate::terminal_service::TerminalService::new(task_registry.clone())
+            })
+        });
         let invocation = RuntimeNormalToolInvocation::snapshot(
             config,
             request,
@@ -201,7 +213,8 @@ impl RuntimeToolActorContext {
             shell_timeout_secs,
             task_registry,
             self.permission_overlay.clone(),
-        );
+        )
+        .with_terminal_service(terminal_service);
         let fallback_cancel = CancelToken::new();
         let parent_cancel = cancel.unwrap_or(&fallback_cancel);
         let runtime = RuntimeToolCallRuntime::for_normal_execution();

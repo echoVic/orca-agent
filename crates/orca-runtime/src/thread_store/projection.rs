@@ -620,7 +620,7 @@ fn tool_call_to_thread_item(tool_call: &RawToolCall) -> Value {
         {
             return item;
         }
-        if tool_call.function_name == "bash" {
+        if matches!(tool_call.function_name.as_str(), "bash" | "exec_command") {
             return command_execution_thread_item(tool_call);
         }
         dynamic_tool_started_item(
@@ -675,8 +675,10 @@ fn complete_tool_item(item: &mut Value, result: &Value) {
 }
 
 fn command_from_tool_arguments(raw: &str) -> Value {
-    parse_json_or_null(raw)
+    let arguments = parse_json_or_null(raw);
+    arguments
         .get("command")
+        .or_else(|| arguments.get("cmd"))
         .and_then(Value::as_str)
         .map(|command| Value::from(command.to_string()))
         .unwrap_or(Value::Null)

@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.22";
+export const releaseVersion = "v0.3.23";
 
 export const releases = [
+  {
+    version: "v0.3.23",
+    date: "2026-08-18",
+    title: "Unified interactive execution and proactive terminal supervision",
+    body: "Adds thread-owned exec_command and write_stdin sessions with optional PTY, raw terminal control input, bounded incremental output, and task-based process-tree control. A single-owner background supervisor now settles natural exits and external stop requests without another poll, releases session resources, and injects exactly-once bounded completion notifications before the next model turn unless the terminal was already observed.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.23",
+  },
   {
     version: "v0.3.22",
     date: "2026-08-17",

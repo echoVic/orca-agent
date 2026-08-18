@@ -1007,21 +1007,46 @@ fn rebuild_completed_projected_tool_item(
 
     if item["type"] == "commandExecution" {
         let content = result["content"].as_str().unwrap_or_default();
+        let unified_exec =
+            unified_exec_projection(item["tool"].as_str().unwrap_or_default(), content);
+        let projected_status = unified_exec
+            .as_ref()
+            .map(|projection| projection.status.clone())
+            .unwrap_or_else(|| Value::from(status.to_string()));
+        let projected_output = unified_exec
+            .as_ref()
+            .map(|projection| projection.output.clone())
+            .unwrap_or_else(|| {
+                if status == "completed" {
+                    Value::from(content.to_string())
+                } else {
+                    Value::Null
+                }
+            });
+        let projected_error = unified_exec
+            .as_ref()
+            .map(|projection| projection.error.clone())
+            .unwrap_or_else(|| {
+                if status == "completed" {
+                    Value::Null
+                } else {
+                    error
+                }
+            });
+        let projected_truncated = unified_exec
+            .as_ref()
+            .map(|projection| projection.truncated.clone())
+            .unwrap_or_else(|| truncated_metadata(result));
         *item = persisted_command_execution_completed_item(
             item,
-            Value::from(status.to_string()),
-            if status == "completed" {
-                Value::from(content.to_string())
-            } else {
-                Value::Null
-            },
-            if status == "completed" {
-                Value::Null
-            } else {
-                error
-            },
-            truncated_metadata(result),
+            projected_status,
+            projected_output,
+            projected_error,
+            projected_truncated,
         );
+        if let Some(projection) = unified_exec {
+            item["exitCode"] = projection.exit_code;
+        }
         copy_terminal_metadata(item, result);
         return;
     }
@@ -1045,6 +1070,46 @@ fn rebuild_completed_projected_tool_item(
     };
     item["error"] = error;
     copy_terminal_metadata(item, result);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct UnifiedExecProjection {
+    pub(crate) status: Value,
+    pub(crate) output: Value,
+    pub(crate) error: Value,
+    pub(crate) exit_code: Value,
+    pub(crate) truncated: Value,
+}
+
+pub(crate) fn unified_exec_projection(tool: &str, content: &str) -> Option<UnifiedExecProjection> {
+    if !matches!(tool, "exec_command" | "write_stdin") {
+        return None;
+    }
+    let content = content
+        .strip_suffix("\n[output truncated]")
+        .unwrap_or(content);
+    let value: Value = serde_json::from_str(content).ok()?;
+    let status = value.get("status")?.as_str()?;
+    let output = value
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let error = matches!(status, "failed" | "cancelled" | "stopped")
+        .then_some(output)
+        .filter(|error| !error.is_empty())
+        .map(|error| tool_error_object_from_value(error, &value))
+        .unwrap_or(Value::Null);
+    Some(UnifiedExecProjection {
+        status: Value::from(status.to_string()),
+        output: Value::from(output.to_string()),
+        error,
+        exit_code: value.get("exit_code").cloned().unwrap_or(Value::Null),
+        truncated: value
+            .get("truncated")
+            .cloned()
+            .filter(|value| value.as_bool() == Some(true))
+            .unwrap_or(Value::Null),
+    })
 }
 
 fn truncated_metadata(result: &Value) -> Value {
@@ -1916,6 +1981,45 @@ mod tests {
         assert_eq!(item["status"], "failed");
         assert_eq!(item["aggregatedOutput"], "test failure details");
         assert_eq!(item["error"], "command failed");
+        assert_eq!(item["exitCode"], 101);
+        assert_eq!(item["truncated"], true);
+    }
+
+    #[test]
+    fn unified_exec_completion_projects_inner_process_status_and_output() {
+        let mut item = persisted_command_execution_started_item(
+            "tool-exec",
+            "exec_command",
+            Value::from("cargo test"),
+        );
+        let content = serde_json::json!({
+            "session_id": "shell-1",
+            "task_id": "task-1",
+            "status": "failed",
+            "termination": "exited",
+            "output": "tests failed",
+            "exit_code": 101,
+            "truncated": true,
+            "omitted_prefix_bytes": 0,
+            "next_output_offset": 12,
+            "output_bytes_total": 24,
+            "requested_terminal": "pipe",
+            "effective_terminal": "pipe"
+        })
+        .to_string();
+        complete_projected_tool_item(
+            &mut item,
+            &serde_json::json!({
+                "content": content,
+                "status": "completed",
+                "exit_code": 0,
+                "truncated": false
+            }),
+        );
+
+        assert_eq!(item["status"], "failed");
+        assert_eq!(item["aggregatedOutput"], "tests failed");
+        assert_eq!(item["error"]["message"], "tests failed");
         assert_eq!(item["exitCode"], 101);
         assert_eq!(item["truncated"], true);
     }

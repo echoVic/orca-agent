@@ -557,6 +557,12 @@ impl RuntimeShellSessionManager {
         self.reap_completed_where(|_| true)
     }
 
+    pub(crate) fn reap_completed_preserving_output(
+        &mut self,
+    ) -> io::Result<Vec<ShellSessionOutput>> {
+        self.reap_completed_where_with_output_policy(|_| true, false)
+    }
+
     pub fn reap_completed_except(
         &mut self,
         protected_ids: &HashSet<String>,
@@ -567,6 +573,14 @@ impl RuntimeShellSessionManager {
     fn reap_completed_where(
         &mut self,
         should_reap: impl Fn(&str) -> bool,
+    ) -> io::Result<Vec<ShellSessionOutput>> {
+        self.reap_completed_where_with_output_policy(should_reap, true)
+    }
+
+    fn reap_completed_where_with_output_policy(
+        &mut self,
+        should_reap: impl Fn(&str) -> bool,
+        remove_completed_output: bool,
     ) -> io::Result<Vec<ShellSessionOutput>> {
         let ids = self
             .sessions
@@ -580,12 +594,25 @@ impl RuntimeShellSessionManager {
             .collect::<io::Result<Vec<_>>>()?;
         let mut completed = Vec::new();
         for (id, status) in ids {
-            completed.push(self.finish_terminal_session(&id, status, true)?);
+            completed.push(self.finish_terminal_session(&id, status, remove_completed_output)?);
         }
         Ok(completed)
     }
 
     pub fn reap_requested_stops(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
+        self.reap_requested_stops_inner(true)
+    }
+
+    pub(crate) fn reap_requested_stops_preserving_output(
+        &mut self,
+    ) -> io::Result<Vec<ShellSessionOutput>> {
+        self.reap_requested_stops_inner(false)
+    }
+
+    fn reap_requested_stops_inner(
+        &mut self,
+        remove_completed_output: bool,
+    ) -> io::Result<Vec<ShellSessionOutput>> {
         let ids = self
             .sessions
             .iter()
@@ -599,7 +626,11 @@ impl RuntimeShellSessionManager {
             .collect::<Vec<_>>();
         let mut stopped = Vec::new();
         for id in ids {
-            stopped.push(self.kill(&id)?);
+            stopped.push(self.terminate(
+                &id,
+                ShellSessionTermination::Cancelled,
+                remove_completed_output,
+            )?);
         }
         Ok(stopped)
     }
@@ -691,7 +722,7 @@ impl RuntimeShellSessionManager {
                 return self.kill(id);
             }
             if Instant::now() >= deadline {
-                return self.terminate(id, ShellSessionTermination::TimedOut);
+                return self.terminate(id, ShellSessionTermination::TimedOut, true);
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -731,13 +762,18 @@ impl RuntimeShellSessionManager {
     }
 
     pub fn kill(&mut self, id: &str) -> io::Result<ShellSessionOutput> {
-        self.terminate(id, ShellSessionTermination::Cancelled)
+        self.terminate(id, ShellSessionTermination::Cancelled, true)
+    }
+
+    pub(crate) fn kill_preserving_output(&mut self, id: &str) -> io::Result<ShellSessionOutput> {
+        self.terminate(id, ShellSessionTermination::Cancelled, false)
     }
 
     fn terminate(
         &mut self,
         id: &str,
         termination: ShellSessionTermination,
+        remove_completed_output: bool,
     ) -> io::Result<ShellSessionOutput> {
         debug_assert!(matches!(
             termination,
@@ -758,7 +794,9 @@ impl RuntimeShellSessionManager {
                 ShellSessionTermination::Exited,
             );
             Self::record_terminal_output(&tasks, &output)?;
-            self.output_store.remove(&output.task_id);
+            if remove_completed_output {
+                self.output_store.remove(&output.task_id);
+            }
             return Ok(output);
         }
         session.terminate_child_tree();
@@ -773,14 +811,16 @@ impl RuntimeShellSessionManager {
         tasks
             .stop(&output.task_id, output.stdout.clone())
             .map_err(io::Error::other)?;
-        self.output_store.remove(&output.task_id);
+        if remove_completed_output {
+            self.output_store.remove(&output.task_id);
+        }
         Ok(output)
     }
 
     pub fn terminate_all(&mut self) {
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         for id in ids {
-            let _ = self.terminate(&id, ShellSessionTermination::Cancelled);
+            let _ = self.terminate(&id, ShellSessionTermination::Cancelled, true);
         }
     }
 
