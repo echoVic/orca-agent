@@ -4096,10 +4096,13 @@ done
 
     #[test]
     fn hosted_canonical_approval_uses_operation_fence_and_resumes_turn() {
-        with_orca_home(|_| {
-            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+        with_orca_home(|home| {
+            std::fs::create_dir(home.join(".git")).expect("protected metadata fixture");
+            let mut config = test_config(HistoryMode::Record);
+            config.cwd = Some(home.to_path_buf());
+            let mut harness = HostedTuiHarness::start(config, None);
             harness.send(UserAction::Submit(
-                "bash printf canonical-approval".to_string(),
+                "bash printf canonical-approval > .git/orca-approval-contract".to_string(),
             ));
 
             let key = match harness

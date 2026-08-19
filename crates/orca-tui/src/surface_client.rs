@@ -3971,6 +3971,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        std::fs::create_dir(home.path().join(".git")).expect("protected metadata fixture");
         let mut config = crate::test_support::test_run_config();
         config.cwd = Some(home.path().to_path_buf());
         config.history_mode = HistoryMode::Record;
@@ -3988,7 +3989,9 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let result = run_through_dispatch(
                 &worker_thread,
-                HostedTurnRequest::new("bash printf canonical-approval"),
+                HostedTurnRequest::new(
+                    "bash printf canonical-approval > .git/orca-approval-contract",
+                ),
                 worker_config,
                 &worker_controller,
                 &worker_event_tx,
