@@ -3971,7 +3971,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("ORCA_HOME");
         unsafe { std::env::set_var("ORCA_HOME", home.path()) };
-        std::fs::create_dir(home.path().join(".git")).expect("protected metadata fixture");
+        std::fs::write(home.path().join("approval.txt"), "old").expect("approval fixture");
         let mut config = crate::test_support::test_run_config();
         config.cwd = Some(home.path().to_path_buf());
         config.history_mode = HistoryMode::Record;
@@ -3989,9 +3989,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let result = run_through_dispatch(
                 &worker_thread,
-                HostedTurnRequest::new(
-                    "bash printf canonical-approval > .git/orca-approval-contract",
-                ),
+                HostedTurnRequest::new("edit approval.txt :: old => new"),
                 worker_config,
                 &worker_controller,
                 &worker_event_tx,
@@ -4015,23 +4013,6 @@ mod tests {
                 )
                 .expect("typed approval response")
         );
-        let permission_key = loop {
-            match event_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("permission event after tool approval")
-            {
-                TuiEvent::PermissionApprovalNeeded { key, .. } => break key,
-                _ => {}
-            }
-        };
-        assert!(
-            controller
-                .respond_surface_interaction(
-                    &permission_key,
-                    &crate::types::TuiInteractionResponse::Permission(true)
-                )
-                .expect("typed permission response after tool approval")
-        );
         let outcome = worker_result_rx
             .recv_timeout(Duration::from_secs(10))
             .unwrap_or_else(|error| {
@@ -4044,6 +4025,10 @@ mod tests {
             outcome,
             TuiHostedOperationOutcome::Turn { status } if status == "success"
         ));
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("approval.txt")).unwrap(),
+            "new"
+        );
         assert!(event_rx.try_iter().any(
             |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
         ));

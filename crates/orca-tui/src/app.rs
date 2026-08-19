@@ -4097,12 +4097,12 @@ done
     #[test]
     fn hosted_canonical_approval_uses_operation_fence_and_resumes_turn() {
         with_orca_home(|home| {
-            std::fs::create_dir(home.join(".git")).expect("protected metadata fixture");
+            std::fs::write(home.join("approval.txt"), "old").expect("approval fixture");
             let mut config = test_config(HistoryMode::Record);
             config.cwd = Some(home.to_path_buf());
             let mut harness = HostedTuiHarness::start(config, None);
             harness.send(UserAction::Submit(
-                "bash printf canonical-approval > .git/orca-approval-contract".to_string(),
+                "edit approval.txt :: old => new".to_string(),
             ));
 
             let key = match harness
@@ -4117,23 +4117,16 @@ done
                 response: TuiInteractionResponse::Approval(true),
             });
 
-            let permission_key = match harness
-                .recv_until(|event| matches!(event, TuiEvent::PermissionApprovalNeeded { .. }))
-            {
-                TuiEvent::PermissionApprovalNeeded { key, .. } => key,
-                _ => unreachable!(),
-            };
-            harness.send(UserAction::RespondToInteraction {
-                key: permission_key,
-                response: TuiInteractionResponse::Permission(true),
-            });
-
             let terminal =
                 harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
             assert!(matches!(
                 terminal,
                 TuiEvent::SessionCompleted { status } if status == "success"
             ));
+            assert_eq!(
+                std::fs::read_to_string(home.join("approval.txt")).unwrap(),
+                "new"
+            );
             harness.shutdown();
         });
     }
