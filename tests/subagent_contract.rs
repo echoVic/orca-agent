@@ -118,6 +118,7 @@ fn async_subagent_launches_without_blocking_parent_tool() {
             "mock",
             "--approval-mode",
             "full-auto",
+            "--save-history",
             "subagent async inspect repo",
         ])
         .output()
@@ -184,6 +185,7 @@ fn subagent_status_can_read_persisted_async_handle() {
             "mock",
             "--approval-mode",
             "full-auto",
+            "--save-history",
             "subagent async inspect repo",
         ])
         .output()
@@ -206,6 +208,7 @@ fn subagent_status_can_read_persisted_async_handle() {
             "mock",
             "--approval-mode",
             "full-auto",
+            "--save-history",
             &format!("subagent_status {agent_id}"),
         ])
         .output()
@@ -238,6 +241,7 @@ fn async_subagent_completes_after_launching_exec_process_exits() {
             "mock",
             "--approval-mode",
             "full-auto",
+            "--save-history",
             "subagent async mock_usage",
         ])
         .output()
@@ -388,6 +392,7 @@ fn async_subagent_schema_failure_persists_failed_task() {
             "mock",
             "--approval-mode",
             "full-auto",
+            "--save-history",
             "subagent async schema_fail",
         ])
         .output()
@@ -610,6 +615,7 @@ fn poll_subagent_status_until_failed(
                 "mock",
                 "--approval-mode",
                 "full-auto",
+                "--save-history",
                 &format!("subagent_status {agent_id}"),
             ])
             .output()
@@ -656,6 +662,7 @@ fn poll_subagent_status(
                 "mock",
                 "--approval-mode",
                 "full-auto",
+                "--save-history",
                 &format!("subagent_status {agent_id}"),
             ])
             .output()

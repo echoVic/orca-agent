@@ -237,6 +237,7 @@ fn full_auto_bash_persists_runtime_shell_task_record() {
             "mock",
             "--approval-mode",
             "full-auto",
+            "--save-history",
             "--cwd",
             workspace.to_str().unwrap(),
             "bash printf persisted-shell-task",

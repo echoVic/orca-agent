@@ -162,7 +162,7 @@ pub fn call(
                             Some(RawToolCall {
                                 id: req.id.clone(),
                                 function_name: req.name.as_str().to_string(),
-                                arguments: "{}".to_string(),
+                                arguments: req.raw_arguments.clone().unwrap_or_default(),
                             })
                         } else {
                             None
@@ -708,8 +708,9 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             _ => false,
         });
         if saw_schema_error {
-            let tool_request =
+            let mut tool_request =
                 valid_mock_plan_request(Some("Recovered from schema validation failure"));
+            tool_request.id = "mock-tool-2".to_string();
             let raw_call = RawToolCall {
                 id: tool_request.id.clone(),
                 function_name: tool_request.name.as_str().to_string(),

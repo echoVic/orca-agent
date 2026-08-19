@@ -1527,6 +1527,10 @@ fn headless_operation_status(
             class: SurfaceFailureClass::LegacyApprovalRequired,
             ..
         } => RunStatus::ApprovalRequired,
+        SurfaceOperationTerminal::Failed {
+            class: SurfaceFailureClass::Verification,
+            ..
+        } => RunStatus::VerificationFailed,
         _ => RunStatus::Failed,
     }
 }

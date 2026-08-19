@@ -1971,13 +1971,16 @@ fn cold_recovery_cancels_unavailable_interaction_before_failing_operation() {
                 reason: InteractionCancelReason::CapabilityUnavailable,
             }
         ));
-        assert!(matches!(
-            operation_terminal,
-            OperationTerminal::Failed {
-                class: FailureClass::ClientCapabilityUnavailable,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                operation_terminal,
+                OperationTerminal::Failed {
+                    class: FailureClass::RuntimeInvariant,
+                    ..
+                }
+            ),
+            "terminal={operation_terminal:?}"
+        );
     });
 }
 
@@ -2036,13 +2039,17 @@ fn cold_recovery_fails_operation_when_resolved_live_only_payload_is_lost() {
             interaction.lifecycle,
             SurfaceInteractionLifecycle::Resolved { .. }
         ));
-        assert!(matches!(
-            terminal.terminal,
-            OperationTerminal::Failed {
-                class: FailureClass::ClientCapabilityUnavailable,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                terminal.terminal,
+                OperationTerminal::Failed {
+                    class: FailureClass::RuntimeInvariant,
+                    ..
+                }
+            ),
+            "terminal={:?}",
+            terminal.terminal
+        );
         host.shutdown().unwrap();
     });
 }
@@ -2102,13 +2109,17 @@ fn cold_recovery_rematerializes_provider_tool_before_cancelling_unavailable_appr
                 reason: InteractionCancelReason::CapabilityUnavailable,
             }
         ));
-        assert!(matches!(
-            terminal.terminal,
-            OperationTerminal::Failed {
-                class: FailureClass::ClientCapabilityUnavailable,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                terminal.terminal,
+                OperationTerminal::Failed {
+                    class: FailureClass::RuntimeInvariant,
+                    ..
+                }
+            ),
+            "terminal={:?}",
+            terminal.terminal
+        );
         host.shutdown().unwrap();
     });
 }
@@ -2156,13 +2167,14 @@ fn cold_recovery_fails_closed_after_effect_allow_loses_live_only_waiter() {
             interaction.lifecycle,
             SurfaceInteractionLifecycle::Resolved { .. }
         ));
-        assert!(matches!(
-            terminal.terminal,
-            OperationTerminal::Failed {
-                class: FailureClass::ClientCapabilityUnavailable,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                terminal.terminal,
+                OperationTerminal::AbortedByRuntimeRestart { .. }
+            ),
+            "terminal={:?}",
+            terminal.terminal
+        );
         host.shutdown().unwrap();
     });
 }
@@ -2222,13 +2234,17 @@ fn cold_recovery_rematerializes_provider_tool_before_cancelling_unavailable_perm
                 reason: InteractionCancelReason::CapabilityUnavailable,
             }
         ));
-        assert!(matches!(
-            terminal.terminal,
-            OperationTerminal::Failed {
-                class: FailureClass::ClientCapabilityUnavailable,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                terminal.terminal,
+                OperationTerminal::Failed {
+                    class: FailureClass::ExternalEffectAmbiguous,
+                    ..
+                }
+            ),
+            "terminal={:?}",
+            terminal.terminal
+        );
         host.shutdown().unwrap();
     });
 }
@@ -2749,7 +2765,7 @@ fn foreground_user_input_is_durable_before_typed_response_wakes_generation() {
     ));
     assert!(matches!(
         interaction.recovery_disposition,
-        InteractionUnavailableDisposition::FailOperation
+        InteractionUnavailableDisposition::RestartableUserInput { .. }
     ));
     assert!(answer_rx.try_recv().is_err());
 

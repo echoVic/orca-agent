@@ -1589,12 +1589,11 @@ impl ToolExecutionActor {
                                 &mut event_error,
                                 ingress.commit_plan_update(&update),
                             );
-                        } else {
-                            retain_first_io_error(
-                                &mut event_error,
-                                sink.emit(events.plan_updated(&update)),
-                            );
                         }
+                        retain_first_io_error(
+                            &mut event_error,
+                            sink.emit(events.plan_updated(&update)),
+                        );
                     }
                     Err(error) => retain_first_io_error(
                         &mut event_error,

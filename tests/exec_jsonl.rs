@@ -40,7 +40,13 @@ fn exec_outputs_jsonl_contract_and_success_status() {
 
     for (seq, event) in events.iter().enumerate() {
         assert_eq!(event["seq"], seq);
-        assert!(event["run_id"].as_str().unwrap().starts_with("run-"));
+        let run_id = event["run_id"].as_str().expect("run id string");
+        assert_eq!(
+            uuid::Uuid::parse_str(run_id)
+                .expect("UUID run id")
+                .get_version_num(),
+            7
+        );
     }
 }
 
@@ -296,7 +302,7 @@ fn exec_auto_model_defaults_to_pro() {
         .iter()
         .find(|event| event["type"] == "model.routed")
         .expect("model routed event");
-    assert_eq!(routed["payload"]["requested_model"], Value::Null);
+    assert_eq!(routed["payload"]["requested_model"], "auto");
     assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-pro");
     assert_eq!(routed["payload"]["reason"], "default_pro");
 }

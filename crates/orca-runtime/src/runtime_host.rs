@@ -22103,7 +22103,8 @@ impl ThreadActor {
                 .is_some_and(|operation| {
                     matches!(
                         operation.intent.origin,
-                        surface::OperationOrigin::JsonlThreadTurn { .. }
+                        surface::OperationOrigin::Headless
+                            | surface::OperationOrigin::JsonlThreadTurn { .. }
                     )
                 });
             let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
@@ -22143,7 +22144,8 @@ impl ThreadActor {
                 )?
             else {
                 if jsonl_compatibility_fallback {
-                    active.surface_execution_failure = None;
+                    active.surface_execution_failure =
+                        Some(surface::GenerationExecutionFailureClass::LegacyApprovalRequired);
                     active.surface_execution_failure_diagnostic = None;
                 }
                 let _ = reply.send(Ok(orca_core::approval_types::ApprovalResolution {
