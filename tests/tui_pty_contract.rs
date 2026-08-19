@@ -82,21 +82,23 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
         "TUI did not advance to the runtime-owned tool approval",
     );
     process.write(b"1").expect("approve bash once");
-    receive_until(
+    let completion = receive_until_any(
         &process,
         &mut output,
-        "Unsandboxed Shell Required",
+        &["Unsandboxed Shell Required", PERMISSION_SENTINEL],
         Duration::from_secs(10),
-        "TUI did not advance to the runtime-owned unsandboxed shell permission",
+        "TUI did not resume or request the host-dependent unsandboxed shell permission",
     );
-    process.write(b"1").expect("allow unsandboxed shell once");
-    receive_until(
-        &process,
-        &mut output,
-        PERMISSION_SENTINEL,
-        Duration::from_secs(10),
-        "TUI did not resume after the typed permission response",
-    );
+    if completion == 0 {
+        process.write(b"1").expect("allow unsandboxed shell once");
+        receive_until(
+            &process,
+            &mut output,
+            PERMISSION_SENTINEL,
+            Duration::from_secs(10),
+            "TUI did not resume after the typed permission response",
+        );
+    }
 
     arm_idle_exit(&mut process, &mut output);
     let status = process.wait_for_exit(Duration::from_secs(5));
@@ -751,6 +753,33 @@ fn receive_until(
         assert!(
             !remaining.is_zero(),
             "{failure}; output={}",
+            String::from_utf8_lossy(output)
+        );
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+}
+
+fn receive_until_any(
+    process: &PtyProcess,
+    output: &mut Vec<u8>,
+    expected: &[&str],
+    timeout: Duration,
+    failure: &str,
+) -> usize {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(index) = expected
+            .iter()
+            .position(|candidate| contains_rendered_text(output, candidate))
+        {
+            return index;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{failure}; expected one of {expected:?}; output={}",
             String::from_utf8_lossy(output)
         );
         if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
