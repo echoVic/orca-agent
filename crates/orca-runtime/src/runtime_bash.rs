@@ -128,7 +128,7 @@ pub(crate) fn execute_bash_with_shell_session(
         && let Some(permission_handler) = permission_handler
     {
         let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
-        let response = match PermissionRuntimeState.request_permission(
+        let response = match PermissionRuntimeState.request_permission_pre_side_effect(
             permission_overlay,
             permission_handler,
             permission_request,
@@ -168,7 +168,7 @@ pub(crate) fn execute_bash_with_shell_session(
             && let Some(permission_handler) = permission_handler
         {
             let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
-            let response = match PermissionRuntimeState.request_permission(
+            let response = match PermissionRuntimeState.request_permission_pre_side_effect(
                 permission_overlay,
                 permission_handler,
                 permission_request,
@@ -207,7 +207,7 @@ pub(crate) fn execute_bash_with_shell_session(
             && let Some(permission_handler) = permission_handler
         {
             let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
-            let response = match PermissionRuntimeState.request_permission(
+            let response = match PermissionRuntimeState.request_permission_pre_side_effect(
                 permission_overlay,
                 permission_handler,
                 permission_request,

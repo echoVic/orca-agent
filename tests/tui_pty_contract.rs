@@ -85,6 +85,14 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
     receive_until(
         &process,
         &mut output,
+        "Unsandboxed Shell Required",
+        Duration::from_secs(10),
+        "TUI did not advance to the runtime-owned unsandboxed shell permission",
+    );
+    process.write(b"1").expect("allow unsandboxed shell once");
+    receive_until(
+        &process,
+        &mut output,
         PERMISSION_SENTINEL,
         Duration::from_secs(10),
         "TUI did not resume after the typed permission response",

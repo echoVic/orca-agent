@@ -16,7 +16,6 @@ use orca_core::task_types::BackgroundTaskSummary;
 use orca_file_search::{SearchPhase, SearchProgress, SessionGeneration};
 use orca_runtime::history::SessionSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
-use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 use orca_runtime::surface::{RuntimeSurfaceThreadHandle, SurfaceOperationId};
 
@@ -55,6 +54,13 @@ pub enum TuiInteractionKind {
     Permission,
     UserInput,
     McpElicitation,
+}
+
+/// Input mode requested by an MCP elicitation event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiMcpElicitationMode {
+    Form,
+    Url,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -118,7 +124,7 @@ impl PendingTuiInput {
 pub(crate) struct PendingInteractionSubmission {
     key: TuiInteractionKey,
     pending_input: PendingTuiInput,
-    mcp_mode: Option<RuntimeMcpElicitationMode>,
+    mcp_mode: Option<TuiMcpElicitationMode>,
     visible_text: String,
     mention_bindings: MentionBindings,
     atomic_skill_tokens: MentionBindings,
@@ -348,7 +354,7 @@ pub enum TuiEvent {
     McpElicitationRequested {
         key: TuiInteractionKey,
         server_name: String,
-        mode: RuntimeMcpElicitationMode,
+        mode: TuiMcpElicitationMode,
         message: String,
         url: Option<String>,
         requested_schema_json: Option<String>,
@@ -841,7 +847,7 @@ pub struct AppState {
     pub config_dialog: Option<ConfigDialog>,
     pub(crate) user_input_dialog: Option<UserInputDialog>,
     pub pending_input: Option<PendingTuiInput>,
-    pub(crate) pending_mcp_elicitation_mode: Option<RuntimeMcpElicitationMode>,
+    pub(crate) pending_mcp_elicitation_mode: Option<TuiMcpElicitationMode>,
     pub(crate) pending_interaction_submission: Option<PendingInteractionSubmission>,
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
     /// session. Checked when a new approval arrives so the dialog is skipped.
@@ -2335,13 +2341,13 @@ impl AppState {
                 self.finish_assistant_stream();
                 let mut lines = vec![format!("MCP {server_name} requests input: {message}")];
                 match mode {
-                    RuntimeMcpElicitationMode::Form => {
+                    TuiMcpElicitationMode::Form => {
                         lines.push("Mode: form".to_string());
                         if let Some(schema) = requested_schema_json {
                             lines.push(format!("Schema: {schema}"));
                         }
                     }
-                    RuntimeMcpElicitationMode::Url => {
+                    TuiMcpElicitationMode::Url => {
                         lines.push("Mode: url".to_string());
                         if let Some(url) = url {
                             lines.push(format!("URL: {url}"));
@@ -3735,7 +3741,7 @@ mod tests {
                 "mcp_elicitation:github:42",
             ),
             server_name: "github".to_string(),
-            mode: RuntimeMcpElicitationMode::Url,
+            mode: TuiMcpElicitationMode::Url,
             message: "Authorize GitHub".to_string(),
             url: Some("https://github.com/login/device".to_string()),
             requested_schema_json: None,
@@ -3749,7 +3755,7 @@ mod tests {
         ));
         assert_eq!(
             state.pending_mcp_elicitation_mode,
-            Some(RuntimeMcpElicitationMode::Url)
+            Some(TuiMcpElicitationMode::Url)
         );
         assert!(matches!(
             state.messages.last(),
@@ -3766,7 +3772,7 @@ mod tests {
         input_state.update(TuiEvent::McpElicitationRequested {
             key: interaction_key(TuiInteractionKind::McpElicitation, "mcp-1"),
             server_name: "fixture".to_string(),
-            mode: RuntimeMcpElicitationMode::Form,
+            mode: TuiMcpElicitationMode::Form,
             message: "Provide fields".to_string(),
             url: None,
             requested_schema_json: None,
@@ -3805,7 +3811,7 @@ mod tests {
         state.update(TuiEvent::McpElicitationRequested {
             key: interaction_key(TuiInteractionKind::McpElicitation, "mcp-reset"),
             server_name: "fixture".to_string(),
-            mode: RuntimeMcpElicitationMode::Url,
+            mode: TuiMcpElicitationMode::Url,
             message: "Authorize".to_string(),
             url: Some("https://example.test/device".to_string()),
             requested_schema_json: None,

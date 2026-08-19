@@ -582,7 +582,7 @@ impl TuiSurfaceTaskControl {
                         requested_schema,
                         ..
                     } => (
-                        orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode::Form,
+                        crate::types::TuiMcpElicitationMode::Form,
                         None,
                         requested_schema.as_ref().map(|value| {
                             serde_json::to_string(value)
@@ -593,7 +593,7 @@ impl TuiSurfaceTaskControl {
                         raw_url,
                         requested_schema,
                     } => (
-                        orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode::Url,
+                        crate::types::TuiMcpElicitationMode::Url,
                         raw_url.as_ref().map(|value| value.as_str().to_string()),
                         requested_schema.as_ref().map(|value| {
                             serde_json::to_string(value)

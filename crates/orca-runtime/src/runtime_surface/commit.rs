@@ -497,6 +497,30 @@ pub struct SurfaceCommitApplied {
     pub receipt: SurfaceBatchReceipt,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoricalToolResultCommitAuthority {
+    current_owner_epoch: ThreadOwnerEpoch,
+    current_incarnation: super::SurfaceIncarnation,
+    historical_fence: super::SurfaceOperationFence,
+    invocation_id: super::SurfaceToolCallId,
+    invocation_started: super::ToolInvocationStartedReceiptV1,
+    expected_projection_revision: super::ToolInvocationRevision,
+}
+
+impl HistoricalToolResultCommitAuthority {
+    pub(crate) fn historical_fence(&self) -> &super::SurfaceOperationFence {
+        &self.historical_fence
+    }
+
+    pub(crate) fn invocation_id(&self) -> &super::SurfaceToolCallId {
+        &self.invocation_id
+    }
+
+    pub(crate) const fn expected_projection_revision(&self) -> super::ToolInvocationRevision {
+        self.expected_projection_revision
+    }
+}
+
 struct ColdOwnerTakeoverAuthority {
     previous_owner_epoch: ThreadOwnerEpoch,
     previous_incarnation: super::SurfaceIncarnation,
@@ -614,6 +638,21 @@ impl ColdOwnerTakeoverAuthority {
         self.recoverable_operations.contains(operation_id)
             && self.authorizes_transition(snapshot, new_incarnation, new_owner_epoch)
     }
+
+    fn authorizes_historical_commit(
+        &self,
+        fence: &super::SurfaceOperationFence,
+        snapshot: &super::SurfaceSnapshot,
+        current_incarnation: &super::SurfaceIncarnation,
+        current_owner_epoch: ThreadOwnerEpoch,
+    ) -> bool {
+        self.new_incarnation.as_ref() == Some(current_incarnation)
+            && self.current_owner_epoch == current_owner_epoch
+            && snapshot.thread.owner_epoch == current_owner_epoch
+            && snapshot.cursor.incarnation == *current_incarnation
+            && fence.thread_owner_epoch < current_owner_epoch
+            && self.recoverable_operations.contains(&fence.operation_id)
+    }
 }
 
 enum OwnerLeaseAuthority<'owner> {
@@ -706,6 +745,9 @@ enum BatchCommitAuthority<'permit> {
         verification_goal: Option<&'permit SurfacePublisherPermit>,
         decision_goal: &'permit SurfacePublisherPermit,
         predecessor: &'permit SurfacePublisherPermit,
+    },
+    HistoricalToolResult {
+        authority: &'permit HistoricalToolResultCommitAuthority,
     },
 }
 
@@ -1446,6 +1488,77 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         self.commit_batch(&permit, batch)
     }
 
+    /// Function intent contract:
+    ///
+    /// - Input: an unforgeable cold-owner authority bound to one historical
+    ///   generation, one stable invocation id, its durable start receipt, and
+    ///   the projection revision observed by the recovery owner.
+    /// - Output: commits exactly the completed tool result and its paired
+    ///   terminal item for that invocation.
+    /// - Errors: rejects live-owner, stale-fence, wrong-invocation, stale
+    ///   revision, missing-receipt, and non-terminal batch shapes before any
+    ///   durable append.
+    /// - State changes and external calls: appends one recorded surface batch;
+    ///   it never creates an active operation and never invokes a provider or
+    ///   tool.
+    pub(crate) fn commit_historical_tool_result_batch(
+        &mut self,
+        authority: &HistoricalToolResultCommitAuthority,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::HistoricalToolResult { authority },
+            batch,
+            None,
+        )
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: the exact stable tool-call identity and owning
+    ///   operation/generation fence that are about to be externally invoked.
+    /// - Output: a version-1 durable start receipt only after its recorded
+    ///   surface event has been appended, checkpointed, and projected.
+    /// - Errors: rejects missing, mismatched, already-started, executing, or
+    ///   non-recorded invocations through the normal commit/reducer errors.
+    /// - State changes and external calls: commits one durable surface patch;
+    ///   it never invokes the tool. Callers must not perform any external tool
+    ///   side effect unless this function returns `Ok`.
+    pub fn commit_tool_invocation_started(
+        &mut self,
+        fence: super::SurfaceOperationFence,
+        invocation_id: super::SurfaceToolCallId,
+    ) -> Result<super::ToolInvocationStartedReceiptV1, SurfaceCommitError> {
+        let receipt = super::ToolInvocationStartedReceiptV1::new(
+            invocation_id,
+            fence.clone(),
+            super::ToolInvocationRevision::try_new(1)
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        );
+        let background_fence = self
+            .state
+            .snapshot()
+            .background_operations
+            .iter()
+            .find(|operation| operation.fence.operation_fence == fence)
+            .map(|operation| operation.fence.clone());
+        let scope = background_fence.as_ref().map_or_else(
+            || SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            |background| SurfaceScope::Background {
+                fence: background.clone(),
+            },
+        );
+        let batch = self.tool_invocation_started_batch(scope, receipt.clone())?;
+        if let Some(background_fence) = background_fence {
+            self.commit_background_batch(background_fence, &batch)?;
+        } else {
+            self.commit_generation_batch(fence, &batch)?;
+        }
+        Ok(receipt)
+    }
+
     pub(crate) fn commit_background_batch(
         &mut self,
         fence: super::SurfaceBackgroundFence,
@@ -2092,10 +2205,165 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         self.recover_operation_inner(operation_id, materialization, None)
     }
 
+    /// Function intent contract:
+    ///
+    /// - Input: one interrupted operation, its cold-owner materialization,
+    ///   and a bounded safe diagnostic classifying why a persisted
+    ///   interaction checkpoint cannot be restarted.
+    /// - Output: begins the normal durable stop/finalize sequence with that
+    ///   exact failure reason when the operation still owns a live generation;
+    ///   otherwise preserves the ordinary recovery action.
+    /// - Errors: rejects stale/missing operation state or any unauthorized
+    ///   recovery batch before append.
+    /// - State changes and external calls: may append generation-stop and
+    ///   finalization facts; it never reconstructs a waiter, resumes a call
+    ///   stack, dispatches a provider, or invokes a tool.
+    pub(crate) fn recover_operation_checkpoint_rejection(
+        &mut self,
+        operation_id: &super::SurfaceOperationId,
+        materialization: &super::MaterializationCause,
+        class: super::GenerationExecutionFailureClass,
+        message: super::SafeDiagnosticText,
+    ) -> Result<RecoveryAction, SurfaceCommitError> {
+        let action = self
+            .recovery_action(operation_id, materialization)
+            .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        if !matches!(
+            action,
+            RecoveryAction::StopAndFinalizeRuntimeRestart
+                | RecoveryAction::StopAndFinalizeClientCapabilityUnavailable
+                | RecoveryAction::StopAndFinalizeRecoveryAbort
+        ) {
+            return self.recover_operation_inner(operation_id, materialization, None);
+        }
+        self.materialize_cold_owner_takeover(materialization)?;
+        let operation = self
+            .state
+            .snapshot()
+            .foreground_operation
+            .iter()
+            .chain(self.state.snapshot().queued_operations.iter())
+            .chain(self.state.snapshot().operation_history.iter())
+            .find(|operation| &operation.operation_id == operation_id)
+            .cloned()
+            .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        let generation = self
+            .recovery_generation(&operation)
+            .cloned()
+            .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+        let stop_reason = super::GenerationStopReason::ExecutionFailed { class, message };
+        let mut batch = self.recovery_stop_and_finalize_batch(
+            operation_id,
+            generation.fence.clone(),
+            stop_reason.clone(),
+            super::OperationFinalizationCause::GenerationStop(stop_reason),
+            None,
+        )?;
+        let pending_interactions = self
+            .state
+            .snapshot()
+            .interactions
+            .iter()
+            .filter(|interaction| {
+                interaction.fence == generation.fence
+                    && matches!(
+                        interaction.lifecycle,
+                        super::SurfaceInteractionLifecycle::Requested
+                    )
+                    && matches!(
+                        interaction.recovery_disposition,
+                        super::InteractionUnavailableDisposition::FailOperation
+                            | super::InteractionUnavailableDisposition::RestartableToolApproval {
+                                ..
+                            }
+                            | super::InteractionUnavailableDisposition::RestartablePermissionRequest {
+                                ..
+                            }
+                            | super::InteractionUnavailableDisposition::RestartableUserInput {
+                                ..
+                            }
+                            | super::InteractionUnavailableDisposition::RestartableMcpElicitation {
+                                ..
+                            }
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !pending_interactions.is_empty() {
+            let mut events = pending_interactions
+                .into_iter()
+                .map(
+                    |interaction| -> Result<super::SurfaceEventEnvelope, SurfaceCommitError> {
+                        let next_revision = super::InteractionRevision::try_new(
+                            interaction
+                                .revision
+                                .get()
+                                .checked_add(1)
+                                .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                        )
+                        .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+                        Ok(super::SurfaceEventEnvelope {
+                            ordinal: 0,
+                            event_id: super::SurfaceEventId::try_from_bytes(
+                                *uuid::Uuid::now_v7().as_bytes(),
+                            )
+                            .expect("generated UUID is v7"),
+                            commit_class: batch.commit_class.clone(),
+                            scope: SurfaceScope::Generation {
+                                fence: interaction.fence,
+                            },
+                            event: super::SurfaceEvent::Interaction(
+                                super::InteractionPatch::Cancelled {
+                                    interaction_id: interaction.interaction_id,
+                                    expected_revision: interaction.revision,
+                                    next_revision,
+                                    reason: super::InteractionCancelReason::CapabilityUnavailable,
+                                },
+                            ),
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>()?;
+            events.extend(batch.events.as_slice().iter().cloned());
+            if events.len() as u64 > super::SURFACE_COMMIT_BATCH_EVENT_LIMIT {
+                return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+            }
+            for (ordinal, event) in events.iter_mut().enumerate() {
+                event.ordinal = ordinal as u32;
+            }
+            let event_count = u32::try_from(events.len())
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+            batch.cursor_after.next_seq = super::SequenceNumber::new(
+                batch
+                    .cursor_before
+                    .next_seq
+                    .get()
+                    .checked_add(u64::from(event_count))
+                    .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+            );
+            batch.event_count = event_count;
+            batch.events = super::NonEmptyVec::try_new(events)
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+            batch.batch_digest = super::canonical_batch_digest(&batch);
+        }
+        let recovery_permit = self.issue_recovery_permit(generation.fence);
+        self.commit_batch(&recovery_permit, &batch)?;
+        Ok(action)
+    }
+
     pub fn recover_unavailable_interactions(
         &mut self,
         operation_id: &super::SurfaceOperationId,
         materialization: &super::MaterializationCause,
+    ) -> Result<(), SurfaceCommitError> {
+        self.recover_unavailable_interactions_except(operation_id, materialization, &[])
+    }
+
+    pub(crate) fn recover_unavailable_interactions_except(
+        &mut self,
+        operation_id: &super::SurfaceOperationId,
+        materialization: &super::MaterializationCause,
+        retained_interactions: &[super::SurfaceInteractionId],
     ) -> Result<(), SurfaceCommitError> {
         if self
             .recovery_action(operation_id, materialization)
@@ -2111,6 +2379,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             .iter()
             .filter(|interaction| {
                 interaction.fence.operation_id == *operation_id
+                    && !retained_interactions.contains(&interaction.interaction_id)
                     && matches!(
                         interaction.lifecycle,
                         super::SurfaceInteractionLifecycle::Requested
@@ -2118,6 +2387,10 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     && matches!(
                         interaction.recovery_disposition,
                         super::InteractionUnavailableDisposition::FailOperation
+                            | super::InteractionUnavailableDisposition::RestartableToolApproval { .. }
+                            | super::InteractionUnavailableDisposition::RestartablePermissionRequest { .. }
+                            | super::InteractionUnavailableDisposition::RestartableUserInput { .. }
+                            | super::InteractionUnavailableDisposition::RestartableMcpElicitation { .. }
                     )
             })
             .cloned()
@@ -2998,6 +3271,84 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             permit_id: next_permit_id(),
             current_owner_epoch: self.owner_epoch,
             historical_fence,
+        })
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: the exact historical operation/generation fence, stable tool
+    ///   invocation id, and projected invocation revision observed by a cold
+    ///   recovery owner.
+    /// - Output: an explicit commit authority only when the materialized cold
+    ///   owner still owns that historical operation and the projected durable
+    ///   `InvocationStarted` receipt matches every supplied identity.
+    /// - Errors: stale owner/fence/revision, missing generation/tool/receipt,
+    ///   or a non-running/non-completed tool projection are rejected without
+    ///   changing durable state.
+    /// - State changes and external calls: none; issuance is a read-only
+    ///   authorization step and does not dispatch or commit anything.
+    pub(crate) fn issue_historical_tool_result_commit_authority(
+        &self,
+        historical_fence: super::SurfaceOperationFence,
+        invocation_id: super::SurfaceToolCallId,
+        expected_projection_revision: super::ToolInvocationRevision,
+    ) -> Result<HistoricalToolResultCommitAuthority, SurfaceCommitError> {
+        let snapshot = self.state.snapshot();
+        let cold_owner = self
+            .cold_takeover_authority
+            .as_ref()
+            .ok_or(SurfaceCommitError::StalePublisherPermit)?;
+        if !cold_owner.authorizes_historical_commit(
+            &historical_fence,
+            snapshot,
+            &snapshot.cursor.incarnation,
+            self.owner_epoch,
+        ) {
+            return Err(SurfaceCommitError::StalePublisherPermit);
+        }
+        let generation = snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| operation.operation_id == historical_fence.operation_id)
+            .and_then(|operation| {
+                operation
+                    .generations
+                    .iter()
+                    .find(|generation| generation.fence == historical_fence)
+            })
+            .ok_or(SurfaceCommitError::StalePublisherPermit)?;
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == invocation_id)
+            .ok_or(SurfaceCommitError::StalePublisherPermit)?;
+        let invocation_started = tool
+            .invocation_started
+            .as_ref()
+            .filter(|receipt| {
+                receipt.invocation_id() == &invocation_id
+                    && receipt.fence() == &historical_fence
+                    && receipt.revision() == expected_projection_revision
+            })
+            .cloned()
+            .ok_or(SurfaceCommitError::StalePublisherPermit)?;
+        if tool.request.turn_id != generation.logical_turn_id
+            || !matches!(
+                tool.state,
+                super::SurfaceToolViewState::Running | super::SurfaceToolViewState::Completed
+            )
+        {
+            return Err(SurfaceCommitError::StalePublisherPermit);
+        }
+        Ok(HistoricalToolResultCommitAuthority {
+            current_owner_epoch: self.owner_epoch,
+            current_incarnation: snapshot.cursor.incarnation.clone(),
+            historical_fence,
+            invocation_id,
+            invocation_started,
+            expected_projection_revision,
         })
     }
 
@@ -4036,6 +4387,63 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         Ok(batch)
     }
 
+    fn tool_invocation_started_batch(
+        &self,
+        scope: SurfaceScope,
+        receipt: super::ToolInvocationStartedReceiptV1,
+    ) -> Result<SurfaceCommitBatch, SurfaceCommitError> {
+        let cursor_before = self.state.snapshot().cursor.clone();
+        let durable_revision = match cursor_before.source_revision {
+            super::CursorSourceRevision::Recorded { durable_revision } => {
+                super::DurableRevision::try_new(
+                    durable_revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                )
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?
+            }
+            super::CursorSourceRevision::Ephemeral { .. } => {
+                return Err(SurfaceCommitError::CursorRangeAlreadyConsumed);
+            }
+        };
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: self.owner_epoch,
+            durable_revision,
+            commit_id: super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+        };
+        let event = super::SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("generated UUID is v7"),
+            commit_class: commit_class.clone(),
+            scope,
+            event: super::SurfaceEvent::Tool(super::ToolPatch::InvocationStartedV1 { receipt }),
+        };
+        let mut batch = SurfaceCommitBatch {
+            cursor_before: cursor_before.clone(),
+            cursor_after: super::SurfaceCursor {
+                next_seq: super::SequenceNumber::new(
+                    cursor_before
+                        .next_seq
+                        .get()
+                        .checked_add(1)
+                        .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+                ),
+                source_revision: super::CursorSourceRevision::Recorded { durable_revision },
+                ..cursor_before
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: super::Sha256Digest::new([0; 32]),
+            events: super::NonEmptyVec::try_new(vec![event])
+                .map_err(|_| SurfaceCommitError::CursorRangeAlreadyConsumed)?,
+        };
+        batch.batch_digest = super::canonical_batch_digest(&batch);
+        Ok(batch)
+    }
+
     fn manual_compaction_recovery_batch(
         &self,
         fence: super::SurfaceOperationFence,
@@ -4652,6 +5060,15 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 batch,
                 self.owner_epoch,
             ),
+            BatchCommitAuthority::HistoricalToolResult { authority } => {
+                historical_tool_result_commit_authorized(
+                    &self.state,
+                    self.cold_takeover_authority.as_ref(),
+                    authority,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
         };
         if !authorized {
             return Err(SurfaceCommitError::StalePublisherPermit);
@@ -5333,6 +5750,116 @@ fn terminal_task_reconciliation_authorized(
             }),
     );
     tasks == expected
+}
+
+fn historical_tool_result_commit_authorized(
+    state: &SurfaceReducerState,
+    cold_owner: Option<&ColdOwnerTakeoverAuthority>,
+    authority: &HistoricalToolResultCommitAuthority,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    let snapshot = state.snapshot();
+    let Some(cold_owner) = cold_owner else {
+        return false;
+    };
+    if authority.current_owner_epoch != owner_epoch
+        || authority.current_incarnation != snapshot.cursor.incarnation
+        || authority.historical_fence.thread_id != snapshot.thread.thread_id
+        || authority.invocation_started.invocation_id() != &authority.invocation_id
+        || authority.invocation_started.fence() != &authority.historical_fence
+        || authority.invocation_started.revision() != authority.expected_projection_revision
+        || !cold_owner.authorizes_historical_commit(
+            &authority.historical_fence,
+            snapshot,
+            &authority.current_incarnation,
+            owner_epoch,
+        )
+        || !matches!(
+            &batch.commit_class,
+            CommitClass::Recorded {
+                thread_owner_epoch,
+                ..
+            } if *thread_owner_epoch == owner_epoch
+        )
+    {
+        return false;
+    }
+    let Some(generation) = snapshot
+        .foreground_operation
+        .iter()
+        .chain(snapshot.queued_operations.iter())
+        .chain(snapshot.operation_history.iter())
+        .find(|operation| operation.operation_id == authority.historical_fence.operation_id)
+        .and_then(|operation| {
+            operation
+                .generations
+                .iter()
+                .find(|generation| generation.fence == authority.historical_fence)
+        })
+    else {
+        return false;
+    };
+    let Some(tool) = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == authority.invocation_id)
+    else {
+        return false;
+    };
+    if tool.request.turn_id != generation.logical_turn_id
+        || tool.state != super::SurfaceToolViewState::Running
+        || tool.result.is_some()
+        || tool.invocation_started.as_ref() != Some(&authority.invocation_started)
+    {
+        return false;
+    }
+    let [completed, item] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Generation {
+            fence: completed_fence,
+        },
+        super::SurfaceEvent::Tool(super::ToolPatch::Completed { result }),
+    ) = (&completed.scope, &completed.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Generation { fence: item_fence },
+        super::SurfaceEvent::Item(super::ItemPatch::Added {
+            item:
+                super::SurfaceItem::ToolResultMessage {
+                    turn_id,
+                    tool_call_id,
+                    content,
+                    terminal,
+                    pinned,
+                    ..
+                },
+        }),
+    ) = (&item.scope, &item.event)
+    else {
+        return false;
+    };
+    completed_fence == &authority.historical_fence
+        && item_fence == &authority.historical_fence
+        && result.tool_call_id == authority.invocation_id
+        && result.name == tool.request.name
+        && matches!(
+            &result.terminal,
+            super::SurfaceToolTerminal {
+                source: super::ToolTerminalSource::Observed,
+                invocation_started: super::ToolInvocationStarted::Yes,
+                ..
+            }
+        )
+        && turn_id == &tool.request.turn_id
+        && tool_call_id == &authority.invocation_id
+        && terminal == &result.terminal
+        && result.output.as_ref().or(result.error.as_ref()) == Some(content)
+        && !pinned
 }
 
 fn permit_authorizes(
@@ -7134,6 +7661,7 @@ fn provider_background_interaction_resolution_authorized(
             expected_revision,
             next_revision,
             receipt,
+            ..
         }),
     ) = (&event.scope, &event.event)
     else {
@@ -8817,7 +9345,7 @@ fn recovery_batch_authorized(
         .iter()
         .filter(|event| !recovery_generation_stop_authorized(historical_fence, event))
         .collect::<Vec<_>>();
-    let mut non_stream_dispositions = 0usize;
+    let mut operation_dispositions = 0usize;
     dispositions.iter().all(|event| {
         let stream_discard = match (&event.scope, &event.event) {
             (
@@ -8847,10 +9375,19 @@ fn recovery_batch_authorized(
         if stream_discard {
             true
         } else {
-            non_stream_dispositions += 1;
+            if matches!(
+                &event.event,
+                super::SurfaceEvent::Operation(
+                    super::OperationPatch::Suspended { .. }
+                        | super::OperationPatch::SuspensionRebasedAfterUnstartedResume { .. }
+                        | super::OperationPatch::FinalizationStarted { .. }
+                )
+            ) {
+                operation_dispositions += 1;
+            }
             recovery_event_authorized(historical_fence, background_fence, event)
         }
-    }) && non_stream_dispositions == 1
+    }) && operation_dispositions == 1
 }
 
 fn recovery_terminal_cleanup_ambiguity_authorized(
@@ -9188,6 +9725,7 @@ fn recovery_generation_stop_authorized(
                         reason: super::NotStartedReason::RuntimeRestart,
                     } | super::GenerationStopReason::ExecutionFailed {
                     class: super::GenerationExecutionFailureClass::ClientCapabilityUnavailable
+                        | super::GenerationExecutionFailureClass::RuntimeInvariant
                         | super::GenerationExecutionFailureClass::ExternalEffectAmbiguous
                         | super::GenerationExecutionFailureClass::RemoteResourceCleanupAmbiguous,
                     ..
@@ -9246,6 +9784,13 @@ fn recovery_event_authorized(
                 && operation_id == &historical_fence.operation_id
                 && patch_operation == &historical_fence.operation_id
         }
+        (
+            SurfaceScope::Generation { fence },
+            super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
+                reason: super::InteractionCancelReason::CapabilityUnavailable,
+                ..
+            }),
+        ) => background_fence.is_none() && fence == historical_fence,
         (
             SurfaceScope::Background { fence },
             super::SurfaceEvent::Operation(
@@ -10342,7 +10887,7 @@ mod tests {
     use super::*;
     use crate::runtime_surface::DurableBatchReceipt;
     use crate::runtime_surface::reducer::tests::{
-        digest, reducer_snapshot, thread_id, uuid_v7_bytes,
+        digest, reducer_snapshot, started_operation, thread_id, uuid_v7_bytes,
     };
     use crate::tasks::{LegacyActiveTaskAdoptionRecord, TaskRegistry};
 
@@ -10510,6 +11055,206 @@ mod tests {
                 .unwrap(),
             generation_id: super::super::SurfaceGenerationId::new(0),
         }
+    }
+
+    fn checkpoint_recovery_snapshot() -> (
+        super::super::SurfaceSnapshot,
+        super::super::SurfaceOperationId,
+        super::super::SurfaceInteractionId,
+    ) {
+        let operation = started_operation();
+        let operation_id = operation.operation_id.clone();
+        let fence = operation.generations[0].fence.clone();
+        let interaction_id =
+            super::super::SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(133)).unwrap();
+        let request = super::super::SurfaceInteractionRequest::UserInput {
+            question: super::super::NonEmptyText::try_new("continue after restart?").unwrap(),
+            suggestions: Vec::new(),
+        };
+        let capsule = super::super::DurableInteractionContinuationCapsule::try_new(
+            interaction_id.clone(),
+            fence.clone(),
+            request.clone(),
+            digest(134),
+        )
+        .unwrap();
+        let recovery_disposition =
+            super::super::InteractionUnavailableDisposition::restartable_continuation_turn(
+                &capsule,
+            )
+            .unwrap();
+        let interaction = super::super::SurfaceInteractionView {
+            interaction_id: interaction_id.clone(),
+            revision: super::super::InteractionRevision::try_new(1).unwrap(),
+            fence,
+            kind: super::super::SurfaceInteractionKind::UserInput,
+            request,
+            route: super::super::SurfaceInteractionRoute::Unassigned {
+                epoch: super::super::ResponseRouteEpoch::try_new(1).unwrap(),
+            },
+            lifecycle: super::super::SurfaceInteractionLifecycle::Requested,
+            recovery_disposition,
+        };
+        let mut snapshot = reducer_snapshot();
+        snapshot.foreground_operation = Some(operation);
+        snapshot.interactions.push(interaction);
+        (snapshot, operation_id, interaction_id)
+    }
+
+    #[test]
+    fn checkpoint_rejection_cancels_and_terminalizes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let (snapshot, operation_id, interaction_id) = checkpoint_recovery_snapshot();
+        let materialization = super::super::MaterializationCause::SameProcessProjectionReset {
+            retained_incarnation: snapshot.cursor.incarnation.clone(),
+        };
+        let state = SurfaceReducerState::new(snapshot);
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owner_lease(TestLedger::default(), state, &owner)
+                .unwrap();
+        let diagnostic = super::super::SafeDiagnosticText::try_new(
+            "cold recovery rejected durable interaction checkpoint: Unsafe",
+        )
+        .unwrap();
+
+        assert_eq!(
+            coordinator
+                .recover_operation_checkpoint_rejection(
+                    &operation_id,
+                    &materialization,
+                    super::super::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
+                    diagnostic.clone(),
+                )
+                .unwrap(),
+            RecoveryAction::StopAndFinalizeRuntimeRestart
+        );
+        assert_eq!(coordinator.ledger().writes, 2);
+        assert!(matches!(
+            coordinator
+                .state()
+                .snapshot()
+                .interactions
+                .iter()
+                .find(|interaction| interaction.interaction_id == interaction_id)
+                .map(|interaction| &interaction.lifecycle),
+            Some(super::super::SurfaceInteractionLifecycle::Cancelled {
+                reason: super::super::InteractionCancelReason::CapabilityUnavailable,
+            })
+        ));
+        let finalizing = coordinator
+            .state()
+            .snapshot()
+            .foreground_operation
+            .as_ref()
+            .expect("checkpoint rejection keeps the operation visible while finalizing");
+        assert!(matches!(
+            finalizing.phase,
+            super::super::OperationPhase::Finalizing { .. }
+        ));
+        assert!(matches!(
+            finalizing.generations[0].stop_reason.as_ref(),
+            Some(super::super::GenerationStopReason::ExecutionFailed {
+                class: super::super::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
+                message,
+            }) if message == &diagnostic && message.as_str().contains("Unsafe")
+        ));
+
+        assert_eq!(
+            coordinator
+                .recover_operation_checkpoint_rejection(
+                    &operation_id,
+                    &materialization,
+                    super::super::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
+                    diagnostic,
+                )
+                .unwrap(),
+            RecoveryAction::ReconcileOriginalFinalizer
+        );
+        assert_eq!(coordinator.ledger().writes, 4);
+        let terminal = coordinator
+            .state()
+            .snapshot()
+            .operation_history
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("checkpoint rejection reaches one durable terminal");
+        assert!(matches!(
+            terminal.terminal.as_ref().map(|record| &record.terminal),
+            Some(super::super::OperationTerminal::Failed {
+                class: super::super::FailureClass::ExternalEffectAmbiguous,
+                message,
+            }) if message.as_str().contains("Unsafe")
+        ));
+
+        assert_eq!(
+            coordinator
+                .recover_operation_checkpoint_rejection(
+                    &operation_id,
+                    &materialization,
+                    super::super::GenerationExecutionFailureClass::ExternalEffectAmbiguous,
+                    super::super::SafeDiagnosticText::try_new("must not replace terminal").unwrap(),
+                )
+                .unwrap(),
+            RecoveryAction::NoOp
+        );
+        assert_eq!(coordinator.ledger().writes, 4);
+        assert!(matches!(
+            coordinator
+                .state()
+                .snapshot()
+                .interactions
+                .iter()
+                .find(|interaction| interaction.interaction_id == interaction_id)
+                .map(|interaction| &interaction.lifecycle),
+            Some(super::super::SurfaceInteractionLifecycle::Cancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn retained_checkpoint_is_not_cancelled_by_unavailable_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ExclusiveOwnerLease::acquire_thread(
+            dir.path().join("thread.lock"),
+            dir.path().join("thread.epoch"),
+            thread_id(),
+            &TestClock,
+        )
+        .unwrap();
+        let (snapshot, operation_id, interaction_id) = checkpoint_recovery_snapshot();
+        let materialization = super::super::MaterializationCause::SameProcessProjectionReset {
+            retained_incarnation: snapshot.cursor.incarnation.clone(),
+        };
+        let state = SurfaceReducerState::new(snapshot);
+        let mut coordinator =
+            RuntimeCommitCoordinator::new_with_owner_lease(TestLedger::default(), state, &owner)
+                .unwrap();
+
+        coordinator
+            .recover_unavailable_interactions_except(
+                &operation_id,
+                &materialization,
+                std::slice::from_ref(&interaction_id),
+            )
+            .unwrap();
+
+        assert_eq!(coordinator.ledger().writes, 0);
+        assert!(matches!(
+            coordinator
+                .state()
+                .snapshot()
+                .interactions
+                .iter()
+                .find(|interaction| interaction.interaction_id == interaction_id)
+                .map(|interaction| &interaction.lifecycle),
+            Some(super::super::SurfaceInteractionLifecycle::Requested)
+        ));
     }
 
     fn finalization_started(
@@ -12007,6 +12752,7 @@ mod tests {
                 arguments_digest: digest(123),
             },
             state: super::super::SurfaceToolViewState::Running,
+            invocation_started: None,
             arguments_bytes: super::super::ByteCount::new(21),
             output_bytes: super::super::ByteCount::new(0),
             streamed_output: super::super::DisplayText::new(""),

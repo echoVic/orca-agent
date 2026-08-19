@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
-use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 
 use crate::commands;
 use crate::composer_textarea::{
@@ -13,7 +12,8 @@ use crate::composer_textarea::{
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
 use crate::theme::Theme;
 use crate::types::{
-    AppState, AppStatus, ChatMessage, PendingTuiInput, TuiInteractionResponse, UserAction,
+    AppState, AppStatus, ChatMessage, PendingTuiInput, TuiInteractionResponse,
+    TuiMcpElicitationMode, UserAction,
 };
 use crate::vim::VimState;
 
@@ -49,7 +49,7 @@ pub(crate) fn handle_idle_submit(
         )
         && matches!(
             state.pending_mcp_elicitation_mode,
-            Some(RuntimeMcpElicitationMode::Url)
+            Some(TuiMcpElicitationMode::Url)
         );
     if text.is_empty() && !empty_mcp_url_response {
         return false;
@@ -189,10 +189,9 @@ mod tests {
     use super::*;
     use crate::composer_textarea::{make_textarea_with_text, textarea_text};
     use crate::test_support::test_run_config;
-    use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind};
+    use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiMcpElicitationMode};
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::ThemeName;
-    use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
 
     fn interaction_key(kind: TuiInteractionKind, request_id: &str) -> TuiInteractionKey {
         TuiInteractionKey::new(OperationIdAllocator::default().allocate(), request_id, kind)
@@ -350,7 +349,7 @@ mod tests {
         state.update(TuiEvent::McpElicitationRequested {
             key: key.clone(),
             server_name: "fixture".to_string(),
-            mode: RuntimeMcpElicitationMode::Form,
+            mode: TuiMcpElicitationMode::Form,
             message: "Provide fields".to_string(),
             url: None,
             requested_schema_json: Some(r#"{"type":"object"}"#.to_string()),
@@ -398,7 +397,7 @@ mod tests {
         state.update(TuiEvent::McpElicitationRequested {
             key: key.clone(),
             server_name: "fixture".to_string(),
-            mode: RuntimeMcpElicitationMode::Url,
+            mode: TuiMcpElicitationMode::Url,
             message: "Authorize device".to_string(),
             url: Some("https://example.test/device".to_string()),
             requested_schema_json: None,
@@ -452,13 +451,13 @@ mod tests {
                 TuiEvent::McpElicitationRequested {
                     key: form_key.clone(),
                     server_name: "fixture".to_string(),
-                    mode: RuntimeMcpElicitationMode::Form,
+                    mode: TuiMcpElicitationMode::Form,
                     message: "Provide fields".to_string(),
                     url: None,
                     requested_schema_json: None,
                 },
                 form_key,
-                Some(RuntimeMcpElicitationMode::Form),
+                Some(TuiMcpElicitationMode::Form),
             ),
         ];
 

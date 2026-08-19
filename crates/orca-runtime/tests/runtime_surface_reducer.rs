@@ -805,6 +805,7 @@ fn state_with_capability_call(
             arguments_digest: digest(48),
         },
         state: SurfaceToolViewState::Running,
+        invocation_started: None,
         arguments_bytes: ByteCount::new(2),
         output_bytes: ByteCount::new(0),
         streamed_output: DisplayText::new(""),
@@ -1338,6 +1339,7 @@ fn interaction_resolution_receipt_kind_and_projection_must_match_request() {
                         allowed: true,
                     },
                 },
+                continuation: None,
             }),
         )],
     );
@@ -1658,6 +1660,7 @@ fn capability_call_rejects_fence_from_a_different_generation_than_its_tool() {
             arguments_digest: digest(45),
         },
         state: SurfaceToolViewState::Requested,
+        invocation_started: None,
         arguments_bytes: ByteCount::new(2),
         output_bytes: ByteCount::new(0),
         streamed_output: DisplayText::new(""),
@@ -8920,6 +8923,7 @@ fn tool_completion_requires_exactly_one_matching_result_item() {
     snapshot.tools.push(SurfaceToolView {
         request,
         state: SurfaceToolViewState::Running,
+        invocation_started: None,
         arguments_bytes: ByteCount::new(2),
         output_bytes: ByteCount::new(0),
         streamed_output: DisplayText::new(""),

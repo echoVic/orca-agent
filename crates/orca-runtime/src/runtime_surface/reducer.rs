@@ -16,11 +16,12 @@ use super::identity::{
     canonical_background_fence_v1, canonical_surface_scope_v1,
 };
 use super::interaction::{
-    AuthorityFingerprint, CanonicalInteractionPatchV1, InteractionCancelReason,
+    AuthorityFingerprint, CanonicalInteractionPatchV1,
+    DurableInteractionContinuationOperationIdentity, InteractionCancelReason,
     InteractionExpiryAuthorityFailure, InteractionPatch, InteractionUnavailableDisposition,
     SurfaceInteractionKind, SurfaceInteractionLifecycle, SurfaceInteractionRequest,
-    SurfaceInteractionRoute, SurfaceInteractionSafeProjection, SurfaceInteractionView,
-    SurfaceToolAction, SurfaceToolRequest, canonical_interaction_patch_v1,
+    SurfaceInteractionResolutionReceipt, SurfaceInteractionRoute, SurfaceInteractionSafeProjection,
+    SurfaceInteractionView, SurfaceToolAction, SurfaceToolRequest, canonical_interaction_patch_v1,
 };
 use super::operation::{
     AdmissionRejectionReason, AdmittedInput, CancelReason, FailureClass, FinalizationDegradedCause,
@@ -1204,6 +1205,10 @@ fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
             scope,
             SurfaceScope::Background { fence } if fence == background_fence
         ),
+        SurfaceEvent::Interaction(
+            InteractionPatch::ContinuationDispatchStarted { .. }
+            | InteractionPatch::ContinuationDispatchConsumed { .. },
+        ) => matches!(scope, SurfaceScope::Thread),
         SurfaceEvent::Interaction(_) => matches!(
             scope,
             SurfaceScope::Generation { .. } | SurfaceScope::Background { .. }
@@ -1484,6 +1489,66 @@ fn validate_batch_pairings(
 ) -> Result<(), SurfaceReducerError> {
     for envelope in batch.events.as_slice() {
         match &envelope.event {
+            SurfaceEvent::Interaction(InteractionPatch::ContinuationDispatchStarted {
+                interaction_id,
+                receipt_id,
+                dispatch_id,
+                operation_id,
+                turn_id,
+                ..
+            }) => {
+                let identity = state
+                    .snapshot
+                    .interactions
+                    .iter()
+                    .find(|interaction| &interaction.interaction_id == interaction_id)
+                    .and_then(|interaction| match &interaction.lifecycle {
+                        SurfaceInteractionLifecycle::Resolved { receipt }
+                            if &receipt.receipt_id == receipt_id =>
+                        {
+                            DurableInteractionContinuationOperationIdentity::try_new(
+                                interaction_id,
+                                receipt,
+                            )
+                            .ok()
+                        }
+                        _ => None,
+                    });
+                let Some(identity) = identity else {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::InvalidOrdering,
+                        "continuation dispatch start lacks its durable resolution identity",
+                    ));
+                };
+                if identity.dispatch_id() != dispatch_id
+                    || identity.operation_id() != operation_id
+                    || identity.turn_id() != turn_id
+                {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::IllegalTransition,
+                        "continuation dispatch start changed its stable operation identity",
+                    ));
+                }
+                let paired_operation = batch_event_count(batch, |event| {
+                    matches!(
+                        event,
+                        SurfaceEvent::Operation(OperationPatch::Requested { operation })
+                            if &operation.operation_id == identity.operation_id()
+                                && &operation.request_id == identity.request_id()
+                                && operation.intent.kind == OperationKind::UserTurn
+                                && operation.ready_for_admission
+                    )
+                });
+                if paired_operation != 1 {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::InvalidOrdering,
+                        "continuation dispatch start must atomically create its stable operation",
+                    ));
+                }
+            }
             SurfaceEvent::Operation(OperationPatch::Admitted { input, .. }) => match input {
                 AdmittedInput::PendingUser {
                     item_id,
@@ -4074,6 +4139,7 @@ fn apply_tool_patch(
             snapshot.tools.push(SurfaceToolView {
                 request: request.clone(),
                 state: SurfaceToolViewState::Requested,
+                invocation_started: None,
                 arguments_bytes: final_arguments_bytes,
                 output_bytes: ByteCount::new(0),
                 streamed_output: DisplayText::new(""),
@@ -4213,6 +4279,55 @@ fn apply_tool_patch(
                 chunk.as_str()
             ));
             tool.output_bytes = ByteCount::new(offset.get() + chunk.as_str().len() as u64);
+            tool.state = SurfaceToolViewState::Running;
+            Ok(())
+        }
+        ToolPatch::InvocationStartedV1 { receipt } => {
+            if !matches!(batch.commit_class, CommitClass::Recorded { .. }) {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::CommitClassMismatch,
+                    "tool invocation start receipt must be durable",
+                ));
+            }
+            let turn_id = snapshot
+                .tools
+                .iter()
+                .find(|tool| tool.request.tool_call_id == *receipt.invocation_id())
+                .map(|tool| tool.request.turn_id.clone())
+                .ok_or_else(|| {
+                    event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::MissingIdentity,
+                        "tool invocation start receipt has no matching request",
+                    )
+                })?;
+            let fence = generation_fence_for_turn(snapshot, &turn_id).ok_or_else(|| {
+                event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::MissingIdentity,
+                    "tool invocation start receipt generation does not exist",
+                )
+            })?;
+            require_event_scope_owns_generation(snapshot, envelope, &fence)?;
+            let tool = snapshot
+                .tools
+                .iter_mut()
+                .find(|tool| tool.request.tool_call_id == *receipt.invocation_id())
+                .expect("tool request was resolved before mutable projection update");
+            if receipt.fence() != &fence
+                || receipt.revision().get() != 1
+                || tool.invocation_started.is_some()
+                || tool.state != SurfaceToolViewState::Requested
+                || tool.result.is_some()
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "tool invocation start receipt is stale, duplicated, or follows execution",
+                ));
+            }
+            tool.invocation_started = Some(receipt.clone());
             tool.state = SurfaceToolViewState::Running;
             Ok(())
         }
@@ -4634,6 +4749,10 @@ fn interaction_cancel_reason_matches_disposition(
             matches!(
                 disposition,
                 InteractionUnavailableDisposition::FailOperation
+                    | InteractionUnavailableDisposition::RestartableToolApproval { .. }
+                    | InteractionUnavailableDisposition::RestartablePermissionRequest { .. }
+                    | InteractionUnavailableDisposition::RestartableUserInput { .. }
+                    | InteractionUnavailableDisposition::RestartableMcpElicitation { .. }
             )
         }
         InteractionCancelReason::ExpiryAuthorityUnavailable { deadline, failure } => {
@@ -4707,6 +4826,18 @@ fn apply_interaction_patch(
             next_revision,
             ..
         }
+        | InteractionPatch::ContinuationDispatchStarted {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            ..
+        }
+        | InteractionPatch::ContinuationDispatchConsumed {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            ..
+        }
         | InteractionPatch::Cancelled {
             interaction_id,
             expected_revision,
@@ -4745,6 +4876,10 @@ fn apply_interaction_patch(
             background_fence.operation_fence == current.fence
                 && event_scope_owns_generation(snapshot, envelope, &current.fence)
         }
+        InteractionPatch::ContinuationDispatchStarted { .. }
+        | InteractionPatch::ContinuationDispatchConsumed { .. } => {
+            matches!(envelope.scope, SurfaceScope::Thread)
+        }
         _ => match &current.lifecycle {
             SurfaceInteractionLifecycle::Transferred { background_fence } => matches!(
                 &envelope.scope,
@@ -4770,10 +4905,18 @@ fn apply_interaction_patch(
             "interaction revision is not contiguous",
         ));
     }
-    let open = matches!(
-        interaction.lifecycle,
-        SurfaceInteractionLifecycle::Requested | SurfaceInteractionLifecycle::Transferred { .. }
-    );
+    let open = match patch {
+        InteractionPatch::ContinuationDispatchStarted { .. }
+        | InteractionPatch::ContinuationDispatchConsumed { .. } => matches!(
+            interaction.lifecycle,
+            SurfaceInteractionLifecycle::Resolved { .. }
+        ),
+        _ => matches!(
+            interaction.lifecycle,
+            SurfaceInteractionLifecycle::Requested
+                | SurfaceInteractionLifecycle::Transferred { .. }
+        ),
+    };
     if !open {
         return Err(event_error(
             envelope,
@@ -4797,7 +4940,11 @@ fn apply_interaction_patch(
             }
             interaction.route = route.clone();
         }
-        InteractionPatch::Resolved { receipt, .. } => {
+        InteractionPatch::Resolved {
+            receipt,
+            continuation,
+            ..
+        } => {
             if receipt.kind != interaction.kind
                 || !interaction_safe_projection_matches_kind(receipt.kind, &receipt.safe_projection)
             {
@@ -4807,8 +4954,105 @@ fn apply_interaction_patch(
                     "interaction receipt kind or safe projection is invalid",
                 ));
             }
+            if let Some(continuation) = continuation {
+                let capsule = interaction
+                    .recovery_disposition
+                    .restartable_continuation_turn_capsule()
+                    .ok()
+                    .flatten();
+                if capsule
+                    .as_ref()
+                    .is_none_or(|capsule| continuation.validate(capsule, receipt).is_err())
+                {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::IllegalTransition,
+                        "interaction continuation answer does not match its durable request",
+                    ));
+                }
+            }
             interaction.lifecycle = SurfaceInteractionLifecycle::Resolved {
                 receipt: receipt.clone(),
+            }
+        }
+        InteractionPatch::ContinuationDispatchStarted {
+            receipt_id,
+            dispatch_id,
+            operation_id,
+            turn_id,
+            ..
+        } => {
+            let identity = match &interaction.lifecycle {
+                SurfaceInteractionLifecycle::Resolved { receipt }
+                    if &receipt.receipt_id == receipt_id =>
+                {
+                    DurableInteractionContinuationOperationIdentity::try_new(
+                        &interaction.interaction_id,
+                        receipt,
+                    )
+                    .ok()
+                }
+                _ => None,
+            };
+            if identity.as_ref().is_none_or(|identity| {
+                identity.dispatch_id() != dispatch_id
+                    || identity.operation_id() != operation_id
+                    || identity.turn_id() != turn_id
+            }) {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "continuation dispatch start does not match the stable resolution identity",
+                ));
+            }
+        }
+        InteractionPatch::ContinuationDispatchConsumed {
+            receipt_id,
+            dispatch_id,
+            operation_id,
+            turn_id,
+            ..
+        } => {
+            let identity = match &interaction.lifecycle {
+                SurfaceInteractionLifecycle::Resolved { receipt }
+                    if &receipt.receipt_id == receipt_id =>
+                {
+                    DurableInteractionContinuationOperationIdentity::try_new(
+                        &interaction.interaction_id,
+                        receipt,
+                    )
+                    .ok()
+                }
+                _ => None,
+            };
+            if identity.as_ref().is_none_or(|identity| {
+                identity.dispatch_id() != dispatch_id
+                    || identity.operation_id() != operation_id
+                    || identity.turn_id() != turn_id
+            }) {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "continuation dispatch consumption does not match the stable resolution identity",
+                ));
+            }
+            let operation_has_taken_over = snapshot
+                .foreground_operation
+                .iter()
+                .chain(snapshot.queued_operations.iter())
+                .chain(snapshot.operation_history.iter())
+                .find(|operation| &operation.operation_id == operation_id)
+                .is_some_and(|operation| {
+                    operation.agent_loop_turns.iter().any(|turn| {
+                        &turn.turn_id == turn_id && turn.fence.operation_id == *operation_id
+                    }) || operation.terminal.is_some()
+                });
+            if !operation_has_taken_over {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::InvalidOrdering,
+                    "continuation dispatch consumption precedes operation takeover",
+                ));
             }
         }
         InteractionPatch::Cancelled { reason, .. } => {
@@ -8351,7 +8595,7 @@ pub(crate) mod tests {
         batch
     }
 
-    fn started_operation() -> OperationRecord {
+    pub(crate) fn started_operation() -> OperationRecord {
         let fence = operation_fence();
         let incarnation = SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(5)).unwrap();
         let replayability = Replayability::NonReplayable {
@@ -8417,6 +8661,122 @@ pub(crate) mod tests {
             pending_control: None,
             finalization: None,
             terminal: None,
+        }
+    }
+
+    fn resolved_continuation_interaction(
+        seed: u8,
+    ) -> (
+        SurfaceInteractionView,
+        SurfaceInteractionResolutionReceipt,
+        DurableInteractionContinuationOperationIdentity,
+    ) {
+        let interaction_id = SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(seed)).unwrap();
+        let receipt = SurfaceInteractionResolutionReceipt {
+            response_id: super::super::identity::SurfaceResponseId::try_from_bytes(uuid_v7_bytes(
+                seed + 1,
+            ))
+            .unwrap(),
+            receipt_id: super::super::identity::SurfaceResponseReceiptId::try_from_bytes(
+                uuid_v7_bytes(seed + 2),
+            )
+            .unwrap(),
+            kind: SurfaceInteractionKind::UserInput,
+            safe_projection: SurfaceInteractionSafeProjection::UserInput { answered: true },
+        };
+        let identity =
+            DurableInteractionContinuationOperationIdentity::try_new(&interaction_id, &receipt)
+                .unwrap();
+        (
+            SurfaceInteractionView {
+                interaction_id,
+                revision: InteractionRevision::try_new(2).unwrap(),
+                fence: operation_fence(),
+                kind: SurfaceInteractionKind::UserInput,
+                request: SurfaceInteractionRequest::UserInput {
+                    question: NonEmptyText::try_new("continue?").unwrap(),
+                    suggestions: Vec::new(),
+                },
+                route: SurfaceInteractionRoute::Unassigned {
+                    epoch: ResponseRouteEpoch::try_new(1).unwrap(),
+                },
+                lifecycle: SurfaceInteractionLifecycle::Resolved {
+                    receipt: receipt.clone(),
+                },
+                recovery_disposition: InteractionUnavailableDisposition::FailOperation,
+            },
+            receipt,
+            identity,
+        )
+    }
+
+    #[test]
+    fn continuation_started_without_atomic_operation_is_rejected() {
+        let (interaction, receipt, identity) = resolved_continuation_interaction(90);
+        let mut snapshot = reducer_snapshot();
+        snapshot.interactions.push(interaction.clone());
+        snapshot.operation_history.push(started_operation());
+        let state = SurfaceReducerState::new(snapshot);
+        let invalid = reducer_batch(
+            &state,
+            93,
+            SurfaceScope::Thread,
+            SurfaceEvent::Interaction(InteractionPatch::ContinuationDispatchStarted {
+                interaction_id: interaction.interaction_id,
+                expected_revision: InteractionRevision::try_new(2).unwrap(),
+                next_revision: InteractionRevision::try_new(3).unwrap(),
+                receipt_id: receipt.receipt_id,
+                dispatch_id: identity.dispatch_id().clone(),
+                operation_id: identity.operation_id().clone(),
+                turn_id: identity.turn_id().clone(),
+            }),
+        );
+
+        match reduce_batch(SurfaceReduceMode::Live, &state, &invalid) {
+            SurfaceReduceResult::Rejected { error } => {
+                assert_eq!(error.code, SurfaceReducerErrorCode::InvalidOrdering)
+            }
+            _ => panic!("continuation start without operation unexpectedly applied"),
+        }
+    }
+
+    #[test]
+    fn continuation_consumed_before_operation_takeover_is_rejected() {
+        let (interaction, receipt, identity) = resolved_continuation_interaction(100);
+        let historical_operation = started_operation();
+        let mut operation = historical_operation.clone();
+        operation.operation_id = identity.operation_id().clone();
+        operation.request_id = identity.request_id().clone();
+        operation.intent.kind = OperationKind::UserTurn;
+        operation.phase = OperationPhase::Admitted;
+        operation.initial_logical_turn_id = Some(identity.turn_id().clone());
+        operation.agent_loop_turns.clear();
+        operation.terminal = None;
+        let mut snapshot = reducer_snapshot();
+        snapshot.interactions.push(interaction.clone());
+        snapshot.operation_history.push(historical_operation);
+        snapshot.queued_operations.push(operation);
+        let state = SurfaceReducerState::new(snapshot);
+        let invalid = reducer_batch(
+            &state,
+            103,
+            SurfaceScope::Thread,
+            SurfaceEvent::Interaction(InteractionPatch::ContinuationDispatchConsumed {
+                interaction_id: interaction.interaction_id,
+                expected_revision: InteractionRevision::try_new(2).unwrap(),
+                next_revision: InteractionRevision::try_new(3).unwrap(),
+                receipt_id: receipt.receipt_id,
+                dispatch_id: identity.dispatch_id().clone(),
+                operation_id: identity.operation_id().clone(),
+                turn_id: identity.turn_id().clone(),
+            }),
+        );
+
+        match reduce_batch(SurfaceReduceMode::Live, &state, &invalid) {
+            SurfaceReduceResult::Rejected { error } => {
+                assert_eq!(error.code, SurfaceReducerErrorCode::InvalidOrdering)
+            }
+            _ => panic!("continuation consumption before takeover unexpectedly applied"),
         }
     }
 
@@ -8568,6 +8928,7 @@ pub(crate) mod tests {
         snapshot.tools.push(SurfaceToolView {
             request: persisted_tool,
             state: SurfaceToolViewState::Running,
+            invocation_started: None,
             arguments_bytes: ByteCount::new(2),
             output_bytes: ByteCount::new(0),
             streamed_output: DisplayText::new(""),
@@ -8662,6 +9023,7 @@ pub(crate) mod tests {
         snapshot.tools.push(SurfaceToolView {
             request: tool.clone(),
             state: SurfaceToolViewState::Requested,
+            invocation_started: None,
             arguments_bytes: ByteCount::new(2),
             output_bytes: ByteCount::new(0),
             streamed_output: DisplayText::new(""),

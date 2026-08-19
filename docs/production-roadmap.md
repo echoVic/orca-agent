@@ -3,7 +3,21 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-16
+Last updated: 2026-08-18
+
+The 2026-08-18 Durable Interaction Broker completion closes the pending-store
+deletion gate. Tool Approval, Permission Request, User Input, and MCP
+Elicitation now pass the complete TUI, ACP, JSONL, and Headless 4×4 matrix.
+Stable route epoch, response token, grant, and operation fence selectors are
+exact and fail closed. Tool Approval records an `InvocationStarted` receipt;
+Permission retries only before the protected side effect; and answered User
+Input and MCP interactions resume through stable durable continuation
+operations. Missing, executing, unsafe, unsupported, and stale-context cold
+recovery durably fail closed. The `RuntimePendingInteractionStore` source file,
+its crate export, and `with_pending_interactions` compatibility builder are
+deleted, with zero old symbols in production or test source. The validator,
+runtime all-targets checks, and TUI checks pass. This is a breaking Rust source
+API removal for callers of the former compatibility module or builder.
 
 The 2026-08-10 headless resume slice makes "restore a headless execution" a
 first-class CLI capability, following Codex's `exec resume` design while keeping
@@ -501,24 +515,24 @@ domain-restricted network policy fail closed. Atomic replacement and OS locks
 cover the runtime's durable stores, while native x64 and ARM64 runners execute
 platform contracts and the full workspace test suite.
 
-The 2026-08-07 TUI single-surface interaction slice removes the process-local
-TUI interaction broker, four legacy interaction adapters, and the legacy hosted
-turn runner. Production turns and interaction tests now use the typed runtime
-surface and its supervised presentation control. The 2026-08-08 runtime
-pending-store slice removes that process-local map from `RuntimeHost` ownership:
-the public store and `with_pending_interactions` builder remain as documented,
-source-compatible no-op shims until legacy Goal/server/CLI callers migrate and
-durable broker recovery evidence passes the deletion gate. A Rust deprecation
-attribute is deferred to a separately versioned API migration because it is a
-semver minor change.
+Historically, the 2026-08-07 TUI single-surface interaction slice removed the
+process-local TUI interaction broker, four legacy interaction adapters, and the
+legacy hosted turn runner. Production turns and interaction tests now use the
+typed runtime surface and its supervised presentation control. The 2026-08-08
+runtime pending-store slice removed that process-local map from `RuntimeHost`
+ownership.
+At that checkpoint, the public store and `with_pending_interactions` builder
+remained as documented, source-compatible no-op shims pending legacy caller
+migration and durable broker recovery evidence. That compatibility state was
+superseded by the completed 2026-08-18 deletion.
 
-The 2026-08-10 pending-store gate audit confirms the first two ownership and
-recovery conditions, but does not delete the shim: legacy
-`HostedTurnRequest`/Goal continuation workers are still production paths used
-by TUI, ACP, and controller code, and `cargo-semver-checks` is unavailable in
-the current environment. The audit and exact next-window commands are recorded
-in `docs/reports/2026-08-10-pending-store-deletion-gate.md`; no compatibility
-API removal is claimed until those conditions are closed in a major migration.
+The historical 2026-08-10 pending-store gate audit confirmed the first two
+ownership and recovery conditions, but did not delete the shim: legacy
+`HostedTurnRequest`/Goal continuation workers were still production paths used
+by TUI, ACP, and controller code, and `cargo-semver-checks` was unavailable in
+that checkpoint's environment. The report at
+`docs/reports/2026-08-10-pending-store-deletion-gate.md` now records the
+superseding 2026-08-18 completion and breaking API impact.
 
 The 2026-08-08 Goal interaction-settlement slice keeps TUI approval semantics
 typed across the runtime-to-Goal boundary. Allow executes the approved tool and
@@ -1722,12 +1736,13 @@ end state.
    but deterministic cache-critical prefixes (stable system prompt, tool
    schema, and conversation-prefix ordering), fork isolation, and explicit
    checkpoints are not yet specified as one independently verifiable change.
-5. **The pending-store deletion gate has not passed.**
-   `RuntimePendingInteractionStore` remains as a source-compatible shim. Its
-   retirement spec requires the legacy Goal path to disappear, server and CLI
-   callers to stop compiling against it, and durable broker recovery evidence;
-   the implementation plan being checked off does not itself satisfy those
-   gates.
+5. **The pending-store deletion gate passed on 2026-08-18.**
+   The four interaction types pass on all four surfaces with exact fail-closed
+   selectors and durable cold recovery. `RuntimePendingInteractionStore`, its
+   crate export, and the no-op builder are deleted, and production/test source
+   contains zero old symbols. Validator, runtime all-targets, and TUI checks
+   pass; downstream Rust callers must migrate from the removed compatibility
+   API.
 6. **Repository cleanup (round 19, done).** The five linked cleanup
    candidates (`codex/auto-memory-governance`, `codex/headless-trajectory-truth`,
    `codex/mcp-sse-elicitation`, `codex/network-ask-on-block`,
@@ -1756,7 +1771,7 @@ size, then short-term implementation cost.
 | 2 | **ThreadActor split completion**: finish the four existing controller seams and reduce the main impl toward ~8k lines | Architecture boundary | Future runtime features become cheaper to change and less likely to regress lifecycle behavior | Behavior tests and focused runtime suites; do not make source shape the acceptance oracle |
 | 3 | **TUI/runtime protocol convergence**: extract renderer-owned orchestration and make runtime surface state the single projection source | Architecture boundary | Fewer TUI regressions and one authoritative rendering/lifecycle state | Real TUI PTY contracts plus the runtime-surface contract validator in CI |
 | 4 | **P2.4 context/cache identity**: deterministic cache-critical prefixes, fork-state isolation, and explicit checkpoints | DeepSeek-native | Stable long sessions can realize prompt-cache savings instead of invalidating the prefix on incidental reorderings | Two real DeepSeek API requests with the same prefix and observed `prompt_cache_hit_tokens`, plus fork/checkpoint behavior tests |
-| 5 | **Pending-store deletion gate**: remove the compatibility shim and legacy Goal path only after its stated migration gates pass | Compatibility migration | Eliminate the second interaction fact source without stranding existing callers | Gate each requirement in `docs/superpowers/specs/2026-08-08-runtime-pending-store-retirement.md` and run `cargo-semver-checks` |
+| 5 | **Pending-store deletion gate (completed 2026-08-18)**: the compatibility shim and legacy pending-store API are removed | Compatibility migration | The durable broker is the only interaction fact source across all four surfaces | 4×4 interaction matrix, exact fail-closed selector and cold-recovery coverage, zero old symbols, validator, runtime all-targets, and TUI checks pass |
 | 6 | **Compaction completion and remote-compaction evaluation**: finish `RuntimeCompactionPolicy`, then drive remote work from real waiting behavior | DeepSeek-native | Long conversations retain usable context without silently dropping state | Long-context real-API smoke, interruption/recovery checks, and focused/full compaction gates |
 | 7 | **Repository cleanup**: remove the five superseded linked branches and integration residue | Hygiene | One clear source of truth for maintainers and release automation | `git merge-base`, patch/provenance checks, clean worktrees, and branch/worktree verification |
 
@@ -1786,11 +1801,12 @@ focused runtime/provider gates cover waiting, cancellation, persistence, and
 recovery. The reproducible evidence is in
 `docs/reports/2026-08-10-compaction-remote-evaluation.md`.
 
-These reliability slices ship together in v0.3.14. The release includes the
+These reliability slices shipped together in v0.3.14. That release included the
 cross-process task lease/fencing boundary, ThreadActor state ownership
 extraction, centralized TUI attachment routing, DeepSeek cache-prefix identity,
-and the remote-compaction verifier. Pending-store API removal is deliberately
-excluded until its documented legacy Goal and semver gates pass.
+and the remote-compaction verifier. At that historical release point,
+pending-store API removal was deliberately excluded; the gate later completed
+on 2026-08-18.
 
 #### Historical Refactor Inventory (Superseded)
 
@@ -2901,7 +2917,7 @@ instruction and capability system.
 | P0.5 | Surface convergence | Moves server/headless first and TUI second onto the same runtime handles, then removes the TUI provider/tool kernel and direct execution dependencies | High |
 | P1.1 | Semantic execution journal, one sequencer, and stable item ids | Makes canonical items, durable history, task state, goal state, and replay derive from one ordered source without synchronously journaling every token delta | High |
 | P1.2 | Async ToolCallRuntime | Gives each invocation concurrency, approval, output, cancellation, cleanup, and exactly one truthful terminal outcome, including `indeterminate` after a crash | High |
-| P1.3 | Durable interaction broker | Lets approval, user input, and MCP elicitation survive process loss as idempotent continuations | High |
+| P1.3 | Durable interaction broker | Completed 2026-08-18 for Tool Approval, Permission Request, User Input, and MCP Elicitation across TUI, ACP, JSONL, and Headless | Done |
 | P1.4 | Unified task supervisor, cancellation tree, lease, and fencing | Makes stop, pause, shutdown, reattach, stale-owner takeover, and stale-commit rejection verifiable | High |
 | P2.1 | Checkpointable workflow and subagent resume | Resumes the same run from a safe cursor instead of replaying only completed cache entries | High |
 | P2.2 | Runtime goal orchestrator | Complete in v0.2.52: Goal state, runs, outer turns, usage, leases, terminal verification, recovery, cancellation, and continuation policy are runtime-owned; the fixed continuation ceiling is removed, resumable interruption is distinct from blocking, and a durable progress watchdog guards repeated stalls | Done |
@@ -2920,7 +2936,7 @@ instruction and capability system.
 | P1 | Runtime Task/Turn actor | Turn-start, model routing, pre/post model hooks, provider streaming, shell tool event shaping, pre/post tool hooks, non-interactive and interactive approval resolution, request-user-input handling, normal tool execution fallback, one tool actor context, runtime-special dispatch classification including `request_permissions`, workflow IPC execution, SubagentStatus execution, package-3-style `task_list` / `task_stop`, WorkflowDraft preview creation, workflow/subagent execution modules, active server-turn interrupt/resume, active steer item streaming/context injection including multi-text inputs, shell session/list/update controls, package-3-style incremental permission updates including additional directory roots, usage accounting, immutable turn-entry snapshotting through `RuntimeTurnContext`, read-only service grouping through `RuntimeTurnDeps`, mutable runtime handle grouping through `RuntimeTurnState`, execution/lifecycle grouping through `RuntimeTurnExecution`, lifecycle-owned agent-loop result shape and terminal constructors, runtime-lifecycle-owned task/turn state machine types, runtime-conversation-bootstrap-owned step composing session-owned bootstrap and initial history recording, lifecycle-owned runtime turn setup step composing context config, tool approval policy, and provider config construction, lifecycle-owned runtime turn opening step composing compaction, turn start, turn-start result folding, model routing, and steer application, lifecycle-owned runtime provider cycle step composing provider turn, provider turn result folding, provider error handling/result folding, and provider response/result folding, lifecycle-owned runtime turn iteration step composing turn opening, provider cycle execution, and provider-cycle result folding, runtime-turn-loop-owned iteration retry/return folding plus grouped input/executor objects to shrink the agent-loop call surface, lifecycle-owned runtime compaction step handling budget warning hooks, pre/post compact hooks, prompt-too-long reactive compaction, and history persistence, lifecycle-owned turn-start step handling first-turn prompt selection, turn start errors, and started event emission, lifecycle-owned turn-start result folding into continuation or agent-loop results, lifecycle-owned model-route step handling model routing, cost model updates, per-turn provider config selection, and `model.routed` event emission, lifecycle-owned provider-error step handling reactive prompt-too-long retry state, compaction retry decisions, and provider error failures, lifecycle-owned provider-error result folding into turn continuation, loop continuation, or agent-loop results, lifecycle-owned provider-turn result step handling response/terminal folding and cancelled-error event suppression, lifecycle-owned provider-turn result folding from response/failure outcomes into response continuation or agent-loop results, lifecycle-owned provider-turn step handling pre/post model hooks, provider streaming deltas, provider replay updates, provider error handling including prompt-too-long retry decisions, cancellation checks, usage accounting, and usage history persistence, lifecycle-owned provider-response step handling assistant response recording, provider turn terminal folding, provider tool request extraction, and tool-turn dispatch, lifecycle-owned provider-response result step folding continue/success/terminal outcomes into agent-loop results, runtime-steer-owned step draining multi-text inputs into conversation/history through grouped `RuntimeSteerInput`, tool-execution-owned approval policy construction, tool-execution-owned normal tool execution entrypoint, tool-invocation-owned provider tool schema override, tool-invocation-owned provider config construction, tool-invocation-owned provider tool request extraction, tool-invocation-owned child tool policy gate, tool-turn-owned cursor state, tool-turn outcome state, dispatch runner, normal/readonly tool-turn runners, read-only batch planning/execution/result recording, and normal result recording/status folding, subagent-execution-owned batch result recording and status folding, subagent-execution-owned batch tool-turn runner, controller-owned durable successful-root auto-memory enqueue, session-owned automatic-memory worker and exact-turn recovery, memory-owned typed candidate persistence and relevant recall, session-owned system prompt construction for agent conversation bootstrap, session-owned conversation bootstrap, session-owned initial history recording, session-owned assistant response recording, session-owned tool result recording for model content plus history persistence, and session-owned plan-state recording for conversation plus history persistence are seeded; next continue shrinking lifecycle/tool-turn call surfaces against the Codex/package 3 priority list | Medium/High |
 | P1 | Storage-neutral ThreadStore | Codex keeps thread persistence behind a dedicated `thread-store` crate; Orca now exposes a `thread_store` module that owns the storage-neutral `ThreadStore` trait, the `JsonlThreadStore` backend type, the `ThreadStore` implementation, live thread handle, session metadata, summary, transcript, and writer API/behavior, JSONL record shape and stored-message conversion, append writing/redaction/locking, JSONL record reading/rewrite helpers, session metadata/transcript read models, thread-record lookup/path helpers, session list/load/read-summary/search/mutation operations, storage-neutral thread projection/page/filter types, message/turn/item projections, identified-record grouping with one isolated legacy id fallback, pagination, filters, and protocol-visible thread types, with `SessionStore` retained as a compatibility alias; live server message/turn/item/search projection, typed persisted turn/item identity, protocol thread shapes, session production wiring, agent-loop resume wiring, pagination, thread-record materialization, session list/load materialization, session search, delete/archive/rename/compress session mutations, and metadata/read/list/search/turn/item trait paths now go through the boundary without bridging projection helpers back through `history`. Append and read-modify-rewrite paths reopen the transcript after acquiring a stable sidecar lock, and the plaintext plus compressed names of one logical transcript resolve to that same cross-process lock; next consider a storage backend split only after the runtime/session protocol boundaries settle | Medium |
 | P1 | Permission profiles and directory scope | Codex app-server has named active permission profiles, request-permissions approval round trips, `turn` / `session` grant scopes, filesystem entry semantics, special workspace-root labels, runtime workspace-root rebinding, and strict auto-review, while package 3 tracks update destinations, sources, and additional directories; Orca now has thread-scoped mode/rule snapshots, active permission profile metadata, built-in `permissionProfile` execution semantics for `command/exec`, configured profile `extends` chains plus filesystem `read` roots enforced as strict read allow-lists for custom read-only command sandbox profiles, filesystem `write` / `read-write` roots, filesystem `deny` read/write overrides, startup-time expansion of bounded configured filesystem globs for read/write/read-write/deny access, configurable glob scan depth with inherited profile defaults and child-profile overrides, `[network].enabled` command sandbox resolution, command/exec domain allow/deny policy enforcement through a managed loopback HTTP proxy with Codex-style denylist/allowlist block reasons plus normalized blocked-host attribution, default local/private literal blocking unless explicitly allowlisted, and DNS-resolved non-public target blocking before connect, session-scoped `request_permissions` network domain grants persisted on server threads and inherited by later thread-bound `command/exec` calls, session-scoped network deny overlays that override permission-profile allows while session allows cannot bypass existing profile denies, configured Unix socket allowlists materialized into macOS command/exec Seatbelt rules while non-macOS builds accept the config without path-level enforcement, configured `:workspace_roots` / `:workspace_roots/<subpath>` materialization against thread runtime roots, TOML scoped filesystem table normalization, trailing `/**` subtree normalization, configured `:tmpdir` / `:slash_tmp` materialization for command sandbox roots, configured `:root` materialization, configured `:minimal` platform-default read-root materialization, inherited thread active profiles for thread-bound command execution, incremental rule updates with destination metadata, persisted additional working directories with source-aware replacement/removal, protocol projections, bash sandbox roots, turn-scoped `request_permissions` write-root overlays, server-mediated permission approvals, session-scope grant persistence, Codex-style `fileSystem.entries` normalization including `project_roots` / `:workspace_roots` special paths, explicit `runtimeWorkspaceRoots` thread/turn overrides, TUI session-picker labels for workspace-root-scoped directory grants, `strictAutoReview` propagation that re-prompts later same-turn tools, thread-bound shell tasks that can be stopped through model-visible `task_stop`, and inherited-profile network blocks that now route through the existing permission grant/retry path; next reduce remaining TUI/runtime protocol drift | Medium |
-| P1 | TUI event and interaction adapters | Assistant deltas, usage, model routing notices, errors, session completion, tool requested/completed, plan updated, subagent started/completed, approval prompts/resolution notices, request-user-input prompts/results, verification started/completed notices, workflow terminal notifications, workflow lifecycle notices, and workflow task-list/progress refreshes now flow through runtime `EventFactory` and typed runtime-surface boundaries; ordinary TUI turns no longer install a local interaction adapter or pending store, `RuntimePendingInteractionStore` remains only as a documented source-compatibility projection, the hosted action receive/lifecycle controller has one focused owner outside the renderer, renderer runtime-event plus frame timing/presentation coordination have focused owners, terminal session startup is a focused pending-to-activated owner, and renderer input wake/suspend, semantic input routing, interaction-acknowledgement draining, the bounded runtime-event inbox and pre-agent close, typed input-vs-runtime iteration routing, the complete foreground renderer cycle, active-terminal initial-title/first-frame bootstrap, receipt-backed recorded terminal-task import, and non-replayable safe Running MainSession adoption now have focused owners; next specify queued/paused/stopping, approval, failed/retryable, and rich-task cold reconstruction with durable operation, interaction, and ownership fences | Medium |
+| P1 | TUI event and interaction adapters | At this historical checkpoint, assistant deltas, usage, model routing notices, errors, session completion, tool requested/completed, plan updated, subagent started/completed, approval prompts/resolution notices, request-user-input prompts/results, verification started/completed notices, workflow terminal notifications, workflow lifecycle notices, and workflow task-list/progress refreshes flowed through runtime `EventFactory` and typed runtime-surface boundaries; ordinary TUI turns no longer installed a local interaction adapter or pending store, while `RuntimePendingInteractionStore` still remained as a documented source-compatibility projection. That projection was deleted on 2026-08-18 after durable broker completion. The hosted action receive/lifecycle controller had one focused owner outside the renderer, renderer runtime-event plus frame timing/presentation coordination had focused owners, terminal session startup was a focused pending-to-activated owner, and renderer input wake/suspend, semantic input routing, interaction-acknowledgement draining, the bounded runtime-event inbox and pre-agent close, typed input-vs-runtime iteration routing, the complete foreground renderer cycle, active-terminal initial-title/first-frame bootstrap, receipt-backed recorded terminal-task import, and non-replayable safe Running MainSession adoption had focused owners; the next work at that checkpoint was queued/paused/stopping, approval, failed/retryable, and rich-task cold reconstruction with durable operation, interaction, and ownership fences | Medium |
 | P2 | Unified tool invocation records | First-class MCP and external/dynamic app-server stream and history items are seeded, including failed/denied/not-implemented status plus error/exit-code/truncation restoration in history projections and legacy realtime `tool_completed` exit-code/result-kind preservation; MCP resource list/read/template tools now share the registry path, all-server resource/template discovery surfaces registry startup failures plus per-server list failures, and resource-capability caching avoids probing tools-only servers during all-server discovery; next reduce remaining TUI/runtime protocol drift | Medium |
 | P2 | Shared approval/result shaping | Historical first-class tool item completion preserves explicit non-success statuses, realtime MCP/dynamic/file-change item helpers avoid success result/content payloads for non-completed statuses, realtime MCP/dynamic item errors now carry `exitCode` when tool completion reports one, command-execution items keep failed-command output as diagnostic aggregated output by contract, realtime/persisted tool item projections now share MCP parsing/started/result/error/status helpers, and `ToolExecutionActor::handle_approval` receives one grouped `ToolApprovalGateContext`; next continue moving approval/result shaping helpers behind focused runtime-owned context boundaries | Medium |
 | Skills | Plugin-compatible skill manifests | Unlocks reusable instruction bundles after runtime contracts stabilize | Medium |

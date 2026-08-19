@@ -527,6 +527,7 @@ revision_value!(
     WorkflowRevision,
     SubagentRevision,
     InteractionRevision,
+    ToolInvocationRevision,
     ResponseRouteEpoch,
     CapabilityRevision,
     PlanRevision,
@@ -1142,6 +1143,7 @@ pub enum SurfaceAttachmentRole {
     Tui,
     Acp,
     Jsonl,
+    Headless,
     InternalCompatibility,
 }
 

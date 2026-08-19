@@ -9,9 +9,9 @@ use agent_client_protocol::{
     Agent, AuthenticateRequest, CancelNotification, CreateTerminalRequest, CreateTerminalResponse,
     EnvVariable, InitializeRequest, KillTerminalRequest, KillTerminalResponse, LoadSessionRequest,
     NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionResponse, SessionId,
-    TerminalOutputRequest, TerminalOutputResponse, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, SessionId, TerminalOutputRequest,
+    TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use orca_core::config::RunConfig;
 use serde::Serialize;
@@ -21,8 +21,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, oneshot};
 
 use super::agent::{
-    ACP_NOTIFICATION_CAPACITY, AcpClientBridge, AcpNotificationDelivery, AcpPermissionWaitError,
-    OrcaAcpAgent,
+    ACP_NOTIFICATION_CAPACITY, AcpClientBridge, AcpInteractionRequest, AcpInteractionResponseKind,
+    AcpInteractionWaitError, AcpInteractionWireResponse, AcpNotificationDelivery, OrcaAcpAgent,
 };
 use super::rpc_facade::{
     FrameDirection, InboundFrame, LocalHandlerCompletion, LocalHandlerFuture,
@@ -38,16 +38,17 @@ use crate::surface::{RuntimeSurfaceClientHandle, RuntimeSurfaceHostHandle};
 
 const ACP_REVERSE_REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 
-struct PendingPermissionRoute {
+struct PendingInteractionRoute {
     session_id: SessionId,
     key: String,
+    response_kind: AcpInteractionResponseKind,
     completed: oneshot::Sender<()>,
 }
 
 #[derive(Default)]
-struct PermissionRoutes {
+struct InteractionRoutes {
     next_request_id: Cell<i64>,
-    pending: Arc<Mutex<HashMap<i64, PendingPermissionRoute>>>,
+    pending: Arc<Mutex<HashMap<i64, PendingInteractionRoute>>>,
 }
 
 struct PendingReadTextFileRoute {
@@ -189,7 +190,7 @@ where
     let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(ACP_NOTIFICATION_CAPACITY);
     let (
         client_bridge,
-        permission_rx,
+        interaction_rx,
         read_text_file_rx,
         write_text_file_rx,
         terminal_create_rx,
@@ -201,7 +202,7 @@ where
             .with_client_bridge(Arc::clone(&client_bridge)),
     );
     let facade_slot = Rc::new(RefCell::new(None::<RpcFacadeHandle>));
-    let permission_routes = Rc::new(PermissionRoutes::default());
+    let interaction_routes = Rc::new(InteractionRoutes::default());
     let read_text_file_routes = Rc::new(ReadTextFileRoutes::default());
     let write_text_file_routes = Rc::new(WriteTextFileRoutes {
         response_observer: write_response_observer.clone(),
@@ -219,7 +220,7 @@ where
         let agent = Rc::clone(&agent);
         let facade_slot = Rc::clone(&facade_slot);
         let client_bridge = Arc::clone(&client_bridge);
-        let permission_routes = Rc::clone(&permission_routes);
+        let interaction_routes = Rc::clone(&interaction_routes);
         let read_text_file_routes = Rc::clone(&read_text_file_routes);
         let write_text_file_routes = Rc::clone(&write_text_file_routes);
         let terminal_create_routes = Rc::clone(&terminal_create_routes);
@@ -230,7 +231,7 @@ where
                 Rc::clone(&agent),
                 Rc::clone(&facade_slot),
                 Arc::clone(&client_bridge),
-                Rc::clone(&permission_routes),
+                Rc::clone(&interaction_routes),
                 Rc::clone(&read_text_file_routes),
                 Rc::clone(&write_text_file_routes),
                 Rc::clone(&terminal_create_routes),
@@ -240,7 +241,7 @@ where
             )
         })
     };
-    let response_routes = Arc::clone(&permission_routes.pending);
+    let response_routes = Arc::clone(&interaction_routes.pending);
     let read_response_routes = Arc::clone(&read_text_file_routes.pending);
     let write_response_routes = Arc::clone(&write_text_file_routes.pending);
     let terminal_create_response_routes = Arc::clone(&terminal_create_routes.pending);
@@ -249,7 +250,7 @@ where
     let response_session_resolver: ResponseSessionResolver = Arc::new(move |request_id| {
         response_routes
             .lock()
-            .expect("ACP permission route mutex is not poisoned")
+            .expect("ACP interaction route mutex is not poisoned")
             .get(&request_id)
             .map(|route| route.session_id.to_string())
             .or_else(|| {
@@ -299,11 +300,11 @@ where
 
     let notification_task =
         tokio::task::spawn_local(dispatch_notifications(facade.clone(), notification_rx));
-    let permission_task = tokio::task::spawn_local(dispatch_permissions(
+    let interaction_task = tokio::task::spawn_local(dispatch_interactions(
         facade.clone(),
         Arc::clone(&client_bridge),
-        Rc::clone(&permission_routes),
-        permission_rx,
+        Rc::clone(&interaction_routes),
+        interaction_rx,
     ));
     let mut read_text_file_task = tokio::task::spawn_local(dispatch_read_text_files(
         facade.clone(),
@@ -343,16 +344,16 @@ where
 
     let result = supervisor.wait().await.map(|_| ());
     client_bridge.cancel_all();
-    retire_all_permission_routes(&permission_routes);
+    retire_all_interaction_routes(&interaction_routes);
     retire_all_read_text_file_routes(&read_text_file_routes);
     retire_all_write_text_file_routes(&write_text_file_routes);
     retire_all_terminal_create_routes(&terminal_create_routes);
     retire_all_terminal_observation_routes(&terminal_observation_routes);
     retire_all_terminal_cleanup_routes(&terminal_cleanup_routes);
     notification_task.abort();
-    permission_task.abort();
+    interaction_task.abort();
     let _ = notification_task.await;
-    let _ = permission_task.await;
+    let _ = interaction_task.await;
     if tokio::time::timeout(Duration::from_secs(5), &mut read_text_file_task)
         .await
         .is_err()
@@ -395,7 +396,7 @@ fn handle_inbound(
     agent: Rc<OrcaAcpAgent>,
     facade_slot: Rc<RefCell<Option<RpcFacadeHandle>>>,
     client_bridge: Arc<AcpClientBridge>,
-    permission_routes: Rc<PermissionRoutes>,
+    interaction_routes: Rc<InteractionRoutes>,
     read_text_file_routes: Rc<ReadTextFileRoutes>,
     write_text_file_routes: Rc<WriteTextFileRoutes>,
     terminal_create_routes: Rc<TerminalCreateRoutes>,
@@ -412,7 +413,7 @@ fn handle_inbound(
                 && !handle_terminal_observation_response(&terminal_observation_routes, &value)
                 && !handle_terminal_cleanup_response(&terminal_cleanup_routes, &value)
             {
-                handle_permission_response(&client_bridge, &permission_routes, &value);
+                handle_interaction_response(&client_bridge, &interaction_routes, &value);
             }
             return Ok(empty_completion());
         }
@@ -498,7 +499,7 @@ fn handle_inbound(
                         message: format!("ACP cancel failed: {error:?}"),
                     }
                 })?;
-                retire_session_permission_routes(&client_bridge, &permission_routes, &session_id);
+                retire_session_interaction_routes(&client_bridge, &interaction_routes, &session_id);
                 retire_session_read_text_file_routes(&read_text_file_routes, &session_id);
                 retire_session_write_text_file_routes(&write_text_file_routes, &session_id);
                 retire_session_terminal_create_routes(&terminal_create_routes, &session_id);
@@ -586,21 +587,40 @@ async fn dispatch_notifications(
     }
 }
 
-async fn dispatch_permissions(
+/// Frozen intent: expose broker-selected ACP interactions as one reverse
+/// JSON-RPC request whose method and params exactly match the standard ACP or
+/// extension wire contract, and retire every response route on completion,
+/// transport failure, timeout, or cancellation.
+async fn dispatch_interactions(
     facade: RpcFacadeHandle,
     client_bridge: Arc<AcpClientBridge>,
-    routes: Rc<PermissionRoutes>,
-    mut requests: tokio::sync::mpsc::Receiver<super::agent::AcpPermissionRequest>,
+    routes: Rc<InteractionRoutes>,
+    mut requests: tokio::sync::mpsc::Receiver<AcpInteractionRequest>,
 ) {
     while let Some(request) = requests.recv().await {
         if !client_bridge.is_pending(&request.key) {
             continue;
         }
+        let session_id = request.request.session_id().clone();
+        let wire_method = request.request.wire_method();
+        let response_kind = request.request.response_kind();
+        let params = match request.request.params_value() {
+            Ok(params) => params,
+            Err(error) => {
+                client_bridge.complete_interaction(
+                    &request.key,
+                    Err(AcpInteractionWaitError::Client(format!(
+                        "ACP interaction request could not be encoded: {error}"
+                    ))),
+                );
+                continue;
+            }
+        };
         let request_id = routes.next_request_id.get();
         let Some(next_request_id) = request_id.checked_add(1) else {
-            client_bridge.complete_permission(
+            client_bridge.complete_interaction(
                 &request.key,
-                Err(AcpPermissionWaitError::Client(
+                Err(AcpInteractionWaitError::Client(
                     "ACP reverse request id exhausted".to_string(),
                 )),
             );
@@ -611,30 +631,28 @@ async fn dispatch_permissions(
         routes
             .pending
             .lock()
-            .expect("ACP permission route mutex is not poisoned")
+            .expect("ACP interaction route mutex is not poisoned")
             .insert(
                 request_id,
-                PendingPermissionRoute {
-                    session_id: request.request.session_id.clone(),
+                PendingInteractionRoute {
+                    session_id,
                     key: request.key.clone(),
+                    response_kind,
                     completed,
                 },
             );
         let value = json!({
             "jsonrpc": "2.0",
             "id": request_id,
-            "method": "session/request_permission",
-            "params": request.request,
+            "method": wire_method,
+            "params": params,
         });
         if let Err(error) = enqueue_json(&facade, value).await {
-            routes
-                .pending
-                .lock()
-                .expect("ACP permission route mutex is not poisoned")
-                .remove(&request_id);
-            client_bridge.complete_permission(
-                &request.key,
-                Err(AcpPermissionWaitError::Client(error.to_string())),
+            fail_interaction_route(
+                &client_bridge,
+                &routes,
+                request_id,
+                AcpInteractionWaitError::Client(error.to_string()),
             );
             break;
         }
@@ -642,18 +660,30 @@ async fn dispatch_permissions(
             .await
             .is_err()
         {
-            routes
-                .pending
-                .lock()
-                .expect("ACP permission route mutex is not poisoned")
-                .remove(&request_id);
-            client_bridge.complete_permission(
-                &request.key,
-                Err(AcpPermissionWaitError::Client(
-                    "ACP permission response timed out".to_string(),
-                )),
+            fail_interaction_route(
+                &client_bridge,
+                &routes,
+                request_id,
+                AcpInteractionWaitError::Client("ACP interaction response timed out".to_string()),
             );
         }
+    }
+}
+
+fn fail_interaction_route(
+    bridge: &AcpClientBridge,
+    routes: &InteractionRoutes,
+    request_id: i64,
+    error: AcpInteractionWaitError,
+) {
+    let route = routes
+        .pending
+        .lock()
+        .expect("ACP interaction route mutex is not poisoned")
+        .remove(&request_id);
+    if let Some(route) = route {
+        bridge.complete_interaction(&route.key, Err(error));
+        let _ = route.completed.send(());
     }
 }
 
@@ -2037,44 +2067,55 @@ fn handle_terminal_cleanup_response(routes: &TerminalCleanupRoutes, value: &Valu
     true
 }
 
-fn handle_permission_response(bridge: &AcpClientBridge, routes: &PermissionRoutes, value: &Value) {
+/// Frozen intent: consume at most one registered reverse-response route,
+/// decode its result according to the request's frozen response kind, and wake
+/// the broker waiter exactly once; malformed or remote-error responses remain
+/// fail-closed client errors.
+fn handle_interaction_response(
+    bridge: &AcpClientBridge,
+    routes: &InteractionRoutes,
+    value: &Value,
+) {
     let Some(request_id) = value.get("id").and_then(Value::as_i64) else {
         return;
     };
     let Some(route) = routes
         .pending
         .lock()
-        .expect("ACP permission route mutex is not poisoned")
+        .expect("ACP interaction route mutex is not poisoned")
         .remove(&request_id)
     else {
         return;
     };
     let result = if let Some(result) = value.get("result") {
-        serde_json::from_value::<RequestPermissionResponse>(result.clone()).map_err(|error| {
-            AcpPermissionWaitError::Client(format!("invalid ACP permission response: {error}"))
+        AcpInteractionWireResponse::decode(route.response_kind, result.clone()).map_err(|error| {
+            AcpInteractionWaitError::Client(format!("invalid ACP interaction response: {error}"))
         })
     } else {
         let message = value
             .get("error")
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
-            .unwrap_or("ACP permission request failed")
+            .unwrap_or("ACP interaction request failed")
             .to_string();
-        Err(AcpPermissionWaitError::Client(message))
+        Err(AcpInteractionWaitError::Client(message))
     };
-    bridge.complete_permission(&route.key, result);
+    bridge.complete_interaction(&route.key, result);
     let _ = route.completed.send(());
 }
 
-fn retire_session_permission_routes(
+/// Frozen intent: session cancellation removes every matching reverse route
+/// before waking broker waiters with cancellation, preventing late responses
+/// from being applied to a cancelled session.
+fn retire_session_interaction_routes(
     bridge: &AcpClientBridge,
-    routes: &PermissionRoutes,
+    routes: &InteractionRoutes,
     session_id: &SessionId,
 ) {
     let request_ids = routes
         .pending
         .lock()
-        .expect("ACP permission route mutex is not poisoned")
+        .expect("ACP interaction route mutex is not poisoned")
         .iter()
         .filter_map(|(request_id, route)| (route.session_id == *session_id).then_some(*request_id))
         .collect::<Vec<_>>();
@@ -2082,10 +2123,10 @@ fn retire_session_permission_routes(
         if let Some(route) = routes
             .pending
             .lock()
-            .expect("ACP permission route mutex is not poisoned")
+            .expect("ACP interaction route mutex is not poisoned")
             .remove(&request_id)
         {
-            bridge.complete_permission(&route.key, Err(AcpPermissionWaitError::Cancelled));
+            bridge.complete_interaction(&route.key, Err(AcpInteractionWaitError::Cancelled));
             let _ = route.completed.send(());
         }
     }
@@ -2243,11 +2284,11 @@ fn retire_session_terminal_cleanup_routes(routes: &TerminalCleanupRoutes, sessio
     }
 }
 
-fn retire_all_permission_routes(routes: &PermissionRoutes) {
+fn retire_all_interaction_routes(routes: &InteractionRoutes) {
     let pending = routes
         .pending
         .lock()
-        .expect("ACP permission route mutex is not poisoned")
+        .expect("ACP interaction route mutex is not poisoned")
         .drain()
         .map(|(_, route)| route)
         .collect::<Vec<_>>();
@@ -2430,6 +2471,8 @@ mod tests {
     use agent_client_protocol::{
         CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
         Implementation, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
+        RequestPermissionRequest, RequestPermissionResponse, ToolCallId, ToolCallUpdate,
+        ToolCallUpdateFields,
     };
     use orca_core::approval_types::{ActionKind, ApprovalDecision, ApprovalRequest};
     use orca_core::cancel::CancelToken;
@@ -2477,6 +2520,99 @@ mod tests {
 
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
+    }
+
+    fn pending_permission_route(
+        session_id: &str,
+        request_id: i64,
+    ) -> (
+        Arc<AcpClientBridge>,
+        InteractionRoutes,
+        std::thread::JoinHandle<Result<RequestPermissionResponse, AcpInteractionWaitError>>,
+        oneshot::Receiver<()>,
+    ) {
+        let (bridge, mut requests) = AcpClientBridge::new();
+        let waiter_bridge = Arc::clone(&bridge);
+        let request = RequestPermissionRequest::new(
+            SessionId::new(session_id),
+            ToolCallUpdate::new(
+                ToolCallId::new("route-cleanup"),
+                ToolCallUpdateFields::new(),
+            ),
+            Vec::new(),
+        );
+        let waiter = std::thread::spawn(move || waiter_bridge.request_permission(request));
+        let request = requests
+            .blocking_recv()
+            .expect("permission request registered");
+        let response_kind = request.request.response_kind();
+        let (completed, completion) = oneshot::channel();
+        let routes = InteractionRoutes::default();
+        routes
+            .pending
+            .lock()
+            .expect("ACP interaction route mutex is not poisoned")
+            .insert(
+                request_id,
+                PendingInteractionRoute {
+                    session_id: SessionId::new(session_id),
+                    key: request.key,
+                    response_kind,
+                    completed,
+                },
+            );
+        (bridge, routes, waiter, completion)
+    }
+
+    #[test]
+    fn interaction_routes_are_retired_on_error_timeout_and_cancel() {
+        let (bridge, routes, waiter, completion) = pending_permission_route("remote-error", 41);
+        handle_interaction_response(
+            &bridge,
+            &routes,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "error": { "code": -32000, "message": "remote denied" },
+            }),
+        );
+        assert!(routes.pending.lock().unwrap().is_empty());
+        completion
+            .blocking_recv()
+            .expect("remote error retires completion route");
+        assert_eq!(
+            waiter.join().unwrap(),
+            Err(AcpInteractionWaitError::Client("remote denied".to_string()))
+        );
+
+        let (bridge, routes, waiter, completion) = pending_permission_route("timeout", 42);
+        fail_interaction_route(
+            &bridge,
+            &routes,
+            42,
+            AcpInteractionWaitError::Client("ACP interaction response timed out".to_string()),
+        );
+        assert!(routes.pending.lock().unwrap().is_empty());
+        completion
+            .blocking_recv()
+            .expect("timeout retires completion route");
+        assert_eq!(
+            waiter.join().unwrap(),
+            Err(AcpInteractionWaitError::Client(
+                "ACP interaction response timed out".to_string()
+            ))
+        );
+
+        let (bridge, routes, waiter, completion) = pending_permission_route("cancelled", 43);
+        retire_session_interaction_routes(&bridge, &routes, &SessionId::new("cancelled"));
+        assert!(routes.pending.lock().unwrap().is_empty());
+        completion
+            .blocking_recv()
+            .expect("cancellation retires completion route");
+        assert_eq!(
+            waiter.join().unwrap(),
+            Err(AcpInteractionWaitError::Cancelled)
+        );
     }
 
     struct WaitForCancelExecutor;
@@ -3375,7 +3511,8 @@ mod tests {
     }
 
     #[test]
-    fn production_connection_routes_only_standard_tool_approval_and_fails_extensions_closed() {
+    fn production_connection_routes_standard_interactions_and_fails_unnegotiated_extensions_closed()
+    {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3468,12 +3605,66 @@ mod tests {
                 StandardInteractionOutcome::ToolApproval(ApprovalDecision::Deny)
             );
 
-            for (index, (request_id, prompt, expected)) in [
-                (
-                    4,
-                    "extensionless permission request",
-                    StandardInteractionOutcome::PermissionRequest(PermissionResponseDecision::Deny),
+            write_request(
+                &mut client_write,
+                20,
+                "session/new",
+                NewSessionRequest::new(cwd.path().to_path_buf()),
+            )
+            .await;
+            let permission_session =
+                read_response(&mut client_read, 20).await["result"]["sessionId"]
+                    .as_str()
+                    .expect("permission session id")
+                    .to_string();
+            write_request(
+                &mut client_write,
+                4,
+                "session/prompt",
+                PromptRequest::new(
+                    SessionId::new(permission_session),
+                    vec![ContentBlock::from(
+                        "standard permission request".to_string(),
+                    )],
                 ),
+            )
+            .await;
+            let permission_prompt = loop {
+                let value = read_value(&mut client_read).await;
+                if value["method"] == "session/request_permission" {
+                    permission_requests += 1;
+                    assert_eq!(
+                        value["params"]["options"]
+                            .as_array()
+                            .expect("permission options")
+                            .len(),
+                        6
+                    );
+                    assert!(value["params"]["toolCall"]["rawInput"].is_object());
+                    write_raw_response(
+                        &mut client_write,
+                        value["id"].as_i64().expect("permission request id"),
+                        serde_json::to_value(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(
+                                agent_client_protocol::SelectedPermissionOutcome::new(
+                                    "reject_once",
+                                ),
+                            ),
+                        ))
+                        .unwrap(),
+                    )
+                    .await;
+                } else if value.get("id").and_then(Value::as_i64) == Some(4) {
+                    break value;
+                }
+            };
+            assert_eq!(permission_prompt["result"]["stopReason"], "end_turn");
+            assert_eq!(
+                outcome_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
+                StandardInteractionOutcome::PermissionRequest(PermissionResponseDecision::Deny)
+            );
+
+            for (index, (request_id, prompt, expected)) in [
                 (
                     5,
                     "extensionless user input",
@@ -3488,7 +3679,7 @@ mod tests {
             .into_iter()
             .enumerate()
             {
-                let session_request_id = 20 + index as i64;
+                let session_request_id = 21 + index as i64;
                 write_request(
                     &mut client_write,
                     session_request_id,
@@ -3517,6 +3708,16 @@ mod tests {
                         value["method"], "session/request_permission",
                         "extension-only interaction reached standard ACP wire: {prompt}"
                     );
+                    assert_ne!(
+                        value["method"],
+                        format!("_{}", crate::acp::agent::ORCA_ACP_USER_INPUT_METHOD),
+                        "unnegotiated user input extension reached ACP wire"
+                    );
+                    assert_ne!(
+                        value["method"],
+                        format!("_{}", crate::acp::agent::ORCA_ACP_MCP_ELICITATION_METHOD),
+                        "unnegotiated MCP extension reached ACP wire"
+                    );
                     if value.get("id").and_then(Value::as_i64) == Some(request_id) {
                         break value;
                     }
@@ -3532,7 +3733,163 @@ mod tests {
                     expected
                 );
             }
-            assert_eq!(permission_requests, 1);
+            assert_eq!(permission_requests, 2);
+
+            client_write.shutdown().await.unwrap();
+            tokio::time::timeout(TEST_TIMEOUT, connection)
+                .await
+                .expect("connection shutdown")
+                .expect("connection task")
+                .expect("clean connection");
+            host.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn production_connection_routes_negotiated_user_input_and_mcp_extensions() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+            let host = RuntimeHost::start_with_executor(Arc::new(StandardInteractionExecutor {
+                behaviors: Mutex::new(vec![
+                    StandardInteractionBehavior::UserInput,
+                    StandardInteractionBehavior::McpElicitation,
+                ]),
+                outcome_tx,
+            }))
+            .unwrap();
+            let cwd = tempfile::tempdir().unwrap();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (client_read, mut client_write) = tokio::io::split(client);
+            let (server_read, server_write) = tokio::io::split(server);
+            let connection = tokio::task::spawn_local(run_connection(
+                host.surface_handle(),
+                test_config(cwd.path().to_path_buf()),
+                server_read,
+                server_write,
+            ));
+            let mut client_read = BufReader::new(client_read);
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                crate::acp::agent::ORCA_ACP_INTERACTION_CAPABILITIES_META_KEY.to_string(),
+                json!({
+                    "version": 1,
+                    "userInput": true,
+                    "mcpElicitation": true,
+                }),
+            );
+            write_request(
+                &mut client_write,
+                1,
+                "initialize",
+                InitializeRequest::new(ProtocolVersion::V1)
+                    .client_info(Implementation::new("extension-test", "0.0.0"))
+                    .client_capabilities(ClientCapabilities::new().meta(meta)),
+            )
+            .await;
+            let _ = read_response(&mut client_read, 1).await;
+
+            for (index, (prompt, expected_method)) in [
+                (
+                    "negotiated user input",
+                    format!("_{}", crate::acp::agent::ORCA_ACP_USER_INPUT_METHOD),
+                ),
+                (
+                    "negotiated MCP elicitation",
+                    format!("_{}", crate::acp::agent::ORCA_ACP_MCP_ELICITATION_METHOD),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let new_session_id = 10 + index as i64;
+                let prompt_id = 20 + index as i64;
+                write_request(
+                    &mut client_write,
+                    new_session_id,
+                    "session/new",
+                    NewSessionRequest::new(cwd.path().to_path_buf()),
+                )
+                .await;
+                let session_id =
+                    read_response(&mut client_read, new_session_id).await["result"]["sessionId"]
+                        .as_str()
+                        .expect("extension session id")
+                        .to_string();
+                write_request(
+                    &mut client_write,
+                    prompt_id,
+                    "session/prompt",
+                    PromptRequest::new(
+                        SessionId::new(session_id.clone()),
+                        vec![ContentBlock::from(prompt.to_string())],
+                    ),
+                )
+                .await;
+                let extension_request = loop {
+                    let value = read_value(&mut client_read).await;
+                    if value["method"] == expected_method {
+                        break value;
+                    }
+                };
+                assert_eq!(extension_request["params"]["version"], 1);
+                assert_eq!(extension_request["params"]["sessionId"], session_id);
+                let interaction_id = extension_request["params"]["interactionId"]
+                    .as_str()
+                    .expect("extension interaction id")
+                    .to_string();
+                let response = if index == 0 {
+                    assert_eq!(
+                        extension_request["params"]["request"]["question"],
+                        "Continue?"
+                    );
+                    assert_eq!(
+                        extension_request["params"]["request"]["suggestions"],
+                        json!(["yes", "no"])
+                    );
+                    json!({
+                        "version": 1,
+                        "sessionId": session_id,
+                        "interactionId": interaction_id,
+                        "response": { "outcome": "answer", "value": "yes" },
+                    })
+                } else {
+                    assert_eq!(extension_request["params"]["serverName"], "docs");
+                    assert_eq!(extension_request["params"]["request"]["mode"], "url");
+                    json!({
+                        "version": 1,
+                        "sessionId": session_id,
+                        "interactionId": interaction_id,
+                        "response": { "outcome": "decline" },
+                    })
+                };
+                write_raw_response(
+                    &mut client_write,
+                    extension_request["id"]
+                        .as_i64()
+                        .expect("extension request id"),
+                    response,
+                )
+                .await;
+                let prompt_response = read_response(&mut client_read, prompt_id).await;
+                assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+                let outcome = outcome_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+                if index == 0 {
+                    assert_eq!(
+                        outcome,
+                        StandardInteractionOutcome::UserInput(Some("yes".to_string()))
+                    );
+                } else {
+                    assert_eq!(
+                        outcome,
+                        StandardInteractionOutcome::McpElicitation(McpElicitationResponse::Decline)
+                    );
+                }
+            }
 
             client_write.shutdown().await.unwrap();
             tokio::time::timeout(TEST_TIMEOUT, connection)
@@ -4363,23 +4720,43 @@ mod tests {
                     (*terminal_id != released_terminal).then_some((*terminal_id).to_string())
                 })
                 .expect("one killed terminal remains unreleased");
-            let outcome_result =
-                tokio::task::spawn_blocking(move || outcome_rx.recv_timeout(TEST_TIMEOUT))
-                    .await
-                    .expect("multi-terminal outcome task");
-            assert_eq!(
-                outcome_result.unwrap_or_else(|_| {
+            let outcome_deadline = Instant::now() + TEST_TIMEOUT;
+            let mut client_write_closed = false;
+            let outcome_result = loop {
+                match outcome_rx.try_recv() {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("multi-terminal outcome channel disconnected")
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                if Instant::now() >= outcome_deadline {
                     crate::acp_stall_trace::flush_and_print();
-                    panic!("multi-terminal outcome timed out")
-                }),
-                Err(io::ErrorKind::Other)
-            );
+                    panic!("multi-terminal outcome timed out");
+                }
+                if client_write_closed {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+                if let Ok(cleanup_request) =
+                    tokio::time::timeout(Duration::from_millis(10), read_value(&mut client_read))
+                        .await
+                {
+                    assert_eq!(cleanup_request["method"], "terminal/release");
+                    assert_eq!(cleanup_request["params"]["terminalId"], unresolved_terminal);
+                    let _ = client_write.shutdown().await;
+                    client_write_closed = true;
+                }
+            };
+            assert_eq!(outcome_result, Err(io::ErrorKind::Other));
             assert_persisted_terminal_cleanup_ambiguous(
                 &transcript_path,
                 crate::surface::ExternalEffectKind::TerminalRelease,
                 &unresolved_terminal,
             );
-            let _ = client_write.shutdown().await;
+            if !client_write_closed {
+                let _ = client_write.shutdown().await;
+            }
             drop(client_read);
             let _ = tokio::time::timeout(TEST_TIMEOUT, connection)
                 .await

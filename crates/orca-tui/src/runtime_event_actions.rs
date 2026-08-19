@@ -217,11 +217,11 @@ mod tests {
     use crate::terminal_presentation::TerminalNotification;
     use crate::types::{
         ChatMessage, PendingWorkflowNotification, TuiInteractionKey, TuiInteractionKind,
+        TuiMcpElicitationMode,
     };
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::{ThemeName, VimInsertEscapeSequence};
     use orca_runtime::mentions::{MentionBinding, MentionBindings, MentionFileKind, MentionTarget};
-    use orca_runtime::runtime_pending_interaction::RuntimeMcpElicitationMode;
     use std::path::PathBuf;
     use std::time::Instant;
     use tui_textarea::CursorMove;
@@ -947,7 +947,7 @@ mod tests {
                 TuiEvent::McpElicitationRequested {
                     key: interaction_key(TuiInteractionKind::McpElicitation, "mcp"),
                     server_name: "secret-server".to_string(),
-                    mode: RuntimeMcpElicitationMode::Form,
+                    mode: TuiMcpElicitationMode::Form,
                     message: "secret-message".to_string(),
                     url: Some("secret-url".to_string()),
                     requested_schema_json: Some("secret-schema".to_string()),

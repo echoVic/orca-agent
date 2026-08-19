@@ -155,6 +155,7 @@ pub struct LegacyTurnId(pub DisplayText);
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OperationOrigin {
     TuiUser,
+    Headless,
     TuiWorkflowNotification {
         result_id: SurfaceWorkflowResultId,
     },
@@ -181,6 +182,7 @@ pub enum OperationOrigin {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OperationIngressCorrelation {
     TuiUser,
+    Headless,
     TuiWorkflowNotification {
         result_id: SurfaceWorkflowResultId,
     },

@@ -4114,6 +4114,17 @@ done
                 response: TuiInteractionResponse::Approval(true),
             });
 
+            let permission_key = match harness
+                .recv_until(|event| matches!(event, TuiEvent::PermissionApprovalNeeded { .. }))
+            {
+                TuiEvent::PermissionApprovalNeeded { key, .. } => key,
+                _ => unreachable!(),
+            };
+            harness.send(UserAction::RespondToInteraction {
+                key: permission_key,
+                response: TuiInteractionResponse::Permission(true),
+            });
+
             let terminal =
                 harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
             assert!(matches!(

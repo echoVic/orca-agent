@@ -30,7 +30,7 @@ use orca_core::thread_identity::TurnId;
 use orca_mcp::McpRegistry;
 use orca_runtime::controller::{ThreadTurnOutcome, ThreadTurnRequest};
 use orca_runtime::history::{self, SessionTranscript};
-use orca_runtime::lifecycle::{RuntimeApprovalHandler, RuntimeTaskStatus, RuntimeUserInputRequest};
+use orca_runtime::lifecycle::{RuntimeApprovalHandler, RuntimeTaskStatus};
 use orca_runtime::provider_stream::{
     RuntimeProviderSuspensionControl, RuntimeProviderSuspensionEvent,
 };
@@ -40,9 +40,6 @@ use orca_runtime::runtime_host::{
     InterruptOperationResult, OperationOutcome, ResumeOperationResult, RuntimeHost,
     RuntimeHostError, RuntimeThreadMutation, RuntimeThreadStartRequest, RuntimeThreadState,
     SteerOperationResult, ThreadOperationExecutor, ThreadOperationOutcome,
-};
-use orca_runtime::runtime_pending_interaction::{
-    RuntimePendingInteractionRecord, RuntimePendingInteractionStore,
 };
 use orca_runtime::surface::{
     AttachResult, CompactionState, FreshAttachRequest, MutationReply, OperationPatch,
@@ -4365,76 +4362,6 @@ fn goal_run_rejects_automatic_continuation_in_plan_mode() {
         assert!(observer.events().iter().any(|event| {
             event.event_type == EventType::GoalContinuationRejected
                 && event.payload["reason"] == "plan_mode"
-        }));
-
-        host.shutdown().unwrap();
-    });
-}
-
-#[test]
-fn legacy_goal_pending_store_does_not_block_continuation() {
-    with_orca_home(|_home| {
-        let executor = Arc::new(ScriptedExecutor::new([TestBehavior::RecordUsage {
-            input_tokens: 10,
-            output_tokens: 5,
-            status: RunStatus::Success,
-        }]));
-        let cwd = tempfile::tempdir().unwrap();
-        let host = RuntimeHost::start_with_executor(executor.clone()).unwrap();
-        let mut config = test_config(cwd.path().to_path_buf());
-        config.history_mode = HistoryMode::Record;
-        let thread = host
-            .start_thread(config, "pending-interaction goal")
-            .unwrap();
-        let session_id = thread.session_id().unwrap().to_string();
-        let runtime = thread.goal_runtime().unwrap();
-        runtime
-            .create(orca_runtime::goal_store::CreateGoalInput {
-                session_id: session_id.clone(),
-                objective: "wait for user input".to_string(),
-                token_budget: Some(10),
-                now: 1,
-            })
-            .unwrap();
-        let pending = RuntimePendingInteractionStore::default();
-        pending
-            .insert(RuntimePendingInteractionRecord::from_user_input(
-                &RuntimeUserInputRequest {
-                    id: "goal-input-1".to_string(),
-                    question: "Choose a target?".to_string(),
-                    choices: vec!["A".to_string(), "B".to_string()],
-                },
-            ))
-            .unwrap();
-        let observer = Arc::new(RecordingEventObserver::default());
-
-        let operation = thread
-            .start_turn(
-                HostedTurnRequest::new("wait for interaction")
-                    .with_operation_kind(HostedOperationKind::GoalRun)
-                    .with_goal_tools(true)
-                    .with_pending_interactions(pending)
-                    .with_event_observer(observer.clone()),
-                io::sink(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            operation.wait_timeout(TEST_TIMEOUT).unwrap().outcome(),
-            &OperationOutcome::Completed(RunStatus::Success)
-        );
-        assert_eq!(executor.call_count(), 1);
-        assert!(matches!(
-            runtime.read(&session_id).unwrap().unwrap().state,
-            orca_core::goal_runtime::GoalState::BudgetLimited
-        ));
-        assert!(observer.events().iter().any(|event| {
-            event.event_type == EventType::GoalContinuationRejected
-                && event.payload["reason"] == "budget_limited"
-        }));
-        assert!(!observer.events().iter().any(|event| {
-            event.event_type == EventType::GoalContinuationRejected
-                && event.payload["reason"] == "pending_interaction"
         }));
 
         host.shutdown().unwrap();

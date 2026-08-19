@@ -1835,46 +1835,6 @@
       "preserve_item_id"
     ],
     [
-      "interaction.tool_approval",
-      "crates/orca-runtime/src/runtime_pending_interaction.rs",
-      10,
-      "interaction.tool_approval",
-      "Interaction",
-      "LifecyclePatchSet",
-      "typed_projection",
-      "durable_broker_revision_route_and_response"
-    ],
-    [
-      "interaction.permission",
-      "crates/orca-runtime/src/runtime_pending_interaction.rs",
-      10,
-      "interaction.permission",
-      "Interaction",
-      "LifecyclePatchSet",
-      "typed_projection",
-      "durable_broker_revision_route_and_response"
-    ],
-    [
-      "interaction.user_input",
-      "crates/orca-runtime/src/runtime_pending_interaction.rs",
-      10,
-      "interaction.user_input",
-      "Interaction",
-      "LifecyclePatchSet",
-      "typed_projection",
-      "durable_broker_revision_route_and_response"
-    ],
-    [
-      "interaction.mcp_elicitation",
-      "crates/orca-runtime/src/runtime_pending_interaction.rs",
-      10,
-      "interaction.mcp_elicitation",
-      "Interaction",
-      "LifecyclePatchSet",
-      "typed_projection",
-      "closed_schema_and_response"
-    ],
-    [
       "interaction.background_approval",
       "crates/orca-tui/src/background_tasks.rs",
       100,
@@ -12893,6 +12853,7 @@
       "TaskRevision",
       "ThreadOwnerEpoch",
       "ThreadOwnershipLease",
+      "ToolInvocationRevision",
       "TrustRevision",
       "Unit",
       "UnixMillis",
@@ -13177,6 +13138,7 @@
       "TaskPatch",
       "ThreadPersistence",
       "ToolInvocationStarted",
+      "ToolInvocationStartedReceiptV1",
       "ToolPatch",
       "ToolTerminalSource",
       "WorkflowPatch"

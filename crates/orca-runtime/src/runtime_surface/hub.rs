@@ -1530,7 +1530,8 @@ fn interaction_role_priority(role: SurfaceAttachmentRole) -> u8 {
         SurfaceAttachmentRole::Tui => 0,
         SurfaceAttachmentRole::Acp => 1,
         SurfaceAttachmentRole::Jsonl => 2,
-        SurfaceAttachmentRole::InternalCompatibility => 3,
+        SurfaceAttachmentRole::Headless => 3,
+        SurfaceAttachmentRole::InternalCompatibility => 4,
     }
 }
 

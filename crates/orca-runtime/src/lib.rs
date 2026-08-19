@@ -54,7 +54,6 @@ pub mod runtime_host;
 mod runtime_lifecycle;
 mod runtime_model_route;
 mod runtime_normal_tool;
-pub mod runtime_pending_interaction;
 pub mod runtime_permission;
 pub(crate) mod runtime_readonly_tool_turn;
 pub(crate) mod runtime_special;
@@ -292,13 +291,14 @@ pub mod surface {
         TaskPatch, TaskRevision, TerminalProjectionDeferredState, TerminalizationCause,
         ThreadCursorAckRequirement, ThreadItemTurnFilter, ThreadOwnerEpoch, ThreadOwnershipLease,
         ThreadPageCursor, ThreadPageQuery, ThreadPersistence, ThreadSettingsReceipt,
-        ToolInvocationStarted, ToolPatch, ToolTerminalSource, TransferBackgroundOutput,
-        TrustRevision, TurnItemsView, TurnRequestBudgetScope, UnavailableMutationError,
-        UncommittedMutation, Unit, UnixMillis, UsageRevision, UsageTotals, Uuid, UuidV7,
-        ValidatedInteractionResponse, WaitOperationTerminalRequest, WaitOperationTerminalResult,
-        WorkflowCatalogRevision, WorkflowControlAction, WorkflowControlOutput, WorkflowPatch,
-        WorkflowRevision, ZeroizingProcessLocalSecret, canonical_batch_digest,
-        canonical_batch_encoded_bytes, canonical_event_digest, canonical_replayability_digest,
+        ToolInvocationRevision, ToolInvocationStarted, ToolInvocationStartedReceiptV1, ToolPatch,
+        ToolTerminalSource, TransferBackgroundOutput, TrustRevision, TurnItemsView,
+        TurnRequestBudgetScope, UnavailableMutationError, UncommittedMutation, Unit, UnixMillis,
+        UsageRevision, UsageTotals, Uuid, UuidV7, ValidatedInteractionResponse,
+        WaitOperationTerminalRequest, WaitOperationTerminalResult, WorkflowCatalogRevision,
+        WorkflowControlAction, WorkflowControlOutput, WorkflowPatch, WorkflowRevision,
+        ZeroizingProcessLocalSecret, canonical_batch_digest, canonical_batch_encoded_bytes,
+        canonical_event_digest, canonical_replayability_digest,
         decide_post_materialization_recovery, preflight_batch, reconcile_finalize_intent,
         reduce_batch, select_shutdown_cause,
     };

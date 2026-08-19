@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -77,6 +77,12 @@ use crate::runtime_actor::goal::{
 use crate::runtime_surface as surface;
 use crate::tasks::{DurableTypedProviderOutcome, MainSessionTerminalUpdate, TaskRegistry};
 use crate::thread::RuntimeThread;
+use crate::tool_execution::{
+    RecoveredPermissionRetryAuthorization, RecoveredToolExecutionDependencies,
+    RecoveredToolInvocationAuthorization, RecoveredToolInvocationCommitter,
+    ToolExecutionCompletion, execute_recovered_permission_retry_intent,
+    execute_recovered_tool_intent,
+};
 
 #[path = "runtime_actor/thread_state.rs"]
 mod thread_state;
@@ -737,14 +743,6 @@ impl HostedTurnRequest {
         F: Fn(GenerationFence, CancelToken) -> HostedGenerationHandlers + Send + Sync + 'static,
     {
         self.generation_handler_factory = Some(Arc::new(factory));
-        self
-    }
-
-    /// Compatibility no-op. Pending interactions are runtime-surface owned.
-    pub fn with_pending_interactions(
-        self,
-        _pending_interactions: crate::runtime_pending_interaction::RuntimePendingInteractionStore,
-    ) -> Self {
         self
     }
 
@@ -1632,11 +1630,30 @@ impl RuntimePermissionRequestHandler for RuntimeSurfacePermissionHandler {
         &self,
         request: &crate::runtime_permission::RuntimePermissionRequest,
     ) -> io::Result<crate::runtime_permission::RuntimePermissionResponse> {
+        self.request_permissions_with_retry_overlay(request, None)
+    }
+
+    fn request_permissions_pre_side_effect(
+        &self,
+        request: &crate::runtime_permission::RuntimePermissionRequest,
+        permission_overlay: &crate::runtime_permission::TurnPermissionOverlay,
+    ) -> io::Result<crate::runtime_permission::RuntimePermissionResponse> {
+        self.request_permissions_with_retry_overlay(request, Some(permission_overlay.clone()))
+    }
+}
+
+impl RuntimeSurfacePermissionHandler {
+    fn request_permissions_with_retry_overlay(
+        &self,
+        request: &crate::runtime_permission::RuntimePermissionRequest,
+        retry_overlay: Option<crate::runtime_permission::TurnPermissionOverlay>,
+    ) -> io::Result<crate::runtime_permission::RuntimePermissionResponse> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx
             .try_send(ThreadCommand::SurfaceRequestPermission {
                 fence: self.fence.clone(),
                 request: request.clone(),
+                retry_overlay,
                 reply: reply_tx,
             })
             .map_err(|error| match error {
@@ -2831,6 +2848,222 @@ pub struct RuntimeThreadHandle {
     surface: surface::RuntimeSurfaceHandle,
 }
 
+#[derive(Clone, PartialEq)]
+pub struct HeadlessInteractionCheckpoint {
+    pub interaction: surface::SurfaceInteractionView,
+    pub selector: surface::InteractionSelector,
+}
+
+pub struct HeadlessSurfaceSession {
+    thread: RuntimeThreadHandle,
+    client: surface::RuntimeSurfaceClientHandle,
+    subscription: surface::SurfaceSubscriptionReceiver,
+    pending_interactions: VecDeque<surface::SurfaceInteractionId>,
+    delivered_interactions: HashSet<surface::SurfaceInteractionId>,
+    baseline: Arc<surface::SurfaceSnapshot>,
+}
+
+pub struct HeadlessOperationHandle {
+    operation_id: surface::SurfaceOperationId,
+    terminal_rx: mpsc::Receiver<
+        Result<surface::WaitOperationTerminalResult, surface::SurfaceClientCommandError>,
+    >,
+}
+
+impl HeadlessOperationHandle {
+    pub fn operation_id(&self) -> &surface::SurfaceOperationId {
+        &self.operation_id
+    }
+
+    pub fn try_terminal(&self) -> io::Result<Option<surface::OperationTerminalAtCursor>> {
+        match self.terminal_rx.try_recv() {
+            Ok(Ok(surface::WaitOperationTerminalResult::Terminal { value })) => Ok(Some(value)),
+            Ok(Ok(_)) => Err(io::Error::other(
+                "headless operation terminal requires runtime repair",
+            )),
+            Ok(Err(error)) => Err(io::Error::other(format!(
+                "headless operation terminal wait failed: {error:?}"
+            ))),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "headless operation terminal wait closed",
+            )),
+        }
+    }
+}
+
+impl HeadlessSurfaceSession {
+    /// Start a headless user turn through the typed runtime surface. The
+    /// operation identity, input, generation, output writer and terminal are
+    /// committed by the broker-owned surface path before execution.
+    pub fn start_turn<W>(&self, prompt: &str, writer: W) -> io::Result<HeadlessOperationHandle>
+    where
+        W: io::Write + Send + 'static,
+    {
+        let intent = surface::OperationRequestIntent {
+            correlation: surface::OperationIngressCorrelation::Headless,
+            kind: surface::OperationKind::UserTurn,
+            input: Some(surface::SurfaceInputRequest {
+                blocks: surface::NonEmptyVec::try_new(vec![
+                    surface::SurfaceInputRequestBlock::Text {
+                        text: surface::DisplayText::new(prompt),
+                    },
+                ])
+                .expect("headless prompt has one input block"),
+            }),
+            replayability: surface::ReplayabilityRequest::CaptureReplayableCapsule,
+            settings_preparation: surface::OperationSettingsPreparation::UseCurrent {
+                expected_settings_revision: self.baseline.settings.thread_revision,
+                expected_policy_epoch: self.baseline.settings.effective.policy_epoch,
+            },
+        };
+        let reserved = committed_headless_value(
+            self.client
+                .reserve_operation(surface::SurfaceRequestId::new(), intent)
+                .map_err(headless_surface_error)?,
+            "reserve",
+        )?;
+        let admission = committed_headless_value(
+            self.client
+                .admit_reserved_with_output(
+                    surface::SurfaceRequestId::new(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                    PassthroughHostedOperationWriter::new(writer),
+                )
+                .map_err(headless_surface_error)?,
+            "admit",
+        )?;
+        let operation_id = match admission {
+            surface::AdmissionOutput::Admitted { operation_id, .. } => operation_id,
+            surface::AdmissionOutput::Queued { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "headless operation was queued instead of admitted",
+                ));
+            }
+        };
+        let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
+        let client = self.client.clone();
+        let wait_operation_id = operation_id.clone();
+        thread::spawn(move || {
+            let result =
+                client.wait_operation_terminal(surface::SurfaceRequestId::new(), wait_operation_id);
+            let _ = terminal_tx.send(result);
+        });
+        Ok(HeadlessOperationHandle {
+            operation_id,
+            terminal_rx,
+        })
+    }
+
+    /// Project the next broker-owned interaction routed to this Headless
+    /// attachment. The returned selector contains the exact current private
+    /// token, route epoch, grant and operation fence.
+    pub fn try_next_interaction(&mut self) -> io::Result<Option<HeadlessInteractionCheckpoint>> {
+        self.collect_interaction_events();
+        while let Some(interaction_id) = self.pending_interactions.pop_front() {
+            if self.delivered_interactions.contains(&interaction_id) {
+                continue;
+            }
+            let checkpoint = self
+                .thread
+                .project_headless_interaction(self.client.clone(), interaction_id.clone())?;
+            if let Some(checkpoint) = checkpoint {
+                self.delivered_interactions.insert(interaction_id);
+                return Ok(Some(checkpoint));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Submit one typed answer only if the callback's exact selector is still
+    /// current, then let respond_interaction_by_id perform the broker's full
+    /// token/route/grant/fence/type validation and durable settlement.
+    pub fn respond_interaction(
+        &self,
+        checkpoint: &HeadlessInteractionCheckpoint,
+        answer: surface::SurfaceClientInteractionAnswer,
+    ) -> io::Result<()> {
+        let current = self
+            .thread
+            .project_headless_interaction(
+                self.client.clone(),
+                checkpoint.interaction.interaction_id.clone(),
+            )?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interaction is not pending"))?;
+        if current.selector != checkpoint.selector {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "headless interaction selector is stale",
+            ));
+        }
+        match self.client.respond_interaction_by_id(
+            surface::SurfaceRequestId::new(),
+            checkpoint.interaction.interaction_id.clone(),
+            answer,
+        ) {
+            Ok(surface::MutationReply::Committed { .. })
+            | Ok(surface::MutationReply::Deferred { .. }) => Ok(()),
+            Ok(surface::MutationReply::Uncommitted { .. }) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime rejected headless interaction response",
+            )),
+            Err(error) => Err(headless_surface_error(error)),
+        }
+    }
+
+    fn collect_interaction_events(&mut self) {
+        while let Some(item) = self.subscription.try_recv() {
+            if let surface::SurfaceSubscriptionItem::Batch { batch } = item {
+                for envelope in batch.events.as_slice() {
+                    match &envelope.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Requested { interaction },
+                        ) => self
+                            .pending_interactions
+                            .push_back(interaction.interaction_id.clone()),
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::RouteChanged { interaction_id, .. },
+                        ) => self.pending_interactions.push_back(interaction_id.clone()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn committed_headless_value<T>(reply: surface::MutationReply<T>, action: &str) -> io::Result<T> {
+    match reply {
+        surface::MutationReply::Committed { value, .. } => Ok(value),
+        surface::MutationReply::Deferred { .. } => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("headless operation {action} was deferred"),
+        )),
+        surface::MutationReply::Uncommitted { .. } => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("headless operation {action} was rejected"),
+        )),
+    }
+}
+
+fn headless_surface_error(error: surface::SurfaceClientCommandError) -> io::Error {
+    io::Error::other(format!(
+        "headless runtime surface command failed: {error:?}"
+    ))
+}
+
+fn headless_interaction_capabilities() -> BTreeSet<surface::SurfaceInteractionKind> {
+    BTreeSet::from([
+        surface::SurfaceInteractionKind::ToolApproval,
+        surface::SurfaceInteractionKind::PermissionRequest,
+        surface::SurfaceInteractionKind::UserInput,
+        surface::SurfaceInteractionKind::McpElicitation,
+    ])
+}
+
 impl RuntimeThreadHandle {
     pub fn thread_id(&self) -> &str {
         &self.thread_id
@@ -2862,6 +3095,107 @@ impl RuntimeThreadHandle {
 
     pub fn surface(&self) -> surface::RuntimeSurfaceHandle {
         self.surface.clone()
+    }
+
+    fn headless_surface(&self) -> Option<surface::RuntimeSurfaceHandle> {
+        let authority = surface::SurfaceAttachAuthority::new(
+            self.surface.host_incarnation().clone(),
+            self.surface.thread_id().clone(),
+            surface::SurfaceAttachmentRole::Headless,
+            surface::NonEmptySet::try_new(BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::RespondGrantedInteraction,
+            ]))
+            .expect("Headless surface grant is non-empty"),
+            surface::NonEmptySet::try_new(BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+            ]))
+            .expect("Headless surface required grant is non-empty"),
+            headless_interaction_capabilities(),
+        );
+        self.surface.with_authority(authority)
+    }
+
+    /// Attach a distinct Headless surface. Interactive capability is granted
+    /// only when a typed handler is configured; otherwise interactions remain
+    /// unavailable and the existing fail-closed/ApprovalRequired behavior wins.
+    pub fn attach_headless_surface(&self, interactive: bool) -> io::Result<HeadlessSurfaceSession> {
+        let surface = self
+            .headless_surface()
+            .ok_or_else(|| io::Error::other("headless runtime surface is unavailable"))?;
+        let mut requested_capabilities = BTreeSet::from([
+            surface::SurfaceCapability::ReadSnapshot,
+            surface::SurfaceCapability::SubmitOperation,
+            surface::SurfaceCapability::ControlBoundOperation,
+        ]);
+        let interaction_capabilities = if interactive {
+            requested_capabilities.insert(surface::SurfaceCapability::RespondGrantedInteraction);
+            headless_interaction_capabilities()
+        } else {
+            BTreeSet::new()
+        };
+        let attachment = match surface.attach_fresh(surface::FreshAttachRequest {
+            request_id: surface::SurfaceRequestId::new(),
+            role: surface::SurfaceAttachmentRole::Headless,
+            requested_capabilities,
+            interaction_capabilities,
+        }) {
+            surface::AttachResult::FreshAttached { attachment } => attachment,
+            _ => return Err(io::Error::other("headless runtime surface attach failed")),
+        };
+        let mut pending_interactions = VecDeque::new();
+        if interactive {
+            pending_interactions.extend(
+                attachment
+                    .baseline
+                    .snapshot
+                    .interactions
+                    .iter()
+                    .filter(|interaction| {
+                        matches!(
+                            interaction.lifecycle,
+                            surface::SurfaceInteractionLifecycle::Requested
+                        ) && matches!(
+                            interaction.kind,
+                            surface::SurfaceInteractionKind::ToolApproval
+                                | surface::SurfaceInteractionKind::PermissionRequest
+                                | surface::SurfaceInteractionKind::UserInput
+                                | surface::SurfaceInteractionKind::McpElicitation
+                        )
+                    })
+                    .map(|interaction| interaction.interaction_id.clone()),
+            );
+        }
+        let subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .ok_or_else(|| io::Error::other("headless surface subscription claim failed"))?;
+        Ok(HeadlessSurfaceSession {
+            thread: self.clone(),
+            client: attachment.client,
+            subscription,
+            pending_interactions,
+            delivered_interactions: HashSet::new(),
+            baseline: attachment.baseline.snapshot.clone(),
+        })
+    }
+
+    fn project_headless_interaction(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        interaction_id: surface::SurfaceInteractionId,
+    ) -> io::Result<Option<HeadlessInteractionCheckpoint>> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::SurfaceProjectHeadlessInteraction {
+            client,
+            interaction_id,
+            reply: reply_tx,
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        receive_reply(reply_rx, "runtime thread")
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .map_err(headless_surface_error)
     }
 
     pub(crate) fn acp_surface_for_connection(
@@ -4097,6 +4431,7 @@ enum ThreadCommand {
     SurfaceRequestPermission {
         fence: surface::SurfaceOperationFence,
         request: crate::runtime_permission::RuntimePermissionRequest,
+        retry_overlay: Option<crate::runtime_permission::TurnPermissionOverlay>,
         reply: SyncSender<io::Result<crate::runtime_permission::RuntimePermissionResponse>>,
     },
     SurfaceRequestUserInput {
@@ -4259,6 +4594,13 @@ enum ThreadCommand {
                 surface::MutationReply<surface::RespondInteractionOutput>,
                 surface::SurfaceClientCommandError,
             >,
+        >,
+    },
+    SurfaceProjectHeadlessInteraction {
+        client: surface::RuntimeSurfaceClientHandle,
+        interaction_id: surface::SurfaceInteractionId,
+        reply: SyncSender<
+            Result<Option<HeadlessInteractionCheckpoint>, surface::SurfaceClientCommandError>,
         >,
     },
     SurfaceRespondInteractionByIdWithPolicy {
@@ -8060,6 +8402,1168 @@ fn recovered_background_approval_resolutions(
         .collect()
 }
 
+#[derive(Clone)]
+struct ColdRecoveryToolApprovalOwner {
+    interaction_id: surface::SurfaceInteractionId,
+    historical_fence: surface::SurfaceOperationFence,
+    cold_owner_epoch: surface::ThreadOwnerEpoch,
+    thread_config_fingerprint: surface::Sha256Digest,
+    capsule: surface::DurableInteractionContinuationCapsule,
+}
+
+#[derive(Clone)]
+struct ColdRecoveryPermissionOwner {
+    interaction_id: surface::SurfaceInteractionId,
+    historical_fence: surface::SurfaceOperationFence,
+    cold_owner_epoch: surface::ThreadOwnerEpoch,
+    thread_config_fingerprint: surface::Sha256Digest,
+    capsule: surface::DurableInteractionContinuationCapsule,
+}
+
+#[derive(Clone)]
+struct ContinuationTurnCheckpointOwner {
+    interaction_id: surface::SurfaceInteractionId,
+    historical_fence: surface::SurfaceOperationFence,
+    cold_owner_epoch: surface::ThreadOwnerEpoch,
+    thread_config_fingerprint: surface::Sha256Digest,
+    capsule: surface::DurableInteractionContinuationCapsule,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecoveredContinuationDispatchState {
+    Pending,
+    Started {
+        dispatch_id: surface::SurfaceSettlementId,
+        operation_id: surface::SurfaceOperationId,
+        turn_id: TurnId,
+    },
+    Consumed {
+        dispatch_id: surface::SurfaceSettlementId,
+        operation_id: surface::SurfaceOperationId,
+        turn_id: TurnId,
+    },
+}
+
+#[derive(Clone)]
+struct RecoveredContinuationResolution {
+    receipt: surface::SurfaceInteractionResolutionReceipt,
+    answer: Option<surface::DurableInteractionContinuationAnswer>,
+    dispatch_state: RecoveredContinuationDispatchState,
+    acknowledgement: surface::MutationCommitAck,
+    projected_cursor: surface::SurfaceCursor,
+}
+
+fn recovered_continuation_resolutions_from_batches(
+    batches: &[surface::SurfaceCommitBatch],
+) -> HashMap<surface::SurfaceInteractionId, RecoveredContinuationResolution> {
+    let mut recovered = HashMap::new();
+    for batch in batches {
+        for envelope in batch.events.as_slice() {
+            match &envelope.event {
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
+                    interaction_id,
+                    receipt,
+                    continuation,
+                    ..
+                }) if matches!(
+                    receipt.kind,
+                    surface::SurfaceInteractionKind::UserInput
+                        | surface::SurfaceInteractionKind::McpElicitation
+                ) =>
+                {
+                    recovered.insert(
+                        interaction_id.clone(),
+                        RecoveredContinuationResolution {
+                            receipt: receipt.clone(),
+                            answer: continuation.clone(),
+                            dispatch_state: RecoveredContinuationDispatchState::Pending,
+                            acknowledgement: surface::MutationCommitAck::ThreadLocalCursor {
+                                cursor: batch.cursor_after.clone(),
+                                family: surface::SurfaceFactFamily::Interaction,
+                                event_id: envelope.event_id.clone(),
+                                commit_class: batch.commit_class.clone(),
+                            },
+                            projected_cursor: batch.cursor_after.clone(),
+                        },
+                    );
+                }
+                surface::SurfaceEvent::Interaction(
+                    surface::InteractionPatch::ContinuationDispatchStarted {
+                        interaction_id,
+                        receipt_id,
+                        dispatch_id,
+                        operation_id,
+                        turn_id,
+                        ..
+                    },
+                ) => {
+                    if let Some(resolution) = recovered.get_mut(interaction_id)
+                        && resolution.receipt.receipt_id == *receipt_id
+                    {
+                        resolution.dispatch_state = RecoveredContinuationDispatchState::Started {
+                            dispatch_id: dispatch_id.clone(),
+                            operation_id: operation_id.clone(),
+                            turn_id: turn_id.clone(),
+                        };
+                    }
+                }
+                surface::SurfaceEvent::Interaction(
+                    surface::InteractionPatch::ContinuationDispatchConsumed {
+                        interaction_id,
+                        receipt_id,
+                        dispatch_id,
+                        operation_id,
+                        turn_id,
+                        ..
+                    },
+                ) => {
+                    if let Some(resolution) = recovered.get_mut(interaction_id)
+                        && resolution.receipt.receipt_id == *receipt_id
+                    {
+                        resolution.dispatch_state = RecoveredContinuationDispatchState::Consumed {
+                            dispatch_id: dispatch_id.clone(),
+                            operation_id: operation_id.clone(),
+                            turn_id: turn_id.clone(),
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    recovered
+}
+
+fn continuation_resolution_requires_dispatch(
+    receipt: &surface::SurfaceInteractionResolutionReceipt,
+) -> bool {
+    matches!(
+        receipt.safe_projection,
+        surface::SurfaceInteractionSafeProjection::UserInput { answered: true }
+            | surface::SurfaceInteractionSafeProjection::McpElicitation { accepted: true }
+    )
+}
+
+impl ContinuationTurnCheckpointOwner {
+    fn operation_id(&self) -> &surface::SurfaceOperationId {
+        &self.historical_fence.operation_id
+    }
+
+    fn continuation_operation_identity(
+        &self,
+        receipt: &surface::SurfaceInteractionResolutionReceipt,
+    ) -> Result<surface::DurableInteractionContinuationOperationIdentity, io::Error> {
+        surface::DurableInteractionContinuationOperationIdentity::try_new(
+            &self.interaction_id,
+            receipt,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: the durable resolution receipt and exact private winning
+    ///   answer for this recovered UserInput/MCP checkpoint.
+    /// - Output: the versioned private answer fact that must be committed in
+    ///   the same batch as the public resolution, or `None` for cancel/decline.
+    /// - Errors: rejects stale fingerprints, mismatched answer kinds, or an
+    ///   injection type that does not match the durable intent.
+    /// - State changes: none; rendering neither wakes a waiter nor starts a
+    ///   turn and contains no process-local continuation state.
+    fn durable_answer(
+        &self,
+        receipt: &surface::SurfaceInteractionResolutionReceipt,
+        answer: &surface::SurfaceClientInteractionAnswer,
+    ) -> io::Result<Option<surface::DurableInteractionContinuationAnswer>> {
+        self.capsule
+            .validate_for_execution_context(&self.thread_config_fingerprint)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        surface::DurableInteractionContinuationAnswer::try_new(&self.capsule, receipt, answer)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn render_pinned_user_continuation(
+        &self,
+        receipt: &surface::SurfaceInteractionResolutionReceipt,
+        answer: &surface::DurableInteractionContinuationAnswer,
+    ) -> io::Result<String> {
+        answer
+            .validate(&self.capsule, receipt)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        if answer.injection().context_kind()
+            != surface::ContinuationTurnContextKind::PinnedUserTaskNotification
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cold-recovery continuation injection kind is unsupported",
+            ));
+        }
+        let interaction_id = uuid::Uuid::from_bytes(*self.interaction_id.as_bytes());
+        let operation_id = uuid::Uuid::from_bytes(*self.historical_fence.operation_id.as_bytes());
+        let receipt_id = uuid::Uuid::from_bytes(*receipt.receipt_id.as_bytes());
+        let response_id = uuid::Uuid::from_bytes(*receipt.response_id.as_bytes());
+        Ok(format!(
+            "{}\ninteraction_id: {interaction_id}\nrequest_identity: {}\noperation_id: {operation_id}\ngeneration_id: {}\nresolution_receipt_id: {receipt_id}\nresponse_id: {response_id}\nanswer:\n{answer_text}",
+            answer.injection().template().as_str(),
+            answer.request_identity().as_str(),
+            self.historical_fence.generation_id.get(),
+            answer_text = answer.answer_text(),
+        ))
+    }
+}
+
+impl ColdRecoveryPermissionOwner {
+    fn operation_id(&self) -> &surface::SurfaceOperationId {
+        &self.historical_fence.operation_id
+    }
+}
+
+impl ColdRecoveryToolApprovalOwner {
+    fn operation_id(&self) -> &surface::SurfaceOperationId {
+        &self.historical_fence.operation_id
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: the cold owner that re-parked one restartable ToolApproval,
+    ///   its durable allow receipt, the current thread-owned execution
+    ///   dependencies, and output/event adapters.
+    /// - Output: delegates the exact persisted BeforeInvocation intent to the
+    ///   recovered tool dispatcher, which commits InvocationStarted before
+    ///   dispatch and commits the observed result to the historical fence.
+    /// - Errors: rejects a different owner epoch, interaction identity,
+    ///   fingerprint, intent kind, or non-allow receipt before dispatch.
+    /// - State changes and external calls: never creates a live original
+    ///   operation or waiter; all tool side effects remain behind the durable
+    ///   InvocationStarted boundary owned by the historical committer.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn dispatch_after_approval<W: io::Write>(
+        &self,
+        actor: &mut ThreadActor,
+        config: &RunConfig,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        approval_receipt: &surface::SurfaceInteractionResolutionReceipt,
+        dependencies: RecoveredToolExecutionDependencies<'_>,
+        subagent_child_executor: crate::agent_child::ChildAgentExecutor<io::Sink>,
+        workflow_child_executor: crate::agent_child::ChildAgentExecutor<
+            crate::workflow::runner::SharedEventBuffer,
+        >,
+    ) -> io::Result<ToolExecutionCompletion> {
+        let snapshot = actor.resident_surface.coordinator.state().snapshot();
+        if snapshot.thread.owner_epoch != self.cold_owner_epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cold-recovery ToolApproval owner epoch is stale",
+            ));
+        }
+        let Some(interaction) = snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == self.interaction_id)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "cold-recovery ToolApproval interaction is missing",
+            ));
+        };
+        if interaction.fence != self.historical_fence
+            || !matches!(
+                approval_receipt.safe_projection,
+                surface::SurfaceInteractionSafeProjection::ToolApproval { allowed: true }
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cold-recovery ToolApproval resolution is not authorized",
+            ));
+        }
+        let intent = match self
+            .capsule
+            .restart_intent(&self.thread_config_fingerprint)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?
+        {
+            surface::DurableInteractionContinuationIntent::ToolInvocation(intent) => intent,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cold-recovery owner contains a non-tool intent",
+                ));
+            }
+        };
+        actor.dispatch_recovered_tool_intent(
+            config,
+            events,
+            sink,
+            intent,
+            &self.historical_fence,
+            self.capsule
+                .execution_context_fingerprint()
+                .expect("restartable capsule has a fingerprint"),
+            &self.thread_config_fingerprint,
+            approval_receipt,
+            dependencies,
+            subagent_child_executor,
+            workflow_child_executor,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColdRecoveryCheckpointFailure {
+    Missing,
+    Executing,
+    Unsafe,
+    Unsupported,
+    StaleContext,
+}
+
+impl ColdRecoveryCheckpointFailure {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Missing => 1,
+            Self::Unsupported => 2,
+            Self::StaleContext => 3,
+            Self::Unsafe => 4,
+            Self::Executing => 5,
+        }
+    }
+
+    fn diagnostic(self) -> surface::SafeDiagnosticText {
+        let reason = match self {
+            Self::Missing => "Missing",
+            Self::Executing => "Executing",
+            Self::Unsafe => "Unsafe",
+            Self::Unsupported => "Unsupported",
+            Self::StaleContext => "StaleContext",
+        };
+        surface::SafeDiagnosticText::try_new(format!(
+            "cold recovery rejected durable interaction checkpoint: {reason}"
+        ))
+        .expect("fixed cold-recovery diagnostic is bounded")
+    }
+
+    fn failure_class(self) -> surface::GenerationExecutionFailureClass {
+        match self {
+            Self::Executing | Self::Unsafe => {
+                surface::GenerationExecutionFailureClass::ExternalEffectAmbiguous
+            }
+            Self::Missing | Self::Unsupported | Self::StaleContext => {
+                surface::GenerationExecutionFailureClass::RuntimeInvariant
+            }
+        }
+    }
+}
+
+fn merge_cold_recovery_checkpoint_failure(
+    failures: &mut HashMap<surface::SurfaceOperationId, ColdRecoveryCheckpointFailure>,
+    operation_id: surface::SurfaceOperationId,
+    failure: ColdRecoveryCheckpointFailure,
+) {
+    failures
+        .entry(operation_id)
+        .and_modify(|current| {
+            if failure.priority() > current.priority() {
+                *current = failure;
+            }
+        })
+        .or_insert(failure);
+}
+
+fn encoded_restartable_capsule(
+    interaction: &surface::SurfaceInteractionView,
+) -> Result<&[u8], ColdRecoveryCheckpointFailure> {
+    match (&interaction.kind, &interaction.recovery_disposition) {
+        (
+            surface::SurfaceInteractionKind::ToolApproval,
+            surface::InteractionUnavailableDisposition::RestartableToolApproval { capsule },
+        )
+        | (
+            surface::SurfaceInteractionKind::PermissionRequest,
+            surface::InteractionUnavailableDisposition::RestartablePermissionRequest { capsule },
+        )
+        | (
+            surface::SurfaceInteractionKind::UserInput,
+            surface::InteractionUnavailableDisposition::RestartableUserInput { capsule },
+        )
+        | (
+            surface::SurfaceInteractionKind::McpElicitation,
+            surface::InteractionUnavailableDisposition::RestartableMcpElicitation { capsule },
+        ) => Ok(capsule),
+        (
+            surface::SurfaceInteractionKind::PermissionRequest,
+            surface::InteractionUnavailableDisposition::FailOperation,
+        ) => Err(ColdRecoveryCheckpointFailure::Unsafe),
+        (
+            surface::SurfaceInteractionKind::ToolApproval
+            | surface::SurfaceInteractionKind::UserInput
+            | surface::SurfaceInteractionKind::McpElicitation,
+            surface::InteractionUnavailableDisposition::FailOperation,
+        ) => Err(ColdRecoveryCheckpointFailure::Missing),
+        (
+            surface::SurfaceInteractionKind::ToolApproval
+            | surface::SurfaceInteractionKind::PermissionRequest
+            | surface::SurfaceInteractionKind::UserInput
+            | surface::SurfaceInteractionKind::McpElicitation,
+            surface::InteractionUnavailableDisposition::RestartableToolApproval { .. }
+            | surface::InteractionUnavailableDisposition::RestartablePermissionRequest { .. }
+            | surface::InteractionUnavailableDisposition::RestartableUserInput { .. }
+            | surface::InteractionUnavailableDisposition::RestartableMcpElicitation { .. },
+        ) => Err(ColdRecoveryCheckpointFailure::Unsupported),
+        _ => Err(ColdRecoveryCheckpointFailure::Unsupported),
+    }
+}
+
+fn preflight_encoded_restartable_capsule(
+    encoded: &[u8],
+) -> Result<(), ColdRecoveryCheckpointFailure> {
+    if encoded.is_empty() {
+        return Err(ColdRecoveryCheckpointFailure::Missing);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(encoded).map_err(|_| ColdRecoveryCheckpointFailure::Unsupported)?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(ColdRecoveryCheckpointFailure::Missing)?;
+    if !matches!(version, 1 | 2) {
+        return Err(ColdRecoveryCheckpointFailure::Unsupported);
+    }
+    if version == 1 {
+        return Ok(());
+    }
+    let disposition = value
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ColdRecoveryCheckpointFailure::Missing)?;
+    match disposition {
+        "Restartable" => {
+            if value.get("intent").is_none_or(serde_json::Value::is_null) {
+                Err(ColdRecoveryCheckpointFailure::Missing)
+            } else {
+                Ok(())
+            }
+        }
+        "Executing" => Err(ColdRecoveryCheckpointFailure::Executing),
+        "Unsafe" => Err(ColdRecoveryCheckpointFailure::Unsafe),
+        "Unsupported" => Err(ColdRecoveryCheckpointFailure::Unsupported),
+        _ => Err(ColdRecoveryCheckpointFailure::Unsupported),
+    }
+}
+
+fn cold_recovery_failure_from_capsule_error(
+    error: surface::DurableInteractionContinuationCapsuleError,
+) -> ColdRecoveryCheckpointFailure {
+    match error {
+        surface::DurableInteractionContinuationCapsuleError::MissingPermissionRetryContext
+        | surface::DurableInteractionContinuationCapsuleError::MissingDisposition
+        | surface::DurableInteractionContinuationCapsuleError::MissingExecutionContextFingerprint {
+            ..
+        }
+        | surface::DurableInteractionContinuationCapsuleError::MissingRestartableIntent {
+            ..
+        } => ColdRecoveryCheckpointFailure::Missing,
+        surface::DurableInteractionContinuationCapsuleError::UnsupportedVersion { .. }
+        | surface::DurableInteractionContinuationCapsuleError::UnsupportedInteractionKind { .. }
+        | surface::DurableInteractionContinuationCapsuleError::IntentKindMismatch { .. }
+        | surface::DurableInteractionContinuationCapsuleError::InvalidEncoding => {
+            ColdRecoveryCheckpointFailure::Unsupported
+        }
+        surface::DurableInteractionContinuationCapsuleError::ExecutionContextFingerprintMismatch
+        | surface::DurableInteractionContinuationCapsuleError::AuthorityFenceMismatch { .. }
+        | surface::DurableInteractionContinuationCapsuleError::InvocationIdMismatch { .. }
+        | surface::DurableInteractionContinuationCapsuleError::RequestIntentMismatch { .. } => {
+            ColdRecoveryCheckpointFailure::StaleContext
+        }
+        surface::DurableInteractionContinuationCapsuleError::UnexpectedExecutionContextFingerprint {
+            ..
+        }
+        | surface::DurableInteractionContinuationCapsuleError::UnexpectedIntentForDisposition {
+            ..
+        } => ColdRecoveryCheckpointFailure::Unsafe,
+        surface::DurableInteractionContinuationCapsuleError::NonRestartableDisposition {
+            disposition,
+        } => match disposition {
+            surface::DurableInteractionContinuationDisposition::Restartable => {
+                ColdRecoveryCheckpointFailure::Missing
+            }
+            surface::DurableInteractionContinuationDisposition::Executing => {
+                ColdRecoveryCheckpointFailure::Executing
+            }
+            surface::DurableInteractionContinuationDisposition::Unsafe => {
+                ColdRecoveryCheckpointFailure::Unsafe
+            }
+            surface::DurableInteractionContinuationDisposition::Unsupported => {
+                ColdRecoveryCheckpointFailure::Unsupported
+            }
+        },
+    }
+}
+
+/// Function intent contract:
+///
+/// - Input: one persisted ToolApproval, PermissionRequest, UserInput, or MCP
+///   interaction plus the recovered thread execution-context fingerprint.
+/// - Output: the exact restartable capsule only when version, kind, identity,
+///   fence, request, intent, disposition, and fingerprint all still agree.
+/// - Errors: classifies every invalid checkpoint as Missing, Executing,
+///   Unsafe, Unsupported, or StaleContext without exposing private answers.
+/// - State changes and external calls: none; classification is read-only and
+///   cannot rotate a route, create a waiter, resume a call stack, or dispatch
+///   a side effect.
+fn classify_restartable_cold_recovery_capsule(
+    interaction: &surface::SurfaceInteractionView,
+    observed_fingerprint: &surface::Sha256Digest,
+) -> Result<surface::DurableInteractionContinuationCapsule, ColdRecoveryCheckpointFailure> {
+    let encoded = encoded_restartable_capsule(interaction)?;
+    preflight_encoded_restartable_capsule(encoded)?;
+    let capsule = surface::DurableInteractionContinuationCapsule::decode(encoded)
+        .map_err(cold_recovery_failure_from_capsule_error)?;
+    match capsule.disposition() {
+        surface::DurableInteractionContinuationDisposition::Restartable => {}
+        surface::DurableInteractionContinuationDisposition::Executing => {
+            return Err(ColdRecoveryCheckpointFailure::Executing);
+        }
+        surface::DurableInteractionContinuationDisposition::Unsafe => {
+            return Err(ColdRecoveryCheckpointFailure::Unsafe);
+        }
+        surface::DurableInteractionContinuationDisposition::Unsupported => {
+            return Err(ColdRecoveryCheckpointFailure::Unsupported);
+        }
+    }
+    if capsule.kind() != interaction.kind {
+        return Err(ColdRecoveryCheckpointFailure::Unsupported);
+    }
+    if capsule.interaction_id() != &interaction.interaction_id
+        || capsule.fence() != &interaction.fence
+        || capsule.request().to_surface_request() != interaction.request
+    {
+        return Err(ColdRecoveryCheckpointFailure::StaleContext);
+    }
+    capsule
+        .validate_for_execution_context(observed_fingerprint)
+        .map_err(cold_recovery_failure_from_capsule_error)?;
+    Ok(capsule)
+}
+
+fn tool_checkpoint_projection_failure(
+    disposition: surface::ToolInvocationRecoveryDisposition,
+) -> Option<ColdRecoveryCheckpointFailure> {
+    match disposition {
+        surface::ToolInvocationRecoveryDisposition::RestartableBeforeInvocation => None,
+        surface::ToolInvocationRecoveryDisposition::FailClosedStarted
+        | surface::ToolInvocationRecoveryDisposition::FailClosedExecuting => {
+            Some(ColdRecoveryCheckpointFailure::Executing)
+        }
+        surface::ToolInvocationRecoveryDisposition::FailClosedUnsafe => {
+            Some(ColdRecoveryCheckpointFailure::Unsafe)
+        }
+    }
+}
+
+fn permission_checkpoint_projection_failure(
+    disposition: surface::PermissionRetryRecoveryDisposition,
+) -> Option<ColdRecoveryCheckpointFailure> {
+    match disposition {
+        surface::PermissionRetryRecoveryDisposition::RestartablePreSideEffect => None,
+        surface::PermissionRetryRecoveryDisposition::FailClosedExecuting => {
+            Some(ColdRecoveryCheckpointFailure::Executing)
+        }
+        surface::PermissionRetryRecoveryDisposition::FailClosedUnsafe => {
+            Some(ColdRecoveryCheckpointFailure::Unsafe)
+        }
+    }
+}
+
+/// Freeze the thread-owned execution configuration used to decide whether a
+/// persisted ToolApproval intent may be dispatched after a cold restart. The
+/// digest deliberately records only execution-affecting values and API-key
+/// presence, never credential contents.
+fn cold_recovery_thread_config_fingerprint(
+    config: &RunConfig,
+    snapshot: &surface::SurfaceSnapshot,
+) -> surface::Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"orca-cold-recovery-tool-approval-owner-v1\0");
+    hasher.update(
+        serde_json::to_vec(&snapshot.settings.effective)
+            .expect("surface runtime settings are serializable"),
+    );
+    macro_rules! hash_debug_part {
+        ($value:expr) => {{
+            hasher.update(format!("{:?}", $value).as_bytes());
+            hasher.update([0]);
+        }};
+    }
+    hash_debug_part!(config.app_version);
+    hash_debug_part!(config.provider);
+    hash_debug_part!(config.model_runtime);
+    hash_debug_part!(config.mcp_servers);
+    hash_debug_part!(config.hooks);
+    hash_debug_part!(config.external_tools);
+    hash_debug_part!(config.permission_profiles);
+    hash_debug_part!(config.permission_rules);
+    hash_debug_part!(config.additional_working_directories);
+    hash_debug_part!(config.budget);
+    hash_debug_part!(config.subagents);
+    hash_debug_part!(config.tools);
+    hash_debug_part!(config.workflows);
+    hash_debug_part!(config.auto_memory);
+    hash_debug_part!(config.api_key.is_some());
+    hash_debug_part!(config.base_url);
+    surface::Sha256Digest::new(hasher.finalize().into())
+}
+
+/// Rebuild only restartable ToolApproval owners. Every malformed, stale,
+/// started, non-tool, or fingerprint-mismatched capsule is intentionally left
+/// for the existing fail-closed recovery path.
+fn recover_cold_tool_approval_owners_on_start(
+    config: &RunConfig,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<
+    (
+        HashMap<surface::SurfaceInteractionId, ColdRecoveryToolApprovalOwner>,
+        HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+        HashMap<surface::SurfaceOperationId, ColdRecoveryCheckpointFailure>,
+    ),
+    RuntimeHostError,
+> {
+    let observed_fingerprint =
+        cold_recovery_thread_config_fingerprint(config, coordinator.state().snapshot());
+    let cold_owner_epoch = coordinator.state().snapshot().thread.owner_epoch;
+    let candidates = coordinator
+        .state()
+        .snapshot()
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            interaction.kind == surface::SurfaceInteractionKind::ToolApproval
+                && matches!(
+                    interaction.lifecycle,
+                    surface::SurfaceInteractionLifecycle::Requested
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut owners = HashMap::new();
+    let mut interactions = HashMap::new();
+    let mut failures = HashMap::new();
+    for interaction in candidates {
+        let capsule =
+            match classify_restartable_cold_recovery_capsule(&interaction, &observed_fingerprint) {
+                Ok(capsule) => capsule,
+                Err(failure) => {
+                    merge_cold_recovery_checkpoint_failure(
+                        &mut failures,
+                        interaction.fence.operation_id.clone(),
+                        failure,
+                    );
+                    continue;
+                }
+            };
+        if let Some(failure) = tool_checkpoint_projection_failure(
+            coordinator
+                .state()
+                .snapshot()
+                .tool_invocation_recovery_disposition(&capsule),
+        ) {
+            merge_cold_recovery_checkpoint_failure(
+                &mut failures,
+                interaction.fence.operation_id.clone(),
+                failure,
+            );
+            continue;
+        }
+        let current_epoch = match interaction.route {
+            surface::SurfaceInteractionRoute::Unassigned { epoch }
+            | surface::SurfaceInteractionRoute::Exclusive { epoch, .. }
+            | surface::SurfaceInteractionRoute::SharedFirstCommitWins { epoch, .. } => epoch,
+        };
+        let next_epoch =
+            surface::ResponseRouteEpoch::try_new(current_epoch.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "cold-recovery ToolApproval route epoch exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "cold-recovery ToolApproval route epoch is invalid".to_string(),
+            })?;
+        let next_revision = surface::InteractionRevision::try_new(
+            interaction.revision.get().checked_add(1).ok_or_else(|| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: "cold-recovery ToolApproval revision exhausted".to_string(),
+                }
+            })?,
+        )
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "cold-recovery ToolApproval revision is invalid".to_string(),
+        })?;
+        let snapshot = coordinator.state().snapshot().clone();
+        let batch = runtime_surface_event_batch(
+            &snapshot,
+            vec![(
+                surface::SurfaceScope::Generation {
+                    fence: interaction.fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
+                    interaction_id: interaction.interaction_id.clone(),
+                    expected_revision: interaction.revision,
+                    next_revision,
+                    route: surface::SurfaceInteractionRoute::Unassigned { epoch: next_epoch },
+                }),
+            )],
+            None,
+        );
+        coordinator
+            .commit_generation_batch(interaction.fence.clone(), &batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to re-park cold-recovery ToolApproval interaction: {error:?}"
+                ),
+            })?;
+        let owner = ColdRecoveryToolApprovalOwner {
+            interaction_id: interaction.interaction_id.clone(),
+            historical_fence: interaction.fence.clone(),
+            cold_owner_epoch,
+            thread_config_fingerprint: observed_fingerprint.clone(),
+            capsule,
+        };
+        let record = surface::BrokerInteractionRequestRecord {
+            thread_id: interaction.fence.thread_id.clone(),
+            interaction_id: interaction.interaction_id.clone(),
+            fence: interaction.fence,
+            kind: interaction.kind,
+            request: interaction.request,
+            response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            recovery_disposition: interaction.recovery_disposition,
+        };
+        interactions.insert(
+            owner.interaction_id.clone(),
+            ResidentSurfaceInteraction {
+                record,
+                route: surface::BrokerInteractionResponseRoute::Unassigned { epoch: next_epoch },
+                revision: next_revision,
+                waiter: None,
+                private_response: None,
+                pending_background_route: None,
+                winning_receipt: None,
+                resolution_ack: None,
+                projected_cursor: None,
+                cancelled: None,
+            },
+        );
+        owners.insert(owner.interaction_id.clone(), owner);
+    }
+    Ok((owners, interactions, failures))
+}
+
+/// Rebuild only permission checkpoints that prove the bound tool remained at
+/// the durable pre-side-effect boundary. Unknown, malformed, already-started,
+/// or fingerprint-mismatched requests remain on the normal fail-closed path.
+fn recover_cold_permission_owners_on_start(
+    config: &RunConfig,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<
+    (
+        HashMap<surface::SurfaceInteractionId, ColdRecoveryPermissionOwner>,
+        HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+        HashMap<surface::SurfaceOperationId, ColdRecoveryCheckpointFailure>,
+    ),
+    RuntimeHostError,
+> {
+    let observed_fingerprint =
+        cold_recovery_thread_config_fingerprint(config, coordinator.state().snapshot());
+    let cold_owner_epoch = coordinator.state().snapshot().thread.owner_epoch;
+    let candidates = coordinator
+        .state()
+        .snapshot()
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            interaction.kind == surface::SurfaceInteractionKind::PermissionRequest
+                && matches!(
+                    interaction.lifecycle,
+                    surface::SurfaceInteractionLifecycle::Requested
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut owners = HashMap::new();
+    let mut interactions = HashMap::new();
+    let mut failures = HashMap::new();
+    for interaction in candidates {
+        let capsule =
+            match classify_restartable_cold_recovery_capsule(&interaction, &observed_fingerprint) {
+                Ok(capsule) => capsule,
+                Err(failure) => {
+                    merge_cold_recovery_checkpoint_failure(
+                        &mut failures,
+                        interaction.fence.operation_id.clone(),
+                        failure,
+                    );
+                    continue;
+                }
+            };
+        if let Some(failure) = permission_checkpoint_projection_failure(
+            coordinator
+                .state()
+                .snapshot()
+                .permission_retry_recovery_disposition(&capsule),
+        ) {
+            merge_cold_recovery_checkpoint_failure(
+                &mut failures,
+                interaction.fence.operation_id.clone(),
+                failure,
+            );
+            continue;
+        }
+        let current_epoch = match interaction.route {
+            surface::SurfaceInteractionRoute::Unassigned { epoch }
+            | surface::SurfaceInteractionRoute::Exclusive { epoch, .. }
+            | surface::SurfaceInteractionRoute::SharedFirstCommitWins { epoch, .. } => epoch,
+        };
+        let next_epoch =
+            surface::ResponseRouteEpoch::try_new(current_epoch.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "cold-recovery PermissionRequest route epoch exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "cold-recovery PermissionRequest route epoch is invalid".to_string(),
+            })?;
+        let next_revision = surface::InteractionRevision::try_new(
+            interaction.revision.get().checked_add(1).ok_or_else(|| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: "cold-recovery PermissionRequest revision exhausted".to_string(),
+                }
+            })?,
+        )
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "cold-recovery PermissionRequest revision is invalid".to_string(),
+        })?;
+        let snapshot = coordinator.state().snapshot().clone();
+        let batch = runtime_surface_event_batch(
+            &snapshot,
+            vec![(
+                surface::SurfaceScope::Generation {
+                    fence: interaction.fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
+                    interaction_id: interaction.interaction_id.clone(),
+                    expected_revision: interaction.revision,
+                    next_revision,
+                    route: surface::SurfaceInteractionRoute::Unassigned { epoch: next_epoch },
+                }),
+            )],
+            None,
+        );
+        coordinator
+            .commit_generation_batch(interaction.fence.clone(), &batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to re-park cold-recovery PermissionRequest interaction: {error:?}"
+                ),
+            })?;
+        let owner = ColdRecoveryPermissionOwner {
+            interaction_id: interaction.interaction_id.clone(),
+            historical_fence: interaction.fence.clone(),
+            cold_owner_epoch,
+            thread_config_fingerprint: observed_fingerprint.clone(),
+            capsule,
+        };
+        let record = surface::BrokerInteractionRequestRecord {
+            thread_id: interaction.fence.thread_id.clone(),
+            interaction_id: interaction.interaction_id.clone(),
+            fence: interaction.fence,
+            kind: interaction.kind,
+            request: interaction.request,
+            response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            recovery_disposition: interaction.recovery_disposition,
+        };
+        interactions.insert(
+            owner.interaction_id.clone(),
+            ResidentSurfaceInteraction {
+                record,
+                route: surface::BrokerInteractionResponseRoute::Unassigned { epoch: next_epoch },
+                revision: next_revision,
+                waiter: None,
+                private_response: None,
+                pending_background_route: None,
+                winning_receipt: None,
+                resolution_ack: None,
+                projected_cursor: None,
+                cancelled: None,
+            },
+        );
+        owners.insert(owner.interaction_id.clone(), owner);
+    }
+    Ok((owners, interactions, failures))
+}
+
+/// Rebuild only UserInput/MCP checkpoints whose durable intent still matches
+/// the recovered thread configuration. The original waiter and call stack are
+/// never reconstructed; only the typed request route is re-established.
+fn recover_continuation_turn_owners_on_start(
+    config: &RunConfig,
+    coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
+) -> Result<
+    (
+        HashMap<surface::SurfaceInteractionId, ContinuationTurnCheckpointOwner>,
+        HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+        HashMap<surface::SurfaceOperationId, ColdRecoveryCheckpointFailure>,
+    ),
+    RuntimeHostError,
+> {
+    let observed_fingerprint =
+        cold_recovery_thread_config_fingerprint(config, coordinator.state().snapshot());
+    let cold_owner_epoch = coordinator.state().snapshot().thread.owner_epoch;
+    let recovered_batches = coordinator.ledger().recover_batches().map_err(|error| {
+        RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to recover continuation answer facts: {error:?}"),
+        }
+    })?;
+    let recovered_resolutions =
+        recovered_continuation_resolutions_from_batches(&recovered_batches.committed);
+    let candidates = coordinator
+        .state()
+        .snapshot()
+        .interactions
+        .iter()
+        .filter(|interaction| {
+            matches!(
+                interaction.kind,
+                surface::SurfaceInteractionKind::UserInput
+                    | surface::SurfaceInteractionKind::McpElicitation
+            ) && matches!(
+                interaction.lifecycle,
+                surface::SurfaceInteractionLifecycle::Requested
+                    | surface::SurfaceInteractionLifecycle::Resolved { .. }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut owners = HashMap::new();
+    let mut interactions = HashMap::new();
+    let mut failures = HashMap::new();
+    for interaction in candidates {
+        let capsule =
+            match classify_restartable_cold_recovery_capsule(&interaction, &observed_fingerprint) {
+                Ok(capsule) => capsule,
+                Err(failure) => {
+                    merge_cold_recovery_checkpoint_failure(
+                        &mut failures,
+                        interaction.fence.operation_id.clone(),
+                        failure,
+                    );
+                    continue;
+                }
+            };
+        if !matches!(
+            capsule.restart_intent(&observed_fingerprint),
+            Ok(surface::DurableInteractionContinuationIntent::ContinuationTurn(_))
+        ) {
+            merge_cold_recovery_checkpoint_failure(
+                &mut failures,
+                interaction.fence.operation_id.clone(),
+                ColdRecoveryCheckpointFailure::Unsupported,
+            );
+            continue;
+        }
+        let owner = ContinuationTurnCheckpointOwner {
+            interaction_id: interaction.interaction_id.clone(),
+            historical_fence: interaction.fence.clone(),
+            cold_owner_epoch,
+            thread_config_fingerprint: observed_fingerprint.clone(),
+            capsule,
+        };
+        if let surface::SurfaceInteractionLifecycle::Resolved { receipt } = &interaction.lifecycle {
+            let Some(resolution) = recovered_resolutions
+                .get(&interaction.interaction_id)
+                .filter(|resolution| resolution.receipt == *receipt)
+            else {
+                merge_cold_recovery_checkpoint_failure(
+                    &mut failures,
+                    interaction.fence.operation_id.clone(),
+                    ColdRecoveryCheckpointFailure::Missing,
+                );
+                continue;
+            };
+            let requires_dispatch = continuation_resolution_requires_dispatch(receipt);
+            match (requires_dispatch, resolution.answer.as_ref()) {
+                (true, Some(answer)) if answer.validate(&owner.capsule, receipt).is_ok() => {}
+                (true, Some(_)) => {
+                    merge_cold_recovery_checkpoint_failure(
+                        &mut failures,
+                        interaction.fence.operation_id.clone(),
+                        ColdRecoveryCheckpointFailure::StaleContext,
+                    );
+                    continue;
+                }
+                (true, None) => {
+                    merge_cold_recovery_checkpoint_failure(
+                        &mut failures,
+                        interaction.fence.operation_id.clone(),
+                        ColdRecoveryCheckpointFailure::Missing,
+                    );
+                    continue;
+                }
+                (false, None) => {}
+                (false, Some(_)) => {
+                    merge_cold_recovery_checkpoint_failure(
+                        &mut failures,
+                        interaction.fence.operation_id.clone(),
+                        ColdRecoveryCheckpointFailure::StaleContext,
+                    );
+                    continue;
+                }
+            }
+            let Ok(expected_identity) = owner.continuation_operation_identity(receipt) else {
+                merge_cold_recovery_checkpoint_failure(
+                    &mut failures,
+                    interaction.fence.operation_id.clone(),
+                    ColdRecoveryCheckpointFailure::StaleContext,
+                );
+                continue;
+            };
+            let dispatch_identity_valid = match &resolution.dispatch_state {
+                RecoveredContinuationDispatchState::Pending => true,
+                RecoveredContinuationDispatchState::Started {
+                    dispatch_id,
+                    operation_id,
+                    turn_id,
+                }
+                | RecoveredContinuationDispatchState::Consumed {
+                    dispatch_id,
+                    operation_id,
+                    turn_id,
+                } => {
+                    dispatch_id == expected_identity.dispatch_id()
+                        && operation_id == expected_identity.operation_id()
+                        && turn_id == expected_identity.turn_id()
+                }
+            };
+            if !dispatch_identity_valid {
+                merge_cold_recovery_checkpoint_failure(
+                    &mut failures,
+                    interaction.fence.operation_id.clone(),
+                    ColdRecoveryCheckpointFailure::StaleContext,
+                );
+                continue;
+            }
+            let current_epoch = match interaction.route {
+                surface::SurfaceInteractionRoute::Unassigned { epoch }
+                | surface::SurfaceInteractionRoute::Exclusive { epoch, .. }
+                | surface::SurfaceInteractionRoute::SharedFirstCommitWins { epoch, .. } => epoch,
+            };
+            let record = surface::BrokerInteractionRequestRecord {
+                thread_id: interaction.fence.thread_id.clone(),
+                interaction_id: interaction.interaction_id.clone(),
+                fence: interaction.fence,
+                kind: interaction.kind,
+                request: interaction.request,
+                response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+                answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+                recovery_disposition: interaction.recovery_disposition,
+            };
+            interactions.insert(
+                owner.interaction_id.clone(),
+                ResidentSurfaceInteraction {
+                    record,
+                    route: surface::BrokerInteractionResponseRoute::Unassigned {
+                        epoch: current_epoch,
+                    },
+                    revision: interaction.revision,
+                    waiter: None,
+                    private_response: None,
+                    pending_background_route: None,
+                    winning_receipt: Some(receipt.clone()),
+                    resolution_ack: Some(resolution.acknowledgement.clone()),
+                    projected_cursor: Some(resolution.projected_cursor.clone()),
+                    cancelled: None,
+                },
+            );
+            owners.insert(owner.interaction_id.clone(), owner);
+            continue;
+        }
+        let current_epoch = match interaction.route {
+            surface::SurfaceInteractionRoute::Unassigned { epoch }
+            | surface::SurfaceInteractionRoute::Exclusive { epoch, .. }
+            | surface::SurfaceInteractionRoute::SharedFirstCommitWins { epoch, .. } => epoch,
+        };
+        let next_epoch =
+            surface::ResponseRouteEpoch::try_new(current_epoch.get().checked_add(1).ok_or_else(
+                || RuntimeHostError::ThreadStartFailed {
+                    message: "cold-recovery continuation route epoch exhausted".to_string(),
+                },
+            )?)
+            .map_err(|_| RuntimeHostError::ThreadStartFailed {
+                message: "cold-recovery continuation route epoch is invalid".to_string(),
+            })?;
+        let next_revision = surface::InteractionRevision::try_new(
+            interaction.revision.get().checked_add(1).ok_or_else(|| {
+                RuntimeHostError::ThreadStartFailed {
+                    message: "cold-recovery continuation revision exhausted".to_string(),
+                }
+            })?,
+        )
+        .map_err(|_| RuntimeHostError::ThreadStartFailed {
+            message: "cold-recovery continuation revision is invalid".to_string(),
+        })?;
+        let snapshot = coordinator.state().snapshot().clone();
+        let batch = runtime_surface_event_batch(
+            &snapshot,
+            vec![(
+                surface::SurfaceScope::Generation {
+                    fence: interaction.fence.clone(),
+                },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
+                    interaction_id: interaction.interaction_id.clone(),
+                    expected_revision: interaction.revision,
+                    next_revision,
+                    route: surface::SurfaceInteractionRoute::Unassigned { epoch: next_epoch },
+                }),
+            )],
+            None,
+        );
+        coordinator
+            .commit_generation_batch(interaction.fence.clone(), &batch)
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to re-park cold-recovery continuation interaction: {error:?}"
+                ),
+            })?;
+        let record = surface::BrokerInteractionRequestRecord {
+            thread_id: interaction.fence.thread_id.clone(),
+            interaction_id: interaction.interaction_id.clone(),
+            fence: interaction.fence,
+            kind: interaction.kind,
+            request: interaction.request,
+            response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            recovery_disposition: interaction.recovery_disposition,
+        };
+        interactions.insert(
+            owner.interaction_id.clone(),
+            ResidentSurfaceInteraction {
+                record,
+                route: surface::BrokerInteractionResponseRoute::Unassigned { epoch: next_epoch },
+                revision: next_revision,
+                waiter: None,
+                private_response: None,
+                pending_background_route: None,
+                winning_receipt: None,
+                resolution_ack: None,
+                projected_cursor: None,
+                cancelled: None,
+            },
+        );
+        owners.insert(owner.interaction_id.clone(), owner);
+    }
+    Ok((owners, interactions, failures))
+}
+
 fn bootstrap_runtime_surface(
     thread: &mut RuntimeThread,
     config: &RunConfig,
@@ -8157,6 +9661,12 @@ fn bootstrap_recorded_surface(
     .map_err(|error| RuntimeHostError::ThreadStartFailed {
         message: format!("failed to recover typed runtime surface: {error:?}"),
     })?;
+    let mut cold_recovery_owners = HashMap::new();
+    let mut cold_recovery_permission_owners = HashMap::new();
+    let mut continuation_turn_owners = HashMap::new();
+    let mut recovered_tool_approval_interactions = HashMap::new();
+    let mut recovered_permission_interactions = HashMap::new();
+    let mut recovered_continuation_interactions = HashMap::new();
     if current_owner_epoch.get() > initial_owner_epoch {
         let materialization = surface::MaterializationCause::ColdOwnerTakeover {
             new_incarnation: surface::SurfaceIncarnation::try_from_bytes(
@@ -8170,6 +9680,60 @@ fn bootstrap_recorded_surface(
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
                 message: format!("failed to materialize typed surface owner: {error:?}"),
             })?;
+        let (recovered_tool_owners, recovered_tool_requests, mut cold_recovery_checkpoint_failures) =
+            recover_cold_tool_approval_owners_on_start(config, &mut coordinator)?;
+        cold_recovery_owners = recovered_tool_owners;
+        recovered_tool_approval_interactions = recovered_tool_requests;
+        let (recovered_permission_owners, recovered_permission_requests, permission_failures) =
+            recover_cold_permission_owners_on_start(config, &mut coordinator)?;
+        cold_recovery_permission_owners = recovered_permission_owners;
+        recovered_permission_interactions = recovered_permission_requests;
+        for (operation_id, failure) in permission_failures {
+            merge_cold_recovery_checkpoint_failure(
+                &mut cold_recovery_checkpoint_failures,
+                operation_id,
+                failure,
+            );
+        }
+        let (recovered_continuation_owners, recovered_continuation_requests, continuation_failures) =
+            recover_continuation_turn_owners_on_start(config, &mut coordinator)?;
+        continuation_turn_owners = recovered_continuation_owners;
+        recovered_continuation_interactions = recovered_continuation_requests;
+        for (operation_id, failure) in continuation_failures {
+            merge_cold_recovery_checkpoint_failure(
+                &mut cold_recovery_checkpoint_failures,
+                operation_id,
+                failure,
+            );
+        }
+        cold_recovery_owners.retain(|_, owner| {
+            !cold_recovery_checkpoint_failures.contains_key(owner.operation_id())
+        });
+        recovered_tool_approval_interactions.retain(|_, interaction| {
+            !cold_recovery_checkpoint_failures.contains_key(&interaction.record.fence.operation_id)
+        });
+        cold_recovery_permission_owners.retain(|_, owner| {
+            !cold_recovery_checkpoint_failures.contains_key(owner.operation_id())
+        });
+        recovered_permission_interactions.retain(|_, interaction| {
+            !cold_recovery_checkpoint_failures.contains_key(&interaction.record.fence.operation_id)
+        });
+        continuation_turn_owners.retain(|_, owner| {
+            !cold_recovery_checkpoint_failures.contains_key(owner.operation_id())
+        });
+        recovered_continuation_interactions.retain(|_, interaction| {
+            !cold_recovery_checkpoint_failures.contains_key(&interaction.record.fence.operation_id)
+        });
+        let recovered_continuation_operation_owners = continuation_turn_owners
+            .iter()
+            .filter_map(|(interaction_id, owner)| {
+                recovered_continuation_interactions
+                    .get(interaction_id)
+                    .and_then(|interaction| interaction.winning_receipt.as_ref())
+                    .and_then(|receipt| owner.continuation_operation_identity(receipt).ok())
+                    .map(|identity| (identity.operation_id().clone(), interaction_id.clone()))
+            })
+            .collect::<HashMap<_, _>>();
         adopt_legacy_active_main_session_tasks_on_start(
             thread,
             &mut coordinator,
@@ -8201,13 +9765,38 @@ fn bootstrap_recorded_surface(
                         "failed to reconcile typed manual compaction context: {error:?}"
                     ),
                 })?;
-            coordinator
-                .recover_unavailable_interactions(&operation_id, &materialization)
-                .map_err(|error| RuntimeHostError::ThreadStartFailed {
-                    message: format!(
-                        "failed to reconcile typed interaction availability: {error:?}"
-                    ),
-                })?;
+            let checkpoint_failure = cold_recovery_checkpoint_failures
+                .get(&operation_id)
+                .copied();
+            if checkpoint_failure.is_none() {
+                coordinator
+                    .recover_unavailable_interactions_except(
+                        &operation_id,
+                        &materialization,
+                        &cold_recovery_owners
+                            .values()
+                            .filter(|owner| owner.operation_id() == &operation_id)
+                            .map(|owner| owner.interaction_id.clone())
+                            .chain(
+                                cold_recovery_permission_owners
+                                    .values()
+                                    .filter(|owner| owner.operation_id() == &operation_id)
+                                    .map(|owner| owner.interaction_id.clone()),
+                            )
+                            .chain(
+                                continuation_turn_owners
+                                    .values()
+                                    .filter(|owner| owner.operation_id() == &operation_id)
+                                    .map(|owner| owner.interaction_id.clone()),
+                            )
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                        message: format!(
+                            "failed to reconcile typed interaction availability: {error:?}"
+                        ),
+                    })?;
+            }
             coordinator
                 .recover_interrupted_capability_calls(&operation_id, &materialization)
                 .map_err(|error| RuntimeHostError::ThreadStartFailed {
@@ -8215,13 +9804,34 @@ fn bootstrap_recorded_surface(
                         "failed to reconcile typed capability availability: {error:?}"
                     ),
                 })?;
+            if cold_recovery_owners
+                .values()
+                .any(|owner| owner.operation_id() == &operation_id)
+                || cold_recovery_permission_owners
+                    .values()
+                    .any(|owner| owner.operation_id() == &operation_id)
+                || continuation_turn_owners
+                    .values()
+                    .any(|owner| owner.operation_id() == &operation_id)
+                || recovered_continuation_operation_owners.contains_key(&operation_id)
+            {
+                continue;
+            }
+            let mut checkpoint_failure_pending = checkpoint_failure;
             loop {
                 let before = coordinator.state().snapshot().cursor.clone();
-                let action = coordinator
-                    .recover_operation(&operation_id, &materialization)
-                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
-                        message: format!("failed to reconcile typed operation: {error:?}"),
-                    })?;
+                let action = match checkpoint_failure_pending.take() {
+                    Some(failure) => coordinator.recover_operation_checkpoint_rejection(
+                        &operation_id,
+                        &materialization,
+                        failure.failure_class(),
+                        failure.diagnostic(),
+                    ),
+                    None => coordinator.recover_operation(&operation_id, &materialization),
+                }
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to reconcile typed operation: {error:?}"),
+                })?;
                 if matches!(
                     action,
                     surface::RecoveryAction::ExposeRecoveryRequired
@@ -8276,7 +9886,10 @@ fn bootstrap_recorded_surface(
         message: format!("failed to persist effective typed surface settings: {error}"),
     })?;
     let terminals = recovered_surface_terminals(&coordinator);
-    let interactions = recovered_background_approval_interactions(&coordinator);
+    let mut interactions = recovered_background_approval_interactions(&coordinator);
+    interactions.extend(recovered_tool_approval_interactions);
+    interactions.extend(recovered_permission_interactions);
+    interactions.extend(recovered_continuation_interactions);
     let coordinator = coordinator.map_ledger(surface::RuntimeSurfaceCommitLedger::Recorded);
     bind_runtime_surface(
         coordinator,
@@ -8286,6 +9899,9 @@ fn bootstrap_recorded_surface(
         surface_hub_config,
         terminals,
         interactions,
+        cold_recovery_owners,
+        cold_recovery_permission_owners,
+        continuation_turn_owners,
     )
 }
 
@@ -8355,6 +9971,9 @@ fn bootstrap_ephemeral_surface(
         surface_hub_config,
         HashMap::new(),
         HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
     )
 }
 
@@ -8369,6 +9988,15 @@ fn bind_runtime_surface(
     surface_hub_config: surface::SurfaceHubConfig,
     terminals: HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
     interactions: HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+    cold_recovery_owners: HashMap<surface::SurfaceInteractionId, ColdRecoveryToolApprovalOwner>,
+    cold_recovery_permission_owners: HashMap<
+        surface::SurfaceInteractionId,
+        ColdRecoveryPermissionOwner,
+    >,
+    continuation_turn_owners: HashMap<
+        surface::SurfaceInteractionId,
+        ContinuationTurnCheckpointOwner,
+    >,
 ) -> Result<(surface::RuntimeSurfaceHandle, ResidentSurfaceState), RuntimeHostError> {
     let authority = surface::SurfaceAttachAuthority::new(
         host_incarnation,
@@ -8421,6 +10049,9 @@ fn bind_runtime_surface(
             hub: hub.clone(),
             capability: RuntimeCapabilityController::new(),
             interactions,
+            cold_recovery_owners,
+            cold_recovery_permission_owners,
+            continuation_turn_owners,
             operation_origin_attachments: HashMap::new(),
             pending_task_ownership: None,
             pending_detaches: HashMap::new(),
@@ -9409,6 +11040,11 @@ struct ResidentSurfaceState {
     hub: surface::SurfaceHub,
     capability: ResidentCapabilityController,
     interactions: HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+    cold_recovery_owners: HashMap<surface::SurfaceInteractionId, ColdRecoveryToolApprovalOwner>,
+    cold_recovery_permission_owners:
+        HashMap<surface::SurfaceInteractionId, ColdRecoveryPermissionOwner>,
+    continuation_turn_owners:
+        HashMap<surface::SurfaceInteractionId, ContinuationTurnCheckpointOwner>,
     operation_origin_attachments:
         HashMap<surface::SurfaceOperationId, surface::SurfaceAttachmentId>,
     pending_task_ownership: Option<PendingSurfaceTaskOwnership>,
@@ -11092,6 +12728,103 @@ fn runtime_permission_profile_from_surface(
         network,
         shell,
     }
+}
+
+fn surface_permission_retry_overlay_from_runtime(
+    overlay: &crate::runtime_permission::TurnPermissionOverlay,
+) -> io::Result<surface::PermissionRetryOverlay> {
+    let additional_working_directories = overlay
+        .additional_working_directories()
+        .iter()
+        .cloned()
+        .map(surface::CanonicalPath::try_new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "permission retry overlay contains a non-canonical working directory",
+            )
+        })?;
+    let metadata_writable_directories = overlay
+        .metadata_writable_directories()
+        .iter()
+        .cloned()
+        .map(surface::CanonicalPath::try_new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "permission retry overlay contains a non-canonical metadata directory",
+            )
+        })?;
+    let mut network_domain_permissions = overlay
+        .network_domain_permissions()
+        .iter()
+        .map(|(domain, access)| {
+            (
+                surface::SurfacePermissionDomainPattern(surface::DisplayText::new(domain.clone())),
+                match access {
+                    orca_core::config::PermissionProfileNetworkAccess::Allow => {
+                        surface::SurfaceAllowDeny::Allow
+                    }
+                    orca_core::config::PermissionProfileNetworkAccess::Deny => {
+                        surface::SurfaceAllowDeny::Deny
+                    }
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    network_domain_permissions.sort_by(|left, right| left.0.0.as_str().cmp(right.0.0.as_str()));
+    Ok(surface::PermissionRetryOverlay {
+        additional_working_directories,
+        metadata_writable_directories,
+        network_domain_permissions,
+        strict_auto_review: overlay.strict_auto_review(),
+    })
+}
+
+fn runtime_permission_overlay_from_surface(
+    overlay: &surface::PermissionRetryOverlay,
+) -> crate::runtime_permission::TurnPermissionOverlay {
+    let mut runtime = crate::runtime_permission::TurnPermissionOverlay::default();
+    let permissions = crate::protocol::RequestPermissionProfile {
+        file_system: Some(crate::protocol::RequestFileSystemPermissions {
+            read: None,
+            write: Some(
+                overlay
+                    .additional_working_directories
+                    .iter()
+                    .chain(overlay.metadata_writable_directories.iter())
+                    .map(|path| path.as_path().to_path_buf())
+                    .collect(),
+            ),
+            entries: None,
+        }),
+        network: Some(crate::protocol::RequestNetworkPermissions {
+            enabled: None,
+            domains: overlay
+                .network_domain_permissions
+                .iter()
+                .map(|(domain, access)| {
+                    (
+                        domain.0.as_str().to_string(),
+                        match access {
+                            surface::SurfaceAllowDeny::Allow => {
+                                orca_core::config::PermissionProfileNetworkAccess::Allow
+                            }
+                            surface::SurfaceAllowDeny::Deny => {
+                                orca_core::config::PermissionProfileNetworkAccess::Deny
+                            }
+                        },
+                    )
+                })
+                .collect(),
+        }),
+        shell: None,
+    };
+    runtime.merge_permissions(&permissions);
+    runtime.merge_strict_auto_review(overlay.strict_auto_review);
+    runtime
 }
 
 fn permission_path_subset(
@@ -13863,6 +15596,53 @@ fn restore_goal_surface_binding_worker(
         origin: turn.origin,
         turn,
     })
+}
+
+struct RuntimeOwnedRecoveredToolCommitter<'a> {
+    actor: &'a mut ThreadActor,
+}
+
+impl RecoveredToolInvocationCommitter for RuntimeOwnedRecoveredToolCommitter<'_> {
+    type HistoricalCommitAuthority = surface::HistoricalToolResultCommitAuthority;
+
+    fn commit_tool_invocation_started(
+        &mut self,
+        fence: &surface::SurfaceOperationFence,
+        intent: &surface::ToolInvocationIntent,
+    ) -> io::Result<Self::HistoricalCommitAuthority> {
+        let receipt = self
+            .actor
+            .resident_surface
+            .coordinator
+            .commit_tool_invocation_started(fence.clone(), intent.invocation_id().clone())
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to commit recovered tool invocation start: {error:?}"
+                ))
+            })?;
+        self.actor
+            .resident_surface
+            .coordinator
+            .issue_historical_tool_result_commit_authority(
+                fence.clone(),
+                intent.invocation_id().clone(),
+                receipt.revision(),
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to issue recovered historical tool authority: {error:?}"
+                ))
+            })
+    }
+
+    fn commit_historical_tool_result(
+        &mut self,
+        authority: &Self::HistoricalCommitAuthority,
+        result: &orca_core::tool_types::ToolResult,
+    ) -> io::Result<()> {
+        self.actor
+            .commit_recovery_authorized_historical_tool_result(authority, result)
+    }
 }
 
 impl ThreadActor {
@@ -16840,6 +18620,95 @@ impl ThreadActor {
             .map_err(|_| io::Error::other("failed to commit plan update facts"))
     }
 
+    fn surface_completed_tool_result(
+        tool: &surface::SurfaceToolView,
+        result: &orca_core::tool_types::ToolResult,
+    ) -> io::Result<(surface::SurfaceToolResult, surface::DisplayText)> {
+        if tool.request.name.as_str() != result.name.as_str() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tool completion name differs from the committed provider tool",
+            ));
+        }
+        let kind = match result.kind {
+            orca_core::tool_types::ToolResultKind::Success
+            | orca_core::tool_types::ToolResultKind::Empty
+            | orca_core::tool_types::ToolResultKind::NoMatches
+            | orca_core::tool_types::ToolResultKind::Truncated => {
+                surface::SurfaceToolResultKind::Success
+            }
+            orca_core::tool_types::ToolResultKind::PermissionDenied => {
+                surface::SurfaceToolResultKind::Denied
+            }
+            orca_core::tool_types::ToolResultKind::InvalidInput => {
+                surface::SurfaceToolResultKind::InvalidArguments
+            }
+            orca_core::tool_types::ToolResultKind::RuntimeError => {
+                surface::SurfaceToolResultKind::Failed
+            }
+            orca_core::tool_types::ToolResultKind::Cancelled => {
+                surface::SurfaceToolResultKind::Cancelled
+            }
+            orca_core::tool_types::ToolResultKind::Indeterminate => {
+                surface::SurfaceToolResultKind::ExternalEffectAmbiguous
+            }
+        };
+        let source = match result.source {
+            orca_core::tool_types::ToolTerminalSource::Observed => {
+                surface::ToolTerminalSource::Observed
+            }
+            orca_core::tool_types::ToolTerminalSource::CompatibilityRepair => {
+                surface::ToolTerminalSource::CompatibilityRepair
+            }
+        };
+        let invocation_started = match result.started {
+            orca_core::tool_types::ToolInvocationStarted::Yes => {
+                surface::ToolInvocationStarted::Yes
+            }
+            orca_core::tool_types::ToolInvocationStarted::No => surface::ToolInvocationStarted::No,
+            orca_core::tool_types::ToolInvocationStarted::Unknown => {
+                surface::ToolInvocationStarted::Unknown
+            }
+        };
+        let terminal = surface::SurfaceToolTerminal {
+            kind,
+            source,
+            invocation_started,
+        };
+        let output = result.output.as_deref().map(surface_persisted_display_text);
+        let error = result.error.as_deref().map(surface_persisted_display_text);
+        let content = output
+            .clone()
+            .or_else(|| error.clone())
+            .unwrap_or_else(|| surface::DisplayText::new("(no output)"));
+        let (output, error) = if output.is_none() && error.is_none() {
+            if matches!(terminal.kind, surface::SurfaceToolResultKind::Success) {
+                (Some(content.clone()), None)
+            } else {
+                (None, Some(content.clone()))
+            }
+        } else {
+            (output, error)
+        };
+        Ok((
+            surface::SurfaceToolResult {
+                tool_call_id: tool.request.tool_call_id.clone(),
+                name: tool.request.name.clone(),
+                terminal,
+                output,
+                error,
+                exit_code: if matches!(tool.request.action, surface::SurfaceToolAction::Shell) {
+                    result.exit_code
+                } else {
+                    None
+                },
+                truncated: result.truncated,
+                file_change: None,
+            },
+            content,
+        ))
+    }
+
     fn commit_surface_tool_results(
         &mut self,
         active: &mut ActiveOperation,
@@ -16890,92 +18759,14 @@ impl ThreadActor {
                         "tool completion lacks a committed provider tool identity",
                     )
                 })?;
-            if tool.request.turn_id != generation.logical_turn_id
-                || tool.request.name.as_str() != result.name.as_str()
-                || tool.result.is_some()
-            {
+            if tool.request.turn_id != generation.logical_turn_id || tool.result.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "tool completion differs from the active committed provider tool",
                 ));
             }
-
-            let kind = match result.kind {
-                orca_core::tool_types::ToolResultKind::Success
-                | orca_core::tool_types::ToolResultKind::Empty
-                | orca_core::tool_types::ToolResultKind::NoMatches
-                | orca_core::tool_types::ToolResultKind::Truncated => {
-                    surface::SurfaceToolResultKind::Success
-                }
-                orca_core::tool_types::ToolResultKind::PermissionDenied => {
-                    surface::SurfaceToolResultKind::Denied
-                }
-                orca_core::tool_types::ToolResultKind::InvalidInput => {
-                    surface::SurfaceToolResultKind::InvalidArguments
-                }
-                orca_core::tool_types::ToolResultKind::RuntimeError => {
-                    surface::SurfaceToolResultKind::Failed
-                }
-                orca_core::tool_types::ToolResultKind::Cancelled => {
-                    surface::SurfaceToolResultKind::Cancelled
-                }
-                orca_core::tool_types::ToolResultKind::Indeterminate => {
-                    surface::SurfaceToolResultKind::ExternalEffectAmbiguous
-                }
-            };
-            let source = match result.source {
-                orca_core::tool_types::ToolTerminalSource::Observed => {
-                    surface::ToolTerminalSource::Observed
-                }
-                orca_core::tool_types::ToolTerminalSource::CompatibilityRepair => {
-                    surface::ToolTerminalSource::CompatibilityRepair
-                }
-            };
-            let invocation_started = match result.started {
-                orca_core::tool_types::ToolInvocationStarted::Yes => {
-                    surface::ToolInvocationStarted::Yes
-                }
-                orca_core::tool_types::ToolInvocationStarted::No => {
-                    surface::ToolInvocationStarted::No
-                }
-                orca_core::tool_types::ToolInvocationStarted::Unknown => {
-                    surface::ToolInvocationStarted::Unknown
-                }
-            };
-            let terminal = surface::SurfaceToolTerminal {
-                kind,
-                source,
-                invocation_started,
-            };
-            let output = result.output.as_deref().map(surface_persisted_display_text);
-            let error = result.error.as_deref().map(surface_persisted_display_text);
-            let content = output
-                .clone()
-                .or_else(|| error.clone())
-                .unwrap_or_else(|| surface::DisplayText::new("(no output)"));
-            let (output, error) = if output.is_none() && error.is_none() {
-                if matches!(terminal.kind, surface::SurfaceToolResultKind::Success) {
-                    (Some(content.clone()), None)
-                } else {
-                    (None, Some(content.clone()))
-                }
-            } else {
-                (output, error)
-            };
-            let completed = surface::SurfaceToolResult {
-                tool_call_id: tool_call_id.clone(),
-                name: tool.request.name.clone(),
-                terminal: terminal.clone(),
-                output,
-                error,
-                exit_code: if matches!(tool.request.action, surface::SurfaceToolAction::Shell) {
-                    result.exit_code
-                } else {
-                    None
-                },
-                truncated: result.truncated,
-                file_change: None,
-            };
+            let (completed, content) = Self::surface_completed_tool_result(tool, result)?;
+            let terminal = completed.terminal.clone();
             events.push((
                 scope.clone(),
                 surface::SurfaceEvent::Tool(surface::ToolPatch::Completed { result: completed }),
@@ -16996,6 +18787,307 @@ impl ThreadActor {
         }
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.commit_surface_generation_batch_with_retry(fence, &batch)
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: a previously validated durable tool intent, its historical
+    ///   generation fence, matching recovered execution fingerprint, approved
+    ///   interaction receipt, and complete execution dependencies.
+    /// - Output: dispatches through the normal tool execution stack while
+    ///   skipping only the completed approval gate, then commits the result to
+    ///   the historical generation.
+    /// - Errors: rejects missing/mismatched projected tools, stale fences,
+    ///   non-requested state, existing start receipts, or any start/result
+    ///   commit failure before exposing success.
+    /// - State changes and external calls: commits durable InvocationStarted
+    ///   before tool dispatch and never creates or mutates `ActiveOperation`.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn dispatch_recovered_tool_intent<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        intent: &surface::ToolInvocationIntent,
+        fence: &surface::SurfaceOperationFence,
+        expected_execution_context_fingerprint: &surface::Sha256Digest,
+        observed_execution_context_fingerprint: &surface::Sha256Digest,
+        approval_receipt: &surface::SurfaceInteractionResolutionReceipt,
+        dependencies: RecoveredToolExecutionDependencies<'_>,
+        subagent_child_executor: crate::agent_child::ChildAgentExecutor<io::Sink>,
+        workflow_child_executor: crate::agent_child::ChildAgentExecutor<
+            crate::workflow::runner::SharedEventBuffer,
+        >,
+    ) -> io::Result<ToolExecutionCompletion> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
+        let generation = operation
+            .generations
+            .iter()
+            .find(|generation| generation.fence == *fence)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == *intent.invocation_id())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recovered tool intent lacks a committed provider tool",
+                )
+            })?;
+        if tool.request != *intent.request()
+            || tool.request.turn_id != generation.logical_turn_id
+            || tool.state != surface::SurfaceToolViewState::Requested
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered tool intent does not match its requested historical projection",
+            ));
+        }
+        let existing_started_receipt = tool.invocation_started.clone();
+        let mut committer = RuntimeOwnedRecoveredToolCommitter { actor: self };
+        execute_recovered_tool_intent(
+            config,
+            events,
+            sink,
+            intent,
+            RecoveredToolInvocationAuthorization {
+                fence,
+                expected_execution_context_fingerprint,
+                observed_execution_context_fingerprint,
+                approval_receipt,
+                existing_started_receipt: existing_started_receipt.as_ref(),
+            },
+            dependencies,
+            subagent_child_executor,
+            workflow_child_executor,
+            &mut committer,
+        )
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: a validated durable pre-side-effect permission retry intent,
+    ///   its historical fence/fingerprint, durable allow receipt and exact
+    ///   permission response, plus rebuilt execution dependencies.
+    /// - Output: re-dispatches the bound tool once without repeating approval,
+    ///   consuming only the persisted permission answer.
+    /// - Errors: rejects stale tools/fences, started projections, fingerprint
+    ///   mismatch, non-allow receipts, or start/result commit failures.
+    /// - State changes and external calls: commits `InvocationStarted` before
+    ///   hooks/router/tool execution and never recreates an active operation.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_recovered_permission_retry<W: io::Write>(
+        &mut self,
+        config: &RunConfig,
+        events: &mut EventFactory,
+        sink: &mut EventSink<W>,
+        intent: &surface::PermissionRetryIntent,
+        fence: &surface::SurfaceOperationFence,
+        expected_execution_context_fingerprint: &surface::Sha256Digest,
+        observed_execution_context_fingerprint: &surface::Sha256Digest,
+        permission_receipt: &surface::SurfaceInteractionResolutionReceipt,
+        permission_response: &crate::runtime_permission::RuntimePermissionResponse,
+        dependencies: RecoveredToolExecutionDependencies<'_>,
+        subagent_child_executor: crate::agent_child::ChildAgentExecutor<io::Sink>,
+        workflow_child_executor: crate::agent_child::ChildAgentExecutor<
+            crate::workflow::runner::SharedEventBuffer,
+        >,
+    ) -> io::Result<ToolExecutionCompletion> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
+        let generation = operation
+            .generations
+            .iter()
+            .find(|generation| generation.fence == *fence)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == *intent.invocation_id())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recovered permission intent lacks a committed provider tool",
+                )
+            })?;
+        if tool.request != *intent.tool()
+            || tool.request.turn_id != generation.logical_turn_id
+            || tool.state != surface::SurfaceToolViewState::Requested
+            || tool.result.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered permission intent does not match its not-started historical tool",
+            ));
+        }
+        let existing_started_receipt = tool.invocation_started.clone();
+        let mut committer = RuntimeOwnedRecoveredToolCommitter { actor: self };
+        execute_recovered_permission_retry_intent(
+            config,
+            events,
+            sink,
+            intent,
+            RecoveredPermissionRetryAuthorization {
+                fence,
+                expected_execution_context_fingerprint,
+                observed_execution_context_fingerprint,
+                permission_receipt,
+                permission_response,
+                existing_started_receipt: existing_started_receipt.as_ref(),
+            },
+            dependencies,
+            subagent_child_executor,
+            workflow_child_executor,
+            &mut committer,
+        )
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: a cold-recovery authority bound to one historical generation,
+    ///   invocation id, durable `InvocationStarted` receipt revision, and one
+    ///   completed observed tool result.
+    /// - Output: commits only that tool terminal result and its paired durable
+    ///   result item; an identical already-committed result succeeds
+    ///   idempotently.
+    /// - Errors: rejects stale fences/revisions, wrong invocation identities,
+    ///   missing start receipts, non-observed/non-started terminals, and
+    ///   conflicting repeated results without changing durable state.
+    /// - State changes and external calls: may append one recorded historical
+    ///   result batch; it does not create or mutate `ActiveOperation`, dispatch
+    ///   a tool, or replay a provider response.
+    #[allow(dead_code)]
+    fn commit_recovery_authorized_historical_tool_result(
+        &mut self,
+        authority: &surface::HistoricalToolResultCommitAuthority,
+        result: &orca_core::tool_types::ToolResult,
+    ) -> io::Result<()> {
+        let fence = authority.historical_fence();
+        let invocation_id = authority.invocation_id();
+        let result_invocation_id = surface::SurfaceToolCallId::try_new(result.id.clone())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
+        if &result_invocation_id != invocation_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered tool result invocation id differs from its authority",
+            ));
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
+        let generation = operation
+            .generations
+            .iter()
+            .find(|generation| generation.fence == *fence)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == *invocation_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recovered tool completion lacks a committed provider tool identity",
+                )
+            })?;
+        let receipt_matches = tool.invocation_started.as_ref().is_some_and(|receipt| {
+            receipt.invocation_id() == invocation_id
+                && receipt.fence() == fence
+                && receipt.revision() == authority.expected_projection_revision()
+        });
+        if tool.request.turn_id != generation.logical_turn_id || !receipt_matches {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered tool completion has a stale fence or invocation projection revision",
+            ));
+        }
+        let (completed, content) = Self::surface_completed_tool_result(tool, result)?;
+        if !matches!(
+            &completed.terminal,
+            surface::SurfaceToolTerminal {
+                source: surface::ToolTerminalSource::Observed,
+                invocation_started: surface::ToolInvocationStarted::Yes,
+                ..
+            }
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered tool completion must be observed after a durable invocation start",
+            ));
+        }
+        if let Some(existing) = &tool.result {
+            return if existing == &completed {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "recovered tool completion conflicts with the durable terminal result",
+                ))
+            };
+        }
+        if tool.state != surface::SurfaceToolViewState::Running {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered tool completion is stale for the projected invocation state",
+            ));
+        }
+        let terminal = completed.terminal.clone();
+        let scope = surface::SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    scope.clone(),
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::Completed {
+                        result: completed,
+                    }),
+                ),
+                (
+                    scope,
+                    surface::SurfaceEvent::Item(surface::ItemPatch::Added {
+                        item: surface::SurfaceItem::ToolResultMessage {
+                            id: surface::SurfaceItemId::new(),
+                            turn_id: tool.request.turn_id.clone(),
+                            tool_call_id: invocation_id.clone(),
+                            content,
+                            terminal,
+                            pinned: false,
+                        },
+                    }),
+                ),
+            ],
+            None,
+        );
+        for attempt in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
+            match self
+                .resident_surface
+                .coordinator
+                .commit_historical_tool_result_batch(authority, &batch)
+            {
+                Ok(_) => return Ok(()),
+                Err(surface::SurfaceCommitError::Ledger(error))
+                    if attempt + 1 < SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS
+                        && matches!(
+                            error,
+                            surface::SurfaceLedgerError::AppendFailed
+                                | surface::SurfaceLedgerError::PartialAppend
+                                | surface::SurfaceLedgerError::CheckpointFailed
+                        ) => {}
+                Err(error) => {
+                    return Err(io::Error::other(format!(
+                        "failed to commit recovered historical tool result: {error:?}"
+                    )));
+                }
+            }
+        }
+        Err(io::Error::other(
+            "recovered historical tool result did not commit after bounded retries",
+        ))
     }
 
     fn commit_surface_workflow_started(
@@ -19872,12 +21964,24 @@ impl ThreadActor {
         ))
     }
 
+    /// Function intent contract:
+    ///
+    /// - Input: an active generation, preallocated stable interaction id,
+    ///   typed effect request, and its already-decided recovery disposition.
+    /// - Output: durably commits the exact request before presentation and
+    ///   returns the private broker record/route for the live waiter.
+    /// - Errors: rejects stale or terminalizing generations and preserves the
+    ///   existing capability-unavailable fail-closed behavior.
+    /// - State changes: writes one interaction request batch; it never builds
+    ///   or interprets a continuation capsule itself.
     fn commit_surface_effect_interaction_request(
         &mut self,
         active: &mut ActiveOperation,
         fence: surface::SurfaceOperationFence,
+        interaction_id: surface::SurfaceInteractionId,
         kind: surface::SurfaceInteractionKind,
         request: surface::SurfaceInteractionRequest,
+        recovery_disposition: surface::InteractionUnavailableDisposition,
     ) -> io::Result<
         Option<(
             surface::SurfaceInteractionId,
@@ -19907,9 +22011,6 @@ impl ThreadActor {
             .hub
             .select_interaction_attachment_for(kind, preferred);
         let unavailable = attachment_id.is_none();
-        let interaction_id =
-            surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
-                .expect("generated UUID is v7");
         let revision = surface::InteractionRevision::try_new(1).expect("one is valid");
         let route_epoch = surface::ResponseRouteEpoch::try_new(1).expect("one is valid");
         let record = surface::BrokerInteractionRequestRecord {
@@ -19920,7 +22021,7 @@ impl ThreadActor {
             request: request.clone(),
             response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
             answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
-            recovery_disposition: surface::InteractionUnavailableDisposition::FailOperation,
+            recovery_disposition,
         };
         let route = match attachment_id.as_ref() {
             Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
@@ -20008,17 +22109,37 @@ impl ThreadActor {
             let tool = Self::surface_tool_for_runtime_request(&snapshot, &fence, &request)?;
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool)?;
             let interaction_request = surface::SurfaceInteractionRequest::ToolApproval {
-                tool,
+                tool: tool.clone(),
                 description: surface::DisplayText::new(approval.description.clone()),
                 preview: approval.preview.clone().map(surface::DisplayText::new),
-                authority,
+                authority: authority.clone(),
             };
+            let interaction_id =
+                surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let execution_context_fingerprint =
+                cold_recovery_thread_config_fingerprint(&self.config, &snapshot);
+            let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
+                interaction_id.clone(),
+                fence.clone(),
+                interaction_request.clone(),
+                execution_context_fingerprint,
+                surface::DurableInteractionContinuationIntent::ToolInvocation(
+                    surface::ToolInvocationIntent::before_invocation(tool, authority),
+                ),
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let recovery_disposition =
+                surface::InteractionUnavailableDisposition::restartable_tool_approval(&capsule)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let Some((interaction_id, record, route, revision)) = self
                 .commit_surface_effect_interaction_request(
                     active,
                     fence,
+                    interaction_id,
                     surface::SurfaceInteractionKind::ToolApproval,
                     interaction_request,
+                    recovery_disposition,
                 )?
             else {
                 if jsonl_compatibility_fallback {
@@ -20062,6 +22183,7 @@ impl ThreadActor {
         active: &mut ActiveOperation,
         fence: surface::SurfaceOperationFence,
         request: crate::runtime_permission::RuntimePermissionRequest,
+        retry_overlay: Option<crate::runtime_permission::TurnPermissionOverlay>,
         reply: SyncSender<io::Result<crate::runtime_permission::RuntimePermissionResponse>>,
     ) {
         let result = (|| -> io::Result<()> {
@@ -20099,17 +22221,53 @@ impl ThreadActor {
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool_request)?;
             let permissions = surface_permission_profile_from_runtime(request.permissions.clone())?;
             let interaction_request = surface::SurfaceInteractionRequest::PermissionRequest {
-                tool_call_id: tool_request.tool_call_id,
+                tool_call_id: tool_request.tool_call_id.clone(),
                 reason: request.reason.clone().map(surface::DisplayText::new),
-                permissions,
-                authority,
+                permissions: permissions.clone(),
+                authority: authority.clone(),
+            };
+            let interaction_id =
+                surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7");
+            let recovery_disposition = match retry_overlay {
+                Some(retry_overlay) => surface_permission_retry_overlay_from_runtime(
+                    &retry_overlay,
+                )
+                .ok()
+                .and_then(|permission_overlay| {
+                    surface::DurableInteractionContinuationCapsule::try_new_restartable(
+                        interaction_id.clone(),
+                        fence.clone(),
+                        interaction_request.clone(),
+                        cold_recovery_thread_config_fingerprint(&self.config, &snapshot),
+                        surface::DurableInteractionContinuationIntent::PermissionRetry(
+                            surface::PermissionRetryIntent::pre_side_effect(
+                                tool_request,
+                                permissions,
+                                permission_overlay,
+                                authority,
+                            ),
+                        ),
+                    )
+                    .ok()
+                })
+                .and_then(|capsule| {
+                    surface::InteractionUnavailableDisposition::restartable_permission_request(
+                        &capsule,
+                    )
+                    .ok()
+                })
+                .unwrap_or(surface::InteractionUnavailableDisposition::FailOperation),
+                None => surface::InteractionUnavailableDisposition::FailOperation,
             };
             let Some((interaction_id, record, route, revision)) = self
                 .commit_surface_effect_interaction_request(
                     active,
                     fence,
+                    interaction_id,
                     surface::SurfaceInteractionKind::PermissionRequest,
                     interaction_request,
+                    recovery_disposition,
                 )?
             else {
                 let _ = reply.send(Ok(crate::runtime_permission::RuntimePermissionResponse {
@@ -20174,7 +22332,7 @@ impl ThreadActor {
                 "runtime generation is terminalizing",
             ));
         }
-        surface::NonEmptyText::try_new(request.id.clone())
+        let request_identity = surface::NonEmptyText::try_new(request.id.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty user-input id"))?;
         let question = surface::NonEmptyText::try_new(request.question.clone()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "empty user-input question")
@@ -20196,7 +22354,7 @@ impl ThreadActor {
         let response_token = surface::SurfaceResponseToken::new(random_token_bytes());
         let response_grant_token = surface::SurfaceResponseGrantToken::new(random_token_bytes());
         let interaction_request = surface::SurfaceInteractionRequest::UserInput {
-            question,
+            question: question.clone(),
             suggestions: request
                 .choices
                 .iter()
@@ -20204,6 +22362,30 @@ impl ThreadActor {
                 .map(surface::DisplayText::new)
                 .collect(),
         };
+        let continuation_intent = surface::ContinuationTurnIntent::user_input(
+            request_identity,
+            question,
+            request
+                .choices
+                .iter()
+                .cloned()
+                .map(surface::DisplayText::new)
+                .collect(),
+        );
+        let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
+            interaction_id.clone(),
+            fence.clone(),
+            interaction_request.clone(),
+            cold_recovery_thread_config_fingerprint(
+                &self.config,
+                self.resident_surface.coordinator.state().snapshot(),
+            ),
+            surface::DurableInteractionContinuationIntent::ContinuationTurn(continuation_intent),
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let recovery_disposition =
+            surface::InteractionUnavailableDisposition::restartable_continuation_turn(&capsule)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let record = surface::BrokerInteractionRequestRecord {
             thread_id: fence.thread_id.clone(),
             interaction_id: interaction_id.clone(),
@@ -20212,7 +22394,7 @@ impl ThreadActor {
             request: interaction_request.clone(),
             response_token,
             answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
-            recovery_disposition: surface::InteractionUnavailableDisposition::FailOperation,
+            recovery_disposition,
         };
         let route = match attachment_id.as_ref() {
             Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
@@ -20355,11 +22537,31 @@ impl ThreadActor {
         let route_epoch =
             surface::ResponseRouteEpoch::try_new(1).expect("one is a valid route epoch");
         let interaction_request = surface::SurfaceInteractionRequest::McpElicitation {
-            server_name,
+            server_name: server_name.clone(),
             server_request_id: opaque_request_id.clone(),
             message: surface::DisplayText::new(request.message.clone()),
-            request: mcp_request,
+            request: mcp_request.clone(),
         };
+        let continuation_intent = surface::ContinuationTurnIntent::mcp_elicitation(
+            server_name,
+            opaque_request_id,
+            surface::DisplayText::new(request.message.clone()),
+            mcp_request,
+        );
+        let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
+            interaction_id.clone(),
+            fence.clone(),
+            interaction_request.clone(),
+            cold_recovery_thread_config_fingerprint(
+                &self.config,
+                self.resident_surface.coordinator.state().snapshot(),
+            ),
+            surface::DurableInteractionContinuationIntent::ContinuationTurn(continuation_intent),
+        )
+        .map_err(|error| error.to_string())?;
+        let recovery_disposition =
+            surface::InteractionUnavailableDisposition::restartable_continuation_turn(&capsule)
+                .map_err(|error| error.to_string())?;
         let record = surface::BrokerInteractionRequestRecord {
             thread_id: fence.thread_id.clone(),
             interaction_id: interaction_id.clone(),
@@ -20368,7 +22570,7 @@ impl ThreadActor {
             request: interaction_request.clone(),
             response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
             answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
-            recovery_disposition: surface::InteractionUnavailableDisposition::FailOperation,
+            recovery_disposition,
         };
         let route = match attachment_id.as_ref() {
             Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
@@ -20445,6 +22647,83 @@ impl ThreadActor {
             },
         );
         Ok(())
+    }
+
+    fn project_headless_interaction(
+        &mut self,
+        client: &surface::RuntimeSurfaceClientHandle,
+        interaction_id: surface::SurfaceInteractionId,
+    ) -> Result<Option<HeadlessInteractionCheckpoint>, surface::SurfaceClientCommandError> {
+        if client.grant().role != surface::SurfaceAttachmentRole::Headless {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        if !self
+            .resident_surface
+            .interactions
+            .contains_key(&interaction_id)
+        {
+            return Ok(None);
+        }
+        self.assign_unassigned_background_interaction(client, &interaction_id)?;
+        let interaction = self
+            .resident_surface
+            .interactions
+            .get(&interaction_id)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if interaction.cancelled.is_some()
+            || interaction.winning_receipt.is_some()
+            || !self
+                .resident_surface
+                .hub
+                .admits_interaction_client(client, interaction.record.kind)
+        {
+            return Ok(None);
+        }
+        let selector = exact_interaction_selectors(interaction)
+            .into_iter()
+            .find_map(|(attachment_id, selector)| {
+                (attachment_id == *client.attachment_id()).then_some(selector)
+            })
+            .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+        let route = match &interaction.route {
+            surface::BrokerInteractionResponseRoute::Unassigned { epoch } => {
+                surface::SurfaceInteractionRoute::Unassigned { epoch: *epoch }
+            }
+            surface::BrokerInteractionResponseRoute::Exclusive {
+                epoch,
+                attachment_id,
+                ..
+            } => surface::SurfaceInteractionRoute::Exclusive {
+                epoch: *epoch,
+                attachment_id: attachment_id.clone(),
+            },
+            surface::BrokerInteractionResponseRoute::SharedFirstCommitWins { epoch, grants } => {
+                surface::SurfaceInteractionRoute::SharedFirstCommitWins {
+                    epoch: *epoch,
+                    attachments: surface::NonEmptySet::try_new(
+                        grants
+                            .as_slice()
+                            .iter()
+                            .map(|(attachment_id, _)| attachment_id.clone())
+                            .collect(),
+                    )
+                    .expect("private interaction route grants are non-empty"),
+                }
+            }
+        };
+        Ok(Some(HeadlessInteractionCheckpoint {
+            interaction: surface::SurfaceInteractionView {
+                interaction_id: interaction.record.interaction_id.clone(),
+                revision: interaction.revision,
+                fence: interaction.record.fence.clone(),
+                kind: interaction.record.kind,
+                request: interaction.record.request.clone(),
+                route,
+                lifecycle: surface::SurfaceInteractionLifecycle::Requested,
+                recovery_disposition: interaction.record.recovery_disposition.clone(),
+            },
+            selector,
+        }))
     }
 
     fn respond_surface_interaction_by_id(
@@ -20577,6 +22856,77 @@ impl ThreadActor {
             interaction.route,
             surface::BrokerInteractionResponseRoute::Unassigned { .. }
         ) {
+            return Ok(());
+        }
+        if self
+            .resident_surface
+            .cold_recovery_owners
+            .contains_key(interaction_id)
+            || self
+                .resident_surface
+                .cold_recovery_permission_owners
+                .contains_key(interaction_id)
+            || self
+                .resident_surface
+                .continuation_turn_owners
+                .contains_key(interaction_id)
+        {
+            if !matches!(
+                interaction.record.kind,
+                surface::SurfaceInteractionKind::ToolApproval
+                    | surface::SurfaceInteractionKind::PermissionRequest
+                    | surface::SurfaceInteractionKind::UserInput
+                    | surface::SurfaceInteractionKind::McpElicitation
+            ) || !self
+                .resident_surface
+                .hub
+                .admits_interaction_client(client, interaction.record.kind)
+            {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
+            let expected_revision = interaction.revision;
+            let next_revision =
+                surface::InteractionRevision::try_new(expected_revision.get().saturating_add(1))
+                    .expect("interaction revision did not exhaust");
+            let current_epoch = interaction_route_epoch(&interaction.route);
+            let next_epoch =
+                surface::ResponseRouteEpoch::try_new(current_epoch.get().saturating_add(1))
+                    .expect("interaction route epoch did not exhaust");
+            let public_route = surface::SurfaceInteractionRoute::Exclusive {
+                epoch: next_epoch,
+                attachment_id: client.attachment_id().clone(),
+            };
+            let private_route = surface::BrokerInteractionResponseRoute::Exclusive {
+                epoch: next_epoch,
+                attachment_id: client.attachment_id().clone(),
+                grant_token: surface::SurfaceResponseGrantToken::new(random_token_bytes()),
+            };
+            let fence = interaction.record.fence.clone();
+            let batch = self.surface_event_batch_with_commit_id(
+                vec![(
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
+                        interaction_id: interaction_id.clone(),
+                        expected_revision,
+                        next_revision,
+                        route: public_route,
+                    }),
+                )],
+                None,
+            );
+            self.resident_surface
+                .coordinator
+                .commit_generation_batch(fence, &batch)
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let interaction = self
+                .resident_surface
+                .interactions
+                .get_mut(interaction_id)
+                .expect("cold-recovery ToolApproval remains resident");
+            interaction.revision = next_revision;
+            interaction.route = private_route;
             return Ok(());
         }
         if interaction.record.kind != surface::SurfaceInteractionKind::BackgroundApproval
@@ -21007,6 +23357,14 @@ impl ThreadActor {
                 .unwrap_or_else(|| surface::SurfaceScope::Generation {
                     fence: fence.clone(),
                 });
+            let continuation = self
+                .resident_surface
+                .continuation_turn_owners
+                .get(&interaction_id)
+                .map(|owner| owner.durable_answer(&receipt, &winner_answer))
+                .transpose()
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+                .flatten();
             let batch = self.surface_event_batch_with_commit_id(
                 vec![(
                     scope,
@@ -21015,6 +23373,7 @@ impl ThreadActor {
                         expected_revision,
                         next_revision,
                         receipt: receipt.clone(),
+                        continuation,
                     }),
                 )],
                 None,
@@ -21224,6 +23583,1395 @@ impl ThreadActor {
                 _ => unreachable!("waiter and answer kind were validated before commit"),
             }
         }
+        self.settle_cold_recovery_tool_approval(interaction_id, winner_answer);
+        self.settle_cold_recovery_permission(interaction_id, winner_answer);
+        self.settle_cold_recovery_continuation_turn(interaction_id);
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: one durably resolved interaction owned by the cold-recovery
+    ///   ToolApproval owner.
+    /// - Output: an allow dispatches the persisted BeforeInvocation intent;
+    ///   deny skips execution. Both paths release the historical operation by
+    ///   completing its durable recovery finalization.
+    /// - Errors: execution or finalization failures are retained as a blocked
+    ///   surface condition after the interaction resolution remains committed.
+    /// - State changes and external calls: allow may run hooks/router only
+    ///   after durable InvocationStarted; deny performs no tool side effect.
+    fn settle_cold_recovery_tool_approval(
+        &mut self,
+        interaction_id: &surface::SurfaceInteractionId,
+        winner_answer: &surface::SurfaceClientInteractionAnswer,
+    ) {
+        let Some(owner) = self
+            .resident_surface
+            .cold_recovery_owners
+            .get(interaction_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(receipt) = self
+            .resident_surface
+            .interactions
+            .get(interaction_id)
+            .and_then(|interaction| interaction.winning_receipt.clone())
+        else {
+            self.surface_terminal_blocked =
+                Some("cold-recovery ToolApproval lost its durable resolution receipt".to_string());
+            return;
+        };
+        let dispatch = match winner_answer {
+            surface::SurfaceClientInteractionAnswer::ToolApproval {
+                decision: surface::SurfaceAllowDeny::Allow,
+            } => self
+                .dispatch_cold_recovery_tool_approval(&owner, &receipt)
+                .map(|_| ()),
+            surface::SurfaceClientInteractionAnswer::ToolApproval {
+                decision: surface::SurfaceAllowDeny::Deny,
+            } => Ok(()),
+            _ => return,
+        };
+        self.resident_surface
+            .cold_recovery_owners
+            .remove(interaction_id);
+        if let Err(error) = dispatch {
+            eprintln!("orca: recovered ToolApproval dispatch failed closed: {error}");
+        }
+        if let Err(error) = self.terminalize_cold_recovery_tool_approval(&owner) {
+            self.surface_terminal_blocked = Some(format!(
+                "cold-recovery ToolApproval operation terminalization failed: {error}"
+            ));
+        }
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: one durably resolved PermissionRequest retained by a validated
+    ///   cold-recovery pre-side-effect owner.
+    /// - Output: allow re-dispatches the exact tool with the durable permission
+    ///   answer; deny terminalizes without dispatch.
+    /// - Errors: dispatch/finalization failures remain fail closed after the
+    ///   interaction resolution is durable.
+    /// - State changes and external calls: allow may execute the tool only
+    ///   after durable `InvocationStarted`; deny performs no tool side effect.
+    fn settle_cold_recovery_permission(
+        &mut self,
+        interaction_id: &surface::SurfaceInteractionId,
+        winner_answer: &surface::SurfaceClientInteractionAnswer,
+    ) {
+        let Some(owner) = self
+            .resident_surface
+            .cold_recovery_permission_owners
+            .get(interaction_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(receipt) = self
+            .resident_surface
+            .interactions
+            .get(interaction_id)
+            .and_then(|interaction| interaction.winning_receipt.clone())
+        else {
+            self.surface_terminal_blocked = Some(
+                "cold-recovery PermissionRequest lost its durable resolution receipt".to_string(),
+            );
+            return;
+        };
+        let dispatch = match winner_answer {
+            surface::SurfaceClientInteractionAnswer::PermissionRequest { decision } => {
+                let (decision, scope, permissions, strict_auto_review) = match decision {
+                    surface::SurfacePermissionClientDecision::Allow {
+                        scope,
+                        permissions,
+                        strict_auto_review,
+                    } => (
+                        crate::protocol::PermissionResponseDecision::Allow,
+                        *scope,
+                        permissions,
+                        *strict_auto_review,
+                    ),
+                    surface::SurfacePermissionClientDecision::Deny {
+                        scope,
+                        permissions,
+                        strict_auto_review,
+                    } => (
+                        crate::protocol::PermissionResponseDecision::Deny,
+                        *scope,
+                        permissions,
+                        *strict_auto_review,
+                    ),
+                };
+                let response = crate::runtime_permission::RuntimePermissionResponse {
+                    decision,
+                    scope: match scope {
+                        surface::PermissionGrantScope::Turn => {
+                            crate::protocol::PermissionGrantScope::Turn
+                        }
+                        surface::PermissionGrantScope::Session => {
+                            crate::protocol::PermissionGrantScope::Session
+                        }
+                    },
+                    permissions: runtime_permission_profile_from_surface(permissions),
+                    strict_auto_review,
+                };
+                if decision == crate::protocol::PermissionResponseDecision::Allow {
+                    self.dispatch_cold_recovery_permission(&owner, &receipt, &response)
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
+            _ => return,
+        };
+        self.resident_surface
+            .cold_recovery_permission_owners
+            .remove(interaction_id);
+        if let Err(error) = dispatch {
+            eprintln!("orca: recovered PermissionRequest dispatch failed closed: {error}");
+        }
+        if let Err(error) = self.terminalize_cold_recovery_permission(&owner) {
+            self.surface_terminal_blocked = Some(format!(
+                "cold-recovery PermissionRequest operation terminalization failed: {error}"
+            ));
+        }
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: one durably resolved recovered UserInput/MCP interaction.
+    /// - Output: cancel/decline only terminalizes the historical operation;
+    ///   an accepted answer atomically creates one stable durable operation
+    ///   intent and then executes that same operation/turn identity.
+    /// - Errors: invalid capsules, stale owners, terminalization failures, or
+    ///   turn-start failures remain fail closed after the resolution commit.
+    /// - State changes: `Started` means the stable durable operation exists,
+    ///   not that a process-local `StartTurn` call happened. Recovery retries
+    ///   until the stable turn is durably present; `Consumed` is written only
+    ///   after that durable turn boundary or operation terminal is observable.
+    fn settle_cold_recovery_continuation_turn(
+        &mut self,
+        interaction_id: &surface::SurfaceInteractionId,
+    ) {
+        let Some(owner) = self
+            .resident_surface
+            .continuation_turn_owners
+            .get(interaction_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(receipt) = self
+            .resident_surface
+            .interactions
+            .get(interaction_id)
+            .and_then(|interaction| interaction.winning_receipt.clone())
+        else {
+            let terminalization =
+                self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation");
+            self.surface_terminal_blocked = Some(match terminalization {
+                Ok(()) => {
+                    "cold-recovery continuation lost its durable resolution receipt".to_string()
+                }
+                Err(error) => format!(
+                    "cold-recovery continuation lost its durable resolution receipt and terminalization failed: {error}"
+                ),
+            });
+            return;
+        };
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let owner_valid = snapshot.thread.owner_epoch == owner.cold_owner_epoch
+            && snapshot.interactions.iter().any(|interaction| {
+                interaction.interaction_id == owner.interaction_id
+                    && interaction.fence == owner.historical_fence
+                    && matches!(
+                        interaction.lifecycle,
+                        surface::SurfaceInteractionLifecycle::Resolved {
+                            receipt: ref durable_receipt,
+                        } if durable_receipt == &receipt
+                    )
+            });
+        let recovered = self
+            .resident_surface
+            .coordinator
+            .ledger()
+            .recover_batches()
+            .map(|batches| {
+                recovered_continuation_resolutions_from_batches(&batches.committed)
+                    .remove(interaction_id)
+            });
+        if !continuation_resolution_requires_dispatch(&receipt) {
+            self.resident_surface
+                .continuation_turn_owners
+                .remove(interaction_id);
+            if let Err(error) =
+                self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation")
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "cold-recovery continuation cancellation terminalization failed: {error}"
+                ));
+            }
+            return;
+        }
+        let resolution = match recovered {
+            Ok(Some(resolution)) if owner_valid && resolution.receipt == receipt => resolution,
+            Ok(_) => {
+                self.resident_surface
+                    .continuation_turn_owners
+                    .remove(interaction_id);
+                let _ =
+                    self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation");
+                self.surface_terminal_blocked = Some(
+                    "cold-recovery continuation lacks a valid durable answer fact".to_string(),
+                );
+                return;
+            }
+            Err(error) => {
+                self.surface_terminal_blocked = Some(format!(
+                    "cold-recovery continuation fact recovery failed: {error:?}"
+                ));
+                return;
+            }
+        };
+        let identity = match owner.continuation_operation_identity(&receipt) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.resident_surface
+                    .continuation_turn_owners
+                    .remove(interaction_id);
+                let _ =
+                    self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation");
+                self.surface_terminal_blocked = Some(format!(
+                    "cold-recovery continuation identity is invalid: {error}"
+                ));
+                return;
+            }
+        };
+        let operation_id = identity.operation_id().clone();
+        let turn_id = identity.turn_id().clone();
+        let dispatch_id = identity.dispatch_id().clone();
+        match &resolution.dispatch_state {
+            RecoveredContinuationDispatchState::Pending => {}
+            RecoveredContinuationDispatchState::Started {
+                dispatch_id: recorded_dispatch,
+                operation_id: recorded_operation,
+                turn_id: recorded_turn,
+            }
+            | RecoveredContinuationDispatchState::Consumed {
+                dispatch_id: recorded_dispatch,
+                operation_id: recorded_operation,
+                turn_id: recorded_turn,
+            } if recorded_dispatch != &dispatch_id
+                || recorded_operation != &operation_id
+                || recorded_turn != &turn_id =>
+            {
+                self.resident_surface
+                    .continuation_turn_owners
+                    .remove(interaction_id);
+                let _ =
+                    self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation");
+                self.surface_terminal_blocked = Some(
+                    "cold-recovery continuation dispatch identity is inconsistent".to_string(),
+                );
+                return;
+            }
+            RecoveredContinuationDispatchState::Consumed { .. } => {
+                self.resident_surface
+                    .continuation_turn_owners
+                    .remove(interaction_id);
+                if let Err(error) =
+                    self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation")
+                {
+                    self.surface_terminal_blocked = Some(format!(
+                        "consumed continuation terminalization failed: {error}"
+                    ));
+                }
+                return;
+            }
+            RecoveredContinuationDispatchState::Started { .. } => {}
+        }
+        let Some(answer) = resolution.answer else {
+            self.resident_surface
+                .continuation_turn_owners
+                .remove(interaction_id);
+            let _ = self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation");
+            self.surface_terminal_blocked =
+                Some("accepted continuation resolution has no durable answer".to_string());
+            return;
+        };
+        let notification = match owner.render_pinned_user_continuation(&receipt, &answer) {
+            Ok(notification) => notification,
+            Err(error) => {
+                self.resident_surface
+                    .continuation_turn_owners
+                    .remove(interaction_id);
+                let _ =
+                    self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation");
+                self.surface_terminal_blocked =
+                    Some(format!("recovered continuation failed closed: {error}"));
+                return;
+            }
+        };
+        if matches!(
+            resolution.dispatch_state,
+            RecoveredContinuationDispatchState::Pending
+        ) && let Err(error) =
+            self.commit_cold_recovery_continuation_operation_intent(&owner, &receipt, &identity)
+        {
+            self.surface_terminal_blocked = Some(format!(
+                "cold-recovery continuation operation intent commit failed: {error}"
+            ));
+            return;
+        }
+        if let Err(error) =
+            self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation")
+        {
+            self.surface_terminal_blocked = Some(format!(
+                "cold-recovery continuation historical operation terminalization failed: {error}"
+            ));
+            return;
+        }
+        let durable_turn_exists = self.has_durable_continuation_turn(&turn_id);
+        let continuation_terminal = Self::surface_operation_record(
+            self.resident_surface.coordinator.state().snapshot(),
+            &operation_id,
+        )
+        .is_some_and(|operation| operation.terminal.is_some());
+        if durable_turn_exists || continuation_terminal {
+            if durable_turn_exists
+                && !continuation_terminal
+                && let Err(error) =
+                    self.terminalize_cold_recovery_operation(&operation_id, "continuation turn")
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "cold-recovery continuation durable turn terminalization failed: {error}"
+                ));
+                return;
+            }
+            if let Err(error) = self.commit_cold_recovery_continuation_dispatch_consumed(
+                &owner,
+                &receipt,
+                dispatch_id,
+                operation_id,
+                turn_id,
+            ) {
+                self.surface_terminal_blocked = Some(format!(
+                    "cold-recovery continuation consumption commit failed: {error}"
+                ));
+                return;
+            }
+            self.resident_surface
+                .continuation_turn_owners
+                .remove(interaction_id);
+            return;
+        }
+        if let Err(error) = self.start_cold_recovery_continuation_operation(
+            &owner,
+            &receipt,
+            notification,
+            operation_id,
+            turn_id,
+        ) {
+            self.surface_terminal_blocked = Some(format!(
+                "cold-recovery continuation turn start failed: {error}"
+            ));
+        }
+    }
+
+    fn has_durable_continuation_turn(&self, turn_id: &TurnId) -> bool {
+        self.state
+            .as_ref()
+            .and_then(|state| state.thread.session().conversation_records())
+            .is_some_and(|records| {
+                records
+                    .iter()
+                    .any(|record| record.turn_id.as_ref() == Some(turn_id))
+            })
+    }
+
+    fn commit_cold_recovery_continuation_operation_intent(
+        &mut self,
+        owner: &ContinuationTurnCheckpointOwner,
+        receipt: &surface::SurfaceInteractionResolutionReceipt,
+        identity: &surface::DurableInteractionContinuationOperationIdentity,
+    ) -> io::Result<()> {
+        let interaction = self
+            .resident_surface
+            .interactions
+            .get(&owner.interaction_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interaction missing"))?;
+        let expected_revision = interaction.revision;
+        let next_revision = surface::InteractionRevision::try_new(
+            expected_revision
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("interaction revision exhausted"))?,
+        )
+        .map_err(|_| io::Error::other("interaction revision is invalid"))?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let historical_operation = Self::surface_operation_record(&snapshot, owner.operation_id())
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "historical continuation operation is missing",
+                )
+            })?;
+        let origin = historical_operation.intent.origin;
+        let origin_attachment = self
+            .resident_surface
+            .operation_origin_attachments
+            .get(owner.operation_id())
+            .cloned();
+        if matches!(&origin, surface::OperationOrigin::AcpPrompt { .. })
+            && !origin_attachment
+                .as_ref()
+                .is_some_and(|attachment| self.resident_surface.hub.has_live_attachment(attachment))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "ACP continuation origin attachment is unavailable",
+            ));
+        }
+        let reference = surface::SurfaceInputRequest {
+            blocks: surface::NonEmptyVec::try_new(vec![surface::SurfaceInputRequestBlock::Text {
+                text: surface::DisplayText::new(format!(
+                    "durable continuation reference: interaction={} receipt={}",
+                    uuid::Uuid::from_bytes(*owner.interaction_id.as_bytes()),
+                    uuid::Uuid::from_bytes(*receipt.receipt_id.as_bytes()),
+                )),
+            }])
+            .expect("continuation reference input is non-empty"),
+        };
+        let request_digest = surface_sha256(
+            &serde_json::to_vec(&reference).expect("continuation reference is serializable"),
+        );
+        if let Some(operation) = Self::surface_operation_record(
+            self.resident_surface.coordinator.state().snapshot(),
+            identity.operation_id(),
+        ) {
+            let exact_replayability = matches!(
+                &operation.intent.initial_replayability,
+                surface::Replayability::Replayable {
+                    request: Some(request),
+                    request_digest: Some(digest),
+                    ..
+                } if request == &reference && digest == &request_digest
+            );
+            if operation.request_id == *identity.request_id()
+                && operation.intent.kind == surface::OperationKind::UserTurn
+                && exact_replayability
+            {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "stable continuation operation identity is occupied by different work",
+            ));
+        }
+        let replayability = surface::Replayability::Replayable {
+            capsule_digest: request_digest.clone(),
+            request: Some(reference),
+            request_digest: Some(request_digest),
+            cwd: snapshot.settings.effective.cwd.clone(),
+            workspace_roots: snapshot.settings.effective.workspace_roots.clone(),
+            settings_revision: snapshot.settings.thread_revision,
+            policy_epoch: snapshot.settings.effective.policy_epoch,
+            tool_schema_digest: surface_sha256(
+                &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+            ),
+        };
+        let capability_fingerprint = surface_sha256(
+            &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+        );
+        let operation_id = identity.operation_id().clone();
+        let lease = surface::ReservationLease::new(
+            surface::SurfaceAdmissionLeaseId::try_from_bytes(*owner.interaction_id.as_bytes())
+                .expect("interaction identity is a UUIDv7"),
+            operation_id.clone(),
+            surface::SequenceNumber::new(snapshot.queued_operations.len() as u64 + 1),
+            self.resident_surface
+                .hub
+                .authority()
+                .host_incarnation()
+                .clone(),
+            surface::MonotonicInstant {
+                clock_id: surface::HostMonotonicClockId::try_from_bytes(
+                    *receipt.response_id.as_bytes(),
+                )
+                .expect("response identity is a UUIDv7"),
+                tick: surface::MonotonicTick::new(0),
+            },
+        );
+        let operation = surface::OperationRecord {
+            operation_id: operation_id.clone(),
+            request_id: identity.request_id().clone(),
+            intent: surface::OperationIntent {
+                origin,
+                kind: surface::OperationKind::UserTurn,
+                initial_replayability: replayability,
+                busy_disposition: surface::BusyDisposition::Queue,
+                interrupt_settlement: surface::InterruptSettlement::SuspendUntilExplicitControl,
+                legacy_visibility: surface::LegacyVisibility::PublishAfterAdmitted,
+                settings_revision: snapshot.settings.thread_revision,
+                policy_epoch: snapshot.settings.effective.policy_epoch,
+                required_capabilities: Default::default(),
+                capability_fingerprint,
+                settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
+                    settings_revision: snapshot.settings.thread_revision,
+                    policy_epoch: snapshot.settings.effective.policy_epoch,
+                },
+            },
+            phase: surface::OperationPhase::Requested,
+            reservation: lease,
+            ready_for_admission: true,
+            initial_logical_turn_id: None,
+            initial_input_item_id: None,
+            generations: Vec::new(),
+            agent_loop_turns: Vec::new(),
+            pending_control: None,
+            finalization: None,
+            terminal: None,
+        };
+        let patch = surface::InteractionPatch::ContinuationDispatchStarted {
+            interaction_id: owner.interaction_id.clone(),
+            expected_revision,
+            next_revision,
+            receipt_id: receipt.receipt_id.clone(),
+            dispatch_id: identity.dispatch_id().clone(),
+            operation_id: operation_id.clone(),
+            turn_id: identity.turn_id().clone(),
+        };
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    surface::SurfaceScope::Operation {
+                        operation_id: operation_id.clone(),
+                    },
+                    surface::SurfaceEvent::Operation(surface::OperationPatch::Requested {
+                        operation,
+                    }),
+                ),
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Interaction(patch),
+                ),
+            ],
+            None,
+        );
+        self.resident_surface
+            .coordinator
+            .commit_actor_batch(&batch)
+            .map_err(|error| {
+                io::Error::other(format!("continuation operation commit failed: {error:?}"))
+            })?;
+        self.resident_surface
+            .interactions
+            .get_mut(&owner.interaction_id)
+            .expect("committed continuation interaction remains resident")
+            .revision = next_revision;
+        if let Some(origin_attachment) = origin_attachment {
+            self.resident_surface
+                .operation_origin_attachments
+                .insert(operation_id, origin_attachment);
+        }
+        Ok(())
+    }
+
+    fn commit_cold_recovery_continuation_dispatch_consumed(
+        &mut self,
+        owner: &ContinuationTurnCheckpointOwner,
+        receipt: &surface::SurfaceInteractionResolutionReceipt,
+        dispatch_id: surface::SurfaceSettlementId,
+        operation_id: surface::SurfaceOperationId,
+        turn_id: TurnId,
+    ) -> io::Result<()> {
+        let interaction = self
+            .resident_surface
+            .interactions
+            .get(&owner.interaction_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interaction missing"))?;
+        let expected_revision = interaction.revision;
+        let next_revision = surface::InteractionRevision::try_new(
+            expected_revision
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("interaction revision exhausted"))?,
+        )
+        .map_err(|_| io::Error::other("interaction revision is invalid"))?;
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Interaction(
+                    surface::InteractionPatch::ContinuationDispatchConsumed {
+                        interaction_id: owner.interaction_id.clone(),
+                        expected_revision,
+                        next_revision,
+                        receipt_id: receipt.receipt_id.clone(),
+                        dispatch_id,
+                        operation_id,
+                        turn_id,
+                    },
+                ),
+            )],
+            None,
+        );
+        self.resident_surface
+            .coordinator
+            .commit_actor_batch(&batch)
+            .map_err(|error| {
+                io::Error::other(format!("continuation consumption commit failed: {error:?}"))
+            })?;
+        self.resident_surface
+            .interactions
+            .get_mut(&owner.interaction_id)
+            .expect("committed continuation interaction remains resident")
+            .revision = next_revision;
+        Ok(())
+    }
+
+    fn prepare_cold_recovery_continuation_generation(
+        &mut self,
+        operation_id: &surface::SurfaceOperationId,
+        turn_id: &TurnId,
+    ) -> io::Result<surface::SurfaceOperationFence> {
+        loop {
+            let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+            let operation = Self::surface_operation_record(&snapshot, operation_id)
+                .cloned()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "continuation operation intent is missing",
+                    )
+                })?;
+            match operation.phase {
+                surface::OperationPhase::Requested => {
+                    if snapshot.foreground_operation.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "continuation operation cannot admit beside a foreground operation",
+                        ));
+                    }
+                    let fence = surface::SurfaceOperationFence {
+                        thread_id: snapshot.thread.thread_id.clone(),
+                        thread_owner_epoch: snapshot.thread.owner_epoch,
+                        operation_id: operation_id.clone(),
+                        generation_id: surface::SurfaceGenerationId::new(0),
+                    };
+                    let generation = surface::GenerationRecord {
+                        fence: fence.clone(),
+                        logical_turn_id: turn_id.clone(),
+                        input: surface::GenerationInputState::NotApplicable,
+                        predecessor: None,
+                        attempt: surface::GenerationAttempt::Initial,
+                        goal_identity: None,
+                        replayability: operation.intent.initial_replayability.clone(),
+                        required_capabilities: operation.intent.required_capabilities.clone(),
+                        capability_fingerprint: operation.intent.capability_fingerprint.clone(),
+                        phase: surface::GenerationPhase::Reserved,
+                        started_witness: None,
+                        stop_reason: None,
+                    };
+                    let batch = self.surface_operation_batch(
+                        operation_id,
+                        vec![surface::OperationPatch::Admitted {
+                            operation_id: operation_id.clone(),
+                            logical_turn_id: turn_id.clone(),
+                            input: surface::AdmittedInput::NotApplicable,
+                            first_generation: generation,
+                        }],
+                    );
+                    self.resident_surface
+                        .coordinator
+                        .commit_actor_batch(&batch)
+                        .map_err(|error| {
+                            io::Error::other(format!(
+                                "continuation operation admission failed: {error:?}"
+                            ))
+                        })?;
+                }
+                surface::OperationPhase::Admitted => {
+                    let generation = operation.generations.last().cloned().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "admitted continuation operation has no generation",
+                        )
+                    })?;
+                    if generation.logical_turn_id != *turn_id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "continuation operation turn identity changed",
+                        ));
+                    }
+                    if generation.fence.thread_owner_epoch != snapshot.thread.owner_epoch {
+                        let stop_reason = match generation.phase {
+                            surface::GenerationPhase::Reserved => {
+                                surface::GenerationStopReason::NotStarted {
+                                    reason: surface::NotStartedReason::RuntimeRestart,
+                                }
+                            }
+                            surface::GenerationPhase::Started
+                            | surface::GenerationPhase::Transferred => {
+                                surface::GenerationStopReason::RuntimeRestart
+                            }
+                            surface::GenerationPhase::Stopped => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "stopped continuation generation is not suspended",
+                                ));
+                            }
+                        };
+                        let batch = self.surface_event_batch_with_commit_id(
+                            vec![
+                                (
+                                    surface::SurfaceScope::Generation {
+                                        fence: generation.fence.clone(),
+                                    },
+                                    surface::SurfaceEvent::Operation(
+                                        surface::OperationPatch::GenerationStopped {
+                                            fence: generation.fence.clone(),
+                                            reason: stop_reason,
+                                            usage_delta: surface::UsageTotals {
+                                                input_tokens: 0,
+                                                output_tokens: 0,
+                                                cache_tokens: 0,
+                                                estimated_cost_usd_micros: 0,
+                                            },
+                                        },
+                                    ),
+                                ),
+                                (
+                                    surface::SurfaceScope::Operation {
+                                        operation_id: operation_id.clone(),
+                                    },
+                                    surface::SurfaceEvent::Operation(
+                                        surface::OperationPatch::Suspended {
+                                            operation_id: operation_id.clone(),
+                                            cause: surface::SuspensionCause::RecoveryRequired {
+                                                generation_id: generation.fence.generation_id,
+                                            },
+                                        },
+                                    ),
+                                ),
+                            ],
+                            None,
+                        );
+                        self.resident_surface
+                            .coordinator
+                            .commit_resume_abort_batch(generation.fence.clone(), &batch)
+                            .map_err(|error| {
+                                io::Error::other(format!(
+                                    "continuation generation recovery failed: {error:?}"
+                                ))
+                            })?;
+                        continue;
+                    }
+                    if generation.phase == surface::GenerationPhase::Reserved {
+                        let started_commit_id = surface::SurfaceCommitId::try_from_bytes(
+                            *uuid::Uuid::now_v7().as_bytes(),
+                        )
+                        .expect("generated UUID is v7");
+                        let batch = self.surface_operation_batch_with_commit_id(
+                            operation_id,
+                            vec![surface::OperationPatch::GenerationStarted {
+                                fence: generation.fence.clone(),
+                                witness: surface::GenerationStartedWitness {
+                                    started_commit_id: started_commit_id.clone(),
+                                    settings_revision: operation.intent.settings_revision,
+                                    policy_epoch: operation.intent.policy_epoch,
+                                    durable_replayability_digest:
+                                        surface::canonical_replayability_digest(
+                                            &generation.replayability,
+                                        ),
+                                    capability_fingerprint: generation
+                                        .capability_fingerprint
+                                        .clone(),
+                                },
+                            }],
+                            Some(started_commit_id),
+                        );
+                        self.resident_surface
+                            .coordinator
+                            .commit_generation_batch(generation.fence.clone(), &batch)
+                            .map_err(|error| {
+                                io::Error::other(format!(
+                                    "continuation generation start failed: {error:?}"
+                                ))
+                            })?;
+                        continue;
+                    }
+                    if generation.phase != surface::GenerationPhase::Started {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "continuation generation is not executable",
+                        ));
+                    }
+                    if !operation
+                        .agent_loop_turns
+                        .iter()
+                        .any(|turn| turn.fence == generation.fence && turn.turn_id == *turn_id)
+                    {
+                        let task_id = surface::SurfaceTaskId::try_new(format!(
+                            "continuation-{}-{}",
+                            uuid::Uuid::from_bytes(*operation_id.as_bytes()),
+                            generation.fence.generation_id.get(),
+                        ))
+                        .expect("continuation task identity is non-empty");
+                        let batch = self.surface_operation_batch(
+                            operation_id,
+                            vec![surface::OperationPatch::AgentLoopTurnStarted {
+                                turn: surface::SurfaceAgentLoopTurn {
+                                    turn_id: turn_id.clone(),
+                                    fence: generation.fence.clone(),
+                                    ordinal: 0,
+                                    task_id,
+                                    task_status: surface::SurfaceTaskRunningStatus::Running,
+                                },
+                            }],
+                        );
+                        self.resident_surface
+                            .coordinator
+                            .commit_generation_batch(generation.fence.clone(), &batch)
+                            .map_err(|error| {
+                                io::Error::other(format!(
+                                    "continuation agent-loop admission failed: {error:?}"
+                                ))
+                            })?;
+                    }
+                    return Ok(generation.fence);
+                }
+                surface::OperationPhase::Suspended {
+                    cause: surface::SuspensionCause::RecoveryRequired { .. },
+                } => {
+                    let previous = operation.generations.last().cloned().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "suspended continuation operation has no generation",
+                        )
+                    })?;
+                    if previous.phase != surface::GenerationPhase::Stopped {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "suspended continuation generation is not stopped",
+                        ));
+                    }
+                    let generation_id = surface::SurfaceGenerationId::new(
+                        previous
+                            .fence
+                            .generation_id
+                            .get()
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                io::Error::other("continuation generation identity exhausted")
+                            })?,
+                    );
+                    let fence = surface::SurfaceOperationFence {
+                        thread_id: snapshot.thread.thread_id.clone(),
+                        thread_owner_epoch: snapshot.thread.owner_epoch,
+                        operation_id: operation_id.clone(),
+                        generation_id,
+                    };
+                    let generation = surface::GenerationRecord {
+                        fence: fence.clone(),
+                        logical_turn_id: turn_id.clone(),
+                        input: surface::GenerationInputState::NotApplicable,
+                        predecessor: Some(previous.fence),
+                        attempt: surface::GenerationAttempt::RecoveryReplacement,
+                        goal_identity: None,
+                        replayability: previous.replayability,
+                        required_capabilities: previous.required_capabilities,
+                        capability_fingerprint: previous.capability_fingerprint,
+                        phase: surface::GenerationPhase::Reserved,
+                        started_witness: None,
+                        stop_reason: None,
+                    };
+                    let batch = self.surface_operation_batch(
+                        operation_id,
+                        vec![
+                            surface::OperationPatch::GenerationReserved {
+                                generation: generation.clone(),
+                            },
+                            surface::OperationPatch::ControlIntentCommitted {
+                                operation_id: operation_id.clone(),
+                                request_id: operation.request_id,
+                                intent: surface::PendingControlIntent::ResumeStarting {
+                                    generation_fence: fence,
+                                },
+                            },
+                        ],
+                    );
+                    self.resident_surface
+                        .coordinator
+                        .commit_actor_batch(&batch)
+                        .map_err(|error| {
+                            io::Error::other(format!(
+                                "continuation recovery reservation failed: {error:?}"
+                            ))
+                        })?;
+                }
+                surface::OperationPhase::Terminal => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "continuation operation is terminal",
+                    ));
+                }
+                surface::OperationPhase::Suspended { .. }
+                | surface::OperationPhase::Finalizing { .. }
+                | surface::OperationPhase::FinalizingDegraded { .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "continuation operation is not recoverably executable",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Start only the durable operation/turn identity created by the
+    /// interaction settlement. The pinned-user prompt is persisted under
+    /// that stable turn before model execution; recovery uses that transcript
+    /// fact as the at-most-once execution boundary.
+    fn start_cold_recovery_continuation_operation(
+        &mut self,
+        owner: &ContinuationTurnCheckpointOwner,
+        receipt: &surface::SurfaceInteractionResolutionReceipt,
+        notification: String,
+        operation_id: surface::SurfaceOperationId,
+        turn_id: TurnId,
+    ) -> io::Result<()> {
+        if self.active.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cold-recovery continuation cannot start beside a live operation",
+            ));
+        }
+        if self.state.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "cold-recovery continuation thread state is unavailable",
+            ));
+        }
+        let fence = self.prepare_cold_recovery_continuation_generation(&operation_id, &turn_id)?;
+        let interaction_command_tx = self.handle.command_tx.clone();
+        let interaction_fence = fence.clone();
+        let headless = Self::surface_operation_record(
+            self.resident_surface.coordinator.state().snapshot(),
+            &operation_id,
+        )
+        .is_some_and(|operation| {
+            matches!(&operation.intent.origin, surface::OperationOrigin::Headless)
+        });
+        let request = if headless {
+            HostedTurnRequest::headless_session(notification)
+        } else {
+            HostedTurnRequest::new(notification)
+        }
+        .with_turn_id(turn_id)
+        .with_generation_handlers(move |_, cancel| {
+            HostedGenerationHandlers::default()
+                .with_provider_response_ingress(Arc::new(RuntimeSurfaceProviderResponseIngress {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                }))
+                .with_workflow_lifecycle_ingress(Arc::new(RuntimeSurfaceWorkflowLifecycleIngress {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                }))
+                .with_acp_read_text_file_handler(Arc::new(RuntimeSurfaceReadTextFileHandler {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                }))
+                .with_acp_write_text_file_handler(Arc::new(RuntimeSurfaceWriteTextFileHandler {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                }))
+                .with_acp_terminal_create_handler(Arc::new(RuntimeSurfaceTerminalCreateHandler {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                }))
+                .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                    cancel: cancel.clone(),
+                }))
+                .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                    cancel: cancel.clone(),
+                }))
+                .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                    cancel: cancel.clone(),
+                }))
+                .with_mcp_elicitation_handler(Arc::new(RuntimeSurfaceMcpElicitationHandler {
+                    command_tx: interaction_command_tx.clone(),
+                    fence: interaction_fence.clone(),
+                    cancel,
+                }))
+        });
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        self.handle_idle_command(ThreadCommand::StartTurn {
+            request: Box::new(request),
+            writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
+            config: None,
+            reply: start_tx,
+        });
+        start_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "continuation start closed"))?
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let active = self.active.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "cold-recovery continuation did not become active",
+            )
+        })?;
+        active.surface_operation = Some(fence);
+        debug_assert_eq!(
+            owner
+                .continuation_operation_identity(receipt)
+                .expect("validated continuation identity")
+                .operation_id(),
+            &operation_id
+        );
+        Ok(())
+    }
+
+    /// Resume durable resolved continuation work whenever the actor is idle.
+    /// Requested interactions remain parked for a client answer; resolved
+    /// Pending answers create their stable operation once; Started answers
+    /// remain retryable until the stable turn record or operation terminal is
+    /// durable. Consumed and negative receipts never launch another turn.
+    fn resume_recovered_continuation_turns(&mut self) {
+        if self.resident_surface.0.is_none() {
+            return;
+        }
+        loop {
+            if self.active.is_some() || self.surface_terminal_blocked.is_some() {
+                return;
+            }
+            let next = self
+                .resident_surface
+                .continuation_turn_owners
+                .keys()
+                .find(|interaction_id| {
+                    self.resident_surface
+                        .coordinator
+                        .state()
+                        .snapshot()
+                        .interactions
+                        .iter()
+                        .any(|interaction| {
+                            interaction.interaction_id == **interaction_id
+                                && matches!(
+                                    interaction.lifecycle,
+                                    surface::SurfaceInteractionLifecycle::Resolved { .. }
+                                )
+                        })
+                })
+                .cloned();
+            let Some(interaction_id) = next else {
+                return;
+            };
+            let before = self.resident_surface.continuation_turn_owners.len();
+            self.settle_cold_recovery_continuation_turn(&interaction_id);
+            if self.active.is_some()
+                || self.resident_surface.continuation_turn_owners.len() >= before
+            {
+                return;
+            }
+        }
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: a validated cold owner and its durable allow receipt.
+    /// - Output: rebuilds thread-owned execution dependencies and invokes the
+    ///   recovered dispatcher without recreating the operation or waiter.
+    /// - Errors: rejects concurrent live execution or missing thread state;
+    ///   downstream fingerprint/start/result errors remain fail closed.
+    /// - State changes and external calls: hooks/router may run only through
+    ///   `dispatch_after_approval`, after durable InvocationStarted authority.
+    fn dispatch_cold_recovery_tool_approval(
+        &mut self,
+        owner: &ColdRecoveryToolApprovalOwner,
+        receipt: &surface::SurfaceInteractionResolutionReceipt,
+    ) -> io::Result<ToolExecutionCompletion> {
+        if self.active.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cold-recovery ToolApproval cannot dispatch beside a live operation",
+            ));
+        }
+        let config = self.config.clone();
+        let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let cancel = CancelToken::new();
+        let mut permission_overlay = crate::runtime_permission::TurnPermissionOverlay::default();
+        let mut background_workflows = Vec::new();
+        let mut state = self.state.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "cold-recovery ToolApproval thread state is unavailable",
+            )
+        })?;
+        let result = (|| {
+            let thread_extensions = state.thread.thread_extensions_handle();
+            let turn_extensions = crate::extension::ExtensionData::new(format!(
+                "{}:recovered-tool-approval",
+                state.thread.thread_id()
+            ));
+            let extension_registry = crate::extension::empty_extension_registry();
+            let goal_runtime_binding = state
+                .thread
+                .thread_extensions()
+                .get::<crate::goal_actor::GoalRuntimeBinding>()
+                .map(|binding| (*binding).clone());
+            let goal_mode = Self::surface_operation_record(
+                self.resident_surface.coordinator.state().snapshot(),
+                owner.operation_id(),
+            )
+            .is_some_and(|operation| {
+                matches!(
+                    operation.intent.kind,
+                    surface::OperationKind::GoalRun { .. }
+                )
+            });
+            let mut sink = EventSink::new(io::sink(), config.output_format);
+            let parts = state.thread.session_mut().runtime_parts();
+            owner.dispatch_after_approval(
+                self,
+                &config,
+                &mut state.events,
+                &mut sink,
+                receipt,
+                RecoveredToolExecutionDependencies {
+                    cwd: &cwd,
+                    subagent_depth: 0,
+                    goal_mode,
+                    policy: &policy,
+                    instructions: parts.instructions,
+                    memory: parts.memory,
+                    mcp_registry: parts.mcp_registry,
+                    hooks: parts.hooks,
+                    cost_tracker: parts.cost_tracker,
+                    cancel: &cancel,
+                    task_registry: parts.task_registry,
+                    background_workflows: &mut background_workflows,
+                    workflow_ipc: None,
+                    permission_overlay: &mut permission_overlay,
+                    permission_handler: None,
+                    user_input_handler: None,
+                    mcp_elicitation_handler: None,
+                    workflow_lifecycle_ingress: None,
+                    wait_for_background_workflows: false,
+                    extension_registry: Some(extension_registry.as_ref()),
+                    extension_stores: Some(crate::extension::RuntimeExtensionStores::new(
+                        thread_extensions.as_ref(),
+                        &turn_extensions,
+                    )),
+                    goal_runtime_binding,
+                    root_task_id: None,
+                    child_budget: None,
+                },
+                crate::agent_loop::execute_child_agent_loop::<io::Sink>,
+                crate::agent_loop::execute_child_agent_loop::<
+                    crate::workflow::runner::SharedEventBuffer,
+                >,
+            )
+        })();
+        self.state = Some(state);
+        result
+    }
+
+    /// Rebuild the original permission-retry execution context from its
+    /// durable capsule. Only the existing bash sandbox/network retry path can
+    /// create this owner; ordinary tool-internal permission requests cannot.
+    fn dispatch_cold_recovery_permission(
+        &mut self,
+        owner: &ColdRecoveryPermissionOwner,
+        receipt: &surface::SurfaceInteractionResolutionReceipt,
+        response: &crate::runtime_permission::RuntimePermissionResponse,
+    ) -> io::Result<ToolExecutionCompletion> {
+        if self.active.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cold-recovery PermissionRequest cannot dispatch beside a live operation",
+            ));
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        if snapshot.thread.owner_epoch != owner.cold_owner_epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cold-recovery PermissionRequest owner epoch is stale",
+            ));
+        }
+        let intent = match owner
+            .capsule
+            .restart_intent(&owner.thread_config_fingerprint)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?
+        {
+            surface::DurableInteractionContinuationIntent::PermissionRetry(intent) => {
+                intent.clone()
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cold-recovery permission owner contains a non-permission intent",
+                ));
+            }
+        };
+        let config = self.config.clone();
+        let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let cancel = CancelToken::new();
+        let mut permission_overlay =
+            runtime_permission_overlay_from_surface(intent.permission_overlay());
+        let mut background_workflows = Vec::new();
+        let mut state = self.state.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "cold-recovery PermissionRequest thread state is unavailable",
+            )
+        })?;
+        let result = (|| {
+            let thread_extensions = state.thread.thread_extensions_handle();
+            let turn_extensions = crate::extension::ExtensionData::new(format!(
+                "{}:recovered-permission-retry",
+                state.thread.thread_id()
+            ));
+            let extension_registry = crate::extension::empty_extension_registry();
+            let goal_runtime_binding = state
+                .thread
+                .thread_extensions()
+                .get::<crate::goal_actor::GoalRuntimeBinding>()
+                .map(|binding| (*binding).clone());
+            let goal_mode = Self::surface_operation_record(
+                self.resident_surface.coordinator.state().snapshot(),
+                owner.operation_id(),
+            )
+            .is_some_and(|operation| {
+                matches!(
+                    operation.intent.kind,
+                    surface::OperationKind::GoalRun { .. }
+                )
+            });
+            let mut sink = EventSink::new(io::sink(), config.output_format);
+            let parts = state.thread.session_mut().runtime_parts();
+            self.dispatch_recovered_permission_retry(
+                &config,
+                &mut state.events,
+                &mut sink,
+                &intent,
+                &owner.historical_fence,
+                owner
+                    .capsule
+                    .execution_context_fingerprint()
+                    .expect("restartable permission capsule has a fingerprint"),
+                &owner.thread_config_fingerprint,
+                receipt,
+                response,
+                RecoveredToolExecutionDependencies {
+                    cwd: &cwd,
+                    subagent_depth: 0,
+                    goal_mode,
+                    policy: &policy,
+                    instructions: parts.instructions,
+                    memory: parts.memory,
+                    mcp_registry: parts.mcp_registry,
+                    hooks: parts.hooks,
+                    cost_tracker: parts.cost_tracker,
+                    cancel: &cancel,
+                    task_registry: parts.task_registry,
+                    background_workflows: &mut background_workflows,
+                    workflow_ipc: None,
+                    permission_overlay: &mut permission_overlay,
+                    permission_handler: None,
+                    user_input_handler: None,
+                    mcp_elicitation_handler: None,
+                    workflow_lifecycle_ingress: None,
+                    wait_for_background_workflows: false,
+                    extension_registry: Some(extension_registry.as_ref()),
+                    extension_stores: Some(crate::extension::RuntimeExtensionStores::new(
+                        thread_extensions.as_ref(),
+                        &turn_extensions,
+                    )),
+                    goal_runtime_binding,
+                    root_task_id: None,
+                    child_budget: None,
+                },
+                crate::agent_loop::execute_child_agent_loop::<io::Sink>,
+                crate::agent_loop::execute_child_agent_loop::<
+                    crate::workflow::runner::SharedEventBuffer,
+                >,
+            )
+        })();
+        self.state = Some(state);
+        result
+    }
+
+    /// Finish the interrupted historical operation after the recovered
+    /// interaction has reached a durable terminal answer.
+    fn terminalize_cold_recovery_tool_approval(
+        &mut self,
+        owner: &ColdRecoveryToolApprovalOwner,
+    ) -> io::Result<()> {
+        self.terminalize_cold_recovery_operation(owner.operation_id(), "ToolApproval")
+    }
+
+    fn terminalize_cold_recovery_operation(
+        &mut self,
+        operation_id: &surface::SurfaceOperationId,
+        interaction_label: &str,
+    ) -> io::Result<()> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let materialization = surface::MaterializationCause::ColdOwnerTakeover {
+            new_incarnation: snapshot.cursor.incarnation.clone(),
+            new_owner_epoch: snapshot.thread.owner_epoch,
+        };
+        loop {
+            let before = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .cursor
+                .clone();
+            let action = self
+                .resident_surface
+                .coordinator
+                .recover_operation(operation_id, &materialization)
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "failed to terminalize recovered {interaction_label} operation: {error:?}"
+                    ))
+                })?;
+            if matches!(
+                action,
+                surface::RecoveryAction::ExposeRecoveryRequired
+                    | surface::RecoveryAction::ExposeRetryFinalization
+                    | surface::RecoveryAction::ExposeRetryProjection
+                    | surface::RecoveryAction::NoOp
+            ) {
+                return Ok(());
+            }
+            if self.resident_surface.coordinator.state().snapshot().cursor == before {
+                return Err(io::Error::other(format!(
+                    "recovered {interaction_label} terminalization made no durable progress"
+                )));
+            }
+        }
+    }
+
+    fn terminalize_cold_recovery_permission(
+        &mut self,
+        owner: &ColdRecoveryPermissionOwner,
+    ) -> io::Result<()> {
+        self.terminalize_cold_recovery_operation(owner.operation_id(), "PermissionRequest")
     }
 
     fn settle_background_approval_resolution(
@@ -22471,6 +26219,18 @@ impl ThreadActor {
         interaction_ids: &[surface::SurfaceInteractionId],
     ) {
         for interaction_id in interaction_ids {
+            let cold_recovery_owner = self
+                .resident_surface
+                .cold_recovery_owners
+                .remove(interaction_id);
+            let cold_recovery_permission_owner = self
+                .resident_surface
+                .cold_recovery_permission_owners
+                .remove(interaction_id);
+            let continuation_turn_owner = self
+                .resident_surface
+                .continuation_turn_owners
+                .remove(interaction_id);
             let waiter = self
                 .resident_surface
                 .interactions
@@ -22498,6 +26258,28 @@ impl ThreadActor {
                         let _ = waiter.send(Ok(orca_mcp::McpElicitationResponse::Decline));
                     }
                 }
+            }
+            if let Some(owner) = cold_recovery_owner
+                && let Err(error) = self.terminalize_cold_recovery_tool_approval(&owner)
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "cancelled cold-recovery ToolApproval terminalization failed: {error}"
+                ));
+            }
+            if let Some(owner) = cold_recovery_permission_owner
+                && let Err(error) = self.terminalize_cold_recovery_permission(&owner)
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "cancelled cold-recovery PermissionRequest terminalization failed: {error}"
+                ));
+            }
+            if let Some(owner) = continuation_turn_owner
+                && let Err(error) =
+                    self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation")
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "cancelled cold-recovery continuation terminalization failed: {error}"
+                ));
             }
         }
     }
@@ -22637,8 +26419,16 @@ impl ThreadActor {
         transition: &PreparedSurfaceAttachmentTransition,
     ) {
         let mut cancelled_waiters = Vec::new();
+        let mut cancelled_continuation_owners = Vec::new();
         for prepared in &transition.interactions {
             if prepared.cancelled {
+                if let Some(owner) = self
+                    .resident_surface
+                    .continuation_turn_owners
+                    .remove(&prepared.interaction_id)
+                {
+                    cancelled_continuation_owners.push(owner);
+                }
                 if let Some(waiter) = self
                     .resident_surface
                     .interactions
@@ -22685,6 +26475,15 @@ impl ThreadActor {
                 ResidentInteractionWaiter::McpElicitation(waiter) => {
                     let _ = waiter.send(Ok(orca_mcp::McpElicitationResponse::Decline));
                 }
+            }
+        }
+        for owner in cancelled_continuation_owners {
+            if let Err(error) =
+                self.terminalize_cold_recovery_operation(owner.operation_id(), "continuation")
+            {
+                self.surface_terminal_blocked = Some(format!(
+                    "capability-lost cold-recovery continuation terminalization failed: {error}"
+                ));
             }
         }
     }
@@ -23751,6 +27550,7 @@ impl ThreadActor {
         if !matches!(
             intent.correlation,
             surface::OperationIngressCorrelation::TuiUser
+                | surface::OperationIngressCorrelation::Headless
                 | surface::OperationIngressCorrelation::AcpPrompt { .. }
                 | surface::OperationIngressCorrelation::JsonlThreadTurn { .. }
                 | surface::OperationIngressCorrelation::JsonlStatelessSubmit { .. }
@@ -23987,6 +27787,7 @@ impl ThreadActor {
         });
         let origin = match &intent.correlation {
             surface::OperationIngressCorrelation::TuiUser => surface::OperationOrigin::TuiUser,
+            surface::OperationIngressCorrelation::Headless => surface::OperationOrigin::Headless,
             surface::OperationIngressCorrelation::AcpPrompt {
                 session_id,
                 inbound_seq,
@@ -25890,6 +29691,7 @@ impl ThreadActor {
         if !matches!(
             operation.intent.origin,
             surface::OperationOrigin::TuiUser
+                | surface::OperationOrigin::Headless
                 | surface::OperationOrigin::AcpPrompt { .. }
                 | surface::OperationOrigin::JsonlThreadTurn { .. }
                 | surface::OperationOrigin::JsonlStatelessSubmit { .. }
@@ -26478,7 +30280,12 @@ impl ThreadActor {
             .join(" ");
         #[cfg(not(test))]
         let provider_input = resolved_input.canonical_text.as_str().to_string();
-        let mut hosted_request = HostedTurnRequest::new(provider_input)
+        let mut hosted_request =
+            if matches!(operation.intent.origin, surface::OperationOrigin::Headless) {
+                HostedTurnRequest::headless_session(provider_input)
+            } else {
+                HostedTurnRequest::new(provider_input)
+            }
             .with_backtrack_target(backtrack_target)
             .with_task_description(resolved_input.canonical_text.as_str())
             .with_generation_handlers(move |_, cancel| {
@@ -31300,6 +35107,9 @@ impl ThreadActor {
     ) {
         let mut subscription_seal_reason = surface::SurfaceSubscriptionSealReason::ThreadClosed;
         loop {
+            if self.active.is_none() {
+                self.resume_recovered_continuation_turns();
+            }
             if self.one_shot_close_ready() {
                 match self.close_ephemeral_one_shot().await {
                     Ok(()) => {
@@ -32107,6 +35917,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceRespondInteractionById { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceProjectHeadlessInteraction { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceRespondInteractionByIdWithPolicy { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
@@ -32604,6 +36417,14 @@ impl ThreadActor {
                     interaction_id,
                     answer,
                 );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceProjectHeadlessInteraction {
+                client,
+                interaction_id,
+                reply,
+            } => {
+                let result = self.project_headless_interaction(&client, interaction_id);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceRespondInteractionByIdWithPolicy {
@@ -33437,9 +37258,10 @@ impl ThreadActor {
             ThreadCommand::SurfaceRequestPermission {
                 fence,
                 request,
+                retry_overlay,
                 reply,
             } => {
-                self.request_surface_permission(active, fence, request, reply);
+                self.request_surface_permission(active, fence, request, retry_overlay, reply);
             }
             ThreadCommand::SurfaceRequestUserInput {
                 fence,
@@ -33758,6 +37580,14 @@ impl ThreadActor {
                     interaction_id,
                     answer,
                 );
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceProjectHeadlessInteraction {
+                client,
+                interaction_id,
+                reply,
+            } => {
+                let result = self.project_headless_interaction(&client, interaction_id);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceRespondInteractionByIdWithPolicy {
@@ -38367,6 +42197,560 @@ mod tests {
         std::env::temp_dir().join(name)
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum RecoveryMatrixCase {
+        Valid,
+        Missing,
+        Executing,
+        Unsafe,
+        Unsupported,
+        StaleContext,
+    }
+
+    fn recovery_matrix_fence() -> surface::SurfaceOperationFence {
+        surface::SurfaceOperationFence {
+            thread_id: surface::SurfaceThreadId::try_from_bytes(*uuid::Uuid::new_v4().as_bytes())
+                .unwrap(),
+            thread_owner_epoch: surface::ThreadOwnerEpoch::new(1),
+            operation_id: surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            generation_id: surface::SurfaceGenerationId::new(0),
+        }
+    }
+
+    fn recovery_matrix_authority(
+        fence: &surface::SurfaceOperationFence,
+    ) -> surface::AuthorityFingerprint {
+        surface::AuthorityFingerprint::new(
+            fence.operation_id.clone(),
+            surface::Sha256Digest::new([1; 32]),
+            surface::Sha256Digest::new([2; 32]),
+            surface::CanonicalPath::try_new(test_absolute_path("orca-t025-authority")).unwrap(),
+            surface::Sha256Digest::new([3; 32]),
+            surface::PolicyEpoch::try_new(1).unwrap(),
+            surface::Sha256Digest::new([4; 32]),
+            surface::Sha256Digest::new([5; 32]),
+            surface::Sha256Digest::new([6; 32]),
+        )
+    }
+
+    fn recovery_matrix_tool() -> surface::SurfaceToolRequest {
+        surface::SurfaceToolRequest {
+            tool_call_id: surface::SurfaceToolCallId::try_new("t025-call").unwrap(),
+            source_response_id: None,
+            turn_id: surface::SurfaceTurnId::new(),
+            name: surface::NonEmptyText::try_new("bash").unwrap(),
+            action: surface::SurfaceToolAction::Shell,
+            target: Some(surface::DisplayText::new("cargo check")),
+            raw_arguments: surface::DisplayText::new("{}"),
+            arguments_digest: surface::Sha256Digest::new([7; 32]),
+        }
+    }
+
+    fn recovery_matrix_request_and_intent(
+        kind: surface::SurfaceInteractionKind,
+        fence: &surface::SurfaceOperationFence,
+    ) -> (
+        surface::SurfaceInteractionRequest,
+        surface::DurableInteractionContinuationIntent,
+    ) {
+        match kind {
+            surface::SurfaceInteractionKind::ToolApproval => {
+                let tool = recovery_matrix_tool();
+                let authority = recovery_matrix_authority(fence);
+                (
+                    surface::SurfaceInteractionRequest::ToolApproval {
+                        tool: tool.clone(),
+                        description: surface::DisplayText::new("run check"),
+                        preview: None,
+                        authority: authority.clone(),
+                    },
+                    surface::DurableInteractionContinuationIntent::ToolInvocation(
+                        surface::ToolInvocationIntent::before_invocation(tool, authority),
+                    ),
+                )
+            }
+            surface::SurfaceInteractionKind::PermissionRequest => {
+                let tool = recovery_matrix_tool();
+                let authority = recovery_matrix_authority(fence);
+                let permissions = surface::SurfacePermissionProfile::empty();
+                (
+                    surface::SurfaceInteractionRequest::PermissionRequest {
+                        tool_call_id: tool.tool_call_id.clone(),
+                        reason: Some(surface::DisplayText::new("sandbox retry")),
+                        permissions: permissions.clone(),
+                        authority: authority.clone(),
+                    },
+                    surface::DurableInteractionContinuationIntent::PermissionRetry(
+                        surface::PermissionRetryIntent::pre_side_effect(
+                            tool,
+                            permissions,
+                            surface::PermissionRetryOverlay::empty(),
+                            authority,
+                        ),
+                    ),
+                )
+            }
+            surface::SurfaceInteractionKind::UserInput => {
+                let question = surface::NonEmptyText::try_new("continue?").unwrap();
+                (
+                    surface::SurfaceInteractionRequest::UserInput {
+                        question: question.clone(),
+                        suggestions: vec![surface::DisplayText::new("yes")],
+                    },
+                    surface::DurableInteractionContinuationIntent::ContinuationTurn(
+                        surface::ContinuationTurnIntent::user_input(
+                            surface::NonEmptyText::try_new("t025-user-input").unwrap(),
+                            question,
+                            vec![surface::DisplayText::new("yes")],
+                        ),
+                    ),
+                )
+            }
+            surface::SurfaceInteractionKind::McpElicitation => {
+                let server_name = surface::NonEmptyText::try_new("t025-server").unwrap();
+                let request_id = surface::NonEmptyText::try_new("t025-mcp").unwrap();
+                let message = surface::DisplayText::new("provide value");
+                let request = surface::SurfaceMcpElicitationRequest::Form {
+                    requested_schema: None,
+                    supported_schema: None,
+                };
+                (
+                    surface::SurfaceInteractionRequest::McpElicitation {
+                        server_name: server_name.clone(),
+                        server_request_id: request_id.clone(),
+                        message: message.clone(),
+                        request: request.clone(),
+                    },
+                    surface::DurableInteractionContinuationIntent::ContinuationTurn(
+                        surface::ContinuationTurnIntent::mcp_elicitation(
+                            server_name,
+                            request_id,
+                            message,
+                            request,
+                        ),
+                    ),
+                )
+            }
+            surface::SurfaceInteractionKind::BackgroundApproval => {
+                unreachable!("background approval is outside the T025 matrix")
+            }
+        }
+    }
+
+    fn recovery_matrix_disposition(
+        kind: surface::SurfaceInteractionKind,
+        capsule: Vec<u8>,
+    ) -> surface::InteractionUnavailableDisposition {
+        match kind {
+            surface::SurfaceInteractionKind::ToolApproval => {
+                surface::InteractionUnavailableDisposition::RestartableToolApproval { capsule }
+            }
+            surface::SurfaceInteractionKind::PermissionRequest => {
+                surface::InteractionUnavailableDisposition::RestartablePermissionRequest { capsule }
+            }
+            surface::SurfaceInteractionKind::UserInput => {
+                surface::InteractionUnavailableDisposition::RestartableUserInput { capsule }
+            }
+            surface::SurfaceInteractionKind::McpElicitation => {
+                surface::InteractionUnavailableDisposition::RestartableMcpElicitation { capsule }
+            }
+            surface::SurfaceInteractionKind::BackgroundApproval => {
+                unreachable!("background approval is outside the T025 matrix")
+            }
+        }
+    }
+
+    fn recovery_matrix_interaction(
+        kind: surface::SurfaceInteractionKind,
+        case: RecoveryMatrixCase,
+    ) -> (
+        surface::SurfaceInteractionView,
+        surface::Sha256Digest,
+        Option<ColdRecoveryCheckpointFailure>,
+    ) {
+        let interaction_id =
+            surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .unwrap();
+        let fence = recovery_matrix_fence();
+        let (request, intent) = recovery_matrix_request_and_intent(kind, &fence);
+        let captured_fingerprint = surface::Sha256Digest::new([25; 32]);
+        let restartable = surface::DurableInteractionContinuationCapsule::try_new_restartable(
+            interaction_id.clone(),
+            fence.clone(),
+            request.clone(),
+            captured_fingerprint.clone(),
+            intent,
+        )
+        .unwrap();
+        let (capsule, observed_fingerprint, expected) = match case {
+            RecoveryMatrixCase::Valid => {
+                (restartable.encode().unwrap(), captured_fingerprint, None)
+            }
+            RecoveryMatrixCase::Missing => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&restartable.encode().unwrap()).unwrap();
+                value["intent"] = serde_json::Value::Null;
+                (
+                    serde_json::to_vec(&value).unwrap(),
+                    captured_fingerprint,
+                    Some(ColdRecoveryCheckpointFailure::Missing),
+                )
+            }
+            RecoveryMatrixCase::Executing
+            | RecoveryMatrixCase::Unsafe
+            | RecoveryMatrixCase::Unsupported => {
+                let (disposition, expected) = match case {
+                    RecoveryMatrixCase::Executing => (
+                        surface::DurableInteractionContinuationDisposition::Executing,
+                        ColdRecoveryCheckpointFailure::Executing,
+                    ),
+                    RecoveryMatrixCase::Unsafe => (
+                        surface::DurableInteractionContinuationDisposition::Unsafe,
+                        ColdRecoveryCheckpointFailure::Unsafe,
+                    ),
+                    RecoveryMatrixCase::Unsupported => (
+                        surface::DurableInteractionContinuationDisposition::Unsupported,
+                        ColdRecoveryCheckpointFailure::Unsupported,
+                    ),
+                    _ => unreachable!(),
+                };
+                let fail_closed =
+                    surface::DurableInteractionContinuationCapsule::try_new_fail_closed(
+                        interaction_id.clone(),
+                        fence.clone(),
+                        request.clone(),
+                        disposition,
+                    )
+                    .unwrap();
+                (
+                    fail_closed.encode().unwrap(),
+                    captured_fingerprint,
+                    Some(expected),
+                )
+            }
+            RecoveryMatrixCase::StaleContext => (
+                restartable.encode().unwrap(),
+                surface::Sha256Digest::new([26; 32]),
+                Some(ColdRecoveryCheckpointFailure::StaleContext),
+            ),
+        };
+        (
+            surface::SurfaceInteractionView {
+                interaction_id,
+                revision: surface::InteractionRevision::try_new(3).unwrap(),
+                fence,
+                kind,
+                request,
+                route: surface::SurfaceInteractionRoute::Unassigned {
+                    epoch: surface::ResponseRouteEpoch::try_new(7).unwrap(),
+                },
+                lifecycle: surface::SurfaceInteractionLifecycle::Requested,
+                recovery_disposition: recovery_matrix_disposition(kind, capsule),
+            },
+            observed_fingerprint,
+            expected,
+        )
+    }
+
+    #[test]
+    fn cold_recovery_checkpoint_matrix_classifies_all_interactions() {
+        let kinds = [
+            surface::SurfaceInteractionKind::ToolApproval,
+            surface::SurfaceInteractionKind::PermissionRequest,
+            surface::SurfaceInteractionKind::UserInput,
+            surface::SurfaceInteractionKind::McpElicitation,
+        ];
+        let cases = [
+            RecoveryMatrixCase::Valid,
+            RecoveryMatrixCase::Missing,
+            RecoveryMatrixCase::Executing,
+            RecoveryMatrixCase::Unsafe,
+            RecoveryMatrixCase::Unsupported,
+            RecoveryMatrixCase::StaleContext,
+        ];
+
+        for kind in kinds {
+            for case in cases {
+                let (interaction, observed_fingerprint, expected) =
+                    recovery_matrix_interaction(kind, case);
+                let actual =
+                    classify_restartable_cold_recovery_capsule(&interaction, &observed_fingerprint)
+                        .err();
+                assert_eq!(actual, expected, "kind={kind:?} case={case:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cold_recovery_projection_dispositions_fail_closed() {
+        assert_eq!(
+            tool_checkpoint_projection_failure(
+                surface::ToolInvocationRecoveryDisposition::RestartableBeforeInvocation,
+            ),
+            None
+        );
+        assert_eq!(
+            tool_checkpoint_projection_failure(
+                surface::ToolInvocationRecoveryDisposition::FailClosedStarted,
+            ),
+            Some(ColdRecoveryCheckpointFailure::Executing)
+        );
+        assert_eq!(
+            tool_checkpoint_projection_failure(
+                surface::ToolInvocationRecoveryDisposition::FailClosedExecuting,
+            ),
+            Some(ColdRecoveryCheckpointFailure::Executing)
+        );
+        assert_eq!(
+            tool_checkpoint_projection_failure(
+                surface::ToolInvocationRecoveryDisposition::FailClosedUnsafe,
+            ),
+            Some(ColdRecoveryCheckpointFailure::Unsafe)
+        );
+        assert_eq!(
+            permission_checkpoint_projection_failure(
+                surface::PermissionRetryRecoveryDisposition::RestartablePreSideEffect,
+            ),
+            None
+        );
+        assert_eq!(
+            permission_checkpoint_projection_failure(
+                surface::PermissionRetryRecoveryDisposition::FailClosedExecuting,
+            ),
+            Some(ColdRecoveryCheckpointFailure::Executing)
+        );
+        assert_eq!(
+            permission_checkpoint_projection_failure(
+                surface::PermissionRetryRecoveryDisposition::FailClosedUnsafe,
+            ),
+            Some(ColdRecoveryCheckpointFailure::Unsafe)
+        );
+    }
+
+    #[test]
+    fn cold_recovery_failure_merge_is_idempotent_and_deterministic() {
+        let operation_id = recovery_matrix_fence().operation_id;
+        let mut failures = HashMap::new();
+        for failure in [
+            ColdRecoveryCheckpointFailure::Missing,
+            ColdRecoveryCheckpointFailure::Missing,
+            ColdRecoveryCheckpointFailure::Unsupported,
+            ColdRecoveryCheckpointFailure::Unsafe,
+            ColdRecoveryCheckpointFailure::StaleContext,
+        ] {
+            merge_cold_recovery_checkpoint_failure(&mut failures, operation_id.clone(), failure);
+        }
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures.get(&operation_id),
+            Some(&ColdRecoveryCheckpointFailure::Unsafe)
+        );
+        let diagnostic = failures[&operation_id].diagnostic();
+        assert_eq!(
+            diagnostic.as_str(),
+            "cold recovery rejected durable interaction checkpoint: Unsafe"
+        );
+        assert!(!diagnostic.as_str().contains("answer"));
+    }
+
+    fn continuation_recovery_fixture() -> (
+        surface::SurfaceSnapshot,
+        surface::SurfaceInteractionId,
+        surface::SurfaceOperationFence,
+        surface::SurfaceInteractionResolutionReceipt,
+        surface::DurableInteractionContinuationAnswer,
+    ) {
+        let config = surface_test_config(
+            test_absolute_path("orca-t022-continuation-recovery"),
+            HistoryMode::Disabled,
+        );
+        let snapshot = initial_surface_snapshot(
+            surface::SurfaceThreadId::try_from_bytes(*uuid::Uuid::new_v4().as_bytes()).unwrap(),
+            surface::SurfaceIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+            surface::ThreadOwnerEpoch::new(1),
+            surface::ThreadPersistence::EphemeralAttached,
+            &config,
+            "T022 continuation recovery",
+            None,
+        )
+        .unwrap();
+        let interaction_id =
+            surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .unwrap();
+        let fence = surface::SurfaceOperationFence {
+            thread_id: snapshot.thread.thread_id.clone(),
+            thread_owner_epoch: snapshot.thread.owner_epoch,
+            operation_id: surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            generation_id: surface::SurfaceGenerationId::new(0),
+        };
+        let request = surface::SurfaceInteractionRequest::UserInput {
+            question: surface::NonEmptyText::try_new("continue after recovery?").unwrap(),
+            suggestions: Vec::new(),
+        };
+        let capsule = surface::DurableInteractionContinuationCapsule::try_new(
+            interaction_id.clone(),
+            fence.clone(),
+            request,
+            surface::Sha256Digest::new([22; 32]),
+        )
+        .unwrap();
+        let receipt = surface::SurfaceInteractionResolutionReceipt {
+            response_id: surface::SurfaceResponseId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            receipt_id: surface::SurfaceResponseReceiptId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            kind: surface::SurfaceInteractionKind::UserInput,
+            safe_projection: surface::SurfaceInteractionSafeProjection::UserInput {
+                answered: true,
+            },
+        };
+        let answer = surface::DurableInteractionContinuationAnswer::try_new(
+            &capsule,
+            &receipt,
+            &surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: surface::SurfaceUserInputDecision::Answer(surface::DisplayText::new(
+                    "continue",
+                )),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        (snapshot, interaction_id, fence, receipt, answer)
+    }
+
+    #[test]
+    fn continuation_resolution_crash_recovers_pending_durable_answer() {
+        let (snapshot, interaction_id, fence, receipt, answer) = continuation_recovery_fixture();
+        let resolved = runtime_surface_event_batch(
+            &snapshot,
+            vec![(
+                surface::SurfaceScope::Generation { fence },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision: surface::InteractionRevision::try_new(1).unwrap(),
+                    next_revision: surface::InteractionRevision::try_new(2).unwrap(),
+                    receipt: receipt.clone(),
+                    continuation: Some(answer.clone()),
+                }),
+            )],
+            None,
+        );
+
+        let recovered = recovered_continuation_resolutions_from_batches(&[resolved]);
+        let recovered = recovered.get(&interaction_id).unwrap();
+        assert_eq!(recovered.receipt, receipt);
+        assert_eq!(recovered.answer.as_ref(), Some(&answer));
+        assert_eq!(
+            recovered.dispatch_state,
+            RecoveredContinuationDispatchState::Pending
+        );
+    }
+
+    #[test]
+    fn continuation_started_before_process_start_remains_retryable_with_one_identity() {
+        let (mut snapshot, interaction_id, fence, receipt, answer) =
+            continuation_recovery_fixture();
+        let resolved = runtime_surface_event_batch(
+            &snapshot,
+            vec![(
+                surface::SurfaceScope::Generation { fence },
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision: surface::InteractionRevision::try_new(1).unwrap(),
+                    next_revision: surface::InteractionRevision::try_new(2).unwrap(),
+                    receipt: receipt.clone(),
+                    continuation: Some(answer),
+                }),
+            )],
+            None,
+        );
+        snapshot.cursor = resolved.cursor_after.clone();
+        let identity = surface::DurableInteractionContinuationOperationIdentity::try_new(
+            &interaction_id,
+            &receipt,
+        )
+        .unwrap();
+        let started = runtime_surface_event_batch(
+            &snapshot,
+            vec![(
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Interaction(
+                    surface::InteractionPatch::ContinuationDispatchStarted {
+                        interaction_id: interaction_id.clone(),
+                        expected_revision: surface::InteractionRevision::try_new(2).unwrap(),
+                        next_revision: surface::InteractionRevision::try_new(3).unwrap(),
+                        receipt_id: receipt.receipt_id.clone(),
+                        dispatch_id: identity.dispatch_id().clone(),
+                        operation_id: identity.operation_id().clone(),
+                        turn_id: identity.turn_id().clone(),
+                    },
+                ),
+            )],
+            None,
+        );
+
+        for batches in [
+            vec![resolved.clone(), started.clone()],
+            vec![resolved, started.clone(), started],
+        ] {
+            let recovered = recovered_continuation_resolutions_from_batches(&batches);
+            assert_eq!(
+                recovered.get(&interaction_id).unwrap().dispatch_state,
+                RecoveredContinuationDispatchState::Started {
+                    dispatch_id: identity.dispatch_id().clone(),
+                    operation_id: identity.operation_id().clone(),
+                    turn_id: identity.turn_id().clone(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_cancel_and_decline_do_not_request_dispatch() {
+        for receipt in [
+            surface::SurfaceInteractionResolutionReceipt {
+                response_id: surface::SurfaceResponseId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .unwrap(),
+                receipt_id: surface::SurfaceResponseReceiptId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .unwrap(),
+                kind: surface::SurfaceInteractionKind::UserInput,
+                safe_projection: surface::SurfaceInteractionSafeProjection::UserInput {
+                    answered: false,
+                },
+            },
+            surface::SurfaceInteractionResolutionReceipt {
+                response_id: surface::SurfaceResponseId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .unwrap(),
+                receipt_id: surface::SurfaceResponseReceiptId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .unwrap(),
+                kind: surface::SurfaceInteractionKind::McpElicitation,
+                safe_projection: surface::SurfaceInteractionSafeProjection::McpElicitation {
+                    accepted: false,
+                },
+            },
+        ] {
+            assert!(!continuation_resolution_requires_dispatch(&receipt));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn session_listing_does_not_block_host_supervisor() {
@@ -38405,7 +42789,7 @@ mod tests {
         let start_handle = handle.clone();
         let start_request = std::thread::spawn(move || {
             let result = start_handle.start_thread(
-                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
                 "supervisor responsiveness",
             );
             let _ = start_tx.send(result);
@@ -38725,6 +43109,10 @@ mod tests {
 
     struct ExactSelectorUserInputExecutor {
         answer_tx: SyncSender<Option<String>>,
+    }
+
+    struct HeadlessMcpInteractionExecutor {
+        response_tx: SyncSender<orca_mcp::McpElicitationResponse>,
     }
 
     struct SequentialUserInputExecutor {
@@ -39642,6 +44030,36 @@ mod tests {
         }
     }
 
+    impl ThreadOperationExecutor for HeadlessMcpInteractionExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let response = generation
+                .mcp_elicitation_handler()
+                .expect("runtime installs typed MCP elicitation broker")
+                .handle_elicitation(orca_mcp::McpElicitationRequest {
+                    server_name: "docs".to_string(),
+                    id: "headless-matrix-mcp".to_string(),
+                    mode: orca_mcp::McpElicitationMode::Url,
+                    message: "Authorize Headless matrix?".to_string(),
+                    url: Some("https://example.test/headless-matrix".to_string()),
+                    requested_schema: None,
+                })
+                .map_err(io::Error::other)?;
+            self.response_tx
+                .send(response)
+                .expect("report typed Headless MCP response");
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
     impl ThreadOperationExecutor for SequentialUserInputExecutor {
         fn run_turn(
             &self,
@@ -39787,6 +44205,366 @@ mod tests {
             terminal_notifications: false,
             auto_memory: false,
         }
+    }
+
+    #[test]
+    fn headless_attachment_has_distinct_role_and_typed_interaction_grant() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor)).unwrap();
+        let thread = host
+            .start_thread_with_request(
+                RuntimeThreadStartRequest::new(
+                    surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                    "headless attachment",
+                )
+                .with_ephemeral_non_catalogued_one_shot(
+                    surface::FirstOperationCompletionPolicy::Terminal,
+                ),
+            )
+            .unwrap();
+
+        let interactive = thread.attach_headless_surface(true).unwrap();
+        assert_eq!(
+            interactive.client.grant().role,
+            surface::SurfaceAttachmentRole::Headless
+        );
+        assert!(
+            interactive
+                .client
+                .grant()
+                .capabilities
+                .as_set()
+                .contains(&surface::SurfaceCapability::RespondGrantedInteraction)
+        );
+
+        let non_interactive = thread.attach_headless_surface(false).unwrap();
+        assert_eq!(
+            non_interactive.client.grant().role,
+            surface::SurfaceAttachmentRole::Headless
+        );
+        assert!(
+            !non_interactive
+                .client
+                .grant()
+                .capabilities
+                .as_set()
+                .contains(&surface::SurfaceCapability::RespondGrantedInteraction)
+        );
+
+        host.shutdown().unwrap();
+    }
+
+    fn wait_headless_checkpoint(
+        session: &mut HeadlessSurfaceSession,
+    ) -> HeadlessInteractionCheckpoint {
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            if let Some(checkpoint) = session.try_next_interaction().unwrap() {
+                return checkpoint;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Headless interaction checkpoint was not projected"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn wait_headless_terminal(
+        operation: &HeadlessOperationHandle,
+    ) -> surface::OperationTerminalAtCursor {
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            if let Some(terminal) = operation.try_terminal().unwrap() {
+                return terminal;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Headless operation terminal was not projected"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn headless_capabilities_cover_four_checkpoint_kinds_without_background_approval() {
+        assert_eq!(
+            headless_interaction_capabilities(),
+            BTreeSet::from([
+                surface::SurfaceInteractionKind::ToolApproval,
+                surface::SurfaceInteractionKind::PermissionRequest,
+                surface::SurfaceInteractionKind::UserInput,
+                surface::SurfaceInteractionKind::McpElicitation,
+            ])
+        );
+        assert!(
+            !headless_interaction_capabilities()
+                .contains(&surface::SurfaceInteractionKind::BackgroundApproval)
+        );
+    }
+
+    #[test]
+    fn headless_four_checkpoint_matrix_projects_exact_selectors_and_routes_typed_answers() {
+        for kind in [
+            surface::SurfaceInteractionKind::ToolApproval,
+            surface::SurfaceInteractionKind::PermissionRequest,
+            surface::SurfaceInteractionKind::UserInput,
+            surface::SurfaceInteractionKind::McpElicitation,
+        ] {
+            let cwd = tempfile::tempdir().unwrap();
+            let (host, mcp_response_rx) = if kind == surface::SurfaceInteractionKind::McpElicitation
+            {
+                let (response_tx, response_rx) = mpsc::sync_channel(1);
+                (
+                    RuntimeHost::start_with_executor(Arc::new(HeadlessMcpInteractionExecutor {
+                        response_tx,
+                    }))
+                    .unwrap(),
+                    Some(response_rx),
+                )
+            } else {
+                (RuntimeHost::start().unwrap(), None)
+            };
+            let thread = host
+                .start_thread(
+                    surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                    &format!("Headless interaction matrix {kind:?}"),
+                )
+                .unwrap();
+            let mut session = thread.attach_headless_surface(true).unwrap();
+            let prompt = match kind {
+                surface::SurfaceInteractionKind::ToolApproval => {
+                    "bash printf headless-matrix-approval"
+                }
+                surface::SurfaceInteractionKind::PermissionRequest => {
+                    "request_network_permissions_then_done example.com"
+                }
+                surface::SurfaceInteractionKind::UserInput => "ask continue?",
+                surface::SurfaceInteractionKind::McpElicitation => "headless MCP matrix",
+                surface::SurfaceInteractionKind::BackgroundApproval => unreachable!(),
+            };
+            let operation = session.start_turn(prompt, io::sink()).unwrap();
+            let checkpoint = wait_headless_checkpoint(&mut session);
+            assert_eq!(checkpoint.interaction.kind, kind);
+            let surface::InteractionSelector::Exact {
+                interaction_id,
+                expected_revision,
+                kind: selector_kind,
+                operation_fence,
+                ..
+            } = &checkpoint.selector
+            else {
+                panic!("Headless matrix requires an exact selector for {kind:?}")
+            };
+            assert_eq!(interaction_id, &checkpoint.interaction.interaction_id);
+            assert_eq!(expected_revision, &checkpoint.interaction.revision);
+            assert_eq!(*selector_kind, kind);
+            assert_eq!(operation_fence, &checkpoint.interaction.fence);
+
+            let answer = match &checkpoint.interaction.request {
+                surface::SurfaceInteractionRequest::ToolApproval { .. } => {
+                    surface::SurfaceClientInteractionAnswer::ToolApproval {
+                        decision: surface::SurfaceAllowDeny::Allow,
+                    }
+                }
+                surface::SurfaceInteractionRequest::PermissionRequest { permissions, .. } => {
+                    surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                        decision: surface::SurfacePermissionClientDecision::Allow {
+                            scope: surface::PermissionGrantScope::Turn,
+                            permissions: permissions.clone(),
+                            strict_auto_review: false,
+                        },
+                    }
+                }
+                surface::SurfaceInteractionRequest::UserInput { .. } => {
+                    surface::SurfaceClientInteractionAnswer::UserInput {
+                        decision: surface::SurfaceUserInputDecision::Answer(
+                            surface::DisplayText::new("yes"),
+                        ),
+                    }
+                }
+                surface::SurfaceInteractionRequest::McpElicitation { .. } => {
+                    surface::SurfaceClientInteractionAnswer::McpElicitation {
+                        decision: surface::SurfaceMcpElicitationDecision::Decline,
+                    }
+                }
+                surface::SurfaceInteractionRequest::BackgroundApproval { .. } => unreachable!(),
+            };
+            session.respond_interaction(&checkpoint, answer).unwrap();
+            if let Some(response_rx) = mcp_response_rx {
+                assert_eq!(
+                    response_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+                    orca_mcp::McpElicitationResponse::Decline
+                );
+            }
+            let snapshot = fresh_surface_attachment(&thread.surface())
+                .baseline
+                .snapshot;
+            assert!(matches!(
+                snapshot
+                    .interactions
+                    .iter()
+                    .find(|interaction| {
+                        interaction.interaction_id == checkpoint.interaction.interaction_id
+                    })
+                    .map(|interaction| &interaction.lifecycle),
+                Some(surface::SurfaceInteractionLifecycle::Resolved { .. })
+            ));
+            let _ = operation.try_terminal();
+            match host.shutdown() {
+                Ok(()) | Err(RuntimeHostError::ThreadUnavailable) => {}
+                Err(error) => panic!("Headless matrix shutdown failed for {kind:?}: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn headless_exact_selector_response_and_no_handler_fail_closed() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "Headless exact selector",
+            )
+            .unwrap();
+        let mut session = thread.attach_headless_surface(true).unwrap();
+        let operation = session
+            .start_turn("Headless exact selector", io::sink())
+            .unwrap();
+        let checkpoint = wait_headless_checkpoint(&mut session);
+        assert!(matches!(
+            (&checkpoint.interaction.request, &checkpoint.selector),
+            (
+                surface::SurfaceInteractionRequest::UserInput { .. },
+                surface::InteractionSelector::Exact {
+                    interaction_id,
+                    expected_revision,
+                    kind: surface::SurfaceInteractionKind::UserInput,
+                    operation_fence,
+                    ..
+                }
+            ) if interaction_id == &checkpoint.interaction.interaction_id
+                && expected_revision == &checkpoint.interaction.revision
+                && operation_fence == &checkpoint.interaction.fence
+        ));
+        session
+            .respond_interaction(
+                &checkpoint,
+                surface::SurfaceClientInteractionAnswer::UserInput {
+                    decision: surface::SurfaceUserInputDecision::Answer(surface::DisplayText::new(
+                        "typed Headless answer",
+                    )),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+            Some("typed Headless answer".to_string())
+        );
+        assert!(matches!(
+            wait_headless_terminal(&operation).terminal,
+            surface::OperationTerminal::Succeeded { .. }
+        ));
+        host.shutdown().unwrap();
+
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "Headless fail closed",
+            )
+            .unwrap();
+        let session = thread.attach_headless_surface(false).unwrap();
+        let operation = session
+            .start_turn("Headless fail closed", io::sink())
+            .unwrap();
+        assert_eq!(answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), None);
+        assert!(matches!(
+            wait_headless_terminal(&operation).terminal,
+            surface::OperationTerminal::Failed {
+                class: surface::FailureClass::ClientCapabilityUnavailable,
+                ..
+            }
+        ));
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn headless_baseline_requested_checkpoint_is_projected_after_route_recovery() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(ExactSelectorUserInputExecutor {
+            answer_tx,
+        }))
+        .unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "Headless recovered baseline",
+            )
+            .unwrap();
+        let surface = thread.surface();
+        let tui = fresh_surface_interaction_attachment(&surface);
+        let mut tui_subscription = surface
+            .claim_subscription(&tui.subscription)
+            .expect("claim TUI interaction subscription");
+        let reserved = committed_surface_value(
+            tui.client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&tui.baseline.snapshot, "Headless recovered baseline"),
+                )
+                .unwrap(),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            tui.client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .unwrap(),
+        );
+        let requested = collect_requested_surface_interaction(&mut tui_subscription);
+        let mut headless = thread.attach_headless_surface(true).unwrap();
+        assert!(
+            headless
+                .pending_interactions
+                .iter()
+                .any(|interaction_id| interaction_id == &requested.interaction_id),
+            "Requested checkpoint from the attachment baseline must be retained"
+        );
+        detach_surface_attachment(&surface, &tui);
+        let checkpoint = wait_headless_checkpoint(&mut headless);
+        assert_eq!(
+            checkpoint.interaction.interaction_id,
+            requested.interaction_id
+        );
+        headless
+            .respond_interaction(
+                &checkpoint,
+                surface::SurfaceClientInteractionAnswer::UserInput {
+                    decision: surface::SurfaceUserInputDecision::Cancel,
+                },
+            )
+            .unwrap();
+        assert_eq!(answer_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(), None);
+        let _ = headless
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .unwrap();
+        host.shutdown().unwrap();
     }
 
     fn surface_request_id() -> surface::SurfaceRequestId {

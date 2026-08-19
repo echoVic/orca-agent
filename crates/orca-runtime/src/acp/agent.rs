@@ -24,6 +24,7 @@ use agent_client_protocol::{
 };
 use orca_core::config::{AdditionalWorkingDirectory, HistoryMode, RunConfig};
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 
@@ -35,10 +36,12 @@ use crate::surface::{
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
     Sha256Digest, SurfaceAllowDeny, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability,
     SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceInputRequest,
-    SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceInteractionRequest,
-    SurfaceInteractionRoute, SurfaceInteractionView, SurfaceOperationId, SurfaceRequestId,
-    SurfaceSubscriptionItem, SurfaceToolResultKind, ToolPatch, TurnRequestBudgetScope,
-    UncommittedMutation,
+    SurfaceInputRequestBlock, SurfaceInteractionId, SurfaceInteractionKind,
+    SurfaceInteractionRequest, SurfaceInteractionRoute, SurfaceInteractionView,
+    SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest, SurfaceOperationId,
+    SurfacePermissionClientDecision, SurfacePermissionProfile, SurfaceRequestId, SurfaceSchema,
+    SurfaceSubscriptionItem, SurfaceToolResultKind, SurfaceUserInputDecision, ToolPatch,
+    TurnRequestBudgetScope, UncommittedMutation,
 };
 
 use crate::runtime_surface::{
@@ -48,7 +51,13 @@ use crate::runtime_surface::{
 };
 
 pub(crate) const ACP_NOTIFICATION_CAPACITY: usize = 256;
-const ACP_PERMISSION_REQUEST_CAPACITY: usize = 64;
+const ACP_INTERACTION_REQUEST_CAPACITY: usize = 64;
+const ACP_TERMINAL_CLEANUP_REQUEST_CAPACITY: usize = 32;
+const ORCA_ACP_INTERACTION_EXTENSION_VERSION: u32 = 1;
+pub(crate) const ORCA_ACP_INTERACTION_CAPABILITIES_META_KEY: &str =
+    "orca.dev/interactionCapabilities";
+pub(crate) const ORCA_ACP_USER_INPUT_METHOD: &str = "orca.dev/session/request_user_input";
+pub(crate) const ORCA_ACP_MCP_ELICITATION_METHOD: &str = "orca.dev/session/request_mcp_elicitation";
 
 #[derive(Clone)]
 pub(crate) enum AcpNotificationSender {
@@ -109,6 +118,8 @@ struct AcpClientCapabilityProfile {
     read_text_file: bool,
     write_text_file: bool,
     terminal: bool,
+    user_input: bool,
+    mcp_elicitation: bool,
 }
 
 impl AcpClientCapabilityProfile {
@@ -119,6 +130,8 @@ impl AcpClientCapabilityProfile {
             read_text_file: false,
             write_text_file: false,
             terminal: false,
+            user_input: false,
+            mcp_elicitation: false,
         }
     }
 
@@ -136,15 +149,122 @@ impl AcpClientCapabilityProfile {
 }
 
 impl From<&ClientCapabilities> for AcpClientCapabilityProfile {
+    /// Frozen intent: derive one fail-closed capability snapshot from the
+    /// initialize request; extension interactions are advertised only by an
+    /// explicit, schema-valid v1 declaration for the corresponding kind.
     fn from(capabilities: &ClientCapabilities) -> Self {
+        let extension_capabilities = capabilities
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(ORCA_ACP_INTERACTION_CAPABILITIES_META_KEY))
+            .and_then(|value| {
+                serde_json::from_value::<OrcaAcpInteractionCapabilitiesV1>(value.clone()).ok()
+            })
+            .filter(|capabilities| capabilities.version == ORCA_ACP_INTERACTION_EXTENSION_VERSION);
         Self {
             revision: CapabilityRevision::try_new(1)
                 .expect("initial ACP capability revision is valid"),
             read_text_file: capabilities.fs.read_text_file,
             write_text_file: capabilities.fs.write_text_file,
             terminal: capabilities.terminal,
+            user_input: extension_capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.user_input),
+            mcp_elicitation: extension_capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.mcp_elicitation),
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct OrcaAcpInteractionCapabilitiesV1 {
+    version: u32,
+    #[serde(default)]
+    user_input: bool,
+    #[serde(default)]
+    mcp_elicitation: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrcaAcpUserInputRequestV1 {
+    question: NonEmptyText,
+    suggestions: Vec<DisplayText>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrcaAcpUserInputExtensionRequestV1 {
+    version: u32,
+    session_id: SessionId,
+    interaction_id: SurfaceInteractionId,
+    request: OrcaAcpUserInputRequestV1,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrcaAcpUserInputExtensionResponseV1 {
+    version: u32,
+    session_id: SessionId,
+    interaction_id: SurfaceInteractionId,
+    response: OrcaAcpUserInputResponseV1,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum OrcaAcpUserInputResponseV1 {
+    Answer { value: DisplayText },
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum OrcaAcpMcpElicitationRequestV1 {
+    Form {
+        requested_schema: Option<crate::surface::SurfaceDataValue>,
+        supported_schema: Option<SurfaceSchema>,
+    },
+    Url {
+        raw_url: Option<DisplayText>,
+        requested_schema: Option<crate::surface::SurfaceDataValue>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrcaAcpMcpElicitationExtensionRequestV1 {
+    version: u32,
+    session_id: SessionId,
+    interaction_id: SurfaceInteractionId,
+    server_name: NonEmptyText,
+    server_request_id: NonEmptyText,
+    message: DisplayText,
+    request: OrcaAcpMcpElicitationRequestV1,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrcaAcpMcpElicitationExtensionResponseV1 {
+    version: u32,
+    session_id: SessionId,
+    interaction_id: SurfaceInteractionId,
+    response: OrcaAcpMcpElicitationResponseV1,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum OrcaAcpMcpElicitationResponseV1 {
+    Accept {
+        content: crate::surface::SurfaceDataValue,
+    },
+    Decline,
+    Cancelled,
 }
 
 /// ACP agent backed by the Orca runtime host.
@@ -157,7 +277,7 @@ pub struct OrcaAcpAgent {
 }
 
 pub(crate) struct AcpClientBridge {
-    request_tx: mpsc::Sender<AcpPermissionRequest>,
+    request_tx: mpsc::Sender<AcpInteractionRequest>,
     read_text_file_tx: Mutex<Option<mpsc::Sender<AcpReadTextFileRequest>>>,
     write_text_file_tx: Mutex<Option<mpsc::Sender<AcpWriteTextFileRequest>>>,
     terminal_create_tx: Mutex<Option<mpsc::Sender<AcpTerminalCreateRequest>>>,
@@ -171,7 +291,7 @@ pub(crate) struct AcpClientBridge {
 struct AcpClientBridgeState {
     pending: HashMap<
         String,
-        std_mpsc::SyncSender<Result<RequestPermissionResponse, AcpPermissionWaitError>>,
+        std_mpsc::SyncSender<Result<AcpInteractionWireResponse, AcpInteractionWaitError>>,
     >,
     cancelled_sessions: HashSet<String>,
     capability_writes: HashMap<String, usize>,
@@ -179,15 +299,96 @@ struct AcpClientBridgeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AcpPermissionWaitError {
+pub(crate) enum AcpInteractionWaitError {
     Cancelled,
     BridgeClosed,
     ResponseDropped,
     Client(String),
 }
 
-pub(crate) struct AcpPermissionRequest {
-    pub request: RequestPermissionRequest,
+#[derive(Clone, Copy)]
+pub(crate) enum AcpInteractionResponseKind {
+    Permission,
+    UserInput,
+    McpElicitation,
+}
+
+pub(crate) enum AcpInteractionWireRequest {
+    Permission(RequestPermissionRequest),
+    UserInput(OrcaAcpUserInputExtensionRequestV1),
+    McpElicitation(OrcaAcpMcpElicitationExtensionRequestV1),
+}
+
+impl AcpInteractionWireRequest {
+    pub(crate) fn session_id(&self) -> &SessionId {
+        match self {
+            Self::Permission(request) => &request.session_id,
+            Self::UserInput(request) => &request.session_id,
+            Self::McpElicitation(request) => &request.session_id,
+        }
+    }
+
+    /// Frozen intent: return the exact JSON-RPC method placed on the wire.
+    /// ACP extension methods carry one leading underscore; standard
+    /// permission requests retain their standard method name.
+    pub(crate) fn wire_method(&self) -> String {
+        match self {
+            Self::Permission(_) => "session/request_permission".to_string(),
+            Self::UserInput(_) => format!("_{ORCA_ACP_USER_INPUT_METHOD}"),
+            Self::McpElicitation(_) => format!("_{ORCA_ACP_MCP_ELICITATION_METHOD}"),
+        }
+    }
+
+    pub(crate) fn response_kind(&self) -> AcpInteractionResponseKind {
+        match self {
+            Self::Permission(_) => AcpInteractionResponseKind::Permission,
+            Self::UserInput(_) => AcpInteractionResponseKind::UserInput,
+            Self::McpElicitation(_) => AcpInteractionResponseKind::McpElicitation,
+        }
+    }
+
+    /// Frozen intent: serialize exactly the request parameters expected by
+    /// ACP `ExtRequest`/standard request dispatch, without a method or params
+    /// wrapper.
+    pub(crate) fn params_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        match self {
+            Self::Permission(request) => serde_json::to_value(request),
+            Self::UserInput(request) => serde_json::to_value(request),
+            Self::McpElicitation(request) => serde_json::to_value(request),
+        }
+    }
+}
+
+pub(crate) enum AcpInteractionWireResponse {
+    Permission(RequestPermissionResponse),
+    UserInput(OrcaAcpUserInputExtensionResponseV1),
+    McpElicitation(OrcaAcpMcpElicitationExtensionResponseV1),
+}
+
+impl AcpInteractionWireResponse {
+    /// Frozen intent: decode a raw JSON-RPC result into the private,
+    /// versioned response schema selected when the reverse request route was
+    /// registered; never infer a response kind from payload shape.
+    pub(crate) fn decode(
+        kind: AcpInteractionResponseKind,
+        value: serde_json::Value,
+    ) -> Result<Self, serde_json::Error> {
+        match kind {
+            AcpInteractionResponseKind::Permission => {
+                serde_json::from_value(value).map(Self::Permission)
+            }
+            AcpInteractionResponseKind::UserInput => {
+                serde_json::from_value(value).map(Self::UserInput)
+            }
+            AcpInteractionResponseKind::McpElicitation => {
+                serde_json::from_value(value).map(Self::McpElicitation)
+            }
+        }
+    }
+}
+
+pub(crate) struct AcpInteractionRequest {
+    pub request: AcpInteractionWireRequest,
     pub key: String,
 }
 
@@ -218,8 +419,8 @@ pub(crate) struct AcpTerminalCleanupRequest {
 
 impl AcpClientBridge {
     #[cfg(test)]
-    pub(crate) fn new() -> (Arc<Self>, mpsc::Receiver<AcpPermissionRequest>) {
-        let (request_tx, request_rx) = mpsc::channel(ACP_PERMISSION_REQUEST_CAPACITY);
+    pub(crate) fn new() -> (Arc<Self>, mpsc::Receiver<AcpInteractionRequest>) {
+        let (request_tx, request_rx) = mpsc::channel(ACP_INTERACTION_REQUEST_CAPACITY);
         (
             Arc::new(Self {
                 request_tx,
@@ -243,19 +444,20 @@ impl AcpClientBridge {
 
     pub(crate) fn new_with_capability_lanes() -> (
         Arc<Self>,
-        mpsc::Receiver<AcpPermissionRequest>,
+        mpsc::Receiver<AcpInteractionRequest>,
         mpsc::Receiver<AcpReadTextFileRequest>,
         mpsc::Receiver<AcpWriteTextFileRequest>,
         mpsc::Receiver<AcpTerminalCreateRequest>,
         mpsc::Receiver<AcpTerminalObservationRequest>,
         mpsc::Receiver<AcpTerminalCleanupRequest>,
     ) {
-        let (request_tx, request_rx) = mpsc::channel(ACP_PERMISSION_REQUEST_CAPACITY);
+        let (request_tx, request_rx) = mpsc::channel(ACP_INTERACTION_REQUEST_CAPACITY);
         let (read_text_file_tx, read_text_file_rx) = mpsc::channel(1);
         let (write_text_file_tx, write_text_file_rx) = mpsc::channel(1);
         let (terminal_create_tx, terminal_create_rx) = mpsc::channel(1);
         let (terminal_observation_tx, terminal_observation_rx) = mpsc::channel(1);
-        let (terminal_cleanup_tx, terminal_cleanup_rx) = mpsc::channel(1);
+        let (terminal_cleanup_tx, terminal_cleanup_rx) =
+            mpsc::channel(ACP_TERMINAL_CLEANUP_REQUEST_CAPACITY);
         (
             Arc::new(Self {
                 request_tx,
@@ -423,54 +625,70 @@ impl AcpClientBridge {
         }
     }
 
-    fn request_permission(
+    fn request_interaction(
         &self,
-        request: RequestPermissionRequest,
-    ) -> Result<RequestPermissionResponse, AcpPermissionWaitError> {
+        request: AcpInteractionWireRequest,
+    ) -> Result<AcpInteractionWireResponse, AcpInteractionWaitError> {
         let key = format!(
             "{}\0{}",
-            request.session_id,
+            request.session_id(),
             self.next_key.fetch_add(1, Ordering::Relaxed)
         );
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-        let session_id = request.session_id.to_string();
+        let session_id = request.session_id().to_string();
         let mut state = self
             .state
             .lock()
-            .expect("ACP permission bridge mutex is not poisoned");
+            .expect("ACP interaction bridge mutex is not poisoned");
         if state.cancelled_sessions.contains(&session_id) {
-            return Err(AcpPermissionWaitError::Cancelled);
+            return Err(AcpInteractionWaitError::Cancelled);
         }
         state.pending.insert(key.clone(), reply_tx);
         drop(state);
         self.request_tx
-            .try_send(AcpPermissionRequest {
+            .try_send(AcpInteractionRequest {
                 request,
                 key: key.clone(),
             })
             .map_err(|_| {
                 self.state
                     .lock()
-                    .expect("ACP permission bridge mutex is not poisoned")
+                    .expect("ACP interaction bridge mutex is not poisoned")
                     .pending
                     .remove(&key);
-                AcpPermissionWaitError::BridgeClosed
+                AcpInteractionWaitError::BridgeClosed
             })?;
         let result = reply_rx
             .recv()
-            .map_err(|_| AcpPermissionWaitError::ResponseDropped)?;
+            .map_err(|_| AcpInteractionWaitError::ResponseDropped)?;
         self.state
             .lock()
-            .expect("ACP permission bridge mutex is not poisoned")
+            .expect("ACP interaction bridge mutex is not poisoned")
             .pending
             .remove(&key);
         result
     }
 
+    #[cfg(test)]
+    pub(crate) fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> Result<RequestPermissionResponse, AcpInteractionWaitError> {
+        match self.request_interaction(AcpInteractionWireRequest::Permission(request))? {
+            AcpInteractionWireResponse::Permission(response) => Ok(response),
+            AcpInteractionWireResponse::UserInput(_)
+            | AcpInteractionWireResponse::McpElicitation(_) => {
+                Err(AcpInteractionWaitError::Client(
+                    "ACP permission request received an incompatible response".to_string(),
+                ))
+            }
+        }
+    }
+
     pub(crate) fn begin_session(&self, session_id: &SessionId) {
         self.state
             .lock()
-            .expect("ACP permission bridge mutex is not poisoned")
+            .expect("ACP interaction bridge mutex is not poisoned")
             .cancelled_sessions
             .remove(&session_id.to_string());
     }
@@ -481,7 +699,7 @@ impl AcpClientBridge {
             let mut pending = self
                 .state
                 .lock()
-                .expect("ACP permission bridge mutex is not poisoned");
+                .expect("ACP interaction bridge mutex is not poisoned");
             pending.cancelled_sessions.insert(session_id.to_string());
             let keys = pending
                 .pending
@@ -494,19 +712,19 @@ impl AcpClientBridge {
                 .collect::<Vec<_>>()
         };
         for reply in pending {
-            let _ = reply.send(Err(AcpPermissionWaitError::Cancelled));
+            let _ = reply.send(Err(AcpInteractionWaitError::Cancelled));
         }
     }
 
-    pub(crate) fn complete_permission(
+    pub(crate) fn complete_interaction(
         &self,
         key: &str,
-        result: Result<RequestPermissionResponse, AcpPermissionWaitError>,
+        result: Result<AcpInteractionWireResponse, AcpInteractionWaitError>,
     ) {
         let reply = self
             .state
             .lock()
-            .expect("ACP permission bridge mutex is not poisoned")
+            .expect("ACP interaction bridge mutex is not poisoned")
             .pending
             .remove(key);
         if let Some(reply) = reply {
@@ -517,7 +735,7 @@ impl AcpClientBridge {
     pub(crate) fn is_pending(&self, key: &str) -> bool {
         self.state
             .lock()
-            .expect("ACP permission bridge mutex is not poisoned")
+            .expect("ACP interaction bridge mutex is not poisoned")
             .pending
             .contains_key(key)
     }
@@ -547,7 +765,7 @@ impl AcpClientBridge {
             let mut state = self
                 .state
                 .lock()
-                .expect("ACP permission bridge mutex is not poisoned");
+                .expect("ACP interaction bridge mutex is not poisoned");
             state.capability_lanes_closed = true;
             state
                 .pending
@@ -556,7 +774,7 @@ impl AcpClientBridge {
                 .collect::<Vec<_>>()
         };
         for reply in pending {
-            let _ = reply.send(Err(AcpPermissionWaitError::Cancelled));
+            let _ = reply.send(Err(AcpInteractionWaitError::Cancelled));
         }
     }
 }
@@ -1322,7 +1540,7 @@ fn prepare_surface_prompt(
                 SurfaceCapability::ControlBoundOperation,
                 SurfaceCapability::RespondGrantedInteraction,
             ]),
-            interaction_capabilities: standard_interaction_capabilities(),
+            interaction_capabilities: standard_interaction_capabilities(client_capabilities),
         },
         client_capabilities.attachment_profile(),
     ) {
@@ -1495,8 +1713,20 @@ fn prepare_surface_prompt(
     })
 }
 
-fn standard_interaction_capabilities() -> std::collections::BTreeSet<SurfaceInteractionKind> {
-    std::collections::BTreeSet::from([SurfaceInteractionKind::ToolApproval])
+fn standard_interaction_capabilities(
+    client_capabilities: AcpClientCapabilityProfile,
+) -> std::collections::BTreeSet<SurfaceInteractionKind> {
+    let mut capabilities = std::collections::BTreeSet::from([
+        SurfaceInteractionKind::ToolApproval,
+        SurfaceInteractionKind::PermissionRequest,
+    ]);
+    if client_capabilities.user_input {
+        capabilities.insert(SurfaceInteractionKind::UserInput);
+    }
+    if client_capabilities.mcp_elicitation {
+        capabilities.insert(SurfaceInteractionKind::McpElicitation);
+    }
+    capabilities
 }
 
 fn standard_acp_routes_interaction(
@@ -1504,7 +1734,13 @@ fn standard_acp_routes_interaction(
     kind: SurfaceInteractionKind,
     route: &SurfaceInteractionRoute,
 ) -> bool {
-    if kind != SurfaceInteractionKind::ToolApproval {
+    if !matches!(
+        kind,
+        SurfaceInteractionKind::ToolApproval
+            | SurfaceInteractionKind::PermissionRequest
+            | SurfaceInteractionKind::UserInput
+            | SurfaceInteractionKind::McpElicitation
+    ) {
         return false;
     }
     match route {
@@ -1529,37 +1765,132 @@ fn uncommitted_mutation_message(mutation: &UncommittedMutation) -> &str {
 }
 
 #[derive(Clone)]
-enum AcpPermissionTarget {
+enum AcpInteractionTarget {
     ToolApproval,
+    PermissionRequest {
+        permissions: SurfacePermissionProfile,
+    },
+    UserInput {
+        session_id: SessionId,
+        interaction_id: SurfaceInteractionId,
+    },
+    McpElicitation {
+        session_id: SessionId,
+        interaction_id: SurfaceInteractionId,
+    },
 }
 
-fn build_permission_request(
+/// Frozen intent: map one broker-selected runtime interaction to either the
+/// standard ACP permission request or the negotiated v1 Orca extension shape,
+/// retaining the identity needed to validate and type the response.
+fn build_interaction_request(
     session_id: &SessionId,
     interaction: &SurfaceInteractionView,
-) -> Result<(RequestPermissionRequest, AcpPermissionTarget), String> {
-    let (tool_call_id, title, target) = match &interaction.request {
+) -> Result<(AcpInteractionWireRequest, AcpInteractionTarget), String> {
+    let (tool_call_id, title, raw_input, options, target) = match &interaction.request {
         SurfaceInteractionRequest::ToolApproval {
             tool, description, ..
         } => (
             tool.tool_call_id.as_str().to_string(),
             description.as_str().to_string(),
-            AcpPermissionTarget::ToolApproval,
+            None,
+            standard_tool_approval_options(),
+            AcpInteractionTarget::ToolApproval,
         ),
-        SurfaceInteractionRequest::PermissionRequest { .. }
-        | SurfaceInteractionRequest::UserInput { .. }
-        | SurfaceInteractionRequest::McpElicitation { .. }
-        | SurfaceInteractionRequest::BackgroundApproval { .. } => {
+        SurfaceInteractionRequest::PermissionRequest {
+            tool_call_id,
+            reason,
+            permissions,
+            ..
+        } => (
+            tool_call_id.as_str().to_string(),
+            reason
+                .as_ref()
+                .map(|reason| reason.as_str().to_string())
+                .unwrap_or_else(|| "Permission request".to_string()),
+            Some(serde_json::to_value(permissions).map_err(|error| {
+                format!("ACP permission request could not encode permissions: {error}")
+            })?),
+            standard_permission_request_options(),
+            AcpInteractionTarget::PermissionRequest {
+                permissions: permissions.clone(),
+            },
+        ),
+        SurfaceInteractionRequest::UserInput {
+            question,
+            suggestions,
+        } => {
+            return Ok((
+                AcpInteractionWireRequest::UserInput(OrcaAcpUserInputExtensionRequestV1 {
+                    version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+                    session_id: session_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                    request: OrcaAcpUserInputRequestV1 {
+                        question: question.clone(),
+                        suggestions: suggestions.clone(),
+                    },
+                }),
+                AcpInteractionTarget::UserInput {
+                    session_id: session_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                },
+            ));
+        }
+        SurfaceInteractionRequest::McpElicitation {
+            server_name,
+            server_request_id,
+            message,
+            request,
+        } => {
+            let request = match request {
+                SurfaceMcpElicitationRequest::Form {
+                    requested_schema,
+                    supported_schema,
+                } => OrcaAcpMcpElicitationRequestV1::Form {
+                    requested_schema: requested_schema.clone(),
+                    supported_schema: supported_schema.clone(),
+                },
+                SurfaceMcpElicitationRequest::Url {
+                    raw_url,
+                    requested_schema,
+                } => OrcaAcpMcpElicitationRequestV1::Url {
+                    raw_url: raw_url.clone(),
+                    requested_schema: requested_schema.clone(),
+                },
+            };
+            return Ok((
+                AcpInteractionWireRequest::McpElicitation(
+                    OrcaAcpMcpElicitationExtensionRequestV1 {
+                        version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+                        session_id: session_id.clone(),
+                        interaction_id: interaction.interaction_id.clone(),
+                        server_name: server_name.clone(),
+                        server_request_id: server_request_id.clone(),
+                        message: message.clone(),
+                        request,
+                    },
+                ),
+                AcpInteractionTarget::McpElicitation {
+                    session_id: session_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                },
+            ));
+        }
+        SurfaceInteractionRequest::BackgroundApproval { .. } => {
             return Err("ACP client bridge does not support this interaction kind".to_string());
         }
     };
-    let fields = ToolCallUpdateFields::new().title(title);
+    let mut fields = ToolCallUpdateFields::new().title(title);
+    if let Some(raw_input) = raw_input {
+        fields = fields.raw_input(raw_input);
+    }
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id), fields);
     Ok((
-        RequestPermissionRequest::new(
+        AcpInteractionWireRequest::Permission(RequestPermissionRequest::new(
             session_id.clone(),
             tool_call,
-            standard_tool_approval_options(),
-        ),
+            options,
+        )),
         target,
     ))
 }
@@ -1575,30 +1906,174 @@ fn standard_tool_approval_options() -> Vec<PermissionOption> {
     ]
 }
 
-fn permission_answer(
-    response: RequestPermissionResponse,
-    target: AcpPermissionTarget,
+fn standard_permission_request_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption::new(
+            "allow_once",
+            "Allow for this turn",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            "allow_once_strict",
+            "Allow for this turn and require tool review",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            "allow_always",
+            "Allow for this session",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new(
+            "allow_always_strict",
+            "Allow for this session and require tool review",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new(
+            "reject_once",
+            "Deny for this turn",
+            PermissionOptionKind::RejectOnce,
+        ),
+        PermissionOption::new(
+            "reject_always",
+            "Deny for this session",
+            PermissionOptionKind::RejectAlways,
+        ),
+    ]
+}
+
+/// Frozen intent: accept only a response matching the request kind and v1
+/// identity, then produce the exact typed broker answer. Permission
+/// cancellation and unknown options fail closed as explicit denials.
+fn interaction_answer(
+    response: AcpInteractionWireResponse,
+    target: AcpInteractionTarget,
 ) -> Result<SurfaceClientInteractionAnswer, String> {
-    let allow = match response.outcome {
-        RequestPermissionOutcome::Cancelled => false,
-        RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
-            match option_id.to_string().as_str() {
-                "allow_once" => true,
-                "reject_once" => false,
-                other => return Err(format!("unknown ACP permission option '{other}'")),
-            }
+    match (response, target) {
+        (AcpInteractionWireResponse::Permission(response), AcpInteractionTarget::ToolApproval) => {
+            let option_id = permission_option_id(response);
+            let decision = match option_id.as_deref() {
+                Some("allow_once") => SurfaceAllowDeny::Allow,
+                None | Some(_) => SurfaceAllowDeny::Deny,
+            };
+            Ok(SurfaceClientInteractionAnswer::ToolApproval { decision })
         }
-        _ => return Err("unsupported ACP permission outcome".to_string()),
-    };
-    Ok(match target {
-        AcpPermissionTarget::ToolApproval => SurfaceClientInteractionAnswer::ToolApproval {
-            decision: if allow {
-                SurfaceAllowDeny::Allow
+        (
+            AcpInteractionWireResponse::Permission(response),
+            AcpInteractionTarget::PermissionRequest { permissions },
+        ) => {
+            let option_id = permission_option_id(response);
+            let (allow, scope, strict_auto_review) = match option_id.as_deref() {
+                Some("allow_once") => (true, crate::surface::PermissionGrantScope::Turn, false),
+                Some("allow_once_strict") => {
+                    (true, crate::surface::PermissionGrantScope::Turn, true)
+                }
+                Some("allow_always") => {
+                    (true, crate::surface::PermissionGrantScope::Session, false)
+                }
+                Some("allow_always_strict") => {
+                    (true, crate::surface::PermissionGrantScope::Session, true)
+                }
+                Some("reject_once") => (false, crate::surface::PermissionGrantScope::Turn, false),
+                Some("reject_always") => {
+                    (false, crate::surface::PermissionGrantScope::Session, false)
+                }
+                None | Some(_) => (false, crate::surface::PermissionGrantScope::Turn, false),
+            };
+            let decision = if allow {
+                SurfacePermissionClientDecision::Allow {
+                    scope,
+                    permissions,
+                    strict_auto_review,
+                }
             } else {
-                SurfaceAllowDeny::Deny
+                SurfacePermissionClientDecision::Deny {
+                    scope,
+                    permissions,
+                    strict_auto_review,
+                }
+            };
+            Ok(SurfaceClientInteractionAnswer::PermissionRequest { decision })
+        }
+        (
+            AcpInteractionWireResponse::UserInput(response),
+            AcpInteractionTarget::UserInput {
+                session_id,
+                interaction_id,
             },
-        },
-    })
+        ) => {
+            validate_extension_response_identity(
+                response.version,
+                &response.session_id,
+                &response.interaction_id,
+                &session_id,
+                &interaction_id,
+            )?;
+            let decision = match response.response {
+                OrcaAcpUserInputResponseV1::Answer { value } => {
+                    SurfaceUserInputDecision::Answer(value)
+                }
+                OrcaAcpUserInputResponseV1::Cancelled => SurfaceUserInputDecision::Cancel,
+            };
+            Ok(SurfaceClientInteractionAnswer::UserInput { decision })
+        }
+        (
+            AcpInteractionWireResponse::McpElicitation(response),
+            AcpInteractionTarget::McpElicitation {
+                session_id,
+                interaction_id,
+            },
+        ) => {
+            validate_extension_response_identity(
+                response.version,
+                &response.session_id,
+                &response.interaction_id,
+                &session_id,
+                &interaction_id,
+            )?;
+            let decision = match response.response {
+                OrcaAcpMcpElicitationResponseV1::Accept { content } => {
+                    SurfaceMcpElicitationDecision::Accept { content }
+                }
+                OrcaAcpMcpElicitationResponseV1::Decline
+                | OrcaAcpMcpElicitationResponseV1::Cancelled => {
+                    SurfaceMcpElicitationDecision::Decline
+                }
+            };
+            Ok(SurfaceClientInteractionAnswer::McpElicitation { decision })
+        }
+        _ => Err("ACP interaction response kind does not match request".to_string()),
+    }
+}
+
+fn permission_option_id(response: RequestPermissionResponse) -> Option<String> {
+    match response.outcome {
+        RequestPermissionOutcome::Cancelled => None,
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
+            Some(option_id.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn validate_extension_response_identity(
+    version: u32,
+    observed_session_id: &SessionId,
+    observed_interaction_id: &SurfaceInteractionId,
+    expected_session_id: &SessionId,
+    expected_interaction_id: &SurfaceInteractionId,
+) -> Result<(), String> {
+    if version != ORCA_ACP_INTERACTION_EXTENSION_VERSION {
+        return Err(format!(
+            "unsupported Orca ACP interaction extension version {version}"
+        ));
+    }
+    if observed_session_id != expected_session_id {
+        return Err("Orca ACP interaction response session id mismatch".to_string());
+    }
+    if observed_interaction_id != expected_interaction_id {
+        return Err("Orca ACP interaction response interaction id mismatch".to_string());
+    }
+    Ok(())
 }
 
 fn drain_surface_prompt(
@@ -1985,6 +2460,9 @@ fn emit_surface_event(
     }
 }
 
+/// Frozen intent: answer only interactions selected for this ACP attachment,
+/// then submit the typed answer through the broker's interaction-id selector;
+/// any bridge, decode, or commit failure cancels the owning operation closed.
 fn project_surface_event(
     prepared: &mut PreparedSurfacePrompt,
     session_id: &SessionId,
@@ -2003,25 +2481,25 @@ fn project_surface_event(
             cancel_surface_operation(prepared)?;
             return Err("ACP interaction requires a connected client bridge".to_string());
         };
-        let (request, target) = match build_permission_request(session_id, interaction) {
+        let (request, target) = match build_interaction_request(session_id, interaction) {
             Ok(value) => value,
             Err(error) => {
                 cancel_surface_operation(prepared)?;
                 return Err(error);
             }
         };
-        let response = match bridge.request_permission(request) {
+        let response = match bridge.request_interaction(request) {
             Ok(response) => response,
-            Err(AcpPermissionWaitError::Cancelled) => {
+            Err(AcpInteractionWaitError::Cancelled) => {
                 let _ = cancel_surface_operation(prepared);
                 return Ok(());
             }
             Err(error) => {
                 cancel_surface_operation(prepared)?;
-                return Err(format!("ACP permission request failed: {error:?}"));
+                return Err(format!("ACP interaction request failed: {error:?}"));
             }
         };
-        let answer = match permission_answer(response, target) {
+        let answer = match interaction_answer(response, target) {
             Ok(answer) => answer,
             Err(error) => {
                 let _ = cancel_surface_operation(prepared);
@@ -2322,6 +2800,30 @@ mod tests {
         SurfaceAttachmentId::try_from_bytes(bytes).expect("valid UUIDv7 attachment id")
     }
 
+    fn interaction_id(seed: u8) -> SurfaceInteractionId {
+        let mut bytes = [seed; 16];
+        bytes[6] = 0x70 | (seed & 0x0f);
+        bytes[8] = 0x80 | (seed & 0x3f);
+        SurfaceInteractionId::try_from_bytes(bytes).expect("valid UUIDv7 interaction id")
+    }
+
+    fn extension_capabilities(
+        version: u32,
+        user_input: bool,
+        mcp_elicitation: bool,
+    ) -> ClientCapabilities {
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            ORCA_ACP_INTERACTION_CAPABILITIES_META_KEY.to_string(),
+            serde_json::json!({
+                "version": version,
+                "userInput": user_input,
+                "mcpElicitation": mcp_elicitation,
+            }),
+        );
+        ClientCapabilities::new().meta(meta)
+    }
+
     #[test]
     fn prompt_content_decodes_supported_blocks_in_original_order() {
         use agent_client_protocol::{
@@ -2593,26 +3095,240 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["allow_once".to_string(), "reject_once".to_string()]
         );
-        let error = permission_answer(
-            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
-                SelectedPermissionOutcome::new("allow_always"),
+        let answer = interaction_answer(
+            AcpInteractionWireResponse::Permission(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("allow_always")),
             )),
-            AcpPermissionTarget::ToolApproval,
+            AcpInteractionTarget::ToolApproval,
         )
-        .expect_err("unadvertised persistent grant must be rejected");
-        assert!(error.contains("unknown ACP permission option"));
-    }
-
-    #[test]
-    fn standard_interaction_capabilities_only_advertise_exact_tool_approval() {
+        .expect("unadvertised persistent grant fails closed as a denial");
         assert_eq!(
-            standard_interaction_capabilities(),
-            std::collections::BTreeSet::from([SurfaceInteractionKind::ToolApproval])
+            answer,
+            SurfaceClientInteractionAnswer::ToolApproval {
+                decision: SurfaceAllowDeny::Deny,
+            }
         );
     }
 
     #[test]
-    fn standard_acp_ignores_ungranted_and_extension_only_interactions() {
+    fn permission_options_preserve_scope_subset_and_strict_review_policy() {
+        let permissions = SurfacePermissionProfile {
+            file_system: None,
+            network: None,
+            shell: Some(crate::surface::SurfaceShellPermissionProfile { unsandboxed: true }),
+        };
+        for (option_id, expected) in [
+            (
+                "allow_once",
+                SurfacePermissionClientDecision::Allow {
+                    scope: crate::surface::PermissionGrantScope::Turn,
+                    permissions: permissions.clone(),
+                    strict_auto_review: false,
+                },
+            ),
+            (
+                "allow_once_strict",
+                SurfacePermissionClientDecision::Allow {
+                    scope: crate::surface::PermissionGrantScope::Turn,
+                    permissions: permissions.clone(),
+                    strict_auto_review: true,
+                },
+            ),
+            (
+                "allow_always",
+                SurfacePermissionClientDecision::Allow {
+                    scope: crate::surface::PermissionGrantScope::Session,
+                    permissions: permissions.clone(),
+                    strict_auto_review: false,
+                },
+            ),
+            (
+                "allow_always_strict",
+                SurfacePermissionClientDecision::Allow {
+                    scope: crate::surface::PermissionGrantScope::Session,
+                    permissions: permissions.clone(),
+                    strict_auto_review: true,
+                },
+            ),
+            (
+                "reject_once",
+                SurfacePermissionClientDecision::Deny {
+                    scope: crate::surface::PermissionGrantScope::Turn,
+                    permissions: permissions.clone(),
+                    strict_auto_review: false,
+                },
+            ),
+            (
+                "reject_always",
+                SurfacePermissionClientDecision::Deny {
+                    scope: crate::surface::PermissionGrantScope::Session,
+                    permissions: permissions.clone(),
+                    strict_auto_review: false,
+                },
+            ),
+            (
+                "unknown-option",
+                SurfacePermissionClientDecision::Deny {
+                    scope: crate::surface::PermissionGrantScope::Turn,
+                    permissions: permissions.clone(),
+                    strict_auto_review: false,
+                },
+            ),
+        ] {
+            let answer = interaction_answer(
+                AcpInteractionWireResponse::Permission(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
+                )),
+                AcpInteractionTarget::PermissionRequest {
+                    permissions: permissions.clone(),
+                },
+            )
+            .expect("permission option maps to a typed broker decision");
+            assert_eq!(
+                answer,
+                SurfaceClientInteractionAnswer::PermissionRequest { decision: expected }
+            );
+        }
+
+        let cancelled = interaction_answer(
+            AcpInteractionWireResponse::Permission(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            )),
+            AcpInteractionTarget::PermissionRequest {
+                permissions: permissions.clone(),
+            },
+        )
+        .expect("cancelled permission request fails closed as a denial");
+        assert_eq!(
+            cancelled,
+            SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: SurfacePermissionClientDecision::Deny {
+                    scope: crate::surface::PermissionGrantScope::Turn,
+                    permissions,
+                    strict_auto_review: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn interaction_capabilities_require_exact_extension_v1_negotiation() {
+        let standard = AcpClientCapabilityProfile::from(&ClientCapabilities::new());
+        assert_eq!(
+            standard_interaction_capabilities(standard),
+            std::collections::BTreeSet::from([
+                SurfaceInteractionKind::ToolApproval,
+                SurfaceInteractionKind::PermissionRequest,
+            ])
+        );
+
+        let unsupported = AcpClientCapabilityProfile::from(&extension_capabilities(2, true, true));
+        assert_eq!(
+            standard_interaction_capabilities(unsupported),
+            standard_interaction_capabilities(standard)
+        );
+
+        let negotiated = AcpClientCapabilityProfile::from(&extension_capabilities(1, true, true));
+        assert_eq!(
+            standard_interaction_capabilities(negotiated),
+            std::collections::BTreeSet::from([
+                SurfaceInteractionKind::ToolApproval,
+                SurfaceInteractionKind::PermissionRequest,
+                SurfaceInteractionKind::UserInput,
+                SurfaceInteractionKind::McpElicitation,
+            ])
+        );
+
+        let user_input_only =
+            AcpClientCapabilityProfile::from(&extension_capabilities(1, true, false));
+        assert_eq!(
+            standard_interaction_capabilities(user_input_only),
+            std::collections::BTreeSet::from([
+                SurfaceInteractionKind::ToolApproval,
+                SurfaceInteractionKind::PermissionRequest,
+                SurfaceInteractionKind::UserInput,
+            ])
+        );
+
+        let mut malformed_meta = serde_json::Map::new();
+        malformed_meta.insert(
+            ORCA_ACP_INTERACTION_CAPABILITIES_META_KEY.to_string(),
+            serde_json::json!({ "version": 1, "userInput": "yes" }),
+        );
+        let malformed =
+            AcpClientCapabilityProfile::from(&ClientCapabilities::new().meta(malformed_meta));
+        assert_eq!(
+            standard_interaction_capabilities(malformed),
+            standard_interaction_capabilities(standard)
+        );
+    }
+
+    #[test]
+    fn extension_wire_contract_uses_prefixed_methods_and_rejects_invalid_schema() {
+        let session_id = SessionId::new("wire-contract");
+        let interaction_id = interaction_id(8);
+        let user_input = AcpInteractionWireRequest::UserInput(OrcaAcpUserInputExtensionRequestV1 {
+            version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+            session_id: session_id.clone(),
+            interaction_id: interaction_id.clone(),
+            request: OrcaAcpUserInputRequestV1 {
+                question: NonEmptyText::try_new("Continue?").unwrap(),
+                suggestions: vec![DisplayText::new("yes"), DisplayText::new("no")],
+            },
+        });
+        assert_eq!(
+            user_input.wire_method(),
+            format!("_{ORCA_ACP_USER_INPUT_METHOD}")
+        );
+        let params = user_input.params_value().expect("user input params encode");
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "version": 1,
+                "sessionId": "wire-contract",
+                "interactionId": uuid::Uuid::from_bytes(*interaction_id.as_bytes())
+                    .hyphenated()
+                    .to_string(),
+                "request": {
+                    "question": "Continue?",
+                    "suggestions": ["yes", "no"],
+                },
+            })
+        );
+
+        let mcp =
+            AcpInteractionWireRequest::McpElicitation(OrcaAcpMcpElicitationExtensionRequestV1 {
+                version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+                session_id,
+                interaction_id,
+                server_name: NonEmptyText::try_new("docs").unwrap(),
+                server_request_id: NonEmptyText::try_new("request-1").unwrap(),
+                message: DisplayText::new("Open sign-in?"),
+                request: OrcaAcpMcpElicitationRequestV1::Url {
+                    raw_url: Some(DisplayText::new("https://example.test/sign-in")),
+                    requested_schema: None,
+                },
+            });
+        assert_eq!(
+            mcp.wire_method(),
+            format!("_{ORCA_ACP_MCP_ELICITATION_METHOD}")
+        );
+        let params = mcp.params_value().expect("MCP elicitation params encode");
+        assert_eq!(params["request"]["mode"], "url");
+        assert_eq!(params["request"]["rawUrl"], "https://example.test/sign-in");
+
+        assert!(
+            AcpInteractionWireResponse::decode(
+                AcpInteractionResponseKind::UserInput,
+                serde_json::json!({ "version": 1 }),
+            )
+            .is_err(),
+            "missing response identity and decision must fail closed"
+        );
+    }
+
+    #[test]
+    fn standard_acp_routes_supported_interactions_only_to_granted_attachment() {
         let acp = attachment_id(1);
         let other = attachment_id(2);
         let acp_route = SurfaceInteractionRoute::Exclusive {
@@ -2634,11 +3350,136 @@ mod tests {
             SurfaceInteractionKind::ToolApproval,
             &other_route,
         ));
-        assert!(!standard_acp_routes_interaction(
+        assert!(standard_acp_routes_interaction(
             &acp,
             SurfaceInteractionKind::PermissionRequest,
             &acp_route,
         ));
+        assert!(standard_acp_routes_interaction(
+            &acp,
+            SurfaceInteractionKind::UserInput,
+            &acp_route,
+        ));
+        assert!(standard_acp_routes_interaction(
+            &acp,
+            SurfaceInteractionKind::McpElicitation,
+            &acp_route,
+        ));
+        assert!(!standard_acp_routes_interaction(
+            &acp,
+            SurfaceInteractionKind::BackgroundApproval,
+            &acp_route,
+        ));
+    }
+
+    #[test]
+    fn extension_answers_validate_identity_and_map_typed_decisions() {
+        let session_id = SessionId::new("extension-session");
+        let interaction_id = interaction_id(9);
+        let user_answer = interaction_answer(
+            AcpInteractionWireResponse::UserInput(OrcaAcpUserInputExtensionResponseV1 {
+                version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+                session_id: session_id.clone(),
+                interaction_id: interaction_id.clone(),
+                response: OrcaAcpUserInputResponseV1::Answer {
+                    value: DisplayText::new("yes"),
+                },
+            }),
+            AcpInteractionTarget::UserInput {
+                session_id: session_id.clone(),
+                interaction_id: interaction_id.clone(),
+            },
+        )
+        .expect("valid user input extension response");
+        assert_eq!(
+            user_answer,
+            SurfaceClientInteractionAnswer::UserInput {
+                decision: SurfaceUserInputDecision::Answer(DisplayText::new("yes")),
+            }
+        );
+        let user_cancel = interaction_answer(
+            AcpInteractionWireResponse::UserInput(OrcaAcpUserInputExtensionResponseV1 {
+                version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+                session_id: session_id.clone(),
+                interaction_id: interaction_id.clone(),
+                response: OrcaAcpUserInputResponseV1::Cancelled,
+            }),
+            AcpInteractionTarget::UserInput {
+                session_id: session_id.clone(),
+                interaction_id: interaction_id.clone(),
+            },
+        )
+        .expect("cancelled user input extension response");
+        assert_eq!(
+            user_cancel,
+            SurfaceClientInteractionAnswer::UserInput {
+                decision: SurfaceUserInputDecision::Cancel,
+            }
+        );
+
+        let content = crate::surface::SurfaceDataValue::String(DisplayText::new("accepted"));
+        let mcp_answer = interaction_answer(
+            AcpInteractionWireResponse::McpElicitation(OrcaAcpMcpElicitationExtensionResponseV1 {
+                version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+                session_id: session_id.clone(),
+                interaction_id: interaction_id.clone(),
+                response: OrcaAcpMcpElicitationResponseV1::Accept {
+                    content: content.clone(),
+                },
+            }),
+            AcpInteractionTarget::McpElicitation {
+                session_id: session_id.clone(),
+                interaction_id: interaction_id.clone(),
+            },
+        )
+        .expect("valid MCP elicitation extension response");
+        assert_eq!(
+            mcp_answer,
+            SurfaceClientInteractionAnswer::McpElicitation {
+                decision: SurfaceMcpElicitationDecision::Accept { content },
+            }
+        );
+        for response in [
+            OrcaAcpMcpElicitationResponseV1::Decline,
+            OrcaAcpMcpElicitationResponseV1::Cancelled,
+        ] {
+            let mcp_decline = interaction_answer(
+                AcpInteractionWireResponse::McpElicitation(
+                    OrcaAcpMcpElicitationExtensionResponseV1 {
+                        version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+                        session_id: session_id.clone(),
+                        interaction_id: interaction_id.clone(),
+                        response,
+                    },
+                ),
+                AcpInteractionTarget::McpElicitation {
+                    session_id: session_id.clone(),
+                    interaction_id: interaction_id.clone(),
+                },
+            )
+            .expect("negative MCP elicitation extension response");
+            assert_eq!(
+                mcp_decline,
+                SurfaceClientInteractionAnswer::McpElicitation {
+                    decision: SurfaceMcpElicitationDecision::Decline,
+                }
+            );
+        }
+
+        let error = interaction_answer(
+            AcpInteractionWireResponse::UserInput(OrcaAcpUserInputExtensionResponseV1 {
+                version: 2,
+                session_id,
+                interaction_id: interaction_id.clone(),
+                response: OrcaAcpUserInputResponseV1::Cancelled,
+            }),
+            AcpInteractionTarget::UserInput {
+                session_id: SessionId::new("extension-session"),
+                interaction_id,
+            },
+        )
+        .expect_err("unknown extension versions must fail closed");
+        assert!(error.contains("unsupported Orca ACP interaction extension version"));
     }
 
     #[test]
@@ -2649,7 +3490,7 @@ mod tests {
 
         let result =
             bridge.request_permission(permission_request("cancel-before-register", "tool-1"));
-        assert_eq!(result, Err(AcpPermissionWaitError::Cancelled));
+        assert_eq!(result, Err(AcpInteractionWaitError::Cancelled));
     }
 
     #[test]
@@ -2667,7 +3508,7 @@ mod tests {
         bridge.cancel_session(&session_id);
         assert_eq!(
             waiter.join().expect("permission waiter joins"),
-            Err(AcpPermissionWaitError::Cancelled)
+            Err(AcpInteractionWaitError::Cancelled)
         );
         assert!(!bridge.is_pending(&request.key));
     }
@@ -2682,10 +3523,12 @@ mod tests {
         let request = requests
             .blocking_recv()
             .expect("permission request is queued");
-        bridge.complete_permission(
+        bridge.complete_interaction(
             &request.key,
-            Ok(RequestPermissionResponse::new(
-                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("allow_once")),
+            Ok(AcpInteractionWireResponse::Permission(
+                RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                    SelectedPermissionOutcome::new("allow_once"),
+                )),
             )),
         );
         let response = waiter

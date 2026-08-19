@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.24":
+        "Unifies tool approval, permission requests, user input, and MCP elicitation behind one durable interaction broker across TUI, ACP, JSONL, and Headless. Restartable intents, exact route and response fencing, durable invocation receipts, pre-side-effect permission retry, and stable continuation operation identities make crash recovery deterministic without replaying ambiguous side effects. Recovered answers retain user-level trust, ACP continuations preserve their surface origin and capabilities, and timed-out Headless callbacks cannot create unbounded worker threads. The obsolete RuntimePendingInteractionStore compatibility API is removed.",
       "v0.3.23":
         "Adds thread-owned exec_command and write_stdin sessions with optional PTY, raw control-character input, bounded incremental output, and task-based process-tree control. A bounded-mailbox, single-owner terminal supervisor actively settles natural exits and TaskRegistry stop requests without another poll, releases retained resources, and injects one bounded completion notification before the next model turn unless the terminal result was already observed.",
       "v0.3.22":
@@ -608,6 +610,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.24":
+        "将工具审批、权限请求、用户输入和 MCP elicitation 统一到同一个持久化 interaction broker，并覆盖 TUI、ACP、JSONL 与 Headless。可恢复 intent、精确路由与回答 fencing、持久化 invocation receipt、仅限副作用前的权限重试，以及稳定 continuation operation identity，让崩溃恢复保持确定性且不会重放副作用不明的操作。恢复后的回答保持用户级信任，ACP continuation 保留原 surface 来源与能力，Headless 回调超时后也不会继续无界创建线程；旧 RuntimePendingInteractionStore 兼容 API 已删除。",
       "v0.3.23":
         "新增线程持有的 exec_command 与 write_stdin 会话，支持可选 PTY、原始控制字符输入、有界增量输出和基于 task 的进程树控制。采用有界 mailbox 的单 owner 终端监督器会主动结算自然退出和 TaskRegistry 停止请求，无需再次轮询，同时释放会话资源；若模型尚未直接观察终态，下一轮执行前会注入一次有界完成通知。",
       "v0.3.22":

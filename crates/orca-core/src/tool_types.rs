@@ -762,6 +762,18 @@ impl ToolResult {
         &self.terminal
     }
 
+    /// Function intent contract:
+    ///
+    /// - Input: a terminal tool result whose owner has already committed the
+    ///   authoritative invocation-start receipt.
+    /// - Output: the same result with `invocation_started=Yes`.
+    /// - Errors: none.
+    /// - State changes and external calls: mutates only the monotonic terminal
+    ///   started fact; it performs no I/O and cannot downgrade a started result.
+    pub fn record_invocation_started(&mut self) {
+        self.terminal.started = ToolInvocationStarted::Yes;
+    }
+
     pub fn append_error(&mut self, suffix: &str) {
         match self.terminal.error.as_mut() {
             Some(error) if !error.trim_end().is_empty() => error.push_str(suffix),

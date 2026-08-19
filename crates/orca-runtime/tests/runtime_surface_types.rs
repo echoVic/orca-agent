@@ -662,6 +662,7 @@ fn all_public_interaction_patch_variants_are_constructible() {
             expected_revision: revision,
             next_revision,
             receipt,
+            continuation: None,
         },
         InteractionPatch::Cancelled {
             interaction_id: interaction_id.clone(),
@@ -681,6 +682,8 @@ fn all_public_interaction_patch_variants_are_constructible() {
             InteractionPatch::Requested { .. }
             | InteractionPatch::RouteChanged { .. }
             | InteractionPatch::Resolved { .. }
+            | InteractionPatch::ContinuationDispatchStarted { .. }
+            | InteractionPatch::ContinuationDispatchConsumed { .. }
             | InteractionPatch::Cancelled { .. }
             | InteractionPatch::Expired { .. }
             | InteractionPatch::Transferred { .. } => {}
@@ -743,6 +746,7 @@ patch_name_matcher!(
         Requested,
         ArgumentsProgress,
         OutputDelta,
+        InvocationStartedV1,
         Completed,
         CapabilityCallChanged,
         RemoteTerminalLeaseChanged
@@ -755,6 +759,8 @@ patch_name_matcher!(
         Requested,
         RouteChanged,
         Resolved,
+        ContinuationDispatchStarted,
+        ContinuationDispatchConsumed,
         Cancelled,
         Expired,
         Transferred

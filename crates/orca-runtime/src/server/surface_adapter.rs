@@ -2922,10 +2922,15 @@ mod tests {
     const PROJECTION_FAILURE: &str = "injected JSONL projection disconnect";
 
     #[test]
-    fn server_turn_attachments_route_tool_approval() {
-        assert!(
-            jsonl_turn_interaction_capabilities().contains(&SurfaceInteractionKind::ToolApproval),
-            "server turn attachments must route tool approvals through JSONL"
+    fn server_turn_attachments_declare_four_interaction_capabilities() {
+        assert_eq!(
+            jsonl_turn_interaction_capabilities(),
+            BTreeSet::from([
+                SurfaceInteractionKind::ToolApproval,
+                SurfaceInteractionKind::PermissionRequest,
+                SurfaceInteractionKind::UserInput,
+                SurfaceInteractionKind::McpElicitation,
+            ])
         );
     }
 

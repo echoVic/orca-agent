@@ -103,6 +103,15 @@ impl PermissionRuntimeState {
         overlay.request_and_merge(handler, request)
     }
 
+    pub(crate) fn request_permission_pre_side_effect(
+        &self,
+        overlay: &mut TurnPermissionOverlay,
+        handler: &dyn RuntimePermissionRequestHandler,
+        request: RuntimePermissionRequest,
+    ) -> io::Result<RuntimePermissionResponse> {
+        overlay.request_and_merge_pre_side_effect(handler, request)
+    }
+
     pub fn merge_permission_overlay(
         &self,
         overlay: &mut TurnPermissionOverlay,

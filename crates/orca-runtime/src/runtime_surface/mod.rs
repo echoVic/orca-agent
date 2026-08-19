@@ -94,6 +94,7 @@ pub use commands::{
 };
 pub(crate) use commands::{AcpAttachmentCapabilityProfile, RuntimeSurfaceCommandDispatcher};
 
+pub(crate) use commit::HistoricalToolResultCommitAuthority;
 pub(crate) use commit::legacy_active_task_adoption_capability_fingerprint;
 pub(crate) use commit::manual_compaction_item_patches;
 pub use commit::{
@@ -144,9 +145,9 @@ pub use identity::{
     SurfaceResponseToken, SurfaceScope, SurfaceSettlementId, SurfaceStreamId, SurfaceSubagentId,
     SurfaceTaskFence, SurfaceTaskId, SurfaceThreadId, SurfaceToolCallId, SurfaceTurnId,
     SurfaceUnavailableReason, SurfaceValueError, SurfaceWorkflowFence, SurfaceWorkflowResultId,
-    SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, ThreadOwnershipLease, TrustRevision,
-    Unit, UnixMillis, UsageRevision, Uuid, UuidV7, WorkflowCatalogRevision, WorkflowRevision,
-    ZeroizingProcessLocalSecret,
+    SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, ThreadOwnershipLease,
+    ToolInvocationRevision, TrustRevision, Unit, UnixMillis, UsageRevision, Uuid, UuidV7,
+    WorkflowCatalogRevision, WorkflowRevision, ZeroizingProcessLocalSecret,
 };
 
 pub use ingress::{
@@ -168,6 +169,14 @@ pub use interaction::{
     SurfacePermissionNetworkProfile, SurfacePermissionPathLabel, SurfacePermissionProfile,
     SurfaceSchema, SurfaceSchemaInteger, SurfaceSchemaProperty, SurfaceShellPermissionProfile,
     SurfaceToolAction, SurfaceToolRequest, SurfaceUserInputDecision, ValidatedInteractionResponse,
+};
+pub(crate) use interaction::{
+    ContinuationTurnAnswerType, ContinuationTurnContextKind, ContinuationTurnIntent,
+    DurableInteractionContinuationAnswer, DurableInteractionContinuationCapsule,
+    DurableInteractionContinuationCapsuleError, DurableInteractionContinuationDisposition,
+    DurableInteractionContinuationIntent, DurableInteractionContinuationOperationIdentity,
+    PermissionRetryCheckpoint, PermissionRetryIntent, PermissionRetryOverlay,
+    ToolInvocationCheckpoint, ToolInvocationIntent,
 };
 
 pub use operation::{
@@ -233,7 +242,11 @@ pub use projection::{
     SurfaceToolViewState, SurfaceUsageSnapshot, SurfaceUserInputState, SurfaceVerificationResult,
     SurfaceWorkflow, SurfaceWorkflowAgent, SurfaceWorkflowAgentStatus, SurfaceWorkflowPhase,
     SurfaceWorkflowResult, SurfaceWorkflowResultStatus, SurfaceWorkflowStatus, TaskPatch,
-    ThreadPersistence, ToolInvocationStarted, ToolPatch, ToolTerminalSource, WorkflowPatch,
+    ThreadPersistence, ToolInvocationStarted, ToolInvocationStartedReceiptV1, ToolPatch,
+    ToolTerminalSource, WorkflowPatch,
+};
+pub(crate) use projection::{
+    PermissionRetryRecoveryDisposition, ToolInvocationRecoveryDisposition,
 };
 
 pub use reducer::{

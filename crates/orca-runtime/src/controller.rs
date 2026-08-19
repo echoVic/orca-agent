@@ -1,6 +1,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
@@ -38,8 +42,13 @@ use crate::lifecycle::{
 use crate::provider_stream::{RuntimeProviderSuspension, RuntimeProviderSuspensionControl};
 use crate::runtime_conversation_bootstrap::AgentConversationContext;
 use crate::runtime_host::{
-    HostedTurnRequest, OperationHandle, OperationOutcome, OperationTerminal, RuntimeHost,
-    RuntimeHostError,
+    HeadlessInteractionCheckpoint, HeadlessOperationHandle, HeadlessSurfaceSession, RuntimeHost,
+    RuntimeHostError, RuntimeThreadStartRequest,
+};
+use crate::runtime_surface::{
+    FailureClass as SurfaceFailureClass, OperationTerminal as SurfaceOperationTerminal,
+    SurfaceAllowDeny, SurfaceClientInteractionAnswer, SurfaceInteractionRequest,
+    SurfaceMcpElicitationDecision, SurfacePermissionClientDecision, SurfaceUserInputDecision,
 };
 use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
 use crate::session::{InteractiveSession, InteractiveSessionRuntimeParts};
@@ -52,6 +61,55 @@ use crate::workflow_execution::{BackgroundWorkflowRun, observe_background_workfl
 
 const HOSTED_EVENT_RELAY_CAPACITY: usize = 1;
 const HOSTED_EVENT_RELAY_POLL: Duration = Duration::from_millis(10);
+const DEFAULT_HEADLESS_INTERACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub trait HeadlessInteractionHandler: Send + Sync + 'static {
+    fn handle(
+        &self,
+        checkpoint: &HeadlessInteractionCheckpoint,
+    ) -> io::Result<SurfaceClientInteractionAnswer>;
+}
+
+impl<F> HeadlessInteractionHandler for F
+where
+    F: Fn(&HeadlessInteractionCheckpoint) -> io::Result<SurfaceClientInteractionAnswer>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn handle(
+        &self,
+        checkpoint: &HeadlessInteractionCheckpoint,
+    ) -> io::Result<SurfaceClientInteractionAnswer> {
+        self(checkpoint)
+    }
+}
+
+#[derive(Clone)]
+pub struct HeadlessInteractionTransport {
+    handler: Arc<dyn HeadlessInteractionHandler>,
+    timeout: Duration,
+    callback_in_flight: Arc<AtomicBool>,
+    callback_unavailable: Arc<AtomicBool>,
+}
+
+impl HeadlessInteractionTransport {
+    /// Register the typed Headless callback. The runtime passes the complete
+    /// request plus exact private selector and accepts only a typed answer.
+    pub fn new(handler: impl HeadlessInteractionHandler) -> Self {
+        Self {
+            handler: Arc::new(handler),
+            timeout: DEFAULT_HEADLESS_INTERACTION_TIMEOUT,
+            callback_in_flight: Arc::new(AtomicBool::new(false)),
+            callback_unavailable: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
 
 struct HostedEventRelayWriter {
     tx: mpsc::SyncSender<HostedEventChunk>,
@@ -61,6 +119,12 @@ struct HostedEventRelayWriter {
 struct HostedEventChunk {
     bytes: Vec<u8>,
     ack: mpsc::SyncSender<Result<(), HostedEventRelayError>>,
+}
+
+struct PendingHeadlessInteraction {
+    checkpoint: HeadlessInteractionCheckpoint,
+    answer_rx: mpsc::Receiver<io::Result<SurfaceClientInteractionAnswer>>,
+    deadline: std::time::Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +331,7 @@ pub struct ThreadTurnRequest {
 pub enum ThreadTurnPromptPlacement {
     BacktrackableUser,
     PinnedUser,
+    PinnedSystem,
     ExistingTurn,
 }
 
@@ -423,6 +488,7 @@ impl<'a> ThreadTurnContext<'a> {
             let message = match request.prompt_placement() {
                 ThreadTurnPromptPlacement::BacktrackableUser => Message::user(prompt.clone()),
                 ThreadTurnPromptPlacement::PinnedUser => Message::pinned_user(prompt.clone()),
+                ThreadTurnPromptPlacement::PinnedSystem => Message::pinned_system(prompt.clone()),
                 ThreadTurnPromptPlacement::ExistingTurn => unreachable!(),
             };
             if let Some(writer) = parts.writer.as_deref_mut() {
@@ -1174,7 +1240,7 @@ impl ThreadTurnToolMode {
 pub fn run(config: RunConfig) -> i32 {
     let stdout = io::stdout();
     let options = ControllerRunOptions::for_run_config(&config);
-    match run_inner(config, stdout.lock(), options) {
+    match run_inner(config, stdout.lock(), options, None) {
         Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("orca: {error}");
@@ -1193,7 +1259,24 @@ pub fn run_to_writer_with_options<W: io::Write>(
     writer: W,
     options: ControllerRunOptions,
 ) -> i32 {
-    match run_inner(config, writer, options) {
+    match run_inner(config, writer, options, None) {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            RunStatus::Failed.exit_code()
+        }
+    }
+}
+
+/// Run one Headless operation with a typed runtime-surface interaction
+/// transport. Existing run/run_to_writer callers remain non-interactive.
+pub fn run_to_writer_with_headless_transport<W: io::Write>(
+    config: RunConfig,
+    writer: W,
+    options: ControllerRunOptions,
+    transport: HeadlessInteractionTransport,
+) -> i32 {
+    match run_inner(config, writer, options, Some(transport)) {
         Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("orca: {error}");
@@ -1205,7 +1288,8 @@ pub fn run_to_writer_with_options<W: io::Write>(
 fn run_inner<W: io::Write>(
     config: RunConfig,
     mut writer: W,
-    options: ControllerRunOptions,
+    _options: ControllerRunOptions,
+    transport: Option<HeadlessInteractionTransport>,
 ) -> io::Result<i32> {
     let prompt = if config.prompt.trim().is_empty() {
         "(empty prompt)".to_string()
@@ -1214,30 +1298,42 @@ fn run_inner<W: io::Write>(
     };
 
     let host = RuntimeHost::start().map_err(runtime_host_io_error)?;
+    let mut start_request = RuntimeThreadStartRequest::new(config.clone(), prompt.as_str());
+    if matches!(config.history_mode, HistoryMode::Disabled) {
+        start_request = start_request.with_ephemeral_non_catalogued_one_shot(
+            crate::runtime_surface::FirstOperationCompletionPolicy::Terminal,
+        );
+    }
     let thread = host
-        .start_thread(config.clone(), prompt.as_str())
+        .start_thread_with_request(start_request)
         .map_err(runtime_host_io_error)?;
     for error in thread.startup_warnings() {
         eprintln!("orca: warning: {error}");
     }
+    let mut headless = thread.attach_headless_surface(transport.is_some())?;
     let (relay_tx, relay_rx) = mpsc::sync_channel(HOSTED_EVENT_RELAY_CAPACITY);
-    let operation = thread
-        .start_turn(
-            HostedTurnRequest::headless_session(prompt.clone())
-                .with_task_description(prompt.clone())
-                .with_options(options),
-            HostedEventRelayWriter {
-                tx: relay_tx,
-                buffer: Vec::new(),
-            },
-        )
-        .map_err(runtime_host_io_error)?;
-    let terminal = drain_hosted_events(&operation, relay_rx, &mut writer);
-    let status = operation_status(&terminal);
-    let exit_code = operation_exit_code(&terminal);
-    let shutdown = host.shutdown().map_err(runtime_host_io_error);
-    let status = status?;
-    let exit_code = exit_code?;
+    let operation = headless.start_turn(
+        &prompt,
+        HostedEventRelayWriter {
+            tx: relay_tx,
+            buffer: Vec::new(),
+        },
+    )?;
+    let terminal = drain_headless_events(
+        &operation,
+        &mut headless,
+        transport.as_ref(),
+        config.output_format == OutputFormat::Jsonl,
+        relay_rx,
+        &mut writer,
+    );
+    let shutdown = match host.shutdown() {
+        Ok(()) | Err(RuntimeHostError::ThreadUnavailable) => Ok(()),
+        Err(error) => Err(runtime_host_io_error(error)),
+    };
+    let terminal = terminal?;
+    let status = headless_operation_status(&terminal);
+    let exit_code = headless_operation_exit_code(&terminal);
     shutdown?;
     if config.desktop_notifications {
         let _ = crate::notify::notify("Orca", &format!("Session {}", status.as_str()));
@@ -1254,58 +1350,193 @@ fn run_inner<W: io::Write>(
     Ok(exit_code)
 }
 
-fn drain_hosted_events<W: io::Write>(
-    operation: &OperationHandle,
+fn drain_headless_events<W: io::Write>(
+    operation: &HeadlessOperationHandle,
+    session: &mut HeadlessSurfaceSession,
+    transport: Option<&HeadlessInteractionTransport>,
+    preserve_jsonl_session_boundary: bool,
     relay_rx: mpsc::Receiver<HostedEventChunk>,
     writer: &mut W,
-) -> OperationTerminal {
+) -> io::Result<crate::runtime_surface::OperationTerminalAtCursor> {
+    let mut pending = None;
+    let mut session_started_written = !preserve_jsonl_session_boundary;
+    let mut before_session_started = Vec::new();
     loop {
+        if let Some(transport) = transport {
+            if pending.is_none()
+                && let Some(checkpoint) = session.try_next_interaction()?
+            {
+                if transport.callback_unavailable.load(Ordering::Acquire)
+                    || transport.callback_in_flight.swap(true, Ordering::AcqRel)
+                {
+                    let answer = fail_closed_headless_answer(&checkpoint)?;
+                    session.respond_interaction(&checkpoint, answer)?;
+                } else {
+                    let handler = Arc::clone(&transport.handler);
+                    let callback_in_flight = Arc::clone(&transport.callback_in_flight);
+                    let callback_checkpoint = checkpoint.clone();
+                    let (answer_tx, answer_rx) = mpsc::sync_channel(1);
+                    std::thread::spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handler.handle(&callback_checkpoint)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(io::Error::other("Headless interaction handler panicked"))
+                        });
+                        callback_in_flight.store(false, Ordering::Release);
+                        let _ = answer_tx.send(result);
+                    });
+                    pending = Some(PendingHeadlessInteraction {
+                        checkpoint,
+                        answer_rx,
+                        deadline: std::time::Instant::now() + transport.timeout,
+                    });
+                }
+            }
+            if let Some(active) = pending.as_ref() {
+                let answer = match active.answer_rx.try_recv() {
+                    Ok(Ok(answer)) if headless_answer_matches(&active.checkpoint, &answer) => {
+                        Some(answer)
+                    }
+                    Ok(Ok(_)) | Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(fail_closed_headless_answer(&active.checkpoint)?)
+                    }
+                    Err(mpsc::TryRecvError::Empty)
+                        if std::time::Instant::now() >= active.deadline =>
+                    {
+                        transport
+                            .callback_unavailable
+                            .store(true, Ordering::Release);
+                        Some(fail_closed_headless_answer(&active.checkpoint)?)
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                };
+                if let Some(answer) = answer {
+                    let active = pending.take().expect("pending Headless interaction exists");
+                    session.respond_interaction(&active.checkpoint, answer)?;
+                }
+            }
+        }
         match relay_rx.recv_timeout(HOSTED_EVENT_RELAY_POLL) {
             Ok(chunk) => {
+                if !session_started_written
+                    && !headless_chunk_contains_session_started(&chunk.bytes)
+                {
+                    before_session_started.push(chunk.bytes);
+                    let _ = chunk.ack.send(Ok(()));
+                    continue;
+                }
                 let result = writer.write_all(&chunk.bytes).and_then(|()| writer.flush());
+                if result.is_ok() && !session_started_written {
+                    session_started_written = true;
+                    for bytes in before_session_started.drain(..) {
+                        writer.write_all(&bytes)?;
+                    }
+                    writer.flush()?;
+                }
                 let acknowledgement = result
                     .as_ref()
                     .map(|()| ())
                     .map_err(HostedEventRelayError::from_io);
                 let _ = chunk.ack.send(acknowledgement);
+                result?;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(terminal) = operation.completion().try_terminal() {
-                    return terminal;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return operation.wait(),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        if let Some(terminal) = operation.try_terminal()? {
+            return Ok(terminal);
         }
     }
 }
 
-fn operation_status(terminal: &OperationTerminal) -> io::Result<RunStatus> {
-    match terminal.outcome() {
-        OperationOutcome::Completed(status) => Ok(*status),
-        OperationOutcome::Stopped(_) => Ok(RunStatus::Failed),
-        OperationOutcome::Backgrounded { task_id } => Err(io::Error::other(format!(
-            "hosted operation backgrounded as task {task_id} without a background-aware caller"
-        ))),
-        OperationOutcome::ExecutionFailed { kind, message } => {
-            Err(io::Error::new(*kind, message.clone()))
+fn headless_chunk_contains_session_started(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).ok().is_some_and(|text| {
+        text.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|event| event["type"] == "session.started")
+        })
+    })
+}
+
+fn headless_answer_matches(
+    checkpoint: &HeadlessInteractionCheckpoint,
+    answer: &SurfaceClientInteractionAnswer,
+) -> bool {
+    matches!(
+        (&checkpoint.interaction.request, answer),
+        (
+            SurfaceInteractionRequest::ToolApproval { .. },
+            SurfaceClientInteractionAnswer::ToolApproval { .. }
+        ) | (
+            SurfaceInteractionRequest::PermissionRequest { .. },
+            SurfaceClientInteractionAnswer::PermissionRequest { .. }
+        ) | (
+            SurfaceInteractionRequest::UserInput { .. },
+            SurfaceClientInteractionAnswer::UserInput { .. }
+        ) | (
+            SurfaceInteractionRequest::McpElicitation { .. },
+            SurfaceClientInteractionAnswer::McpElicitation { .. }
+        )
+    )
+}
+
+fn fail_closed_headless_answer(
+    checkpoint: &HeadlessInteractionCheckpoint,
+) -> io::Result<SurfaceClientInteractionAnswer> {
+    match &checkpoint.interaction.request {
+        SurfaceInteractionRequest::ToolApproval { .. } => {
+            Ok(SurfaceClientInteractionAnswer::ToolApproval {
+                decision: SurfaceAllowDeny::Deny,
+            })
         }
-        OperationOutcome::Panicked { message } => Err(io::Error::other(message.clone())),
+        SurfaceInteractionRequest::PermissionRequest { permissions, .. } => {
+            Ok(SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: SurfacePermissionClientDecision::Deny {
+                    scope: crate::runtime_surface::PermissionGrantScope::Turn,
+                    permissions: permissions.clone(),
+                    strict_auto_review: false,
+                },
+            })
+        }
+        SurfaceInteractionRequest::UserInput { .. } => {
+            Ok(SurfaceClientInteractionAnswer::UserInput {
+                decision: SurfaceUserInputDecision::Cancel,
+            })
+        }
+        SurfaceInteractionRequest::McpElicitation { .. } => {
+            Ok(SurfaceClientInteractionAnswer::McpElicitation {
+                decision: SurfaceMcpElicitationDecision::Decline,
+            })
+        }
+        SurfaceInteractionRequest::BackgroundApproval { .. } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Headless transport does not accept background approvals",
+        )),
     }
 }
 
-/// Exit code for a hosted operation: typed terminals own their exit code
-/// (budget stops are 4), plain statuses keep the legacy mapping.
-fn operation_exit_code(terminal: &OperationTerminal) -> io::Result<i32> {
-    match terminal.outcome() {
-        OperationOutcome::Completed(status) => Ok(status.exit_code()),
-        OperationOutcome::Stopped(terminal) => Ok(terminal.clone().exit_code()),
-        OperationOutcome::Backgrounded { task_id } => Err(io::Error::other(format!(
-            "hosted operation backgrounded as task {task_id} without a background-aware caller"
-        ))),
-        OperationOutcome::ExecutionFailed { kind, message } => {
-            Err(io::Error::new(*kind, message.clone()))
-        }
-        OperationOutcome::Panicked { message } => Err(io::Error::other(message.clone())),
+fn headless_operation_status(
+    terminal: &crate::runtime_surface::OperationTerminalAtCursor,
+) -> RunStatus {
+    match &terminal.terminal {
+        SurfaceOperationTerminal::Succeeded { .. } => RunStatus::Success,
+        SurfaceOperationTerminal::Cancelled { .. } => RunStatus::Cancelled,
+        SurfaceOperationTerminal::Failed {
+            class: SurfaceFailureClass::LegacyApprovalRequired,
+            ..
+        } => RunStatus::ApprovalRequired,
+        _ => RunStatus::Failed,
+    }
+}
+
+fn headless_operation_exit_code(
+    terminal: &crate::runtime_surface::OperationTerminalAtCursor,
+) -> i32 {
+    match terminal.terminal {
+        SurfaceOperationTerminal::BudgetExhausted { .. } => 4,
+        _ => headless_operation_status(terminal).exit_code(),
     }
 }
 
@@ -1735,7 +1966,7 @@ mod tests {
         let mut config = config(SubagentConfig::default());
         config.prompt = "inspect repo".to_string();
         config.output_format = OutputFormat::Jsonl;
-        let error = run_inner(config, BrokenWriter, ControllerRunOptions::default())
+        let error = run_inner(config, BrokenWriter, ControllerRunOptions::default(), None)
             .expect_err("borrowed writer failure");
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
@@ -1749,7 +1980,7 @@ mod tests {
         config.output_format = OutputFormat::Jsonl;
         let mut output = Vec::new();
 
-        let status = run_inner(config, &mut output, ControllerRunOptions::default())
+        let status = run_inner(config, &mut output, ControllerRunOptions::default(), None)
             .expect("headless controller run");
 
         assert_eq!(status, RunStatus::Success.exit_code());

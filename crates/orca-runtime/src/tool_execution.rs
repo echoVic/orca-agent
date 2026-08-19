@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::ApprovalDecision;
@@ -26,7 +27,13 @@ use crate::lifecycle::{
     run_status_from_tool_status,
 };
 use crate::memory::MemoryBlock;
-use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
+use crate::runtime_surface::{
+    PermissionRetryCheckpoint, PermissionRetryIntent, RuntimeProviderResponseIngress,
+    RuntimeWorkflowLifecycleIngress, Sha256Digest, SurfaceInteractionKind,
+    SurfaceInteractionResolutionReceipt, SurfaceInteractionSafeProjection, SurfaceOperationFence,
+    SurfaceToolRequest, ToolInvocationCheckpoint, ToolInvocationIntent,
+    ToolInvocationStartedReceiptV1,
+};
 use crate::tasks::TaskRegistry;
 use crate::tool_invocation::{
     ToolInvocation, apply_pre_tool_outcome, approval_request_for_invocation,
@@ -100,6 +107,121 @@ pub(crate) struct ToolExecutionContext<'a> {
     /// Lease-derived budget bound for subagent children of this tool call
     /// (parent remaining minus outstanding reservations).
     child_budget: Option<orca_core::budget::BudgetSpec>,
+}
+
+/// Thread-owned and operation-owned dependencies required to rebuild the
+/// normal tool execution context for one recovered invocation.
+pub(crate) struct RecoveredToolExecutionDependencies<'a> {
+    pub(crate) cwd: &'a Path,
+    pub(crate) subagent_depth: u32,
+    pub(crate) goal_mode: bool,
+    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) instructions: &'a ProjectInstructions,
+    pub(crate) memory: &'a MemoryBlock,
+    pub(crate) mcp_registry: &'a McpRegistry,
+    pub(crate) hooks: &'a HookRunner,
+    pub(crate) cost_tracker: &'a mut CostTracker,
+    pub(crate) cancel: &'a CancelToken,
+    pub(crate) task_registry: &'a TaskRegistry,
+    pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+    pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
+    pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
+    pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
+    pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+    pub(crate) wait_for_background_workflows: bool,
+    pub(crate) extension_registry: Option<&'a ExtensionRegistry>,
+    pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
+    pub(crate) goal_runtime_binding: Option<GoalRuntimeBinding>,
+    pub(crate) root_task_id: Option<&'a str>,
+    pub(crate) child_budget: Option<orca_core::budget::BudgetSpec>,
+}
+
+impl<'a> RecoveredToolExecutionDependencies<'a> {
+    fn into_context(self) -> ToolExecutionContext<'a> {
+        let permission_handler = self.permission_handler;
+        self.into_context_with_permission_handler(permission_handler)
+    }
+
+    /// Reborrow the thread-owned recovered dependencies to the shorter
+    /// lifetime of an owned, invocation-scoped permission handler. This keeps
+    /// the live `ToolExecutionContext` lifetime model unchanged.
+    fn into_context_with_permission_handler<'context>(
+        self,
+        permission_handler: Option<&'context (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    ) -> ToolExecutionContext<'context>
+    where
+        'a: 'context,
+    {
+        let mut context =
+            ToolExecutionContext::new(self.cwd, self.subagent_depth, false, self.policy)
+                .with_goal_mode(self.goal_mode)
+                .with_root_task_id(self.root_task_id)
+                .with_child_budget(self.child_budget)
+                .with_services(
+                    self.instructions,
+                    self.memory,
+                    self.mcp_registry,
+                    self.hooks,
+                )
+                .with_runtime(
+                    self.cost_tracker,
+                    self.cancel,
+                    self.task_registry,
+                    self.background_workflows,
+                    self.workflow_ipc,
+                )
+                .with_workflow_lifecycle(
+                    self.workflow_lifecycle_ingress,
+                    self.wait_for_background_workflows,
+                )
+                .with_permission_overlay(self.permission_overlay)
+                .with_permission_handler(permission_handler)
+                .with_user_input_handler(self.user_input_handler)
+                .with_mcp_elicitation_handler(self.mcp_elicitation_handler)
+                .with_provider_response_ingress(None);
+        if let (Some(registry), Some(stores)) = (self.extension_registry, self.extension_stores) {
+            context = context.with_extensions(registry, stores);
+        }
+        if let Some(binding) = self.goal_runtime_binding {
+            context = context.with_goal_runtime_binding(binding);
+        }
+        context
+    }
+}
+
+pub(crate) struct RecoveredToolInvocationAuthorization<'a> {
+    pub(crate) fence: &'a SurfaceOperationFence,
+    pub(crate) expected_execution_context_fingerprint: &'a Sha256Digest,
+    pub(crate) observed_execution_context_fingerprint: &'a Sha256Digest,
+    pub(crate) approval_receipt: &'a SurfaceInteractionResolutionReceipt,
+    pub(crate) existing_started_receipt: Option<&'a ToolInvocationStartedReceiptV1>,
+}
+
+pub(crate) struct RecoveredPermissionRetryAuthorization<'a> {
+    pub(crate) fence: &'a SurfaceOperationFence,
+    pub(crate) expected_execution_context_fingerprint: &'a Sha256Digest,
+    pub(crate) observed_execution_context_fingerprint: &'a Sha256Digest,
+    pub(crate) permission_receipt: &'a SurfaceInteractionResolutionReceipt,
+    pub(crate) permission_response: &'a crate::runtime_permission::RuntimePermissionResponse,
+    pub(crate) existing_started_receipt: Option<&'a ToolInvocationStartedReceiptV1>,
+}
+
+pub(crate) trait RecoveredToolInvocationCommitter {
+    type HistoricalCommitAuthority;
+
+    fn commit_tool_invocation_started(
+        &mut self,
+        fence: &SurfaceOperationFence,
+        intent: &ToolInvocationIntent,
+    ) -> io::Result<Self::HistoricalCommitAuthority>;
+
+    fn commit_historical_tool_result(
+        &mut self,
+        authority: &Self::HistoricalCommitAuthority,
+        result: &tool_types::ToolResult,
+    ) -> io::Result<()>;
 }
 
 pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
@@ -416,7 +538,370 @@ pub(crate) fn execute_tool_with_approval<W: io::Write>(
         context,
         subagent_child_executor,
         workflow_child_executor,
+        false,
+        None,
+        false,
     )
+}
+
+/// Function intent contract:
+///
+/// - Input: one validated durable `BeforeInvocation` intent, the matching
+///   recovered execution fingerprint, an approved interaction receipt, and
+///   complete thread/runtime dependencies.
+/// - Output: executes through the normal hooks, router, permission handling,
+///   lifecycle, and tool backends without repeating approval, then settles the
+///   result through the supplied historical committer.
+/// - Errors: fails closed for fingerprint/checkpoint/receipt mismatches, an
+///   existing durable start receipt, start-commit failure, or historical
+///   result-commit failure.
+/// - State changes and external calls: no hook or router dispatch occurs until
+///   the committer returns authority derived from durable
+///   `commit_tool_invocation_started`; this function creates no live operation.
+pub(crate) fn execute_recovered_tool_intent<W, C>(
+    config: &RunConfig,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    intent: &ToolInvocationIntent,
+    authorization: RecoveredToolInvocationAuthorization<'_>,
+    dependencies: RecoveredToolExecutionDependencies<'_>,
+    subagent_child_executor: ChildAgentExecutor<io::Sink>,
+    workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    committer: &mut C,
+) -> io::Result<ToolExecutionCompletion>
+where
+    W: io::Write,
+    C: RecoveredToolInvocationCommitter,
+{
+    validate_recovered_tool_authorization(intent, &authorization)?;
+    let tool_request = runtime_tool_request_from_intent(intent)?;
+    let mut historical_authority = None;
+    let mut commit_started = |execution_request: &tool_types::ToolRequest| {
+        if execution_request.id != intent.invocation_id().as_str() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered tool dispatch changed its stable invocation identity",
+            ));
+        }
+        historical_authority =
+            Some(committer.commit_tool_invocation_started(authorization.fence, intent)?);
+        Ok(())
+    };
+    let mut actor = ToolExecutionActor::new(events.run_id().to_string());
+    let mut completion = actor.execute_with_event_error(
+        config,
+        events,
+        sink,
+        &tool_request,
+        dependencies.into_context(),
+        subagent_child_executor,
+        workflow_child_executor,
+        true,
+        Some(&mut commit_started),
+        true,
+    )?;
+    let authority = historical_authority.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered tool dispatch completed without durable start authority",
+        )
+    })?;
+    completion.result.record_invocation_started();
+    committer.commit_historical_tool_result(authority, &completion.result)?;
+    Ok(completion)
+}
+
+struct RecoveredPermissionResponseHandler {
+    invocation_id: String,
+    requested_permissions: crate::protocol::RequestPermissionProfile,
+    response: crate::runtime_permission::RuntimePermissionResponse,
+    consumed: AtomicBool,
+}
+
+impl RuntimePermissionRequestHandler for RecoveredPermissionResponseHandler {
+    fn request_permissions(
+        &self,
+        request: &crate::runtime_permission::RuntimePermissionRequest,
+    ) -> io::Result<crate::runtime_permission::RuntimePermissionResponse> {
+        if request.id != self.invocation_id || request.permissions != self.requested_permissions {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered tool requested permissions outside its durable retry intent",
+            ));
+        }
+        if self
+            .consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "recovered tool already consumed its durable permission response",
+            ));
+        }
+        Ok(self.response.clone())
+    }
+}
+
+/// Function intent contract:
+///
+/// - Input: one validated durable `PreSideEffect` permission intent, the
+///   matching recovered execution fingerprint, an allowed permission receipt
+///   and response, and complete thread/runtime dependencies.
+/// - Output: restores the captured permission overlay and re-dispatches the
+///   exact stable tool once, consuming only the durable permission answer.
+/// - Errors: fails closed for checkpoint, fingerprint, permission, receipt,
+///   identity, existing-start, start-commit, or historical-result mismatch.
+/// - State changes and external calls: the durable `InvocationStarted` commit
+///   completes before hooks/router/tool execution; the recovered permission
+///   handler cannot authorize a different request or a second permission set.
+pub(crate) fn execute_recovered_permission_retry_intent<W, C>(
+    config: &RunConfig,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    intent: &PermissionRetryIntent,
+    authorization: RecoveredPermissionRetryAuthorization<'_>,
+    dependencies: RecoveredToolExecutionDependencies<'_>,
+    subagent_child_executor: ChildAgentExecutor<io::Sink>,
+    workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    committer: &mut C,
+) -> io::Result<ToolExecutionCompletion>
+where
+    W: io::Write,
+    C: RecoveredToolInvocationCommitter,
+{
+    validate_recovered_permission_retry_authorization(intent, &authorization)?;
+    let permission_handler = RecoveredPermissionResponseHandler {
+        invocation_id: intent.invocation_id().as_str().to_string(),
+        requested_permissions: runtime_permission_profile_from_surface(
+            intent.requested_permissions(),
+        ),
+        response: authorization.permission_response.clone(),
+        consumed: AtomicBool::new(false),
+    };
+    let tool_intent =
+        ToolInvocationIntent::before_invocation(intent.tool().clone(), intent.authority().clone());
+    let tool_request = runtime_tool_request_from_surface(intent.tool(), intent.invocation_id())?;
+    let mut historical_authority = None;
+    let mut commit_started = |execution_request: &tool_types::ToolRequest| {
+        if execution_request.id != intent.invocation_id().as_str() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered permission retry changed its stable invocation identity",
+            ));
+        }
+        historical_authority =
+            Some(committer.commit_tool_invocation_started(authorization.fence, &tool_intent)?);
+        Ok(())
+    };
+    let mut actor = ToolExecutionActor::new(events.run_id().to_string());
+    let mut completion = actor.execute_with_event_error(
+        config,
+        events,
+        sink,
+        &tool_request,
+        dependencies.into_context_with_permission_handler(Some(&permission_handler)),
+        subagent_child_executor,
+        workflow_child_executor,
+        true,
+        Some(&mut commit_started),
+        true,
+    )?;
+    let authority = historical_authority.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered permission retry completed without durable start authority",
+        )
+    })?;
+    completion.result.record_invocation_started();
+    committer.commit_historical_tool_result(authority, &completion.result)?;
+    Ok(completion)
+}
+
+fn validate_recovered_permission_retry_authorization(
+    intent: &PermissionRetryIntent,
+    authorization: &RecoveredPermissionRetryAuthorization<'_>,
+) -> io::Result<()> {
+    if authorization.expected_execution_context_fingerprint
+        != authorization.observed_execution_context_fingerprint
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered permission execution-context fingerprint does not match",
+        ));
+    }
+    if intent.checkpoint() != PermissionRetryCheckpoint::PreSideEffect {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered permission intent is not at PreSideEffect",
+        ));
+    }
+    if authorization.existing_started_receipt.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "recovered permission retry already has a durable start receipt",
+        ));
+    }
+    if authorization.permission_response.decision
+        != crate::protocol::PermissionResponseDecision::Allow
+        || authorization.permission_receipt.kind != SurfaceInteractionKind::PermissionRequest
+        || !matches!(
+            authorization.permission_receipt.safe_projection,
+            SurfaceInteractionSafeProjection::PermissionRequest {
+                decision: crate::runtime_surface::SurfaceAllowDeny::Allow,
+                ..
+            }
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered permission retry lacks a durable allow receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_permission_profile_from_surface(
+    profile: &crate::runtime_surface::SurfacePermissionProfile,
+) -> crate::protocol::RequestPermissionProfile {
+    let file_system = profile.file_system.as_ref().map(|permissions| {
+        crate::protocol::RequestFileSystemPermissions {
+            read: permissions.read.as_ref().map(|paths| {
+                paths
+                    .iter()
+                    .map(|path| std::path::PathBuf::from(path.0.as_str()))
+                    .collect()
+            }),
+            write: permissions.write.as_ref().map(|paths| {
+                paths
+                    .iter()
+                    .map(|path| std::path::PathBuf::from(path.0.as_str()))
+                    .collect()
+            }),
+            entries: None,
+        }
+    });
+    let network =
+        profile
+            .network
+            .as_ref()
+            .map(|permissions| crate::protocol::RequestNetworkPermissions {
+                enabled: permissions.enabled,
+                domains: permissions
+                    .domains
+                    .iter()
+                    .map(|(domain, access)| {
+                        (
+                            domain.0.as_str().to_string(),
+                            match access {
+                                crate::runtime_surface::SurfaceAllowDeny::Allow => {
+                                    orca_core::config::PermissionProfileNetworkAccess::Allow
+                                }
+                                crate::runtime_surface::SurfaceAllowDeny::Deny => {
+                                    orca_core::config::PermissionProfileNetworkAccess::Deny
+                                }
+                            },
+                        )
+                    })
+                    .collect(),
+            });
+    let shell =
+        profile
+            .shell
+            .as_ref()
+            .map(|permissions| crate::protocol::RequestShellPermissions {
+                unsandboxed: permissions.unsandboxed,
+            });
+    crate::protocol::RequestPermissionProfile {
+        file_system,
+        network,
+        shell,
+    }
+}
+
+fn validate_recovered_tool_authorization(
+    intent: &ToolInvocationIntent,
+    authorization: &RecoveredToolInvocationAuthorization<'_>,
+) -> io::Result<()> {
+    if authorization.expected_execution_context_fingerprint
+        != authorization.observed_execution_context_fingerprint
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered tool execution-context fingerprint does not match",
+        ));
+    }
+    if intent.checkpoint() != ToolInvocationCheckpoint::BeforeInvocation {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered tool intent is not at BeforeInvocation",
+        ));
+    }
+    if authorization.existing_started_receipt.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "recovered tool invocation already has a durable start receipt",
+        ));
+    }
+    if authorization.approval_receipt.kind != SurfaceInteractionKind::ToolApproval
+        || !matches!(
+            authorization.approval_receipt.safe_projection,
+            SurfaceInteractionSafeProjection::ToolApproval { allowed: true }
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered tool invocation lacks an approved tool-interaction receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_tool_request_from_intent(
+    intent: &ToolInvocationIntent,
+) -> io::Result<tool_types::ToolRequest> {
+    runtime_tool_request_from_surface(intent.request(), intent.invocation_id())
+}
+
+fn runtime_tool_request_from_surface(
+    request: &SurfaceToolRequest,
+    invocation_id: &crate::runtime_surface::SurfaceToolCallId,
+) -> io::Result<tool_types::ToolRequest> {
+    if invocation_id != &request.tool_call_id
+        || request.arguments_digest != Sha256Digest::digest(request.raw_arguments.as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovered tool intent identity or arguments digest is invalid",
+        ));
+    }
+    let action = match request.action {
+        crate::runtime_surface::SurfaceToolAction::Read => {
+            orca_core::approval_types::ActionKind::Read
+        }
+        crate::runtime_surface::SurfaceToolAction::Write => {
+            orca_core::approval_types::ActionKind::Write
+        }
+        crate::runtime_surface::SurfaceToolAction::Network => {
+            orca_core::approval_types::ActionKind::Network
+        }
+        crate::runtime_surface::SurfaceToolAction::Agent => {
+            orca_core::approval_types::ActionKind::Agent
+        }
+        crate::runtime_surface::SurfaceToolAction::Shell => {
+            orca_core::approval_types::ActionKind::Shell
+        }
+    };
+    Ok(tool_types::ToolRequest {
+        id: request.tool_call_id.as_str().to_string(),
+        name: tool_types::ToolName::plain(request.name.as_str()),
+        action,
+        target: request
+            .target
+            .as_ref()
+            .map(|target| target.as_str().to_string()),
+        raw_arguments: Some(request.raw_arguments.as_str().to_string()),
+    })
 }
 
 impl ToolExecutionActor {
@@ -473,6 +958,9 @@ impl ToolExecutionActor {
             context,
             subagent_child_executor,
             workflow_child_executor,
+            false,
+            None,
+            false,
         )?;
         match completion.event_error {
             Some(error) => Err(error),
@@ -489,6 +977,9 @@ impl ToolExecutionActor {
         context: ToolExecutionContext<'_>,
         subagent_child_executor: ChildAgentExecutor<io::Sink>,
         workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
+        approval_already_resolved: bool,
+        mut before_dispatch: Option<&mut dyn FnMut(&tool_types::ToolRequest) -> io::Result<()>>,
+        run_post_hook_without_deltas: bool,
     ) -> io::Result<ToolExecutionCompletion> {
         let ToolExecutionContext {
             cwd,
@@ -558,62 +1049,68 @@ impl ToolExecutionActor {
             ));
         }
 
-        let approval_bound_request = approval_request_for_invocation(&invocation)
-            .filter(|approval| agent_common::requires_approval(approval.action))
-            .map(|_| invocation.effective.clone());
+        let approval_bound_request = if approval_already_resolved {
+            Some(invocation.effective.clone())
+        } else {
+            approval_request_for_invocation(&invocation)
+                .filter(|approval| agent_common::requires_approval(approval.action))
+                .map(|_| invocation.effective.clone())
+        };
 
-        let approval_execution = self.handle_approval(ToolApprovalGateContext {
-            config,
-            events,
-            sink,
-            tool_request,
-            invocation: &invocation,
-            policy,
-            permission_overlay,
-            approval_handler,
-            cancel,
-            emit_deltas,
-            provider_response_ingress,
-        });
-        match (approval_execution.outcome, approval_execution.event_error) {
-            (Some(outcome), event_error) => {
-                return Ok(ToolExecutionCompletion::from_pair_with_event_error(
-                    outcome,
-                    event_error,
-                ));
-            }
-            (None, Some(error)) => {
-                let result = tool_types::ToolResult::failed_before_start(
-                    tool_request,
-                    format!(
-                        "tool dispatch stopped because approval event delivery failed: {error}"
-                    ),
-                    None,
-                );
-                let mut event_error = Some(error);
-                if emit_deltas {
+        if !approval_already_resolved {
+            let approval_execution = self.handle_approval(ToolApprovalGateContext {
+                config,
+                events,
+                sink,
+                tool_request,
+                invocation: &invocation,
+                policy,
+                permission_overlay,
+                approval_handler,
+                cancel,
+                emit_deltas,
+                provider_response_ingress,
+            });
+            match (approval_execution.outcome, approval_execution.event_error) {
+                (Some(outcome), event_error) => {
+                    return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                        outcome,
+                        event_error,
+                    ));
+                }
+                (None, Some(error)) => {
+                    let result = tool_types::ToolResult::failed_before_start(
+                        tool_request,
+                        format!(
+                            "tool dispatch stopped because approval event delivery failed: {error}"
+                        ),
+                        None,
+                    );
+                    let mut event_error = Some(error);
+                    if emit_deltas {
+                        retain_first_io_error(
+                            &mut event_error,
+                            emit_tool_call_requested(events, sink, tool_request),
+                        );
+                    }
                     retain_first_io_error(
                         &mut event_error,
-                        emit_tool_call_requested(events, sink, tool_request),
+                        publish_tool_call_completed(
+                            events,
+                            sink,
+                            tool_request,
+                            &result,
+                            emit_deltas,
+                            provider_response_ingress,
+                        ),
                     );
+                    return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                        (RunStatus::Failed, result),
+                        event_error,
+                    ));
                 }
-                retain_first_io_error(
-                    &mut event_error,
-                    publish_tool_call_completed(
-                        events,
-                        sink,
-                        tool_request,
-                        &result,
-                        emit_deltas,
-                        provider_response_ingress,
-                    ),
-                );
-                return Ok(ToolExecutionCompletion::from_pair_with_event_error(
-                    (RunStatus::Failed, result),
-                    event_error,
-                ));
+                (None, None) => {}
             }
-            (None, None) => {}
         }
 
         if emit_deltas {
@@ -647,6 +1144,9 @@ impl ToolExecutionActor {
                     event_error,
                 ));
             }
+        }
+        if let Some(commit_started) = before_dispatch.as_mut() {
+            commit_started(tool_request)?;
         }
         let cwd_display = cwd.display().to_string();
         let hook_execution = self.apply_pre_tool_hook(
@@ -781,6 +1281,7 @@ impl ToolExecutionActor {
             provider_response_ingress,
             Some(cancel),
             child_budget_usage,
+            run_post_hook_without_deltas,
         );
         if !completion
             .event_error
@@ -1063,6 +1564,7 @@ impl ToolExecutionActor {
         provider_response_ingress: Option<&dyn RuntimeProviderResponseIngress>,
         cancel: Option<&CancelToken>,
         child_budget_usage: Option<orca_core::budget::BudgetUsage>,
+        run_post_hook_without_deltas: bool,
     ) -> ToolExecutionCompletion {
         let mut event_error = None;
         retain_first_io_error(
@@ -1100,11 +1602,13 @@ impl ToolExecutionActor {
                     ),
                 }
             }
-            if let Some(warning) =
+        }
+        if (emit_deltas || run_post_hook_without_deltas)
+            && let Some(warning) =
                 self.run_post_tool_hook(hooks, cwd_display, execution_request, result, cancel)
-            {
-                retain_first_io_error(&mut event_error, sink.emit(events.error(&warning)));
-            }
+            && emit_deltas
+        {
+            retain_first_io_error(&mut event_error, sink.emit(events.error(&warning)));
         }
 
         let status = run_status_from_tool_status(result.status);
@@ -1484,6 +1988,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(completion.status, RunStatus::Cancelled);
         assert!(completion.event_error.is_none());
@@ -1506,6 +2011,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(completion.status, RunStatus::Failed);
         assert!(completion.event_error.is_none());
@@ -1659,6 +2165,9 @@ mod tests {
                     .with_permission_overlay(&mut permission_overlay),
                 unused_child_executor,
                 unused_child_executor,
+                false,
+                None,
+                false,
             )
             .expect("known approval denial must survive event I/O failure");
 
@@ -1723,6 +2232,9 @@ mod tests {
                     .with_permission_overlay(&mut permission_overlay),
                 unused_child_executor,
                 unused_child_executor,
+                false,
+                None,
+                false,
             )
             .expect("pre-dispatch event I/O failure must produce a tool terminal");
 

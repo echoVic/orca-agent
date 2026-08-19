@@ -17,6 +17,7 @@ const {
   validateArtifactDigest,
   validateCurrentInventories,
   validateManifestStructure,
+  validateNoLegacyInteractionSymbols,
   validateRuntimeSurfaceContract,
 } = validator;
 
@@ -100,6 +101,65 @@ assert.deepEqual(
   ),
   [3],
 );
+
+{
+  const relativePath = "crates/orca-runtime/src/runtime_surface/interaction.rs";
+  assert.deepEqual(
+    validateNoLegacyInteractionSymbols({
+      repoRoot,
+      sourcePaths: [relativePath],
+      sourceOverrides: new Map([
+        [relativePath, "pub struct SurfaceInteractionRequest;"],
+        ["target/generated.rs", "pub struct RuntimePendingInteractionStore;"],
+        [
+          "flux/changes/example/tech_spec.rs",
+          "pub struct RuntimePendingInteractionRecord;",
+        ],
+      ]),
+    }),
+    [],
+    "legacy interaction deletion gate only scans the explicit checked-in Rust source scope",
+  );
+}
+
+for (const [symbol, source] of [
+  ["RuntimePendingInteractionStore", "pub struct RuntimePendingInteractionStore;"],
+  ["RuntimePendingInteractionRecord", "pub struct RuntimePendingInteractionRecord;"],
+  [
+    "with_pending_interactions",
+    "impl HostedTurnRequest { fn with_pending_interactions(self) -> Self { self } }",
+  ],
+]) {
+  const relativePath = "crates/orca-runtime/src/synthetic_legacy_interaction.rs";
+  expectFailure(
+    `${symbol} is rejected by the legacy interaction deletion gate`,
+    () =>
+      validateNoLegacyInteractionSymbols({
+        repoRoot,
+        sourcePaths: [relativePath],
+        sourceOverrides: new Map([[relativePath, source]]),
+      }),
+    new RegExp(`${relativePath.replaceAll("/", "\\/")}:1: ${symbol}`),
+  );
+}
+
+for (const excludedPath of [
+  "target/generated.rs",
+  "flux/changes/example/tech_spec.rs",
+  "crates/../flux/changes/example/tech_spec.rs",
+  "crates/generated/legacy.rs",
+]) {
+  expectFailure(
+    `${excludedPath} cannot be added to the legacy interaction deletion gate source scope`,
+    () =>
+      validateNoLegacyInteractionSymbols({
+        repoRoot,
+        sourcePaths: [excludedPath],
+        sourceOverrides: new Map([[excludedPath, "pub struct SurfaceInteractionRequest;"]]),
+      }),
+    /source must be checked-in Rust under crates\//,
+  );
+}
 
 function appSourceOverride(extraSource) {
   const relativePath = "crates/orca-tui/src/app.rs";
@@ -3218,5 +3278,13 @@ pub enum LifetimeFixture<'a> {
   "Rust enum parsing distinguishes lifetimes from character literals",
 );
 
-validateRuntimeSurfaceContract({ repoRoot, manifestPath, emitSuccess: false });
+assert.doesNotThrow(
+  () => validateNoLegacyInteractionSymbols({ repoRoot }),
+  "the standalone legacy interaction deletion gate accepts the shim-free source tree",
+);
+
+assert.doesNotThrow(
+  () => validateRuntimeSurfaceContract({ repoRoot, manifestPath, emitSuccess: false }),
+  "the main runtime surface validator accepts the shim-free source tree",
+);
 console.log("runtime surface contract validator self-tests passed");

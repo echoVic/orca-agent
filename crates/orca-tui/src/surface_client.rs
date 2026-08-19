@@ -2739,8 +2739,16 @@ mod tests {
             TuiHostedOperationOutcome::ManualCompaction
         ));
     }
+    use orca_core::cancel::CancelToken;
     use orca_core::config::HistoryMode;
-    use orca_runtime::runtime_host::{RuntimeHost, RuntimeThreadHandle};
+    use orca_core::event_schema::{EventFactory, RunStatus};
+    use orca_mcp::{McpElicitationMode, McpElicitationRequest, McpElicitationResponse};
+    use orca_runtime::runtime_host::{
+        GenerationContext, RuntimeHost, RuntimeThreadHandle, ThreadOperationExecutor,
+        ThreadOperationOutcome,
+    };
+    use orca_runtime::thread::RuntimeThread;
+    use std::sync::Arc;
     use std::time::Instant;
 
     use crate::types::TuiTaskLifecycle;
@@ -2754,6 +2762,40 @@ mod tests {
     ) -> io::Result<TuiHostedOperationOutcome> {
         let typed_thread = thread.typed_surface();
         run(&typed_thread, request, config, controller, event_tx)
+    }
+
+    struct TuiMcpInteractionExecutor {
+        response_tx: std::sync::mpsc::SyncSender<McpElicitationResponse>,
+    }
+
+    impl ThreadOperationExecutor for TuiMcpInteractionExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let response = generation
+                .mcp_elicitation_handler()
+                .expect("runtime installs a typed MCP elicitation broker")
+                .handle_elicitation(McpElicitationRequest {
+                    server_name: "docs".to_string(),
+                    id: "tui-matrix-mcp".to_string(),
+                    mode: McpElicitationMode::Url,
+                    message: "Authorize TUI matrix?".to_string(),
+                    url: Some("https://example.test/tui-matrix".to_string()),
+                    requested_schema: None,
+                })
+                .map_err(io::Error::other)?;
+            self.response_tx
+                .send(response)
+                .expect("report typed TUI MCP response");
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
     }
 
     #[test]
@@ -2819,6 +2861,151 @@ mod tests {
         match previous {
             Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
             None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_tui_four_interaction_matrix_projects_and_commits_typed_responses() {
+        for kind in [
+            SurfaceInteractionKind::ToolApproval,
+            SurfaceInteractionKind::PermissionRequest,
+            SurfaceInteractionKind::UserInput,
+            SurfaceInteractionKind::McpElicitation,
+        ] {
+            let _guard = crate::test_support::lock_process_env();
+            let home = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("ORCA_HOME");
+            unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+            let mut config = crate::test_support::test_run_config();
+            config.cwd = Some(home.path().to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let (host, mcp_response_rx) = if kind == SurfaceInteractionKind::McpElicitation {
+                let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+                (
+                    RuntimeHost::start_with_executor(Arc::new(TuiMcpInteractionExecutor {
+                        response_tx,
+                    }))
+                    .expect("runtime host"),
+                    Some(response_rx),
+                )
+            } else {
+                (RuntimeHost::start().expect("runtime host"), None)
+            };
+            let thread = host
+                .start_thread(config.clone(), &format!("typed TUI matrix {kind:?}"))
+                .expect("runtime thread");
+            let controller = TuiSurfaceTaskControl::isolated_for_test();
+            let (event_tx, event_rx) = mpsc::unbounded();
+            let worker_controller = controller.clone();
+            let worker_thread = thread.clone();
+            let worker_config = config.clone();
+            let worker_event_tx = event_tx.clone();
+            let (worker_result_tx, worker_result_rx) = std::sync::mpsc::sync_channel(1);
+            let prompt = match kind {
+                SurfaceInteractionKind::ToolApproval => "bash printf tui-matrix-approval",
+                SurfaceInteractionKind::PermissionRequest => {
+                    "request_network_permissions_then_done example.com"
+                }
+                SurfaceInteractionKind::UserInput => "ask continue?",
+                SurfaceInteractionKind::McpElicitation => "elicit through TUI matrix",
+                SurfaceInteractionKind::BackgroundApproval => unreachable!(),
+            };
+            let worker = std::thread::spawn(move || {
+                let result = run_through_dispatch(
+                    &worker_thread,
+                    HostedTurnRequest::new(prompt),
+                    worker_config,
+                    &worker_controller,
+                    &worker_event_tx,
+                );
+                worker_result_tx
+                    .send(result)
+                    .expect("report bounded TUI matrix worker result");
+            });
+            let (key, response) = loop {
+                let event = event_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap_or_else(|error| {
+                        panic!("missing TUI matrix event for {kind:?}: {error}")
+                    });
+                match (kind, event) {
+                    (
+                        SurfaceInteractionKind::ToolApproval,
+                        TuiEvent::ApprovalNeeded { key, .. },
+                    ) => break (key, crate::types::TuiInteractionResponse::Approval(true)),
+                    (
+                        SurfaceInteractionKind::PermissionRequest,
+                        TuiEvent::PermissionApprovalNeeded { key, .. },
+                    ) => break (key, crate::types::TuiInteractionResponse::Permission(true)),
+                    (
+                        SurfaceInteractionKind::UserInput,
+                        TuiEvent::UserInputRequested { key, .. },
+                    ) => {
+                        break (
+                            key,
+                            crate::types::TuiInteractionResponse::UserInput("yes".to_string()),
+                        );
+                    }
+                    (
+                        SurfaceInteractionKind::McpElicitation,
+                        TuiEvent::McpElicitationRequested { key, mode, .. },
+                    ) => {
+                        assert_eq!(mode, crate::types::TuiMcpElicitationMode::Url);
+                        break (
+                            key,
+                            crate::types::TuiInteractionResponse::McpElicitation {
+                                accepted: false,
+                                content_json: None,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            };
+            assert_eq!(response.kind(), key.kind);
+            assert!(
+                controller
+                    .respond_surface_interaction(&key, &response)
+                    .unwrap_or_else(|error| panic!(
+                        "TUI matrix response failed for {kind:?}: {error}"
+                    ))
+            );
+            if let Some(response_rx) = mcp_response_rx {
+                assert_eq!(
+                    response_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                    McpElicitationResponse::Decline
+                );
+            }
+            match host.shutdown() {
+                Ok(()) | Err(orca_runtime::runtime_host::RuntimeHostError::ThreadUnavailable) => {}
+                Err(error) => panic!("TUI matrix shutdown failed for {kind:?}: {error}"),
+            }
+            let worker_result = worker_result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    panic!("TUI matrix worker did not settle for {kind:?}: {error}")
+                })
+                .unwrap_or_else(|error| panic!("TUI matrix worker failed for {kind:?}: {error}"));
+            let status = match worker_result {
+                TuiHostedOperationOutcome::Turn { status } => status,
+                TuiHostedOperationOutcome::ManualCompaction => {
+                    panic!("TUI matrix worker returned manual compaction for {kind:?}")
+                }
+            };
+            assert!(
+                matches!(
+                    status.as_str(),
+                    "success" | "cancelled" | "budget_exhausted" | "not_admitted" | "failed"
+                ),
+                "unexpected TUI matrix worker status for {kind:?}: {status}"
+            );
+            worker
+                .join()
+                .unwrap_or_else(|_| panic!("TUI matrix worker panicked for {kind:?}"));
+            match previous {
+                Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+                None => unsafe { std::env::remove_var("ORCA_HOME") },
+            }
         }
     }
 
@@ -3797,14 +3984,16 @@ mod tests {
         let worker_thread = thread.clone();
         let worker_config = config.clone();
         let worker_event_tx = event_tx.clone();
+        let (worker_result_tx, worker_result_rx) = mpsc::bounded(1);
         let worker = std::thread::spawn(move || {
-            run_through_dispatch(
+            let result = run_through_dispatch(
                 &worker_thread,
                 HostedTurnRequest::new("bash printf canonical-approval"),
                 worker_config,
                 &worker_controller,
                 &worker_event_tx,
-            )
+            );
+            let _ = worker_result_tx.send(result);
         });
         let key = loop {
             match event_rx
@@ -3823,10 +4012,31 @@ mod tests {
                 )
                 .expect("typed approval response")
         );
-        let outcome = worker
-            .join()
-            .expect("typed approval worker")
+        let permission_key = loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("permission event after tool approval")
+            {
+                TuiEvent::PermissionApprovalNeeded { key, .. } => break key,
+                _ => {}
+            }
+        };
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &permission_key,
+                    &crate::types::TuiInteractionResponse::Permission(true)
+                )
+                .expect("typed permission response after tool approval")
+        );
+        let outcome = worker_result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| {
+                let pending_events = event_rx.try_iter().collect::<Vec<_>>();
+                panic!("typed approval worker timed out: {error}; events={pending_events:?}")
+            })
             .expect("typed approval");
+        worker.join().expect("typed approval worker");
         assert!(matches!(
             outcome,
             TuiHostedOperationOutcome::Turn { status } if status == "success"
@@ -3957,6 +4167,84 @@ mod tests {
             .join()
             .expect("typed user input worker")
             .expect("typed user input");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "success"
+        ));
+        assert!(event_rx.try_iter().any(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success")
+        ));
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn typed_ordinary_turn_routes_mcp_elicitation_through_runtime_surface() {
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        let host =
+            RuntimeHost::start_with_executor(Arc::new(TuiMcpInteractionExecutor { response_tx }))
+                .expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed TUI MCP elicitation")
+            .expect("runtime thread");
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let worker_controller = controller.clone();
+        let worker_thread = thread.clone();
+        let worker_config = config.clone();
+        let worker_event_tx = event_tx.clone();
+        let worker = std::thread::spawn(move || {
+            run_through_dispatch(
+                &worker_thread,
+                HostedTurnRequest::new("elicit through TUI"),
+                worker_config,
+                &worker_controller,
+                &worker_event_tx,
+            )
+        });
+        let key = loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("MCP elicitation event")
+            {
+                TuiEvent::McpElicitationRequested { key, mode, .. } => {
+                    assert_eq!(mode, crate::types::TuiMcpElicitationMode::Url);
+                    break key;
+                }
+                _ => {}
+            }
+        };
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &key,
+                    &crate::types::TuiInteractionResponse::McpElicitation {
+                        accepted: false,
+                        content_json: None,
+                    },
+                )
+                .expect("typed MCP elicitation response")
+        );
+        assert_eq!(
+            response_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            McpElicitationResponse::Decline
+        );
+        let outcome = worker
+            .join()
+            .expect("typed MCP elicitation worker")
+            .expect("typed MCP elicitation");
         assert!(matches!(
             outcome,
             TuiHostedOperationOutcome::Turn { status } if status == "success"

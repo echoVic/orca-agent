@@ -1,44 +1,46 @@
 # Pending Store Deletion Gate
 
+Updated: 2026-08-18
+
 ## Result
 
-The deletion gate is not passed on `dcf95aac2`. The process-local store is no
-longer a runtime owner, but removing its public compatibility API now would
-break the still-active legacy `HostedTurnRequest`/Goal continuation path.
+The deletion gate is complete. The Durable Interaction Broker now owns durable
+interaction routing, continuation, and cold recovery across every supported
+interaction and surface. The `RuntimePendingInteractionStore` compatibility
+shim, its source file, and its crate export have been deleted.
 
-## Evidence
+## Gate Evidence
 
 | Requirement | Result | Evidence |
 |---|---|---|
-| Runtime host no longer reads the map | Pass | `HostedTurnRequest::with_pending_interactions` is a documented no-op; the legacy Goal preflight has no store read. |
-| Server/CLI production callers no longer compile against the store | Pass | Repository search finds no server/CLI production import; remaining callers are the compatibility regression and TUI-only MCP mode enum. |
-| Durable broker recovery exists | Pass | `runtime_surface_interaction` cold-recovery fixtures rematerialize provider tools and fail closed when a live-only waiter is unavailable. |
-| Legacy Goal path is gone | **Blocked** | `RuntimeHost::dispatch_legacy_goal_continuation` and its `HostedTurnRequest` workers remain in production, and TUI/ACP/controller still construct `HostedTurnRequest`. |
-| Rust API compatibility gate | **Blocked** | `cargo-semver-checks` is not installed in the current environment; no public symbol removal was attempted. |
+| Interaction coverage | Pass | Tool Approval, Permission Request, User Input, and MCP Elicitation all use the durable broker. |
+| Surface coverage | Pass | The TUI, ACP, JSONL, and Headless 4×4 interaction matrix passes. |
+| Exact routing | Pass | Stable route epoch, response token, grant, and operation fence selectors are exact and fail closed. |
+| Tool Approval continuation | Pass | An `InvocationStarted` receipt prevents an approved invocation from being ambiguously replayed. |
+| Permission continuation | Pass | Permission recovery permits retry only before the protected side effect starts. |
+| User Input and MCP continuation | Pass | After an answer is accepted, each path resumes through a stable durable continuation operation. |
+| Cold recovery | Pass | Missing, executing, unsafe, unsupported, and stale-context recovery states durably fail closed. |
+| Shim deletion | Pass | `crates/orca-runtime/src/runtime_pending_interaction.rs` and the `lib.rs` export are deleted; production and test source contain zero old store or builder symbols. |
+| Validation | Pass | The runtime-surface validator, runtime all-targets checks, and TUI checks pass. |
 
-## Verification Commands
+## Breaking Rust API Impact
 
-The following commands are the executable gate for the next migration window:
+This deletion is intentionally source-breaking for downstream Rust callers that
+still compile against the compatibility layer:
 
-```bash
-cargo test -p orca-runtime --test runtime_host legacy_goal_pending_store_does_not_block_continuation -- --exact --nocapture
-cargo test -p orca-runtime --test runtime_surface_interaction cold_recovery_rematerializes_provider_tool_before_cancelling_unavailable_approval -- --exact --nocapture
-cargo test -p orca-runtime --test runtime_surface_interaction cold_recovery_rematerializes_provider_tool_before_cancelling_unavailable_permission -- --exact --nocapture
-cargo check -p orca-runtime -p orca-tui --all-targets --locked
-rg -n "RuntimePendingInteractionStore|with_pending_interactions" crates/orca-runtime/src crates/orca-tui/src
-cargo-semver-checks check-release -p orca-runtime --release-type major
-```
+- `orca_runtime::runtime_pending_interaction` is no longer exported.
+- `RuntimePendingInteractionStore` and the other public types formerly exposed
+  by that module are no longer available.
+- `HostedTurnRequest::with_pending_interactions` is removed rather than retained
+  as a no-op builder.
 
-The first four commands provide the current behavioral evidence. The search is
-expected to continue finding the compatibility builder and the legacy Goal
-worker until the migration slice removes them. The final command must run only
-after those production paths are gone and a major-version API migration has
-been chosen.
+Downstream callers must use the typed runtime-surface interaction and operation
+contracts. There is no remaining process-local pending-interaction store or
+compatibility builder to preserve the old API shape.
 
-## Deletion Conditions
+## Verification
 
-The shim may be deleted only after `HostedTurnRequest` no longer owns or
-dispatches a legacy Goal continuation, TUI/ACP/controller callers use the typed
-surface operation request, and the Rust API gate runs against the published
-baseline. Until then, retain the no-op builder and public store types; they are
-compatibility projections, not a second runtime fact source.
+The completed gate is backed by the repository runtime-surface validator and
+its self-tests, the locked runtime all-targets check, the TUI checks, and a
+source search confirming that the deleted store and builder symbols have no
+production or test references.

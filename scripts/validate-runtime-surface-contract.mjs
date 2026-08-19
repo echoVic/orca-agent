@@ -33,6 +33,13 @@ const UNSTABLE_SURFACE_SOURCE_ROOTS = [
   "crates/orca-runtime/tests",
   "crates/orca-tui/src",
 ];
+const LEGACY_INTERACTION_SYMBOLS = [
+  "RuntimePendingInteractionStore",
+  "RuntimePendingInteractionRecord",
+  "with_pending_interactions",
+];
+const LEGACY_INTERACTION_SOURCE_ROOTS = ["crates"];
+const GENERATED_SOURCE_DIRECTORY_NAMES = new Set(["target", "generated", ".generated"]);
 
 // Inventory validation revisits the same Rust sources for each closed-world
 // mutation fixture. Keep the lexical mask reusable while preserving distinct
@@ -3058,12 +3065,18 @@ function validateSourceReference(repoRoot, reference, label, sourceOverrides) {
   };
 }
 
-function rustSourcePaths(repoRoot, sourceRoots) {
+function rustSourcePaths(
+  repoRoot,
+  sourceRoots,
+  { excludedDirectoryNames = new Set() } = {},
+) {
   const paths = [];
   const visit = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const absolute = path.join(directory, entry.name);
-      if (entry.isDirectory()) visit(absolute);
+      if (entry.isDirectory() && !excludedDirectoryNames.has(entry.name)) {
+        visit(absolute);
+      }
       else if (entry.isFile() && entry.name.endsWith(".rs")) {
         paths.push(relativeRepoPath(repoRoot, absolute));
       }
@@ -3098,6 +3111,68 @@ function validateNoUnstableSurfaceReferences(repoRoot, sourceOverrides) {
   if (references.length > 0) {
     fail(`unstable_surface references must be removed:\n${references.join("\n")}`);
   }
+}
+
+function checkedLegacyInteractionSourcePath(relativePath) {
+  const normalized = path.posix.normalize(relativePath.split(path.sep).join("/"));
+  const segments = normalized.split("/");
+  if (
+    !normalized.startsWith("crates/") ||
+    !normalized.endsWith(".rs") ||
+    segments.some((segment) => GENERATED_SOURCE_DIRECTORY_NAMES.has(segment))
+  ) {
+    fail(
+      `legacy interaction symbol deletion gate source must be checked-in Rust under crates/: ${relativePath}`,
+    );
+  }
+  return normalized;
+}
+
+// Function Intent Contract:
+// - Input: a repository root plus an explicit checked-in Rust source scope.
+// - Output: returns no violations, or throws with every legacy symbol file/line violation.
+// - Scope: never traverses build/generated directories or Flux design artifacts.
+export function validateNoLegacyInteractionSymbols({
+  repoRoot,
+  sourceRoots = LEGACY_INTERACTION_SOURCE_ROOTS,
+  sourcePaths,
+  sourceOverrides,
+}) {
+  const checkedSourceRoots = sourceRoots.map((sourceRoot) => {
+    const normalized = path.posix.normalize(sourceRoot.split(path.sep).join("/"));
+    const segments = normalized.split("/");
+    if (
+      normalized !== "crates" &&
+      (!normalized.startsWith("crates/") ||
+        segments.some((segment) => GENERATED_SOURCE_DIRECTORY_NAMES.has(segment)))
+    ) {
+      fail(
+        `legacy interaction symbol deletion gate source root must stay under crates/: ${sourceRoot}`,
+      );
+    }
+    return normalized;
+  });
+  const paths = (
+    sourcePaths ??
+    rustSourcePaths(repoRoot, checkedSourceRoots, {
+      excludedDirectoryNames: GENERATED_SOURCE_DIRECTORY_NAMES,
+    })
+  ).map(checkedLegacyInteractionSourcePath);
+  const violations = [];
+  for (const relativePath of paths) {
+    const source = readRepoSource(repoRoot, relativePath, sourceOverrides);
+    for (const symbol of LEGACY_INTERACTION_SYMBOLS) {
+      const pattern = new RegExp(`\\b${symbol}\\b`, "g");
+      for (const match of source.matchAll(pattern)) {
+        const line = source.slice(0, match.index).split("\n").length;
+        violations.push(`${relativePath}:${line}: ${symbol}`);
+      }
+    }
+  }
+  if (violations.length > 0) {
+    fail(`legacy interaction symbols must be removed:\n${violations.join("\n")}`);
+  }
+  return violations;
 }
 
 function cfgPredicateTokens(predicate) {
@@ -4386,6 +4461,7 @@ export function validateRuntimeSurfaceContract({
 }) {
   const absoluteManifestPath = path.resolve(manifestPath);
   const manifest = parseManifestText(readFileSync(absoluteManifestPath, "utf8"));
+  validateNoLegacyInteractionSymbols({ repoRoot });
   validateManifestStructure(manifest);
   validateArtifactBundle(manifest, { repoRoot });
   validateArtifactDigest(JSON.parse(readFileSync(path.resolve(digestPath), "utf8")), {

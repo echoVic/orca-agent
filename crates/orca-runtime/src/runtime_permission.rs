@@ -34,6 +34,17 @@ pub trait RuntimePermissionRequestHandler {
         &self,
         request: &RuntimePermissionRequest,
     ) -> io::Result<RuntimePermissionResponse>;
+
+    /// Request a permission at a caller-proven pre-side-effect checkpoint.
+    /// Implementations that do not own durable recovery may use the ordinary
+    /// request path; runtime-owned handlers can persist the supplied overlay.
+    fn request_permissions_pre_side_effect(
+        &self,
+        request: &RuntimePermissionRequest,
+        _permission_overlay: &TurnPermissionOverlay,
+    ) -> io::Result<RuntimePermissionResponse> {
+        self.request_permissions(request)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -409,6 +420,28 @@ impl TurnPermissionOverlay {
         request: RuntimePermissionRequest,
     ) -> io::Result<RuntimePermissionResponse> {
         let response = handler.request_permissions(&request)?;
+        if response.decision == PermissionResponseDecision::Allow {
+            self.merge_permissions(&response.permissions);
+            self.merge_strict_auto_review(response.strict_auto_review);
+        }
+        Ok(response)
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: a permission request whose caller has proven no external tool
+    ///   side effect occurred, plus the current turn overlay.
+    /// - Output: the normal response while preserving existing merge, scope,
+    ///   and strict-auto-review behavior.
+    /// - Errors: forwards handler errors without mutating the overlay.
+    /// - State changes and external calls: the handler may durably checkpoint
+    ///   the request; this overlay changes only after an allowed response.
+    pub(crate) fn request_and_merge_pre_side_effect(
+        &mut self,
+        handler: &dyn RuntimePermissionRequestHandler,
+        request: RuntimePermissionRequest,
+    ) -> io::Result<RuntimePermissionResponse> {
+        let response = handler.request_permissions_pre_side_effect(&request, self)?;
         if response.decision == PermissionResponseDecision::Allow {
             self.merge_permissions(&response.permissions);
             self.merge_strict_auto_review(response.strict_auto_review);

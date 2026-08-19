@@ -7670,6 +7670,104 @@ enabled = true
     }
 
     #[test]
+    fn turn_tool_and_permission_interactions_project_and_route_typed_responses() {
+        with_orca_home(|home| {
+            for (label, prompt, expect_permissions) in [
+                ("tool-approval", "bash printf jsonl-matrix-approval", false),
+                (
+                    "permission-request",
+                    "request_network_permissions_then_done example.com",
+                    true,
+                ),
+            ] {
+                let mut config = test_run_config();
+                config.cwd = Some(home.to_path_buf());
+                config.approval_mode = ApprovalMode::Suggest;
+                let server_config = ServerConfig { run_config: config };
+                let mut state = ServerState::default();
+                let writer = Arc::new(Mutex::new(Vec::new()));
+
+                handle_line(
+                    &server_config,
+                    &mut state,
+                    &format!(r#"{{"id":"thread-{label}","method":"thread/start","params":{{}}}}"#),
+                    Arc::clone(&writer),
+                )
+                .expect("thread start");
+                let thread_id = parse_jsonl(&writer.lock().expect("writer").clone())
+                    .into_iter()
+                    .find(|event| event["event"] == "thread_started")
+                    .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
+                    .expect("thread id");
+
+                let turn_id = format!("turn-{label}");
+                handle_line(
+                    &server_config,
+                    &mut state,
+                    &serde_json::json!({
+                        "id": turn_id,
+                        "method": "turn/start",
+                        "params": {
+                            "threadId": thread_id,
+                            "input": [{ "type": "text", "text": prompt }],
+                        },
+                    })
+                    .to_string(),
+                    Arc::clone(&writer),
+                )
+                .expect("turn start");
+
+                let request = wait_for_event(&writer, Duration::from_secs(5), |event| {
+                    event["event"] == "permission_request"
+                })
+                .unwrap_or_else(|| panic!("{label} permission projection"));
+                let request_id = request["requestId"]
+                    .as_str()
+                    .expect("request id")
+                    .to_string();
+                assert_eq!(request["threadId"], thread_id);
+                assert_eq!(
+                    request["permissions"]
+                        .as_object()
+                        .is_some_and(|permissions| !permissions.is_empty()),
+                    expect_permissions,
+                    "unexpected JSONL permission payload for {label}: {request:?}"
+                );
+
+                let response_id = format!("response-{label}");
+                handle_line(
+                    &server_config,
+                    &mut state,
+                    &serde_json::json!({
+                        "id": response_id,
+                        "method": "permission/respond",
+                        "params": {
+                            "requestId": request_id,
+                            "decision": "allow",
+                            "scope": "turn",
+                            "permissions": request["permissions"].clone(),
+                            "strictAutoReview": false,
+                        },
+                    })
+                    .to_string(),
+                    Arc::clone(&writer),
+                )
+                .expect("typed permission response");
+
+                let events = parse_jsonl(&writer.lock().expect("writer").clone());
+                assert!(events.iter().any(|event| {
+                    event["event"] == "permission_resolved" && event["id"] == response_id
+                }));
+                state
+                    .shutdown(JsonlSupervisorCloseTrigger::NonIo(
+                        JsonlNonIoCloseTrigger::SupervisorShutdown,
+                    ))
+                    .expect("shutdown JSONL matrix case");
+            }
+        });
+    }
+
+    #[test]
     fn turn_user_input_request_waits_for_protocol_response() {
         with_orca_home(|home| {
             let mut config = test_run_config();

@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.23";
+export const releaseVersion = "v0.3.24";
 
 export const releases = [
+  {
+    version: "v0.3.24",
+    date: "2026-08-19",
+    title: "Durable interactions across every runtime surface",
+    body: "Unifies tool approval, permission requests, user input, and MCP elicitation behind one durable interaction broker across TUI, ACP, JSONL, and Headless. Restartable intents, exact response fencing, pre-side-effect permission retry, durable invocation receipts, and stable continuation operation identities make crash recovery fail closed without replaying ambiguous side effects. The obsolete RuntimePendingInteractionStore compatibility API is removed.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.24",
+  },
   {
     version: "v0.3.23",
     date: "2026-08-18",

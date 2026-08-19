@@ -11,9 +11,14 @@ use super::identity::{
     SurfaceRemoteTerminalId, SurfaceRequestId, SurfaceSettlementId, SurfaceStreamId,
     SurfaceSubagentId, SurfaceTaskId, SurfaceThreadId, SurfaceToolCallId, SurfaceTurnId,
     SurfaceValueError, SurfaceWorkflowFence, SurfaceWorkflowResultId, SurfaceWorkflowRunId,
-    TaskRevision, ThreadOwnerEpoch, UnixMillis, UsageRevision, UuidV7, WorkflowRevision,
+    TaskRevision, ThreadOwnerEpoch, ToolInvocationRevision, UnixMillis, UsageRevision, UuidV7,
+    WorkflowRevision,
 };
-use super::interaction::{SurfaceSchema, SurfaceToolRequest};
+use super::interaction::{
+    DurableInteractionContinuationCapsule, DurableInteractionContinuationDisposition,
+    DurableInteractionContinuationIntent, SurfaceSchema, SurfaceToolRequest,
+    ToolInvocationCheckpoint,
+};
 use super::operation::{
     AdmittedInput, FailureClass, FinalizationDegradedCause, GenerationRecord,
     GenerationStartedWitness, GenerationStopReason, InputResolutionErrorCode, OperationBudget,
@@ -362,6 +367,56 @@ pub enum ToolInvocationStarted {
     Unknown,
 }
 
+/// Version 1 of the durable receipt that closes the pre-side-effect restart
+/// window for one stable logical tool invocation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolInvocationStartedReceiptV1 {
+    invocation_id: SurfaceToolCallId,
+    fence: SurfaceOperationFence,
+    revision: ToolInvocationRevision,
+}
+
+impl ToolInvocationStartedReceiptV1 {
+    pub(crate) fn new(
+        invocation_id: SurfaceToolCallId,
+        fence: SurfaceOperationFence,
+        revision: ToolInvocationRevision,
+    ) -> Self {
+        Self {
+            invocation_id,
+            fence,
+            revision,
+        }
+    }
+
+    pub fn invocation_id(&self) -> &SurfaceToolCallId {
+        &self.invocation_id
+    }
+
+    pub fn fence(&self) -> &SurfaceOperationFence {
+        &self.fence
+    }
+
+    pub const fn revision(&self) -> ToolInvocationRevision {
+        self.revision
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolInvocationRecoveryDisposition {
+    RestartableBeforeInvocation,
+    FailClosedStarted,
+    FailClosedExecuting,
+    FailClosedUnsafe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PermissionRetryRecoveryDisposition {
+    RestartablePreSideEffect,
+    FailClosedExecuting,
+    FailClosedUnsafe,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ToolTerminalSource {
     Observed,
@@ -411,6 +466,7 @@ pub enum SurfaceToolViewState {
 pub struct SurfaceToolView {
     pub request: SurfaceToolRequest,
     pub state: SurfaceToolViewState,
+    pub invocation_started: Option<ToolInvocationStartedReceiptV1>,
     pub arguments_bytes: ByteCount,
     pub output_bytes: ByteCount,
     pub streamed_output: DisplayText,
@@ -595,6 +651,9 @@ pub enum ToolPatch {
         offset: ByteOffset,
         chunk: DisplayText,
     },
+    InvocationStartedV1 {
+        receipt: ToolInvocationStartedReceiptV1,
+    },
     Completed {
         result: SurfaceToolResult,
     },
@@ -604,6 +663,133 @@ pub enum ToolPatch {
     RemoteTerminalLeaseChanged {
         lease: SurfaceRemoteTerminalLease,
     },
+}
+
+impl super::commands::SurfaceSnapshot {
+    /// Function intent contract:
+    ///
+    /// - Input: a recovered durable continuation capsule.
+    /// - Output: `RestartableBeforeInvocation` only when the capsule, request,
+    ///   checkpoint, fence, and projected tool agree and no start receipt or
+    ///   later execution state exists; every other result is fail closed.
+    /// - State changes and external calls: none; this is a read-only recovery
+    ///   authorization check and never dispatches a tool.
+    pub(crate) fn tool_invocation_recovery_disposition(
+        &self,
+        capsule: &DurableInteractionContinuationCapsule,
+    ) -> ToolInvocationRecoveryDisposition {
+        if capsule.disposition() == DurableInteractionContinuationDisposition::Executing {
+            return ToolInvocationRecoveryDisposition::FailClosedExecuting;
+        }
+        if capsule.validate().is_err() {
+            return ToolInvocationRecoveryDisposition::FailClosedUnsafe;
+        }
+        let Some(DurableInteractionContinuationIntent::ToolInvocation(intent)) = capsule.intent()
+        else {
+            return ToolInvocationRecoveryDisposition::FailClosedUnsafe;
+        };
+        if intent.checkpoint() != ToolInvocationCheckpoint::BeforeInvocation {
+            return ToolInvocationRecoveryDisposition::FailClosedExecuting;
+        }
+        let Some(tool) = self
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == *intent.invocation_id())
+        else {
+            return ToolInvocationRecoveryDisposition::FailClosedUnsafe;
+        };
+        if &tool.request != intent.request() {
+            return ToolInvocationRecoveryDisposition::FailClosedUnsafe;
+        }
+        let Some(projected_fence) = self
+            .foreground_operation
+            .iter()
+            .chain(self.queued_operations.iter())
+            .chain(self.operation_history.iter())
+            .flat_map(|operation| operation.generations.iter())
+            .filter(|generation| generation.logical_turn_id == tool.request.turn_id)
+            .last()
+            .map(|generation| &generation.fence)
+        else {
+            return ToolInvocationRecoveryDisposition::FailClosedUnsafe;
+        };
+        if projected_fence != capsule.fence() {
+            return ToolInvocationRecoveryDisposition::FailClosedUnsafe;
+        }
+        if let Some(receipt) = &tool.invocation_started {
+            if receipt.invocation_id() != intent.invocation_id()
+                || receipt.fence() != projected_fence
+            {
+                return ToolInvocationRecoveryDisposition::FailClosedUnsafe;
+            }
+            return ToolInvocationRecoveryDisposition::FailClosedStarted;
+        }
+        if tool.state != SurfaceToolViewState::Requested {
+            return ToolInvocationRecoveryDisposition::FailClosedExecuting;
+        }
+        ToolInvocationRecoveryDisposition::RestartableBeforeInvocation
+    }
+
+    /// Function intent contract:
+    ///
+    /// - Input: a recovered PermissionRetry capsule claiming a
+    ///   `PreSideEffect` checkpoint.
+    /// - Output: restart authority only when the capsule, request, stable tool
+    ///   identity, operation fence, and projected not-started tool all agree.
+    /// - Errors: represented as fail-closed dispositions; an executing,
+    ///   completed, missing, or otherwise ambiguous tool is never restartable.
+    /// - State changes and external calls: none; this check only reads the
+    ///   durable projection and never grants permission or dispatches a tool.
+    pub(crate) fn permission_retry_recovery_disposition(
+        &self,
+        capsule: &DurableInteractionContinuationCapsule,
+    ) -> PermissionRetryRecoveryDisposition {
+        if capsule.disposition() == DurableInteractionContinuationDisposition::Executing {
+            return PermissionRetryRecoveryDisposition::FailClosedExecuting;
+        }
+        if capsule.validate().is_err() {
+            return PermissionRetryRecoveryDisposition::FailClosedUnsafe;
+        }
+        let Some(DurableInteractionContinuationIntent::PermissionRetry(intent)) = capsule.intent()
+        else {
+            return PermissionRetryRecoveryDisposition::FailClosedUnsafe;
+        };
+        if intent.checkpoint() != super::PermissionRetryCheckpoint::PreSideEffect {
+            return PermissionRetryRecoveryDisposition::FailClosedExecuting;
+        }
+        let Some(tool) = self
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == *intent.invocation_id())
+        else {
+            return PermissionRetryRecoveryDisposition::FailClosedUnsafe;
+        };
+        if &tool.request != intent.tool() {
+            return PermissionRetryRecoveryDisposition::FailClosedUnsafe;
+        }
+        if tool.invocation_started.is_some()
+            || tool.state != SurfaceToolViewState::Requested
+            || tool.result.is_some()
+        {
+            return PermissionRetryRecoveryDisposition::FailClosedExecuting;
+        }
+        let Some(projected_fence) = self
+            .foreground_operation
+            .iter()
+            .chain(self.queued_operations.iter())
+            .chain(self.operation_history.iter())
+            .flat_map(|operation| operation.generations.iter())
+            .filter(|generation| generation.logical_turn_id == tool.request.turn_id)
+            .last()
+            .map(|generation| &generation.fence)
+        else {
+            return PermissionRetryRecoveryDisposition::FailClosedUnsafe;
+        };
+        if projected_fence != capsule.fence() {
+            return PermissionRetryRecoveryDisposition::FailClosedUnsafe;
+        }
+        PermissionRetryRecoveryDisposition::RestartablePreSideEffect
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
