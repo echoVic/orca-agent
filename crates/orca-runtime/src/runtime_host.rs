@@ -42758,8 +42758,7 @@ mod tests {
     fn session_listing_does_not_block_host_supervisor() {
         use std::ffi::CString;
 
-        // Needs a private home: the FIFO fixture must sit in an otherwise
-        // empty sessions directory (the assertion expects an empty listing),
+        // Needs a private home so the FIFO fixture cannot affect another test,
         // and a lingering FIFO must never be left in the shared home.
         let _env = crate::history::lock_test_env();
         let home = tempfile::tempdir().unwrap();
@@ -42796,16 +42795,26 @@ mod tests {
             );
             let _ = start_tx.send(result);
         });
-        start_rx
+        let started_thread = start_rx
             .recv_timeout(Duration::from_millis(250))
             .expect("blocked session listing stalled the host supervisor")
             .expect("unrelated runtime thread failed to start");
+        let started_thread_id = started_thread.thread_id().to_string();
 
         let page = list_rx
             .recv_timeout(SURFACE_TEST_TIMEOUT)
             .expect("session listing opened a non-regular history entry")
             .expect("session listing failed while ignoring a non-regular history entry");
-        assert!(page.data.is_empty());
+        assert!(
+            page.data
+                .iter()
+                .all(|summary| summary.thread_id == started_thread_id),
+            "session listing returned an entry other than the concurrently created thread: {:?}",
+            page.data
+                .iter()
+                .map(|summary| summary.thread_id.as_str())
+                .collect::<Vec<_>>()
+        );
         list_request.join().unwrap();
         start_request.join().unwrap();
         host.shutdown().expect("shutdown runtime host");
