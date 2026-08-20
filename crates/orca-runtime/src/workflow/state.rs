@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use orca_core::cost_types::UsageTotals;
-use orca_core::task_types::WorkflowAgentTaskSummary;
+use orca_core::task_types::{TaskContinuationSummary, WorkflowAgentTaskSummary};
 use orca_core::workflow_types::{
     WorkflowAgentFailureKind, WorkflowAgentStatus, WorkflowEvidenceAgent, WorkflowEvidenceBundle,
     WorkflowEvidenceFailure, WorkflowEvidenceFailureKind, WorkflowEvidenceIdentity,
@@ -55,6 +55,8 @@ pub struct WorkflowAgentRecord {
     pub task: Option<WorkflowTaskLifecycleEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_events: Vec<WorkflowEvidenceToolEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<TaskContinuationSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +106,8 @@ struct WorkflowAgentRecordOnDisk {
     task: Option<WorkflowTaskLifecycleEvidence>,
     #[serde(default)]
     tool_events: Vec<WorkflowEvidenceToolEvent>,
+    #[serde(default)]
+    continuation: Option<TaskContinuationSummary>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -134,6 +138,8 @@ struct WorkflowAgentRecordOnDiskWritable {
     task: Option<WorkflowTaskLifecycleEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_events: Vec<WorkflowEvidenceToolEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation: Option<TaskContinuationSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -479,6 +485,22 @@ impl WorkflowStateStore {
             .map(|entry| entry.record.output.clone().unwrap_or(Value::Null))
     }
 
+    pub fn find_agent_record(
+        &self,
+        run_id: &str,
+        call_path: &str,
+        input_hash: &str,
+    ) -> Option<WorkflowAgentRecord> {
+        let path = self.run_dir(run_id).join("agent-cache.json");
+        if !path.exists() {
+            return None;
+        }
+        read_agent_cache(&path)
+            .ok()?
+            .get(&cache_key(call_path, input_hash))
+            .map(|entry| entry.record.clone())
+    }
+
     pub fn cached_agent_result(
         &self,
         run_id: &str,
@@ -553,6 +575,7 @@ impl WorkflowStateStore {
                 started_at_ms: entry.record.started_at_ms,
                 completed_at_ms: entry.record.completed_at_ms,
                 usage: entry.record.usage,
+                continuation: entry.record.continuation.clone(),
             })
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| {
@@ -716,6 +739,7 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
             usage: None,
             task: None,
             tool_events: Vec::new(),
+            continuation: None,
         }
     }
 }
@@ -816,6 +840,7 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
                             usage: record.usage,
                             task: record.task,
                             tool_events: record.tool_events,
+                            continuation: record.continuation,
                         },
                         output_present: record.output.present,
                     },
@@ -872,6 +897,7 @@ fn write_agent_cache(
                     usage: entry.record.usage,
                     task: entry.record.task.clone(),
                     tool_events: entry.record.tool_events.clone(),
+                    continuation: entry.record.continuation.clone(),
                 },
             )
         })

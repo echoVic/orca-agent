@@ -8,6 +8,8 @@ use orca_core::model::ModelSelection;
 use orca_provider::{ProviderConfig, context};
 
 use crate::agent_child::ChildAgentExecutor;
+use crate::agent_continuation::{conversation_has_open_tool_calls, try_last_settled_tool_boundary};
+use crate::child_agent_types::ChildAgentCheckpointObservation;
 use crate::lifecycle::{
     AgentLoopOutcome, RuntimeTaskActor, RuntimeTurnContext, RuntimeTurnDeps, RuntimeTurnLoopState,
 };
@@ -257,9 +259,23 @@ impl RuntimeTurnLoopStep {
                 executors.batch_child_executor,
             )? {
                 RuntimeTurnIterationResult::ContinueLoop => {
+                    emit_safe_child_checkpoint(
+                        input.prepared_conversation,
+                        input.operation.controller.usage(),
+                    )?;
                     continue;
                 }
                 RuntimeTurnIterationResult::Return(result) => {
+                    if result.status != orca_core::event_schema::RunStatus::ApprovalRequired {
+                        let (conversation, observer) =
+                            input.prepared_conversation.checkpoint_parts();
+                        if observer.is_some() && !conversation_has_open_tool_calls(conversation) {
+                            emit_safe_child_checkpoint(
+                                input.prepared_conversation,
+                                input.operation.controller.usage(),
+                            )?;
+                        }
+                    }
                     return Ok(AgentLoopOutcome::Completed(result));
                 }
                 RuntimeTurnIterationResult::Suspended(suspension) => {
@@ -268,6 +284,37 @@ impl RuntimeTurnLoopStep {
             }
         }
     }
+}
+
+/// Emits a checkpoint only after one production child iteration has fully
+/// settled. It reports this operation's current cumulative usage and derived
+/// trustworthy tool boundary, performs no action without an observer, and
+/// propagates validation or persistence failures as explicit I/O errors.
+fn emit_safe_child_checkpoint(
+    prepared_conversation: &RuntimePreparedConversation<'_>,
+    usage: orca_core::budget::BudgetUsage,
+) -> io::Result<()> {
+    let (conversation, observer) = prepared_conversation.checkpoint_parts();
+    let Some(observer) = observer else {
+        return Ok(());
+    };
+    let last_tool_boundary =
+        try_last_settled_tool_boundary(conversation).map_err(child_checkpoint_error)?;
+    observer
+        .checkpoint(ChildAgentCheckpointObservation {
+            conversation,
+            turn: usage.turns,
+            usage,
+            last_tool_boundary,
+        })
+        .map_err(child_checkpoint_error)
+}
+
+fn child_checkpoint_error(error: crate::agent_continuation::AgentContinuationError) -> io::Error {
+    io::Error::other(format!(
+        "child checkpoint failed [{}]: {error}",
+        error.contract_code()
+    ))
 }
 
 impl<'a, 'runtime, W: io::Write> RuntimeAgentTurnLoopInput<'a, 'runtime, W> {

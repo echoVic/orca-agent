@@ -8369,6 +8369,7 @@ rl.on("line", (line) => {
         crate::history::with_test_orca_home(&home, f)
     }
 
+    #[allow(dead_code, reason = "used by platform-specific sandbox tests")]
     fn trust_test_folder(home: &std::path::Path, folder: &std::path::Path) {
         orca_core::config::folder_trust::set_trust_with_config_dir(
             folder,
@@ -8378,6 +8379,7 @@ rl.on("line", (line) => {
         .expect("trust test folder");
     }
 
+    #[allow(dead_code, reason = "used by platform-specific sandbox tests")]
     fn sandbox_test_parent(prefix: &str) -> TempDir {
         #[cfg(target_os = "macos")]
         {

@@ -357,6 +357,7 @@ impl InboundFrame {
         self.method.as_deref()
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn json_value(&self) -> Result<Value, RpcFacadeError> {
         validate_jsonrpc_frame(&self.encoded)
     }

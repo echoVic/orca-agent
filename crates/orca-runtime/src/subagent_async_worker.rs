@@ -1,8 +1,8 @@
 use std::io::{self, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -19,18 +19,30 @@ use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
+use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_core::tool_types;
 
 use crate::agent_child::{
     ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, ChildAgentRuntimeContext,
 };
+use crate::agent_continuation::{
+    AgentContinuationId, AgentPromptId, AgentTerminal, ChildAgentCoordinator,
+    ContinuationCompatibility, ContinuationLease, ContinuationProjection, ContinuationRevision,
+    CreateContinuationInput, PreparedContinuation, ResumeContinuationInput, WorktreeBinding,
+    compute_continuation_compatibility_hash,
+};
 use crate::agent_loop::execute_child_agent_loop;
+use crate::child_agent_types::{ChildAgentCompatibilityIdentity, ChildAgentContinuationStart};
 use crate::hooks::HookRunner;
 use crate::instructions;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
 use crate::memory;
-use crate::runtime_subagent_call::{append_worktree_outcome, validate_subagent_output_schema};
+use crate::runtime_subagent_call::{
+    append_worktree_outcome, build_checkpoint_observer, commit_continuation_write_with_retry,
+    continuation_error, continuation_footer, serialized_subagent_type, validate_resume_overrides,
+    validate_subagent_output_schema,
+};
 use crate::subagent::{self, SubagentIsolation};
 use crate::tasks::TaskRegistry;
 use crate::worktree::WorktreeGuard;
@@ -98,6 +110,75 @@ struct AsyncSubagentWorkerSpawnContext<'a> {
     worktree: Option<&'a AsyncSubagentWorktree>,
 }
 
+struct AsyncLaunchWorktree {
+    child_cwd: PathBuf,
+    worker: Option<AsyncSubagentWorktree>,
+    fresh_guard: Option<WorktreeGuard>,
+}
+
+impl AsyncLaunchWorktree {
+    fn finish_fresh(self) -> Option<crate::worktree::WorktreeOutcome> {
+        self.fresh_guard.and_then(|guard| guard.finish().ok())
+    }
+
+    fn detach(self) {
+        if let Some(guard) = self.fresh_guard {
+            std::mem::forget(guard);
+        }
+    }
+}
+
+struct AsyncLeaseHeartbeat {
+    stop: mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncLeaseHeartbeat {
+    fn start(
+        task_registry: TaskRegistry,
+        task_lease: crate::tasks::TaskLease,
+        agent_id: String,
+        coordinator: ChildAgentCoordinator,
+        continuation_lease: ContinuationLease,
+        continuation_revision: Arc<Mutex<ContinuationRevision>>,
+    ) -> Self {
+        let (stop, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            loop {
+                match receiver.recv_timeout(Duration::from_secs(5)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if task_registry
+                    .renew_task_lease(&task_lease, &agent_id)
+                    .is_err()
+                {
+                    break;
+                }
+                let Ok(mut revision) = continuation_revision.lock() else {
+                    break;
+                };
+                let projection = match coordinator.renew(&continuation_lease, *revision) {
+                    Ok(projection) => projection,
+                    Err(_) => break,
+                };
+                *revision = projection.revision;
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn stop(mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 pub fn run_async_subagent_worker(input: AsyncSubagentWorkerInput) -> i32 {
     run_async_subagent_worker_with_executor(AsyncSubagentWorkerContext {
         input,
@@ -120,40 +201,98 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         child_depth,
         worktree,
     } = input;
+    let owns_worktree = request.resume_from.is_none();
     let task_registry = match wait_for_async_subagent_adoption(&task_session_id, &cwd, &agent_id) {
         Ok(registry) => registry,
         Err(_) => return 1,
     };
-    let lease = match task_registry.acquire_task_lease(&agent_id) {
+    let task_lease = match task_registry.acquire_task_lease(&agent_id) {
         Ok(lease) => lease,
         Err(_) => return 1,
     };
     if task_registry
-        .mark_running_with_lease(&lease, &agent_id)
+        .mark_running_with_lease(&task_lease, &agent_id)
         .is_err()
     {
         return 1;
     }
-    let heartbeat_stop = Arc::new(AtomicBool::new(false));
-    let heartbeat_registry = task_registry.clone();
-    let heartbeat_lease = lease.clone();
-    let heartbeat_stop_signal = heartbeat_stop.clone();
-    let heartbeat_agent_id = agent_id.clone();
-    std::thread::spawn(move || {
-        while !heartbeat_stop_signal.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_secs(5));
-            if heartbeat_stop_signal.load(Ordering::Acquire) {
-                break;
-            }
-            if heartbeat_registry
-                .renew_task_lease(&heartbeat_lease, &heartbeat_agent_id)
-                .is_err()
-            {
-                break;
-            }
+    let coordinator = match ChildAgentCoordinator::with_owner_id(
+        task_registry.clone(),
+        format!("async-subagent:{}:{agent_id}", std::process::id()),
+    ) {
+        Ok(coordinator) => coordinator,
+        Err(error) => {
+            let mut message = continuation_error("failed to initialize async continuation", &error);
+            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+            append_worktree_outcome(&mut message, worktree.as_ref());
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+            return 1;
         }
-    });
-    let stop_heartbeat = || heartbeat_stop.store(true, Ordering::Release);
+    };
+    let prepared = match coordinator.prepared(&agent_id) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mut message = continuation_error("failed to load async continuation", &error);
+            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+            append_worktree_outcome(&mut message, worktree.as_ref());
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+            return 1;
+        }
+    };
+    let continuation_lease = match coordinator
+        .acquire(&prepared)
+        .or_else(|_| coordinator.acquire(&prepared))
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            let mut message = continuation_error("failed to acquire async continuation", &error);
+            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+            append_worktree_outcome(&mut message, worktree.as_ref());
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+            return 1;
+        }
+    };
+    let continuation_start = match prepared.checkpoint.clone() {
+        Some(checkpoint) => match ChildAgentContinuationStart::new(
+            prepared.continuation_id.clone(),
+            prepared.attempt_id.clone(),
+            prepared.prompt_id.clone(),
+            checkpoint,
+            ChildAgentCompatibilityIdentity::new(prepared.compatibility.compatibility_hash),
+        ) {
+            Ok(start) => Some(start),
+            Err(error) => {
+                let mut message =
+                    continuation_error("failed to construct async continuation start", &error);
+                let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+                append_worktree_outcome(&mut message, worktree.as_ref());
+                let projection = commit_async_terminal(
+                    &coordinator,
+                    &continuation_lease,
+                    None,
+                    AgentTerminal::Failed {
+                        error: message.clone(),
+                    },
+                )
+                .ok();
+                let message = append_projection_footer(message, projection.as_ref());
+                let _ =
+                    task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let (checkpoint_observer, shared_revision) =
+        build_checkpoint_observer(coordinator.clone(), continuation_lease.clone(), &prepared);
+    let heartbeat = AsyncLeaseHeartbeat::start(
+        task_registry.clone(),
+        task_lease.clone(),
+        agent_id.clone(),
+        coordinator.clone(),
+        continuation_lease.clone(),
+        Arc::clone(&shared_revision),
+    );
     let instructions = instructions::load_for_cwd_or_default(&cwd);
     let memory = memory::load_for_cwd(&cwd);
     let hooks = HookRunner::new(config.hooks.clone());
@@ -168,12 +307,13 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         allowed_tools: None,
         tool_policy_label: None,
         workflow_ipc: None,
+        continuation: continuation_start,
     };
     let mut child_events = EventFactory::new(format!("subagent-{agent_id}"));
     let mut child_lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{agent_id}"));
     child_lifecycle.start_task(RuntimeTaskKind::Subagent);
     let mut child_sink = EventSink::new(io::sink(), config.output_format);
-    let (child, child_cost_tracker) = {
+    let child = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut child_runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
             cwd: &child_cwd,
             events: &mut child_events,
@@ -186,9 +326,36 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             lifecycle: Some(&mut child_lifecycle),
             task_registry: Some(&task_registry),
             root_task_id: Some(&agent_id),
+            checkpoint_observer: Some(&checkpoint_observer),
             executor: child_executor,
         });
         crate::agent_child::run_child_agent(&config, &child_request, &mut child_runtime)
+    }));
+    heartbeat.stop();
+    let (child, child_cost_tracker) = match child {
+        Ok((child, cost_tracker)) => (child, cost_tracker),
+        Err(payload) => {
+            let mut message = format!(
+                "Async subagent worker panicked after execution started: {}. Inspect external state before retrying.",
+                panic_payload_message(payload)
+            );
+            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+            append_worktree_outcome(&mut message, worktree.as_ref());
+            let terminal = AgentTerminal::Indeterminate {
+                reason: message.clone(),
+            };
+            let projection = commit_async_terminal(
+                &coordinator,
+                &continuation_lease,
+                Some(&shared_revision),
+                terminal,
+            )
+            .ok();
+            let message = append_projection_footer(message, projection.as_ref());
+            let message = async_subagent_result_payload(message, None);
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+            return 1;
+        }
     };
     let completed_task = child_lifecycle
         .finish_task(child.status)
@@ -200,9 +367,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
                     .clone()
             })
         });
-    let worktree = worktree.and_then(|worktree| {
-        WorktreeGuard::finish_existing(worktree.repo_root, worktree.path).ok()
-    });
+    let worktree = finish_async_worker_worktree(worktree, owns_worktree);
     let usage = usage_totals_if_non_empty(child_cost_tracker.totals());
     if child.status == RunStatus::Success {
         let mut output = child
@@ -212,11 +377,20 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             validate_subagent_output_schema(&request.description, request.schema.as_ref(), &output)
         {
             append_worktree_outcome(&mut error, worktree.as_ref());
+            let projection = commit_async_terminal(
+                &coordinator,
+                &continuation_lease,
+                Some(&shared_revision),
+                AgentTerminal::Failed {
+                    error: error.clone(),
+                },
+            )
+            .ok();
+            let error = append_projection_footer(error, projection.as_ref());
             let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
             let error = async_subagent_result_payload(error, Some(failed_task.payload()));
-            stop_heartbeat();
             if task_registry
-                .fail_with_usage_and_lease(&lease, &agent_id, error, usage)
+                .fail_with_usage_and_lease(&task_lease, &agent_id, error, usage)
                 .is_ok()
             {
                 return 1;
@@ -224,10 +398,28 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 1;
         }
         append_worktree_outcome(&mut output, worktree.as_ref());
+        let projection = match commit_async_terminal(
+            &coordinator,
+            &continuation_lease,
+            Some(&shared_revision),
+            AgentTerminal::Completed {
+                result: Some(output.clone()),
+            },
+        ) {
+            Ok(projection) => projection,
+            Err(error) => {
+                let error =
+                    continuation_error("failed to commit async continuation terminal", &error);
+                let error = async_subagent_result_payload(error, Some(completed_task.payload()));
+                let _ =
+                    task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, usage);
+                return 1;
+            }
+        };
+        output = append_projection_footer(output, Some(&projection));
         let output = async_subagent_result_payload(output, Some(completed_task.payload()));
-        stop_heartbeat();
         if task_registry
-            .complete_with_usage_and_lease(&lease, &agent_id, output, usage)
+            .complete_with_usage_and_lease(&task_lease, &agent_id, output, usage)
             .is_ok()
         {
             return 0;
@@ -238,10 +430,25 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             .or(child.final_message)
             .unwrap_or_else(|| format!("subagent ended with status {:?}", child.status));
         append_worktree_outcome(&mut error, worktree.as_ref());
+        let terminal = match child.status {
+            RunStatus::Cancelled => AgentTerminal::Cancelled {
+                reason: Some(error.clone()),
+            },
+            _ => AgentTerminal::Failed {
+                error: error.clone(),
+            },
+        };
+        let projection = commit_async_terminal(
+            &coordinator,
+            &continuation_lease,
+            Some(&shared_revision),
+            terminal,
+        )
+        .ok();
+        let error = append_projection_footer(error, projection.as_ref());
         let error = async_subagent_result_payload(error, Some(completed_task.payload()));
-        stop_heartbeat();
         if task_registry
-            .fail_with_usage_and_lease(&lease, &agent_id, error, usage)
+            .fail_with_usage_and_lease(&task_lease, &agent_id, error, usage)
             .is_ok()
         {
             return 1;
@@ -262,7 +469,7 @@ pub(crate) fn launch_async_subagent(
         task_registry,
         root_task_id,
     } = context;
-    let request = subagent::with_delegation_snapshot(
+    let mut request = subagent::with_delegation_snapshot(
         request,
         orca_core::config::DelegationSnapshot::from_config(config),
     );
@@ -276,9 +483,39 @@ pub(crate) fn launch_async_subagent(
             task: None,
         };
     }
-    let agent_type = serde_json::to_value(&request.subagent_type)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string));
+    let coordinator = match ChildAgentCoordinator::new(task_registry.clone()) {
+        Ok(coordinator) => coordinator,
+        Err(error) => {
+            return AsyncSubagentLaunchOutput {
+                result: tool_types::ToolResult::failed(
+                    tool_request,
+                    continuation_error("failed to initialize async continuation", &error),
+                    None,
+                ),
+                task: None,
+            };
+        }
+    };
+    let source = match request.resume_from.as_deref() {
+        Some(selector) => match coordinator.prepared(selector) {
+            Ok(source) => Some(source),
+            Err(error) => {
+                return AsyncSubagentLaunchOutput {
+                    result: tool_types::ToolResult::failed(
+                        tool_request,
+                        continuation_error("failed to resolve async continuation", &error),
+                        None,
+                    ),
+                    task: None,
+                };
+            }
+        },
+        None => None,
+    };
+    let agent_type = source
+        .as_ref()
+        .map(|source| source.compatibility.subagent_type.clone())
+        .or_else(|| serialized_subagent_type(&request.subagent_type));
     let task = task_registry.create_subagent_with_parent(
         request.description.clone(),
         agent_type,
@@ -299,11 +536,45 @@ pub(crate) fn launch_async_subagent(
             ),
         );
     }
-    let worktree_guard = if request.isolation == SubagentIsolation::Worktree {
-        match WorktreeGuard::create(cwd) {
-            Ok(guard) => Some(guard),
+    if let Some(source) = source.as_ref()
+        && let Err(error) = validate_resume_overrides(
+            tool_request,
+            &request.subagent_type,
+            request.model.as_deref(),
+            request.isolation,
+            source,
+        )
+    {
+        let _ = task_registry.fail(&agent_id, error.clone());
+        return async_launch_output(
+            task_registry,
+            &agent_id,
+            tool_types::ToolResult::failed(tool_request, error, None),
+        );
+    }
+    request.subagent_type = source
+        .as_ref()
+        .map(|source| SubagentType::from_str(&source.compatibility.subagent_type))
+        .unwrap_or(request.subagent_type);
+    request.model = source
+        .as_ref()
+        .map(|source| source.compatibility.model.clone())
+        .unwrap_or(request.model);
+    request.isolation = source
+        .as_ref()
+        .map(|source| source.compatibility.isolation)
+        .unwrap_or(request.isolation);
+    let delegation = request
+        .delegation
+        .clone()
+        .unwrap_or_else(|| orca_core::config::DelegationSnapshot::from_config(config));
+    let mut child_config = config.clone();
+    delegation.apply_to(&mut child_config, request.model.clone());
+    request.model = child_config.model.as_option();
+    let launch_worktree =
+        match prepare_async_launch_worktree(source.as_ref(), request.isolation, cwd) {
+            Ok(worktree) => worktree,
             Err(error) => {
-                let error = format!("failed to create subagent worktree: {error}");
                 let _ = task_registry.fail(&agent_id, error.clone());
                 return async_launch_output(
                     task_registry,
@@ -311,19 +582,94 @@ pub(crate) fn launch_async_subagent(
                     tool_types::ToolResult::failed(tool_request, error, None),
                 );
             }
-        }
-    } else {
-        None
-    };
-    let child_cwd = worktree_guard
+        };
+    let mcp_registry = orca_mcp::initialize_registry(&child_config.mcp_servers);
+    let worktree_binding = launch_worktree
+        .worker
         .as_ref()
-        .map(|guard| guard.path().to_path_buf())
-        .unwrap_or_else(|| cwd.to_path_buf());
-    let worktree = worktree_guard.as_ref().map(|guard| AsyncSubagentWorktree {
-        repo_root: guard.repo_root().to_path_buf(),
-        path: guard.path().to_path_buf(),
-    });
+        .map(|worktree| WorktreeBinding {
+            repo_root: worktree.repo_root.display().to_string(),
+            path: worktree.path.display().to_string(),
+        });
+    let compatibility_hash = match compute_continuation_compatibility_hash(
+        &request.subagent_type,
+        request.model.as_deref(),
+        request.isolation,
+        &launch_worktree.child_cwd.display().to_string(),
+        worktree_binding.as_ref(),
+        &delegation,
+        &mcp_registry,
+        &child_config.external_tools,
+    ) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let worktree = launch_worktree.finish_fresh();
+            let mut error = continuation_error("failed to compute async compatibility", &error);
+            append_worktree_outcome(&mut error, worktree.as_ref());
+            let _ = task_registry.fail(&agent_id, error.clone());
+            return async_launch_output(
+                task_registry,
+                &agent_id,
+                tool_types::ToolResult::failed(tool_request, error, None),
+            );
+        }
+    };
+    let compatibility = ContinuationCompatibility {
+        subagent_type: serialized_subagent_type(&request.subagent_type)
+            .unwrap_or_else(|| "general".to_string()),
+        model: request.model.clone(),
+        isolation: request.isolation,
+        effective_cwd: launch_worktree.child_cwd.display().to_string(),
+        worktree: worktree_binding,
+        compatibility_hash,
+    };
+    let prompt_id = AgentPromptId::new();
+    let prepared = match source.as_ref() {
+        Some(_) => coordinator.prepare_resume(ResumeContinuationInput {
+            selector: request
+                .resume_from
+                .clone()
+                .expect("resolved async resume source has selector"),
+            parent_task_id: root_task_id.map(str::to_string),
+            task_id: agent_id.clone(),
+            prompt_id,
+            compatibility,
+        }),
+        None => coordinator.create(CreateContinuationInput {
+            continuation_id: Some(AgentContinuationId::new()),
+            parent_task_id: root_task_id.map(str::to_string),
+            task_id: agent_id.clone(),
+            prompt_id,
+            compatibility,
+        }),
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let worktree = launch_worktree.finish_fresh();
+            let mut error = continuation_error("failed to prepare async continuation", &error);
+            append_worktree_outcome(&mut error, worktree.as_ref());
+            let _ = task_registry.fail(&agent_id, error.clone());
+            return async_launch_output(
+                task_registry,
+                &agent_id,
+                tool_types::ToolResult::failed(tool_request, error, None),
+            );
+        }
+    };
     if let Err(error) = task_registry.mark_worker_spawned(&agent_id, 0) {
+        let worktree = launch_worktree.finish_fresh();
+        let mut error = error;
+        append_worktree_outcome(&mut error, worktree.as_ref());
+        let projection = coordinator
+            .commit_prepared_terminal(
+                &prepared,
+                AgentTerminal::Failed {
+                    error: error.clone(),
+                },
+            )
+            .ok();
+        error = append_projection_footer(error, projection.as_ref());
         let _ = task_registry.fail(&agent_id, error.clone());
         return async_launch_output(
             task_registry,
@@ -332,22 +678,31 @@ pub(crate) fn launch_async_subagent(
         );
     }
     match spawn_async_subagent_worker(AsyncSubagentWorkerSpawnContext {
-        config,
+        config: &child_config,
         cwd,
-        child_cwd: &child_cwd,
+        child_cwd: &launch_worktree.child_cwd,
         task_session_id: task_registry.session_id(),
         agent_id: &agent_id,
         request: &request,
         child_depth: subagent_depth + 1,
-        worktree: worktree.as_ref(),
+        worktree: launch_worktree.worker.as_ref(),
     }) {
         Ok((child, process_job)) => {
             if let Err(error) =
                 task_registry.adopt_subagent_worker_with_job(&agent_id, child, process_job)
             {
-                let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
+                let worktree = launch_worktree.finish_fresh();
                 let mut error = format!("failed to own async subagent worker: {error}");
                 append_worktree_outcome(&mut error, worktree.as_ref());
+                let projection = coordinator
+                    .commit_prepared_terminal(
+                        &prepared,
+                        AgentTerminal::Failed {
+                            error: error.clone(),
+                        },
+                    )
+                    .ok();
+                error = append_projection_footer(error, projection.as_ref());
                 let _ = task_registry.fail(&agent_id, error.clone());
                 return async_launch_output(
                     task_registry,
@@ -355,12 +710,21 @@ pub(crate) fn launch_async_subagent(
                     tool_types::ToolResult::failed(tool_request, error, None),
                 );
             }
-            std::mem::forget(worktree_guard);
+            launch_worktree.detach();
         }
         Err(error) => {
-            let worktree = worktree_guard.and_then(|guard| guard.finish().ok());
+            let worktree = launch_worktree.finish_fresh();
             let mut error = format!("failed to start async subagent worker: {error}");
             append_worktree_outcome(&mut error, worktree.as_ref());
+            let projection = coordinator
+                .commit_prepared_terminal(
+                    &prepared,
+                    AgentTerminal::Failed {
+                        error: error.clone(),
+                    },
+                )
+                .ok();
+            error = append_projection_footer(error, projection.as_ref());
             let _ = task_registry.fail(&agent_id, error.clone());
             return async_launch_output(
                 task_registry,
@@ -370,10 +734,16 @@ pub(crate) fn launch_async_subagent(
         }
     }
 
+    let projection = coordinator.projection(&agent_id).ok();
     let output = serde_json::json!({
         "status": "async_launched",
         "agent_id": agent_id,
         "description": request.description,
+        "continuation_id": projection.as_ref().map(|projection| projection.continuation_id.to_string()),
+        "attempt_id": projection.as_ref().map(|projection| projection.attempt_id.to_string()),
+        "checkpoint_id": projection.as_ref().and_then(|projection| projection.checkpoint_id.as_ref().map(ToString::to_string)),
+        "resumable": projection.as_ref().is_some_and(|projection| projection.resumable),
+        "indeterminate": projection.as_ref().is_some_and(|projection| projection.indeterminate),
     })
     .to_string();
     async_launch_output(
@@ -391,6 +761,62 @@ fn async_launch_output(
     AsyncSubagentLaunchOutput {
         result,
         task: task_registry.summary(agent_id),
+    }
+}
+
+fn prepare_async_launch_worktree(
+    source: Option<&PreparedContinuation>,
+    isolation: SubagentIsolation,
+    parent_cwd: &Path,
+) -> Result<AsyncLaunchWorktree, String> {
+    if let Some(source) = source {
+        let child_cwd = PathBuf::from(&source.compatibility.effective_cwd);
+        if !child_cwd.is_dir() {
+            return Err(
+                "continuation_incompatible: inherited effective cwd is missing or not a directory"
+                    .to_string(),
+            );
+        }
+        let worker = match isolation {
+            SubagentIsolation::None => None,
+            SubagentIsolation::Worktree => {
+                let binding = source.compatibility.worktree.as_ref().ok_or_else(|| {
+                    "continuation_incompatible: worktree continuation has no durable binding"
+                        .to_string()
+                })?;
+                Some(AsyncSubagentWorktree {
+                    repo_root: PathBuf::from(&binding.repo_root),
+                    path: PathBuf::from(&binding.path),
+                })
+            }
+        };
+        return Ok(AsyncLaunchWorktree {
+            child_cwd,
+            worker,
+            fresh_guard: None,
+        });
+    }
+
+    match isolation {
+        SubagentIsolation::None => Ok(AsyncLaunchWorktree {
+            child_cwd: parent_cwd.to_path_buf(),
+            worker: None,
+            fresh_guard: None,
+        }),
+        SubagentIsolation::Worktree => {
+            let guard = WorktreeGuard::create(parent_cwd)
+                .map_err(|error| format!("failed to create subagent worktree: {error}"))?;
+            let child_cwd = guard.path().to_path_buf();
+            let worker = Some(AsyncSubagentWorktree {
+                repo_root: guard.repo_root().to_path_buf(),
+                path: child_cwd.clone(),
+            });
+            Ok(AsyncLaunchWorktree {
+                child_cwd,
+                worker,
+                fresh_guard: Some(guard),
+            })
+        }
     }
 }
 
@@ -584,12 +1010,16 @@ fn spawn_async_subagent_worker_via_runner(
     Ok((child, process_job))
 }
 
-fn prepare_async_subagent_worker_command(command: &mut ProcessCommand, agent_id: &str) {
+fn prepare_async_subagent_worker_command(
+    command: &mut ProcessCommand,
+    #[cfg_attr(windows, allow(unused_variables))] agent_id: &str,
+) {
     orca_tools::process::prepare_non_interactive_command(command);
     #[cfg(unix)]
     command.arg0(crate::tasks::subagent_worker_process_name(agent_id));
 }
 
+#[cfg(not(windows))]
 fn handoff_async_subagent_worker_api_key(
     child: &mut Child,
     api_key: Option<&str>,
@@ -621,6 +1051,70 @@ pub(crate) fn usage_totals_if_non_empty(usage: UsageTotals) -> Option<UsageTotal
     }
 }
 
+fn finish_async_worker_worktree(
+    worktree: Option<AsyncSubagentWorktree>,
+    owns_worktree: bool,
+) -> Option<crate::worktree::WorktreeOutcome> {
+    worktree.and_then(|worktree| {
+        if owns_worktree {
+            WorktreeGuard::finish_existing(worktree.repo_root, worktree.path).ok()
+        } else {
+            Some(crate::worktree::WorktreeOutcome {
+                path: worktree.path,
+                preserved: true,
+            })
+        }
+    })
+}
+
+fn commit_async_terminal(
+    coordinator: &ChildAgentCoordinator,
+    lease: &ContinuationLease,
+    shared_revision: Option<&Arc<Mutex<ContinuationRevision>>>,
+    terminal: AgentTerminal,
+) -> Result<ContinuationProjection, crate::agent_continuation::AgentContinuationError> {
+    if let Some(shared_revision) = shared_revision {
+        let mut revision = shared_revision.lock().map_err(|_| {
+            crate::agent_continuation::AgentContinuationError::Persistence {
+                message: "async continuation revision lock is poisoned".to_string(),
+            }
+        })?;
+        let projection =
+            commit_continuation_write_with_retry(coordinator, lease, *revision, |revision| {
+                coordinator.commit_terminal(lease, revision, terminal.clone())
+            })?;
+        *revision = projection.revision;
+        return Ok(projection);
+    }
+    let revision = coordinator
+        .projection(lease.continuation_id.as_str())?
+        .revision;
+    commit_continuation_write_with_retry(coordinator, lease, revision, |revision| {
+        coordinator.commit_terminal(lease, revision, terminal.clone())
+    })
+}
+
+fn append_projection_footer(
+    mut output: String,
+    projection: Option<&ContinuationProjection>,
+) -> String {
+    if let Some(projection) = projection {
+        output.push_str("\n\n");
+        output.push_str(&continuation_footer(projection));
+    }
+    output
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 pub(crate) fn async_subagent_result_payload(
     output: String,
     task: Option<serde_json::Value>,
@@ -645,6 +1139,21 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn inherited_async_worktree_is_preserved() {
+        let outcome = finish_async_worker_worktree(
+            Some(AsyncSubagentWorktree {
+                repo_root: PathBuf::from("/missing/repo"),
+                path: PathBuf::from("/missing/inherited-worktree"),
+            }),
+            false,
+        )
+        .expect("worktree outcome");
+
+        assert!(outcome.preserved);
+        assert_eq!(outcome.path, PathBuf::from("/missing/inherited-worktree"));
+    }
 
     #[test]
     fn process_local_registry_rejects_async_subagent_before_spawn() {

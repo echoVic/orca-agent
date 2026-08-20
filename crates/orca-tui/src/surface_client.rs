@@ -1078,11 +1078,12 @@ pub(crate) fn read_goal(
     }))
 }
 
-pub(crate) fn edit_goal(
+pub(crate) fn edit_goal_with_committed(
     thread: &RuntimeSurfaceThreadHandle,
     objective: String,
+    committed: impl FnOnce(),
 ) -> io::Result<SurfaceProjectionState> {
-    mutate_idle_goal(thread, |goal| {
+    mutate_idle_goal_with_committed(thread, committed, |goal| {
         Ok(GoalMutationAction::Edit {
             fence: goal_fence(goal),
             objective: NonEmptyText::try_new(objective)
@@ -1139,6 +1140,14 @@ fn mutate_idle_goal(
     thread: &RuntimeSurfaceThreadHandle,
     action: impl FnOnce(&SurfaceGoal) -> io::Result<GoalMutationAction>,
 ) -> io::Result<SurfaceProjectionState> {
+    mutate_idle_goal_with_committed(thread, || {}, action)
+}
+
+fn mutate_idle_goal_with_committed(
+    thread: &RuntimeSurfaceThreadHandle,
+    committed: impl FnOnce(),
+    action: impl FnOnce(&SurfaceGoal) -> io::Result<GoalMutationAction>,
+) -> io::Result<SurfaceProjectionState> {
     let surface = thread.surface();
     let attachment = attach_goal(&surface, false)?;
     let snapshot = &attachment.baseline.snapshot;
@@ -1153,6 +1162,7 @@ fn mutate_idle_goal(
     let output = committed_goal_output(
         result.map_err(|error| io::Error::other(format!("typed TUI Goal failed: {error:?}")))?,
     )?;
+    committed();
     committed_goal_projection(thread, &output.change_cursor)
 }
 
@@ -1188,16 +1198,18 @@ fn goal_projection_cursor_covers_commit(
         && snapshot_cursor.next_seq >= committed_cursor.next_seq
 }
 
-pub(crate) fn set_goal_and_run(
+pub(crate) fn set_goal_and_run_with_committed(
     thread: &RuntimeSurfaceThreadHandle,
     objective: String,
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
+    committed: impl FnOnce(),
 ) -> io::Result<TuiHostedOperationOutcome> {
     run_goal_mutation(
         thread,
         controller,
         event_tx,
+        committed,
         || {},
         move |snapshot| {
             let objective = NonEmptyText::try_new(objective)
@@ -1227,6 +1239,7 @@ pub(crate) fn resume_goal_and_run(
         controller,
         event_tx,
         || {},
+        || {},
         move |snapshot| {
             let goal = snapshot
                 .goal
@@ -1247,22 +1260,30 @@ pub(crate) fn resume_goal_and_run_with_started(
     event_tx: &mpsc::Sender<TuiEvent>,
     started: impl FnOnce(),
 ) -> io::Result<TuiHostedOperationOutcome> {
-    run_goal_mutation(thread, controller, event_tx, started, move |snapshot| {
-        let goal = snapshot
-            .goal
-            .as_ref()
-            .ok_or_else(|| io::Error::other("no goal is currently set"))?;
-        Ok(GoalMutationAction::ResumeAndRun {
-            fence: goal_fence(goal),
-            input: supplied_goal_input(&prompt)?,
-        })
-    })
+    run_goal_mutation(
+        thread,
+        controller,
+        event_tx,
+        || {},
+        started,
+        move |snapshot| {
+            let goal = snapshot
+                .goal
+                .as_ref()
+                .ok_or_else(|| io::Error::other("no goal is currently set"))?;
+            Ok(GoalMutationAction::ResumeAndRun {
+                fence: goal_fence(goal),
+                input: supplied_goal_input(&prompt)?,
+            })
+        },
+    )
 }
 
 fn run_goal_mutation(
     thread: &RuntimeSurfaceThreadHandle,
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
+    committed: impl FnOnce(),
     started: impl FnOnce(),
     action: impl FnOnce(&SurfaceSnapshot) -> io::Result<GoalMutationAction>,
 ) -> io::Result<TuiHostedOperationOutcome> {
@@ -1283,6 +1304,7 @@ fn run_goal_mutation(
             )
             .map_err(|error| io::Error::other(format!("typed TUI Goal failed: {error:?}")))?,
     )?;
+    committed();
     let goal = output
         .goal
         .as_ref()

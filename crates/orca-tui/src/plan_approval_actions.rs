@@ -49,17 +49,19 @@ fn implement(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
         .pre_plan_approval_mode
         .unwrap_or_else(ApprovalMode::default);
     state.plan_approval_dialog = None;
-    state.resume_queued_follow_up_autosend();
     state.enter_running();
 
     let _ = action_tx.send(UserAction::ImplementApprovedPlan {
         prompt: IMPLEMENT_APPROVED_PLAN_PROMPT.to_string(),
         approval_mode: target_mode,
     });
+    state.request_runtime_queue_start();
+    state.resume_queued_follow_up_autosend();
 }
 
 fn stay_in_plan_mode(state: &mut AppState) {
     state.plan_approval_dialog = None;
+    state.request_runtime_queue_start();
     state.resume_queued_follow_up_autosend();
     state.push_message(crate::types::ChatMessage::System(
         "Staying in Plan mode. Send feedback to revise the plan.".to_string(),

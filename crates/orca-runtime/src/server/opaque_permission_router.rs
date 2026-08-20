@@ -58,7 +58,6 @@ pub(super) struct JsonlRepairAuthorityPermit {
 }
 
 pub(super) struct JsonlLiveRequestAdmission {
-    pub(super) connection_id: SurfaceConnectionId,
     pub(super) opaque_request_id: String,
     pub(super) owner: JsonlRetiredRequestOwner,
     pub(super) retirement_sequence: JsonlRetirementSequence,
@@ -67,8 +66,6 @@ pub(super) struct JsonlLiveRequestAdmission {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum JsonlOwnerSettlement {
-    InteractionApplied,
-    InteractionDeferredToRuntime,
     InteractionRecoveryRetained,
     CommandExecFailedBeforeExecution,
 }
@@ -166,7 +163,7 @@ pub(super) struct JsonlConnectionAdmission {
 }
 
 struct JsonlConnectionAdmissionState {
-    connection_id: SurfaceConnectionId,
+    _connection_id: SurfaceConnectionId,
     started_at: Instant,
     ingress_closed: bool,
     next_opaque_suffix: u64,
@@ -179,6 +176,7 @@ struct JsonlConnectionAdmissionState {
 }
 
 impl JsonlConnectionAdmission {
+    #[cfg(test)]
     pub(super) fn new_ephemeral() -> Self {
         Self::new(
             SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -189,7 +187,7 @@ impl JsonlConnectionAdmission {
     pub(super) fn new(connection_id: SurfaceConnectionId) -> Self {
         Self {
             state: Arc::new(Mutex::new(JsonlConnectionAdmissionState {
-                connection_id,
+                _connection_id: connection_id,
                 started_at: Instant::now(),
                 ingress_closed: false,
                 next_opaque_suffix: 0,
@@ -251,7 +249,6 @@ impl JsonlConnectionAdmission {
         state.live_count += 1;
         state.repair_authority_count += 1;
         Ok(JsonlLiveRequestAdmission {
-            connection_id: state.connection_id.clone(),
             opaque_request_id,
             owner,
             retirement_sequence: JsonlRetirementSequence(retirement_sequence),
@@ -458,18 +455,6 @@ impl<T: Clone> JsonlOpaquePermissionRouter<T> {
         })
     }
 
-    pub(super) fn route(&self, request_id: &str) -> io::Result<Option<T>> {
-        if self.admission.tombstone(request_id)?.is_some() {
-            return Ok(None);
-        }
-        Ok(self
-            .routes
-            .lock()
-            .map_err(lock_error)?
-            .get(request_id)
-            .map(|entry| entry.route.clone()))
-    }
-
     pub(super) fn published_route(&self, request_id: &str) -> io::Result<Option<T>> {
         if self.admission.tombstone(request_id)?.is_some() {
             return Ok(None);
@@ -603,31 +588,6 @@ impl<T: Clone> JsonlOpaquePermissionRouter<T> {
                 "JSONL permission route has a different committed repair witness",
             )),
         }
-    }
-
-    pub(super) fn close_routes(
-        &self,
-        owner_settlement: JsonlOwnerSettlement,
-    ) -> io::Result<Vec<JsonlRequestTombstone>> {
-        let request_ids = self
-            .routes
-            .lock()
-            .map_err(lock_error)?
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        request_ids
-            .iter()
-            .filter_map(|request_id| {
-                self.settle(
-                    request_id,
-                    JsonlRetiredRequestSettlement::TransportRetired {
-                        owner_settlement: owner_settlement.clone(),
-                    },
-                )
-                .transpose()
-            })
-            .collect()
     }
 
     pub(super) fn committed_replay(

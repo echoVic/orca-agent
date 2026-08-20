@@ -14,6 +14,7 @@ use orca_platform::process::ProcessJob;
 
 use super::LiveThread;
 #[cfg(not(test))]
+#[cfg(not(test))]
 use super::ORCA_HOME_ENV;
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{

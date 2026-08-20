@@ -512,6 +512,11 @@ impl RuntimeToolActorContext {
             "current_activity": record.subagent_current_activity,
             "turn": record.subagent_turn,
             "last_activity_at_ms": record.last_activity_at_ms,
+            "continuation_id": record.continuation_id,
+            "attempt_id": record.continuation_attempt_id,
+            "checkpoint_id": record.continuation_checkpoint_id,
+            "resumable": record.continuation_resumable,
+            "indeterminate": record.continuation_indeterminate,
         })
         .to_string();
         ToolResult::completed(request, output, false)
@@ -713,6 +718,7 @@ fn task_summary_json(task: BackgroundTaskSummary) -> Value {
         "command": task.command,
         "tool": task.tool,
         "pendingToolCall": task.pending_tool_call,
+        "continuation": task.continuation,
     })
 }
 
@@ -874,6 +880,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,

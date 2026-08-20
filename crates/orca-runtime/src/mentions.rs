@@ -603,7 +603,7 @@ pub struct MentionBinding {
     pub target: MentionTarget,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MentionBindings {
     text: String,
     bindings: Vec<MentionBinding>,

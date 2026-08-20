@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.25":
+        "Adds runtime-owned, checkpointable continuation lineages for synchronous subagents, async workers, and Workflow children. Leased attempts, revision fencing, digest-verified conversation checkpoints, compatibility identities, pre-dispatch replay boundaries, and cold orphan reconciliation resume only safe durable facts and fail closed on indeterminate side effects; retryable resumable Workflow attempts retain their worktree. The durable prompt queue projects one admission and lifecycle model across TUI, ACP, JSONL, and Headless, routes Alt+Up editing through a revision-checked delete, restores rejected prompts, and bounds previews. The TUI keeps large ordinary-chat pastes as compact chips while sending the complete text, enforces the 1 MiB limit, and materializes active Goal pastes and oversized objectives into validated ORCA_HOME attachment files with cleanup on uncommitted failure.",
       "v0.3.24":
         "Unifies tool approval, permission requests, user input, and MCP elicitation behind one durable interaction broker across TUI, ACP, JSONL, and Headless. Restartable intents, exact route and response fencing, durable invocation receipts, pre-side-effect permission retry, and stable continuation operation identities make crash recovery deterministic without replaying ambiguous side effects. Recovered answers retain user-level trust, ACP continuations preserve their surface origin and capabilities, and timed-out Headless callbacks cannot create unbounded worker threads. The obsolete RuntimePendingInteractionStore compatibility API is removed.",
       "v0.3.23":
@@ -610,6 +612,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.3.25":
+        "为同步子代理、异步 worker 和 Workflow 子代理新增 runtime-owned、可检查点恢复的 continuation lineage。带 lease 的 attempt、revision fencing、摘要校验的会话 checkpoint、兼容性身份、工具分发前 replay boundary 与冷启动 orphan reconciliation 只恢复安全的持久化事实，对副作用不明的状态保持 fail closed；可重试且可恢复的 Workflow attempt 会保留 worktree。Durable prompt queue 在 TUI、ACP、JSONL 和 Headless 上投影同一套准入与生命周期，Alt+Up 编辑通过 revision-checked delete 提交，失败准入恢复完整 prompt，预览保持有界。TUI 以紧凑 chip 保存普通聊天大文本并在提交时恢复全文，执行 1 MiB 上限；Goal 中仍有效的 paste 和超长 objective 会写入经过路径校验的 ORCA_HOME 附件，未提交失败会自动清理。",
       "v0.3.24":
         "将工具审批、权限请求、用户输入和 MCP elicitation 统一到同一个持久化 interaction broker，并覆盖 TUI、ACP、JSONL 与 Headless。可恢复 intent、精确路由与回答 fencing、持久化 invocation receipt、仅限副作用前的权限重试，以及稳定 continuation operation identity，让崩溃恢复保持确定性且不会重放副作用不明的操作。恢复后的回答保持用户级信任，ACP continuation 保留原 surface 来源与能力，Headless 回调超时后也不会继续无界创建线程；旧 RuntimePendingInteractionStore 兼容 API 已删除。",
       "v0.3.23":

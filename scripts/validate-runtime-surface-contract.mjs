@@ -1153,6 +1153,8 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:input_history.record", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:settings.update", 1],
   ["crates/orca-tui/src/plan_approval_actions.rs:implement:user_action.route", 1],
+  ["crates/orca-tui/src/queued_input.rs:request_runtime_queue_pause:user_action.route", 1],
+  ["crates/orca-tui/src/queued_input.rs:request_runtime_queue_start:user_action.route", 1],
   ["crates/orca-tui/src/running_actions.rs:handle_running_shortcut:user_action.route", 2],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:user_action.route", 1],
   ["crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:workflow.continue", 2],
@@ -1162,14 +1164,16 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/session_picker_actions.rs:dispatch_selected_resume:user_action.route", 1],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:user_action.route", 1],
-  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:user_action.route", 12],
-  ["crates/orca-tui/src/slash_command_actions.rs:handle_slash_command:input_history.record", 1],
+  ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 13],
+  [
+    "crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:input_history.record",
+    1,
+  ],
   ["crates/orca-tui/src/slash_menu_actions.rs:handle_slash_menu_key:user_action.route", 1],
   ["crates/orca-tui/src/status_key_actions.rs:handle_recovery_prompt_key:user_action.route", 1],
   ["crates/orca-tui/src/surface_actions.rs:backtrack_last_user:thread.backtrack_last_user", 1],
   ["crates/orca-tui/src/surface_actions.rs:remember:memory.update", 2],
   ["crates/orca-tui/src/surface_actions.rs:save_api_key:credentials.update", 2],
-  ["crates/orca-tui/src/queued_input.rs:commit_queued_submission_admission:input_history.record", 1],
   ["crates/orca-tui/src/types.rs:update:input_history.record", 1],
   ["crates/orca-tui/src/workflow_notifications.rs:submit_pending_workflow_notification:user_action.route", 1],
   ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 2],
@@ -1257,13 +1261,23 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     1,
   ],
   [
-    "crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up:state.atomic_skill_tokens.clear",
+    "crates/orca-tui/src/queued_input.rs:replace_runtime_projection:self.composers_by_id.insert",
     1,
   ],
-  ["crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up:state.mention_bindings.clear", 1],
-  ["crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up:state.pending_pastes.clear", 1],
   [
-    "crates/orca-tui/src/queued_input_actions.rs:restore_latest_queued_message:state.atomic_skill_tokens.clear",
+    "crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up_to_runtime:state.atomic_skill_tokens.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up_to_runtime:state.mention_bindings.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/queued_input_actions.rs:enqueue_composer_follow_up_to_runtime:state.pending_pastes.clear",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/runtime_event_actions.rs:handle_runtime_event:state.atomic_skill_tokens.clear",
     1,
   ],
   [
@@ -1288,7 +1302,6 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/transcript_search.rs:insert_char:self.query.insert", 1],
   ["crates/orca-tui/src/transcript_search.rs:open_new:self.matches.clear", 1],
   ["crates/orca-tui/src/transcript_search.rs:open_new:self.query.clear", 1],
-  ["crates/orca-tui/src/transcript_search.rs:replace_query:self.query.clear", 1],
   ["crates/orca-tui/src/transcript_view.rs:extract_text:current_line.clear", 1],
   ["crates/orca-tui/src/transcript_view.rs:invalidate:self.dirty_indices.insert", 1],
   ["crates/orca-tui/src/transcript_view.rs:prepare_entry:self.spinner_indices.insert", 1],
@@ -1790,18 +1803,18 @@ function commandRow(manifest, table, name) {
 function invariantRegistry() {
   return new Map([
     [
-      "source_facts has exactly 53 unique variants matching EventType at baseline",
+      "source_facts has exactly 58 unique variants matching EventType at baseline",
       (manifest) => {
-        assertCondition(manifest.source_facts.length === 53, "source_facts must contain 53 rows");
+        assertCondition(manifest.source_facts.length === 58, "source_facts must contain 58 rows");
         assertUnique(manifest.source_facts.map((row) => row[0]), "source_facts");
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 36 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 38 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 36,
-          "current_tui_user_actions must contain 36 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 38,
+          "current_tui_user_actions must contain 38 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

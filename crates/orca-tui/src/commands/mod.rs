@@ -15,6 +15,7 @@ pub enum SlashCommand {
     Mode(Option<String>),
     Plan(Option<String>),
     Goal(GoalSlashCommand),
+    Queue(QueueSlashCommand),
     WorkflowList,
     WorkflowRun { name: String, args: Option<String> },
     AgentDashboard,
@@ -39,6 +40,13 @@ pub enum GoalSlashCommand {
     Clear,
     Pause,
     Resume,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueSlashCommand {
+    List,
+    Pause,
+    Start,
 }
 
 pub fn parse(input: &str) -> Option<SlashCommand> {
@@ -120,6 +128,12 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
             optional_single_argument(parts).map(|arg| SlashCommand::Plan(arg.map(str::to_string)))
         }
         "goal" => parse_goal(parts.collect::<Vec<_>>().join(" ")).map(SlashCommand::Goal),
+        "queue" => match optional_single_argument(parts)? {
+            None | Some("list") => Some(SlashCommand::Queue(QueueSlashCommand::List)),
+            Some("pause") => Some(SlashCommand::Queue(QueueSlashCommand::Pause)),
+            Some("start") => Some(SlashCommand::Queue(QueueSlashCommand::Start)),
+            Some(_) => None,
+        },
         command if command.starts_with("workflow:") => {
             let name = command.trim_start_matches("workflow:").trim();
             if name.is_empty() {
@@ -172,6 +186,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/mode", "Switch approval mode"),
         ("/plan", "Plan first, then approve implementation"),
         ("/goal", "Manage a persistent goal"),
+        ("/queue", "List, pause, or start queued prompts"),
         ("/workflow:<name>", "Run a saved workflow"),
         ("/workflows", "Show workflow tasks"),
         ("/agents", "Show workflow agent dashboard"),
@@ -487,6 +502,27 @@ mod tests {
             Some(SlashCommand::Goal(GoalSlashCommand::Resume))
         );
         assert_eq!(parse("/goal edit"), None);
+    }
+
+    #[test]
+    fn parses_queue_commands() {
+        assert_eq!(
+            parse("/queue"),
+            Some(SlashCommand::Queue(QueueSlashCommand::List))
+        );
+        assert_eq!(
+            parse("/queue list"),
+            Some(SlashCommand::Queue(QueueSlashCommand::List))
+        );
+        assert_eq!(
+            parse("/queue pause"),
+            Some(SlashCommand::Queue(QueueSlashCommand::Pause))
+        );
+        assert_eq!(
+            parse("/queue start"),
+            Some(SlashCommand::Queue(QueueSlashCommand::Start))
+        );
+        assert_eq!(parse("/queue invalid"), None);
     }
 
     #[test]

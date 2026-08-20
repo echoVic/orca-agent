@@ -189,6 +189,8 @@ pub(crate) enum SessionRecord {
         plan_digest: Vec<u8>,
         record: crate::runtime_surface::StoredShutdownBarrierRecordV1,
     },
+    #[serde(rename = "runtime.prompt_queue.snapshot")]
+    PromptQueueSnapshot(crate::prompt_queue::PromptQueueSnapshot),
     #[serde(rename = "plan.state")]
     PlanState {
         explanation: Option<String>,

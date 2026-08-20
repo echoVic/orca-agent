@@ -3,7 +3,54 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-18
+Last updated: 2026-08-20
+
+The v0.3.25 release publishes the checkpointable child-agent continuation
+lineage together with the runtime-owned durable prompt queue and Codex-style
+Goal paste materialization. Queue admission, pause/start control, dispatch,
+recovery, rejection, and terminal projection now share one durable revisioned
+model across TUI, ACP, JSONL, and Headless. Queue editing uses a
+revision-checked runtime delete, failed admission restores the complete prompt,
+and previews stream into a bounded 256-character prefix instead of copying a
+queued 1 MiB body on every frame. The TUI preserves large ordinary chat paste
+bodies behind compact chips and enforces the 1 MiB expanded-input limit without
+writing files. `/goal` set and edit actions retain draft paste
+identity through the asynchronous action boundary, write only active pastes to
+`ORCA_HOME/attachments/<uuid>/pasted-text-N.txt`, and move objectives above
+4000 characters into `goal-objective.md`. Path checks confine managed files to
+the current attachment directory; uncommitted failures clean the attempt,
+while a committed Goal mutation retains the files it references.
+
+The 2026-08-20 checkpointable child-agent continuation slice gives synchronous
+subagents, async worker-owned subagents, and Workflow child agents one
+runtime-owned lineage model. UUIDv7 continuation, attempt, prompt, and
+checkpoint identities are persisted with revision CAS and lease-epoch fencing.
+Each safe checkpoint contains the normalized non-system conversation, reasoning
+and tool terminal facts, summary state, bounded internal context, budget usage,
+turn cursor, compatibility digest, and a canonical payload digest. Resume
+rebuilds the current system prompt, restores those durable facts, and appends a
+new user prompt; it never restores a Rust future, thread stack, or process.
+
+Tool dispatch persists its replay boundary before execution. `SafeToRetry` and
+keyed-idempotent calls can recover from the preceding checkpoint, while an
+`IndeterminateAfterStart` call blocks automatic replay until a later safe
+checkpoint covers its observed terminal result. Expired owners are reconciled
+before legacy active-task recovery: a safe checkpoint becomes `Suspended`, and
+an owner without a safe replay boundary becomes `Indeterminate`. Async task and
+continuation leases renew under the same owner fence, stale workers cannot
+commit checkpoints or terminals, and worker-spawn failures settle prepared
+attempts without consuming a resume opportunity.
+
+Workflow completed-result caching remains the first resume fast path. A failed
+or interrupted Workflow child with a compatible safe checkpoint resumes the
+same child conversation; incompatible context and indeterminate side effects
+fail closed instead of entering transient retry. Task summaries and
+`subagent_status` publish the same continuation id, attempt id, checkpoint id,
+resumable, and indeterminate fields to TUI, ACP, JSONL, and headless consumers.
+Worktree continuation inherits the recorded path only if it still exists and
+never silently creates a replacement. Retryable resumable Workflow attempts
+retain that path until the continuation settles, so a clean worktree is not
+removed before the next attempt can resume it.
 
 The 2026-08-18 Durable Interaction Broker completion closes the pending-store
 deletion gate. Tool Approval, Permission Request, User Input, and MCP
@@ -70,7 +117,10 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.3.23 adds thread-owned interactive `exec_command` and
+Current baseline: v0.3.25 adds checkpointable child-agent continuation,
+runtime-owned durable prompt queues, and Codex-style Goal paste
+materialization. It builds on v0.3.24's durable four-interaction broker and
+v0.3.23's thread-owned interactive `exec_command` and
 `write_stdin` sessions with optional PTY, raw control input, bounded output,
 task-based process-tree control, and a single-owner background supervisor that
 settles natural exits and external stop requests without another poll. It also

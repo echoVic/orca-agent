@@ -1056,7 +1056,16 @@ fn every_manifest_patch_inventory_has_an_exhaustive_rust_match() {
         ),
         (
             "subagent_patch_variants",
-            &["Started", "Progress", "Completed"],
+            &[
+                "Started",
+                "Progress",
+                "Completed",
+                "ContinuationCheckpointed",
+                "ContinuationSuspended",
+                "ContinuationResumed",
+                "ContinuationOrphanReconciled",
+                "ContinuationIndeterminate",
+            ],
         ),
         (
             "goal_patch_variants",

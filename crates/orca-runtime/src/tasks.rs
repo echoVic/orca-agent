@@ -17,8 +17,8 @@ use orca_core::conversation::RawToolCall;
 use orca_core::cost_types::UsageTotals;
 use orca_core::provider_types::{ProviderResponse, ProviderStep, ToolCallProgress, Usage};
 use orca_core::task_types::{
-    BackgroundTaskSummary, PendingToolCallSummary, TaskActivitySummary, TaskStatus, TaskType,
-    WorkflowAgentTaskSummary, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
+    BackgroundTaskSummary, PendingToolCallSummary, TaskActivitySummary, TaskContinuationSummary,
+    TaskStatus, TaskType, WorkflowAgentTaskSummary, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
 use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::ModelResponseIdentity;
@@ -28,6 +28,10 @@ use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write};
 use orca_platform::process::ProcessJob;
 use serde::{Deserialize, Serialize};
 
+use crate::agent_continuation::{
+    AgentAttemptId, AgentCheckpointId, AgentContinuationId, AgentContinuationStore,
+    ContinuationProjection, ContinuationRevision,
+};
 use crate::lifecycle::{
     RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord, RuntimeUsageTotals,
 };
@@ -93,17 +97,33 @@ impl fmt::Display for TaskLeaseError {
 
 impl std::error::Error for TaskLeaseError {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TaskRegistry {
     session_id: String,
     owner_id: String,
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
     cancelled_roots: Arc<Mutex<HashSet<String>>>,
     typed_provider_outcomes: Arc<Mutex<HashMap<String, DurableTypedProviderOutcome>>>,
+    continuation_store: AgentContinuationStore,
     persistence: Option<Arc<TaskPersistence>>,
     persistent_open_error: Option<Arc<str>>,
     recover_persisted_active_tasks: bool,
     artifact_storage: Arc<TaskArtifactStorage>,
+}
+
+impl fmt::Debug for TaskRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TaskRegistry")
+            .field("session_id", &self.session_id)
+            .field("persistent", &self.persistence.is_some())
+            .field("persistent_open_error", &self.persistent_open_error)
+            .field(
+                "recover_persisted_active_tasks",
+                &self.recover_persisted_active_tasks,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -382,6 +402,12 @@ pub struct TaskRecord {
     pub subagent_current_activity: Option<String>,
     pub subagent_turn: Option<u32>,
     pub last_activity_at_ms: Option<i64>,
+    pub(crate) continuation_id: Option<AgentContinuationId>,
+    pub(crate) continuation_attempt_id: Option<AgentAttemptId>,
+    pub(crate) continuation_checkpoint_id: Option<AgentCheckpointId>,
+    pub(crate) continuation_revision: Option<ContinuationRevision>,
+    pub(crate) continuation_resumable: bool,
+    pub(crate) continuation_indeterminate: bool,
     pub result: Option<String>,
     pub error: Option<String>,
     pub retry_count: u32,
@@ -394,6 +420,29 @@ pub struct TaskRecord {
     pub stop_requested: bool,
     pub publication_revision: u64,
     pub control: TaskControl,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaskContinuationProjection {
+    pub(crate) continuation_id: AgentContinuationId,
+    pub(crate) attempt_id: AgentAttemptId,
+    pub(crate) checkpoint_id: Option<AgentCheckpointId>,
+    pub(crate) revision: ContinuationRevision,
+    pub(crate) resumable: bool,
+    pub(crate) indeterminate: bool,
+}
+
+impl From<&ContinuationProjection> for TaskContinuationProjection {
+    fn from(projection: &ContinuationProjection) -> Self {
+        Self {
+            continuation_id: projection.continuation_id.clone(),
+            attempt_id: projection.attempt_id.clone(),
+            checkpoint_id: projection.checkpoint_id.clone(),
+            revision: projection.revision,
+            resumable: projection.resumable,
+            indeterminate: projection.indeterminate,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -482,6 +531,18 @@ struct PersistedTaskRecord {
     subagent_turn: Option<u32>,
     #[serde(default)]
     last_activity_at_ms: Option<i64>,
+    #[serde(default)]
+    continuation_id: Option<AgentContinuationId>,
+    #[serde(default)]
+    continuation_attempt_id: Option<AgentAttemptId>,
+    #[serde(default)]
+    continuation_checkpoint_id: Option<AgentCheckpointId>,
+    #[serde(default)]
+    continuation_revision: Option<ContinuationRevision>,
+    #[serde(default)]
+    continuation_resumable: bool,
+    #[serde(default)]
+    continuation_indeterminate: bool,
     result: Option<String>,
     error: Option<String>,
     #[serde(default)]
@@ -565,12 +626,14 @@ impl TaskRegistry {
     }
 
     pub fn new(session_id: String) -> Self {
+        let continuation_store = AgentContinuationStore::new(session_id.clone());
         Self {
             session_id,
             owner_id: new_task_lease_owner_id(std::process::id()),
             inner: Arc::new(Mutex::new(HashMap::new())),
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
+            continuation_store,
             persistence: None,
             persistent_open_error: None,
             recover_persisted_active_tasks: false,
@@ -593,15 +656,75 @@ impl TaskRegistry {
         root: PathBuf,
         recover_interrupted: bool,
     ) -> io::Result<Self> {
+        let continuation_store =
+            AgentContinuationStore::new_persistent(session_id.clone(), root.clone())
+                .map_err(io::Error::other)?;
         let persistence = Arc::new(TaskPersistence::new(root, session_id.clone()));
-        let typed_provider_outcomes = persistence.load_typed_provider_outcomes(&session_id)?;
-        let _session_lock = ExclusiveFileLock::acquire(&persistence.session_lock_path(&session_id))
-            .map_err(io::Error::other)?;
+        let continuation_reconciliation = if recover_interrupted {
+            Some(
+                continuation_store
+                    .reconcile_expired_owners_locked()
+                    .map_err(io::Error::other)?,
+            )
+        } else {
+            None
+        };
+        let _session_lock = if continuation_reconciliation.is_none() {
+            Some(
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&session_id))
+                    .map_err(io::Error::other)?,
+            )
+        } else {
+            None
+        };
+        let typed_provider_outcomes =
+            persistence.load_typed_provider_outcomes_unlocked(&session_id)?;
         let mut records = persistence.load_session_records_unlocked(&session_id)?;
         let mut changed = false;
         if recover_interrupted {
+            let continuation_projections = continuation_reconciliation
+                .as_ref()
+                .map(|reconciliation| reconciliation.projections())
+                .unwrap_or_default();
+            let reconciled_task_ids = continuation_projections
+                .iter()
+                .map(|projection| projection.latest_task_id.clone())
+                .collect::<HashSet<_>>();
+            for projection in continuation_projections {
+                let Some(record) = records.get_mut(&projection.latest_task_id) else {
+                    continue;
+                };
+                let task_projection = TaskContinuationProjection::from(projection);
+                if record.continuation_projection().as_ref() != Some(&task_projection) {
+                    record.set_continuation_projection(task_projection);
+                    record.publication_revision = record.publication_revision.saturating_add(1);
+                    changed = true;
+                }
+                if !is_terminal(record.status) && (projection.resumable || projection.indeterminate)
+                {
+                    record.status = TaskStatus::Failed;
+                    record.completed_at_ms = Some(now_ms());
+                    record.worker_pid = None;
+                    record.lease_owner = None;
+                    record.lease_expires_at_ms = None;
+                    record.result = None;
+                    record.error = Some(if projection.indeterminate {
+                        "subagent continuation is indeterminate after owner expiry; inspect external state before retrying"
+                            .to_string()
+                    } else {
+                        format!(
+                            "subagent interrupted after a safe checkpoint; resume_from={}",
+                            projection.continuation_id
+                        )
+                    });
+                    record.publication_revision = record.publication_revision.saturating_add(1);
+                    changed = true;
+                }
+            }
             for (task_id, record) in &mut records {
-                if !typed_provider_outcomes.contains_key(task_id) {
+                if !reconciled_task_ids.contains(task_id)
+                    && !typed_provider_outcomes.contains_key(task_id)
+                {
                     changed |= mark_interrupted_if_active(record);
                 }
             }
@@ -616,6 +739,7 @@ impl TaskRegistry {
             inner: Arc::new(Mutex::new(records)),
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
+            continuation_store,
             persistence: Some(persistence),
             persistent_open_error: None,
             recover_persisted_active_tasks: recover_interrupted,
@@ -698,6 +822,52 @@ impl TaskRegistry {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub(crate) fn continuation_store(&self) -> Result<AgentContinuationStore, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        Ok(self.continuation_store.clone())
+    }
+
+    pub(crate) fn install_continuation_projection(
+        &self,
+        id: &str,
+        projection: &ContinuationProjection,
+    ) -> Result<(), String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        if projection.latest_task_id != id {
+            return Err(format!(
+                "continuation projection targets task '{}', not '{id}'",
+                projection.latest_task_id
+            ));
+        }
+        let projection = TaskContinuationProjection::from(projection);
+        self.mutate_task(id, move |record| {
+            let changed = record.continuation_projection().as_ref() != Some(&projection);
+            if changed {
+                record.set_continuation_projection(projection);
+            }
+            Ok(((), changed))
+        })
+    }
+
+    pub(crate) fn continuation_projection(
+        &self,
+        id: &str,
+    ) -> Result<Option<TaskContinuationProjection>, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        let record = if self.persistence.is_some() {
+            self.refresh_task_from_persistence(id)?
+        } else {
+            self.get(id)
+        };
+        Ok(record.and_then(|record| record.continuation_projection()))
     }
 
     pub(crate) fn with_terminal_main_session_reconciliation<R>(
@@ -1096,6 +1266,12 @@ impl TaskRegistry {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation_id: None,
+            continuation_attempt_id: None,
+            continuation_checkpoint_id: None,
+            continuation_revision: None,
+            continuation_resumable: false,
+            continuation_indeterminate: false,
             result: None,
             error: None,
             retry_count: 0,
@@ -1183,6 +1359,12 @@ impl TaskRegistry {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation_id: None,
+            continuation_attempt_id: None,
+            continuation_checkpoint_id: None,
+            continuation_revision: None,
+            continuation_resumable: false,
+            continuation_indeterminate: false,
             result: None,
             error: None,
             retry_count: 0,
@@ -1277,6 +1459,12 @@ impl TaskRegistry {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation_id: None,
+            continuation_attempt_id: None,
+            continuation_checkpoint_id: None,
+            continuation_revision: None,
+            continuation_resumable: false,
+            continuation_indeterminate: false,
             result: None,
             error: None,
             retry_count: 0,
@@ -1338,6 +1526,12 @@ impl TaskRegistry {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation_id: None,
+            continuation_attempt_id: None,
+            continuation_checkpoint_id: None,
+            continuation_revision: None,
+            continuation_resumable: false,
+            continuation_indeterminate: false,
             result: None,
             error: None,
             retry_count: 0,
@@ -2661,15 +2855,6 @@ impl TaskPersistence {
         write_json_pretty(&self.session_tasks_path(session_id), &persisted)
     }
 
-    fn load_typed_provider_outcomes(
-        &self,
-        session_id: &str,
-    ) -> io::Result<HashMap<String, DurableTypedProviderOutcome>> {
-        let _session_lock = ExclusiveFileLock::acquire(&self.session_lock_path(session_id))
-            .map_err(io::Error::other)?;
-        self.load_typed_provider_outcomes_unlocked(session_id)
-    }
-
     fn load_typed_provider_outcomes_unlocked(
         &self,
         session_id: &str,
@@ -2802,6 +2987,11 @@ impl RuntimeSubagentStatusLookup for TaskRegistry {
             subagent_current_activity: record.subagent_current_activity,
             subagent_turn: record.subagent_turn,
             last_activity_at_ms: record.last_activity_at_ms,
+            continuation_id: record.continuation_id.map(|id| id.to_string()),
+            continuation_attempt_id: record.continuation_attempt_id.map(|id| id.to_string()),
+            continuation_checkpoint_id: record.continuation_checkpoint_id.map(|id| id.to_string()),
+            continuation_resumable: record.continuation_resumable,
+            continuation_indeterminate: record.continuation_indeterminate,
         })
     }
 }
@@ -2842,6 +3032,12 @@ impl PersistedTaskRecord {
             subagent_current_activity: self.subagent_current_activity,
             subagent_turn: self.subagent_turn,
             last_activity_at_ms: self.last_activity_at_ms,
+            continuation_id: self.continuation_id,
+            continuation_attempt_id: self.continuation_attempt_id,
+            continuation_checkpoint_id: self.continuation_checkpoint_id,
+            continuation_revision: self.continuation_revision,
+            continuation_resumable: self.continuation_resumable,
+            continuation_indeterminate: self.continuation_indeterminate,
             result: self.result,
             error: self.error,
             retry_count: self.retry_count,
@@ -2873,6 +3069,26 @@ impl PersistedTaskRecord {
 impl TaskRecord {
     fn from_persisted(record: PersistedTaskRecord) -> (Self, bool) {
         record.into_task_record()
+    }
+
+    fn continuation_projection(&self) -> Option<TaskContinuationProjection> {
+        Some(TaskContinuationProjection {
+            continuation_id: self.continuation_id.clone()?,
+            attempt_id: self.continuation_attempt_id.clone()?,
+            checkpoint_id: self.continuation_checkpoint_id.clone(),
+            revision: self.continuation_revision?,
+            resumable: self.continuation_resumable,
+            indeterminate: self.continuation_indeterminate,
+        })
+    }
+
+    fn set_continuation_projection(&mut self, projection: TaskContinuationProjection) {
+        self.continuation_id = Some(projection.continuation_id);
+        self.continuation_attempt_id = Some(projection.attempt_id);
+        self.continuation_checkpoint_id = projection.checkpoint_id;
+        self.continuation_revision = Some(projection.revision);
+        self.continuation_resumable = projection.resumable;
+        self.continuation_indeterminate = projection.indeterminate;
     }
 }
 
@@ -2909,6 +3125,12 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             subagent_current_activity: record.subagent_current_activity.clone(),
             subagent_turn: record.subagent_turn,
             last_activity_at_ms: record.last_activity_at_ms,
+            continuation_id: record.continuation_id.clone(),
+            continuation_attempt_id: record.continuation_attempt_id.clone(),
+            continuation_checkpoint_id: record.continuation_checkpoint_id.clone(),
+            continuation_revision: record.continuation_revision,
+            continuation_resumable: record.continuation_resumable,
+            continuation_indeterminate: record.continuation_indeterminate,
             result: record.result.clone(),
             error: record.error.as_deref().map(redact_sensitive_text),
             retry_count: record.retry_count,
@@ -3134,6 +3356,16 @@ fn task_summary(record: &TaskRecord) -> BackgroundTaskSummary {
         subagent_current_activity: record.subagent_current_activity.clone(),
         subagent_turn: record.subagent_turn,
         last_activity_at_ms: record.last_activity_at_ms,
+        continuation: record
+            .continuation_projection()
+            .map(|projection| TaskContinuationSummary {
+                continuation_id: projection.continuation_id.to_string(),
+                attempt_id: projection.attempt_id.to_string(),
+                checkpoint_id: projection.checkpoint_id.map(|id| id.to_string()),
+                revision: projection.revision.get(),
+                resumable: projection.resumable,
+                indeterminate: projection.indeterminate,
+            }),
         result: record.result.clone(),
         error: record.error.clone(),
         retry_count: record.retry_count,
@@ -3147,8 +3379,10 @@ fn terminate_worker(worker: &mut OwnedWorker) {
     orca_tools::process::kill_child_tree(&mut worker.child);
 }
 
+#[cfg(unix)]
 const SUBAGENT_WORKER_PROCESS_PREFIX: &str = "orca-subagent-worker-";
 
+#[cfg(unix)]
 pub(crate) fn subagent_worker_process_name(agent_id: &str) -> String {
     format!("{SUBAGENT_WORKER_PROCESS_PREFIX}{agent_id}")
 }
@@ -3194,6 +3428,7 @@ fn verify_recovered_worker(pid: u32, agent_id: &str) -> Result<RecoveredWorkerSt
     Ok(RecoveredWorkerState::Matches)
 }
 
+#[cfg(unix)]
 fn subagent_worker_command_matches(command_line: &str, agent_id: &str) -> bool {
     let arguments = command_line.split_whitespace().collect::<Vec<_>>();
     let expected = subagent_worker_process_name(agent_id);
@@ -3489,7 +3724,7 @@ fn task_type_label(task_type: TaskType) -> &'static str {
     }
 }
 
-fn safe_path_component(value: &str) -> String {
+pub(crate) fn safe_path_component(value: &str) -> String {
     value
         .chars()
         .map(|ch| {
@@ -4192,6 +4427,40 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("interrupted before completion")
+        );
+        assert!(recovered.completed_at_ms.is_some());
+    }
+
+    #[test]
+    fn persistent_registry_recovers_active_task_with_unmatched_partial_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let session_id = "partial-continuation-recovery".to_string();
+        let registry = TaskRegistry::new_persistent(session_id.clone(), root.clone()).unwrap();
+        let task = registry.create_subagent("resume partial state".to_string(), None);
+        registry.mark_running(&task.id).unwrap();
+        registry
+            .with_tasks(|tasks| {
+                tasks
+                    .get_mut(&task.id)
+                    .expect("task record")
+                    .continuation_id = Some(AgentContinuationId::new());
+                registry
+                    .persist_current_task(tasks, &task.id)
+                    .expect("persist partial continuation");
+            })
+            .expect("task registry lock");
+        drop(registry);
+
+        let reloaded = TaskRegistry::new_persistent(session_id, root).unwrap();
+        let recovered = reloaded.get(&task.id).expect("persistent task record");
+
+        assert_eq!(recovered.status, TaskStatus::Failed);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("interrupted before completion"))
         );
         assert!(recovered.completed_at_ms.is_some());
     }
@@ -5286,6 +5555,7 @@ mod tests {
         let _ = unrelated.wait();
     }
 
+    #[cfg(unix)]
     #[test]
     fn recovered_worker_identity_accepts_current_and_legacy_launch_shapes() {
         let agent_id = "task-1234";

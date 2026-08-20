@@ -257,7 +257,10 @@ fn workflow_run_returns_before_slow_workflow_completes() {
 
     wait_for_workflow_terminal_status(temp.path(), Some(&home), task_id);
     let completed = workflow_show(temp.path(), Some(&home), task_id);
-    assert_eq!(completed["status"], "completed");
+    assert_eq!(
+        completed["status"], "completed",
+        "slow workflow did not complete: {completed}"
+    );
 }
 
 #[test]
@@ -610,7 +613,6 @@ fn wait_until_active(
     task_id: &str,
 ) -> Value {
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = Value::Null;
     loop {
         let show = workflow_show(cwd, home, task_id);
         let status = show["status"].as_str().unwrap_or_default();
@@ -621,10 +623,9 @@ fn wait_until_active(
             !matches!(status, "completed" | "failed" | "stopped" | "cancelled"),
             "workflow reached terminal state before it could be observed active: {show}"
         );
-        last = show;
         assert!(
             Instant::now() < deadline,
-            "workflow task {task_id} never became active within 20s (last: {last})"
+            "workflow task {task_id} never became active within 20s (last: {show})"
         );
         thread::sleep(Duration::from_millis(50));
     }

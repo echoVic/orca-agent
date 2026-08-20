@@ -9,7 +9,7 @@ pub mod seatbelt;
 pub mod bwrap;
 // The launch helpers are only invoked from the non-macOS (Linux) platform
 // block; keep the module compiled everywhere for testing without warnings.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod linux;
 
 const PROTECTED_METADATA_DIRS: [&str; 3] = [".git", ".agents", ".codex"];

@@ -236,6 +236,7 @@ impl TranscriptSearchState {
         self.invalidate_prepared();
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_query(&mut self, query: &str) {
         self.query.clear();
         self.query.push_str(query);
@@ -486,6 +487,7 @@ impl AppState {
         self.transcript_search.close();
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_transcript_search_query(&mut self, query: &str) {
         self.transcript_search.replace_query(query);
     }

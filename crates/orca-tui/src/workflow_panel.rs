@@ -315,6 +315,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(activity_at_ms),
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,

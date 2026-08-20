@@ -294,6 +294,22 @@ impl JsonlSurfaceAdapter {
             })
     }
 
+    pub fn prompt_queue(
+        &self,
+        thread_id: &str,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<
+        crate::prompt_queue::PromptQueueSnapshot,
+        crate::prompt_queue::PromptQueueMutationError,
+    > {
+        if let Some(binding) = self.threads.get(thread_id) {
+            return binding.thread.prompt_queue(action);
+        }
+        self.ephemeral_thread(thread_id)
+            .ok_or(crate::prompt_queue::PromptQueueMutationError::RuntimeUnavailable)?
+            .prompt_queue(action)
+    }
+
     fn ephemeral_thread(&self, thread_id: &str) -> Option<RuntimeSurfaceThreadHandle> {
         self.ephemeral_threads
             .lock()

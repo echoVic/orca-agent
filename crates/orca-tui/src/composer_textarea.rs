@@ -4,6 +4,7 @@ use crate::theme::Theme;
 use crate::vim::VimState;
 
 pub(crate) const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+pub(crate) const MAX_USER_INPUT_TEXT_CHARS: usize = 1 << 20;
 
 pub(crate) fn make_textarea<'a>(vim_state: &VimState, theme: &Theme) -> TextArea<'a> {
     let mut textarea = TextArea::default();
@@ -185,7 +186,7 @@ pub(crate) fn retain_active_pending_pastes(
     pending_pastes.retain(|(placeholder, _)| active_placeholders.contains(placeholder));
 }
 
-fn locate_pending_pastes(
+pub(crate) fn locate_pending_pastes(
     visible_text: &str,
     pending_pastes: &[(String, String)],
 ) -> Vec<(usize, usize, usize)> {

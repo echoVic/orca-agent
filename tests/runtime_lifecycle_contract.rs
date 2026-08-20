@@ -1938,6 +1938,11 @@ fn tool_actor_context_executes_subagent_status_against_runtime_lookup() {
     assert_eq!(output["agent_type"], "general");
     assert_eq!(output["output"], "finished async audit");
     assert_eq!(output["error"], Value::Null);
+    assert_eq!(output["continuation_id"], "continuation-1");
+    assert_eq!(output["attempt_id"], "attempt-2");
+    assert_eq!(output["checkpoint_id"], "checkpoint-3");
+    assert_eq!(output["resumable"], true);
+    assert_eq!(output["indeterminate"], false);
 }
 
 #[test]
@@ -2196,6 +2201,11 @@ impl RuntimeSubagentStatusLookup for FakeSubagentStatusLookup {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation_id: Some("continuation-1".to_string()),
+            continuation_attempt_id: Some("attempt-2".to_string()),
+            continuation_checkpoint_id: Some("checkpoint-3".to_string()),
+            continuation_resumable: true,
+            continuation_indeterminate: false,
         })
     }
 }

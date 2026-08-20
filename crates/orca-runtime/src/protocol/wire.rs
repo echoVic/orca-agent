@@ -93,6 +93,10 @@ pub enum ClientOp {
         thread_id: String,
         title: Option<String>,
     },
+    ThreadQueue {
+        thread_id: String,
+        action: crate::prompt_queue::PromptQueueAction,
+    },
     TurnInterrupt {
         thread_id: Option<String>,
         turn_id: String,
@@ -276,6 +280,12 @@ pub(super) struct WireParams {
     pub(super) search_term: Option<String>,
     #[serde(default)]
     pub(super) title: Option<String>,
+    #[serde(rename = "expectedRevision", default)]
+    pub(super) expected_revision: Option<u64>,
+    #[serde(rename = "queueId", default)]
+    pub(super) queue_id: Option<String>,
+    #[serde(rename = "orderedIds", default)]
+    pub(super) ordered_ids: Vec<String>,
     #[serde(rename = "shellId", default)]
     pub(super) shell_id: Option<String>,
     #[serde(default)]
@@ -350,8 +360,27 @@ pub(super) struct WireParams {
     result_limit: Option<usize>,
 }
 
+impl Default for WireParams {
+    fn default() -> Self {
+        serde_json::from_value(Value::Object(Default::default()))
+            .expect("empty JSON object is valid wire params")
+    }
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn required_queue_revision(
+    id: &Value,
+    value: Option<u64>,
+) -> Result<crate::prompt_queue::QueueRevision, DecodeError> {
+    value
+        .map(crate::prompt_queue::QueueRevision::from_u64)
+        .ok_or_else(|| DecodeError {
+            id: id.clone(),
+            message: "thread/queue mutation params.expectedRevision is required".to_string(),
+        })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -744,6 +773,89 @@ impl Submission {
                     op: ClientOp::ThreadMetadataUpdate {
                         thread_id,
                         title: wire.params.and_then(|params| params.title),
+                    },
+                })
+            }
+            (
+                _,
+                Some(
+                    method @ ("thread/queue/list"
+                    | "thread/queue/add"
+                    | "thread/queue/update"
+                    | "thread/queue/delete"
+                    | "thread/queue/reorder"
+                    | "thread/queue/pause"
+                    | "thread/queue/start"),
+                ),
+            ) => {
+                let params = wire.params.unwrap_or_default();
+                let parse_id = |value: Option<String>| {
+                    crate::prompt_queue::QueuedSubmissionId::parse(value.unwrap_or_default())
+                        .map_err(|message| DecodeError {
+                            id: wire.id.clone(),
+                            message,
+                        })
+                };
+                let action = match method {
+                    "thread/queue/list" => crate::prompt_queue::PromptQueueAction::List,
+                    "thread/queue/add" => crate::prompt_queue::PromptQueueAction::Add {
+                        input: match params.input {
+                            Some(WireInputParam::Text(value)) => value.into(),
+                            _ => crate::prompt_queue::PromptQueueInput::text(""),
+                        },
+                    },
+                    "thread/queue/update" => crate::prompt_queue::PromptQueueAction::Update {
+                        expected_revision: required_queue_revision(
+                            &wire.id,
+                            params.expected_revision,
+                        )?,
+                        id: parse_id(params.queue_id)?,
+                        input: match params.input {
+                            Some(WireInputParam::Text(value)) => value.into(),
+                            _ => crate::prompt_queue::PromptQueueInput::text(""),
+                        },
+                    },
+                    "thread/queue/delete" => crate::prompt_queue::PromptQueueAction::Delete {
+                        expected_revision: required_queue_revision(
+                            &wire.id,
+                            params.expected_revision,
+                        )?,
+                        id: parse_id(params.queue_id)?,
+                    },
+                    "thread/queue/reorder" => crate::prompt_queue::PromptQueueAction::Reorder {
+                        expected_revision: required_queue_revision(
+                            &wire.id,
+                            params.expected_revision,
+                        )?,
+                        ordered_ids: params
+                            .ordered_ids
+                            .into_iter()
+                            .map(crate::prompt_queue::QueuedSubmissionId::parse)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|message| DecodeError {
+                                id: wire.id.clone(),
+                                message,
+                            })?,
+                    },
+                    "thread/queue/pause" => crate::prompt_queue::PromptQueueAction::Pause {
+                        expected_revision: required_queue_revision(
+                            &wire.id,
+                            params.expected_revision,
+                        )?,
+                    },
+                    "thread/queue/start" => crate::prompt_queue::PromptQueueAction::Start {
+                        expected_revision: required_queue_revision(
+                            &wire.id,
+                            params.expected_revision,
+                        )?,
+                    },
+                    _ => unreachable!(),
+                };
+                Ok(Self {
+                    id: wire.id,
+                    op: ClientOp::ThreadQueue {
+                        thread_id: params.thread_id.unwrap_or_default(),
+                        action,
                     },
                 })
             }
@@ -1872,6 +1984,48 @@ mod tests {
                 title: Some("renamed thread".to_string())
             }
         );
+    }
+
+    #[test]
+    fn submission_decodes_prompt_queue_wire_contract_bits_spec_ut() {
+        let queue_id = uuid::Uuid::now_v7().to_string();
+        let add = Submission::decode(
+            r#"{"id":"queue-add","method":"thread/queue/add","params":{"threadId":"thread-1","input":"follow up"}}"#,
+        )
+        .expect("queue add submission");
+        assert!(matches!(
+            add.op,
+            ClientOp::ThreadQueue {
+                thread_id,
+                action: crate::prompt_queue::PromptQueueAction::Add { input },
+            } if thread_id == "thread-1" && input.text == "follow up"
+        ));
+
+        let update = Submission::decode(&format!(
+            r#"{{"id":"queue-update","method":"thread/queue/update","params":{{"threadId":"thread-1","expectedRevision":7,"queueId":"{queue_id}","input":"edited"}}}}"#
+        ))
+        .expect("queue update submission");
+        assert!(matches!(
+            update.op,
+            ClientOp::ThreadQueue {
+                action: crate::prompt_queue::PromptQueueAction::Update {
+                    expected_revision,
+                    input,
+                    ..
+                },
+                ..
+            } if expected_revision.get() == 7 && input.text == "edited"
+        ));
+
+        let missing_revision = Submission::decode(&format!(
+            r#"{{"id":"queue-update-missing-revision","method":"thread/queue/update","params":{{"threadId":"thread-1","queueId":"{queue_id}","input":"edited"}}}}"#
+        ))
+        .expect_err("queue mutation without expectedRevision must fail");
+        assert_eq!(
+            missing_revision.id,
+            Value::from("queue-update-missing-revision")
+        );
+        assert!(missing_revision.message.contains("expectedRevision"));
     }
 
     #[test]

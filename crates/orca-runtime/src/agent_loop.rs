@@ -1,6 +1,7 @@
 use std::io;
 
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
+use crate::child_agent_loop_setup::try_prepare_child_agent_conversation;
 use crate::cost::CostTracker;
 use crate::lifecycle::{
     AgentLoopContext, AgentLoopOutcome, RuntimeSessionLifecycle, RuntimeTaskActor,
@@ -149,6 +150,12 @@ pub(crate) fn run_agent_loop(
     Ok(outcome)
 }
 
+/// Executes the real production child kernel. Without a checkpoint observer it
+/// preserves the owned bootstrap path; with one it prepares an isolated fresh
+/// or resumed conversation, borrows that conversation into the kernel, and
+/// lets settled turn boundaries synchronously persist through the observer.
+/// Setup, checkpoint, and provider failures terminate the child with an I/O
+/// error; successful completion returns the child terminal and operation usage.
 pub(crate) fn execute_child_agent_loop<W: io::Write>(
     config: &RunConfig,
     request: &ChildAgentRequest,
@@ -164,6 +171,37 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         &fallback_task_registry
     };
     let mut background_workflows = Vec::new();
+    let mut checkpoint_conversation = runtime
+        .checkpoint_observer
+        .map(|_| {
+            try_prepare_child_agent_conversation(
+                config,
+                request,
+                runtime.cwd,
+                runtime.instructions,
+                runtime.memory,
+            )
+            .map(|prepared| prepared.conversation)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "child continuation setup failed [{}]: {error}",
+                        error.contract_code()
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+    let conversation_context = match (
+        checkpoint_conversation.as_mut(),
+        runtime.checkpoint_observer,
+    ) {
+        (Some(conversation), Some(observer)) => {
+            AgentConversationContext::borrowed_with_checkpoint_observer(conversation, observer)
+        }
+        _ => AgentConversationContext::owned(),
+    };
     let child = run_agent_loop(
         config,
         AgentLoopContext::new(
@@ -188,7 +226,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         ),
         runtime.events,
         runtime.sink,
-        AgentConversationContext::owned(),
+        conversation_context,
         AgentToolPolicyContext::new(
             request.allowed_tools.as_deref(),
             request.tool_policy_label.as_deref(),

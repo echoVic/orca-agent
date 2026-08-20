@@ -383,6 +383,11 @@ pub struct RuntimeSubagentStatusRecord {
     pub subagent_current_activity: Option<String>,
     pub subagent_turn: Option<u32>,
     pub last_activity_at_ms: Option<i64>,
+    pub continuation_id: Option<String>,
+    pub continuation_attempt_id: Option<String>,
+    pub continuation_checkpoint_id: Option<String>,
+    pub continuation_resumable: bool,
+    pub continuation_indeterminate: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

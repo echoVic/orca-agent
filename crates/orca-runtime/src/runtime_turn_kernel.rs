@@ -75,6 +75,9 @@ impl<'a> RuntimeTurnKernel<'a> {
         history_writer: Option<&'response mut SessionWriter>,
         cost_tracker: &'response mut CostTracker,
         background_workflows: &'response mut Vec<BackgroundWorkflowRun>,
+        checkpoint_observer: Option<
+            &'response dyn crate::child_agent_types::ChildAgentCheckpointSink,
+        >,
     ) -> RuntimeProviderResponseInput<'response, W>
     where
         'a: 'response,
@@ -94,6 +97,7 @@ impl<'a> RuntimeTurnKernel<'a> {
                 history_writer,
                 cost_tracker,
                 background_workflows,
+                checkpoint_observer,
             },
         }
     }

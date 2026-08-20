@@ -89,6 +89,7 @@ fn runtime<'a>(
         lifecycle: None,
         task_registry: None,
         root_task_id: None,
+        checkpoint_observer: None,
         executor,
     })
 }
@@ -1323,6 +1324,7 @@ fn run_child_agent_applies_subagent_model_override() {
         allowed_tools: None,
         tool_policy_label: None,
         workflow_ipc: None,
+        continuation: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());
@@ -1353,6 +1355,7 @@ fn run_child_agent_ignores_auto_override() {
         allowed_tools: None,
         tool_policy_label: None,
         workflow_ipc: None,
+        continuation: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());
@@ -1381,6 +1384,7 @@ fn run_child_agent_preserves_cost_tracker_on_loop_error() {
         allowed_tools: None,
         tool_policy_label: None,
         workflow_ipc: None,
+        continuation: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());

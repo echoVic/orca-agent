@@ -115,6 +115,42 @@ impl TuiSurfaceTaskControl {
         true
     }
 
+    pub(crate) fn queue_prompt(
+        &self,
+        prompt: String,
+        bindings: orca_runtime::mentions::MentionBindings,
+    ) -> io::Result<Option<orca_runtime::prompt_queue::PromptQueueSnapshot>> {
+        let surface = self.lock_hosted().surface_active.clone();
+        let Some(surface) = surface else {
+            return Ok(None);
+        };
+        surface
+            .client
+            .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Add {
+                input: orca_runtime::prompt_queue::PromptQueueInput {
+                    text: prompt,
+                    mention_bindings: bindings,
+                },
+            })
+            .map(Some)
+            .map_err(|error| io::Error::other(format!("runtime prompt queue failed: {error:?}")))
+    }
+
+    pub(crate) fn prompt_queue_action(
+        &self,
+        action: orca_runtime::prompt_queue::PromptQueueAction,
+    ) -> io::Result<Option<orca_runtime::prompt_queue::PromptQueueSnapshot>> {
+        let surface = self.lock_hosted().surface_active.clone();
+        let Some(surface) = surface else {
+            return Ok(None);
+        };
+        surface
+            .client
+            .prompt_queue(action)
+            .map(Some)
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
     pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
         let surface = self.lock_hosted().surface_active.clone();
         let Some(surface) = surface else {

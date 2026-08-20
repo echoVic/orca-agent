@@ -276,6 +276,11 @@ pub enum ServerEvent {
         thread_id: Value,
         title: Value,
     },
+    ThreadQueueSnapshot {
+        #[serde(rename = "threadId")]
+        thread_id: Value,
+        snapshot: Value,
+    },
     TurnControlled {
         action: Value,
         #[serde(rename = "turnId")]

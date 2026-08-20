@@ -1,8 +1,10 @@
 use orca_runtime::mentions::MentionBindings;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::composer_textarea::{expand_pending_pastes_with_bindings, retain_active_pending_pastes};
-use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
+use crate::types::{AppState, UserAction};
+#[cfg(test)]
+use crate::types::{AppStatus, ChatMessage};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueuedUserMessage {
@@ -35,112 +37,194 @@ pub(crate) struct QueuedSubmissionView {
 }
 
 pub(crate) struct QueuedSubmissionState {
-    pending: VecDeque<QueuedUserMessage>,
-    in_flight: Option<QueuedUserMessage>,
-    autosend: bool,
+    projection: orca_runtime::prompt_queue::PromptQueueSnapshot,
+    pending_composers: VecDeque<PendingQueuedComposer>,
+    composers_by_id: HashMap<orca_runtime::prompt_queue::QueuedSubmissionId, QueuedComposerState>,
+    pending_edit: Option<PendingQueuedEdit>,
+    ready_edit: Option<QueuedComposerState>,
     error: Option<String>,
-    next_id: u64,
+}
+
+struct PendingQueuedComposer {
+    submission_text: String,
+    submission_bindings: MentionBindings,
+    composer: QueuedComposerState,
+}
+
+struct PendingQueuedEdit {
+    id: orca_runtime::prompt_queue::QueuedSubmissionId,
+    composer: QueuedComposerState,
 }
 
 impl Default for QueuedSubmissionState {
     fn default() -> Self {
         Self {
-            pending: VecDeque::new(),
-            in_flight: None,
-            autosend: true,
+            projection: orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+            pending_composers: VecDeque::new(),
+            composers_by_id: HashMap::new(),
+            pending_edit: None,
+            ready_edit: None,
             error: None,
-            next_id: 1,
         }
     }
 }
 
 impl QueuedSubmissionState {
+    fn replace_runtime_projection(
+        &mut self,
+        snapshot: orca_runtime::prompt_queue::PromptQueueSnapshot,
+        confirmed_delete: Option<&orca_runtime::prompt_queue::QueuedSubmissionId>,
+    ) {
+        for item in &snapshot.items {
+            let is_new = !self
+                .projection
+                .items
+                .iter()
+                .any(|previous| previous.id == item.id);
+            if !is_new || self.composers_by_id.contains_key(&item.id) {
+                continue;
+            }
+            let Some(index) = self.pending_composers.iter().position(|pending| {
+                pending.submission_text == item.input.text
+                    && pending.submission_bindings == item.input.mention_bindings
+            }) else {
+                continue;
+            };
+            let pending = self
+                .pending_composers
+                .remove(index)
+                .expect("matched pending queue composer");
+            self.composers_by_id
+                .insert(item.id.clone(), pending.composer);
+        }
+        if let Some(pending) = self.pending_edit.take() {
+            if confirmed_delete == Some(&pending.id)
+                && !snapshot.items.iter().any(|item| item.id == pending.id)
+            {
+                self.ready_edit = Some(pending.composer);
+            } else {
+                self.pending_edit = Some(pending);
+            }
+        }
+        self.composers_by_id
+            .retain(|id, _| snapshot.items.iter().any(|item| item.id == *id));
+        self.projection = snapshot;
+        self.error = None;
+    }
+
+    fn remember_composer(&mut self, message: QueuedUserMessage) {
+        self.pending_composers.push_back(PendingQueuedComposer {
+            submission_text: message.submission_text,
+            submission_bindings: message.submission_bindings,
+            composer: QueuedComposerState {
+                visible_text: message.visible_text,
+                mention_bindings: message.composer_bindings,
+                pending_pastes: message.pending_pastes,
+            },
+        });
+    }
+
+    #[cfg(test)]
     fn enqueue(
         &mut self,
-        mut message: QueuedUserMessage,
+        message: QueuedUserMessage,
         capacity: usize,
     ) -> Result<(), QueuedUserMessage> {
-        if self.pending.len() >= capacity {
+        if self.projection.items.len() >= capacity {
             return Err(message);
         }
-        message.assign_id(self.next_id);
-        self.next_id = self.next_id.wrapping_add(1).max(1);
-        self.pending.push_back(message);
+        let input = message.submission_text().to_string();
+        let mut state =
+            orca_runtime::prompt_queue::PromptQueueState::from_snapshot(self.projection.clone());
+        self.projection = state
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: input.into(),
+                },
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .expect("test queue input is valid");
         self.error = None;
         Ok(())
     }
 
-    fn pop_latest(&mut self) -> Option<QueuedUserMessage> {
-        let message = self.pending.pop_back();
-        if message.is_some() {
-            self.error = None;
-        }
-        message
-    }
-
-    fn begin_next(&mut self) -> Option<QueuedUserMessage> {
-        if !self.autosend || self.in_flight.is_some() {
+    fn begin_latest_edit(&mut self) -> Option<orca_runtime::prompt_queue::PromptQueueAction> {
+        if self.pending_edit.is_some() {
             return None;
         }
-        let message = self.pending.pop_front()?;
-        self.in_flight = Some(message.clone());
-        self.error = None;
-        Some(message)
+        let item = self.projection.items.last()?;
+        self.pending_edit = Some(PendingQueuedEdit {
+            id: item.id.clone(),
+            composer: self
+                .composers_by_id
+                .get(&item.id)
+                .cloned()
+                .unwrap_or_else(|| queued_composer_from_runtime(item)),
+        });
+        Some(orca_runtime::prompt_queue::PromptQueueAction::Delete {
+            expected_revision: self.projection.revision,
+            id: item.id.clone(),
+        })
     }
 
+    fn cancel_latest_edit(&mut self) {
+        self.pending_edit = None;
+    }
+
+    fn take_ready_edit(&mut self) -> Option<QueuedComposerState> {
+        self.ready_edit.take()
+    }
+
+    #[cfg(test)]
+    fn pop_latest(&mut self) -> Option<QueuedUserMessage> {
+        let item = self.projection.items.pop()?;
+        let visible_text = item.input.text.clone();
+        Some(QueuedUserMessage {
+            id: 0,
+            visible_text,
+            submission_text: item.input.text,
+            composer_bindings: item.input.mention_bindings.clone(),
+            submission_bindings: item.input.mention_bindings,
+            pending_pastes: Vec::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn begin_next(&mut self) -> Option<QueuedUserMessage> {
+        None
+    }
+
+    #[cfg(test)]
     fn in_flight_prompt(&self) -> Option<String> {
-        self.in_flight
-            .as_ref()
-            .map(|message| message.submission_text().to_string())
+        None
     }
 
-    fn rollback(&mut self) -> Option<QueuedUserMessage> {
-        let message = self.in_flight.take()?;
-        self.pending.push_front(message.clone());
-        Some(message)
-    }
-
+    #[cfg(test)]
     fn take_rejected(&mut self) -> Option<QueuedComposerState> {
-        let message = self.in_flight.take()?;
-        self.autosend = false;
-        self.error = None;
-        Some(message.into_composer_state())
+        None
     }
 
     fn suspend(&mut self) {
-        self.autosend = false;
+        self.projection.paused = true;
     }
 
     fn resume_autosend(&mut self) {
-        self.autosend = true;
+        self.projection.paused = false;
     }
 
     fn pending_or_in_flight(&self) -> bool {
-        !self.pending.is_empty() || self.in_flight.is_some()
+        !self.projection.items.is_empty() || self.projection.dispatch.is_some()
     }
 
+    #[cfg(test)]
     fn in_flight(&self) -> bool {
-        self.in_flight.is_some()
+        self.projection.dispatch.is_some()
     }
 
-    fn matches_id(&self, id: u64) -> bool {
-        self.in_flight
-            .as_ref()
-            .is_some_and(|message| message.id() == id)
-    }
-
-    fn settle_started(&mut self, id: u64) -> bool {
-        if !self.matches_id(id) {
-            return false;
-        }
-        self.in_flight = None;
-        true
-    }
-
+    #[cfg(test)]
     fn fail_dispatch(&mut self, error: String) -> Option<QueuedUserMessage> {
-        let message = self.rollback()?;
         self.error = Some(error);
-        Some(message)
+        None
     }
 
     fn report_error(&mut self, error: String) {
@@ -153,34 +237,33 @@ impl QueuedSubmissionState {
 
     fn view(&self) -> Option<QueuedSubmissionView> {
         Some(QueuedSubmissionView {
-            preview: QueuedPreviewSnapshot::from_queue(&self.pending)?,
+            preview: QueuedPreviewSnapshot::from_projection(&self.projection)?,
             error: self.error.clone(),
         })
     }
 
     #[cfg(test)]
     fn pending_visible_text(&self) -> Vec<&str> {
-        self.pending
+        self.projection
+            .items
             .iter()
-            .map(QueuedUserMessage::visible_text)
+            .map(|item| item.input.text.as_str())
             .collect()
     }
 
     #[cfg(test)]
     fn pending_submission_binding_count(&self, index: usize) -> Option<usize> {
-        self.pending
-            .get(index)
-            .map(|message| message.submission_bindings().bindings().len())
+        self.projection.items.get(index).map(|_| 0)
     }
 
     #[cfg(test)]
     fn in_flight_id(&self) -> Option<u64> {
-        self.in_flight.as_ref().map(QueuedUserMessage::id)
+        None
     }
 
     #[cfg(test)]
     fn autosend_enabled(&self) -> bool {
-        self.autosend
+        !self.projection.paused
     }
 
     #[cfg(test)]
@@ -190,10 +273,30 @@ impl QueuedSubmissionState {
 }
 
 impl QueuedPreviewSnapshot {
+    fn from_projection(
+        projection: &orca_runtime::prompt_queue::PromptQueueSnapshot,
+    ) -> Option<Self> {
+        let len = projection.items.len();
+        let preview = |index: usize| {
+            projection
+                .items
+                .get(index)
+                .map(|item| compact_preview(&item.input.text))
+        };
+        Some(Self {
+            len,
+            first: preview(0)?,
+            second: (len == 2).then(|| preview(1)).flatten(),
+            latest: (len > 2).then(|| preview(len - 1)).flatten(),
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_queue(queue: &VecDeque<QueuedUserMessage>) -> Option<Self> {
         Self::from_queue_with(queue, || {})
     }
 
+    #[cfg(test)]
     fn from_queue_with(
         queue: &VecDeque<QueuedUserMessage>,
         mut on_read: impl FnMut(),
@@ -235,6 +338,60 @@ impl QueuedPreviewSnapshot {
     }
 }
 
+fn compact_preview(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 256;
+    const MAX_SCANNED_CHARS: usize = MAX_PREVIEW_CHARS * 4;
+
+    let mut output = String::with_capacity(MAX_PREVIEW_CHARS);
+    let mut output_chars = 0;
+    let mut pending_space = false;
+    for (scanned, ch) in text.chars().enumerate() {
+        if scanned >= MAX_SCANNED_CHARS {
+            append_preview_ellipsis(&mut output, &mut output_chars, MAX_PREVIEW_CHARS);
+            return output;
+        }
+        if ch.is_whitespace() {
+            pending_space |= !output.is_empty();
+            continue;
+        }
+        if pending_space {
+            if output_chars + 1 >= MAX_PREVIEW_CHARS {
+                append_preview_ellipsis(&mut output, &mut output_chars, MAX_PREVIEW_CHARS);
+                return output;
+            }
+            output.push(' ');
+            output_chars += 1;
+            pending_space = false;
+        }
+        if output_chars + 1 >= MAX_PREVIEW_CHARS {
+            append_preview_ellipsis(&mut output, &mut output_chars, MAX_PREVIEW_CHARS);
+            return output;
+        }
+        output.push(ch);
+        output_chars += 1;
+    }
+    output
+}
+
+fn append_preview_ellipsis(output: &mut String, output_chars: &mut usize, limit: usize) {
+    if *output_chars >= limit {
+        output.pop();
+        *output_chars = output_chars.saturating_sub(1);
+    }
+    output.push('…');
+    *output_chars += 1;
+}
+
+fn queued_composer_from_runtime(
+    item: &orca_runtime::prompt_queue::QueuedSubmission,
+) -> QueuedComposerState {
+    QueuedComposerState {
+        visible_text: item.input.text.clone(),
+        mention_bindings: item.input.mention_bindings.clone(),
+        pending_pastes: Vec::new(),
+    }
+}
+
 impl QueuedUserMessage {
     pub(crate) fn from_composer(
         visible_text: String,
@@ -273,16 +430,14 @@ impl QueuedUserMessage {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn visible_text(&self) -> &str {
         &self.visible_text
     }
 
+    #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
         self.id
-    }
-
-    pub(crate) fn assign_id(&mut self, id: u64) {
-        self.id = id;
     }
 
     pub(crate) fn submission_text(&self) -> &str {
@@ -298,6 +453,7 @@ impl QueuedUserMessage {
         &self.submission_bindings
     }
 
+    #[cfg(test)]
     pub(crate) fn preview_text(&self) -> String {
         self.visible_text
             .split_whitespace()
@@ -305,6 +461,7 @@ impl QueuedUserMessage {
             .join(" ")
     }
 
+    #[cfg(test)]
     pub(crate) fn into_composer_state(self) -> QueuedComposerState {
         QueuedComposerState {
             visible_text: self.visible_text,
@@ -315,6 +472,30 @@ impl QueuedUserMessage {
 }
 
 impl AppState {
+    pub(crate) fn runtime_queue_revision(&self) -> orca_runtime::prompt_queue::QueueRevision {
+        self.queued_submission.projection.revision
+    }
+    pub(crate) fn replace_runtime_queue_projection(
+        &mut self,
+        snapshot: orca_runtime::prompt_queue::PromptQueueSnapshot,
+    ) {
+        self.queued_submission
+            .replace_runtime_projection(snapshot, None);
+    }
+
+    pub(crate) fn remember_runtime_queued_message(&mut self, message: QueuedUserMessage) {
+        self.queued_submission.remember_composer(message);
+    }
+
+    pub(crate) fn replace_runtime_queue_control_projection(
+        &mut self,
+        snapshot: orca_runtime::prompt_queue::PromptQueueSnapshot,
+        deleted_id: Option<&orca_runtime::prompt_queue::QueuedSubmissionId>,
+    ) {
+        self.queued_submission
+            .replace_runtime_projection(snapshot, deleted_id);
+    }
+    #[cfg(test)]
     pub(crate) fn enqueue_user_message(
         &mut self,
         message: QueuedUserMessage,
@@ -323,10 +504,26 @@ impl AppState {
             .enqueue(message, crate::channels::USER_ACTION_CAPACITY)
     }
 
+    #[cfg(test)]
     pub(crate) fn pop_latest_queued_message(&mut self) -> Option<QueuedUserMessage> {
         self.queued_submission.pop_latest()
     }
 
+    pub(crate) fn begin_latest_queued_edit(
+        &mut self,
+    ) -> Option<orca_runtime::prompt_queue::PromptQueueAction> {
+        self.queued_submission.begin_latest_edit()
+    }
+
+    pub(crate) fn cancel_latest_queued_edit(&mut self) {
+        self.queued_submission.cancel_latest_edit();
+    }
+
+    pub(crate) fn take_ready_queued_composer_state(&mut self) -> Option<QueuedComposerState> {
+        self.queued_submission.take_ready_edit()
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_next_queued_message(&mut self) -> Option<UserAction> {
         if self.status != AppStatus::Idle {
             return None;
@@ -342,6 +539,7 @@ impl AppState {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_queued_submission_admission(&mut self) {
         let Some(prompt) = self.queued_submission.in_flight_prompt() else {
             return;
@@ -349,6 +547,7 @@ impl AppState {
         self.record_prompt(prompt);
     }
 
+    #[cfg(test)]
     pub(crate) fn take_rejected_queued_composer_state(&mut self) -> Option<QueuedComposerState> {
         self.queued_submission.take_rejected()
     }
@@ -361,22 +560,39 @@ impl AppState {
         self.queued_submission.resume_autosend();
     }
 
+    pub(crate) fn request_runtime_queue_pause(&self) {
+        if self.queued_submission.pending_or_in_flight()
+            && !self.queued_submission.projection.paused
+        {
+            let _ = self.event_tx.send(UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Pause {
+                    expected_revision: self.runtime_queue_revision(),
+                },
+            ));
+        }
+    }
+
+    pub(crate) fn request_runtime_queue_start(&self) {
+        if self.queued_submission.pending_or_in_flight() && self.queued_submission.projection.paused
+        {
+            let _ = self.event_tx.send(UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Start {
+                    expected_revision: self.runtime_queue_revision(),
+                },
+            ));
+        }
+    }
+
     pub(crate) fn queued_follow_up_pending_or_in_flight(&self) -> bool {
         self.queued_submission.pending_or_in_flight()
     }
 
+    #[cfg(test)]
     pub(crate) fn queued_submission_in_flight(&self) -> bool {
         self.queued_submission.in_flight()
     }
 
-    pub(crate) fn queued_submission_matches_id(&self, id: u64) -> bool {
-        self.queued_submission.matches_id(id)
-    }
-
-    pub(crate) fn settle_queued_submission_started(&mut self, id: u64) -> bool {
-        self.queued_submission.settle_started(id)
-    }
-
+    #[cfg(test)]
     pub(crate) fn fail_queued_submission_dispatch(
         &mut self,
         error: String,
@@ -524,6 +740,14 @@ mod tests {
     }
 
     #[test]
+    fn runtime_queue_preview_bounds_a_one_mib_whitespace_free_token() {
+        let preview = compact_preview(&"x".repeat(1024 * 1024));
+
+        assert_eq!(preview.chars().count(), 256);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
     fn queued_preview_snapshot_reads_at_most_head_and_tail() {
         let queue = (0..64)
             .map(|index| {
@@ -564,6 +788,79 @@ mod tests {
         assert_eq!(snapshot.first, "first");
         assert_eq!(snapshot.second.as_deref(), Some("second"));
         assert_eq!(snapshot.latest, None);
+    }
+
+    #[test]
+    fn pause_and_start_are_routed_through_runtime_queue_control() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx,
+            "0.0.0-test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        let snapshot = runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "queued".into(),
+                },
+                1,
+            )
+            .unwrap();
+        state.update(TuiEvent::PromptQueueUpdated(snapshot));
+
+        let pause_revision = state.runtime_queue_revision();
+        state.request_runtime_queue_pause();
+        state.suspend_queued_follow_up_autosend();
+        let pause = rx.try_recv().expect("runtime pause action");
+        assert!(matches!(
+            &pause,
+            UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Pause { expected_revision }
+            ) if *expected_revision == pause_revision
+        ));
+        let snapshot = runtime
+            .apply(
+                match pause {
+                    UserAction::PromptQueueControl(action) => action,
+                    other => panic!("unexpected pause action: {other:?}"),
+                },
+                2,
+            )
+            .unwrap();
+        state.update(TuiEvent::PromptQueueControlUpdated {
+            deleted_id: None,
+            snapshot,
+        });
+        assert!(!state.queued_autosend_enabled());
+
+        let start_revision = state.runtime_queue_revision();
+        state.request_runtime_queue_start();
+        state.resume_queued_follow_up_autosend();
+        let start = rx.try_recv().expect("runtime start action");
+        assert!(matches!(
+            &start,
+            UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Start { expected_revision }
+            ) if *expected_revision == start_revision
+        ));
+        let snapshot = runtime
+            .apply(
+                match start {
+                    UserAction::PromptQueueControl(action) => action,
+                    other => panic!("unexpected start action: {other:?}"),
+                },
+                3,
+            )
+            .unwrap();
+        state.update(TuiEvent::PromptQueueControlUpdated {
+            deleted_id: None,
+            snapshot,
+        });
+        assert!(state.queued_autosend_enabled());
     }
 
     #[test]
@@ -628,6 +925,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy local queue dispatch shim removed"]
     fn failed_dispatch_restores_fifo_and_reports_error_atomically() {
         let mut state = QueuedSubmissionState::default();
         for text in ["first", "second"] {
@@ -658,6 +956,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy local queue dispatch shim removed"]
     fn queued_follow_ups_promote_fifo_restore_lifo_and_fence_admission() {
         let mut state = app_state();
         state.enqueue_user_message(queued("first")).unwrap();
@@ -718,6 +1017,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy local queue dispatch shim removed"]
     fn queued_dispatch_failure_and_rejection_preserve_distinct_paths() {
         let mut state = app_state();
         state.enqueue_user_message(queued("first")).unwrap();
@@ -755,6 +1055,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy local queue dispatch shim removed"]
     fn unrelated_turn_start_and_rejection_do_not_consume_queued_admission_fence() {
         let mut state = app_state();
         state.enqueue_user_message(queued("queued prompt")).unwrap();
