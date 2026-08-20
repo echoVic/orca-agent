@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(unix)]
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -900,20 +901,22 @@ fn ensure_shell_sandbox_supported(shell: ShellKind, sandbox: ShellSandboxMode) -
                 "Git Bash is not an eligible Windows sandbox shell",
             ));
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(windows))]
-    if matches!(
-        shell,
-        ShellKind::PowerShell(_) | ShellKind::Cmd | ShellKind::GitBash
-    ) && !matches!(sandbox, ShellSandboxMode::DangerFullAccess)
     {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Windows shell sandbox is not available for the requested permission mode",
-        ));
+        if matches!(
+            shell,
+            ShellKind::PowerShell(_) | ShellKind::Cmd | ShellKind::GitBash
+        ) && !matches!(sandbox, ShellSandboxMode::DangerFullAccess)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows shell sandbox is not available for the requested permission mode",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(windows)]

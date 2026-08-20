@@ -3,8 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::syntax_highlight::SyntaxTheme;
-use crate::terminal_capabilities::TerminalColorLevel;
 use crate::types::AppState;
 use crate::types::ChatMessage;
 use orca_core::config::RunConfig;
@@ -32,6 +30,7 @@ pub(crate) fn syntax_workspace_root(config: &RunConfig) -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
+#[allow(dead_code, reason = "shared with the TUI binary target")]
 pub(crate) fn configure_tui_syntax_state(
     state: &mut AppState,
     workspace_root: PathBuf,
@@ -41,6 +40,7 @@ pub(crate) fn configure_tui_syntax_state(
     state.configure_syntax_highlighting(workspace_root, syntax_theme, syntax_color_level);
 }
 
+#[allow(dead_code, reason = "shared with the TUI binary target")]
 pub(crate) fn configure_and_preload_tui_state(
     state: &mut AppState,
     workspace_root: PathBuf,

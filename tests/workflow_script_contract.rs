@@ -409,6 +409,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
                 }),
                 task: None,
                 tool_events: Vec::new(),
+                continuation: None,
             },
         )
         .unwrap();
@@ -436,6 +437,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
                 usage: None,
                 task: None,
                 tool_events: Vec::new(),
+                continuation: None,
             },
         )
         .unwrap();
@@ -549,6 +551,7 @@ fn workflow_verifier_reports_proven_and_completed_with_failures_from_artifacts()
                 usage: None,
                 task: None,
                 tool_events: Vec::new(),
+                continuation: None,
             },
         )
         .unwrap();
@@ -654,6 +657,7 @@ fn workflow_verifier_rejects_missing_declared_evidence_contract() {
                 usage: None,
                 task: None,
                 tool_events: Vec::new(),
+                continuation: None,
             },
         )
         .unwrap();
@@ -725,6 +729,7 @@ fn workflow_verifier_rejects_missing_declared_evidence_contract() {
                     error: None,
                     is_mcp: false,
                 }],
+                continuation: None,
             },
         )
         .unwrap();
@@ -818,6 +823,7 @@ fn workflow_verifier_rejects_read_only_contract_when_mutation_tool_completes() {
                     error: None,
                     is_mcp: false,
                 }],
+                continuation: None,
             },
         )
         .unwrap();
@@ -897,6 +903,7 @@ fn workflow_report_is_bound_to_evidence() {
                     usage: None,
                     task: None,
                     tool_events: Vec::new(),
+                    continuation: None,
                 },
             )
             .unwrap();
@@ -1388,6 +1395,7 @@ fn state_store_preserves_current_json_looking_string_outputs() {
                     usage: None,
                     task: None,
                     tool_events: Vec::new(),
+                    continuation: None,
                 },
             )
             .unwrap();
@@ -1478,6 +1486,7 @@ fn state_store_preserves_missing_output_field_when_appending_completed_record() 
                 usage: None,
                 task: None,
                 tool_events: Vec::new(),
+                continuation: None,
             },
         )
         .unwrap();

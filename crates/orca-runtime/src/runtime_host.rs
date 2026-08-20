@@ -1012,14 +1012,6 @@ impl GenerationFence {
     pub fn generation_id(self) -> GenerationId {
         self.generation_id
     }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(generation_id: u64) -> Self {
-        Self {
-            operation_id: OperationIdAllocator::new().allocate(),
-            generation_id: GenerationId(generation_id),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2846,6 +2838,7 @@ pub struct RuntimeThreadHandle {
     mcp_registry: McpRegistry,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     surface: surface::RuntimeSurfaceHandle,
+    prompt_queue_updates: tokio::sync::watch::Sender<crate::prompt_queue::PromptQueueSnapshot>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2894,6 +2887,22 @@ impl HeadlessOperationHandle {
 }
 
 impl HeadlessSurfaceSession {
+    pub fn prompt_queue(
+        &self,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<
+        crate::prompt_queue::PromptQueueSnapshot,
+        crate::prompt_queue::PromptQueueMutationError,
+    > {
+        self.thread.prompt_queue(action)
+    }
+
+    pub fn subscribe_prompt_queue(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::prompt_queue::PromptQueueSnapshot> {
+        self.thread.subscribe_prompt_queue()
+    }
+
     /// Start a headless user turn through the typed runtime surface. The
     /// operation identity, input, generation, output writer and terminal are
     /// committed by the broker-owned surface path before execution.
@@ -3432,6 +3441,34 @@ impl RuntimeThreadHandle {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::ReadSnapshot { reply: reply_tx })?;
         receive_reply(reply_rx, "runtime thread")?
+    }
+
+    /// Read or mutate the runtime-owned prompt queue. Mutations are serialized
+    /// by the thread actor and return the authoritative post-commit snapshot.
+    pub fn prompt_queue(
+        &self,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<
+        crate::prompt_queue::PromptQueueSnapshot,
+        crate::prompt_queue::PromptQueueMutationError,
+    > {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::PromptQueue {
+            action,
+            reply: reply_tx,
+        })
+        .map_err(|_| crate::prompt_queue::PromptQueueMutationError::RuntimeUnavailable)?;
+        reply_rx.recv().unwrap_or(Err(
+            crate::prompt_queue::PromptQueueMutationError::RuntimeUnavailable,
+        ))
+    }
+
+    /// Subscribe to authoritative queue revisions. Receivers can always read
+    /// the latest full snapshot, so missed wakeups do not lose state.
+    pub fn subscribe_prompt_queue(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::prompt_queue::PromptQueueSnapshot> {
+        self.prompt_queue_updates.subscribe()
     }
 
     pub(crate) fn jsonl_read_live_projection(
@@ -4193,6 +4230,15 @@ enum HostCommand {
 }
 
 enum ThreadCommand {
+    PromptQueue {
+        action: crate::prompt_queue::PromptQueueAction,
+        reply: SyncSender<
+            Result<
+                crate::prompt_queue::PromptQueueSnapshot,
+                crate::prompt_queue::PromptQueueMutationError,
+            >,
+        >,
+    },
     SurfaceDetach {
         client: surface::RuntimeSurfaceClientHandle,
         request: surface::DetachRequest,
@@ -4953,6 +4999,9 @@ async fn run_host_supervisor(
                     continue;
                 }
                 let (command_tx, actor_rx) = tokio_mpsc::channel(THREAD_COMMAND_CAPACITY);
+                let (prompt_queue_updates, _) = tokio::sync::watch::channel(
+                    crate::prompt_queue::PromptQueueSnapshot::default(),
+                );
                 let (capability_change_tx, capability_change_rx) = tokio_mpsc::channel(1);
                 let (surface_handle, resident_surface) = if let Some(surface_owner) = surface_owner
                 {
@@ -4995,6 +5044,7 @@ async fn run_host_supervisor(
                     mcp_registry,
                     command_tx: command_tx.clone(),
                     surface: surface_handle,
+                    prompt_queue_updates,
                 };
                 let actor_handle = handle.clone();
                 let actor_executor = Arc::clone(&executor);
@@ -5359,6 +5409,28 @@ impl ThreadSurfaceDispatcher {
 impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
     fn notify_interaction_capability_changed(&self) {
         let _ = self.capability_change_tx.try_send(());
+    }
+
+    fn prompt_queue(
+        &self,
+        _client: surface::RuntimeSurfaceClientHandle,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<
+        crate::prompt_queue::PromptQueueSnapshot,
+        crate::prompt_queue::PromptQueueMutationError,
+    > {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::PromptQueue {
+                action,
+                reply: reply_tx,
+            },
+        )
+        .map_err(|_| crate::prompt_queue::PromptQueueMutationError::RuntimeUnavailable)?;
+        reply_rx
+            .recv()
+            .map_err(|_| crate::prompt_queue::PromptQueueMutationError::RuntimeUnavailable)?
     }
 
     fn claim_acp_read_text_file_write(
@@ -10989,6 +11061,8 @@ struct ThreadActor {
     #[cfg(test)]
     ephemeral_close_commit_failures: usize,
     surface_terminal_blocked: Option<String>,
+    prompt_queue: crate::prompt_queue::PromptQueueState,
+    prompt_queue_path: Option<PathBuf>,
 }
 
 struct EphemeralReservationExpiry {
@@ -34763,6 +34837,40 @@ impl ThreadActor {
         ephemeral_reservation_timeout: Duration,
         #[cfg(test)] ephemeral_close_commit_failures: usize,
     ) -> Self {
+        let prompt_queue_path = thread.session().surface_commit_path();
+        let prompt_queue_snapshot = prompt_queue_path
+            .as_deref()
+            .map(crate::thread_store::read_prompt_queue_snapshot)
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!("orca: failed to restore prompt queue: {error}");
+                None
+            })
+            .unwrap_or_default();
+        let accepted_turn = match prompt_queue_snapshot.dispatch.as_ref() {
+            Some(crate::prompt_queue::QueueDispatchFence::Prepared {
+                client_user_message_id,
+                ..
+            }) => thread
+                .session()
+                .conversation_records()
+                .is_some_and(|records| {
+                    let turn_id = client_user_message_id.turn_id();
+                    records
+                        .iter()
+                        .any(|record| record.turn_id.as_ref() == Some(&turn_id))
+                }),
+            Some(crate::prompt_queue::QueueDispatchFence::Accepted { .. }) => true,
+            None => false,
+        };
+        let mut prompt_queue =
+            crate::prompt_queue::PromptQueueState::from_snapshot(prompt_queue_snapshot);
+        if let Some(recovered) = prompt_queue.recover_dispatch(accepted_turn)
+            && let Some(path) = prompt_queue_path.as_deref()
+            && let Err(error) = crate::thread_store::write_prompt_queue_snapshot(path, &recovered)
+        {
+            eprintln!("orca: failed to persist recovered prompt queue: {error}");
+        }
         let (state, usage_ledger) = ThreadActorState::new(thread);
         let mut background_controller = BackgroundOperationController::new(background_capacity);
         retain_recovered_background_approvals(
@@ -34789,6 +34897,211 @@ impl ThreadActor {
             #[cfg(test)]
             ephemeral_close_commit_failures,
             surface_terminal_blocked: None,
+            prompt_queue,
+            prompt_queue_path,
+        }
+    }
+
+    fn persist_prompt_queue(
+        &self,
+        snapshot: &crate::prompt_queue::PromptQueueSnapshot,
+    ) -> Result<(), crate::prompt_queue::PromptQueueMutationError> {
+        let Some(path) = self.prompt_queue_path.as_deref() else {
+            return Ok(());
+        };
+        crate::thread_store::write_prompt_queue_snapshot(path, snapshot).map_err(|error| {
+            crate::prompt_queue::PromptQueueMutationError::PersistenceFailed {
+                message: error.to_string(),
+            }
+        })
+    }
+
+    fn apply_prompt_queue_action(
+        &mut self,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<
+        crate::prompt_queue::PromptQueueSnapshot,
+        crate::prompt_queue::PromptQueueMutationError,
+    > {
+        let before = self.prompt_queue.clone();
+        let result = self
+            .prompt_queue
+            .apply(action, chrono::Utc::now().timestamp_millis())?;
+        if result != before.snapshot()
+            && let Err(error) = self.persist_prompt_queue(&result)
+        {
+            self.prompt_queue = before;
+            return Err(error);
+        }
+        if result != before.snapshot() {
+            self.handle
+                .prompt_queue_updates
+                .send_replace(result.clone());
+        }
+        Ok(result)
+    }
+
+    fn pause_prompt_queue_for_boundary(&mut self) {
+        let snapshot = self.prompt_queue.snapshot();
+        if snapshot.paused {
+            return;
+        }
+        let _ = self.apply_prompt_queue_action(crate::prompt_queue::PromptQueueAction::Pause {
+            expected_revision: snapshot.revision,
+        });
+    }
+
+    fn reconcile_prompt_queue_dispatch(&mut self) -> bool {
+        let snapshot = self.prompt_queue.snapshot();
+        let Some(dispatch) = snapshot.dispatch.as_ref() else {
+            return true;
+        };
+        let accepted_turn = match dispatch {
+            crate::prompt_queue::QueueDispatchFence::Accepted { .. } => true,
+            crate::prompt_queue::QueueDispatchFence::Prepared {
+                client_user_message_id,
+                ..
+            } => self
+                .state
+                .as_ref()
+                .and_then(|state| state.thread.session().conversation_records())
+                .is_some_and(|records| {
+                    let turn_id = client_user_message_id.turn_id();
+                    records
+                        .iter()
+                        .any(|record| record.turn_id.as_ref() == Some(&turn_id))
+                }),
+        };
+        let Some(reconciled) = self.prompt_queue.recover_dispatch(accepted_turn) else {
+            return false;
+        };
+        if self.persist_prompt_queue(&reconciled).is_err() {
+            return false;
+        }
+        self.handle
+            .prompt_queue_updates
+            .send_replace(reconciled.clone());
+        if !accepted_turn {
+            self.pause_prompt_queue_for_boundary();
+            return false;
+        }
+        true
+    }
+
+    fn try_drain_prompt_queue(&mut self) {
+        if self.active.is_some()
+            || self.goal_controller.is_blocking()
+            || self.prompt_queue.snapshot().paused
+        {
+            return;
+        }
+        if !self.reconcile_prompt_queue_dispatch() {
+            return;
+        }
+        if self.resident_surface.0.as_ref().is_some_and(|resident| {
+            resident
+                .coordinator
+                .state()
+                .snapshot()
+                .foreground_operation
+                .is_some()
+                || resident
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .interactions
+                    .iter()
+                    .any(|interaction| {
+                        matches!(
+                            interaction.lifecycle,
+                            surface::SurfaceInteractionLifecycle::Requested
+                        )
+                    })
+        }) {
+            return;
+        }
+        let before = self.prompt_queue.clone();
+        let Some((prepared, item)) = self.prompt_queue.prepare_dispatch() else {
+            return;
+        };
+        if self.persist_prompt_queue(&prepared).is_err() {
+            self.prompt_queue = before;
+            return;
+        }
+        self.handle
+            .prompt_queue_updates
+            .send_replace(prepared.clone());
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let cwd = self
+            .config
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let workspace_roots = self
+            .config
+            .runtime_workspace_roots
+            .clone()
+            .filter(|roots| !roots.is_empty())
+            .unwrap_or_else(|| vec![cwd.clone()]);
+        let prompt = match crate::mentions::expand_mentions(
+            &item.input.text,
+            &item.input.mention_bindings,
+            &cwd,
+            &workspace_roots,
+            &self.handle.mcp_registry,
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                let rolled_back = self.prompt_queue.rollback_dispatch();
+                let _ = self.persist_prompt_queue(&rolled_back);
+                self.pause_prompt_queue_for_boundary();
+                eprintln!("orca: queued prompt mention expansion failed: {error}");
+                return;
+            }
+        };
+        self.handle_idle_command(ThreadCommand::StartTurn {
+            request: Box::new(
+                HostedTurnRequest::new(prompt).with_turn_id(item.client_user_message_id.turn_id()),
+            ),
+            writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
+            config: None,
+            reply: reply_tx,
+        });
+        match receive_reply(reply_rx, "queued prompt runtime start") {
+            Ok(Ok(operation)) => {
+                if let Some(accepted) = self
+                    .prompt_queue
+                    .accept_dispatch(&item.id, format!("{:?}", operation.id()))
+                {
+                    if self.persist_prompt_queue(&accepted).is_ok()
+                        && let Some(consumed) = self.prompt_queue.consume_accepted()
+                    {
+                        if self.persist_prompt_queue(&consumed).is_ok() {
+                            self.handle.prompt_queue_updates.send_replace(consumed);
+                        }
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                let rolled_back = self.prompt_queue.rollback_dispatch();
+                if self.persist_prompt_queue(&rolled_back).is_ok() {
+                    self.handle
+                        .prompt_queue_updates
+                        .send_replace(rolled_back.clone());
+                }
+                self.pause_prompt_queue_for_boundary();
+                eprintln!("orca: queued prompt runtime start failed: {error}");
+            }
+            Err(error) => {
+                let rolled_back = self.prompt_queue.rollback_dispatch();
+                if self.persist_prompt_queue(&rolled_back).is_ok() {
+                    self.handle
+                        .prompt_queue_updates
+                        .send_replace(rolled_back.clone());
+                }
+                self.pause_prompt_queue_for_boundary();
+                eprintln!("orca: queued prompt runtime start reply failed: {error}");
+            }
         }
     }
 
@@ -35111,6 +35424,7 @@ impl ThreadActor {
         loop {
             if self.active.is_none() {
                 self.resume_recovered_continuation_turns();
+                self.try_drain_prompt_queue();
             }
             if self.one_shot_close_ready() {
                 match self.close_ephemeral_one_shot().await {
@@ -35736,6 +36050,11 @@ impl ThreadActor {
     fn drain_closed_thread_commands(command_rx: &mut tokio_mpsc::Receiver<ThreadCommand>) {
         while let Ok(command) = command_rx.try_recv() {
             match command {
+                ThreadCommand::PromptQueue { reply, .. } => {
+                    let _ = reply.send(Err(
+                        crate::prompt_queue::PromptQueueMutationError::RuntimeUnavailable,
+                    ));
+                }
                 ThreadCommand::SurfaceDetach {
                     client,
                     request,
@@ -36031,6 +36350,16 @@ impl ThreadActor {
             return;
         }
         match command {
+            ThreadCommand::PromptQueue { action, reply } => {
+                let result = self.apply_prompt_queue_action(action);
+                let should_drain = result
+                    .as_ref()
+                    .is_ok_and(|snapshot| !snapshot.paused && !snapshot.items.is_empty());
+                let _ = reply.send(result);
+                if should_drain {
+                    self.try_drain_prompt_queue();
+                }
+            }
             ThreadCommand::SurfaceDetach {
                 client,
                 request,
@@ -36865,6 +37194,9 @@ impl ThreadActor {
         }
         let generation = active.generation.context.fence();
         match command {
+            ThreadCommand::PromptQueue { action, reply } => {
+                let _ = reply.send(self.apply_prompt_queue_action(action));
+            }
             ThreadCommand::SurfaceDetach {
                 client,
                 request,
@@ -36903,6 +37235,7 @@ impl ThreadActor {
                     if is_background {
                         self.cancel_surface_idle(&client, request_id, operation_id)
                     } else {
+                        self.pause_prompt_queue_for_boundary();
                         self.cancel_surface_running(active, &client, request_id, operation_id)
                     }
                 } else {
@@ -37768,6 +38101,7 @@ impl ThreadActor {
                     let _ = reply.send(Err(error));
                     return;
                 } else {
+                    self.pause_prompt_queue_for_boundary();
                     Self::cancel_active_task_tree(active);
                     InterruptOperationResult::Requested { generation }
                 };
@@ -56964,6 +57298,10 @@ mod tests {
                 surface::HostIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                     .expect("host incarnation"),
             ),
+            prompt_queue_updates: tokio::sync::watch::channel(
+                crate::prompt_queue::PromptQueueSnapshot::default(),
+            )
+            .0,
         };
         let responder = std::thread::spawn(move || {
             while let Some(ThreadCommand::ShutdownThread {
@@ -57209,5 +57547,155 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn runtime_prompt_queue_drains_fifo_after_active_turn_bits_spec_ut() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start prompt queue host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "prompt queue actor",
+            )
+            .expect("start prompt queue thread");
+        let first = thread
+            .start_turn(
+                HostedTurnRequest::new("mock_stream_delay_ms 250"),
+                io::sink(),
+            )
+            .expect("start active turn");
+        let first_queue = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("queued first"),
+            })
+            .expect("queue first follow-up");
+        let second_queue = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("queued second"),
+            })
+            .expect("queue second follow-up");
+        assert_eq!(first_queue.items.len(), 1);
+        assert_eq!(second_queue.items.len(), 2);
+        first.wait();
+
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let queue = thread
+                .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+                .expect("read prompt queue");
+            if queue.items.is_empty()
+                && queue.dispatch.is_none()
+                && matches!(thread.state(), Ok(RuntimeThreadState::Idle))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "prompt queue did not drain");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let runtime_snapshot = thread.snapshot().expect("prompt queue snapshot");
+        let users = runtime_snapshot
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            users,
+            vec!["mock_stream_delay_ms 250", "queued first", "queued second"]
+        );
+        host.shutdown().expect("shutdown prompt queue host");
+    }
+
+    #[test]
+    fn recorded_prompt_queue_recovers_stable_ids_after_cold_restart_bits_spec_ut() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        let host = RuntimeHost::start().expect("start queue persistence host");
+        let thread = host
+            .start_thread(config.clone(), "persistent prompt queue")
+            .expect("start persistent queue thread");
+        let paused = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Pause {
+                expected_revision: crate::prompt_queue::QueueRevision::ZERO,
+            })
+            .expect("pause persistent queue");
+        let queued = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("survive restart"),
+            })
+            .expect("persist queue item");
+        assert!(queued.paused);
+        assert_eq!(queued.revision.get(), paused.revision.get() + 1);
+        let expected_id = queued.items[0].id.clone();
+        let expected_message_id = queued.items[0].client_user_message_id.clone();
+        let session_id = thread.session_id().expect("recorded session").to_string();
+        thread.shutdown().expect("shutdown first queue thread");
+        host.shutdown().expect("shutdown first queue host");
+
+        let resumed_host = RuntimeHost::start().expect("start resumed queue host");
+        let mut resumed_config = config;
+        resumed_config.history_mode = HistoryMode::Resume(session_id);
+        let resumed = resumed_host
+            .start_thread(resumed_config, "persistent prompt queue")
+            .expect("resume persistent queue thread");
+        let recovered = resumed
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+            .expect("read recovered queue");
+        assert!(recovered.paused);
+        assert_eq!(recovered.items.len(), 1);
+        assert_eq!(recovered.items[0].id, expected_id);
+        assert_eq!(
+            recovered.items[0].client_user_message_id,
+            expected_message_id
+        );
+        resumed_host
+            .shutdown()
+            .expect("shutdown resumed queue host");
+    }
+
+    #[test]
+    fn interrupt_pauses_queue_and_ordinary_submit_never_consumes_it_bits_spec_ut() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start queue pause host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "paused prompt queue",
+            )
+            .expect("start queue pause thread");
+        let active = thread
+            .start_turn(
+                HostedTurnRequest::new("mock_stream_delay_ms 30000"),
+                io::sink(),
+            )
+            .expect("start interruptible turn");
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("queued after interrupt"),
+            })
+            .expect("queue interrupted follow-up");
+        active.interrupt().expect("interrupt active turn");
+        active.wait();
+
+        let paused = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+            .expect("read interrupted queue");
+        assert!(paused.paused);
+        assert_eq!(paused.items.len(), 1);
+
+        let ordinary = thread
+            .start_turn(HostedTurnRequest::new("ordinary submit"), io::sink())
+            .expect("ordinary submit while queue paused");
+        ordinary.wait();
+        let unchanged = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+            .expect("read queue after ordinary submit");
+        assert_eq!(unchanged.items.len(), 1);
+        assert_eq!(unchanged.items[0].id, paused.items[0].id);
+        host.shutdown().expect("shutdown queue pause host");
     }
 }

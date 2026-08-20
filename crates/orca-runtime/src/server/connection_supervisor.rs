@@ -20,16 +20,14 @@ use super::shell_manager::ServerShellManager;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum JsonlNonIoCloseTrigger {
     EndOfFile,
-    NormalInputClose,
+    #[cfg(test)]
     SupervisorShutdown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum JsonlSupervisorIoFailure {
     ReadFailed(String),
-    EncodeFailed(String),
     WriteFailed(String),
-    FlushFailed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,7 +39,6 @@ pub(super) enum JsonlSupervisorCloseTrigger {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum JsonlServiceSettlementState {
     Joined,
-    AbortedAfterDeadline,
     CleanupUnconfirmed,
 }
 
@@ -415,7 +412,9 @@ mod tests {
         assert!(!should_wait_clean_eof_one_shots(&eof, false, false, true));
         assert!(!should_wait_clean_eof_one_shots(&eof, false, true, false));
         assert!(!should_wait_clean_eof_one_shots(
-            &JsonlSupervisorCloseTrigger::NonIo(JsonlNonIoCloseTrigger::SupervisorShutdown),
+            &JsonlSupervisorCloseTrigger::Io(JsonlSupervisorIoFailure::WriteFailed(
+                "shutdown".to_string(),
+            )),
             false,
             true,
             true,

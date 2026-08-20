@@ -3,8 +3,6 @@
 
 use std::io;
 
-use crossterm::ExecutableCommand;
-use crossterm::terminal::{Clear, ClearType};
 use ratatui::Terminal;
 
 use crate::presentation::InlineTerminal;

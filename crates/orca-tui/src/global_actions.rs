@@ -32,8 +32,9 @@ where
                     | AppStatus::WaitingApproval
                     | AppStatus::WaitingUserInput
             ) {
-                state.suspend_queued_follow_up_autosend();
                 let _ = action_tx.send(UserAction::Interrupt);
+                state.request_runtime_queue_pause();
+                state.suspend_queued_follow_up_autosend();
                 return Ok(GlobalShortcutFlow::Continue);
             }
             let now = Instant::now();

@@ -1,5 +1,9 @@
 /target/
 /.DS_Store
+Thumbs.db
+*.tmp
+.vscode/
+.idea/
 *.log
 .env
 credentials.json

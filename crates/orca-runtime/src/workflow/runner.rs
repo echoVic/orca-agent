@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::io::Write;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -14,7 +15,9 @@ use orca_core::event_schema::EventFactory;
 use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
 use orca_core::subagent_types::SubagentType;
-use orca_core::task_types::{TaskStatus, TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProgress};
+use orca_core::task_types::{
+    TaskContinuationSummary, TaskStatus, TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
+};
 use orca_core::workflow_types::{
     WorkflowAgentStatus, WorkflowEvidenceIdentity, WorkflowEvidenceToolEvent, WorkflowInput,
     WorkflowOutput, WorkflowPhaseRecord, WorkflowRunState, WorkflowRunStatus,
@@ -27,13 +30,24 @@ use crate::agent_child::{
     ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, ChildAgentRuntimeContext,
     run_child_agent,
 };
+use crate::agent_continuation::{
+    AgentContinuationError, AgentContinuationId, AgentPromptId, AgentTerminal,
+    ChildAgentCoordinator, ContinuationCompatibility, ContinuationProjection,
+    CreateContinuationInput, PreparedContinuation, ResumeContinuationInput, WorktreeBinding,
+    compute_continuation_compatibility_hash,
+};
 use crate::agent_loop::execute_child_agent_loop;
+use crate::child_agent_types::{ChildAgentCompatibilityIdentity, ChildAgentContinuationStart};
 use crate::hooks::HookRunner;
 use crate::instructions;
 use crate::lifecycle::{
     RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskLifecycle, RuntimeTaskStatus,
 };
 use crate::memory;
+use crate::runtime_subagent_call::{
+    build_checkpoint_observer, commit_continuation_write_with_retry, continuation_error,
+    continuation_footer,
+};
 use crate::schema_validation::validate_json_schema_subset;
 use crate::tasks::{TaskRecord, TaskRegistry};
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
@@ -194,6 +208,7 @@ struct WorkflowChildAgentCallOutput {
     worktree: Option<WorktreeOutcome>,
     tool_events: Vec<WorkflowEvidenceToolEvent>,
     task: Option<WorkflowTaskLifecycleEvidence>,
+    continuation: TaskContinuationSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +219,100 @@ struct WorkflowChildAgentCallError {
     cancelled: bool,
     tool_events: Vec<WorkflowEvidenceToolEvent>,
     task: Option<WorkflowTaskLifecycleEvidence>,
+    continuation: Option<TaskContinuationSummary>,
+}
+
+enum WorkflowChildWorktree {
+    Plain(PathBuf),
+    Fresh(WorktreeGuard),
+    Inherited(WorktreeBinding),
+}
+
+impl WorkflowChildWorktree {
+    fn cwd(&self) -> &std::path::Path {
+        match self {
+            Self::Plain(path) => path,
+            Self::Fresh(guard) => guard.path(),
+            Self::Inherited(binding) => std::path::Path::new(&binding.path),
+        }
+    }
+
+    fn binding(&self) -> Option<WorktreeBinding> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Fresh(guard) => Some(WorktreeBinding {
+                repo_root: guard.repo_root().display().to_string(),
+                path: guard.path().display().to_string(),
+            }),
+            Self::Inherited(binding) => Some(binding.clone()),
+        }
+    }
+
+    fn finish(self) -> io::Result<Option<WorktreeOutcome>> {
+        match self {
+            Self::Plain(_) => Ok(None),
+            Self::Fresh(guard) => guard.finish().map(Some),
+            Self::Inherited(binding) => Ok(Some(WorktreeOutcome {
+                path: PathBuf::from(binding.path),
+                preserved: true,
+            })),
+        }
+    }
+
+    fn preserve(self) -> Option<WorktreeOutcome> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Fresh(guard) => Some(WorktreeOutcome {
+                path: guard.path().to_path_buf(),
+                preserved: true,
+            }),
+            Self::Inherited(binding) => Some(WorktreeOutcome {
+                path: PathBuf::from(binding.path),
+                preserved: true,
+            }),
+        }
+    }
+}
+
+struct WorkflowContinuationHeartbeat {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WorkflowContinuationHeartbeat {
+    fn start(
+        coordinator: ChildAgentCoordinator,
+        lease: crate::agent_continuation::ContinuationLease,
+        revision: Arc<Mutex<crate::agent_continuation::ContinuationRevision>>,
+    ) -> Self {
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            loop {
+                match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let Ok(mut revision) = revision.lock() else {
+                    break;
+                };
+                match coordinator.renew(&lease, *revision) {
+                    Ok(projection) => *revision = projection.revision,
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn stop(mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -223,7 +332,17 @@ impl From<io::Error> for WorkflowChildAgentCallError {
             cancelled: false,
             tool_events: Vec::new(),
             task: None,
+            continuation: None,
         }
+    }
+}
+
+impl From<AgentContinuationError> for WorkflowChildAgentCallError {
+    fn from(error: AgentContinuationError) -> Self {
+        workflow_continuation_error(continuation_error(
+            "workflow continuation commit failed",
+            &error,
+        ))
     }
 }
 
@@ -1123,6 +1242,7 @@ impl WorkflowRunner {
                             usage: None,
                             task: None,
                             tool_events: Vec::new(),
+                            continuation: None,
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
@@ -1156,6 +1276,7 @@ impl WorkflowRunner {
                         usage: None,
                         task: None,
                         tool_events: Vec::new(),
+                        continuation: None,
                     },
                 )?;
                 if let Ok(state) = self.state.load_run(run_id) {
@@ -1167,6 +1288,25 @@ impl WorkflowRunner {
                 });
             }
         }
+
+        let mut continuation_selector = resume_from
+            .filter(|_| !call_path_matches_phase(&call.call_path, restart_phase))
+            .and_then(|resume_run_id| {
+                self.state
+                    .find_agent_record(resume_run_id, &call.call_path, &hash)
+            })
+            .and_then(|record| record.continuation);
+        if continuation_selector
+            .as_ref()
+            .is_some_and(|continuation| continuation.indeterminate)
+        {
+            return Ok(HostCommand::AgentError {
+                call_id: call.call_id,
+                error: "workflow child continuation is indeterminate; inspect external state before retrying"
+                    .to_string(),
+            });
+        }
+        continuation_selector = continuation_selector.filter(|continuation| continuation.resumable);
 
         let execution_policy = workflow_agent_execution_policy(&call, workflow_limits);
         let max_attempts = execution_policy.max_agent_retries.saturating_add(1).max(1);
@@ -1230,6 +1370,7 @@ impl WorkflowRunner {
                     usage: None,
                     task: None,
                     tool_events: Vec::new(),
+                    continuation: continuation_selector.clone(),
                 },
             )?;
             if let Ok(state) = self.state.load_run(run_id) {
@@ -1265,10 +1406,14 @@ impl WorkflowRunner {
                 child_execution_policy.max_agent_tokens = Some(budget_cap);
             }
             match self.run_child_agent_call(
+                task_id,
                 &call,
                 workflow_ipc,
                 &child_execution_policy,
                 workflow_cancel,
+                continuation_selector
+                    .as_ref()
+                    .map(|continuation| continuation.continuation_id.as_str()),
             ) {
                 Ok(child_output) => {
                     permit.settle_usage(child_output.usage.total_tokens())?;
@@ -1304,6 +1449,7 @@ impl WorkflowRunner {
                                 usage: Some(child_output.usage),
                                 task: child_task,
                                 tool_events: child_output.tool_events,
+                                continuation: Some(child_output.continuation),
                             },
                         )?;
                         if let Ok(state) = self.state.load_run(run_id) {
@@ -1336,6 +1482,7 @@ impl WorkflowRunner {
                             usage: Some(child_output.usage),
                             task: child_task,
                             tool_events: child_output.tool_events,
+                            continuation: Some(child_output.continuation),
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
@@ -1356,6 +1503,7 @@ impl WorkflowRunner {
                         cancelled,
                         tool_events,
                         task,
+                        continuation,
                     } = error;
                     permit
                         .settle_usage(usage.map(UsageTotals::total_tokens).unwrap_or_default())?;
@@ -1390,6 +1538,7 @@ impl WorkflowRunner {
                             usage,
                             task,
                             tool_events,
+                            continuation: continuation.clone(),
                         },
                     )?;
                     if let Ok(state) = self.state.load_run(run_id) {
@@ -1398,6 +1547,8 @@ impl WorkflowRunner {
 
                     if attempt < max_attempts && retryable && !cancelled {
                         previous_errors.push(error_message);
+                        continuation_selector =
+                            continuation.filter(|continuation| continuation.resumable);
                         continue;
                     }
 
@@ -1464,6 +1615,7 @@ impl WorkflowRunner {
                 usage: None,
                 task: None,
                 tool_events: Vec::new(),
+                continuation: None,
             },
         )?;
         if let Ok(state) = self.state.load_run(run_id) {
@@ -1530,32 +1682,182 @@ impl WorkflowRunner {
 
     fn run_child_agent_call(
         &self,
+        workflow_task_id: &str,
         call: &AgentCall,
         workflow_ipc: &WorkflowIpcContext,
         execution_policy: &WorkflowAgentExecutionPolicy,
         cancel: &CancelToken,
+        resume_from: Option<&str>,
     ) -> Result<WorkflowChildAgentCallOutput, WorkflowChildAgentCallError> {
         let cwd = self
             .config
             .cwd
             .as_deref()
             .unwrap_or(self.session_dir.as_path());
-        let worktree_guard = if workflow_agent_uses_worktree(&call.opts) {
-            Some(WorktreeGuard::create(cwd)?)
-        } else {
-            None
-        };
-        let child_cwd = worktree_guard
+        let coordinator = ChildAgentCoordinator::new(self.tasks.clone()).map_err(|error| {
+            workflow_continuation_error(continuation_error(
+                "failed to initialize workflow continuation",
+                &error,
+            ))
+        })?;
+        let source = resume_from
+            .map(|selector| coordinator.prepared(selector))
+            .transpose()
+            .map_err(|error| {
+                workflow_continuation_error(continuation_error(
+                    "failed to resolve workflow continuation",
+                    &error,
+                ))
+            })?
+            .filter(|source| source.parent_task_id.as_deref() == Some(workflow_task_id));
+        let resume_from = source
             .as_ref()
-            .map(|guard| guard.path())
-            .unwrap_or(cwd);
+            .map(|source| source.continuation_id.to_string());
+        let isolation = source
+            .as_ref()
+            .map(|source| source.compatibility.isolation)
+            .unwrap_or_else(|| {
+                if workflow_agent_uses_worktree(&call.opts) {
+                    crate::subagent::SubagentIsolation::Worktree
+                } else {
+                    crate::subagent::SubagentIsolation::None
+                }
+            });
+        let child_task = self.tasks.create_subagent_with_parent(
+            format!("workflow {}", call.call_path),
+            Some("workflow".to_string()),
+            Some(workflow_task_id.to_string()),
+        );
+        let child_task_id = child_task.id;
+        self.tasks
+            .mark_running(&child_task_id)
+            .map_err(|error| workflow_continuation_error(error))?;
+        let worktree_execution = prepare_workflow_child_worktree(source.as_ref(), isolation, cwd)
+            .map_err(|error| {
+            let _ = self.tasks.fail(&child_task_id, error.clone());
+            workflow_continuation_error(error)
+        })?;
+        let child_cwd = worktree_execution.cwd().to_path_buf();
+        let worktree_binding = worktree_execution.binding();
+        let (workflow_child_config, mcp_registry) =
+            Self::workflow_child_runtime_parts(&self.config, &self.delegation);
+        let effective_model = workflow_child_config.model.as_option();
+        let compatibility_hash = match compute_continuation_compatibility_hash(
+            &SubagentType::General,
+            effective_model.as_deref(),
+            isolation,
+            &child_cwd.display().to_string(),
+            worktree_binding.as_ref(),
+            &self.delegation,
+            &mcp_registry,
+            &workflow_child_config.external_tools,
+        ) {
+            Ok(hash) => hash,
+            Err(error) => {
+                let mut message =
+                    continuation_error("failed to compute workflow compatibility", &error);
+                let worktree = worktree_execution.finish().ok().flatten();
+                append_worktree_outcome(&mut message, worktree.as_ref());
+                let _ = self.tasks.fail(&child_task_id, message.clone());
+                return Err(workflow_continuation_error(message));
+            }
+        };
+        let compatibility = ContinuationCompatibility {
+            subagent_type: "general".to_string(),
+            model: effective_model,
+            isolation,
+            effective_cwd: child_cwd.display().to_string(),
+            worktree: worktree_binding,
+            compatibility_hash,
+        };
+        let prompt_id = AgentPromptId::new();
+        let prepared = match resume_from.as_deref() {
+            Some(selector) => coordinator.prepare_resume(ResumeContinuationInput {
+                selector: selector.to_string(),
+                parent_task_id: Some(workflow_task_id.to_string()),
+                task_id: child_task_id.clone(),
+                prompt_id,
+                compatibility,
+            }),
+            None => coordinator.create(CreateContinuationInput {
+                continuation_id: Some(AgentContinuationId::new()),
+                parent_task_id: Some(workflow_task_id.to_string()),
+                task_id: child_task_id.clone(),
+                prompt_id,
+                compatibility,
+            }),
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let mut message =
+                    continuation_error("failed to prepare workflow continuation", &error);
+                let worktree = worktree_execution.finish().ok().flatten();
+                append_worktree_outcome(&mut message, worktree.as_ref());
+                let _ = self.tasks.fail(&child_task_id, message.clone());
+                return Err(workflow_continuation_error(message));
+            }
+        };
+        let lease = match coordinator.acquire(&prepared) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let mut message =
+                    continuation_error("failed to acquire workflow continuation", &error);
+                let worktree = worktree_execution.finish().ok().flatten();
+                append_worktree_outcome(&mut message, worktree.as_ref());
+                let _ = self.tasks.fail(&child_task_id, message.clone());
+                return Err(workflow_continuation_error(message));
+            }
+        };
+        let continuation_start_result = prepared
+            .checkpoint
+            .clone()
+            .map(|checkpoint| {
+                ChildAgentContinuationStart::new(
+                    prepared.continuation_id.clone(),
+                    prepared.attempt_id.clone(),
+                    prepared.prompt_id.clone(),
+                    checkpoint,
+                    ChildAgentCompatibilityIdentity::new(prepared.compatibility.compatibility_hash),
+                )
+            })
+            .transpose();
+        let continuation_start = match continuation_start_result {
+            Ok(start) => start,
+            Err(error) => {
+                let mut message =
+                    continuation_error("failed to construct workflow continuation start", &error);
+                let projection = coordinator
+                    .commit_terminal(
+                        &lease,
+                        coordinator.projection(&child_task_id)?.revision,
+                        AgentTerminal::Failed {
+                            error: message.clone(),
+                        },
+                    )
+                    .ok();
+                let worktree = worktree_execution.finish().ok().flatten();
+                append_worktree_outcome(&mut message, worktree.as_ref());
+                if let Some(projection) = projection.as_ref() {
+                    message.push_str("\n\n");
+                    message.push_str(&continuation_footer(projection));
+                }
+                let _ = self.tasks.fail(&child_task_id, message.clone());
+                return Err(workflow_continuation_error(message));
+            }
+        };
+        let (checkpoint_observer, shared_revision) =
+            build_checkpoint_observer(coordinator.clone(), lease.clone(), &prepared);
+        let heartbeat = WorkflowContinuationHeartbeat::start(
+            coordinator.clone(),
+            lease.clone(),
+            Arc::clone(&shared_revision),
+        );
         let mut events = EventFactory::new(format!("workflow-child-{}", call.call_id));
         let event_buffer = SharedEventBuffer::default();
         let mut sink = EventSink::new(event_buffer.clone(), OutputFormat::Jsonl);
         let instructions = instructions::load_for_cwd_or_default(cwd);
         let memory = memory::load_for_cwd(cwd);
-        let (workflow_child_config, mcp_registry) =
-            Self::workflow_child_runtime_parts(&self.config, &self.delegation);
         let hooks = HookRunner::new(self.config.hooks.clone());
         let child_request = ChildAgentRequest {
             prompt: call.prompt.clone(),
@@ -1566,27 +1868,67 @@ impl WorkflowRunner {
             allowed_tools: execution_policy.allowed_tools.clone(),
             tool_policy_label: execution_policy.tool_policy_label.clone(),
             workflow_ipc: Some(workflow_ipc.for_sender(call.call_path.clone())),
+            continuation: continuation_start,
         };
         let mut lifecycle =
             RuntimeSessionLifecycle::new(format!("workflow-child-{}", call.call_id));
         lifecycle.start_task(RuntimeTaskKind::Subagent);
-        let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
-            cwd: child_cwd,
-            events: &mut events,
-            sink: &mut sink,
-            instructions: &instructions,
-            memory: &memory,
-            mcp_registry: &mcp_registry,
-            hooks: &hooks,
-            cancel,
-            lifecycle: Some(&mut lifecycle),
-            task_registry: None,
-            root_task_id: None,
-            executor: self.child_executor,
-        });
-        let (result, child_cost_tracker) =
-            run_child_agent(&workflow_child_config, &child_request, &mut runtime);
-        drop(runtime);
+        let child = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
+                cwd: &child_cwd,
+                events: &mut events,
+                sink: &mut sink,
+                instructions: &instructions,
+                memory: &memory,
+                mcp_registry: &mcp_registry,
+                hooks: &hooks,
+                cancel,
+                lifecycle: Some(&mut lifecycle),
+                task_registry: Some(&self.tasks),
+                root_task_id: Some(&child_task_id),
+                checkpoint_observer: Some(&checkpoint_observer),
+                executor: self.child_executor,
+            });
+            run_child_agent(&workflow_child_config, &child_request, &mut runtime)
+        }));
+        heartbeat.stop();
+        let (result, child_cost_tracker) = match child {
+            Ok(result) => result,
+            Err(payload) => {
+                let mut message = format!(
+                    "Workflow child panicked after execution started: {}. Inspect external state before retrying.",
+                    panic_payload_message(payload)
+                );
+                let projection = commit_workflow_terminal(
+                    &coordinator,
+                    &lease,
+                    &shared_revision,
+                    AgentTerminal::Indeterminate {
+                        reason: message.clone(),
+                    },
+                )
+                .ok();
+                let worktree = finish_workflow_child_worktree(worktree_execution, &mut message);
+                append_worktree_outcome(&mut message, worktree.as_ref());
+                let continuation = projection.as_ref().map(task_continuation_summary);
+                if let Some(projection) = projection.as_ref() {
+                    message.push_str("\n\n");
+                    message.push_str(&continuation_footer(projection));
+                }
+                let _ = self.tasks.fail(&child_task_id, message.clone());
+                return Err(WorkflowChildAgentCallError {
+                    message,
+                    usage: None,
+                    retryable: false,
+                    cancelled: false,
+                    tool_events: parse_child_tool_events(&event_buffer.content()),
+                    task: lifecycle
+                        .finish_task(RunStatus::Failed)
+                        .map(workflow_task_lifecycle_evidence),
+                    continuation,
+                });
+            }
+        };
         let task = lifecycle
             .finish_task(result.status)
             .map(workflow_task_lifecycle_evidence)
@@ -1597,8 +1939,6 @@ impl WorkflowRunner {
             });
         let usage = child_cost_tracker.totals();
         let tool_events = parse_child_tool_events(&event_buffer.content());
-        let worktree = worktree_guard.map(WorktreeGuard::finish).transpose()?;
-
         match result.status {
             RunStatus::Success => {
                 if let Some(max_agent_tokens) = execution_policy.max_agent_tokens {
@@ -1607,7 +1947,23 @@ impl WorkflowRunner {
                         let mut error = format!(
                             "{total_tokens} tokens exceeded per-agent token budget {max_agent_tokens}"
                         );
+                        let projection = commit_workflow_terminal(
+                            &coordinator,
+                            &lease,
+                            &shared_revision,
+                            AgentTerminal::Failed {
+                                error: error.clone(),
+                            },
+                        )?;
+                        let worktree =
+                            finish_workflow_child_worktree(worktree_execution, &mut error);
                         append_worktree_outcome(&mut error, worktree.as_ref());
+                        let continuation = task_continuation_summary(&projection);
+                        error.push_str("\n\n");
+                        error.push_str(&continuation_footer(&projection));
+                        let _ =
+                            self.tasks
+                                .fail_with_usage(&child_task_id, error.clone(), Some(usage));
                         return Err(WorkflowChildAgentCallError {
                             message: error,
                             usage: Some(usage),
@@ -1615,15 +1971,33 @@ impl WorkflowRunner {
                             cancelled: false,
                             tool_events,
                             task,
+                            continuation: Some(continuation),
                         });
                     }
                 }
+                let mut message = result.final_message.unwrap_or_default();
+                let projection = commit_workflow_terminal(
+                    &coordinator,
+                    &lease,
+                    &shared_revision,
+                    AgentTerminal::Completed {
+                        result: Some(message.clone()),
+                    },
+                )?;
+                let worktree = finish_workflow_child_worktree(worktree_execution, &mut message);
+                message.push_str("\n\n");
+                message.push_str(&continuation_footer(&projection));
+                let continuation = task_continuation_summary(&projection);
+                self.tasks
+                    .complete_with_usage(&child_task_id, message.clone(), Some(usage))
+                    .map_err(workflow_continuation_error)?;
                 Ok(WorkflowChildAgentCallOutput {
-                    message: result.final_message.unwrap_or_default(),
+                    message,
                     usage,
                     worktree,
                     tool_events,
                     task,
+                    continuation,
                 })
             }
             _ => {
@@ -1632,8 +2006,32 @@ impl WorkflowRunner {
                     .error
                     .or(result.final_message)
                     .unwrap_or_else(|| "workflow child agent failed".to_string());
+                let terminal = if cancelled {
+                    AgentTerminal::Cancelled {
+                        reason: Some(error.clone()),
+                    }
+                } else {
+                    AgentTerminal::Failed {
+                        error: error.clone(),
+                    }
+                };
+                let projection =
+                    commit_workflow_terminal(&coordinator, &lease, &shared_revision, terminal)?;
+                error.push_str("\n\n");
+                error.push_str(&continuation_footer(&projection));
+                let continuation = task_continuation_summary(&projection);
+                let retryable = !cancelled
+                    && !continuation.indeterminate
+                    && is_retryable_child_agent_error(&error);
+                let worktree = if retryable && continuation.resumable {
+                    worktree_execution.preserve()
+                } else {
+                    finish_workflow_child_worktree(worktree_execution, &mut error)
+                };
                 append_worktree_outcome(&mut error, worktree.as_ref());
-                let retryable = !cancelled && is_retryable_child_agent_error(&error);
+                let _ = self
+                    .tasks
+                    .fail_with_usage(&child_task_id, error.clone(), Some(usage));
                 Err(WorkflowChildAgentCallError {
                     message: error,
                     usage: Some(usage),
@@ -1641,6 +2039,7 @@ impl WorkflowRunner {
                     cancelled,
                     tool_events,
                     task,
+                    continuation: Some(continuation),
                 })
             }
         }
@@ -2011,6 +2410,95 @@ fn workflow_agent_uses_worktree(opts: &Value) -> bool {
     opts.get("isolation").and_then(Value::as_str) == Some("worktree")
 }
 
+fn prepare_workflow_child_worktree(
+    source: Option<&PreparedContinuation>,
+    isolation: crate::subagent::SubagentIsolation,
+    parent_cwd: &std::path::Path,
+) -> Result<WorkflowChildWorktree, String> {
+    if let Some(source) = source {
+        let effective_cwd = PathBuf::from(&source.compatibility.effective_cwd);
+        if !effective_cwd.is_dir() {
+            return Err(
+                "continuation_incompatible: inherited workflow child cwd is missing or not a directory"
+                    .to_string(),
+            );
+        }
+        return match isolation {
+            crate::subagent::SubagentIsolation::None => {
+                Ok(WorkflowChildWorktree::Plain(effective_cwd))
+            }
+            crate::subagent::SubagentIsolation::Worktree => source
+                .compatibility
+                .worktree
+                .clone()
+                .map(WorkflowChildWorktree::Inherited)
+                .ok_or_else(|| {
+                    "continuation_incompatible: workflow worktree binding is missing".to_string()
+                }),
+        };
+    }
+    match isolation {
+        crate::subagent::SubagentIsolation::None => {
+            Ok(WorkflowChildWorktree::Plain(parent_cwd.to_path_buf()))
+        }
+        crate::subagent::SubagentIsolation::Worktree => WorktreeGuard::create(parent_cwd)
+            .map(WorkflowChildWorktree::Fresh)
+            .map_err(|error| format!("failed to create workflow child worktree: {error}")),
+    }
+}
+
+fn commit_workflow_terminal(
+    coordinator: &ChildAgentCoordinator,
+    lease: &crate::agent_continuation::ContinuationLease,
+    shared_revision: &Arc<Mutex<crate::agent_continuation::ContinuationRevision>>,
+    terminal: AgentTerminal,
+) -> Result<ContinuationProjection, AgentContinuationError> {
+    let mut revision = shared_revision
+        .lock()
+        .map_err(|_| AgentContinuationError::Persistence {
+            message: "workflow continuation revision lock is poisoned".to_string(),
+        })?;
+    let projection =
+        commit_continuation_write_with_retry(coordinator, lease, *revision, |revision| {
+            coordinator.commit_terminal(lease, revision, terminal.clone())
+        })?;
+    *revision = projection.revision;
+    Ok(projection)
+}
+
+fn task_continuation_summary(projection: &ContinuationProjection) -> TaskContinuationSummary {
+    TaskContinuationSummary {
+        continuation_id: projection.continuation_id.to_string(),
+        attempt_id: projection.attempt_id.to_string(),
+        checkpoint_id: projection.checkpoint_id.as_ref().map(ToString::to_string),
+        revision: projection.revision.get(),
+        resumable: projection.resumable,
+        indeterminate: projection.indeterminate,
+    }
+}
+
+fn workflow_continuation_error(message: String) -> WorkflowChildAgentCallError {
+    WorkflowChildAgentCallError {
+        message,
+        usage: None,
+        retryable: false,
+        cancelled: false,
+        tool_events: Vec::new(),
+        task: None,
+        continuation: None,
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 fn workflow_agent_execution_policy(
     call: &AgentCall,
     workflow_limits: &orca_core::config::WorkflowConfig,
@@ -2075,6 +2563,21 @@ fn append_worktree_outcome(output: &mut String, outcome: Option<&WorktreeOutcome
             "\n\nWorktree {status}: {}",
             outcome.path.display()
         ));
+    }
+}
+
+fn finish_workflow_child_worktree(
+    worktree: WorkflowChildWorktree,
+    output: &mut String,
+) -> Option<WorktreeOutcome> {
+    match worktree.finish() {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            output.push_str(&format!(
+                "\n\nWorkflow child reached terminal state, but worktree cleanup failed: {error}"
+            ));
+            None
+        }
     }
 }
 
@@ -2335,6 +2838,22 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn inherited_workflow_worktree_is_preserved_on_finish() {
+        let worktree = WorkflowChildWorktree::Inherited(WorktreeBinding {
+            repo_root: "/missing/repo".to_string(),
+            path: "/missing/inherited-worktree".to_string(),
+        });
+
+        let outcome = worktree
+            .finish()
+            .expect("inherited worktree finish")
+            .expect("worktree outcome");
+
+        assert!(outcome.preserved);
+        assert_eq!(outcome.path, PathBuf::from("/missing/inherited-worktree"));
+    }
+
+    #[test]
     fn workflow_child_config_preserves_parent_approval_mode() {
         let mut config = test_run_config();
         config.approval_mode = ApprovalMode::Suggest;
@@ -2526,6 +3045,7 @@ mod tests {
                     }),
                     task: None,
                     tool_events: Vec::new(),
+                    continuation: None,
                 },
             )
             .expect("persist source usage");
@@ -2778,10 +3298,19 @@ mod tests {
         let cancel = CancelToken::new();
 
         let output = runner
-            .run_child_agent_call(&call, &workflow_ipc, &policy, &cancel)
+            .run_child_agent_call(
+                "workflow-test",
+                &call,
+                &workflow_ipc,
+                &policy,
+                &cancel,
+                None,
+            )
             .expect("injected child executor should satisfy workflow agent call");
 
-        assert_eq!(output.message, "injected workflow child result");
+        assert!(output.message.starts_with("injected workflow child result"));
+        assert!(output.message.contains("[agent_continuation]"));
+        assert!(!output.continuation.continuation_id.is_empty());
     }
 
     #[test]
@@ -2972,8 +3501,16 @@ mod tests {
         let started = Instant::now();
 
         thread::scope(|scope| {
-            let handle =
-                scope.spawn(|| runner.run_child_agent_call(&call, &workflow_ipc, &policy, &cancel));
+            let handle = scope.spawn(|| {
+                runner.run_child_agent_call(
+                    "workflow-test",
+                    &call,
+                    &workflow_ipc,
+                    &policy,
+                    &cancel,
+                    None,
+                )
+            });
             thread::sleep(Duration::from_millis(100));
             cancel.cancel();
             let error = handle

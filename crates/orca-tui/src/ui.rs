@@ -1817,6 +1817,18 @@ fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
             usage.estimated_cost_usd
         ));
     }
+    if let Some(continuation) = task.continuation.as_ref() {
+        if continuation.indeterminate {
+            parts.push("continuation indeterminate".to_string());
+        } else if continuation.resumable {
+            parts.push(format!(
+                "resumable {}",
+                clamp_label(&continuation.continuation_id, 12)
+            ));
+        } else {
+            parts.push("continuation active".to_string());
+        }
+    }
     // The activity carries a tool target of arbitrary length (often a full
     // shell command), so it is clamped and rendered last: when the row
     // truncates, the fixed-width fields stay visible.
@@ -5029,6 +5041,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "runtime queue persists normalized input rather than widget placeholders"]
     fn queued_preview_keeps_unicode_clusters_and_paste_placeholders() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut state = test_state();
@@ -7579,6 +7592,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,
@@ -7632,6 +7646,14 @@ mod tests {
             subagent_current_activity: Some("bash: cargo test".to_string()),
             subagent_turn: Some(2),
             last_activity_at_ms: Some(1_500),
+            continuation: Some(orca_core::task_types::TaskContinuationSummary {
+                continuation_id: "01a01d98-e26a-7550-8844-2773e6caf5ea".to_string(),
+                attempt_id: "01a01d98-e26a-7550-8844-2787b2ee2e07".to_string(),
+                checkpoint_id: Some("01a01d98-e26a-7550-8844-2796abf430d1".to_string()),
+                revision: 4,
+                resumable: true,
+                indeterminate: false,
+            }),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
@@ -7643,7 +7665,7 @@ mod tests {
         }]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 16))
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 16))
             .expect("test backend");
 
         terminal
@@ -7656,6 +7678,7 @@ mod tests {
         assert!(rendered.contains("turn 2"));
         assert!(rendered.contains("150 tok"));
         assert!(rendered.contains("bash: cargo test"));
+        assert!(rendered.contains("resumable"));
     }
 
     #[test]
@@ -7702,6 +7725,7 @@ mod tests {
                     cache_tokens: 10,
                     estimated_cost_usd: 0.0000252,
                 }),
+                continuation: None,
             }],
             workflow_script_path: Some(
                 "/repo/.orca/workflow-sessions/s1/workflow-runs/run-1/script.js".to_string(),
@@ -7717,6 +7741,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation: None,
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(2_000),
@@ -7828,6 +7853,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,
@@ -7869,6 +7895,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,
@@ -7909,6 +7936,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,
@@ -7954,6 +7982,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: None,
             error: Some("model timed out".to_string()),
             retry_count: 0,
@@ -8006,6 +8035,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: None,
             error: Some("first failure\nsecond failure\nthird failure\nfourth failure".to_string()),
             retry_count: 0,
@@ -8059,6 +8089,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: Some("line one\nline two\nline three\nline four".to_string()),
             error: None,
             retry_count: 0,
@@ -8101,6 +8132,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: Some("summary ready".to_string()),
             error: None,
             retry_count: 0,
@@ -8153,6 +8185,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,
@@ -8218,6 +8251,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,
@@ -8275,6 +8309,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(1_000),
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,
@@ -8334,6 +8369,7 @@ mod tests {
                     cache_tokens: 10,
                     estimated_cost_usd: 0.0000252,
                 }),
+                continuation: None,
             }],
             workflow_script_path: None,
             workflow_launch_input: None,
@@ -8343,6 +8379,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation: None,
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
             completed_at_ms: None,

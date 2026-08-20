@@ -129,6 +129,8 @@ pub(crate) struct RuntimeProviderResponseIo<'a, W: io::Write> {
     pub(crate) history_writer: Option<&'a mut SessionWriter>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
+    pub(crate) checkpoint_observer:
+        Option<&'a dyn crate::child_agent_types::ChildAgentCheckpointSink>,
 }
 
 pub(crate) struct RuntimeProviderResponseExecutors {
@@ -596,6 +598,7 @@ impl RuntimeProviderResponseStep {
             mut history_writer,
             cost_tracker,
             background_workflows,
+            checkpoint_observer,
         } = io;
         let RuntimeProviderResponseExecutors {
             workflow_child_executor,
@@ -641,6 +644,7 @@ impl RuntimeProviderResponseStep {
                 background_workflows,
             },
             tool_requests: &tool_requests,
+            checkpoint_observer,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor,
                 batch_child_executor,
@@ -796,7 +800,8 @@ impl RuntimeTurnProviderCycleStep {
             RuntimeProviderErrorResult::ContinueTurn => {}
         }
 
-        let (conversation, history_writer) = input.conversation.parts_mut();
+        let (conversation, history_writer, checkpoint_observer) =
+            input.conversation.parts_mut_with_checkpoint_observer();
         let mut kernel = RuntimeTurnKernel::from_extension_stores(input.extensions.stores());
         kernel.set_preapproved_tool_call_id(preapproved_tool_call_id);
         let step_context =
@@ -817,6 +822,7 @@ impl RuntimeTurnProviderCycleStep {
             history_writer,
             input.cost_tracker,
             input.background_workflows,
+            checkpoint_observer,
         );
         self.handle_response(
             response,
@@ -1532,6 +1538,7 @@ mod tests {
                         history_writer: None,
                         cost_tracker: &mut cost_tracker,
                         background_workflows: &mut background_workflows,
+                        checkpoint_observer: None,
                     },
                 },
                 RuntimeProviderResponseExecutors {
@@ -1617,6 +1624,7 @@ mod tests {
                         history_writer: None,
                         cost_tracker: &mut cost_tracker,
                         background_workflows: &mut background_workflows,
+                        checkpoint_observer: None,
                     },
                 },
                 RuntimeProviderResponseExecutors {

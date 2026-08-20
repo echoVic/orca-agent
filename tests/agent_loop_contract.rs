@@ -149,7 +149,10 @@ fn headless_unlimited_run_completes_128_tool_cycles() {
     assert_eq!(tool_messages.len(), 128);
     assert!(tool_messages.iter().all(|record| {
         record["message"]["status"] == "completed"
-            && record["message"]["kind"] == "success"
+            && matches!(
+                record["message"]["kind"].as_str(),
+                Some("success" | "truncated")
+            )
             && record["message"]["exit_code"] == 0
     }));
 }

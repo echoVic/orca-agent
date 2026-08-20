@@ -73,7 +73,7 @@ pub(crate) fn handle_idle_key(
         Some(ShortcutAction::Idle(IdleShortcut::EditLatestQueued)) => {
             vim_state.cancel_pending_command();
             if state.status == crate::types::AppStatus::Idle {
-                restore_latest_queued_message(state, textarea, vim_state, theme);
+                restore_latest_queued_message(state, action_tx);
             }
         }
         Some(ShortcutAction::Idle(IdleShortcut::Submit)) => {

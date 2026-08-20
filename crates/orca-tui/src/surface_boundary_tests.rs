@@ -6,7 +6,7 @@ use crate::types::UserAction;
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 36] = [
+const CURRENT_ACTIONS: [(&str, &str); 38] = [
     ("StartSideConversation", "host_session_lifecycle_mutation"),
     ("ToggleSideConversation", "host_session_lifecycle_mutation"),
     ("CloseSideConversation", "host_session_lifecycle_mutation"),
@@ -20,6 +20,8 @@ const CURRENT_ACTIONS: [(&str, &str); 36] = [
     ("DeleteSavedSession", "host_store_mutation"),
     ("Submit", "runtime_mutation"),
     ("SubmitWithMentions", "runtime_mutation"),
+    ("QueuePrompt", "runtime_mutation"),
+    ("PromptQueueControl", "runtime_mutation"),
     ("SubmitQueued", "runtime_mutation"),
     ("ImplementApprovedPlan", "runtime_mutation"),
     ("SubmitWorkflowNotification", "runtime_mutation"),
@@ -62,6 +64,8 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
         UserAction::DeleteSavedSession { .. } => "DeleteSavedSession",
         UserAction::Submit(_) => "Submit",
         UserAction::SubmitWithMentions { .. } => "SubmitWithMentions",
+        UserAction::QueuePrompt { .. } => "QueuePrompt",
+        UserAction::PromptQueueControl(_) => "PromptQueueControl",
         UserAction::SubmitQueued { .. } => "SubmitQueued",
         UserAction::ImplementApprovedPlan { .. } => "ImplementApprovedPlan",
         UserAction::SubmitWorkflowNotification(_) => "SubmitWorkflowNotification",

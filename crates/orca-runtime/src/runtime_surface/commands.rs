@@ -361,6 +361,15 @@ pub enum SurfaceClientCommandError {
 pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
     fn notify_interaction_capability_changed(&self);
 
+    fn prompt_queue(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<
+        crate::prompt_queue::PromptQueueSnapshot,
+        crate::prompt_queue::PromptQueueMutationError,
+    >;
+
     fn claim_acp_read_text_file_write(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -613,6 +622,19 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
 
 #[allow(dead_code)]
 impl RuntimeSurfaceClientHandle {
+    pub fn prompt_queue(
+        &self,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<
+        crate::prompt_queue::PromptQueueSnapshot,
+        crate::prompt_queue::PromptQueueMutationError,
+    > {
+        self.dispatcher
+            .as_ref()
+            .ok_or(crate::prompt_queue::PromptQueueMutationError::RuntimeUnavailable)?
+            .prompt_queue(self.clone(), action)
+    }
+
     pub(crate) fn claim_acp_read_text_file_write(
         &self,
         call_id: SurfaceCapabilityCallId,

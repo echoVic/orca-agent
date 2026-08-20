@@ -8,16 +8,20 @@ use crate::commands;
 use crate::composer_input_actions::{
     apply_composer_key_input, handle_composer_editor_shortcut, insert_composer_newline,
 };
-use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
+use crate::composer_textarea::{
+    MAX_USER_INPUT_TEXT_CHARS, expand_pending_pastes, make_textarea, make_textarea_with_text,
+    textarea_text,
+};
 use crate::mention_menu_actions::handle_mention_menu_key;
 use crate::queued_input::QueuedUserMessage;
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
-use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
+use crate::slash_command_actions::{SlashOutcome, handle_composer_slash_command};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, PanelMode, UserAction};
 use crate::vim::VimState;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueuedDispatch {
     Started,
@@ -26,6 +30,7 @@ pub(crate) enum QueuedDispatch {
     Failed,
 }
 
+#[cfg(test)]
 pub(crate) fn enqueue_composer_follow_up(
     state: &mut AppState,
     textarea: &mut TextArea,
@@ -56,11 +61,52 @@ pub(crate) fn enqueue_composer_follow_up(
     true
 }
 
-pub(crate) fn restore_latest_queued_message(
+pub(crate) fn enqueue_composer_follow_up_to_runtime(
     state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
     textarea: &mut TextArea,
     vim_state: &mut VimState,
     theme: &Theme,
+) -> bool {
+    let Some(message) = QueuedUserMessage::from_composer(
+        textarea_text(textarea),
+        state.pending_pastes.clone(),
+        state.mention_bindings.clone(),
+    ) else {
+        return false;
+    };
+    let actual_chars = message.submission_text().chars().count();
+    if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
+        state.report_queued_input_error(format!(
+            "Message exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters ({actual_chars} provided)."
+        ));
+        return false;
+    }
+    if action_tx
+        .try_send(UserAction::QueuePrompt {
+            prompt: message.submission_text().to_string(),
+            bindings: message.submission_bindings().clone(),
+        })
+        .is_err()
+    {
+        state.report_queued_input_error("follow-up action queue is unavailable".to_string());
+        return false;
+    }
+    state.remember_runtime_queued_message(message);
+    state.slash_menu = None;
+    state.mention.clear_projection();
+    state.pending_pastes.clear();
+    state.mention_bindings.clear();
+    state.atomic_skill_tokens.clear();
+    state.reset_history_navigation();
+    vim_state.reset_insert(textarea, theme);
+    *textarea = make_textarea(vim_state, theme);
+    true
+}
+
+pub(crate) fn restore_latest_queued_message(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
 ) -> bool {
     if state.panel_mode != PanelMode::Conversation
         || !matches!(state.status, AppStatus::Idle | AppStatus::Running)
@@ -71,22 +117,21 @@ pub(crate) fn restore_latest_queued_message(
     {
         return false;
     }
-    let Some(composer) = state
-        .pop_latest_queued_message()
-        .map(QueuedUserMessage::into_composer_state)
-    else {
+    let Some(delete_action) = state.begin_latest_queued_edit() else {
         return false;
     };
-
-    vim_state.reset_insert(textarea, theme);
-    *textarea = make_textarea_with_text(&composer.visible_text, vim_state, theme);
-    state.mention_bindings = composer.mention_bindings;
-    state.atomic_skill_tokens.clear();
-    state.pending_pastes = composer.pending_pastes;
-    state.reset_history_navigation();
+    if action_tx
+        .try_send(UserAction::PromptQueueControl(delete_action))
+        .is_err()
+    {
+        state.cancel_latest_queued_edit();
+        state.report_queued_input_error("follow-up action queue is unavailable".to_string());
+        return false;
+    }
     true
 }
 
+#[cfg(test)]
 pub(crate) fn dispatch_next_queued_user_message(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -120,7 +165,7 @@ pub(crate) fn handle_running_key(
     key: &KeyEvent,
     state: &mut AppState,
     config: &mut RunConfig,
-    shared_config: &Arc<Mutex<RunConfig>>,
+    _shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
     textarea: &mut TextArea,
     vim_state: &mut VimState,
@@ -155,9 +200,16 @@ pub(crate) fn handle_running_key(
                 }
                 let text = textarea_text(textarea).trim().to_string();
                 if text.starts_with('/') {
-                    if let Some(outcome) =
-                        handle_slash_command(&text, config, shared_config, state, action_tx)
-                    {
+                    let expanded = expand_pending_pastes(&text, &state.pending_pastes);
+                    let pending_pastes = state.pending_pastes.clone();
+                    if let Some(outcome) = handle_composer_slash_command(
+                        &text,
+                        &expanded,
+                        &pending_pastes,
+                        config,
+                        state,
+                        action_tx,
+                    ) {
                         reset_after_running_slash(state, textarea, vim_state, theme, outcome);
                     } else {
                         state.push_message(crate::types::ChatMessage::Error(
@@ -173,7 +225,7 @@ pub(crate) fn handle_running_key(
                     }
                     return true;
                 }
-                enqueue_composer_follow_up(state, textarea, vim_state, theme);
+                enqueue_composer_follow_up_to_runtime(state, action_tx, textarea, vim_state, theme);
             }
             RunningShortcut::Newline => {
                 if state.panel_mode != PanelMode::Conversation {
@@ -185,7 +237,7 @@ pub(crate) fn handle_running_key(
                 if state.panel_mode != PanelMode::Conversation {
                     return false;
                 }
-                restore_latest_queued_message(state, textarea, vim_state, theme);
+                restore_latest_queued_message(state, action_tx);
             }
             shortcut => handle_running_shortcut(shortcut, state, action_tx),
         }
@@ -366,21 +418,39 @@ mod tests {
     }
 
     #[test]
-    fn restore_latest_replaces_draft_and_preserves_earlier_fifo_items() {
+    fn restore_latest_waits_for_runtime_delete_snapshot_before_restoring() {
         let mut state = state();
         state.enqueue_user_message(queued("first")).unwrap();
         state.enqueue_user_message(queued("latest")).unwrap();
-        let theme = theme();
-        let mut vim = VimState::new(false);
-        let mut textarea = make_textarea_with_text("draft", &vim, &theme);
+        let (action_tx, action_rx) = mpsc::unbounded();
 
-        assert!(restore_latest_queued_message(
-            &mut state,
-            &mut textarea,
-            &mut vim,
-            &theme,
-        ));
-        assert_eq!(textarea_text(&textarea), "latest");
+        assert!(restore_latest_queued_message(&mut state, &action_tx));
+        assert!(state.take_ready_queued_composer_state().is_none());
+        let deleted_id = match action_rx.try_recv() {
+            Ok(UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Delete { id, .. },
+            )) => id,
+            other => panic!("unexpected queue edit action: {other:?}"),
+        };
+
+        let mut queue = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        let snapshot = queue
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "first".into(),
+                },
+                1,
+            )
+            .unwrap();
+        state.update(crate::types::TuiEvent::PromptQueueControlUpdated {
+            deleted_id: Some(deleted_id),
+            snapshot,
+        });
+
+        let restored = state.take_ready_queued_composer_state().unwrap();
+        assert_eq!(restored.visible_text, "latest");
         assert_eq!(state.queued_pending_visible_text().len(), 1);
         assert_eq!(
             state.queued_pending_visible_text().first().copied(),
@@ -390,6 +460,101 @@ mod tests {
     }
 
     #[test]
+    fn restore_latest_runtime_message_preserves_paste_chip_and_payload() {
+        let mut state = state();
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let placeholder = "[Pasted Content 1001 chars]";
+        let payload = "secret payload\n".repeat(100);
+        let visible = format!("review {placeholder}");
+        state.pending_pastes = vec![(placeholder.to_string(), payload.clone())];
+        let mut textarea = make_textarea_with_text(&visible, &vim, &theme);
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        assert!(enqueue_composer_follow_up_to_runtime(
+            &mut state,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        let (prompt, bindings) = match action_rx.try_recv() {
+            Ok(UserAction::QueuePrompt { prompt, bindings }) => (prompt, bindings),
+            other => panic!("unexpected queue action: {other:?}"),
+        };
+        assert!(prompt.contains(payload.trim()));
+        assert!(!prompt.contains(placeholder));
+
+        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        let snapshot = runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: orca_runtime::prompt_queue::PromptQueueInput {
+                        text: prompt,
+                        mention_bindings: bindings,
+                    },
+                },
+                1,
+            )
+            .unwrap();
+        state.update(crate::types::TuiEvent::PromptQueueUpdated(snapshot));
+
+        assert!(restore_latest_queued_message(&mut state, &action_tx));
+        let (deleted_id, delete) = match action_rx.try_recv() {
+            Ok(UserAction::PromptQueueControl(action)) => {
+                let orca_runtime::prompt_queue::PromptQueueAction::Delete { id, .. } = &action
+                else {
+                    panic!("unexpected queue control action: {action:?}");
+                };
+                (id.clone(), action)
+            }
+            other => panic!("unexpected delete action: {other:?}"),
+        };
+        let snapshot = runtime.apply(delete, 2).unwrap();
+        state.update(crate::types::TuiEvent::PromptQueueControlUpdated {
+            deleted_id: Some(deleted_id),
+            snapshot,
+        });
+
+        let restored = state.take_ready_queued_composer_state().unwrap();
+        assert_eq!(restored.visible_text, visible);
+        assert_eq!(
+            restored.pending_pastes,
+            vec![(placeholder.to_string(), payload)]
+        );
+        assert!(!restored.visible_text.contains("secret payload"));
+    }
+
+    #[test]
+    fn operation_rejection_clears_pending_runtime_edit() {
+        let mut state = state();
+        state.enqueue_user_message(queued("latest")).unwrap();
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        assert!(restore_latest_queued_message(&mut state, &action_tx));
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Delete { .. }
+            ))
+        ));
+        state.update(crate::types::TuiEvent::OperationRejected(
+            "queue control disconnected".to_string(),
+        ));
+
+        assert!(restore_latest_queued_message(&mut state, &action_tx));
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Delete { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    #[ignore = "runtime actor owns queue dispatch"]
     fn queued_dispatch_sends_one_fifo_item_nonblocking() {
         let (action_tx, action_rx) = mpsc::bounded(1);
         let mut state = state();
@@ -414,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "runtime actor owns queue dispatch"]
     fn full_and_disconnected_action_channels_restore_queue_front() {
         for (disconnected, expected_error) in [
             (false, "follow-up action queue is full"),

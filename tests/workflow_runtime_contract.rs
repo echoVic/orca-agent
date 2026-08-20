@@ -9,7 +9,7 @@ use orca_core::config::{
 };
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::model::ModelSelection;
-use orca_core::task_types::TaskStatus;
+use orca_core::task_types::{TaskStatus, TaskType};
 use orca_core::workflow_types::{
     WorkflowAgentFailureKind, WorkflowAgentStatus, WorkflowEvidenceFailureKind, WorkflowRunStatus,
     WorkflowSourceMutationRisk,
@@ -498,7 +498,7 @@ fn workflow_resume_reuses_evidence_bound_cached_agents() {
     let second = runner
         .launch(
             WorkflowLaunchRequest::from_script_path(script.display().to_string())
-                .with_resume_from(first_run_id),
+                .with_resume_from(first_run_id.clone()),
         )
         .expect("resumed stress workflow runs from cache");
 
@@ -607,7 +607,7 @@ fn workflow_resume_reuses_complex_fallback_agents_as_cached_rows() {
     let second = runner
         .launch(
             WorkflowLaunchRequest::from_script_path(script.display().to_string())
-                .with_resume_from(first_run_id),
+                .with_resume_from(first_run_id.clone()),
         )
         .expect("resumed workflow completes with cached fallback agents");
     let second_run_id = second.output.run_id.clone().expect("second run id");
@@ -618,9 +618,17 @@ fn workflow_resume_reuses_complex_fallback_agents_as_cached_rows() {
         )
         .expect("second-generation resume reuses cached rows");
 
-    assert!(second.summary.contains("cached 2 agents"));
+    assert!(
+        second.summary.contains("cached 2 agents"),
+        "unexpected resumed summary: {}",
+        second.summary
+    );
     assert!(second.summary.contains("review recovered=recover true"));
-    assert!(third.summary.contains("cached 2 agents"));
+    assert!(
+        third.summary.contains("cached 2 agents"),
+        "unexpected second-generation summary: {}",
+        third.summary
+    );
 
     let record = tasks.get(&second.task_id).expect("task record");
     assert_eq!(record.status, TaskStatus::Completed);
@@ -762,7 +770,11 @@ fn workflow_runner_marks_task_and_run_failed_on_host_error() {
         "unexpected host error: {error}"
     );
 
-    let task = tasks.list().into_iter().next().expect("workflow task");
+    let task = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == TaskType::Workflow)
+        .expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     assert_eq!(record.status, TaskStatus::Failed);
     assert!(record.error.as_deref().is_some());
@@ -801,7 +813,11 @@ fn workflow_runner_marks_task_and_run_failed_on_child_agent_error() {
 
     assert!(error.to_string().contains("mock child failure requested"));
 
-    let task = tasks.list().into_iter().next().expect("workflow task");
+    let task = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == TaskType::Workflow)
+        .expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     assert_eq!(record.status, TaskStatus::Failed);
     assert!(
@@ -1027,7 +1043,11 @@ fn workflow_team_policy_enforces_team_token_budget() {
         "team token budget should fail backend agent: {error}"
     );
 
-    let task = tasks.list().into_iter().next().expect("workflow task");
+    let task = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == TaskType::Workflow)
+        .expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     assert_eq!(record.status, TaskStatus::Failed);
     assert_eq!(record.workflow_agents.len(), 1);
@@ -1088,7 +1108,11 @@ fn workflow_team_policy_blocks_disallowed_tools() {
         "team tool policy should fail backend agent: {error}"
     );
 
-    let task = tasks.list().into_iter().next().expect("workflow task");
+    let task = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == TaskType::Workflow)
+        .expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     assert_eq!(record.status, TaskStatus::Failed);
     assert_eq!(record.workflow_agents.len(), 1);
@@ -1272,7 +1296,11 @@ fn workflow_agent_token_budget_fails_agent_after_usage_exceeds_limit() {
             .contains("exceeded per-agent token budget"),
         "error should explain the budget failure: {error}"
     );
-    let task = tasks.list().into_iter().next().expect("workflow task");
+    let task = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == TaskType::Workflow)
+        .expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     assert_eq!(record.status, TaskStatus::Failed);
     assert_eq!(record.workflow_agents.len(), 1);
@@ -1354,7 +1382,11 @@ fn workflow_agent_schema_failure_fails_agent_and_run() {
         "schema error should identify the failing property: {error}"
     );
 
-    let task = tasks.list().into_iter().next().expect("workflow task");
+    let task = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == TaskType::Workflow)
+        .expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     assert_eq!(record.status, TaskStatus::Failed);
     assert_eq!(record.workflow_agents.len(), 1);
@@ -1579,7 +1611,11 @@ fn failing_phase_is_persisted_as_failed_and_completed() {
 
     assert!(err.to_string().contains("boom in phase"));
 
-    let task = tasks.list().into_iter().next().expect("workflow task");
+    let task = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == TaskType::Workflow)
+        .expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     let run_id = record.workflow_run_id.as_deref().expect("run id");
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
@@ -2306,7 +2342,11 @@ fn agent_cap_failure_is_recorded() {
             .contains("maximum workflow agent count 3 exceeded")
     );
 
-    let task = tasks.list().into_iter().next().expect("workflow task");
+    let task = tasks
+        .list()
+        .into_iter()
+        .find(|task| task.task_type == TaskType::Workflow)
+        .expect("workflow task");
     let record = tasks.get(&task.id).expect("task record");
     let run_id = record.workflow_run_id.as_deref().expect("run id");
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));

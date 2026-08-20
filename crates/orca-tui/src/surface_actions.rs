@@ -232,14 +232,16 @@ impl TuiSurfaceActions {
         crate::surface_client::read_goal(&self.thread).map_err(|error| error.to_string())
     }
 
-    pub(crate) fn edit_goal(
+    pub(crate) fn edit_goal_with_committed(
         &self,
         session_id: &str,
         objective: String,
         at: i64,
+        committed: impl FnOnce(),
     ) -> Result<SurfaceProjectionState, String> {
         let _ = (session_id, at);
-        crate::surface_client::edit_goal(&self.thread, objective).map_err(|error| error.to_string())
+        crate::surface_client::edit_goal_with_committed(&self.thread, objective, committed)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn clear_goal(&self, session_id: &str) -> Result<SurfaceProjectionState, String> {
@@ -251,13 +253,20 @@ impl TuiSurfaceActions {
         crate::surface_client::pause_goal(&self.thread).map_err(|error| error.to_string())
     }
 
-    pub(crate) fn set_goal_and_run(
+    pub(crate) fn set_goal_and_run_with_committed(
         &self,
         objective: String,
         control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
+        committed: impl FnOnce(),
     ) -> io::Result<TuiHostedOperationOutcome> {
-        crate::surface_client::set_goal_and_run(&self.thread, objective, control, event_tx)
+        crate::surface_client::set_goal_and_run_with_committed(
+            &self.thread,
+            objective,
+            control,
+            event_tx,
+            committed,
+        )
     }
 
     pub(crate) fn resume_goal_and_run(

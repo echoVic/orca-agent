@@ -108,7 +108,12 @@
     "subagent_patch_variants": [
       "Started",
       "Progress",
-      "Completed"
+      "Completed",
+      "ContinuationCheckpointed",
+      "ContinuationSuspended",
+      "ContinuationResumed",
+      "ContinuationOrphanReconciled",
+      "ContinuationIndeterminate"
     ],
     "goal_patch_variants": [
       "Created",
@@ -231,6 +236,8 @@
       "DeleteSavedSession",
       "Submit",
       "SubmitWithMentions",
+      "QueuePrompt",
+      "PromptQueueControl",
       "SubmitQueued",
       "ImplementApprovedPlan",
       "SubmitWorkflowNotification",
@@ -300,7 +307,12 @@
       "CompactionRunning",
       "CompatibilityJournalOnly",
       "Completed",
+      "ContinuationCheckpointed",
       "ContinuationDecided",
+      "ContinuationIndeterminate",
+      "ContinuationOrphanReconciled",
+      "ContinuationResumed",
+      "ContinuationSuspended",
       "ControlIntentCommitted",
       "Created",
       "Delta",
@@ -1311,8 +1323,93 @@
       "NoLegacyProjection"
     ],
     [
-      "WorkflowStarted",
+      "AgentContinuationCheckpointed",
       217,
+      "recorded",
+      "Subagent",
+      "ContinuationCheckpointed",
+      "GenerationOrBackgroundScope",
+      "recorded",
+      [
+        "subagents",
+        "tasks"
+      ],
+      "typed_continuation_store_receipt",
+      "Render",
+      "ExtensionOnly",
+      "NoLegacyProjection"
+    ],
+    [
+      "AgentContinuationSuspended",
+      219,
+      "recorded",
+      "Subagent",
+      "ContinuationSuspended",
+      "GenerationOrBackgroundScope",
+      "recorded",
+      [
+        "subagents",
+        "tasks"
+      ],
+      "typed_continuation_store_receipt",
+      "Render",
+      "ExtensionOnly",
+      "NoLegacyProjection"
+    ],
+    [
+      "AgentContinuationResumed",
+      221,
+      "recorded",
+      "Subagent",
+      "ContinuationResumed",
+      "GenerationOrBackgroundScope",
+      "recorded",
+      [
+        "subagents",
+        "tasks"
+      ],
+      "typed_continuation_store_receipt",
+      "Render",
+      "ExtensionOnly",
+      "NoLegacyProjection"
+    ],
+    [
+      "AgentContinuationOrphanReconciled",
+      223,
+      "recorded",
+      "Subagent",
+      "ContinuationOrphanReconciled",
+      "GenerationOrBackgroundScope",
+      "recorded",
+      [
+        "subagents",
+        "tasks"
+      ],
+      "typed_continuation_store_receipt",
+      "Render",
+      "ExtensionOnly",
+      "NoLegacyProjection"
+    ],
+    [
+      "AgentContinuationIndeterminate",
+      225,
+      "recorded",
+      "Subagent",
+      "ContinuationIndeterminate",
+      "GenerationOrBackgroundScope",
+      "recorded",
+      [
+        "subagents",
+        "tasks"
+      ],
+      "typed_continuation_store_receipt",
+      "Render",
+      "ExtensionOnly",
+      "NoLegacyProjection"
+    ],
+    [
+      "WorkflowStarted",
+      227,
       "recorded",
       "Workflow",
       "Started",
@@ -1328,7 +1425,7 @@
     ],
     [
       "WorkflowResumed",
-      219,
+      229,
       "recorded",
       "Workflow",
       "Resumed",
@@ -1344,7 +1441,7 @@
     ],
     [
       "WorkflowPhaseStarted",
-      221,
+      231,
       "recorded",
       "Workflow",
       "PhaseStarted",
@@ -1360,7 +1457,7 @@
     ],
     [
       "WorkflowPhaseCompleted",
-      223,
+      233,
       "recorded",
       "Workflow",
       "PhaseCompleted",
@@ -1376,7 +1473,7 @@
     ],
     [
       "WorkflowAgentStarted",
-      225,
+      235,
       "recorded",
       "Workflow",
       "AgentStarted",
@@ -1392,7 +1489,7 @@
     ],
     [
       "WorkflowAgentCached",
-      227,
+      237,
       "recorded",
       "Workflow",
       "AgentCached",
@@ -1408,7 +1505,7 @@
     ],
     [
       "WorkflowAgentCompleted",
-      229,
+      239,
       "recorded",
       "Workflow",
       "AgentCompleted",
@@ -1424,7 +1521,7 @@
     ],
     [
       "WorkflowAgentFailed",
-      231,
+      241,
       "recorded",
       "Workflow",
       "AgentFailed",
@@ -1440,7 +1537,7 @@
     ],
     [
       "WorkflowPaused",
-      233,
+      243,
       "recorded",
       "Workflow",
       "Paused",
@@ -1456,7 +1553,7 @@
     ],
     [
       "WorkflowStopped",
-      235,
+      245,
       "recorded",
       "Workflow",
       "Stopped",
@@ -1472,7 +1569,7 @@
     ],
     [
       "WorkflowCompleted",
-      237,
+      247,
       "recorded",
       "Workflow",
       "Completed",
@@ -1488,7 +1585,7 @@
     ],
     [
       "WorkflowFailed",
-      239,
+      249,
       "recorded",
       "Workflow",
       "Failed",
@@ -1504,7 +1601,7 @@
     ],
     [
       "WorkflowResultAvailable",
-      241,
+      251,
       "recorded",
       "Workflow",
       "ResultReady",
@@ -1520,7 +1617,7 @@
     ],
     [
       "WorkflowTasksUpdated",
-      243,
+      253,
       "transient",
       "Task",
       "Reconciled",
@@ -1536,7 +1633,7 @@
     ],
     [
       "TaskStatusUpdated",
-      245,
+      255,
       "transient",
       "Task",
       "Upserted",
@@ -1552,7 +1649,7 @@
     ],
     [
       "VerificationStarted",
-      247,
+      257,
       "recorded",
       "Operation",
       "VerificationStarted",
@@ -1568,7 +1665,7 @@
     ],
     [
       "VerificationCompleted",
-      249,
+      259,
       "recorded",
       "Operation",
       "VerificationCompleted",
@@ -1584,7 +1681,7 @@
     ],
     [
       "Error",
-      251,
+      261,
       "recorded",
       "None",
       "TypedSourceRequired",
@@ -1598,7 +1695,7 @@
     ],
     [
       "SessionCompleted",
-      253,
+      263,
       "recorded",
       "Operation",
       "Terminal",
@@ -4114,6 +4211,50 @@
       "MutationReply<AdmissionOutput>+OperationWaiter",
       "composer and binding gate consume InputBindingsResolved",
       "remove_pre_started_resource_expansion_and_writable_mcp_registry"
+    ],
+    [
+      "QueuePrompt",
+      "current",
+      [
+        "crates/orca-tui/src/types.rs:475",
+        "crates/orca-tui/src/action_dispatcher.rs:205"
+      ],
+      "runtime_mutation",
+      "UserAction::QueuePrompt{prompt,bindings}",
+      "PromptQueue(Add)",
+      "RuntimeThreadActor::PromptQueue(Add)",
+      [
+        "SubmitOperation",
+        "ReadSnapshot"
+      ],
+      [
+        "QueueRevision"
+      ],
+      "PromptQueueSnapshot",
+      "TUI consumes runtime queue projection",
+      "delete_tui_queue_ownership"
+    ],
+    [
+      "PromptQueueControl",
+      "current",
+      [
+        "crates/orca-tui/src/types.rs:479",
+        "crates/orca-tui/src/slash_command_actions.rs:214"
+      ],
+      "runtime_mutation",
+      "UserAction::PromptQueueControl(action)",
+      "PromptQueue(List|Pause|Start)",
+      "RuntimeThreadActor::PromptQueue(List|Pause|Start)",
+      [
+        "ReadSnapshot",
+        "SubmitOperation"
+      ],
+      [
+        "QueueRevision"
+      ],
+      "PromptQueueSnapshot",
+      "TUI consumes runtime queue projection",
+      "delete_tui_queue_ownership"
     ],
     [
       "SubmitQueued",
@@ -7305,8 +7446,8 @@
     }
   ],
   "phase_0a_manifest_invariants": [
-    "source_facts has exactly 53 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 36 unique variants matching UserAction at baseline",
+    "source_facts has exactly 58 unique variants matching EventType at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 38 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

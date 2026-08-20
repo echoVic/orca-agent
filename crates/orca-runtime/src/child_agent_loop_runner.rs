@@ -7,9 +7,11 @@ use orca_core::event_schema::RunStatus;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::tool_types::ToolRequest;
 
+use crate::agent_continuation::{conversation_has_open_tool_calls, try_last_settled_tool_boundary};
 use crate::child_agent_entrypoints::run_child_agent_with_executor;
 use crate::child_agent_loop_setup::{
-    ChildAgentLoopSetup, ChildAgentTurnBudget, advance_child_agent_turn, prepare_child_agent_loop,
+    ChildAgentLoopSetup, ChildAgentTurnBudget, advance_child_agent_turn,
+    try_prepare_child_agent_loop,
 };
 use crate::child_agent_provider_turn::{
     ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
@@ -22,7 +24,8 @@ use crate::child_agent_response_folding::{
     fold_child_agent_tool_result_and_close_siblings,
 };
 use crate::child_agent_types::{
-    ChildAgentActivity, ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult,
+    ChildAgentActivity, ChildAgentActivityObserver, ChildAgentCheckpointObservation,
+    ChildAgentCheckpointSink, ChildAgentRequest, ChildAgentResult,
 };
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
@@ -82,21 +85,95 @@ fn sync_child_cost_to_lease(
     }
 }
 
+fn child_agent_setup_error(error: crate::agent_continuation::AgentContinuationError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "child continuation setup failed [{}]: {error}",
+            error.contract_code()
+        ),
+    )
+}
+
+fn child_checkpoint_error(error: crate::agent_continuation::AgentContinuationError) -> io::Error {
+    io::Error::other(format!(
+        "child checkpoint failed [{}]: {error}",
+        error.contract_code()
+    ))
+}
+
+/// Emits one lightweight child checkpoint from a fully settled conversation.
+/// It reports the lease's current operation usage, derives the last trustworthy
+/// tool boundary, performs no action without an observer, and propagates all
+/// validation or persistence failures to the child caller.
+fn emit_lightweight_child_checkpoint(
+    setup: &ChildAgentLoopSetup,
+    lease: &crate::budget_controller::BudgetLease,
+    observer: Option<&dyn ChildAgentCheckpointSink>,
+) -> io::Result<()> {
+    let _continuation_compatibility = setup
+        .continuation
+        .as_ref()
+        .map(|state| state.start.compatibility().digest());
+    let Some(observer) = observer else {
+        return Ok(());
+    };
+    let usage = lease.usage();
+    let last_tool_boundary =
+        try_last_settled_tool_boundary(&setup.conversation).map_err(child_checkpoint_error)?;
+    observer
+        .checkpoint(ChildAgentCheckpointObservation {
+            conversation: &setup.conversation,
+            turn: usage.turns,
+            usage,
+            last_tool_boundary,
+        })
+        .map_err(child_checkpoint_error)
+}
+
+fn finish_lightweight_child_result(
+    setup: &ChildAgentLoopSetup,
+    lease: &crate::budget_controller::BudgetLease,
+    observer: Option<&dyn ChildAgentCheckpointSink>,
+    result: ChildAgentResult,
+) -> io::Result<ChildAgentResult> {
+    if result.status != RunStatus::ApprovalRequired
+        && observer.is_some()
+        && !conversation_has_open_tool_calls(&setup.conversation)
+    {
+        emit_lightweight_child_checkpoint(setup, lease, observer)?;
+    }
+    Ok(attach_child_usage_receipt(result, lease))
+}
+
 pub fn run_child_agent_loop_with_tool_executor<F>(
     config: &RunConfig,
     context: ChildAgentLoopContext<'_>,
+    execute_tool: F,
+) -> io::Result<ChildAgentResult>
+where
+    F: FnMut(&ChildAgentToolContext<'_>, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
+{
+    run_child_agent_loop_with_tool_executor_checkpointed(config, context, None, execute_tool)
+}
+
+pub(crate) fn run_child_agent_loop_with_tool_executor_checkpointed<F>(
+    config: &RunConfig,
+    context: ChildAgentLoopContext<'_>,
+    checkpoint_observer: Option<&dyn ChildAgentCheckpointSink>,
     mut execute_tool: F,
 ) -> io::Result<ChildAgentResult>
 where
     F: FnMut(&ChildAgentToolContext<'_>, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
 {
-    let mut setup = prepare_child_agent_loop(
+    let mut setup = try_prepare_child_agent_loop(
         config,
         context.request,
         context.cwd,
         context.instructions,
         context.memory,
-    );
+    )
+    .map_err(child_agent_setup_error)?;
     let mut fallback_lease =
         crate::budget_controller::BudgetController::new(config.budget.to_spec())
             .child_lease(config.budget.to_spec())
@@ -110,7 +187,7 @@ where
         match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {}
             ChildAgentTurnBudget::Stop(result) => {
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
         }
 
@@ -136,14 +213,24 @@ where
                     context.child_cost_tracker,
                     &mut recorded_cost_usd_micros,
                 ) {
-                    return Ok(child_lease_stop_result(stop));
+                    return finish_lightweight_child_result(
+                        &setup,
+                        lease,
+                        checkpoint_observer,
+                        child_lease_stop_result(stop),
+                    );
                 }
                 if let Some(result) =
                     child_agent_budget_exhausted_result(config, context.child_cost_tracker)
                 {
-                    return Ok(attach_child_usage_receipt(result, &lease));
+                    return finish_lightweight_child_result(
+                        &setup,
+                        lease,
+                        checkpoint_observer,
+                        result,
+                    );
                 }
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
         };
 
@@ -161,17 +248,22 @@ where
             context.child_cost_tracker,
             &mut recorded_cost_usd_micros,
         ) {
-            return Ok(child_lease_stop_result(stop));
+            return finish_lightweight_child_result(
+                &setup,
+                lease,
+                checkpoint_observer,
+                child_lease_stop_result(stop),
+            );
         }
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
-            return Ok(attach_child_usage_receipt(result, &lease));
+            return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
         }
         match provider_error_decision {
             Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
             Some(ChildAgentProviderErrorDecision::Fail(result)) => {
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
             None => {}
         }
@@ -183,16 +275,21 @@ where
             context.child_cost_tracker,
             &mut recorded_cost_usd_micros,
         ) {
-            return Ok(child_lease_stop_result(stop));
+            return finish_lightweight_child_result(
+                &setup,
+                lease,
+                checkpoint_observer,
+                child_lease_stop_result(stop),
+            );
         }
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
-            return Ok(attach_child_usage_receipt(result, &lease));
+            return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
         }
         match provider_fold {
             ChildAgentProviderResponseFold::Complete(result) => {
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
@@ -200,12 +297,26 @@ where
         let tool_requests = child_agent_tool_requests(&response);
         for (index, tool_request) in tool_requests.iter().enumerate() {
             if let Err(stop) = lease.admit_tool_call() {
-                return Ok(child_lease_stop_result(stop));
+                return finish_lightweight_child_result(
+                    &setup,
+                    lease,
+                    checkpoint_observer,
+                    child_lease_stop_result(stop),
+                );
             }
             let tool_context = ChildAgentToolContext {
                 policy: &setup.policy,
                 mcp_registry: &setup.mcp_registry,
             };
+            if let Some(observer) = checkpoint_observer {
+                observer
+                    .tool_boundary(crate::tool_turn::tool_start_boundary(
+                        config,
+                        &setup.mcp_registry,
+                        tool_request,
+                    ))
+                    .map_err(child_checkpoint_error)?;
+            }
             let tool_execution = execute_tool(&tool_context, &child_cancel, tool_request);
             let tool_fold = fold_child_agent_tool_result_and_close_siblings(
                 &mut setup,
@@ -221,20 +332,31 @@ where
                 context.child_cost_tracker,
                 &mut recorded_cost_usd_micros,
             ) {
-                return Ok(child_lease_stop_result(stop));
+                return finish_lightweight_child_result(
+                    &setup,
+                    lease,
+                    checkpoint_observer,
+                    child_lease_stop_result(stop),
+                );
             }
             if let Some(result) =
                 child_agent_budget_exhausted_result(config, context.child_cost_tracker)
             {
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
             match tool_fold {
                 ChildAgentToolResultFold::Continue => {}
                 ChildAgentToolResultFold::Stop(result) => {
-                    return Ok(attach_child_usage_receipt(result, &lease));
+                    return finish_lightweight_child_result(
+                        &setup,
+                        lease,
+                        checkpoint_observer,
+                        result,
+                    );
                 }
             }
         }
+        emit_lightweight_child_checkpoint(&setup, lease, checkpoint_observer)?;
     }
 }
 
@@ -242,18 +364,38 @@ pub fn run_child_agent_loop_with_tool_executor_observed<F>(
     config: &RunConfig,
     context: ChildAgentLoopContext<'_>,
     observer: Option<&ChildAgentActivityObserver<'_>>,
+    execute_tool: F,
+) -> io::Result<ChildAgentResult>
+where
+    F: FnMut(&ChildAgentToolContext<'_>, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
+{
+    run_child_agent_loop_with_tool_executor_observed_checkpointed(
+        config,
+        context,
+        observer,
+        None,
+        execute_tool,
+    )
+}
+
+pub(crate) fn run_child_agent_loop_with_tool_executor_observed_checkpointed<F>(
+    config: &RunConfig,
+    context: ChildAgentLoopContext<'_>,
+    observer: Option<&ChildAgentActivityObserver<'_>>,
+    checkpoint_observer: Option<&dyn ChildAgentCheckpointSink>,
     mut execute_tool: F,
 ) -> io::Result<ChildAgentResult>
 where
     F: FnMut(&ChildAgentToolContext<'_>, &CancelToken, &ToolRequest) -> ChildAgentToolExecution,
 {
-    let mut setup = prepare_child_agent_loop(
+    let mut setup = try_prepare_child_agent_loop(
         config,
         context.request,
         context.cwd,
         context.instructions,
         context.memory,
-    );
+    )
+    .map_err(child_agent_setup_error)?;
     let mut fallback_lease =
         crate::budget_controller::BudgetController::new(config.budget.to_spec())
             .child_lease(config.budget.to_spec())
@@ -271,7 +413,7 @@ where
                 }
             }
             ChildAgentTurnBudget::Stop(result) => {
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
         }
 
@@ -298,14 +440,24 @@ where
                     context.child_cost_tracker,
                     &mut recorded_cost_usd_micros,
                 ) {
-                    return Ok(child_lease_stop_result(stop));
+                    return finish_lightweight_child_result(
+                        &setup,
+                        lease,
+                        checkpoint_observer,
+                        child_lease_stop_result(stop),
+                    );
                 }
                 if let Some(result) =
                     child_agent_budget_exhausted_result(config, context.child_cost_tracker)
                 {
-                    return Ok(attach_child_usage_receipt(result, &lease));
+                    return finish_lightweight_child_result(
+                        &setup,
+                        lease,
+                        checkpoint_observer,
+                        result,
+                    );
                 }
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
         };
 
@@ -323,17 +475,22 @@ where
             context.child_cost_tracker,
             &mut recorded_cost_usd_micros,
         ) {
-            return Ok(child_lease_stop_result(stop));
+            return finish_lightweight_child_result(
+                &setup,
+                lease,
+                checkpoint_observer,
+                child_lease_stop_result(stop),
+            );
         }
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
-            return Ok(attach_child_usage_receipt(result, &lease));
+            return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
         }
         match provider_error_decision {
             Some(ChildAgentProviderErrorDecision::RetryAfterCompaction) => continue,
             Some(ChildAgentProviderErrorDecision::Fail(result)) => {
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
             None => {}
         }
@@ -358,16 +515,21 @@ where
             }
         }
         if let Some(stop) = lease_stop {
-            return Ok(child_lease_stop_result(stop));
+            return finish_lightweight_child_result(
+                &setup,
+                lease,
+                checkpoint_observer,
+                child_lease_stop_result(stop),
+            );
         }
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
-            return Ok(attach_child_usage_receipt(result, &lease));
+            return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
         }
         match provider_fold {
             ChildAgentProviderResponseFold::Complete(result) => {
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
@@ -375,12 +537,26 @@ where
         let tool_requests = child_agent_tool_requests(&response);
         for (index, tool_request) in tool_requests.iter().enumerate() {
             if let Err(stop) = lease.admit_tool_call() {
-                return Ok(child_lease_stop_result(stop));
+                return finish_lightweight_child_result(
+                    &setup,
+                    lease,
+                    checkpoint_observer,
+                    child_lease_stop_result(stop),
+                );
             }
             let tool_context = ChildAgentToolContext {
                 policy: &setup.policy,
                 mcp_registry: &setup.mcp_registry,
             };
+            if let Some(checkpoint_observer) = checkpoint_observer {
+                checkpoint_observer
+                    .tool_boundary(crate::tool_turn::tool_start_boundary(
+                        config,
+                        &setup.mcp_registry,
+                        tool_request,
+                    ))
+                    .map_err(child_checkpoint_error)?;
+            }
             if let Some(observer) = observer {
                 observer.emit(ChildAgentActivity::ToolStarted {
                     name: tool_request.name.as_str().to_string(),
@@ -409,7 +585,12 @@ where
                 context.child_cost_tracker,
                 &mut recorded_cost_usd_micros,
             ) {
-                return Ok(child_lease_stop_result(stop));
+                return finish_lightweight_child_result(
+                    &setup,
+                    lease,
+                    checkpoint_observer,
+                    child_lease_stop_result(stop),
+                );
             }
             if had_child_cost {
                 if let Some(observer) = observer {
@@ -421,15 +602,21 @@ where
             if let Some(result) =
                 child_agent_budget_exhausted_result(config, context.child_cost_tracker)
             {
-                return Ok(attach_child_usage_receipt(result, &lease));
+                return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
             match tool_fold {
                 ChildAgentToolResultFold::Continue => {}
                 ChildAgentToolResultFold::Stop(result) => {
-                    return Ok(attach_child_usage_receipt(result, &lease));
+                    return finish_lightweight_child_result(
+                        &setup,
+                        lease,
+                        checkpoint_observer,
+                        result,
+                    );
                 }
             }
         }
+        emit_lightweight_child_checkpoint(&setup, lease, checkpoint_observer)?;
     }
 }
 

@@ -90,6 +90,7 @@ impl AcpNotificationSender {
 
 /// Per-session runtime state held on the single-threaded ACP task.
 struct SessionEntry {
+    thread: crate::surface::RuntimeSurfaceThreadHandle,
     surface: RuntimeSurfaceHandle,
     prompt_binding: Option<AcpPromptBinding>,
     next_prompt_seq: u64,
@@ -818,6 +819,22 @@ impl OrcaAcpAgent {
     pub(crate) fn with_client_bridge(mut self, bridge: Arc<AcpClientBridge>) -> Self {
         self.client_bridge = Some(bridge);
         self
+    }
+
+    pub(crate) fn prompt_queue(
+        &self,
+        session_id: &SessionId,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<crate::prompt_queue::PromptQueueSnapshot, Error> {
+        let state = self.state.borrow();
+        let entry = state
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| Error::invalid_params().data("unknown ACP session"))?;
+        entry
+            .thread
+            .prompt_queue(action)
+            .map_err(|error| Error::invalid_params().data(error.to_string()))
     }
 
     /// Builds a per-session config from the base config with the session cwd
@@ -2619,6 +2636,7 @@ impl Agent for OrcaAcpAgent {
         self.state.borrow_mut().sessions.insert(
             session_id.clone(),
             SessionEntry {
+                thread,
                 surface,
                 prompt_binding: None,
                 next_prompt_seq: 1,
@@ -2666,6 +2684,7 @@ impl Agent for OrcaAcpAgent {
         self.state.borrow_mut().sessions.insert(
             args.session_id.clone(),
             SessionEntry {
+                thread,
                 surface,
                 prompt_binding: None,
                 next_prompt_seq: 1,

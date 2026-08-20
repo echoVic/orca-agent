@@ -57,6 +57,26 @@ pub(crate) fn read_manual_compaction_snapshot(
     }))
 }
 
+pub(crate) fn read_prompt_queue_snapshot(
+    path: &Path,
+) -> io::Result<crate::prompt_queue::PromptQueueSnapshot> {
+    Ok(read_records(path)?
+        .into_iter()
+        .rev()
+        .find_map(|record| match record {
+            SessionRecord::PromptQueueSnapshot(snapshot) => Some(snapshot),
+            _ => None,
+        })
+        .unwrap_or_default())
+}
+
+pub(crate) fn write_prompt_queue_snapshot(
+    path: &Path,
+    snapshot: &crate::prompt_queue::PromptQueueSnapshot,
+) -> io::Result<()> {
+    write_durable_record(path, &SessionRecord::PromptQueueSnapshot(snapshot.clone()))
+}
+
 pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -482,7 +502,8 @@ pub(crate) fn transcript_from_records(
             | SessionRecord::SurfaceOwnerEpoch { .. }
             | SessionRecord::SurfaceFinalizeIntent { .. }
             | SessionRecord::SurfaceSettlement { .. }
-            | SessionRecord::SurfaceShutdownBarrier { .. } => {}
+            | SessionRecord::SurfaceShutdownBarrier { .. }
+            | SessionRecord::PromptQueueSnapshot(_) => {}
             SessionRecord::PlanState { explanation, plan } => {
                 let all_done = !plan.is_empty()
                     && plan.iter().all(|item| item.status == PlanStatus::Completed);
@@ -614,6 +635,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         | SessionRecord::SurfaceSettlement { .. } => {}
         SessionRecord::SurfaceFinalizeIntent { .. }
         | SessionRecord::SurfaceShutdownBarrier { .. } => {}
+        SessionRecord::PromptQueueSnapshot(_) => {}
         SessionRecord::PlanState { explanation, plan } => {
             if let Some(explanation) = explanation {
                 redact_string_in_place(explanation);
@@ -1397,6 +1419,31 @@ mod tests {
             expected.estimated_cost_usd,
             actual.estimated_cost_usd
         );
+    }
+
+    #[test]
+    fn prompt_queue_snapshot_preserves_input_required_for_recovery_bits_spec_ut() {
+        let path = tempfile::NamedTempFile::new().expect("temporary prompt queue store");
+        let recovery_input = "recover token=test-queue-recovery-value";
+        let snapshot = crate::prompt_queue::PromptQueueSnapshot {
+            revision: crate::prompt_queue::QueueRevision::from_u64(3),
+            paused: true,
+            items: vec![crate::prompt_queue::QueuedSubmission {
+                id: crate::prompt_queue::QueuedSubmissionId::new(),
+                client_user_message_id: crate::prompt_queue::ClientUserMessageId::new(),
+                input: crate::prompt_queue::PromptQueueInput::text(recovery_input),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            }],
+            dispatch: None,
+        };
+
+        write_prompt_queue_snapshot(path.path(), &snapshot).expect("persist prompt queue snapshot");
+        let recovered =
+            read_prompt_queue_snapshot(path.path()).expect("recover prompt queue snapshot");
+
+        assert_eq!(recovered, snapshot);
+        assert_eq!(recovered.items[0].input.text, recovery_input);
     }
 
     #[test]

@@ -126,6 +126,7 @@ fn background_task_summary_matches_sdk_names() {
         subagent_current_activity: None,
         subagent_turn: None,
         last_activity_at_ms: None,
+        continuation: None,
         result: None,
         error: None,
         retry_count: 0,

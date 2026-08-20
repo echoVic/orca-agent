@@ -20,6 +20,20 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, oneshot};
 
+#[derive(serde::Deserialize)]
+struct AcpPromptQueueParams {
+    #[serde(rename = "sessionId")]
+    session_id: SessionId,
+    #[serde(rename = "expectedRevision", default)]
+    expected_revision: Option<u64>,
+    #[serde(rename = "queueId", default)]
+    queue_id: Option<String>,
+    #[serde(rename = "orderedIds", default)]
+    ordered_ids: Vec<String>,
+    #[serde(default)]
+    input: String,
+}
+
 use super::agent::{
     ACP_NOTIFICATION_CAPACITY, AcpClientBridge, AcpInteractionRequest, AcpInteractionResponseKind,
     AcpInteractionWaitError, AcpInteractionWireResponse, AcpNotificationDelivery, OrcaAcpAgent,
@@ -510,6 +524,91 @@ fn handle_inbound(
                 retire_session_terminal_cleanup_routes(&terminal_cleanup_routes, &session_id);
                 Ok(empty_completion())
             }
+            method @ ("orca.dev/session/queue/list"
+            | "orca.dev/session/queue/add"
+            | "orca.dev/session/queue/update"
+            | "orca.dev/session/queue/delete"
+            | "orca.dev/session/queue/reorder"
+            | "orca.dev/session/queue/pause"
+            | "orca.dev/session/queue/start") => {
+                let result = decode::<AcpPromptQueueParams>(params)
+                    .map_err(agent_client_protocol::Error::into_internal_error)
+                    .and_then(|params| {
+                        let parse_id = |value: Option<String>| {
+                            crate::prompt_queue::QueuedSubmissionId::parse(
+                                value.unwrap_or_default(),
+                            )
+                            .map_err(|message| {
+                                agent_client_protocol::Error::invalid_params().data(message)
+                            })
+                        };
+                        let action = match method {
+                            "orca.dev/session/queue/list" => {
+                                crate::prompt_queue::PromptQueueAction::List
+                            }
+                            "orca.dev/session/queue/add" => {
+                                crate::prompt_queue::PromptQueueAction::Add {
+                                    input: params.input.into(),
+                                }
+                            }
+                            "orca.dev/session/queue/update" => {
+                                crate::prompt_queue::PromptQueueAction::Update {
+                                    expected_revision: required_queue_revision(
+                                        params.expected_revision,
+                                    )?,
+                                    id: parse_id(params.queue_id)?,
+                                    input: params.input.into(),
+                                }
+                            }
+                            "orca.dev/session/queue/delete" => {
+                                crate::prompt_queue::PromptQueueAction::Delete {
+                                    expected_revision: required_queue_revision(
+                                        params.expected_revision,
+                                    )?,
+                                    id: parse_id(params.queue_id)?,
+                                }
+                            }
+                            "orca.dev/session/queue/reorder" => {
+                                crate::prompt_queue::PromptQueueAction::Reorder {
+                                    expected_revision: required_queue_revision(
+                                        params.expected_revision,
+                                    )?,
+                                    ordered_ids: params
+                                        .ordered_ids
+                                        .into_iter()
+                                        .map(crate::prompt_queue::QueuedSubmissionId::parse)
+                                        .collect::<Result<Vec<_>, _>>()
+                                        .map_err(|message| {
+                                            agent_client_protocol::Error::invalid_params()
+                                                .data(message)
+                                        })?,
+                                }
+                            }
+                            "orca.dev/session/queue/pause" => {
+                                crate::prompt_queue::PromptQueueAction::Pause {
+                                    expected_revision: required_queue_revision(
+                                        params.expected_revision,
+                                    )?,
+                                }
+                            }
+                            "orca.dev/session/queue/start" => {
+                                crate::prompt_queue::PromptQueueAction::Start {
+                                    expected_revision: required_queue_revision(
+                                        params.expected_revision,
+                                    )?,
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        agent
+                            .prompt_queue(&params.session_id, action)
+                            .and_then(|snapshot| {
+                                serde_json::to_value(snapshot)
+                                    .map_err(agent_client_protocol::Error::into_internal_error)
+                            })
+                    });
+                Ok(response_completion(facade, request_id, result))
+            }
             _ => {
                 let error = agent_client_protocol::Error::method_not_found()
                     .data(format!("unsupported ACP method '{method}'"));
@@ -521,6 +620,17 @@ fn handle_inbound(
 
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
     serde_json::from_value(value)
+}
+
+fn required_queue_revision(
+    value: Option<u64>,
+) -> Result<crate::prompt_queue::QueueRevision, agent_client_protocol::Error> {
+    value
+        .map(crate::prompt_queue::QueueRevision::from_u64)
+        .ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data("queue mutation params.expectedRevision is required")
+        })
 }
 
 fn empty_completion() -> LocalHandlerCompletion {
@@ -2520,6 +2630,19 @@ mod tests {
 
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn acp_queue_mutation_requires_expected_revision_bits_spec_ut() {
+        let params = decode::<AcpPromptQueueParams>(json!({
+            "sessionId": "session-1",
+            "queueId": uuid::Uuid::now_v7().to_string(),
+        }))
+        .expect("decode queue params");
+
+        let error = required_queue_revision(params.expected_revision)
+            .expect_err("missing expectedRevision must be rejected");
+        assert!(format!("{error:?}").contains("expectedRevision"));
     }
 
     fn pending_permission_route(

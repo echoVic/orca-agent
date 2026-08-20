@@ -21,6 +21,71 @@ use crate::surface_actions::TuiSurfaceActions;
 use crate::types::TuiEvent;
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_hosted_queued_prompt(
+    prompt: String,
+    bindings: orca_runtime::mentions::MentionBindings,
+    config: &Arc<Mutex<RunConfig>>,
+    preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
+    thread: &mut Option<RuntimeThreadHandle>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    host: &RuntimeHostHandle,
+) {
+    let cfg = config.lock().unwrap().clone();
+    let rejection_prompt = prompt.clone();
+    let submitted = SubmittedTurn::user_with_mentions(prompt, bindings);
+    let thread_was_missing = thread.is_none();
+    let cwd = cfg
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    if let Err(error) =
+        ensure_hosted_thread(thread, host, &cfg, preloaded, submitted.prompt(), event_tx)
+    {
+        let _ = event_tx.send(TuiEvent::SubmissionRejected {
+            queued_id: None,
+            prompt: rejection_prompt,
+            message: error,
+        });
+        return;
+    }
+    if thread_was_missing {
+        announce_runtime_ready(thread.as_ref().expect("queued prompt thread"), event_tx);
+    }
+    let runtime_thread = thread.as_ref().expect("queued prompt thread initialized");
+    let roots = cfg
+        .runtime_workspace_roots
+        .clone()
+        .filter(|roots| !roots.is_empty())
+        .unwrap_or_else(|| vec![cwd.clone()]);
+    let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
+    let prompt = match submitted.prompt_for_model(&actions, &cwd, &roots) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::SubmissionRejected {
+                queued_id: None,
+                prompt: rejection_prompt,
+                message: error,
+            });
+            return;
+        }
+    };
+    match runtime_thread.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Add {
+        input: prompt.into(),
+    }) {
+        Ok(snapshot) => {
+            let _ = event_tx.send(TuiEvent::PromptQueueUpdated(snapshot));
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::SubmissionRejected {
+                queued_id: None,
+                prompt: rejection_prompt,
+                message: format!("failed to queue follow-up: {error:?}"),
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_hosted_submitted_turn(
     submitted_turn: SubmittedTurn,
     config: &Arc<Mutex<RunConfig>>,
@@ -244,6 +309,75 @@ mod tests {
             event,
             TuiEvent::QueuedSubmissionStarted { .. } | TuiEvent::SessionCompleted { .. }
         )));
+        thread
+            .take()
+            .expect("started runtime thread")
+            .shutdown()
+            .expect("runtime thread shutdown");
+        host.shutdown().expect("runtime host shutdown");
+    }
+
+    #[test]
+    fn first_queued_prompt_announces_runtime_ready_before_rejection() {
+        let _home = crate::test_support::isolate_orca_home();
+        let root = tempfile::tempdir().expect("workspace root");
+        let root_path = root
+            .path()
+            .canonicalize()
+            .expect("canonical workspace root");
+        let mut run_config = crate::test_support::test_run_config();
+        run_config.cwd = Some(root_path.clone());
+        run_config.runtime_workspace_roots = Some(vec![root_path.clone()]);
+        let config = Arc::new(Mutex::new(run_config));
+        let preloaded = Arc::new(Mutex::new(None));
+        let prompt = "review @gone.txt";
+        let bindings = orca_runtime::mentions::MentionBindings::from_bindings(
+            prompt,
+            vec![orca_runtime::mentions::MentionBinding {
+                start: 7,
+                end: prompt.len(),
+                visible: "@gone.txt".to_string(),
+                target: orca_runtime::mentions::MentionTarget::File {
+                    root: root_path,
+                    path: "gone.txt".to_string(),
+                    kind: orca_runtime::mentions::MentionFileKind::File,
+                },
+            }],
+        );
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let mut thread = None;
+
+        super::handle_hosted_queued_prompt(
+            prompt.to_string(),
+            bindings,
+            &config,
+            &preloaded,
+            &mut thread,
+            &event_tx,
+            &host.handle(),
+        );
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        let ready = events
+            .iter()
+            .position(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)))
+            .expect("runtime ready event");
+        let rejected = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    TuiEvent::SubmissionRejected {
+                        queued_id: None,
+                        prompt,
+                        message,
+                    } if prompt == "review @gone.txt"
+                        && message.contains("failed to resolve bound @gone.txt")
+                )
+            })
+            .expect("queued prompt rejection");
+        assert!(ready < rejected, "events: {events:?}");
         thread
             .take()
             .expect("started runtime thread")

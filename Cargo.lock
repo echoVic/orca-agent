@@ -204,7 +204,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "blade-deepseek"
-version = "0.3.24"
+version = "0.3.25"
 dependencies = [
  "base64",
  "clap",
@@ -1704,6 +1704,7 @@ dependencies = [
  "two-face",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 

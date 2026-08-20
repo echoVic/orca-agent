@@ -327,6 +327,22 @@ impl RuntimeSurfaceThreadHandle {
         self.runtime.surface()
     }
 
+    pub fn prompt_queue(
+        &self,
+        action: crate::prompt_queue::PromptQueueAction,
+    ) -> Result<
+        crate::prompt_queue::PromptQueueSnapshot,
+        crate::prompt_queue::PromptQueueMutationError,
+    > {
+        self.runtime.prompt_queue(action)
+    }
+
+    pub fn subscribe_prompt_queue(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::prompt_queue::PromptQueueSnapshot> {
+        self.runtime.subscribe_prompt_queue()
+    }
+
     pub fn acp_surface(&self) -> Option<RuntimeSurfaceHandle> {
         self.connection_id
             .clone()

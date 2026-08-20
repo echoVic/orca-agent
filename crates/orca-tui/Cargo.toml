@@ -23,6 +23,7 @@ tui-textarea = { workspace = true }
 qwertty = { workspace = true }
 supports-color = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }
 pulldown-cmark = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }

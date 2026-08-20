@@ -213,6 +213,16 @@ pub enum EventType {
     SubagentProgress,
     #[serde(rename = "subagent.completed")]
     SubagentCompleted,
+    #[serde(rename = "agent.continuation.checkpointed")]
+    AgentContinuationCheckpointed,
+    #[serde(rename = "agent.continuation.suspended")]
+    AgentContinuationSuspended,
+    #[serde(rename = "agent.continuation.resumed")]
+    AgentContinuationResumed,
+    #[serde(rename = "agent.continuation.orphan_reconciled")]
+    AgentContinuationOrphanReconciled,
+    #[serde(rename = "agent.continuation.indeterminate")]
+    AgentContinuationIndeterminate,
     #[serde(rename = "workflow.started")]
     WorkflowStarted,
     #[serde(rename = "workflow.resumed")]
@@ -282,6 +292,11 @@ impl EventType {
             | Self::GoalCompleted
             | Self::SubagentStarted
             | Self::SubagentCompleted
+            | Self::AgentContinuationCheckpointed
+            | Self::AgentContinuationSuspended
+            | Self::AgentContinuationResumed
+            | Self::AgentContinuationOrphanReconciled
+            | Self::AgentContinuationIndeterminate
             | Self::WorkflowStarted
             | Self::WorkflowResumed
             | Self::WorkflowPhaseStarted
@@ -1165,6 +1180,29 @@ impl EventFactory {
         )
     }
 
+    pub fn agent_continuation_updated(
+        &mut self,
+        event_type: EventType,
+        task_id: &str,
+        continuation: &crate::task_types::TaskContinuationSummary,
+    ) -> EventDraft {
+        debug_assert!(matches!(
+            event_type,
+            EventType::AgentContinuationCheckpointed
+                | EventType::AgentContinuationSuspended
+                | EventType::AgentContinuationResumed
+                | EventType::AgentContinuationOrphanReconciled
+                | EventType::AgentContinuationIndeterminate
+        ));
+        self.make(
+            event_type,
+            json!({
+                "taskId": task_id,
+                "continuation": continuation,
+            }),
+        )
+    }
+
     pub fn verification_started(&mut self, command: &str) -> EventDraft {
         self.make(
             EventType::VerificationStarted,
@@ -1559,6 +1597,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: None,
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,
@@ -1610,6 +1649,7 @@ mod tests {
             subagent_current_activity: None,
             subagent_turn: None,
             last_activity_at_ms: Some(30),
+            continuation: None,
             result: None,
             error: None,
             retry_count: 0,

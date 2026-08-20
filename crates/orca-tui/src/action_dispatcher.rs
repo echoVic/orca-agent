@@ -202,6 +202,64 @@ fn route_action(
         UserAction::BackgroundCurrentTurn => {
             controller.request_background_current();
         }
+        UserAction::QueuePrompt { prompt, bindings } => {
+            match controller.queue_prompt(prompt.clone(), bindings.clone()) {
+                Ok(Some(snapshot)) => {
+                    let _ = event_tx.try_send(TuiEvent::PromptQueueUpdated(snapshot));
+                }
+                Ok(None) => match enqueue_action(
+                    UserAction::QueuePrompt { prompt, bindings },
+                    command_tx,
+                    backlog,
+                    backlog_capacity,
+                ) {
+                    EnqueueResult::Queued => {}
+                    EnqueueResult::Disconnected => return false,
+                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                },
+                Err(error) => {
+                    let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
+                        queued_id: None,
+                        prompt,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+        UserAction::PromptQueueControl(action) => {
+            let deleted_id = match &action {
+                orca_runtime::prompt_queue::PromptQueueAction::Delete { id, .. } => {
+                    Some(id.clone())
+                }
+                _ => None,
+            };
+            match controller.prompt_queue_action(action.clone()) {
+                Ok(Some(snapshot)) => {
+                    let _ = event_tx.try_send(TuiEvent::PromptQueueControlUpdated {
+                        deleted_id,
+                        snapshot,
+                    });
+                }
+                Ok(None) => match enqueue_action(
+                    UserAction::PromptQueueControl(action),
+                    command_tx,
+                    backlog,
+                    backlog_capacity,
+                ) {
+                    EnqueueResult::Queued => {}
+                    EnqueueResult::Disconnected => {
+                        let _ = event_tx.try_send(TuiEvent::OperationRejected(
+                            "TUI command queue is disconnected; queue control rejected".to_string(),
+                        ));
+                        return false;
+                    }
+                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                },
+                Err(error) => {
+                    let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
+                }
+            }
+        }
         UserAction::GoalPause => match controller.pause_current_goal() {
             Ok(true) => {}
             Ok(false) => {
@@ -301,6 +359,16 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
                 prompt,
                 message,
             });
+        }
+        UserAction::QueuePrompt { prompt, .. } => {
+            let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
+                queued_id: None,
+                prompt,
+                message,
+            });
+        }
+        UserAction::PromptQueueControl(_) => {
+            let _ = event_tx.try_send(TuiEvent::OperationRejected(message));
         }
         UserAction::SubmitQueued { id, prompt, .. } => {
             let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
@@ -809,6 +877,32 @@ mod tests {
                 prompt, message, ..
             })
                 if prompt == "third" && message.contains("queue is full")
+        ));
+        dispatcher.shutdown().expect("shutdown dispatcher");
+    }
+
+    #[test]
+    fn disconnected_queue_control_reports_operation_rejected() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+        drop(command_rx);
+
+        raw_tx
+            .send(UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Delete {
+                    expected_revision: orca_runtime::prompt_queue::QueueRevision::ZERO,
+                    id: orca_runtime::prompt_queue::QueuedSubmissionId::new(),
+                },
+            ))
+            .expect("queue control action");
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::OperationRejected(message))
+                if message.contains("queue control rejected")
         ));
         dispatcher.shutdown().expect("shutdown dispatcher");
     }

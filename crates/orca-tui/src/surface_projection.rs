@@ -1518,6 +1518,7 @@ pub(crate) fn workflow_task_summaries(
                                 started_at_ms: None,
                                 completed_at_ms: None,
                                 usage: agent.usage.as_ref().map(core_usage_totals),
+                                continuation: None,
                             })
                             .collect()
                     })
@@ -1543,6 +1544,7 @@ pub(crate) fn workflow_task_summaries(
                 subagent_current_activity: None,
                 subagent_turn: None,
                 last_activity_at_ms: task.completed_at.or(task.started_at).map(UnixMillis::get),
+                continuation: None,
                 result: task.result.as_ref().map(|value| value.as_str().to_string()),
                 error: task.error.as_ref().map(|value| value.as_str().to_string()),
                 retry_count: task.retry_count,

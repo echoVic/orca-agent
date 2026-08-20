@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.24";
+export const releaseVersion = "v0.3.25";
 
 export const releases = [
+  {
+    version: "v0.3.25",
+    date: "2026-08-20",
+    title: "Checkpointable agent continuation and large Goal pastes",
+    body: "Adds runtime-owned, checkpointable continuation lineages for synchronous subagents, async workers, and Workflow children, with leased attempts, digest-verified checkpoints, replay boundaries, cold recovery, and fail-closed indeterminate side effects. A durable prompt queue now projects the same lifecycle across TUI, ACP, JSONL, and Headless. The TUI also adopts Codex-style paste chips and materializes active Goal pastes under ORCA_HOME, including bounded objective files and transactional cleanup.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.25",
+  },
   {
     version: "v0.3.24",
     date: "2026-08-19",

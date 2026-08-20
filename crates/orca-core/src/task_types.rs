@@ -75,6 +75,8 @@ pub struct WorkflowAgentTaskSummary {
     pub completed_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageTotals>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<TaskContinuationSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -154,6 +156,8 @@ pub struct BackgroundTaskSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<TaskContinuationSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -163,6 +167,20 @@ pub struct BackgroundTaskSummary {
     pub output_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskContinuationSummary {
+    pub continuation_id: String,
+    pub attempt_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    pub revision: u64,
+    #[serde(default)]
+    pub resumable: bool,
+    #[serde(default)]
+    pub indeterminate: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

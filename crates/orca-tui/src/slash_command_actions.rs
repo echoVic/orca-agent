@@ -2,10 +2,12 @@ use crossbeam_channel as mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::commands::{self, GoalSlashCommand, SlashCommand, TrustSlashCommand};
+use crate::commands::{self, GoalSlashCommand, QueueSlashCommand, SlashCommand, TrustSlashCommand};
 use crate::session_picker_actions::open_session_picker;
 use crate::surface_actions::TuiHostActions;
-use crate::types::{AppState, AppStatus, ChatMessage, ConfigDialog, TuiMemoryScope, UserAction};
+use crate::types::{
+    AppState, AppStatus, ChatMessage, ConfigDialog, GoalDraft, TuiMemoryScope, UserAction,
+};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::RunConfig;
 
@@ -27,6 +29,68 @@ pub(crate) fn handle_slash_command(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let command = commands::parse_with_cwd(text, &cwd)?;
+    dispatch_slash_command(command, None, config, state, action_tx)
+}
+
+pub(crate) fn handle_composer_slash_command(
+    visible_text: &str,
+    expanded_text: &str,
+    pending_pastes: &[(String, String)],
+    config: &mut RunConfig,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> Option<SlashOutcome> {
+    let cwd = config
+        .cwd
+        .as_deref()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    match commands::parse_with_cwd(visible_text, &cwd) {
+        Some(SlashCommand::Goal(GoalSlashCommand::Set(objective))) => {
+            let draft = GoalDraft {
+                objective: objective.clone(),
+                pending_pastes: pending_pastes.to_vec(),
+            };
+            dispatch_slash_command(
+                SlashCommand::Goal(GoalSlashCommand::Set(objective)),
+                Some(draft),
+                config,
+                state,
+                action_tx,
+            )
+        }
+        Some(SlashCommand::Goal(GoalSlashCommand::Edit(objective))) => {
+            let draft = GoalDraft {
+                objective: objective.clone(),
+                pending_pastes: pending_pastes.to_vec(),
+            };
+            dispatch_slash_command(
+                SlashCommand::Goal(GoalSlashCommand::Edit(objective)),
+                Some(draft),
+                config,
+                state,
+                action_tx,
+            )
+        }
+        _ => {
+            let command = commands::parse_with_cwd(expanded_text, &cwd)?;
+            dispatch_slash_command(command, None, config, state, action_tx)
+        }
+    }
+}
+
+fn dispatch_slash_command(
+    command: SlashCommand,
+    goal_draft: Option<GoalDraft>,
+    config: &mut RunConfig,
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+) -> Option<SlashOutcome> {
+    let cwd = config
+        .cwd
+        .as_deref()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let mut pending_settings_action = None;
     match command {
         SlashCommand::New => {
@@ -117,14 +181,37 @@ pub(crate) fn handle_slash_command(
         SlashCommand::Goal(goal_command) => {
             let action = match goal_command {
                 GoalSlashCommand::Show => UserAction::GoalShow,
-                GoalSlashCommand::Set(objective) => UserAction::GoalSet(objective),
-                GoalSlashCommand::Edit(objective) => UserAction::GoalEdit(objective),
+                GoalSlashCommand::Set(objective) => {
+                    UserAction::GoalSet(goal_draft.unwrap_or_else(|| GoalDraft {
+                        objective,
+                        pending_pastes: Vec::new(),
+                    }))
+                }
+                GoalSlashCommand::Edit(objective) => {
+                    UserAction::GoalEdit(goal_draft.unwrap_or_else(|| GoalDraft {
+                        objective,
+                        pending_pastes: Vec::new(),
+                    }))
+                }
                 GoalSlashCommand::Clear => UserAction::GoalClear,
                 GoalSlashCommand::Pause => UserAction::GoalPause,
                 GoalSlashCommand::Resume => UserAction::GoalResume,
             };
             state.enter_running();
             let _ = action_tx.send(action);
+        }
+        SlashCommand::Queue(queue_command) => {
+            let revision = state.runtime_queue_revision();
+            let action = match queue_command {
+                QueueSlashCommand::List => orca_runtime::prompt_queue::PromptQueueAction::List,
+                QueueSlashCommand::Pause => orca_runtime::prompt_queue::PromptQueueAction::Pause {
+                    expected_revision: revision,
+                },
+                QueueSlashCommand::Start => orca_runtime::prompt_queue::PromptQueueAction::Start {
+                    expected_revision: revision,
+                },
+            };
+            let _ = action_tx.send(UserAction::PromptQueueControl(action));
         }
         SlashCommand::SkillRun { id, args } => {
             let prompt = match args {
@@ -655,5 +742,38 @@ mod tests {
             Ok(UserAction::RenameCurrentSession { title }) if title == "release triage"
         ));
         assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn composer_goal_commands_preserve_visible_paste_bindings() {
+        for (visible, is_edit) in [
+            ("/goal [Pasted Content 1001 chars]", false),
+            ("/goal edit [Pasted Content 1001 chars]", true),
+        ] {
+            let mut state = state();
+            let mut config = test_run_config();
+            let (action_tx, action_rx) = mpsc::unbounded();
+            let pending = vec![("[Pasted Content 1001 chars]".to_string(), "x".repeat(1001))];
+            let expanded = visible.replace(&pending[0].0, &pending[0].1);
+
+            let outcome = handle_composer_slash_command(
+                visible,
+                &expanded,
+                &pending,
+                &mut config,
+                &mut state,
+                &action_tx,
+            );
+
+            assert!(matches!(outcome, Some(SlashOutcome::Continue)));
+            let action = action_rx.try_recv().expect("Goal action");
+            let draft = match action {
+                UserAction::GoalSet(draft) if !is_edit => draft,
+                UserAction::GoalEdit(draft) if is_edit => draft,
+                other => panic!("unexpected Goal action: {other:?}"),
+            };
+            assert_eq!(draft.objective, pending[0].0);
+            assert_eq!(draft.pending_pastes, pending);
+        }
     }
 }

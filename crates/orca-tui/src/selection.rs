@@ -195,6 +195,7 @@ pub fn tmux_passthrough(sequence: &str) -> String {
 /// The selection style is patched over each source span so syntax colors and
 /// modifiers survive. A `None` end highlights through the end of the line. A
 /// wide character is selected iff its leading column is inside the range.
+#[cfg(test)]
 pub fn apply_selection_to_line(
     line: Line<'static>,
     col_start: usize,

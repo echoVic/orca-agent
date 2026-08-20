@@ -7,9 +7,10 @@ use orca_core::config::RunConfig;
 
 use crate::commands;
 use crate::composer_textarea::{
-    expand_pending_pastes, make_textarea, make_textarea_with_text, textarea_text,
+    MAX_USER_INPUT_TEXT_CHARS, expand_pending_pastes, make_textarea, make_textarea_with_text,
+    textarea_text,
 };
-use crate::slash_command_actions::{SlashOutcome, handle_slash_command};
+use crate::slash_command_actions::{SlashOutcome, handle_composer_slash_command};
 use crate::theme::Theme;
 use crate::types::{
     AppState, AppStatus, ChatMessage, PendingTuiInput, TuiInteractionResponse,
@@ -24,7 +25,7 @@ pub(crate) fn handle_idle_submit(
     theme: &Theme,
     state: &mut AppState,
     config: &mut RunConfig,
-    shared_config: &Arc<Mutex<RunConfig>>,
+    _shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> bool {
     state.slash_menu = None;
@@ -56,7 +57,15 @@ pub(crate) fn handle_idle_submit(
     }
 
     if state.status != AppStatus::WaitingUserInput
-        && let Some(outcome) = handle_slash_command(&text, config, shared_config, state, action_tx)
+        && let pending_pastes = state.pending_pastes.clone()
+        && let Some(outcome) = handle_composer_slash_command(
+            visible_text.trim(),
+            &text,
+            &pending_pastes,
+            config,
+            state,
+            action_tx,
+        )
     {
         match outcome {
             SlashOutcome::Continue => {
@@ -85,6 +94,16 @@ pub(crate) fn handle_idle_submit(
         state.atomic_skill_tokens.clear();
         reset_composer_after_submit(textarea, vim_state, theme);
         return true;
+    }
+
+    if state.status != AppStatus::WaitingUserInput {
+        let actual_chars = text.chars().count();
+        if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
+            state.push_message(ChatMessage::Error(format!(
+                "Message exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters ({actual_chars} provided)."
+            )));
+            return true;
+        }
     }
 
     if state.status == AppStatus::WaitingUserInput {
@@ -131,7 +150,6 @@ pub(crate) fn handle_idle_submit(
             let _ = action_tx.send(UserAction::RespondToInteraction { key, response });
         }
     } else {
-        state.resume_queued_follow_up_autosend();
         state.record_prompt(text.clone());
         state.push_message(ChatMessage::User(visible_text.trim().to_string()));
         state.enter_running();
@@ -141,6 +159,8 @@ pub(crate) fn handle_idle_submit(
             prompt: text,
             bindings,
         });
+        state.request_runtime_queue_start();
+        state.resume_queued_follow_up_autosend();
     }
     state.pending_pastes.clear();
     state.mention_bindings.clear();
@@ -495,5 +515,45 @@ mod tests {
             assert_eq!(state.pending_mcp_elicitation_mode, expected_mode);
             assert_eq!(textarea_text(&textarea), "");
         }
+    }
+
+    #[test]
+    fn oversized_expanded_chat_preserves_composer_and_does_not_dispatch() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let placeholder = format!("[Pasted Content {} chars]", MAX_USER_INPUT_TEXT_CHARS + 1);
+        state.pending_pastes.push((
+            placeholder.clone(),
+            "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1),
+        ));
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text(&placeholder, &vim, &theme);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+
+        assert!(action_rx.try_recv().is_err());
+        assert_eq!(textarea_text(&textarea), placeholder);
+        assert_eq!(state.pending_pastes.len(), 1);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Error(message))
+                if message.contains("Message exceeds the maximum length")
+        ));
     }
 }

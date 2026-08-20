@@ -186,6 +186,21 @@ impl<W: Write> EventSink<W> {
                 let status = event.payload["status"].as_str().unwrap_or("unknown");
                 writeln!(self.writer, "subagent completed: {description} ({status})")
             }
+            EventType::AgentContinuationCheckpointed => {
+                writeln!(self.writer, "agent continuation checkpointed")
+            }
+            EventType::AgentContinuationSuspended => {
+                writeln!(self.writer, "agent continuation suspended")
+            }
+            EventType::AgentContinuationResumed => {
+                writeln!(self.writer, "agent continuation resumed")
+            }
+            EventType::AgentContinuationOrphanReconciled => {
+                writeln!(self.writer, "agent continuation orphan reconciled")
+            }
+            EventType::AgentContinuationIndeterminate => {
+                writeln!(self.writer, "agent continuation indeterminate")
+            }
             EventType::WorkflowStarted => {
                 let workflow_name = event.payload["workflowName"].as_str().unwrap_or("workflow");
                 writeln!(self.writer, "workflow started: {workflow_name}")

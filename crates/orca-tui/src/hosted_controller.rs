@@ -27,7 +27,7 @@ use crate::hosted_side::{
     HostedSideAction, HostedSideParent, handle_hosted_side_action, hosted_config_for_active,
     shutdown_attached_side_on_controller_exit,
 };
-use crate::hosted_submission::handle_hosted_submitted_turn;
+use crate::hosted_submission::{handle_hosted_queued_prompt, handle_hosted_submitted_turn};
 use crate::hosted_workflow::{HostedWorkflowAction, handle_hosted_workflow_action};
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::slash_command_actions::decode_settings_intent;
@@ -338,6 +338,44 @@ pub(crate) fn hosted_tui_controller_loop(
                     &pending_workflow_notifications,
                     &host,
                 );
+            }
+            Ok(UserAction::QueuePrompt { prompt, bindings }) => {
+                handle_hosted_queued_prompt(
+                    prompt,
+                    bindings,
+                    &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
+                    &preloaded,
+                    &mut thread,
+                    &event_tx,
+                    &host,
+                );
+            }
+            Ok(UserAction::PromptQueueControl(action)) => {
+                let deleted_id = match &action {
+                    orca_runtime::prompt_queue::PromptQueueAction::Delete { id, .. } => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                };
+                let result = thread
+                    .as_ref()
+                    .ok_or_else(|| "prompt queue requires an active session".to_string())
+                    .and_then(|thread| {
+                        thread
+                            .prompt_queue(action)
+                            .map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(snapshot) => {
+                        let _ = event_tx.send(TuiEvent::PromptQueueControlUpdated {
+                            deleted_id,
+                            snapshot,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    }
+                }
             }
             Ok(UserAction::SubmitQueued {
                 id,

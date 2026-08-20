@@ -28,7 +28,14 @@
       "(?:std::fs::rename|fs::rename)\\(\\s*&?temp_path\\b"
     ]
   ],
-  "foundation_exceptions": [],
+  "foundation_exceptions": [
+    [
+      "tui-goal-materialization-private-unix-permissions",
+      "crates/orca-tui/src/goal_materialization.rs",
+      "unix_std_api",
+      4
+    ]
+  ],
   "deferred_boundaries": [
     [
       "thread-store-session-index-unix-fixture",

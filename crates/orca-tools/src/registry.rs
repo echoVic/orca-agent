@@ -787,7 +787,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "subagent",
-            "Launch a synchronous child agent for a complex, multi-step subtask. The child runs independently and returns a concise result summary.",
+            "Launch or resume a child agent for a complex, multi-step subtask. A resumed call appends the new prompt to the same child conversation and inherits the source subagent type, model, isolation, cwd, and worktree; explicitly conflicting overrides fail closed. Completion returns a concise result summary with a resume hint for continuing the child conversation.",
             json!({
                 "type": "object",
                 "properties": {
@@ -822,6 +822,10 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "schema": {
                         "type": "object",
                         "description": "Optional JSON Schema subset for validating the child agent's final output. Supports type, required, and properties."
+                    },
+                    "resume_from": {
+                        "type": "string",
+                        "description": "Optional continuation id returned by a prior subagent completion, or a compatible agent_id. Resuming appends prompt to the same child conversation and inherits the source subagent_type, model, isolation, cwd, and worktree; explicitly conflicting values fail closed."
                     }
                 },
                 "required": ["description", "prompt"]

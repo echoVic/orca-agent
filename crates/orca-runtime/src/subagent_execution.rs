@@ -1941,10 +1941,10 @@ mod tests {
             result.terminal().started,
             tool_types::ToolInvocationStarted::Yes
         );
-        assert_eq!(
-            result.error.as_deref(),
-            Some("Subagent status: Cancelled\n\nchild turn cancelled")
-        );
+        let error = result.error.as_deref().expect("cancelled child error");
+        assert!(error.starts_with("Subagent status: Cancelled\n\nchild turn cancelled"));
+        assert!(error.contains("[agent_continuation]"));
+        assert!(error.contains("resume_from="));
     }
 
     fn receipt_child_executor<W: io::Write>(

@@ -431,10 +431,12 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
 
+    #[cfg(unix)]
+    use super::read_capped_utf8_with;
     use super::{
         DrainResults, EditHighlightJob, EditHighlightOutcome, EditHighlightResult,
         EditHighlightRuntime, coalesce_jobs, coalesce_jobs_until_shutdown, read_capped_utf8_from,
-        read_capped_utf8_with, run_job, spawn_worker,
+        run_job, spawn_worker,
     };
     use crate::diff_highlight::{RefinedDiffStyles, parse_unified_diff};
     use crate::syntax_highlight::{

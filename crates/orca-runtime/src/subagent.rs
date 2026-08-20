@@ -14,6 +14,8 @@ pub struct SubagentRequest {
     pub isolation: SubagentIsolation,
     pub schema: Option<Value>,
     #[serde(default)]
+    pub resume_from: Option<String>,
+    #[serde(default)]
     pub delegation: Option<DelegationSnapshot>,
 }
 
@@ -65,6 +67,9 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         _ => SubagentIsolation::None,
     };
     let schema = extract_subagent_json_field(tool_request, "schema");
+    let resume_from = extract_subagent_field(tool_request, "resume_from")
+        .map(|selector| selector.trim().to_string())
+        .filter(|selector| !selector.is_empty());
 
     SubagentRequest {
         description,
@@ -74,6 +79,7 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         mode,
         isolation,
         schema,
+        resume_from,
         delegation: None,
     }
 }

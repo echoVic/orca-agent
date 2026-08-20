@@ -1,6 +1,7 @@
 //! Hosted Goal orchestration owner. This module is intentionally stateless;
 //! runtime handles, configuration, and event channels remain controller-owned.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,7 @@ use orca_runtime::runtime_host::{HostedOperationKind, RuntimeHostHandle, Runtime
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::bridge;
+use crate::goal_materialization::materialize_goal_draft;
 use crate::hosted_runtime::{
     TuiHostedOperationOutcome, emit_hosted_operation_error, hosted_turn_request,
     run_hosted_ordinary_turn, send_submission_error,
@@ -20,7 +22,7 @@ use crate::hosted_session_lifecycle::{ensure_hosted_thread, resume_latest_active
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::TuiEvent;
+use crate::types::{GoalDraft, TuiEvent};
 
 pub(crate) fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     format!(
@@ -173,8 +175,8 @@ pub(crate) fn goal_history_error_message() -> &'static str {
 
 pub(crate) enum HostedGoalAction {
     Show,
-    Set(String),
-    Edit(String),
+    Set(GoalDraft),
+    Edit(GoalDraft),
     Clear,
     Pause,
     Resume,
@@ -193,7 +195,17 @@ pub(crate) fn handle_hosted_goal_action(
 ) {
     match action {
         HostedGoalAction::Show => show_hosted_goal(thread, preloaded, config, event_tx),
-        HostedGoalAction::Set(objective) => {
+        HostedGoalAction::Set(draft) => {
+            let materialized = match materialize_goal_draft(draft) {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                        "failed to prepare goal: {error}"
+                    )));
+                    return;
+                }
+            };
+            let objective = materialized.objective().to_string();
             let cfg = config.lock().unwrap().clone();
             let thread_was_missing = thread.is_none();
             if let Err(error) =
@@ -215,16 +227,34 @@ pub(crate) fn handle_hosted_goal_action(
                 "Starting goal. Automatic continuation will keep running while it remains active."
                     .to_string(),
             ));
-            if let Err(error) = actions.set_goal_and_run(objective, control, event_tx) {
+            let committed = Cell::new(false);
+            let result =
+                actions.set_goal_and_run_with_committed(objective, control, event_tx, || {
+                    committed.set(true)
+                });
+            if committed.get() {
+                materialized.retain();
+            }
+            if let Err(error) = result {
                 emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
             }
         }
-        HostedGoalAction::Edit(objective) => {
+        HostedGoalAction::Edit(draft) => {
             let Some(session_id) =
                 existing_hosted_goal_session_id(thread.as_ref(), preloaded, config, event_tx)
             else {
                 return;
             };
+            let materialized = match materialize_goal_draft(draft) {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::Error(format!(
+                        "failed to prepare goal edit: {error}"
+                    )));
+                    return;
+                }
+            };
+            let objective = materialized.objective().to_string();
             if thread.is_none() {
                 let cfg = config.lock().unwrap().clone();
                 if let Err(error) =
@@ -242,7 +272,15 @@ pub(crate) fn handle_hosted_goal_action(
                 return;
             };
             let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
-            match actions.edit_goal(&session_id, objective, now_timestamp()) {
+            let committed = Cell::new(false);
+            let result =
+                actions.edit_goal_with_committed(&session_id, objective, now_timestamp(), || {
+                    committed.set(true)
+                });
+            if committed.get() {
+                materialized.retain();
+            }
+            match result {
                 Ok(projection) => {
                     let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
                 }

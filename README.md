@@ -97,6 +97,12 @@ by default; use `/remember` for explicit user or project facts. See
 - Saves local conversations with `--resume` for continuation and `--fork` for
   branching; `orca exec resume <SESSION_ID>` restores a headless session with a
   fresh budget scope, and headless exits print the exact resume command.
+- Gives synchronous subagents, async subagents, and workflow child agents a
+  runtime-owned continuation id. A later `subagent` call can pass
+  `resume_from` with that continuation id (or the originating task id) to append
+  a new prompt to the same durable child conversation. Task/status output on
+  TUI, ACP, JSONL, and headless surfaces includes the current attempt,
+  checkpoint, resumable, and indeterminate state.
 - Learns a bounded set of durable project facts after successfully committed
   turns and retrieves only prompt-relevant facts on later turns.
 - Runs with no implicit turn ceiling; optional `[budget]` limits
@@ -141,6 +147,21 @@ More detail:
   status.
 - Cancelling a foreground turn also stops the subagent task tree it owns;
   unrelated detached work is left alone.
+- Continuation recovery is deliberately fail-closed. Orca restores only a
+  digest-verified conversation checkpoint, never a Rust future or process
+  stack. A tool admitted with unknown external side effects makes the
+  continuation `indeterminate` until a later safe checkpoint covers its
+  terminal result. Worktree continuations inherit the original path only while
+  it still exists; retryable resumable attempts retain that path, and Orca does
+  not silently recreate a missing worktree.
+- The durable prompt queue and checkpointable child-agent continuation model
+  project the same queued, resumable, indeterminate, and terminal state across
+  TUI, ACP, JSONL, and Headless. Large ordinary-chat pastes remain compact in
+  the composer but submit their complete text; Goal pastes are materialized
+  under `ORCA_HOME/attachments/<uuid>` with path validation and transactional
+  cleanup before the Goal mutation commits. Alt+Up queue editing commits a
+  revision-checked runtime delete, failed queue admission restores the prompt,
+  and queued previews remain bounded instead of copying the full body per frame.
 - Session switches start the replacement before closing the current runtime.
   Rename, fork, archive, and delete commit through revision-checked and durable
   paths, and stale events from a previous attachment are ignored.

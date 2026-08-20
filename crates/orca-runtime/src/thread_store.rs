@@ -7,6 +7,7 @@ mod session_index;
 mod types;
 mod writer;
 
+#[cfg(not(test))]
 pub(crate) const ORCA_HOME_ENV: &str = "ORCA_HOME";
 
 use orca_core::conversation::Conversation;
@@ -37,8 +38,8 @@ pub use types::{
 };
 pub use writer::SessionWriter;
 pub(crate) use writer::{
-    read_latest_context_tokens, read_manual_compaction_snapshot, redact_sensitive_text,
-    truncate_transcript_at_boundary,
+    read_latest_context_tokens, read_manual_compaction_snapshot, read_prompt_queue_snapshot,
+    redact_sensitive_text, truncate_transcript_at_boundary, write_prompt_queue_snapshot,
 };
 
 pub(crate) fn resume_conversation(

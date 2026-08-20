@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod agent_child;
 pub mod agent_common;
+pub(crate) mod agent_continuation;
 pub mod agent_loop;
 pub mod approval_resolution;
 pub mod background_turn;
@@ -40,6 +41,7 @@ pub mod model_response;
 pub mod network_proxy;
 pub mod notify;
 pub mod operation_context;
+pub mod prompt_queue;
 pub mod protocol;
 pub mod provider_stream;
 pub mod provider_turn;

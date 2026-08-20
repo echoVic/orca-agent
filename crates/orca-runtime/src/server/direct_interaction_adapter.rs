@@ -113,23 +113,6 @@ impl<T: Clone> JsonlDirectInteractionAdapter<T> {
         })
     }
 
-    pub(super) fn route(
-        &self,
-        request_id: &str,
-        expected_kind: JsonlDirectInteractionKind,
-    ) -> io::Result<Option<T>> {
-        if self.admission.tombstone(request_id)?.is_some() {
-            return Ok(None);
-        }
-        Ok(self
-            .routes
-            .lock()
-            .map_err(lock_error)?
-            .get(request_id)
-            .filter(|entry| entry.kind == expected_kind)
-            .map(|entry| entry.route.clone()))
-    }
-
     pub(super) fn published_route(
         &self,
         request_id: &str,

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 const INSTRUCTIONS_FILE: &str = "AGENTS.md";
 const RULES_DIR: &str = ".orca/rules";
+#[cfg(not(test))]
 const ORCA_HOME_ENV: &str = "ORCA_HOME";
 
 #[derive(Clone, Debug, Default)]

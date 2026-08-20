@@ -15,11 +15,52 @@ use crate::surface_actions::TuiSurfaceActions;
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
 use crate::types::{ChatMessage, SessionAttachmentId, TuiEvent};
 
+fn start_prompt_queue_watcher(
+    mut queue_updates: tokio::sync::watch::Receiver<
+        orca_runtime::prompt_queue::PromptQueueSnapshot,
+    >,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) {
+    let queue_events = event_tx.clone();
+    let watcher = Box::new(move || {
+        loop {
+            match queue_updates.has_changed() {
+                Ok(true) => {
+                    let snapshot = queue_updates.borrow_and_update().clone();
+                    if queue_events
+                        .send(TuiEvent::PromptQueueUpdated(snapshot))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(false) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+    });
+    if let Err(error) = spawn(watcher) {
+        let _ = event_tx.send(TuiEvent::Error(format!(
+            "failed to start prompt queue watcher: {error}"
+        )));
+    }
+}
+
 pub(crate) fn announce_runtime_ready(
     thread: &RuntimeThreadHandle,
     event_tx: &mpsc::Sender<TuiEvent>,
 ) {
     let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
+    if let Ok(snapshot) = thread.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List) {
+        let _ = event_tx.send(TuiEvent::PromptQueueUpdated(snapshot));
+    }
+    start_prompt_queue_watcher(thread.subscribe_prompt_queue(), event_tx, |watcher| {
+        std::thread::Builder::new()
+            .name("orca-tui-prompt-queue".to_string())
+            .spawn(watcher)
+            .map(|_| ())
+    });
     let actions = TuiSurfaceActions::new(thread.typed_surface());
     match actions.read_snapshot() {
         Ok(snapshot) => {
@@ -261,6 +302,24 @@ mod tests {
     use orca_core::config::HistoryMode;
 
     use super::*;
+
+    #[test]
+    fn prompt_queue_watcher_spawn_failure_emits_error() {
+        let (_queue_tx, queue_updates) =
+            tokio::sync::watch::channel(orca_runtime::prompt_queue::PromptQueueSnapshot::default());
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        start_prompt_queue_watcher(queue_updates, &event_tx, |_| {
+            Err(std::io::Error::other("injected spawn failure"))
+        });
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::Error(message))
+                if message == "failed to start prompt queue watcher: injected spawn failure"
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
 
     #[test]
     fn hosted_session_startup_accepts_latest_and_uuid_selectors_only() {

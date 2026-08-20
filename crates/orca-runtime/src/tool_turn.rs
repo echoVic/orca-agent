@@ -69,6 +69,8 @@ pub(crate) struct RuntimeToolTurnsContext<'a, W: io::Write> {
     pub(crate) operation: Option<&'a mut OperationContext>,
     pub(crate) io: RuntimeToolTurnsIo<'a, W>,
     pub(crate) tool_requests: &'a [ToolRequest],
+    pub(crate) checkpoint_observer:
+        Option<&'a dyn crate::child_agent_types::ChildAgentCheckpointSink>,
     pub(crate) executors: RuntimeToolTurnsExecutors,
 }
 
@@ -216,6 +218,71 @@ pub(crate) fn terminal_tool_turn(status: RunStatus, error: Option<String>) -> To
     ToolTurnOutcome::from_terminal(status, error)
 }
 
+pub(crate) fn tool_start_boundary(
+    config: &RunConfig,
+    mcp_registry: &orca_mcp::McpRegistry,
+    request: &ToolRequest,
+) -> crate::agent_continuation::ToolBoundary {
+    use orca_core::tool_types::ReplaySemantics;
+
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        &config.external_tools,
+    );
+    let replay = registry
+        .control_semantics(&request.name)
+        .map(|control| control.replay)
+        .unwrap_or(ReplaySemantics::IndeterminateAfterStart);
+    match replay {
+        ReplaySemantics::SafeToRetry => crate::agent_continuation::ToolBoundary::SafeToRetry {
+            tool_call_id: Some(request.id.clone()),
+        },
+        ReplaySemantics::IdempotentWithKey => {
+            let idempotency_key = request
+                .raw_arguments
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|arguments| {
+                    [
+                        "idempotency_key",
+                        "idempotencyKey",
+                        "request_id",
+                        "requestId",
+                    ]
+                    .into_iter()
+                    .find_map(|field| {
+                        arguments
+                            .get(field)
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .map(str::to_string)
+                    })
+                });
+            match idempotency_key {
+                Some(idempotency_key) => {
+                    crate::agent_continuation::ToolBoundary::IdempotentWithKey {
+                        tool_call_id: request.id.clone(),
+                        idempotency_key,
+                    }
+                }
+                None => crate::agent_continuation::ToolBoundary::Indeterminate {
+                    tool_call_id: Some(request.id.clone()),
+                    reason: "tool requires an idempotency key but none was persisted".to_string(),
+                },
+            }
+        }
+        ReplaySemantics::IndeterminateAfterStart => {
+            crate::agent_continuation::ToolBoundary::Indeterminate {
+                tool_call_id: Some(request.id.clone()),
+                reason: format!(
+                    "tool '{}' may have external side effects after start",
+                    request.name.as_str()
+                ),
+            }
+        }
+    }
+}
+
 pub(crate) fn run_tool_turns<W: io::Write>(
     context: RuntimeToolTurnsContext<'_, W>,
 ) -> io::Result<ToolTurnOutcome> {
@@ -225,6 +292,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         mut operation,
         io,
         tool_requests,
+        checkpoint_observer,
         executors,
     } = context;
     let RuntimeToolTurnsExecutors {
@@ -402,6 +470,26 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     )),
                     terminal: Some(terminal),
                 });
+            }
+        }
+
+        if let Some(observer) = checkpoint_observer {
+            let window_requests: Vec<&ToolRequest> = match &dispatch {
+                RuntimeToolDispatch::Normal(request) => vec![*request],
+                RuntimeToolDispatch::SubagentBatch(window)
+                | RuntimeToolDispatch::ReadonlyBatch(window) => {
+                    window.tool_requests().iter().collect()
+                }
+            };
+            for request in window_requests {
+                observer
+                    .tool_boundary(tool_start_boundary(config, mcp_registry, request))
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "child tool boundary persistence failed [{}]: {error}",
+                            error.contract_code()
+                        ))
+                    })?;
             }
         }
 
@@ -2493,6 +2581,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: unused_child_executor::<io::Sink>,
@@ -2635,6 +2724,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: delayed_batch_child_executor::<io::Sink>,
@@ -2742,6 +2832,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: unused_child_executor::<io::Sink>,
@@ -2844,6 +2935,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: unused_child_executor::<io::Sink>,
@@ -2956,6 +3048,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: unused_child_executor::<io::Sink>,
@@ -3066,6 +3159,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: unused_child_executor::<io::Sink>,
@@ -3179,6 +3273,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: unused_child_executor::<io::Sink>,
@@ -3285,6 +3380,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: unused_child_executor::<io::Sink>,
@@ -3410,6 +3506,7 @@ mod tests {
                 background_workflows: &mut background_workflows,
             },
             tool_requests: &requests,
+            checkpoint_observer: None,
             executors: RuntimeToolTurnsExecutors {
                 workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
                 batch_child_executor: budget_crossing_child_executor::<io::Sink>,
