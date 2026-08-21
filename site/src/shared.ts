@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.25";
+export const releaseVersion = "v0.3.26";
 
 export const releases = [
+  {
+    version: "v0.3.26",
+    date: "2026-08-21",
+    title: "Reusable session-scoped shell permission capability",
+    body: "Makes the unsandboxed shell permission an explicit, reusable capability: it lives in the turn permission overlay with delta and merge semantics, bash consumes it before prompting, and a grant is recorded only on allow. Session-scoped allow responses persist the capability into thread settings and JSONL metadata, restore it into every new turn and command_exec operation, and validate grant deltas against the requested profile, so a sandbox denial can never trigger repeated approval requests or silently widen authority.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.3.26",
+  },
   {
     version: "v0.3.25",
     date: "2026-08-20",
