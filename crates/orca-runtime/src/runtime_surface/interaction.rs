@@ -596,6 +596,8 @@ pub(crate) struct PermissionRetryOverlay {
     pub additional_working_directories: Vec<CanonicalPath>,
     pub metadata_writable_directories: Vec<CanonicalPath>,
     pub network_domain_permissions: Vec<(SurfacePermissionDomainPattern, SurfaceAllowDeny)>,
+    #[serde(default)]
+    pub unsandboxed_shell: bool,
     pub strict_auto_review: bool,
 }
 
@@ -605,6 +607,7 @@ impl PermissionRetryOverlay {
             additional_working_directories: Vec::new(),
             metadata_writable_directories: Vec::new(),
             network_domain_permissions: Vec::new(),
+            unsandboxed_shell: false,
             strict_auto_review: false,
         }
     }

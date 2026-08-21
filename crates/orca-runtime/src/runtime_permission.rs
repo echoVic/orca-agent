@@ -272,6 +272,7 @@ pub struct TurnPermissionOverlay {
     metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions:
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+    unsandboxed_shell: bool,
     strict_auto_review: bool,
     preapproved_tool_call_id: Option<String>,
 }
@@ -282,6 +283,7 @@ pub struct TurnPermissionOverlayDelta {
     metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions:
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+    unsandboxed_shell: bool,
     strict_auto_review: bool,
 }
 
@@ -303,6 +305,10 @@ impl TurnPermissionOverlayDelta {
     pub fn strict_auto_review(&self) -> bool {
         self.strict_auto_review
     }
+
+    pub fn unsandboxed_shell(&self) -> bool {
+        self.unsandboxed_shell
+    }
 }
 
 impl TurnPermissionOverlay {
@@ -322,6 +328,10 @@ impl TurnPermissionOverlay {
 
     pub fn strict_auto_review(&self) -> bool {
         self.strict_auto_review
+    }
+
+    pub fn unsandboxed_shell(&self) -> bool {
+        self.unsandboxed_shell
     }
 
     pub(crate) fn set_preapproved_tool_call_id(&mut self, id: Option<String>) {
@@ -351,6 +361,7 @@ impl TurnPermissionOverlay {
             self.network_domain_permissions
                 .insert(domain.clone(), *access);
         }
+        self.unsandboxed_shell |= other.unsandboxed_shell;
         self.strict_auto_review |= other.strict_auto_review;
     }
 
@@ -379,6 +390,7 @@ impl TurnPermissionOverlay {
             additional_working_directories,
             metadata_writable_directories,
             network_domain_permissions,
+            unsandboxed_shell: self.unsandboxed_shell && !baseline.unsandboxed_shell,
             strict_auto_review: self.strict_auto_review && !baseline.strict_auto_review,
         }
     }
@@ -398,6 +410,7 @@ impl TurnPermissionOverlay {
             self.network_domain_permissions
                 .insert(domain.clone(), *access);
         }
+        self.unsandboxed_shell |= delta.unsandboxed_shell;
         self.strict_auto_review |= delta.strict_auto_review;
     }
 
@@ -467,6 +480,13 @@ impl TurnPermissionOverlay {
             }
         }
         self.merge_network_permissions(permissions);
+        if permissions
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.unsandboxed)
+        {
+            self.unsandboxed_shell = true;
+        }
     }
 }
 
@@ -502,6 +522,49 @@ mod tests {
         assert!(!overlay.consume_preapproved_tool_call_id("tool-2"));
         assert!(overlay.consume_preapproved_tool_call_id("tool-1"));
         assert!(!overlay.consume_preapproved_tool_call_id("tool-1"));
+    }
+
+    #[test]
+    fn shell_capability_is_reusable_and_survives_permission_delta() {
+        let mut overlay = TurnPermissionOverlay::default();
+        overlay.merge_permissions(&RequestPermissionProfile {
+            shell: Some(crate::protocol::RequestShellPermissions { unsandboxed: true }),
+            ..Default::default()
+        });
+
+        assert!(overlay.unsandboxed_shell());
+
+        let baseline = TurnPermissionOverlay::default();
+        let delta = overlay.delta_from(&baseline);
+        assert!(delta.unsandboxed_shell());
+
+        let mut restored = baseline;
+        restored.apply_delta(&delta);
+        assert!(restored.unsandboxed_shell());
+        assert_eq!(restored.preapproved_tool_call_id, None);
+    }
+
+    #[test]
+    fn unrelated_permission_delta_does_not_grant_unsandboxed_shell() {
+        let baseline = TurnPermissionOverlay::default();
+        let mut current = baseline.clone();
+        current.merge_permissions(&RequestPermissionProfile {
+            network: Some(crate::protocol::RequestNetworkPermissions {
+                enabled: None,
+                domains: HashMap::from([(
+                    "api.example.com".to_string(),
+                    PermissionProfileNetworkAccess::Allow,
+                )]),
+            }),
+            ..Default::default()
+        });
+
+        let delta = current.delta_from(&baseline);
+        assert!(!delta.unsandboxed_shell());
+
+        let mut restored = baseline;
+        restored.apply_delta(&delta);
+        assert!(!restored.unsandboxed_shell());
     }
 
     #[test]
@@ -545,6 +608,7 @@ mod tests {
                 "api.example.com".to_string(),
                 PermissionProfileNetworkAccess::Allow,
             )]),
+            unsandboxed_shell: false,
             strict_auto_review: false,
             preapproved_tool_call_id: Some("approval-only".to_string()),
         };
@@ -564,6 +628,7 @@ mod tests {
                     PermissionProfileNetworkAccess::Deny,
                 ),
             ]),
+            unsandboxed_shell: false,
             strict_auto_review: true,
             preapproved_tool_call_id: None,
         };

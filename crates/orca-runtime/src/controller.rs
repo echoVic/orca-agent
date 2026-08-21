@@ -211,6 +211,7 @@ pub struct ThreadTurnContext<'a> {
     prompt: String,
     memory_start: usize,
     parts: InteractiveSessionRuntimeParts<'a>,
+    unsandboxed_shell: bool,
 }
 
 pub struct ThreadTurnExecution<W: io::Write> {
@@ -501,6 +502,7 @@ impl<'a> ThreadTurnContext<'a> {
             cwd,
             prompt,
             memory_start,
+            unsandboxed_shell: parts.unsandboxed_shell,
             parts,
         })
     }
@@ -699,6 +701,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             cwd,
             prompt,
             memory_start,
+            unsandboxed_shell,
             parts,
         } = context;
         let main_session_task = ThreadTurnMainSessionTask::from_request(
@@ -749,6 +752,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
         .with_provider_response_ingress(request.provider_response_ingress())
         .with_workflow_lifecycle_ingress(request.workflow_lifecycle_ingress())
         .with_wait_for_background_workflows(request.options().wait_for_background_workflows);
+        let loop_context = loop_context.with_unsandboxed_shell(unsandboxed_shell);
         let turn_result = (|| -> io::Result<AgentLoopOutcome> {
             run_agent_loop(
                 config,

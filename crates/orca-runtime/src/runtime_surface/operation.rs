@@ -1020,6 +1020,8 @@ pub struct SurfaceRuntimeSettings {
     pub permission_rules: SurfacePermissionRuleSet,
     pub additional_working_directories: Vec<SurfaceAdditionalWorkingDirectory>,
     pub network_permissions: SurfaceNetworkPermissions,
+    #[serde(default)]
+    pub unsandboxed_shell: bool,
     pub policy_epoch: PolicyEpoch,
 }
 
@@ -1096,6 +1098,9 @@ pub enum RuntimeSettingsPatch {
     },
     ReplaceNetworkPermissions {
         permissions: SurfaceNetworkPermissions,
+    },
+    SetUnsandboxedShell {
+        enabled: bool,
     },
     ApplyPermissionUpdate {
         update: SurfacePermissionUpdate,

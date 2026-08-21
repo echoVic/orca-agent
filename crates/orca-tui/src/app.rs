@@ -2763,6 +2763,7 @@ done
                 additional_working_directories: Vec::new(),
                 metadata_writable_directories: Vec::new(),
                 network_domain_permissions: Default::default(),
+                unsandboxed_shell: false,
             },
             messages: Vec::new(),
             compactions: Vec::new(),

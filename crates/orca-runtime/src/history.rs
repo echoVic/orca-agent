@@ -436,6 +436,7 @@ pub fn create_meta(cwd: &Path, provider: &str, model: Option<String>, prompt: &s
         additional_working_directories: Vec::new(),
         metadata_writable_directories: Vec::new(),
         network_domain_permissions: Default::default(),
+        unsandboxed_shell: false,
     }
 }
 

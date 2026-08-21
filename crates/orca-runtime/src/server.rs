@@ -161,6 +161,7 @@ pub struct ServerThreadView {
     additional_working_directories: Vec<AdditionalWorkingDirectory>,
     metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    unsandboxed_shell: bool,
     mcp_registry: McpRegistry,
 }
 
@@ -183,6 +184,10 @@ impl ServerThreadView {
 
     pub fn network_domain_permissions(&self) -> &HashMap<String, PermissionProfileNetworkAccess> {
         &self.network_domain_permissions
+    }
+
+    pub fn unsandboxed_shell(&self) -> bool {
+        self.unsandboxed_shell
     }
 
     pub fn cwd(&self) -> &str {
@@ -770,6 +775,7 @@ struct PersistedSessionPermissionGrant {
     additional_working_directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
     metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
+    unsandboxed_shell: bool,
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -816,6 +822,10 @@ fn materialize_session_permission_grant(
         additional_working_directories: thread.additional_working_directories,
         metadata_writable_directories: thread.metadata_writable_directories,
         network_domain_permissions: thread.network_domain_permissions,
+        unsandboxed_shell: permissions
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.unsandboxed),
     })
 }
 
@@ -1246,6 +1256,7 @@ fn run_command_exec<W: Write>(
         thread_permission_profile,
         runtime_workspace_roots,
         thread_network_domain_permissions,
+        thread_unsandboxed_shell,
     ) = match thread_id {
         Some(thread_id) => {
             state.prune_finished_turns();
@@ -1260,6 +1271,7 @@ fn run_command_exec<W: Write>(
                     thread.active_permission_profile().cloned(),
                     thread.runtime_workspace_roots().to_vec(),
                     thread.network_domain_permissions().clone(),
+                    thread.unsandboxed_shell(),
                 ),
                 None => {
                     return protocol::write_server_event(
@@ -1280,6 +1292,7 @@ fn run_command_exec<W: Write>(
                 .clone()
                 .unwrap_or_default(),
             HashMap::new(),
+            false,
         ),
     };
     let mut effective_sandbox = match command_exec_sandbox_mode(
@@ -1295,6 +1308,10 @@ fn run_command_exec<W: Write>(
             return protocol::write_server_event(writer, &id, ServerEvent::error(error));
         }
     };
+    if thread_unsandboxed_shell {
+        effective_sandbox.mode = ShellSandboxMode::DangerFullAccess;
+        effective_sandbox.denied_writable_roots.clear();
+    }
     for (domain, access) in thread_network_domain_permissions {
         match access {
             orca_core::config::PermissionProfileNetworkAccess::Deny => {
@@ -3976,7 +3993,7 @@ enabled = true
             );
 
             let response = format!(
-                r#"{{"id":"perm-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"turn","permissions":{{"shell":{{"unsandboxed":true}}}}}}}}"#
+                r#"{{"id":"perm-allow","method":"permission/respond","params":{{"requestId":"{request_id}","decision":"allow","scope":"session","permissions":{{"shell":{{"unsandboxed":true}}}}}}}}"#
             );
             handle_line(&server_config, &mut state, &response, Arc::clone(&writer))
                 .expect("permission response");
@@ -3993,6 +4010,42 @@ enabled = true
                 .expect("command completed");
             assert_eq!(completed["exitCode"], 0);
             assert!(marker.exists());
+
+            let second_marker = outside.join("credential-helper-output-second");
+            let second_request = test_command_exec_request(
+                "cmd-unsandboxed-second",
+                &format!("touch {}", second_marker.display()),
+                json!({"threadId": thread_id, "timeoutMs": 5000}),
+            );
+            handle_line(
+                &server_config,
+                &mut state,
+                &second_request,
+                Arc::clone(&writer),
+            )
+            .expect("second command exec");
+            drain_command_exec_processes_with_timeout(
+                &mut state,
+                &mut *writer.lock().expect("writer"),
+                Duration::from_secs(2),
+            )
+            .expect("drain second retried process");
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            assert!(
+                events.iter().any(|event| {
+                    event["event"] == "command_exec_completed"
+                        && event["id"] == "cmd-unsandboxed-second"
+                        && event["exitCode"] == 0
+                }),
+                "session shell grant should suppress a second approval: {events:?}"
+            );
+            assert!(
+                events.iter().all(|event| {
+                    !(event["event"] == "permission_request"
+                        && event["requestId"] == "permission-command-cmd-unsandboxed-second")
+                }),
+                "second command unexpectedly requested approval: {events:?}"
+            );
         });
     }
 

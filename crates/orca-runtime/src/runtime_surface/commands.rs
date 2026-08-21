@@ -4460,6 +4460,7 @@ mod closed_command_domain_tests {
                 enabled: Some(true),
                 domains: Vec::new(),
             },
+            unsandboxed_shell: false,
             policy_epoch: PolicyEpoch::try_new(1).unwrap(),
         }
     }

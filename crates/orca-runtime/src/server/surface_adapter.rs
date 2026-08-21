@@ -985,6 +985,16 @@ impl JsonlSurfaceAdapter {
                 permissions: network,
             });
         }
+        let unsandboxed_shell = settings.effective.unsandboxed_shell
+            || permissions
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.unsandboxed);
+        if unsandboxed_shell != settings.effective.unsandboxed_shell {
+            patches.push(RuntimeSettingsPatch::SetUnsandboxedShell {
+                enabled: unsandboxed_shell,
+            });
+        }
         let update_result = if let Ok(patches) = NonEmptyVec::try_new(patches) {
             committed(
                 client.update_settings(SurfaceRequestId::new(), settings.thread_revision, patches),
@@ -1007,6 +1017,7 @@ impl JsonlSurfaceAdapter {
                         ),
                         metadata_writable_directories: Some(metadata_writable_directories),
                         network_domain_permissions: Some(persisted_network_domain_permissions),
+                        unsandboxed_shell: Some(unsandboxed_shell),
                         ..ThreadMetadataPatch::default()
                     },
                 )
@@ -1173,6 +1184,7 @@ impl JsonlSurfaceAdapter {
                 additional_working_directories: projection.additional_working_directories,
                 metadata_writable_directories: Vec::new(),
                 network_domain_permissions: projection.network_domain_permissions,
+                unsandboxed_shell: projection.unsandboxed_shell,
                 mcp_registry: thread.mcp_registry(),
             });
         }
@@ -1184,6 +1196,7 @@ impl JsonlSurfaceAdapter {
             additional_working_directories: thread.additional_working_directories,
             metadata_writable_directories: thread.metadata_writable_directories,
             network_domain_permissions: thread.network_domain_permissions,
+            unsandboxed_shell: thread.unsandboxed_shell,
             mcp_registry: self.mcp_registry(thread_id)?,
         })
     }

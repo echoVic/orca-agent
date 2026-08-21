@@ -83,6 +83,25 @@ pub(crate) fn execute_bash_with_shell_session(
         })
         .into_tool_result(request, output_truncation, shell_timeout_secs);
     };
+    if permission_overlay.unsandboxed_shell() {
+        return execute_bash_once(RuntimeBashOnceContext {
+            command,
+            cwd,
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: additional_roots.to_vec(),
+            metadata_writable_directories: Vec::new(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: Default::default(),
+            sandbox: ShellSandboxMode::DangerFullAccess,
+            shell_timeout_secs,
+            task_registry,
+            cancel,
+            output_handler: reborrow_output_handler(&mut output_handler),
+        })
+        .with_sandbox_diagnostic(cwd)
+        .into_tool_result(request, output_truncation, shell_timeout_secs);
+    }
     let mut sandbox = match bash_sandbox_from_active_permission_profile(config, cwd) {
         Ok(sandbox) => sandbox,
         Err(error) => return ToolResult::failed(request, error, None),
@@ -202,46 +221,49 @@ pub(crate) fn execute_bash_with_shell_session(
             .with_sandbox_diagnostic(cwd)
             .into_tool_result(request, output_truncation, shell_timeout_secs);
         }
-        if let Some(permission_prompt) =
-            RuntimeBashPermissionPolicy::unsandboxed_shell_prompt(&request.id, &diagnostic)
-            && let Some(permission_handler) = permission_handler
-        {
-            let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
-            let response = match PermissionRuntimeState.request_permission_pre_side_effect(
-                permission_overlay,
-                permission_handler,
-                permission_request,
-            ) {
-                Ok(response) => response,
-                Err(error) => return ToolResult::failed(request, error.to_string(), None),
-            };
-            if response.decision == PermissionResponseDecision::Deny {
-                return ToolResult::denied(request, "permission request denied".to_string());
+        if !permission_overlay.unsandboxed_shell() {
+            if let Some(permission_prompt) =
+                RuntimeBashPermissionPolicy::unsandboxed_shell_prompt(&request.id, &diagnostic)
+                && let Some(permission_handler) = permission_handler
+            {
+                let (_origin, _kind, permission_request) = permission_prompt.into_request_parts();
+                let response = match PermissionRuntimeState.request_permission_pre_side_effect(
+                    permission_overlay,
+                    permission_handler,
+                    permission_request,
+                ) {
+                    Ok(response) => response,
+                    Err(error) => return ToolResult::failed(request, error.to_string(), None),
+                };
+                if response.decision == PermissionResponseDecision::Deny {
+                    return ToolResult::denied(request, "permission request denied".to_string());
+                }
+            } else {
+                return output.with_diagnostic(diagnostic).into_tool_result(
+                    request,
+                    output_truncation,
+                    shell_timeout_secs,
+                );
             }
-
-            return execute_bash_once(RuntimeBashOnceContext {
-                command,
-                cwd,
-                additional_readable_directories: Vec::new(),
-                additional_working_directories: additional_roots.to_vec(),
-                metadata_writable_directories: Vec::new(),
-                denied_working_directories: Vec::new(),
-                allowed_unix_socket_roots: Vec::new(),
-                env: Default::default(),
-                sandbox: ShellSandboxMode::DangerFullAccess,
-                shell_timeout_secs,
-                task_registry,
-                cancel,
-                output_handler: reborrow_output_handler(&mut output_handler),
-            })
-            .with_sandbox_diagnostic(cwd)
-            .into_tool_result(request, output_truncation, shell_timeout_secs);
         }
-        return output.with_diagnostic(diagnostic).into_tool_result(
-            request,
-            output_truncation,
+
+        return execute_bash_once(RuntimeBashOnceContext {
+            command,
+            cwd,
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: additional_roots.to_vec(),
+            metadata_writable_directories: Vec::new(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: Default::default(),
+            sandbox: ShellSandboxMode::DangerFullAccess,
             shell_timeout_secs,
-        );
+            task_registry,
+            cancel,
+            output_handler: reborrow_output_handler(&mut output_handler),
+        })
+        .with_sandbox_diagnostic(cwd)
+        .into_tool_result(request, output_truncation, shell_timeout_secs);
     }
     output.into_tool_result(request, output_truncation, shell_timeout_secs)
 }

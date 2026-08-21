@@ -231,6 +231,7 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
     pub(crate) wait_for_background_workflows: bool,
     pub(crate) defer_cancel_terminal: bool,
+    pub(crate) unsandboxed_shell: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -944,6 +945,11 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_unsandboxed_shell(mut self, enabled: bool) -> Self {
+        self.turn_context = self.turn_context.with_unsandboxed_shell(enabled);
+        self
+    }
+
     pub fn with_turn_id(mut self, turn_id: TurnId) -> Self {
         self.turn_context = self.turn_context.with_turn_id(turn_id);
         self
@@ -1204,6 +1210,7 @@ impl<'a> RuntimeTurnContext<'a> {
             workflow_lifecycle_ingress: None,
             wait_for_background_workflows: true,
             defer_cancel_terminal: false,
+            unsandboxed_shell: false,
         }
     }
 
@@ -1271,6 +1278,15 @@ impl<'a> RuntimeTurnContext<'a> {
     pub(crate) fn with_deferred_cancel_terminal(mut self, defer: bool) -> Self {
         self.defer_cancel_terminal = defer;
         self
+    }
+
+    pub(crate) fn with_unsandboxed_shell(mut self, enabled: bool) -> Self {
+        self.unsandboxed_shell = enabled;
+        self
+    }
+
+    pub(crate) fn unsandboxed_shell(&self) -> bool {
+        self.unsandboxed_shell
     }
 
     #[cfg(test)]

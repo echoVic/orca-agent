@@ -50,6 +50,8 @@ pub struct SessionMeta {
     pub metadata_writable_directories: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    #[serde(default)]
+    pub unsandboxed_shell: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -585,6 +587,7 @@ pub struct ThreadMetadataPatch {
     pub additional_working_directories: Option<Vec<AdditionalWorkingDirectory>>,
     pub metadata_writable_directories: Option<Vec<PathBuf>>,
     pub network_domain_permissions: Option<HashMap<String, PermissionProfileNetworkAccess>>,
+    pub unsandboxed_shell: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -597,6 +600,7 @@ pub struct StoredThreadProjection {
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
     pub metadata_writable_directories: Vec<PathBuf>,
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    pub unsandboxed_shell: bool,
     pub message_count: usize,
     pub messages: Vec<Value>,
     pub turns: Vec<StoredThreadTurn>,
