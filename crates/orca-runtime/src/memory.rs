@@ -422,7 +422,7 @@ fn process_automatic_memory_job(
         }
     };
     if let Some(error) = response.steps.iter().find_map(|step| match step {
-        ProviderStep::Error(error) => Some(error.as_str()),
+        ProviderStep::Error(error) => Some(error.message.as_str()),
         _ => None,
     }) {
         let redacted = crate::thread_store::redact_sensitive_text(error);

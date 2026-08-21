@@ -43,6 +43,7 @@ pub mod notify;
 pub mod operation_context;
 pub mod prompt_queue;
 pub mod protocol;
+mod provider_retry;
 pub mod provider_stream;
 pub mod provider_turn;
 mod runtime_actor;

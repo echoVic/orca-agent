@@ -285,6 +285,7 @@ pub enum TuiEvent {
     },
     ReasoningDelta(String),
     MessageDelta(String),
+    AssistantAttemptDiscarded,
     AssistantResponseCompleted(Option<String>, Option<String>),
     ToolRequested {
         id: String,
@@ -1987,6 +1988,12 @@ impl AppState {
                 }
                 self.handle_message_delta(&text);
             }
+            TuiEvent::AssistantAttemptDiscarded => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
+                self.discard_current_assistant_attempt();
+            }
             TuiEvent::AssistantResponseCompleted(message, reasoning) => {
                 if self.suppress_background_main_session_output {
                     return;
@@ -2573,6 +2580,33 @@ impl AppState {
         if let Some(message) = message.filter(|text| !text.is_empty()) {
             self.handle_message_delta(message);
         }
+    }
+
+    fn discard_current_assistant_attempt(&mut self) {
+        let boundary = self.messages.iter().rposition(|message| {
+            !matches!(
+                message,
+                ChatMessage::Reasoning(_)
+                    | ChatMessage::Assistant(_)
+                    | ChatMessage::AssistantChunk { .. }
+                    | ChatMessage::ProposedPlan(_)
+            )
+        });
+        let mut index = 0_usize;
+        self.retain_messages(|message| {
+            let keep = boundary.is_some_and(|boundary| index <= boundary)
+                || !matches!(
+                    message,
+                    ChatMessage::Reasoning(_)
+                        | ChatMessage::Assistant(_)
+                        | ChatMessage::AssistantChunk { .. }
+                        | ChatMessage::ProposedPlan(_)
+                );
+            index += 1;
+            keep
+        });
+        self.proposed_plan_parser = ProposedPlanStreamParser::default();
+        self.reset_assistant_stream();
     }
 
     fn handle_message_delta(&mut self, text: &str) {
@@ -4482,6 +4516,32 @@ mod tests {
         });
 
         assert_eq!(assistant_projection_text(&state.messages), "visible\n");
+    }
+
+    #[test]
+    fn discarded_attempt_removes_only_trailing_assistant_output() {
+        let mut state = state();
+        state.push_message(ChatMessage::User("prompt".to_string()));
+        state.push_message(ChatMessage::ToolCall {
+            id: "tool-1".to_string(),
+            name: "read_file".to_string(),
+            target: None,
+            status: "completed".to_string(),
+            output: Some("done".to_string()),
+            diff: None,
+            expanded: false,
+            kind: None,
+        });
+        state.update(TuiEvent::ReasoningDelta("partial reasoning".to_string()));
+        state.update(TuiEvent::MessageDelta("partial answer\n".to_string()));
+
+        state.update(TuiEvent::AssistantAttemptDiscarded);
+
+        assert!(matches!(state.messages[0], ChatMessage::User(_)));
+        assert!(matches!(state.messages[1], ChatMessage::ToolCall { .. }));
+        assert_eq!(state.messages.len(), 2);
+        state.update(TuiEvent::MessageDelta("recovered\n".to_string()));
+        assert_eq!(assistant_projection_text(&state.messages), "recovered\n");
     }
 
     #[test]

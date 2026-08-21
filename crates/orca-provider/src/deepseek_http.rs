@@ -6,7 +6,9 @@ use orca_core::conversation::{
     Conversation, Message, RawToolCall, SummaryState, assistant_message_has_payload,
     normalize_tool_boundaries,
 };
-use orca_core::provider_types::{ProviderReplayState, ProviderResponse, ProviderStep, Usage};
+use orca_core::provider_types::{
+    ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse, ProviderStep, Usage,
+};
 use orca_core::tool_types::{ToolName, ToolRequest};
 
 use crate::ProviderConfig;
@@ -18,29 +20,43 @@ pub(crate) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_CHAT_MAX_TOKENS: u32 = 384_000;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
-const STREAM_INTEGRITY_RETRIES: usize = 1;
 const EMPTY_RESPONSE_ERROR: &str = "response did not contain content or tool calls";
 const EMPTY_RESPONSE_RECOVERY_PROMPT: &str = "Continue the current turn. The previous response ended without visible assistant content or tool calls. Return a user-facing answer in content, or call an available tool. Do not return reasoning only.";
 
 #[derive(Debug, Eq, PartialEq)]
 struct DeepSeekRequestError {
+    kind: ProviderErrorKind,
     message: String,
     usage: Option<Usage>,
 }
 
 impl DeepSeekRequestError {
     fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
-            message: message.into(),
+            kind: classify_deepseek_error(&message),
+            message,
             usage: None,
         }
     }
 
     fn with_usage(message: impl Into<String>, usage: Option<Usage>) -> Self {
+        let message = message.into();
         Self {
-            message: message.into(),
+            kind: classify_deepseek_error(&message),
+            message,
             usage,
         }
+    }
+
+    fn into_provider_error(self) -> (ProviderError, Option<Usage>) {
+        (
+            ProviderError::new(
+                self.kind,
+                format!("DeepSeek provider error: {}", self.message),
+            ),
+            self.usage,
+        )
     }
 }
 
@@ -53,6 +69,42 @@ impl From<String> for DeepSeekRequestError {
 impl std::fmt::Display for DeepSeekRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
+    }
+}
+
+fn classify_deepseek_error(message: &str) -> ProviderErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("request cancelled") || lower == "cancelled" {
+        ProviderErrorKind::Cancelled
+    } else if crate::context::is_prompt_too_long_error(message) {
+        ProviderErrorKind::ContextExceeded
+    } else if lower.contains("429") || lower.contains("rate limit") {
+        ProviderErrorKind::RateLimit
+    } else if ["500", "502", "503", "504"]
+        .into_iter()
+        .any(|status| lower.contains(status))
+    {
+        ProviderErrorKind::Server
+    } else if lower.contains("idle read timed out") || lower.contains("timed out") {
+        ProviderErrorKind::Timeout
+    } else if lower.contains("stream ended before terminal marker") {
+        ProviderErrorKind::StreamClosed
+    } else if lower.contains("invalid sse data json")
+        || lower.contains("invalid utf-8 in sse data")
+        || lower.contains("malformed response")
+    {
+        ProviderErrorKind::MalformedResponse
+    } else if lower.contains(EMPTY_RESPONSE_ERROR) {
+        ProviderErrorKind::EmptyResponse
+    } else if lower.contains("stream read error")
+        || lower.contains("response body read failed")
+        || lower.contains("error decoding response body")
+        || lower.contains("request failed after")
+        || lower.contains("failed to build streaming http client")
+    {
+        ProviderErrorKind::Transport
+    } else {
+        ProviderErrorKind::Other
     }
 }
 
@@ -215,15 +267,16 @@ impl From<ApiUsage> for Usage {
 pub fn call(conversation: &Conversation, config: &ProviderConfig) -> ProviderResponse {
     match request_chat(conversation, config) {
         Ok(response) => response,
-        Err(error) => ProviderResponse {
-            steps: vec![ProviderStep::Error(format!(
-                "DeepSeek provider error: {error}"
-            ))],
-            assistant_content: None,
-            assistant_reasoning: None,
-            tool_calls: Vec::new(),
-            usage: error.usage,
-        },
+        Err(error) => {
+            let (error, usage) = error.into_provider_error();
+            ProviderResponse {
+                steps: vec![ProviderStep::Error(error)],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage,
+            }
+        }
     }
 }
 
@@ -236,14 +289,15 @@ pub async fn call_streaming_async(
     match request_chat_streaming(conversation, config, cancel, &mut on_step).await {
         Ok(response) => response,
         Err(error) => {
-            let step = ProviderStep::Error(format!("DeepSeek provider error: {error}"));
+            let (error, usage) = error.into_provider_error();
+            let step = ProviderStep::Error(error);
             on_step(&step);
             ProviderResponse {
                 steps: vec![step],
                 assistant_content: None,
                 assistant_reasoning: None,
                 tool_calls: Vec::new(),
-                usage: error.usage,
+                usage,
             }
         }
     }
@@ -283,7 +337,6 @@ async fn request_chat_streaming(
     };
 
     let mut empty_response_retries = 0;
-    let mut stream_integrity_retries = 0;
     let mut suppress_retry_reasoning = false;
     let mut accumulated_usage = None;
     loop {
@@ -313,7 +366,6 @@ async fn request_chat_streaming(
         };
 
         let mut steps = Vec::new();
-        let mut emitted_step = false;
         let mut emitted_reasoning = false;
 
         let stream_result = match crate::streaming::parse_sse_response(
@@ -327,7 +379,6 @@ async fn request_chat_streaming(
                     emitted_reasoning = true;
                 }
                 if !(suppress_retry_reasoning && is_reasoning_delta) {
-                    emitted_step = true;
                     on_step(&step);
                 }
                 if stream_step_belongs_in_response_steps(&step) {
@@ -338,14 +389,6 @@ async fn request_chat_streaming(
         .await
         {
             Ok(result) => result,
-            Err(error)
-                if !emitted_step
-                    && stream_integrity_retries < STREAM_INTEGRITY_RETRIES
-                    && crate::streaming::is_stream_integrity_error(&error) =>
-            {
-                stream_integrity_retries += 1;
-                continue;
-            }
             Err(error) => {
                 return Err(DeepSeekRequestError::with_usage(error, accumulated_usage));
             }
@@ -537,9 +580,9 @@ fn request_chat(
             }
             "stop" | "tool_calls" | "" => {}
             other => {
-                steps.push(ProviderStep::Error(format!(
+                steps.push(ProviderStep::Error(ProviderError::other(format!(
                     "Unexpected finish_reason: {other}"
-                )));
+                ))));
             }
         }
 
@@ -802,6 +845,38 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn deepseek_errors_are_classified_for_attempt_retry_bits_spec_ut() {
+        assert_eq!(
+            classify_deepseek_error("stream read error: error decoding response body"),
+            ProviderErrorKind::Transport
+        );
+        assert_eq!(
+            classify_deepseek_error("stream read error: idle read timed out after 5s"),
+            ProviderErrorKind::Timeout
+        );
+        assert_eq!(
+            classify_deepseek_error("stream ended before terminal marker"),
+            ProviderErrorKind::StreamClosed
+        );
+        assert_eq!(
+            classify_deepseek_error("invalid SSE data JSON: unexpected EOF"),
+            ProviderErrorKind::MalformedResponse
+        );
+        assert_eq!(
+            classify_deepseek_error("request error (429 Too Many Requests): limited"),
+            ProviderErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_deepseek_error("max retries exceeded (last status: 503 Service Unavailable)"),
+            ProviderErrorKind::Server
+        );
+        assert_eq!(
+            classify_deepseek_error("prompt_too_long: context length exceeded"),
+            ProviderErrorKind::ContextExceeded
+        );
+    }
 
     fn make_tc(name: &str, arguments: &str) -> ApiToolCallResponse {
         ApiToolCallResponse {
@@ -1737,7 +1812,8 @@ mod tests {
         assert!(matches!(
             response.steps.as_slice(),
             [ProviderStep::Error(message)]
-                if message == "DeepSeek provider error: response did not contain choices"
+                if message.message
+                    == "DeepSeek provider error: response did not contain choices"
         ));
         assert_eq!(
             response.usage,
@@ -1930,12 +2006,14 @@ mod tests {
         assert!(matches!(
             response.steps.as_slice(),
             [ProviderStep::Error(message)]
-                if message == "DeepSeek provider error: response did not contain content or tool calls"
+                if message.message
+                    == "DeepSeek provider error: response did not contain content or tool calls"
         ));
         assert!(matches!(
             emitted.as_slice(),
             [ProviderStep::Error(message)]
-                if message == "DeepSeek provider error: response did not contain content or tool calls"
+                if message.message
+                    == "DeepSeek provider error: response did not contain content or tool calls"
         ));
         assert_eq!(
             response.usage,

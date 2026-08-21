@@ -316,7 +316,8 @@ impl StreamAccumulator {
     }
 }
 
-pub(crate) fn is_stream_integrity_error(error: &str) -> bool {
+#[cfg(test)]
+fn is_stream_integrity_error(error: &str) -> bool {
     error == PREMATURE_STREAM_EOF_ERROR
         || error.starts_with(INVALID_SSE_DATA_JSON_PREFIX)
         || error.starts_with(INVALID_SSE_UTF8_PREFIX)

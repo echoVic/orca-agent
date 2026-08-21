@@ -108,7 +108,7 @@ fn provider_path_check(label: &str, config: &ProviderConfig) -> (bool, String) {
             .steps
             .iter()
             .filter_map(|step| match step {
-                ProviderStep::Error(text) => Some(text.as_str()),
+                ProviderStep::Error(error) => Some(error.message.as_str()),
                 _ => None,
             })
             .collect();

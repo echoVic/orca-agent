@@ -20,7 +20,7 @@ use orca_core::hook_types::HookEvent;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::task_types::TaskStatus;
 use orca_core::thread_identity::TurnId;
-use orca_core::thread_item_projection::{CompletedModelItem, ModelResponseIdentity};
+use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::workflow_types::{WorkflowInput, WorkflowOutput};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 use serde_json::Value;
@@ -70,9 +70,19 @@ use crate::runtime_actor::commit::{
     GoalRecoverySurfaceCommit, ScheduledSurfaceCommit, SurfaceCommitController,
     SurfaceCommitEffect, SurfaceCommitResolution, SurfaceCommitRetryKey,
 };
+use crate::runtime_actor::generation_context::{
+    GenerationContextController, build_background_provider_response_events,
+};
 use crate::runtime_actor::goal::{
     ActiveGoalControl, GoalBlockingCompletion, GoalOperationController, GoalSurfaceWorkerResult,
     OpenedGoalRuntime, PendingGoalPauseEvent,
+};
+use crate::runtime_actor::interaction::{
+    PendingBackgroundInteractionRoute, PreparedInteractionRequest, ResidentInteractionController,
+    ResidentInteractionWaiter, ResidentPrivateInteractionResponse, ResidentSurfaceInteraction,
+    exact_interaction_selectors, interaction_route_admits, interaction_route_admits_exact,
+    interaction_route_attachments, interaction_route_epoch, keyed_interaction_response_digest,
+    prepare_interaction_request,
 };
 use crate::runtime_surface as surface;
 use crate::tasks::{DurableTypedProviderOutcome, MainSessionTerminalUpdate, TaskRegistry};
@@ -1742,6 +1752,25 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx
             .try_send(ThreadCommand::SurfaceCommitProviderFailure {
+                fence: self.fence.clone(),
+                identity: identity.clone(),
+                message: message.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(surface_semantic_ingress_send_error)?;
+        reply_rx
+            .recv()
+            .map_err(|_| surface_semantic_ingress_ack_error())?
+    }
+
+    fn commit_provider_attempt_failure(
+        &self,
+        identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+        message: &str,
+    ) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceCommitProviderAttemptFailure {
                 fence: self.fence.clone(),
                 identity: identity.clone(),
                 message: message.to_string(),
@@ -4442,6 +4471,12 @@ enum ThreadCommand {
         message: String,
         reply: SyncSender<io::Result<()>>,
     },
+    SurfaceCommitProviderAttemptFailure {
+        fence: surface::SurfaceOperationFence,
+        identity: orca_core::thread_item_projection::ModelResponseIdentity,
+        message: String,
+        reply: SyncSender<io::Result<()>>,
+    },
     SurfaceCommitProviderStep {
         fence: surface::SurfaceOperationFence,
         identity: orca_core::thread_item_projection::ModelResponseIdentity,
@@ -7056,16 +7091,13 @@ fn reconcile_durable_provider_outcomes_on_start(
                 .map_err(|_| RuntimeHostError::ThreadStartFailed {
                     message: "recovered background approval task revision is invalid".to_string(),
                 })?;
-            let mut suspension_events = ThreadActor::background_provider_response_events(
-                &snapshot,
-                &background_fence,
-                response,
-            )
-            .map_err(|error| RuntimeHostError::ThreadStartFailed {
-                message: format!(
-                    "failed to rebuild recovered background approval response: {error}"
-                ),
-            })?;
+            let mut suspension_events =
+                build_background_provider_response_events(&snapshot, &background_fence, response)
+                    .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!(
+                        "failed to rebuild recovered background approval response: {error}"
+                    ),
+                })?;
             let tool = suspension_events
                 .iter()
                 .find_map(|(_, event)| match event {
@@ -7297,11 +7329,7 @@ fn reconcile_durable_provider_outcomes_on_start(
             .response
             .as_ref()
             .map(|response| {
-                ThreadActor::background_provider_response_events(
-                    &snapshot,
-                    &background_fence,
-                    response,
-                )
+                build_background_provider_response_events(&snapshot, &background_fence, response)
             })
             .transpose()
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
@@ -10121,7 +10149,7 @@ fn bind_runtime_surface(
             coordinator,
             hub: hub.clone(),
             capability: RuntimeCapabilityController::new(),
-            interactions,
+            interactions: ResidentInteractionController::new(interactions),
             cold_recovery_owners,
             cold_recovery_permission_owners,
             continuation_turn_owners,
@@ -10874,149 +10902,6 @@ fn surface_safe_diagnostic(text: &str, fallback: &'static str) -> surface::SafeD
         })
 }
 
-fn stable_surface_stream_prefix_len(text: &str) -> usize {
-    if let Some(sensitive_assignment_start) = incomplete_surface_sensitive_assignment_start(text) {
-        return sensitive_assignment_start;
-    }
-
-    let trailing_token_start = text
-        .char_indices()
-        .filter_map(|(index, ch)| {
-            (ch.is_whitespace()
-                || matches!(
-                    ch,
-                    '"' | '\'' | '{' | '}' | '[' | ']' | ',' | ':' | ';' | '(' | ')'
-                ))
-            .then_some(index + ch.len_utf8())
-        })
-        .last()
-        .unwrap_or(0);
-    let trailing_token = &text[trailing_token_start..];
-    let lower = trailing_token.to_ascii_lowercase();
-    let mut retained_start = None;
-    for needle in [
-        "api_key",
-        "apikey",
-        "token",
-        "password",
-        "secret",
-        "authorization",
-    ] {
-        if let Some(index) = lower.find(needle) {
-            retained_start =
-                Some(retained_start.map_or(index, |current: usize| current.min(index)));
-            continue;
-        }
-        for prefix_len in 1..needle.len() {
-            if lower.ends_with(&needle[..prefix_len]) {
-                let index = lower.len() - prefix_len;
-                retained_start =
-                    Some(retained_start.map_or(index, |current: usize| current.min(index)));
-            }
-        }
-    }
-    if matches!(lower.as_str(), "s" | "sk") || lower.starts_with("sk-") {
-        retained_start = Some(0);
-    }
-
-    retained_start
-        .map(|index| trailing_token_start + index)
-        .unwrap_or(text.len())
-}
-
-fn incomplete_surface_sensitive_assignment_start(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'=' && bytes[index] != b':' {
-            index += 1;
-            continue;
-        }
-
-        let key_start = surface_sensitive_key_start(bytes, index);
-        let key = text[key_start..index].trim_matches(|ch: char| {
-            ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '[' | ',')
-        });
-        if !is_surface_sensitive_key(key) {
-            index += 1;
-            continue;
-        }
-
-        let mut value_start = index + 1;
-        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
-            value_start += 1;
-        }
-        if value_start == bytes.len() {
-            return Some(key_start);
-        }
-
-        if matches!(bytes[value_start], b'"' | b'\'') {
-            let quote = bytes[value_start];
-            let mut value_index = value_start + 1;
-            let mut escaped = false;
-            let mut closed = false;
-            while value_index < bytes.len() {
-                let byte = bytes[value_index];
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == quote {
-                    closed = true;
-                    value_index += 1;
-                    break;
-                }
-                value_index += 1;
-            }
-            if !closed {
-                return Some(key_start);
-            }
-            index = value_index;
-            continue;
-        }
-
-        let mut value_index = value_start;
-        while value_index < bytes.len()
-            && !bytes[value_index].is_ascii_whitespace()
-            && !matches!(bytes[value_index], b',' | b'}' | b']' | b';')
-        {
-            value_index += 1;
-        }
-        if value_index == bytes.len() {
-            return Some(key_start);
-        }
-        index = value_index + 1;
-    }
-    None
-}
-
-fn surface_sensitive_key_start(bytes: &[u8], delimiter_index: usize) -> usize {
-    let mut start = delimiter_index;
-    while start > 0 {
-        let previous = bytes[start - 1];
-        if previous.is_ascii_whitespace() || matches!(previous, b'{' | b'[' | b',' | b';' | b'(') {
-            break;
-        }
-        start -= 1;
-    }
-    start
-}
-
-fn is_surface_sensitive_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key.contains("api_key")
-        || key.contains("apikey")
-        || key.contains("token")
-        || key.contains("password")
-        || key.contains("secret")
-        || key.contains("authorization")
-}
-
-struct PendingSurfaceStreamRedaction {
-    fence: surface::SurfaceOperationFence,
-    raw_tail: String,
-}
-
 const GOAL_COMPLETION_CAPACITY: usize = 8;
 
 type GoalBlockingSettlement = Box<dyn FnOnce(&mut ThreadActor) + Send + 'static>;
@@ -11063,8 +10948,7 @@ struct ThreadActor {
     resident_surface: ResidentSurfaceSlot,
     pending_manual_compaction_completion: Option<PendingManualCompactionCompletion>,
     pending_provider_transfer: Option<PendingTypedProviderTransfer>,
-    pending_surface_stream_redactions:
-        HashMap<surface::SurfaceItemId, PendingSurfaceStreamRedaction>,
+    generation_context_controller: GenerationContextController,
     live_input_capsules: HashMap<surface::SurfaceOperationId, surface::SurfaceInputRequest>,
     ephemeral_reservation_expiry: Option<EphemeralReservationExpiry>,
     ephemeral_reservation_timeout: Duration,
@@ -11123,7 +11007,7 @@ struct ResidentSurfaceState {
     coordinator: surface::RuntimeCommitCoordinator<'static, surface::RuntimeSurfaceCommitLedger>,
     hub: surface::SurfaceHub,
     capability: ResidentCapabilityController,
-    interactions: HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+    interactions: ResidentInteractionController,
     cold_recovery_owners: HashMap<surface::SurfaceInteractionId, ColdRecoveryToolApprovalOwner>,
     cold_recovery_permission_owners:
         HashMap<surface::SurfaceInteractionId, ColdRecoveryPermissionOwner>,
@@ -11135,35 +11019,6 @@ struct ResidentSurfaceState {
     pending_detaches: HashMap<surface::SurfaceAttachmentId, PendingSurfaceDetach>,
     pending_capability_losses: HashMap<surface::SurfaceAttachmentId, PendingSurfaceCapabilityLoss>,
     commit: ResidentCommitController,
-}
-
-struct ResidentSurfaceInteraction {
-    record: surface::BrokerInteractionRequestRecord,
-    route: surface::BrokerInteractionResponseRoute,
-    revision: surface::InteractionRevision,
-    waiter: Option<ResidentInteractionWaiter>,
-    private_response: Option<ResidentPrivateInteractionResponse>,
-    pending_background_route: Option<PendingBackgroundInteractionRoute>,
-    winning_receipt: Option<surface::SurfaceInteractionResolutionReceipt>,
-    resolution_ack: Option<surface::MutationCommitAck>,
-    projected_cursor: Option<surface::SurfaceCursor>,
-    cancelled: Option<surface::InteractionCancelReason>,
-}
-
-#[derive(Clone)]
-struct PendingBackgroundInteractionRoute {
-    fence: surface::SurfaceBackgroundFence,
-    batch: surface::SurfaceCommitBatch,
-    next_revision: surface::InteractionRevision,
-    private_route: surface::BrokerInteractionResponseRoute,
-    retry_at: tokio::time::Instant,
-}
-
-struct ResidentPrivateInteractionResponse {
-    record: surface::BrokerInteractionResponseRecord,
-    answer: surface::SurfaceClientInteractionAnswer,
-    pending_batch: Option<surface::SurfaceCommitBatch>,
-    retry_at: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -11580,31 +11435,11 @@ struct ExactInteractionSelectorBinding {
     operation_fence: surface::SurfaceOperationFence,
 }
 
-enum ResidentInteractionWaiter {
-    ToolApproval {
-        approval_id: String,
-        waiter: SyncSender<io::Result<orca_core::approval_types::ApprovalResolution>>,
-    },
-    Permission(SyncSender<io::Result<crate::runtime_permission::RuntimePermissionResponse>>),
-    UserInput(SyncSender<io::Result<Option<String>>>),
-    McpElicitation(SyncSender<Result<orca_mcp::McpElicitationResponse, String>>),
-}
-
 fn random_token_bytes() -> [u8; 32] {
     let mut bytes = [0_u8; 32];
     bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     bytes
-}
-
-fn keyed_interaction_response_digest(
-    token: &surface::SurfaceResponseToken,
-    answer: &surface::SurfaceClientInteractionAnswer,
-) -> surface::OpaqueToken {
-    let mut hasher = Sha256::new();
-    hasher.update(token.key_bytes());
-    hasher.update(serde_json::to_vec(answer).expect("interaction answer serializes"));
-    surface::OpaqueToken::new(hasher.finalize().into())
 }
 
 pub(crate) fn surface_sha256(bytes: &[u8]) -> surface::Sha256Digest {
@@ -12670,7 +12505,7 @@ pub(crate) fn runtime_surface_event_batch(
     batch
 }
 
-fn surface_tool_action(
+pub(crate) fn surface_tool_action(
     action: orca_core::approval_types::ActionKind,
 ) -> surface::SurfaceToolAction {
     match action {
@@ -13366,121 +13201,6 @@ fn json_from_surface_data(value: &surface::SurfaceDataValue) -> Value {
                 .collect(),
         ),
     }
-}
-
-fn interaction_route_attachments(
-    route: &surface::BrokerInteractionResponseRoute,
-) -> Vec<surface::SurfaceAttachmentId> {
-    match route {
-        surface::BrokerInteractionResponseRoute::Unassigned { .. } => Vec::new(),
-        surface::BrokerInteractionResponseRoute::Exclusive { attachment_id, .. } => {
-            vec![attachment_id.clone()]
-        }
-        surface::BrokerInteractionResponseRoute::SharedFirstCommitWins { grants, .. } => grants
-            .as_slice()
-            .iter()
-            .map(|(attachment_id, _)| attachment_id.clone())
-            .collect(),
-    }
-}
-
-fn interaction_route_admits(
-    route: &surface::BrokerInteractionResponseRoute,
-    attachment_id: &surface::SurfaceAttachmentId,
-) -> bool {
-    match route {
-        surface::BrokerInteractionResponseRoute::Unassigned { .. } => false,
-        surface::BrokerInteractionResponseRoute::Exclusive {
-            attachment_id: expected,
-            ..
-        } => expected == attachment_id,
-        surface::BrokerInteractionResponseRoute::SharedFirstCommitWins { grants, .. } => grants
-            .as_slice()
-            .iter()
-            .any(|(expected, _)| expected == attachment_id),
-    }
-}
-
-fn interaction_route_admits_exact(
-    route: &surface::BrokerInteractionResponseRoute,
-    attachment_id: &surface::SurfaceAttachmentId,
-    route_epoch: surface::ResponseRouteEpoch,
-    grant_token: &surface::SurfaceResponseGrantToken,
-) -> bool {
-    match route {
-        surface::BrokerInteractionResponseRoute::Unassigned { .. } => false,
-        surface::BrokerInteractionResponseRoute::Exclusive {
-            epoch,
-            attachment_id: expected_attachment,
-            grant_token: expected_grant,
-        } => {
-            *epoch == route_epoch
-                && expected_attachment == attachment_id
-                && expected_grant == grant_token
-        }
-        surface::BrokerInteractionResponseRoute::SharedFirstCommitWins {
-            epoch, grants, ..
-        } => {
-            *epoch == route_epoch
-                && grants
-                    .as_slice()
-                    .iter()
-                    .any(|(expected_attachment, expected_grant)| {
-                        expected_attachment == attachment_id && expected_grant == grant_token
-                    })
-        }
-    }
-}
-
-fn interaction_route_epoch(
-    route: &surface::BrokerInteractionResponseRoute,
-) -> surface::ResponseRouteEpoch {
-    match route {
-        surface::BrokerInteractionResponseRoute::Unassigned { epoch }
-        | surface::BrokerInteractionResponseRoute::Exclusive { epoch, .. }
-        | surface::BrokerInteractionResponseRoute::SharedFirstCommitWins { epoch, .. } => *epoch,
-    }
-}
-
-fn exact_interaction_selectors(
-    interaction: &ResidentSurfaceInteraction,
-) -> Vec<(surface::SurfaceAttachmentId, surface::InteractionSelector)> {
-    let grants = match &interaction.route {
-        surface::BrokerInteractionResponseRoute::Unassigned { .. } => Vec::new(),
-        surface::BrokerInteractionResponseRoute::Exclusive {
-            epoch,
-            attachment_id,
-            grant_token,
-        } => vec![(attachment_id.clone(), *epoch, grant_token.clone())],
-        surface::BrokerInteractionResponseRoute::SharedFirstCommitWins {
-            epoch, grants, ..
-        } => grants
-            .as_slice()
-            .iter()
-            .map(|(attachment_id, grant_token)| {
-                (attachment_id.clone(), *epoch, grant_token.clone())
-            })
-            .collect(),
-    };
-    grants
-        .into_iter()
-        .map(
-            |(attachment_id, response_route_epoch, response_grant_token)| {
-                (
-                    attachment_id,
-                    surface::InteractionSelector::Exact {
-                        interaction_id: interaction.record.interaction_id.clone(),
-                        expected_revision: interaction.revision,
-                        kind: interaction.record.kind,
-                        response_token: interaction.record.response_token.clone(),
-                        response_route_epoch,
-                        response_grant_token,
-                        operation_fence: interaction.record.fence.clone(),
-                    },
-                )
-            },
-        )
-        .collect()
 }
 
 #[cfg(test)]
@@ -17914,170 +17634,28 @@ impl ThreadActor {
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         step: &ProviderStep,
     ) -> io::Result<()> {
-        let (channel, item_id, text) = match step {
-            ProviderStep::MessageDelta(text) => (
-                surface::AssistantChannel::Message,
-                identity.item_ids.conversation_item_id.clone(),
-                text,
-            ),
-            ProviderStep::ReasoningDelta(text) => (
-                surface::AssistantChannel::Reasoning,
-                identity.item_ids.reasoning_item_id.clone(),
-                text,
-            ),
-            _ => return Ok(()),
-        };
-        if text.is_empty() {
-            return Ok(());
-        }
-        let Some(text) =
-            self.take_surface_stream_redacted_prefix(&fence, &item_id, text.as_str())?
-        else {
-            return Ok(());
-        };
-
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let active_generation = active.is_some_and(|active| {
             active.surface_operation.as_ref() == Some(&fence)
                 && !Self::surface_interaction_admission_closed(active)
         });
-        let foregrounded_background = snapshot
-            .background_operations
-            .iter()
-            .find(|background| {
-                background.fence.operation_fence == fence
-                    && background.task_id.as_ref().is_some_and(|task_id| {
-                        snapshot.tasks.iter().any(|task| {
-                            &task.task_id == task_id
-                                && task.status == surface::SurfaceTaskStatus::Running
-                                && !task.backgrounded
-                                && task.background_fence.is_none()
-                        })
-                    })
-            })
-            .map(|background| background.fence.clone());
-        if !active_generation && foregrounded_background.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "provider step generation fence is stale or not foreground-attached",
-            ));
-        }
-        let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
-        let generation = operation
-            .generations
-            .iter()
-            .find(|generation| generation.fence == fence)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
-        if generation.logical_turn_id != identity.turn_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "provider step turn identity differs from active generation",
-            ));
-        }
-
-        let scope = foregrounded_background
-            .as_ref()
-            .map(|fence| surface::SurfaceScope::Background {
-                fence: fence.clone(),
-            })
-            .unwrap_or_else(|| surface::SurfaceScope::Generation {
-                fence: fence.clone(),
-            });
-        let mut events = Vec::with_capacity(2);
-        let (stream_id, offset) = if let Some(stream) = snapshot
-            .assistant_streams
-            .iter()
-            .find(|stream| stream.item_id == item_id && stream.channel == channel)
-        {
-            if stream.fence != fence
-                || stream.turn_id != identity.turn_id
-                || stream.state != surface::SurfaceAssistantStreamState::Open
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "provider step targets a closed or foreign assistant stream",
-                ));
-            }
-            (stream.stream_id.clone(), stream.next_offset)
-        } else {
-            let raw_id = item_id
-                .as_str()
-                .strip_prefix("item_")
-                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "provider step item identity is not UUIDv7-backed",
-                    )
-                })?;
-            let stream_id =
-                surface::SurfaceStreamId::try_from_bytes(*raw_id.as_bytes()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "provider step item identity is not UUIDv7-backed",
-                    )
-                })?;
-            events.push((
-                scope.clone(),
-                surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamOpened {
-                    stream: surface::SurfaceAssistantStream {
-                        stream_id: stream_id.clone(),
-                        fence: fence.clone(),
-                        turn_id: identity.turn_id.clone(),
-                        item_id,
-                        channel,
-                        next_offset: surface::ByteOffset::new(0),
-                        text: surface::DisplayText::new(""),
-                        state: surface::SurfaceAssistantStreamState::Open,
-                    },
-                }),
-            ));
-            (stream_id, surface::ByteOffset::new(0))
+        let Some(projection) = self.generation_context_controller.provider_step_events(
+            &snapshot,
+            active_generation,
+            fence.clone(),
+            identity,
+            step,
+        )?
+        else {
+            return Ok(());
         };
-        events.push((
-            scope,
-            surface::SurfaceEvent::Assistant(surface::AssistantPatch::Delta {
-                stream_id,
-                offset,
-                text,
-            }),
-        ));
-        let batch = self.surface_event_batch_with_commit_id(events, None);
-        match foregrounded_background {
+        let batch = self.surface_event_batch_with_commit_id(projection.events, None);
+        match projection.background_fence {
             Some(background_fence) => {
                 self.commit_surface_background_batch_with_retry(background_fence, &batch)
             }
             None => self.commit_surface_generation_batch_with_retry(fence, &batch),
         }
-    }
-
-    fn take_surface_stream_redacted_prefix(
-        &mut self,
-        fence: &surface::SurfaceOperationFence,
-        item_id: &surface::SurfaceItemId,
-        text: &str,
-    ) -> io::Result<Option<surface::DisplayText>> {
-        let pending = self
-            .pending_surface_stream_redactions
-            .entry(item_id.clone())
-            .or_insert_with(|| PendingSurfaceStreamRedaction {
-                fence: fence.clone(),
-                raw_tail: String::new(),
-            });
-        if pending.fence != *fence {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "provider stream redaction tail belongs to another generation",
-            ));
-        }
-        pending.raw_tail.push_str(text);
-        let stable_len = stable_surface_stream_prefix_len(&pending.raw_tail);
-        if stable_len == 0 {
-            return Ok(None);
-        }
-        let stable = pending.raw_tail.drain(..stable_len).collect::<String>();
-        Ok(Some(surface_persisted_display_text(&stable)))
     }
 
     fn commit_surface_provider_failure(
@@ -18087,10 +17665,26 @@ impl ThreadActor {
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         message: &str,
     ) -> io::Result<()> {
+        self.commit_surface_provider_attempt_failure(active, fence, identity, message)?;
+        active.surface_execution_failure = Some(surface::GenerationExecutionFailureClass::Provider);
+        active.surface_execution_failure_diagnostic = Some(surface_safe_diagnostic(
+            message,
+            "provider execution failed with an invalid diagnostic",
+        ));
+        Ok(())
+    }
+
+    fn commit_surface_provider_attempt_failure(
+        &mut self,
+        active: &ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+        _message: &str,
+    ) -> io::Result<()> {
         if active.surface_operation.as_ref() != Some(&fence) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "provider failure generation fence is stale",
+                "provider attempt failure generation fence is stale",
             ));
         }
         if Self::surface_interaction_admission_closed(active) {
@@ -18100,25 +17694,14 @@ impl ThreadActor {
             ));
         }
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-        let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
-        let generation = operation
-            .generations
-            .iter()
-            .find(|generation| generation.fence == fence)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
-        if generation.logical_turn_id != identity.turn_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "provider failure turn identity differs from active generation",
-            ));
+        let events = self
+            .generation_context_controller
+            .provider_attempt_failure_events(&snapshot, &fence, identity)?;
+        if events.is_empty() {
+            return Ok(());
         }
-        active.surface_execution_failure = Some(surface::GenerationExecutionFailureClass::Provider);
-        active.surface_execution_failure_diagnostic = Some(surface_safe_diagnostic(
-            message,
-            "provider execution failed with an invalid diagnostic",
-        ));
-        Ok(())
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.commit_surface_generation_batch_with_retry(fence, &batch)
     }
 
     fn commit_surface_provider_response(
@@ -18139,536 +17722,15 @@ impl ThreadActor {
                 "runtime generation is terminalizing",
             ));
         }
-
-        let completed = response.completed();
-        let response_uuid = completed
-            .identity
-            .item_ids
-            .conversation_item_id
-            .as_str()
-            .strip_prefix("item_")
-            .and_then(|value| uuid::Uuid::parse_str(value).ok())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "provider response identity is not UUIDv7-backed",
-                )
-            })?;
-        let response_id =
-            surface::UuidV7::try_from_bytes(*response_uuid.as_bytes()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "provider response identity is not UUIDv7-backed",
-                )
-            })?;
-
-        let mut message_item = None;
-        let mut reasoning_item = None;
-        let mut plan_item = None;
-        for item in completed.completed_items() {
-            match item {
-                CompletedModelItem::AgentMessage { id, text } => {
-                    message_item = Some(surface::SurfaceAssistantMessageItem {
-                        id,
-                        turn_id: completed.identity.turn_id.clone(),
-                        text: surface_persisted_display_text(&text),
-                        pinned: false,
-                    });
-                }
-                CompletedModelItem::Reasoning {
-                    id,
-                    summary,
-                    content,
-                } => {
-                    let (summary, content) = if content.is_empty() && !summary.is_empty() {
-                        (String::new(), summary)
-                    } else {
-                        (summary, content)
-                    };
-                    reasoning_item = Some(surface::SurfaceAssistantReasoningItem {
-                        id,
-                        turn_id: completed.identity.turn_id.clone(),
-                        summary: surface_persisted_display_text(&summary),
-                        content: surface_persisted_display_text(&content),
-                        pinned: false,
-                    });
-                }
-                CompletedModelItem::Plan { id, text } => {
-                    plan_item = Some(surface::SurfaceAssistantPlanItem {
-                        id,
-                        turn_id: completed.identity.turn_id.clone(),
-                        text: surface_persisted_display_text(&text),
-                        pinned: false,
-                    });
-                }
-            }
-        }
-
-        let mut requests_by_id = HashMap::new();
-        for step in &response.response.steps {
-            if let ProviderStep::ToolCall(request) = step
-                && requests_by_id
-                    .insert(request.id.clone(), request.clone())
-                    .is_some()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "provider response repeats a tool call id",
-                ));
-            }
-        }
-        if requests_by_id.len() != completed.tool_calls.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "provider response tool metadata is incomplete",
-            ));
-        }
-
-        let mut raw_tool_calls = Vec::with_capacity(completed.tool_calls.len());
-        let mut tool_requests = Vec::with_capacity(completed.tool_calls.len());
-        for raw_call in &completed.tool_calls {
-            let request = requests_by_id.get(&raw_call.id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "provider response lacks the executable tool request",
-                )
-            })?;
-            let raw_arguments = request.raw_arguments.clone().unwrap_or_default();
-            if request.name.as_str() != raw_call.function_name
-                || raw_arguments != raw_call.arguments
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "provider response tool identity differs from executable request",
-                ));
-            }
-            let tool_call_id = surface::SurfaceToolCallId::try_new(raw_call.id.clone())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
-            let name = surface::NonEmptyText::try_new(raw_call.function_name.clone())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool name"))?;
-            let arguments_digest = surface_sha256(raw_call.arguments.as_bytes());
-            raw_tool_calls.push(surface::SurfaceRawToolCall {
-                id: tool_call_id.clone(),
-                name: name.clone(),
-                raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
-                arguments_digest: arguments_digest.clone(),
-            });
-            tool_requests.push(surface::SurfaceToolRequest {
-                tool_call_id,
-                source_response_id: Some(response_id.clone()),
-                turn_id: completed.identity.turn_id.clone(),
-                name,
-                action: surface_tool_action(request.action),
-                target: request.target.clone().map(surface::DisplayText::new),
-                raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
-                arguments_digest,
-            });
-        }
-
-        let completed_response = surface::SurfaceCompletedModelResponse {
-            response_id,
-            turn_id: completed.identity.turn_id.clone(),
-            message_item,
-            reasoning_item,
-            plan_item,
-            tool_calls: raw_tool_calls,
-        };
-        for item_id in [
-            completed_response
-                .message_item
-                .as_ref()
-                .map(|item| &item.id),
-            completed_response
-                .reasoning_item
-                .as_ref()
-                .map(|item| &item.id),
-            completed_response.plan_item.as_ref().map(|item| &item.id),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            self.pending_surface_stream_redactions.remove(item_id);
-        }
-        let scope = surface::SurfaceScope::Generation {
-            fence: fence.clone(),
-        };
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
-        let response_items_match = [
-            completed_response.message_item.as_ref().map(|expected| {
-                snapshot.items.iter().any(|item| {
-                    matches!(
-                        item,
-                        surface::SurfaceItem::AssistantMessage {
-                            id,
-                            turn_id,
-                            text,
-                            pinned,
-                        } if id == &expected.id
-                            && turn_id == &expected.turn_id
-                            && text == &expected.text
-                            && pinned == &expected.pinned
-                    )
-                })
-            }),
-            completed_response.reasoning_item.as_ref().map(|expected| {
-                snapshot.items.iter().any(|item| {
-                    matches!(
-                        item,
-                        surface::SurfaceItem::AssistantReasoning {
-                            id,
-                            turn_id,
-                            summary,
-                            content,
-                            pinned,
-                        } if id == &expected.id
-                            && turn_id == &expected.turn_id
-                            && summary == &expected.summary
-                            && content == &expected.content
-                            && pinned == &expected.pinned
-                    )
-                })
-            }),
-            completed_response.plan_item.as_ref().map(|expected| {
-                snapshot.items.iter().any(|item| {
-                    matches!(
-                        item,
-                        surface::SurfaceItem::AssistantPlan {
-                            id,
-                            turn_id,
-                            text,
-                            pinned,
-                        } if id == &expected.id
-                            && turn_id == &expected.turn_id
-                            && text == &expected.text
-                            && pinned == &expected.pinned
-                    )
-                })
-            }),
-        ];
-        let has_response_identity =
-            response_items_match.iter().any(Option::is_some) || !tool_requests.is_empty();
-        let tools_match = snapshot
-            .tools
-            .iter()
-            .filter(|tool| {
-                tool.request.source_response_id.as_ref() == Some(&completed_response.response_id)
-                    && tool.request.turn_id == completed_response.turn_id
-            })
-            .count()
-            == tool_requests.len()
-            && tool_requests
-                .iter()
-                .all(|expected| snapshot.tools.iter().any(|tool| tool.request == *expected));
-        if has_response_identity
-            && response_items_match
-                .into_iter()
-                .flatten()
-                .all(|matched| matched)
-            && tools_match
-        {
-            if let Some(usage) = response.response.usage
-                && let Some(context) = next_provider_context_snapshot(&snapshot.context, usage)
-            {
-                let batch = self.surface_event_batch_with_commit_id(
-                    vec![(scope, surface::SurfaceEvent::Context(context))],
-                    None,
-                );
-                return self.commit_surface_generation_batch_with_retry(fence, &batch);
-            }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let events = self
+            .generation_context_controller
+            .provider_response_events(&snapshot, &fence, response)?;
+        if events.is_empty() {
             return Ok(());
-        }
-        let mut events = Vec::new();
-        for stream in snapshot.assistant_streams.iter().filter(|stream| {
-            stream.fence == fence
-                && stream.turn_id == completed_response.turn_id
-                && stream.state == surface::SurfaceAssistantStreamState::Open
-        }) {
-            let completed_text = match stream.channel {
-                surface::AssistantChannel::Message => completed_response
-                    .message_item
-                    .as_ref()
-                    .filter(|item| item.id == stream.item_id)
-                    .map(|item| item.text.as_str()),
-                surface::AssistantChannel::Reasoning => completed_response
-                    .reasoning_item
-                    .as_ref()
-                    .filter(|item| item.id == stream.item_id)
-                    .map(|item| item.content.as_str()),
-                surface::AssistantChannel::Plan => completed_response
-                    .plan_item
-                    .as_ref()
-                    .filter(|item| item.id == stream.item_id)
-                    .map(|item| item.text.as_str()),
-            };
-            match completed_text.and_then(|text| text.strip_prefix(stream.text.as_str())) {
-                Some(suffix) if !suffix.is_empty() => events.push((
-                    scope.clone(),
-                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::Delta {
-                        stream_id: stream.stream_id.clone(),
-                        offset: stream.next_offset,
-                        text: surface::DisplayText::new(suffix),
-                    }),
-                )),
-                Some(_) => {}
-                None => events.push((
-                    scope.clone(),
-                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamDiscarded {
-                        stream_id: stream.stream_id.clone(),
-                        reason: surface::AssistantDiscardReason::ProviderFailed,
-                    }),
-                )),
-            }
-        }
-        events.push((
-            scope.clone(),
-            surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseCompleted {
-                response: completed_response,
-            }),
-        ));
-        events.extend(tool_requests.into_iter().map(|request| {
-            (
-                scope.clone(),
-                surface::SurfaceEvent::Tool(surface::ToolPatch::Requested { request }),
-            )
-        }));
-        if let Some(usage) = response.response.usage {
-            if let Some(context) = next_provider_context_snapshot(&snapshot.context, usage) {
-                events.push((scope, surface::SurfaceEvent::Context(context)));
-            }
         }
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.commit_surface_generation_batch_with_retry(fence, &batch)
-    }
-
-    fn background_provider_response_events(
-        snapshot: &surface::SurfaceSnapshot,
-        fence: &surface::SurfaceBackgroundFence,
-        response: &crate::model_response::RuntimeModelResponse,
-    ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
-        let completed = response.completed();
-        let response_uuid = completed
-            .identity
-            .item_ids
-            .conversation_item_id
-            .as_str()
-            .strip_prefix("item_")
-            .and_then(|value| uuid::Uuid::parse_str(value).ok())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "background provider response identity is not UUIDv7-backed",
-                )
-            })?;
-        let response_id =
-            surface::UuidV7::try_from_bytes(*response_uuid.as_bytes()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "background provider response identity is not UUIDv7-backed",
-                )
-            })?;
-        let mut message_item = None;
-        let mut reasoning_item = None;
-        let mut plan_item = None;
-        for item in completed.completed_items() {
-            match item {
-                CompletedModelItem::AgentMessage { id, text } => {
-                    message_item = Some(surface::SurfaceAssistantMessageItem {
-                        id,
-                        turn_id: completed.identity.turn_id.clone(),
-                        text: surface_persisted_display_text(&text),
-                        pinned: false,
-                    });
-                }
-                CompletedModelItem::Reasoning {
-                    id,
-                    summary,
-                    content,
-                } => {
-                    let (summary, content) = if content.is_empty() && !summary.is_empty() {
-                        (String::new(), summary)
-                    } else {
-                        (summary, content)
-                    };
-                    reasoning_item = Some(surface::SurfaceAssistantReasoningItem {
-                        id,
-                        turn_id: completed.identity.turn_id.clone(),
-                        summary: surface_persisted_display_text(&summary),
-                        content: surface_persisted_display_text(&content),
-                        pinned: false,
-                    });
-                }
-                CompletedModelItem::Plan { id, text } => {
-                    plan_item = Some(surface::SurfaceAssistantPlanItem {
-                        id,
-                        turn_id: completed.identity.turn_id.clone(),
-                        text: surface_persisted_display_text(&text),
-                        pinned: false,
-                    });
-                }
-            }
-        }
-        let response_item_ids = [
-            message_item.as_ref().map(|item| &item.id),
-            reasoning_item.as_ref().map(|item| &item.id),
-            plan_item.as_ref().map(|item| &item.id),
-        ];
-        if snapshot.items.iter().any(|item| {
-            let id = match item {
-                surface::SurfaceItem::AssistantMessage { id, .. }
-                | surface::SurfaceItem::AssistantReasoning { id, .. }
-                | surface::SurfaceItem::AssistantPlan { id, .. } => Some(id),
-                _ => None,
-            };
-            id.is_some_and(|id| {
-                response_item_ids
-                    .into_iter()
-                    .flatten()
-                    .any(|item| item == id)
-            })
-        }) {
-            if let Some(usage) = response.response.usage
-                && snapshot.context.used_tokens != usage.input_tokens
-                && let Some(context) = next_provider_context_snapshot(&snapshot.context, usage)
-            {
-                return Ok(vec![(
-                    surface::SurfaceScope::Background {
-                        fence: fence.clone(),
-                    },
-                    surface::SurfaceEvent::Context(context),
-                )]);
-            }
-            return Ok(Vec::new());
-        }
-        let mut requests_by_id = HashMap::new();
-        for step in &response.response.steps {
-            if let ProviderStep::ToolCall(request) = step
-                && requests_by_id
-                    .insert(request.id.clone(), request.clone())
-                    .is_some()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "background provider response repeats a tool call id",
-                ));
-            }
-        }
-        if requests_by_id.len() != completed.tool_calls.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "background provider response tool metadata is incomplete",
-            ));
-        }
-        let mut raw_tool_calls = Vec::with_capacity(completed.tool_calls.len());
-        let mut tool_requests = Vec::with_capacity(completed.tool_calls.len());
-        for raw_call in &completed.tool_calls {
-            let request = requests_by_id.get(&raw_call.id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "background provider response lacks the executable tool request",
-                )
-            })?;
-            let raw_arguments = request.raw_arguments.clone().unwrap_or_default();
-            if request.name.as_str() != raw_call.function_name
-                || raw_arguments != raw_call.arguments
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "background provider tool identity differs from executable request",
-                ));
-            }
-            let tool_call_id = surface::SurfaceToolCallId::try_new(raw_call.id.clone())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
-            let name = surface::NonEmptyText::try_new(raw_call.function_name.clone())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool name"))?;
-            let arguments_digest = surface_sha256(raw_call.arguments.as_bytes());
-            raw_tool_calls.push(surface::SurfaceRawToolCall {
-                id: tool_call_id.clone(),
-                name: name.clone(),
-                raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
-                arguments_digest: arguments_digest.clone(),
-            });
-            tool_requests.push(surface::SurfaceToolRequest {
-                tool_call_id,
-                source_response_id: Some(response_id.clone()),
-                turn_id: completed.identity.turn_id.clone(),
-                name,
-                action: surface_tool_action(request.action),
-                target: request.target.clone().map(surface::DisplayText::new),
-                raw_arguments: surface::DisplayText::new(raw_call.arguments.clone()),
-                arguments_digest,
-            });
-        }
-        let completed_response = surface::SurfaceCompletedModelResponse {
-            response_id,
-            turn_id: completed.identity.turn_id.clone(),
-            message_item,
-            reasoning_item,
-            plan_item,
-            tool_calls: raw_tool_calls,
-        };
-        let scope = surface::SurfaceScope::Background {
-            fence: fence.clone(),
-        };
-        let mut events = Vec::new();
-        for stream in snapshot.assistant_streams.iter().filter(|stream| {
-            stream.fence == fence.operation_fence
-                && stream.turn_id == completed_response.turn_id
-                && stream.state == surface::SurfaceAssistantStreamState::Open
-        }) {
-            let completed_text = match stream.channel {
-                surface::AssistantChannel::Message => completed_response
-                    .message_item
-                    .as_ref()
-                    .filter(|item| item.id == stream.item_id)
-                    .map(|item| item.text.as_str()),
-                surface::AssistantChannel::Reasoning => completed_response
-                    .reasoning_item
-                    .as_ref()
-                    .filter(|item| item.id == stream.item_id)
-                    .map(|item| item.content.as_str()),
-                surface::AssistantChannel::Plan => completed_response
-                    .plan_item
-                    .as_ref()
-                    .filter(|item| item.id == stream.item_id)
-                    .map(|item| item.text.as_str()),
-            };
-            match completed_text.and_then(|text| text.strip_prefix(stream.text.as_str())) {
-                Some(suffix) if !suffix.is_empty() => events.push((
-                    scope.clone(),
-                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::Delta {
-                        stream_id: stream.stream_id.clone(),
-                        offset: stream.next_offset,
-                        text: surface::DisplayText::new(suffix),
-                    }),
-                )),
-                Some(_) => {}
-                None => events.push((
-                    scope.clone(),
-                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamDiscarded {
-                        stream_id: stream.stream_id.clone(),
-                        reason: surface::AssistantDiscardReason::ProviderFailed,
-                    }),
-                )),
-            }
-        }
-        events.push((
-            scope.clone(),
-            surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseCompleted {
-                response: completed_response,
-            }),
-        ));
-        events.extend(tool_requests.into_iter().map(|request| {
-            (
-                scope.clone(),
-                surface::SurfaceEvent::Tool(surface::ToolPatch::Requested { request }),
-            )
-        }));
-        if let Some(usage) = response.response.usage {
-            if let Some(context) = next_provider_context_snapshot(&snapshot.context, usage) {
-                events.push((scope, surface::SurfaceEvent::Context(context)));
-            }
-        }
-        Ok(events)
     }
 
     fn commit_surface_plan_update(
@@ -22137,66 +21199,21 @@ impl ThreadActor {
             .resident_surface
             .hub
             .select_interaction_attachment_for(kind, preferred);
-        let unavailable = attachment_id.is_none();
-        let revision = surface::InteractionRevision::try_new(1).expect("one is valid");
-        let route_epoch = surface::ResponseRouteEpoch::try_new(1).expect("one is valid");
-        let record = surface::BrokerInteractionRequestRecord {
-            thread_id: fence.thread_id.clone(),
-            interaction_id: interaction_id.clone(),
-            fence: fence.clone(),
-            kind,
-            request: request.clone(),
-            response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
-            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
-            recovery_disposition,
-        };
-        let route = match attachment_id.as_ref() {
-            Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
-                epoch: route_epoch,
-                attachment_id: attachment_id.clone(),
-                grant_token: surface::SurfaceResponseGrantToken::new(random_token_bytes()),
-            },
-            None => surface::BrokerInteractionResponseRoute::Unassigned { epoch: route_epoch },
-        };
-        let public_route = match attachment_id {
-            Some(attachment_id) => surface::SurfaceInteractionRoute::Exclusive {
-                epoch: route_epoch,
-                attachment_id,
-            },
-            None => surface::SurfaceInteractionRoute::Unassigned { epoch: route_epoch },
-        };
-        let view = surface::SurfaceInteractionView {
-            interaction_id: interaction_id.clone(),
+        let PreparedInteractionRequest {
+            interaction_id,
+            record,
+            route,
             revision,
-            fence: fence.clone(),
+            events,
+            unavailable,
+        } = prepare_interaction_request(
+            fence.clone(),
+            interaction_id,
             kind,
             request,
-            route: public_route,
-            lifecycle: surface::SurfaceInteractionLifecycle::Requested,
-            recovery_disposition: record.recovery_disposition.clone(),
-        };
-        let mut events = vec![(
-            surface::SurfaceScope::Generation {
-                fence: fence.clone(),
-            },
-            surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
-                interaction: view,
-            }),
-        )];
-        if unavailable {
-            events.push((
-                surface::SurfaceScope::Generation {
-                    fence: fence.clone(),
-                },
-                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
-                    interaction_id: interaction_id.clone(),
-                    expected_revision: revision,
-                    next_revision: surface::InteractionRevision::try_new(revision.get() + 1)
-                        .expect("interaction revision did not exhaust"),
-                    reason: surface::InteractionCancelReason::CapabilityUnavailable,
-                }),
-            ));
-        }
+            recovery_disposition,
+            attachment_id,
+        );
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.resident_surface
             .coordinator
@@ -22474,14 +21491,9 @@ impl ThreadActor {
             surface::SurfaceInteractionKind::UserInput,
             preferred,
         );
-        let unavailable = attachment_id.is_none();
         let interaction_id =
             surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
-        let revision = surface::InteractionRevision::try_new(1).expect("one is a valid revision");
-        let route_epoch = surface::ResponseRouteEpoch::try_new(1).expect("one is a valid revision");
-        let response_token = surface::SurfaceResponseToken::new(random_token_bytes());
-        let response_grant_token = surface::SurfaceResponseGrantToken::new(random_token_bytes());
         let interaction_request = surface::SurfaceInteractionRequest::UserInput {
             question: question.clone(),
             suggestions: request
@@ -22515,63 +21527,21 @@ impl ThreadActor {
         let recovery_disposition =
             surface::InteractionUnavailableDisposition::restartable_continuation_turn(&capsule)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let record = surface::BrokerInteractionRequestRecord {
-            thread_id: fence.thread_id.clone(),
-            interaction_id: interaction_id.clone(),
-            fence: fence.clone(),
-            kind: surface::SurfaceInteractionKind::UserInput,
-            request: interaction_request.clone(),
-            response_token,
-            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
-            recovery_disposition,
-        };
-        let route = match attachment_id.as_ref() {
-            Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
-                epoch: route_epoch,
-                attachment_id: attachment_id.clone(),
-                grant_token: response_grant_token,
-            },
-            None => surface::BrokerInteractionResponseRoute::Unassigned { epoch: route_epoch },
-        };
-        let public_route = match attachment_id {
-            Some(attachment_id) => surface::SurfaceInteractionRoute::Exclusive {
-                epoch: route_epoch,
-                attachment_id,
-            },
-            None => surface::SurfaceInteractionRoute::Unassigned { epoch: route_epoch },
-        };
-        let view = surface::SurfaceInteractionView {
-            interaction_id: interaction_id.clone(),
+        let PreparedInteractionRequest {
+            interaction_id,
+            record,
+            route,
             revision,
-            fence: fence.clone(),
-            kind: record.kind,
-            request: interaction_request,
-            route: public_route,
-            lifecycle: surface::SurfaceInteractionLifecycle::Requested,
-            recovery_disposition: record.recovery_disposition.clone(),
-        };
-        let mut events = vec![(
-            surface::SurfaceScope::Generation {
-                fence: fence.clone(),
-            },
-            surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
-                interaction: view,
-            }),
-        )];
-        if unavailable {
-            events.push((
-                surface::SurfaceScope::Generation {
-                    fence: fence.clone(),
-                },
-                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
-                    interaction_id: interaction_id.clone(),
-                    expected_revision: revision,
-                    next_revision: surface::InteractionRevision::try_new(revision.get() + 1)
-                        .expect("interaction revision did not exhaust"),
-                    reason: surface::InteractionCancelReason::CapabilityUnavailable,
-                }),
-            ));
-        }
+            events,
+            unavailable,
+        } = prepare_interaction_request(
+            fence.clone(),
+            interaction_id,
+            surface::SurfaceInteractionKind::UserInput,
+            interaction_request,
+            recovery_disposition,
+            attachment_id,
+        );
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.resident_surface
             .coordinator
@@ -22658,13 +21628,9 @@ impl ThreadActor {
             surface::SurfaceInteractionKind::McpElicitation,
             preferred,
         );
-        let unavailable = attachment_id.is_none();
         let interaction_id =
             surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
-        let revision = surface::InteractionRevision::try_new(1).expect("one is a valid revision");
-        let route_epoch =
-            surface::ResponseRouteEpoch::try_new(1).expect("one is a valid route epoch");
         let interaction_request = surface::SurfaceInteractionRequest::McpElicitation {
             server_name: server_name.clone(),
             server_request_id: opaque_request_id.clone(),
@@ -22691,63 +21657,21 @@ impl ThreadActor {
         let recovery_disposition =
             surface::InteractionUnavailableDisposition::restartable_continuation_turn(&capsule)
                 .map_err(|error| error.to_string())?;
-        let record = surface::BrokerInteractionRequestRecord {
-            thread_id: fence.thread_id.clone(),
-            interaction_id: interaction_id.clone(),
-            fence: fence.clone(),
-            kind: surface::SurfaceInteractionKind::McpElicitation,
-            request: interaction_request.clone(),
-            response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
-            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
-            recovery_disposition,
-        };
-        let route = match attachment_id.as_ref() {
-            Some(attachment_id) => surface::BrokerInteractionResponseRoute::Exclusive {
-                epoch: route_epoch,
-                attachment_id: attachment_id.clone(),
-                grant_token: surface::SurfaceResponseGrantToken::new(random_token_bytes()),
-            },
-            None => surface::BrokerInteractionResponseRoute::Unassigned { epoch: route_epoch },
-        };
-        let public_route = match attachment_id {
-            Some(attachment_id) => surface::SurfaceInteractionRoute::Exclusive {
-                epoch: route_epoch,
-                attachment_id,
-            },
-            None => surface::SurfaceInteractionRoute::Unassigned { epoch: route_epoch },
-        };
-        let view = surface::SurfaceInteractionView {
-            interaction_id: interaction_id.clone(),
+        let PreparedInteractionRequest {
+            interaction_id,
+            record,
+            route,
             revision,
-            fence: fence.clone(),
-            kind: record.kind,
-            request: interaction_request,
-            route: public_route,
-            lifecycle: surface::SurfaceInteractionLifecycle::Requested,
-            recovery_disposition: record.recovery_disposition.clone(),
-        };
-        let mut events = vec![(
-            surface::SurfaceScope::Generation {
-                fence: fence.clone(),
-            },
-            surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
-                interaction: view,
-            }),
-        )];
-        if unavailable {
-            events.push((
-                surface::SurfaceScope::Generation {
-                    fence: fence.clone(),
-                },
-                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
-                    interaction_id: interaction_id.clone(),
-                    expected_revision: revision,
-                    next_revision: surface::InteractionRevision::try_new(revision.get() + 1)
-                        .expect("interaction revision did not exhaust"),
-                    reason: surface::InteractionCancelReason::CapabilityUnavailable,
-                }),
-            ));
-        }
+            events,
+            unavailable,
+        } = prepare_interaction_request(
+            fence.clone(),
+            interaction_id,
+            surface::SurfaceInteractionKind::McpElicitation,
+            interaction_request,
+            recovery_disposition,
+            attachment_id,
+        );
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.resident_surface
             .coordinator
@@ -31529,8 +30453,8 @@ impl ThreadActor {
         ) {
             Ok(Some(_)) => {
                 if let Some(fence) = active.surface_operation.as_ref() {
-                    self.pending_surface_stream_redactions
-                        .retain(|_, pending| pending.fence.operation_id != fence.operation_id);
+                    self.generation_context_controller
+                        .clear_operation(&fence.operation_id);
                 }
                 self.goal_controller.clear_active(active.operation_id);
                 let completed = active.completion.complete(OperationTerminal {
@@ -32491,8 +31415,8 @@ impl ThreadActor {
             }
         }
         if let Some(fence) = active.surface_operation.as_ref() {
-            self.pending_surface_stream_redactions
-                .retain(|_, pending| pending.fence.operation_id != fence.operation_id);
+            self.generation_context_controller
+                .clear_operation(&fence.operation_id);
         }
         self.goal_controller.clear_active(active.operation_id);
         let completed = active.completion.complete(OperationTerminal {
@@ -34953,7 +33877,7 @@ impl ThreadActor {
             resident_surface: ResidentSurfaceSlot(resident_surface),
             pending_manual_compaction_completion: None,
             pending_provider_transfer: None,
-            pending_surface_stream_redactions: HashMap::new(),
+            generation_context_controller: GenerationContextController::new(),
             live_input_capsules: HashMap::new(),
             ephemeral_reservation_expiry: None,
             ephemeral_reservation_timeout,
@@ -36191,7 +35115,8 @@ impl ThreadActor {
                         "runtime thread is shutting down",
                     )));
                 }
-                ThreadCommand::SurfaceCommitProviderFailure { reply, .. } => {
+                ThreadCommand::SurfaceCommitProviderFailure { reply, .. }
+                | ThreadCommand::SurfaceCommitProviderAttemptFailure { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "runtime thread is shutting down",
@@ -36680,7 +35605,8 @@ impl ThreadActor {
                     "runtime generation is not active",
                 )));
             }
-            ThreadCommand::SurfaceCommitProviderFailure { reply, .. } => {
+            ThreadCommand::SurfaceCommitProviderFailure { reply, .. }
+            | ThreadCommand::SurfaceCommitProviderAttemptFailure { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "runtime generation is not active",
@@ -37601,6 +36527,16 @@ impl ThreadActor {
             } => {
                 let result =
                     self.commit_surface_provider_failure(active, fence, &identity, &message);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCommitProviderAttemptFailure {
+                fence,
+                identity,
+                message,
+                reply,
+            } => {
+                let result = self
+                    .commit_surface_provider_attempt_failure(active, fence, &identity, &message);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderStep {
@@ -39474,8 +38410,8 @@ impl ThreadActor {
         if !matches!(outcome, OperationOutcome::Backgrounded { .. })
             && let Some(fence) = active.surface_operation.as_ref()
         {
-            self.pending_surface_stream_redactions
-                .retain(|_, pending| pending.fence.operation_id != fence.operation_id);
+            self.generation_context_controller
+                .clear_operation(&fence.operation_id);
         }
         self.goal_controller.clear_active(active.operation_id);
         let completed = active.completion.complete(OperationTerminal {
@@ -40409,20 +39345,16 @@ impl ThreadActor {
             surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
         let operation_id = typed.fence.operation_fence.operation_id.clone();
-        if let Some(response) = outcome.response.as_ref() {
-            for item in response.completed().completed_items() {
-                self.pending_surface_stream_redactions.remove(item.id());
-            }
-        }
         let mut completion_events = outcome
             .response
             .as_ref()
             .map(|response| {
-                Self::background_provider_response_events(
-                    self.resident_surface.coordinator.state().snapshot(),
-                    &typed.fence,
-                    response,
-                )
+                self.generation_context_controller
+                    .background_provider_response_events(
+                        self.resident_surface.coordinator.state().snapshot(),
+                        &typed.fence,
+                        response,
+                    )
             })
             .transpose()
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
@@ -42257,7 +41189,7 @@ fn provider_response_requires_approval(response: &ProviderResponse) -> bool {
 
 fn provider_response_error(response: &ProviderResponse) -> Option<String> {
     response.steps.iter().find_map(|step| match step {
-        ProviderStep::Error(error) => Some(error.clone()),
+        ProviderStep::Error(error) => Some(error.message.clone()),
         _ => None,
     })
 }
@@ -42269,25 +41201,6 @@ fn provider_response_usage_totals(
     let usage = response.usage.filter(|usage| !usage.is_empty())?;
     let mut tracker = crate::cost::CostTracker::new(model);
     Some(tracker.add_usage(usage))
-}
-
-fn next_provider_context_snapshot(
-    current: &surface::SurfaceContextSnapshot,
-    usage: orca_core::provider_types::Usage,
-) -> Option<surface::SurfaceContextSnapshot> {
-    if usage.is_empty() || current.limit_tokens == 0 {
-        return None;
-    }
-    let used_tokens = usage.input_tokens.min(current.limit_tokens);
-    if current.used_tokens == used_tokens {
-        return None;
-    }
-    let revision =
-        surface::ContextRevision::try_new(current.revision.get().checked_add(1)?).ok()?;
-    let mut next = current.clone();
-    next.revision = revision;
-    next.used_tokens = used_tokens;
-    Some(next)
 }
 
 fn surface_budget_from_core_terminal(
@@ -42622,7 +41535,7 @@ mod tests {
             provider_replay: surface::ProviderReplayHealth::None,
         };
 
-        let next = next_provider_context_snapshot(
+        let next = crate::runtime_actor::generation_context::next_provider_context_snapshot(
             &current,
             orca_core::provider_types::Usage {
                 input_tokens: 151_063,
@@ -43451,7 +42364,9 @@ mod tests {
     #[test]
     fn surface_stream_redaction_is_chunk_boundary_safe() {
         assert_eq!(
-            stable_surface_stream_prefix_len("restart-partial"),
+            crate::runtime_actor::generation_context::stable_surface_stream_prefix_len(
+                "restart-partial",
+            ),
             "restart-partial".len(),
             "ordinary partial streams remain durable before completion"
         );
@@ -43486,7 +42401,10 @@ mod tests {
             let mut projected = String::new();
             for chunk in chunks {
                 tail.push_str(chunk);
-                let stable_len = stable_surface_stream_prefix_len(&tail);
+                let stable_len =
+                    crate::runtime_actor::generation_context::stable_surface_stream_prefix_len(
+                        &tail,
+                    );
                 if stable_len > 0 {
                     let stable = tail.drain(..stable_len).collect::<String>();
                     projected.push_str(&crate::thread_store::redact_sensitive_text(&stable));

@@ -233,7 +233,10 @@ pub fn handle_child_agent_provider_error(
         return Ok(None);
     };
 
-    match RuntimeCompactionPolicy::decide_for_provider_error(&error, &setup.compaction_retry) {
+    match RuntimeCompactionPolicy::decide_for_provider_error(
+        &error.message,
+        &setup.compaction_retry,
+    ) {
         RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
             let mut events = EventFactory::new("child-agent-compaction".to_string());
             let mut sink = EventSink::new(io::sink(), config.output_format);
@@ -256,7 +259,7 @@ pub fn handle_child_agent_provider_error(
             ChildAgentProviderErrorDecision::Fail(ChildAgentResult {
                 status: RunStatus::Failed,
                 final_message: None,
-                error: Some(error),
+                error: Some(error.message),
                 budget_usage: None,
             }),
         )),

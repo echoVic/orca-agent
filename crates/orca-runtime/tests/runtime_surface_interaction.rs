@@ -1015,6 +1015,66 @@ fn provider_recovery_discards_superseded_stream_before_completing_response() {
 }
 
 #[test]
+fn transient_provider_attempt_is_discarded_and_retried_with_new_response_identity() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "retry transient provider attempt",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let prompt = format!("mock_stream_flaky_once {}", uuid::Uuid::new_v4());
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, &prompt),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    assert!(snapshot.assistant_streams.iter().any(|stream| {
+        stream.channel == AssistantChannel::Reasoning
+            && stream.text.as_str() == "Mock transient attempt emitted partial reasoning."
+            && stream.state == SurfaceAssistantStreamState::Discarded
+    }));
+    assert!(snapshot.assistant_streams.iter().any(|stream| {
+        stream.channel == AssistantChannel::Message
+            && stream
+                .text
+                .as_str()
+                .contains("Mock runtime completed after stream recovery")
+            && stream.state == SurfaceAssistantStreamState::Completed
+    }));
+    assert!(!snapshot.items.iter().any(|item| matches!(
+        item,
+        SurfaceItem::AssistantReasoning { summary, content, .. }
+            if summary.as_str().contains("transient attempt")
+                || content.as_str().contains("transient attempt")
+    )));
+    host.shutdown().unwrap();
+}
+
+#[test]
 fn failed_generation_discards_open_assistant_stream_before_terminal() {
     let cwd = tempfile::tempdir().unwrap();
     let host = RuntimeHost::start_with_executor(Arc::new(AbandonedAssistantStreamExecutor))

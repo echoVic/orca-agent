@@ -17,7 +17,9 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, ReasoningEffort};
 use orca_core::conversation::{Conversation, Message, RawToolCall};
 use orca_core::external_config::ExternalToolConfig;
-use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
+use orca_core::provider_types::{
+    ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
+};
 use orca_core::tool_types::{ToolName, ToolRequest};
 use orca_mcp::McpRegistry;
 
@@ -292,6 +294,39 @@ pub async fn call_streaming_async(
                 }
                 return response;
             }
+            if let Some(key) = conversation
+                .last_user_message()
+                .and_then(|prompt| prompt.trim().strip_prefix("mock_stream_flaky_once "))
+            {
+                if mock_flaky_once_should_fail(key) {
+                    let partial = ProviderStep::ReasoningDelta(
+                        "Mock transient attempt emitted partial reasoning.".to_string(),
+                    );
+                    let error = ProviderStep::Error(ProviderError::new(
+                        ProviderErrorKind::Transport,
+                        format!("mock stream transport failure requested for {key}"),
+                    ));
+                    on_step(&partial);
+                    on_step(&error);
+                    return ProviderResponse {
+                        steps: vec![partial, error],
+                        assistant_content: None,
+                        assistant_reasoning: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    };
+                }
+                let message = format!("Mock runtime completed after stream recovery for {key}.");
+                let completed = ProviderStep::MessageDelta(message.clone());
+                on_step(&completed);
+                return ProviderResponse {
+                    steps: vec![completed],
+                    assistant_content: Some(message),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                };
+            }
             if let Some((delay_ms, tool_prompt)) = mock_stream_tool_delay_ms(conversation) {
                 let started =
                     ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
@@ -439,8 +474,9 @@ async fn sleep_with_cancel(delay: Duration, cancel: &CancelToken) -> bool {
 
 fn provider_worker_error(message: String) -> ProviderResponse {
     ProviderResponse {
-        steps: vec![ProviderStep::Error(format!(
-            "provider worker error: {message}"
+        steps: vec![ProviderStep::Error(ProviderError::new(
+            ProviderErrorKind::Transport,
+            format!("provider worker error: {message}"),
         ))],
         assistant_content: None,
         assistant_reasoning: None,
@@ -676,9 +712,9 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
 
     if prompt.trim() == "mock_provider_error" {
         return ProviderResponse {
-            steps: vec![ProviderStep::Error(
-                "mock provider error: api_key=super-secret".to_string(),
-            )],
+            steps: vec![ProviderStep::Error(ProviderError::other(
+                "mock provider error: api_key=super-secret",
+            ))],
             assistant_content: None,
             assistant_reasoning: None,
             tool_calls: Vec::new(),
@@ -855,9 +891,9 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
 
     if prompt == "mcp__broken__tool" && has_tool_results {
         return ProviderResponse {
-            steps: vec![ProviderStep::Error(
-                "mcp__broken__tool failed in mock provider".to_string(),
-            )],
+            steps: vec![ProviderStep::Error(ProviderError::other(
+                "mcp__broken__tool failed in mock provider",
+            ))],
             assistant_content: None,
             assistant_reasoning: None,
             tool_calls: Vec::new(),
@@ -949,9 +985,9 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
 
     if prompt.trim() == "mock_fail" {
         return ProviderResponse {
-            steps: vec![ProviderStep::Error(
-                "mock child failure requested".to_string(),
-            )],
+            steps: vec![ProviderStep::Error(ProviderError::other(
+                "mock child failure requested",
+            ))],
             assistant_content: None,
             assistant_reasoning: None,
             tool_calls: Vec::new(),
@@ -960,17 +996,11 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
     }
 
     if let Some(key) = prompt.trim().strip_prefix("mock_flaky_once ") {
-        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-            std::sync::OnceLock::new();
-        let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-        let should_fail = seen
-            .lock()
-            .map(|mut keys| keys.insert(key.to_string()))
-            .unwrap_or(false);
-        if should_fail {
+        if mock_flaky_once_should_fail(key) {
             return ProviderResponse {
-                steps: vec![ProviderStep::Error(format!(
-                    "mock transient failure requested for {key}"
+                steps: vec![ProviderStep::Error(ProviderError::new(
+                    ProviderErrorKind::Transport,
+                    format!("mock transient failure requested for {key}"),
                 ))],
                 assistant_content: None,
                 assistant_reasoning: None,
@@ -1256,6 +1286,15 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             usage: None,
         }
     }
+}
+
+fn mock_flaky_once_should_fail(key: &str) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .map(|mut keys| keys.insert(key.to_string()))
+        .unwrap_or(false)
 }
 
 fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {

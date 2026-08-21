@@ -263,7 +263,7 @@ impl GoalVerifier for DeepSeekGoalVerifier {
             ProviderStep::Error(error) => Some(error.clone()),
             _ => None,
         }) {
-            return Err(GoalVerifierError::Indeterminate(error));
+            return Err(GoalVerifierError::Indeterminate(error.message));
         }
         let content = response
             .assistant_content

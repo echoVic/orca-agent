@@ -1101,10 +1101,16 @@ impl TuiSurfaceProjection {
                 }
                 SurfaceEvent::Assistant(AssistantPatch::StreamDiscarded { stream_id, .. }) => {
                     if let Some(stream) = assistant_streams.get_mut(stream_id) {
+                        if stream.state == SurfaceAssistantStreamState::Open {
+                            projected.push(TuiEvent::AssistantAttemptDiscarded);
+                        }
                         stream.state = SurfaceAssistantStreamState::Discarded;
                     }
                 }
                 SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) => {
+                    let discarded_attempt = projected
+                        .iter()
+                        .any(|event| matches!(event, TuiEvent::AssistantAttemptDiscarded));
                     let response_matches_streams =
                         response_matches_streamed_items(response, assistant_streams.values());
                     for stream in assistant_streams.values_mut().filter(|stream| {
@@ -1113,7 +1119,7 @@ impl TuiSurfaceProjection {
                     }) {
                         stream.state = SurfaceAssistantStreamState::Completed;
                     }
-                    if !response_matches_streams {
+                    if discarded_attempt || !response_matches_streams {
                         projected.push(response_completed_event(response));
                     }
                 }

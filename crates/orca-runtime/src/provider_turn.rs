@@ -10,7 +10,9 @@ use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::provider_types::{
+    ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
+};
 #[cfg(test)]
 use orca_core::subagent_types::SubagentType;
 use orca_core::thread_item_projection::ModelResponseIdentity;
@@ -36,6 +38,7 @@ use crate::lifecycle::{
 use crate::memory::MemoryBlock;
 use crate::model_response::RuntimeModelResponse;
 use crate::operation_context::OperationContext;
+use crate::provider_retry::{ProviderRetryDecision, ProviderRetryPolicy, wait_for_provider_retry};
 use crate::provider_stream::RuntimeProviderSuspension;
 use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_directive::conversation_with_runtime_system_messages;
@@ -382,58 +385,75 @@ impl RuntimeProviderTurnStep {
             writer
                 .append_prompt_cache_checkpoint(input.turn_context.turn_id.clone(), checkpoint)?;
         }
-        let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
-        let mut stream = orca_provider::start_streaming(
-            input.provider,
-            &model_conversation,
-            input.provider_config,
-            input.cancel.clone(),
-        );
-        let response = loop {
-            match stream.recv_timeout(Duration::from_millis(10)) {
-                Ok(ProviderStreamEvent::Step(delivery)) => {
-                    emit_provider_delta(
-                        delivery.step(),
-                        &response_identity,
-                        input.turn_context.provider_response_ingress(),
-                        emit_deltas,
-                        events,
-                        sink,
-                    )?;
+        let retry_policy = ProviderRetryPolicy::default();
+        let mut completed_attempts = 0_u32;
+        let mut failed_attempt_usage = None;
+        let (mut response, response_identity) = loop {
+            completed_attempts = completed_attempts.saturating_add(1);
+            let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
+            let mut stream = orca_provider::start_streaming(
+                input.provider,
+                &model_conversation,
+                input.provider_config,
+                input.cancel.clone(),
+            );
+            let response = loop {
+                match stream.recv_timeout(Duration::from_millis(10)) {
+                    Ok(ProviderStreamEvent::Step(delivery)) => {
+                        emit_provider_delta(
+                            delivery.step(),
+                            &response_identity,
+                            input.turn_context.provider_response_ingress(),
+                            emit_deltas,
+                            events,
+                            sink,
+                        )?;
+                    }
+                    Ok(ProviderStreamEvent::Completed(response)) => break response,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        break provider_stream_disconnected_response();
+                    }
                 }
-                Ok(ProviderStreamEvent::Completed(response)) => break response,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
-                        status: RunStatus::Failed,
-                        reason: TurnEndReason::Unclassified,
-                        message: "provider stream disconnected before completion".to_string(),
-                        max_cost_usd_micros: 0,
-                        terminal: None,
-                    }));
+                if input
+                    .turn_context
+                    .provider_suspension_control
+                    .is_some_and(|control| control.take_suspension_request())
+                {
+                    return Ok(RuntimeProviderTurnOutput::Suspended(
+                        RuntimeProviderSuspension::new(
+                            stream,
+                            input.provider_config.model.clone(),
+                            response_identity,
+                        )
+                        .with_operation(
+                            crate::provider_stream::SuspendedOperationHandle {
+                                journal_path: input.operation.journal.path().to_path_buf(),
+                                operation_id: input.operation.journal.operation_id().to_string(),
+                                budget_spec: *input.operation.controller.spec(),
+                            },
+                        ),
+                    ));
                 }
+            };
+
+            let Some(error) = response.error() else {
+                break (response, response_identity);
+            };
+            let ProviderRetryDecision::RetryAfter(delay) =
+                retry_policy.decide(error, completed_attempts)
+            else {
+                break (response, response_identity);
+            };
+            if let Some(ingress) = input.turn_context.provider_response_ingress() {
+                ingress.commit_provider_attempt_failure(&response_identity, &error.message)?;
             }
-            if input
-                .turn_context
-                .provider_suspension_control
-                .is_some_and(|control| control.take_suspension_request())
-            {
-                return Ok(RuntimeProviderTurnOutput::Suspended(
-                    RuntimeProviderSuspension::new(
-                        stream,
-                        input.provider_config.model.clone(),
-                        response_identity,
-                    )
-                    .with_operation(
-                        crate::provider_stream::SuspendedOperationHandle {
-                            journal_path: input.operation.journal.path().to_path_buf(),
-                            operation_id: input.operation.journal.operation_id().to_string(),
-                            budget_spec: *input.operation.controller.spec(),
-                        },
-                    ),
-                ));
+            merge_provider_usage(&mut failed_attempt_usage, response.usage);
+            if !wait_for_provider_retry(delay, input.cancel) {
+                return cancelled_provider_turn(emit_deltas, events, sink);
             }
         };
+        merge_provider_usage(&mut response.usage, failed_attempt_usage);
 
         let mut usage_error = None;
         let mut budget_stop = None;
@@ -561,14 +581,14 @@ impl RuntimeProviderTurnStep {
             return Ok(RuntimeProviderErrorOutcome::NoError);
         };
 
-        match RuntimeCompactionPolicy::decide_for_provider_error(&error, compaction_retry) {
+        match RuntimeCompactionPolicy::decide_for_provider_error(&error.message, compaction_retry) {
             RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
                 compaction.compact_after_provider_error_retry(conversation, trigger)?;
                 Ok(RuntimeProviderErrorOutcome::ContinueAfterCompaction)
             }
             RuntimeCompactionRetryDecision::SurfaceError => {
-                compaction.emit_error(&error)?;
-                Ok(RuntimeProviderErrorOutcome::Failed(error))
+                compaction.emit_error(&error.message)?;
+                Ok(RuntimeProviderErrorOutcome::Failed(error.message))
             }
         }
     }
@@ -895,6 +915,29 @@ fn cancelled_provider_turn<W: io::Write>(
     }))
 }
 
+fn provider_stream_disconnected_response() -> ProviderResponse {
+    ProviderResponse {
+        steps: vec![ProviderStep::Error(ProviderError::new(
+            ProviderErrorKind::Transport,
+            "provider stream disconnected before completion",
+        ))],
+        assistant_content: None,
+        assistant_reasoning: None,
+        tool_calls: Vec::new(),
+        usage: None,
+    }
+}
+
+fn merge_provider_usage(total: &mut Option<Usage>, usage: Option<Usage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let total = total.get_or_insert_with(Usage::default);
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.cache_tokens = total.cache_tokens.saturating_add(usage.cache_tokens);
+}
+
 fn emit_provider_delta<W: io::Write>(
     step: &ProviderStep,
     identity: &ModelResponseIdentity,
@@ -1039,7 +1082,7 @@ mod tests {
     fn provider_turn_error_handler_emits_failure_event_for_non_compaction_errors() {
         let response = ProviderResponse {
             steps: vec![ProviderStep::Error(
-                "DeepSeek provider error: quota".to_string(),
+                orca_core::provider_types::ProviderError::other("DeepSeek provider error: quota"),
             )],
             assistant_content: None,
             assistant_reasoning: None,
@@ -1389,7 +1432,7 @@ mod tests {
     fn provider_error_step_returns_failure_and_resets_reactive_state() {
         let response = ProviderResponse {
             steps: vec![ProviderStep::Error(
-                "DeepSeek provider error: quota".to_string(),
+                orca_core::provider_types::ProviderError::other("DeepSeek provider error: quota"),
             )],
             assistant_content: None,
             assistant_reasoning: None,
