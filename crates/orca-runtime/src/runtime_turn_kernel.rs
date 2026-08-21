@@ -49,6 +49,17 @@ impl<'a> RuntimeTurnKernel<'a> {
             .set_preapproved_tool_call_id(id);
     }
 
+    pub(crate) fn set_unsandboxed_shell(&mut self, enabled: bool) {
+        if enabled {
+            self.sampling_state
+                .permission_overlay_mut()
+                .merge_permissions(&crate::protocol::RequestPermissionProfile {
+                    shell: Some(crate::protocol::RequestShellPermissions { unsandboxed: true }),
+                    ..Default::default()
+                });
+        }
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn bind_step_context(

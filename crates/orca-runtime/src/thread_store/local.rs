@@ -1019,6 +1019,10 @@ impl ThreadStore for JsonlThreadStore {
                     meta.network_domain_permissions = network_domain_permissions;
                     patched = true;
                 }
+                if let Some(unsandboxed_shell) = patch.unsandboxed_shell {
+                    meta.unsandboxed_shell = unsandboxed_shell;
+                    patched = true;
+                }
                 break;
             }
         }
@@ -1070,6 +1074,7 @@ impl ThreadStore for JsonlThreadStore {
             additional_working_directories: meta.additional_working_directories,
             metadata_writable_directories: meta.metadata_writable_directories,
             network_domain_permissions: meta.network_domain_permissions,
+            unsandboxed_shell: meta.unsandboxed_shell,
             message_count: stored_messages.len(),
             messages: projected_messages,
             turns,

@@ -804,6 +804,7 @@ impl RuntimeTurnProviderCycleStep {
             input.conversation.parts_mut_with_checkpoint_observer();
         let mut kernel = RuntimeTurnKernel::from_extension_stores(input.extensions.stores());
         kernel.set_preapproved_tool_call_id(preapproved_tool_call_id);
+        kernel.set_unsandboxed_shell(input.turn_context.unsandboxed_shell());
         let step_context =
             RuntimeStepContext::from_snapshot(RuntimeStepSnapshot::new_with_capabilities(
                 input.config,

@@ -105,6 +105,7 @@ fn run_permission_respond<W: Write>(
                 additional_working_directories: Some(session_grants.additional_working_directories),
                 metadata_writable_directories: Some(session_grants.metadata_writable_directories),
                 network_domain_permissions: Some(session_grants.network_domain_permissions),
+                unsandboxed_shell: Some(session_grants.unsandboxed_shell),
             },
         );
     }
