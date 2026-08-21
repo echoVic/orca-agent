@@ -18343,6 +18343,15 @@ impl ThreadActor {
                 .all(|matched| matched)
             && tools_match
         {
+            if let Some(usage) = response.response.usage
+                && let Some(context) = next_provider_context_snapshot(&snapshot.context, usage)
+            {
+                let batch = self.surface_event_batch_with_commit_id(
+                    vec![(scope, surface::SurfaceEvent::Context(context))],
+                    None,
+                );
+                return self.commit_surface_generation_batch_with_retry(fence, &batch);
+            }
             return Ok(());
         }
         let mut events = Vec::new();
@@ -18399,6 +18408,11 @@ impl ThreadActor {
                 surface::SurfaceEvent::Tool(surface::ToolPatch::Requested { request }),
             )
         }));
+        if let Some(usage) = response.response.usage {
+            if let Some(context) = next_provider_context_snapshot(&snapshot.context, usage) {
+                events.push((scope, surface::SurfaceEvent::Context(context)));
+            }
+        }
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.commit_surface_generation_batch_with_retry(fence, &batch)
     }
@@ -18489,6 +18503,17 @@ impl ThreadActor {
                     .any(|item| item == id)
             })
         }) {
+            if let Some(usage) = response.response.usage
+                && snapshot.context.used_tokens != usage.input_tokens
+                && let Some(context) = next_provider_context_snapshot(&snapshot.context, usage)
+            {
+                return Ok(vec![(
+                    surface::SurfaceScope::Background {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Context(context),
+                )]);
+            }
             return Ok(Vec::new());
         }
         let mut requests_by_id = HashMap::new();
@@ -18615,6 +18640,11 @@ impl ThreadActor {
                 surface::SurfaceEvent::Tool(surface::ToolPatch::Requested { request }),
             )
         }));
+        if let Some(usage) = response.response.usage {
+            if let Some(context) = next_provider_context_snapshot(&snapshot.context, usage) {
+                events.push((scope, surface::SurfaceEvent::Context(context)));
+            }
+        }
         Ok(events)
     }
 
@@ -42208,6 +42238,25 @@ fn provider_response_usage_totals(
     Some(tracker.add_usage(usage))
 }
 
+fn next_provider_context_snapshot(
+    current: &surface::SurfaceContextSnapshot,
+    usage: orca_core::provider_types::Usage,
+) -> Option<surface::SurfaceContextSnapshot> {
+    if usage.is_empty() || current.limit_tokens == 0 {
+        return None;
+    }
+    let used_tokens = usage.input_tokens.min(current.limit_tokens);
+    if current.used_tokens == used_tokens {
+        return None;
+    }
+    let revision =
+        surface::ContextRevision::try_new(current.revision.get().checked_add(1)?).ok()?;
+    let mut next = current.clone();
+    next.revision = revision;
+    next.used_tokens = used_tokens;
+    Some(next)
+}
+
 fn surface_budget_from_core_terminal(
     terminal: &orca_core::budget::OperationTerminal,
 ) -> Option<surface::OperationBudget> {
@@ -42528,6 +42577,33 @@ mod tests {
     const RESERVATION_TERMINAL_FAILURE_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn provider_usage_updates_context_snapshot_with_current_prompt_tokens() {
+        let current = surface::SurfaceContextSnapshot {
+            revision: surface::ContextRevision::try_new(7).unwrap(),
+            used_tokens: 42,
+            limit_tokens: 1_000_000,
+            compaction: surface::CompactionState::Idle,
+            fragments: Vec::new(),
+            provider_replay: surface::ProviderReplayHealth::None,
+        };
+
+        let next = next_provider_context_snapshot(
+            &current,
+            orca_core::provider_types::Usage {
+                input_tokens: 151_063,
+                output_tokens: 12_345,
+                cache_tokens: 140_000,
+            },
+        )
+        .expect("non-empty provider usage should update context");
+
+        assert_eq!(next.revision.get(), 8);
+        assert_eq!(next.used_tokens, 151_063);
+        assert_eq!(next.limit_tokens, 1_000_000);
+        assert_eq!(next.compaction, surface::CompactionState::Idle);
+    }
 
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
@@ -43574,7 +43650,11 @@ mod tests {
                     assistant_content: Some("checkpoint retry succeeded".to_string()),
                     assistant_reasoning: None,
                     tool_calls: Vec::new(),
-                    usage: None,
+                    usage: Some(orca_core::provider_types::Usage {
+                        input_tokens: 151_063,
+                        output_tokens: 12_345,
+                        cache_tokens: 140_000,
+                    }),
                 },
                 request.turn_id().clone(),
             ))?;
@@ -50470,6 +50550,9 @@ mod tests {
             surface::WaitOperationTerminalResult::Terminal { value }
                 if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
         ));
+        let snapshot = fresh_surface_attachment(&surface).baseline.snapshot;
+        assert_eq!(snapshot.context.used_tokens, 151_063);
+        assert_eq!(snapshot.context.limit_tokens, 1_000_000);
         host.shutdown()
             .expect("shutdown semantic retry runtime host");
     }
