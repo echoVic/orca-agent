@@ -117,9 +117,15 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.3.25 adds checkpointable child-agent continuation,
+Current baseline: v0.3.26 makes the unsandboxed shell permission an
+explicit, reusable, session-scoped capability: the turn permission overlay
+carries it with merge, delta, and apply semantics, bash consumes it before
+prompting, grants are recorded only on allow, and session-scope allow
+responses persist it into thread settings and JSONL metadata so recorded
+sessions restore it into every new turn without re-asking. It builds on
+v0.3.25's checkpointable child-agent continuation,
 runtime-owned durable prompt queues, and Codex-style Goal paste
-materialization. It builds on v0.3.24's durable four-interaction broker and
+materialization. v0.3.25 builds on v0.3.24's durable four-interaction broker and
 v0.3.23's thread-owned interactive `exec_command` and
 `write_stdin` sessions with optional PTY, raw control input, bounded output,
 task-based process-tree control, and a single-owner background supervisor that
