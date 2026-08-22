@@ -54,16 +54,52 @@ pub(crate) struct ResidentPrivateInteractionResponse {
     pub(crate) retry_at: Option<tokio::time::Instant>,
 }
 
-#[derive(Default)]
-pub(crate) struct ResidentInteractionController {
+pub(crate) struct InteractionController<
+    ToolRecoveryOwner = (),
+    PermissionRecoveryOwner = (),
+    ContinuationRecoveryOwner = (),
+    Detach = (),
+    CapabilityLoss = (),
+> {
     interactions: HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+    pub(crate) cold_recovery_owners: HashMap<surface::SurfaceInteractionId, ToolRecoveryOwner>,
+    pub(crate) cold_recovery_permission_owners:
+        HashMap<surface::SurfaceInteractionId, PermissionRecoveryOwner>,
+    pub(crate) continuation_turn_owners:
+        HashMap<surface::SurfaceInteractionId, ContinuationRecoveryOwner>,
+    pub(crate) operation_origin_attachments:
+        HashMap<surface::SurfaceOperationId, surface::SurfaceAttachmentId>,
+    pub(crate) pending_detaches: HashMap<surface::SurfaceAttachmentId, Detach>,
+    pub(crate) pending_capability_losses: HashMap<surface::SurfaceAttachmentId, CapabilityLoss>,
 }
 
-impl ResidentInteractionController {
+impl<ToolRecoveryOwner, PermissionRecoveryOwner, ContinuationRecoveryOwner, Detach, CapabilityLoss>
+    InteractionController<
+        ToolRecoveryOwner,
+        PermissionRecoveryOwner,
+        ContinuationRecoveryOwner,
+        Detach,
+        CapabilityLoss,
+    >
+{
     pub(crate) fn new(
         interactions: HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+        cold_recovery_owners: HashMap<surface::SurfaceInteractionId, ToolRecoveryOwner>,
+        cold_recovery_permission_owners: HashMap<
+            surface::SurfaceInteractionId,
+            PermissionRecoveryOwner,
+        >,
+        continuation_turn_owners: HashMap<surface::SurfaceInteractionId, ContinuationRecoveryOwner>,
     ) -> Self {
-        Self { interactions }
+        Self {
+            interactions,
+            cold_recovery_owners,
+            cold_recovery_permission_owners,
+            continuation_turn_owners,
+            operation_origin_attachments: HashMap::new(),
+            pending_detaches: HashMap::new(),
+            pending_capability_losses: HashMap::new(),
+        }
     }
 
     pub(crate) fn insert(
@@ -118,6 +154,20 @@ impl ResidentInteractionController {
         self.interactions.is_empty()
     }
 }
+
+pub(crate) type ResidentInteractionController<
+    ToolRecoveryOwner = (),
+    PermissionRecoveryOwner = (),
+    ContinuationRecoveryOwner = (),
+    Detach = (),
+    CapabilityLoss = (),
+> = InteractionController<
+    ToolRecoveryOwner,
+    PermissionRecoveryOwner,
+    ContinuationRecoveryOwner,
+    Detach,
+    CapabilityLoss,
+>;
 
 pub(crate) fn prepare_interaction_request(
     fence: surface::SurfaceOperationFence,

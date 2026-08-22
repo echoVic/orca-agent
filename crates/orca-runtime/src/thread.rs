@@ -930,6 +930,7 @@ mod tests {
             .messages
             .push(orca_core::conversation::Message::User {
                 content: "before".to_string(),
+                images: Vec::new(),
                 pinned: false,
             });
         let baseline = TurnProgressBaseline::capture(&conversation);

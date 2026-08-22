@@ -239,6 +239,7 @@
       "QueuePrompt",
       "PromptQueueControl",
       "SubmitQueued",
+      "PasteImages",
       "ImplementApprovedPlan",
       "SubmitWorkflowNotification",
       "RunWorkflow",
@@ -4196,7 +4197,7 @@
         "crates/orca-tui/src/idle_submit_actions.rs:70"
       ],
       "runtime_mutation",
-      "UserAction::SubmitWithMentions{prompt,bindings}",
+      "UserAction::SubmitWithMentions{prompt,bindings,images}",
       "ReserveOperation(closed SurfaceInputBinding)+AdmitReserved",
       "ReserveOperation(typed SurfaceInputBinding)+AdmitReserved",
       [
@@ -4220,7 +4221,7 @@
         "crates/orca-tui/src/action_dispatcher.rs:205"
       ],
       "runtime_mutation",
-      "UserAction::QueuePrompt{prompt,bindings}",
+      "UserAction::QueuePrompt{prompt,bindings,images}",
       "PromptQueue(Add)",
       "RuntimeThreadActor::PromptQueue(Add)",
       [
@@ -4264,7 +4265,7 @@
         "crates/orca-tui/src/app.rs:7389"
       ],
       "runtime_mutation",
-      "UserAction::SubmitQueued{id,prompt,bindings}",
+      "UserAction::SubmitQueued{id,prompt,bindings,images}",
       "ReserveOperation(typed SurfaceInputBinding)+AdmitReserved",
       "ReserveOperation(typed SurfaceInputBinding)+AdmitReserved",
       [
@@ -4279,6 +4280,25 @@
       "MutationReply<AdmissionOutput>+OperationWaiter",
       "queued lifecycle consumes typed admission and terminal by id",
       "remove_tui_queued_admission_mirror"
+    ],
+    [
+      "PasteImages",
+      "current",
+      [
+        "crates/orca-tui/src/types.rs:501",
+        "crates/orca-tui/src/composer_image_actions.rs:24",
+        "crates/orca-tui/src/action_dispatcher.rs:205",
+        "crates/orca-tui/src/renderer_runtime.rs:54"
+      ],
+      "presentation_side_effect",
+      "UserAction::PasteImages{request_id,request}",
+      "bounded background clipboard image reader",
+      "TuiEvent::ClipboardImagePasteCompleted{request_id,result}",
+      [],
+      [],
+      "TuiEvent::ClipboardImagePasteCompleted",
+      "TUI fences stale completions and materializes atomic composer attachments",
+      "retain"
     ],
     [
       "ImplementApprovedPlan",
@@ -7447,7 +7467,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 38 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 39 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",
@@ -10072,7 +10092,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "4fabe7db5467c2e469a7768c89d13ab5f54d6a37fa07af4d52b285bf22e83530",
+    "private_contract_sha256": "183a03dd09a05fc6423cfef7aeb89956015503875a07f1188c823d918738bda5",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",
@@ -12892,6 +12912,7 @@
       "CapabilityRevision",
       "CommitClass",
       "ContextRevision",
+      "ContextWindowId",
       "CursorSourceRevision",
       "Denied",
       "DisplayText",
@@ -13119,6 +13140,8 @@
       "SurfaceAgentLoopTurn",
       "SurfaceApprovalMode",
       "SurfaceGoalGenerationIdentity",
+      "SurfaceImageDetail",
+      "SurfaceImageSource",
       "SurfaceInput",
       "SurfaceInputBinding",
       "SurfaceInputBindingKind",

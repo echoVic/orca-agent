@@ -3,26 +3,29 @@ import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
 # Models
 
 
-Orca supports DeepSeek's V4 model family with two variants optimized for different use cases. This page covers model selection, reasoning effort levels, and cost/speed tradeoffs.
+Orca supports DeepSeek's V4 text models and the experimental V4 Flash Vision model. This page covers model selection, multimodal input, reasoning effort levels, and cost tradeoffs.
 
 ## Available Models
 
 ### Model Comparison Table
 
-| Property | deepseek-v4-flash | deepseek-v4-pro |
-|----------|-------------------|-----------------|
-| **Primary use case** | Quick edits, search, simple refactors | Architecture, complex debugging, multi-file changes |
-| **Context window** | 1M tokens | 1M tokens |
-| **Max output tokens** | 8K | 8K |
-| **Reasoning** | Enabled (lighter) | Enabled (deeper) |
-| **Tool use** | Yes (all tools) | Yes (all tools) |
-| **Input cost** | ~$0.001 / 1K tokens | ~$0.004 / 1K tokens |
-| **Output cost** | ~$0.002 / 1K tokens | ~$0.010 / 1K tokens |
-| **Speed** | ~30 tok/s (reasoning) | ~15 tok/s (reasoning) |
-| **First token** | ~2s | ~4s |
-| **MMLU (benchmark)** | 78.2% | 85.7% |
-| **HumanEval (coding)** | 82.1% | 89.3% |
-| **SWE-Bench (agent)** | 52.4% | 64.8% |
+| Property | deepseek-v4-flash | deepseek-v4-flash-vision-exp | deepseek-v4-pro |
+|----------|-------------------|--------------------------------|-----------------|
+| **Primary use case** | Quick edits and routine coding | Screenshots, diagrams, charts, and visual-agent tasks | Architecture and complex debugging |
+| **Image input** | Vision analysis | Direct | Vision analysis |
+| **Context window** | 1M tokens | 1M tokens | 1M tokens |
+| **Max output tokens** | 384K | 384K | 384K |
+| **Reasoning** | Yes | Yes | Yes |
+| **Tool use** | Yes | Yes | Yes |
+| **Peak input/output price** | CNY 3 / 9 per 1M tokens | CNY 3 / 9 per 1M tokens | CNY 9 / 27 per 1M tokens |
+
+<Callout type="info">
+
+`deepseek-v4-flash-vision-exp` is an experimental model released on August 21,
+2026. See DeepSeek's official [Vision guide](https://api-docs.deepseek.com/guides/vision)
+and [pricing](https://api-docs.deepseek.com/quick_start/pricing).
+
+</Callout>
 
 ### When to Use Each Model
 
@@ -51,6 +54,49 @@ orca --model deepseek-v4-flash "Fix the import order in all files"
 orca exec "Add error boundaries to React components" --model deepseek-v4-flash
 ```
 
+
+</Tab>
+<Tab label={"deepseek-v4-flash-vision-exp"}>
+
+
+Choose `deepseek-v4-flash-vision-exp` when the task depends on visual input:
+
+- inspect UI screenshots and error dialogs
+- read diagrams, charts, or scanned documents
+- compare rendered output with a visual reference
+- combine image understanding with Orca's normal coding tools
+
+The TUI accepts JPEG, PNG, GIF, or WebP images with every model selection. The
+vision model receives images directly. `auto`, Pro, and Flash first ask the
+vision model for a task-aware analysis, then continue the turn with the selected
+coding model.
+
+- Press `Ctrl+V` for the current system clipboard image. Windows also supports
+  `Alt+V`; `Cmd+V` works when the terminal forwards `Super+V` instead of
+  consuming the shortcut itself.
+- Drag image files into the terminal, or paste local image paths and `file://`
+  URLs.
+- Select an image through the normal `@file` picker.
+
+Attachments appear as atomic `[Image #N]` items in the composer. Backspace or
+Delete removes the complete item, while `Ctrl+U` clears the draft and its
+attachments. Image-only prompts, queued follow-ups, queue editing, and rejected
+submission recovery preserve the image data. Clipboard decoding runs in the
+background; pressing Enter before it completes waits and then submits the image.
+Place the cursor on an image item and press Enter to open its preview. Submitted
+images also render in the message area and can be clicked. In the viewer, use
+`+`/`-` to zoom, the arrow keys to pan, `0` to fit, and Esc to close.
+Kitty and Ghostty render native pixels through the Kitty graphics protocol;
+iTerm2 and WezTerm use the inline-image protocol. Terminals without an image
+protocol, including Apple Terminal, use a low-resolution true-color cell
+fallback.
+On SSH sessions without a graphical clipboard, paste or mention an image path
+on the remote host. WSL reads the Windows clipboard when available.
+
+ACP clients can send standard image content blocks. Orca accepts inline base64
+images and public HTTP(S) image URLs, persists replayable image inputs, and
+defaults to `high` detail. Local inline attachments are limited to 5 MiB so the
+complete request remains inside Orca's durable commit boundary.
 
 </Tab>
 <Tab label={"deepseek-v4-pro"}>
@@ -86,6 +132,9 @@ orca --model deepseek-v4-pro --reasoning-effort high "Refactor the entire data l
 
 ```
 Is the task:
+├── Requires image understanding?
+│   ├── auto / Pro / Flash → vision analysis, then selected model
+│   └── deepseek-v4-flash-vision-exp → direct image input
 ├── Simple / mechanical? (search, edit, format)
 │   └── deepseek-v4-flash
 ├── Moderate complexity? (multi-file change, test writing)
@@ -101,7 +150,7 @@ Is the task:
 
 ## Reasoning Effort Levels
 
-Both V4 models support three reasoning effort levels that control how much thinking the model does before producing output.
+All supported V4 models accept reasoning effort controls.
 
 ### Reasoning Effort Table
 
@@ -207,6 +256,8 @@ The **reasoning effort** resets to the configured default for the new model
 /model deepseek-v4-pro
 # or
 /model deepseek-v4-flash
+# or
+/model deepseek-v4-flash-vision-exp
 ```
 
 > **Note:** When switching models, the prefix cache breaks (different model = different cache key). The first turn after a switch will be slower as the context is processed fresh.

@@ -153,7 +153,9 @@ pub struct ContextPressure {
 pub fn message_tokens_with_counter(msg: &Message, counter: &impl TokenCounter) -> usize {
     match msg {
         Message::System { content, .. } => counter.count_text(content) + 4,
-        Message::User { content, .. } => counter.count_text(content) + 4,
+        Message::User {
+            content, images, ..
+        } => counter.count_text(content) + 4 + images.len() * 384,
         Message::Assistant {
             content,
             reasoning_content: _,
@@ -819,13 +821,25 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                     pinned: *pinned,
                 }
             }
-            Message::User { content, pinned } => {
-                let (rendered, compacted) = render_tool_output(content);
+            Message::User {
+                content,
+                images,
+                pinned,
+            } => {
+                let mut summary_content = content.clone();
+                if !images.is_empty() {
+                    summary_content.push_str(&format!(
+                        "\n[{} image input(s) omitted from compaction summary]",
+                        images.len()
+                    ));
+                }
+                let (rendered, compacted) = render_tool_output(&summary_content);
                 if compacted {
                     compacted_tool_outputs += 1;
                 }
                 Message::User {
                     content: rendered,
+                    images: Vec::new(),
                     pinned: *pinned,
                 }
             }
@@ -1093,9 +1107,17 @@ fn format_messages(messages: &[Message]) -> String {
                 output.push_str(content.trim());
                 output.push_str("\n\n");
             }
-            Message::User { content, .. } => {
+            Message::User {
+                content, images, ..
+            } => {
                 output.push_str("[user]\n");
                 output.push_str(content.trim());
+                if !images.is_empty() {
+                    output.push_str(&format!(
+                        "\n[{} image input(s) omitted from text summary]",
+                        images.len()
+                    ));
+                }
                 output.push_str("\n\n");
             }
             Message::Assistant {

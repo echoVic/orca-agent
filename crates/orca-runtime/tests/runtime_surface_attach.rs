@@ -86,6 +86,7 @@ fn snapshot(next_seq: u64) -> SurfaceSnapshot {
         },
         context: SurfaceContextSnapshot {
             revision: ContextRevision::try_new(1).unwrap(),
+            window_id: orca_runtime::surface::ContextWindowId::new(),
             used_tokens: 0,
             limit_tokens: 128_000,
             compaction: CompactionState::Idle,

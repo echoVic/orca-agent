@@ -20,12 +20,13 @@ use std::{
 use orca_core::budget::BudgetUsage;
 use orca_core::config::DelegationSnapshot;
 use orca_core::conversation::{
-    Conversation, GOAL_CONTEXT_FRAGMENT_ID, GOAL_CONTEXT_MAX_TOKENS, InternalContextFragment,
-    InternalContextKind, InternalContextOrigin, MEMORY_CONTEXT_FRAGMENT_ID,
-    MEMORY_CONTEXT_MAX_TOKENS, MODE_CONTEXT_FRAGMENT_ID, MODE_CONTEXT_MAX_TOKENS, Message,
-    PLAN_CONTEXT_FRAGMENT_ID, PLAN_CONTEXT_MAX_TOKENS, RUNTIME_CONTEXT_FRAGMENT_ID,
-    RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall, SKILL_CONTEXT_FRAGMENT_ID, SKILL_CONTEXT_MAX_TOKENS,
-    SummaryState, normalize_tool_boundaries, repaired_missing_tool_result,
+    Conversation, GOAL_CONTEXT_FRAGMENT_ID, GOAL_CONTEXT_MAX_TOKENS, ImageInput,
+    InternalContextFragment, InternalContextKind, InternalContextOrigin,
+    MEMORY_CONTEXT_FRAGMENT_ID, MEMORY_CONTEXT_MAX_TOKENS, MODE_CONTEXT_FRAGMENT_ID,
+    MODE_CONTEXT_MAX_TOKENS, Message, PLAN_CONTEXT_FRAGMENT_ID, PLAN_CONTEXT_MAX_TOKENS,
+    RUNTIME_CONTEXT_FRAGMENT_ID, RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall,
+    SKILL_CONTEXT_FRAGMENT_ID, SKILL_CONTEXT_MAX_TOKENS, SummaryState, normalize_tool_boundaries,
+    repaired_missing_tool_result,
 };
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::subagent_types::SubagentType;
@@ -551,6 +552,8 @@ pub(crate) enum StoredChildMessage {
     /// User-authored child prompt or follow-up.
     User {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageInput>,
         #[serde(default)]
         pinned: bool,
     },
@@ -579,8 +582,13 @@ pub(crate) enum StoredChildMessage {
 impl StoredChildMessage {
     fn from_message(message: &Message) -> Self {
         match message {
-            Message::User { content, pinned } => Self::User {
+            Message::User {
+                content,
+                images,
+                pinned,
+            } => Self::User {
                 content: content.clone(),
+                images: images.clone(),
                 pinned: *pinned,
             },
             Message::Assistant {
@@ -613,8 +621,13 @@ impl StoredChildMessage {
 
     fn to_message(&self) -> Message {
         match self {
-            Self::User { content, pinned } => Message::User {
+            Self::User {
+                content,
+                images,
+                pinned,
+            } => Message::User {
                 content: content.clone(),
+                images: images.clone(),
                 pinned: *pinned,
             },
             Self::Assistant {

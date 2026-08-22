@@ -18,9 +18,13 @@ base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ratatui = { workspace = true, features = ["scrolling-regions", "unstable-rendered-line-info"] }
+ratatui-image = { workspace = true }
 crossterm = { workspace = true }
 tui-textarea = { workspace = true }
 qwertty = { workspace = true }
+image = { workspace = true }
+shlex = { workspace = true }
+url = { workspace = true }
 supports-color = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
@@ -34,11 +38,15 @@ two-face = { workspace = true }
 similar = { workspace = true, features = ["inline"] }
 libc = { workspace = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+arboard = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]

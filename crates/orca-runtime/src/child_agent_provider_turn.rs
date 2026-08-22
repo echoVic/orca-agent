@@ -44,6 +44,7 @@ pub fn route_child_agent_model(
     let route_decision = config.model.route(ModelRouteContext {
         subagent_type: &request.subagent_type,
         subagent_model: None,
+        has_images: false,
     });
     child_cost_tracker.set_model(Some(&route_decision.actual_model));
     let mut provider_config = setup.provider_config.clone();

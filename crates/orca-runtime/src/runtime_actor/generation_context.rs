@@ -268,6 +268,120 @@ impl GenerationContextController {
             .collect())
     }
 
+    pub(crate) fn manual_compaction_running_events(
+        &self,
+        snapshot: &surface::SurfaceSnapshot,
+        fence: &surface::SurfaceOperationFence,
+        before_messages: u64,
+    ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
+        let revision = next_context_revision(&snapshot.context)?;
+        let mut context = snapshot.context.clone();
+        context.revision = revision;
+        context.compaction = surface::CompactionState::Running {
+            operation_id: fence.operation_id.clone(),
+            reason: surface::CompactionReason::Manual,
+            before_messages,
+        };
+        Ok(vec![(
+            surface::SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            surface::SurfaceEvent::Context(context),
+        )])
+    }
+
+    pub(crate) fn manual_compaction_completed_events(
+        &self,
+        snapshot: &surface::SurfaceSnapshot,
+        fence: &surface::SurfaceOperationFence,
+        before_messages: u64,
+        after_messages: u64,
+        compaction: Option<&crate::session::ManualCompactionOutcome>,
+    ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
+        if !matches!(
+            &snapshot.context.compaction,
+            surface::CompactionState::Running {
+                operation_id,
+                before_messages: running_before,
+                ..
+            } if operation_id == &fence.operation_id && *running_before == before_messages
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "typed manual compaction context is not running",
+            ));
+        }
+        let mut context = snapshot.context.clone();
+        context.revision = next_context_revision(&context)?;
+        context.window_id =
+            surface::ContextWindowId::for_compaction(&context.window_id, &fence.operation_id);
+        context.compaction = surface::CompactionState::Completed {
+            operation_id: fence.operation_id.clone(),
+            reason: surface::CompactionReason::Manual,
+            strategy: surface::NonEmptyText::try_new(
+                compaction.map_or("manual", |outcome| outcome.strategy),
+            )
+            .expect("manual strategy is non-empty"),
+            before_messages,
+            after_messages,
+            collapsed_messages: before_messages.saturating_sub(after_messages),
+            status_text: surface::DisplayText::new("compacted context manually"),
+        };
+        let scope = surface::SurfaceScope::Generation {
+            fence: fence.clone(),
+        };
+        let mut events = Vec::new();
+        if let Some(compaction) = compaction {
+            let item_patches =
+                surface::manual_compaction_item_patches(&snapshot.items, &compaction.after)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "manual compaction result cannot materialize every typed item",
+                        )
+                    })?;
+            events.extend(
+                item_patches
+                    .into_iter()
+                    .map(|patch| (scope.clone(), surface::SurfaceEvent::Item(patch))),
+            );
+        }
+        events.push((scope, surface::SurfaceEvent::Context(context)));
+        if events.len() as u64 > surface::SURFACE_COMMIT_BATCH_EVENT_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "typed manual compaction completion exceeds one durable batch",
+            ));
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn manual_compaction_idle_events(
+        &self,
+        snapshot: &surface::SurfaceSnapshot,
+        fence: &surface::SurfaceOperationFence,
+    ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
+        if !matches!(
+            &snapshot.context.compaction,
+            surface::CompactionState::Running { operation_id, .. }
+                if operation_id == &fence.operation_id
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "typed manual compaction context is not running",
+            ));
+        }
+        let mut context = snapshot.context.clone();
+        context.revision = next_context_revision(&context)?;
+        context.compaction = surface::CompactionState::Idle;
+        Ok(vec![(
+            surface::SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            surface::SurfaceEvent::Context(context),
+        )])
+    }
+
     pub(crate) fn clear_operation(&mut self, operation_id: &surface::SurfaceOperationId) {
         self.pending_stream_redactions
             .retain(|_, pending| &pending.fence.operation_id != operation_id);
@@ -319,6 +433,17 @@ impl GenerationContextController {
         let stable = pending.raw_tail.drain(..stable_len).collect::<String>();
         Ok(Some(surface_persisted_display_text(&stable)))
     }
+}
+
+fn next_context_revision(
+    context: &surface::SurfaceContextSnapshot,
+) -> io::Result<surface::ContextRevision> {
+    surface::ContextRevision::try_new(
+        context.revision.get().checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "context revision exhausted")
+        })?,
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "context revision is invalid"))
 }
 
 pub(crate) fn build_background_provider_response_events(
@@ -857,6 +982,7 @@ mod tests {
     fn provider_usage_updates_context_snapshot_with_current_prompt_tokens_bits_spec_ut() {
         let current = surface::SurfaceContextSnapshot {
             revision: surface::ContextRevision::try_new(7).unwrap(),
+            window_id: surface::ContextWindowId::new(),
             used_tokens: 42,
             limit_tokens: 1_000_000,
             compaction: surface::CompactionState::Idle,
@@ -881,6 +1007,7 @@ mod tests {
     fn provider_usage_is_bounded_by_context_limit_bits_spec_ut() {
         let current = surface::SurfaceContextSnapshot {
             revision: surface::ContextRevision::try_new(1).unwrap(),
+            window_id: surface::ContextWindowId::new(),
             used_tokens: 0,
             limit_tokens: 100,
             compaction: surface::CompactionState::Idle,

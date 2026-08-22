@@ -626,6 +626,13 @@ fn history_message_from_surface_item(item: &SurfaceItem) -> Option<crate::types:
                 } => visible_input_text(presentation).map(crate::types::ChatMessage::User),
             },
         },
+        SurfaceItem::SystemMessage { content, .. }
+            if content
+                .as_str()
+                .starts_with(orca_core::conversation::IMAGE_ANALYSIS_MESSAGE_PREFIX) =>
+        {
+            None
+        }
         SurfaceItem::SystemMessage { content, .. } => Some(crate::types::ChatMessage::System(
             content.as_str().to_string(),
         )),
@@ -2107,6 +2114,7 @@ mod tests {
             },
             context: SurfaceContextSnapshot {
                 revision: ContextRevision::try_new(1).unwrap(),
+                window_id: orca_runtime::surface::ContextWindowId::new(),
                 used_tokens: 0,
                 limit_tokens: 128_000,
                 compaction: CompactionState::Idle,
@@ -2948,6 +2956,7 @@ mod tests {
             scope: SurfaceScope::Thread,
             event: SurfaceEvent::Context(orca_runtime::surface::SurfaceContextSnapshot {
                 revision: orca_runtime::surface::ContextRevision::try_new(2).unwrap(),
+                window_id: orca_runtime::surface::ContextWindowId::new(),
                 used_tokens: 4_096,
                 limit_tokens: 128_000,
                 compaction: orca_runtime::surface::CompactionState::Idle,
@@ -2990,6 +2999,7 @@ mod tests {
             scope: SurfaceScope::Thread,
             event: SurfaceEvent::Context(orca_runtime::surface::SurfaceContextSnapshot {
                 revision: orca_runtime::surface::ContextRevision::try_new(2).unwrap(),
+                window_id: orca_runtime::surface::ContextWindowId::new(),
                 used_tokens: 1,
                 limit_tokens: 2,
                 compaction: orca_runtime::surface::CompactionState::Idle,

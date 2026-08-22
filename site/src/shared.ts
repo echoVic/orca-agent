@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.3.26";
+export const releaseVersion = "v0.4.0";
 
 export const releases = [
+  {
+    version: "v0.4.0",
+    date: "2026-08-22",
+    title: "DeepSeek vision, image paste, and runtime controllers",
+    body: "Adds end-to-end multimodal support for DeepSeek's deepseek-v4-flash-vision-exp model across clipboard paste, dragged or pasted image paths, TUI file mentions, ACP image blocks, durable prompt queues, conversation history, continuation checkpoints, and OpenAI-compatible provider requests. Atomic [Image #N] attachments survive editing, queueing, and rejected submissions; clipboard reads stay off the renderer thread and preserve paste-before-send ordering across macOS, Linux, Windows, and WSL. RuntimeHost now delegates generation context, interaction routing, operation recovery, Goal control, and task/workflow ownership to focused controllers; stable ContextWindowId epochs make compaction boundaries explicit and restart-safe.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.0",
+  },
   {
     version: "v0.3.26",
     date: "2026-08-21",

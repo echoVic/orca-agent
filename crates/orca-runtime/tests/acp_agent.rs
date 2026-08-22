@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_client_protocol::{
-    Agent, AgentSideConnection, CancelNotification, Client, ClientCapabilities,
+    Agent, AgentSideConnection, AudioContent, CancelNotification, Client, ClientCapabilities,
     ClientSideConnection, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, ImageContent, Implementation, InitializeRequest, LoadSessionRequest,
+    FileSystemCapabilities, Implementation, InitializeRequest, LoadSessionRequest,
     NewSessionRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SessionId,
     SessionNotification, SessionUpdate, StopReason, TextResourceContents,
@@ -871,13 +871,13 @@ fn acp_typed_prompt_rejects_unsupported_content_before_reservation() {
         agent
             .prompt(PromptRequest::new(
                 session.session_id,
-                vec![ContentBlock::Image(ImageContent::new(
-                    "base64-payload",
-                    "image/png",
+                vec![ContentBlock::Audio(AudioContent::new(
+                    "base64-audio",
+                    "audio/mpeg",
                 ))],
             ))
             .await
-            .expect_err("unsupported image prompt must fail")
+            .expect_err("unsupported audio prompt must fail")
     });
 
     assert_eq!(executor.call_count(), 0);

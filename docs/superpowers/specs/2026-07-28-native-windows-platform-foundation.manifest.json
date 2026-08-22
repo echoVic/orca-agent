@@ -30,6 +30,12 @@
   ],
   "foundation_exceptions": [
     [
+      "tui-clipboard-image-private-unix-permissions",
+      "crates/orca-tui/src/clipboard_image.rs",
+      "unix_std_api",
+      1
+    ],
+    [
       "tui-goal-materialization-private-unix-permissions",
       "crates/orca-tui/src/goal_materialization.rs",
       "unix_std_api",

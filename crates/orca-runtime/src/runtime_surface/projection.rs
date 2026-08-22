@@ -1,18 +1,18 @@
 use super::identity::{
     ByteCount, ByteOffset, CanonicalMime, CanonicalPath, CanonicalUri, CapabilityRevision,
-    ContextRevision, DisplayText, GoalCatalogRevision, GoalObjectiveRevision, GoalOwnerEpoch,
-    GoalRevision, McpCatalogRevision, NonEmptyText, NonEmptyVec, PinnedContextRevision,
-    PinnedContextSourceRevision, PlanRevision, PolicyEpoch, SafeDiagnosticText, SequenceNumber,
-    SessionHealthRevision, SessionMetadataRevision, SettingsRevision, Sha256Digest,
-    SubagentRevision, SurfaceBackgroundFence, SurfaceCapabilityCallId, SurfaceCatalogEntryId,
-    SurfaceCommitId, SurfaceCursor, SurfaceFinalizeIntentId, SurfaceGenerationId, SurfaceGoalId,
-    SurfaceGoalIntentId, SurfaceGoalOuterTurnId, SurfaceGoalRunId, SurfaceInputCorrelationId,
-    SurfaceInteractionId, SurfaceItemId, SurfaceOperationFence, SurfaceOperationId,
-    SurfaceRemoteTerminalId, SurfaceRequestId, SurfaceSettlementId, SurfaceStreamId,
-    SurfaceSubagentId, SurfaceTaskId, SurfaceThreadId, SurfaceToolCallId, SurfaceTurnId,
-    SurfaceValueError, SurfaceWorkflowFence, SurfaceWorkflowResultId, SurfaceWorkflowRunId,
-    TaskRevision, ThreadOwnerEpoch, ToolInvocationRevision, UnixMillis, UsageRevision, UuidV7,
-    WorkflowRevision,
+    ContextRevision, ContextWindowId, DisplayText, GoalCatalogRevision, GoalObjectiveRevision,
+    GoalOwnerEpoch, GoalRevision, McpCatalogRevision, NonEmptyText, NonEmptyVec,
+    PinnedContextRevision, PinnedContextSourceRevision, PlanRevision, PolicyEpoch,
+    SafeDiagnosticText, SequenceNumber, SessionHealthRevision, SessionMetadataRevision,
+    SettingsRevision, Sha256Digest, SubagentRevision, SurfaceBackgroundFence,
+    SurfaceCapabilityCallId, SurfaceCatalogEntryId, SurfaceCommitId, SurfaceCursor,
+    SurfaceFinalizeIntentId, SurfaceGenerationId, SurfaceGoalId, SurfaceGoalIntentId,
+    SurfaceGoalOuterTurnId, SurfaceGoalRunId, SurfaceInputCorrelationId, SurfaceInteractionId,
+    SurfaceItemId, SurfaceOperationFence, SurfaceOperationId, SurfaceRemoteTerminalId,
+    SurfaceRequestId, SurfaceSettlementId, SurfaceStreamId, SurfaceSubagentId, SurfaceTaskId,
+    SurfaceThreadId, SurfaceToolCallId, SurfaceTurnId, SurfaceValueError, SurfaceWorkflowFence,
+    SurfaceWorkflowResultId, SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch,
+    ToolInvocationRevision, UnixMillis, UsageRevision, UuidV7, WorkflowRevision,
 };
 use super::interaction::{
     DurableInteractionContinuationCapsule, DurableInteractionContinuationDisposition,
@@ -890,6 +890,8 @@ pub struct SurfaceContextFragment {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceContextSnapshot {
     pub revision: ContextRevision,
+    #[serde(default)]
+    pub window_id: ContextWindowId,
     pub used_tokens: u64,
     pub limit_tokens: u64,
     pub compaction: CompactionState,

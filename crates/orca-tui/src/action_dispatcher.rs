@@ -202,13 +202,31 @@ fn route_action(
         UserAction::BackgroundCurrentTurn => {
             controller.request_background_current();
         }
-        UserAction::QueuePrompt { prompt, bindings } => {
-            match controller.queue_prompt(prompt.clone(), bindings.clone()) {
+        UserAction::PasteImages {
+            request_id,
+            request,
+        } => {
+            dispatch_image_paste(request_id, request, event_tx);
+        }
+        UserAction::QueuePrompt {
+            prompt,
+            bindings,
+            images,
+        } => {
+            match controller.queue_prompt(
+                prompt.clone(),
+                bindings.clone(),
+                crate::composer_images::ComposerImageState::image_inputs(&images),
+            ) {
                 Ok(Some(snapshot)) => {
                     let _ = event_tx.try_send(TuiEvent::PromptQueueUpdated(snapshot));
                 }
                 Ok(None) => match enqueue_action(
-                    UserAction::QueuePrompt { prompt, bindings },
+                    UserAction::QueuePrompt {
+                        prompt,
+                        bindings,
+                        images,
+                    },
                     command_tx,
                     backlog,
                     backlog_capacity,
@@ -221,6 +239,8 @@ fn route_action(
                     let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
                         queued_id: None,
                         prompt,
+                        bindings,
+                        images,
                         message: error.to_string(),
                     });
                 }
@@ -353,27 +373,47 @@ fn enqueue_action(
 fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
     let message = "TUI command queue is full; command rejected".to_string();
     match action {
-        UserAction::Submit(prompt) | UserAction::SubmitWithMentions { prompt, .. } => {
+        UserAction::Submit(prompt) => {
             let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
                 queued_id: None,
                 prompt,
+                bindings: orca_runtime::mentions::MentionBindings::default(),
+                images: Vec::new(),
                 message,
             });
         }
-        UserAction::QueuePrompt { prompt, .. } => {
+        UserAction::SubmitWithMentions {
+            prompt,
+            bindings,
+            images,
+        }
+        | UserAction::QueuePrompt {
+            prompt,
+            bindings,
+            images,
+        } => {
             let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
                 queued_id: None,
                 prompt,
+                bindings,
+                images,
                 message,
             });
         }
-        UserAction::PromptQueueControl(_) => {
+        UserAction::PromptQueueControl(_) | UserAction::PasteImages { .. } => {
             let _ = event_tx.try_send(TuiEvent::OperationRejected(message));
         }
-        UserAction::SubmitQueued { id, prompt, .. } => {
+        UserAction::SubmitQueued {
+            id,
+            prompt,
+            bindings,
+            images,
+        } => {
             let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
                 queued_id: Some(id),
                 prompt,
+                bindings,
+                images,
                 message,
             });
         }
@@ -405,13 +445,37 @@ fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
     }
 }
 
+fn dispatch_image_paste(
+    request_id: u64,
+    request: crate::clipboard_image::ImagePasteRequest,
+    event_tx: &Sender<TuiEvent>,
+) {
+    let worker_event_tx = event_tx.clone();
+    let spawn = thread::Builder::new()
+        .name("orca-clipboard-image".to_string())
+        .spawn(move || {
+            let result = crate::clipboard_image::read_image_request(request)
+                .map_err(|error| error.to_string());
+            let _ =
+                worker_event_tx.send(TuiEvent::ClipboardImagePasteCompleted { request_id, result });
+        });
+    if let Err(error) = spawn {
+        let _ = event_tx.try_send(TuiEvent::ClipboardImagePasteCompleted {
+            request_id,
+            result: Err(format!("failed to start clipboard image reader: {error}")),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::io;
+    use std::io::Cursor;
     use std::time::Duration;
 
     use crossbeam_channel as mpsc;
+    use image::ImageEncoder as _;
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::HistoryMode;
     use orca_runtime::runtime_host::RuntimeHost;
@@ -425,6 +489,48 @@ mod tests {
     use crate::types::{
         TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse, UserAction,
     };
+
+    #[test]
+    fn image_paste_io_runs_off_the_command_mailbox_and_returns_typed_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("clipboard.png");
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut Cursor::new(&mut png))
+            .write_image(&[0, 0xff, 0, 0xff], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).unwrap();
+        raw_tx
+            .send(UserAction::PasteImages {
+                request_id: 7,
+                request: crate::clipboard_image::ImagePasteRequest::Paths(vec![path]),
+            })
+            .unwrap();
+        raw_tx
+            .send(UserAction::Submit("still responsive".to_string()))
+            .unwrap();
+
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(UserAction::Submit(prompt)) if prompt == "still responsive"
+        ));
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(TuiEvent::ClipboardImagePasteCompleted {
+                request_id: 7,
+                result: Ok(images),
+            }) if images.len() == 1
+                && images[0].media_type == "image/png"
+                && (images[0].width, images[0].height) == (1, 1)
+        ));
+        dispatcher.shutdown().unwrap();
+    }
 
     #[test]
     fn unknown_interaction_response_does_not_enter_full_command_mailbox() {

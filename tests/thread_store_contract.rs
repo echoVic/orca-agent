@@ -35,6 +35,7 @@ fn session_store_thread_store_appends_live_thread_items() {
             .append_items(&[
                 Message::User {
                     content: "thread store prompt".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -295,6 +296,7 @@ fn session_store_paginates_thread_summaries_and_search_hits() {
         first
             .append_items(&[Message::User {
                 content: "shared search needle first".to_string(),
+                images: Vec::new(),
                 pinned: false,
             }])
             .expect("append first");
@@ -309,6 +311,7 @@ fn session_store_paginates_thread_summaries_and_search_hits() {
         second
             .append_items(&[Message::User {
                 content: "shared search needle second".to_string(),
+                images: Vec::new(),
                 pinned: false,
             }])
             .expect("append second");
@@ -588,6 +591,7 @@ fn session_store_projects_thread_turns_and_items() {
             .append_items(&[
                 Message::User {
                     content: "turn projection user".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -666,6 +670,7 @@ fn session_store_projects_mcp_tool_calls_as_thread_items() {
             .append_items(&[
                 Message::User {
                     content: "call mcp search".to_string(),
+                images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -721,6 +726,7 @@ fn session_store_preserves_failed_mcp_tool_metadata_in_thread_items() {
             .append_items(&[
                 Message::User {
                     content: "search failed".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -774,6 +780,7 @@ fn session_store_projects_error_prefixed_mcp_tool_content_as_failed_item() {
             .append_items(&[
                 Message::User {
                     content: "slow mcp".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -827,6 +834,7 @@ fn session_store_projects_external_tool_calls_as_dynamic_thread_items() {
             .append_items(&[
                 Message::User {
                     content: "deploy staging".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -885,6 +893,7 @@ fn session_store_preserves_failed_external_tool_metadata_in_dynamic_thread_items
             .append_items(&[
                 Message::User {
                     content: "deploy staging".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -938,6 +947,7 @@ fn session_store_preserves_denied_external_tool_metadata_in_dynamic_thread_items
             .append_items(&[
                 Message::User {
                     content: "deploy production".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -999,6 +1009,7 @@ fn session_store_preserves_truncated_tool_metadata_in_thread_items() {
             .append_items(&[
                 Message::User {
                     content: "run verbose command".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -1060,6 +1071,7 @@ fn session_store_preserves_failed_command_projection_without_aggregated_output()
             .append_items(&[
                 Message::User {
                     content: "run failing command".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -1324,6 +1336,7 @@ fn session_store_projects_file_edit_calls_as_file_change_thread_items() {
             .append_items(&[
                 Message::User {
                     content: "edit note".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -1388,6 +1401,7 @@ fn session_store_projects_write_file_calls_as_file_change_thread_items() {
             .append_items(&[
                 Message::User {
                     content: "write note".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -1457,6 +1471,7 @@ fn session_store_projects_builtin_read_tool_as_dynamic_thread_item() {
             .append_items(&[
                 Message::User {
                     content: "read readme".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -1511,6 +1526,7 @@ fn session_store_projects_multiple_user_turns_with_stable_item_ids() {
             .append_items(&[
                 Message::User {
                     content: "first user".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -1526,6 +1542,7 @@ fn session_store_projects_multiple_user_turns_with_stable_item_ids() {
             .append_items(&[
                 Message::User {
                     content: "second user".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -1608,6 +1625,7 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
             .append_items(&[
                 Message::User {
                     content: "first user".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {
@@ -1623,6 +1641,7 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
             .append_items(&[
                 Message::User {
                     content: "second user".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 },
                 Message::Assistant {

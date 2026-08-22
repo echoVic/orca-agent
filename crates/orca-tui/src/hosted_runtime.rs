@@ -32,6 +32,7 @@ pub(crate) fn hosted_turn_request(
     goal_mode_active: bool,
 ) -> HostedTurnRequest {
     HostedTurnRequest::new(submitted_turn.prompt().to_string())
+        .with_images(submitted_turn.images().to_vec())
         .with_goal_tools(goal_mode_active)
         .with_goal_usage_tracking(goal_mode_active)
         .with_backtrack_target(submitted_turn.is_backtrack_target())
@@ -63,16 +64,37 @@ pub(crate) fn emit_hosted_operation_error(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn send_submission_error(
     event_tx: &crossbeam_channel::Sender<TuiEvent>,
     queued_id: Option<u64>,
     rejection_prompt: Option<&str>,
     message: String,
 ) {
+    send_submission_error_with_images(
+        event_tx,
+        queued_id,
+        rejection_prompt,
+        orca_runtime::mentions::MentionBindings::default(),
+        Vec::new(),
+        message,
+    );
+}
+
+pub(crate) fn send_submission_error_with_images(
+    event_tx: &crossbeam_channel::Sender<TuiEvent>,
+    queued_id: Option<u64>,
+    rejection_prompt: Option<&str>,
+    bindings: orca_runtime::mentions::MentionBindings,
+    images: Vec<crate::composer_images::ComposerImageAttachment>,
+    message: String,
+) {
     if let Some(prompt) = rejection_prompt {
         let _ = event_tx.send(TuiEvent::SubmissionRejected {
             queued_id,
             prompt: prompt.to_string(),
+            bindings,
+            images,
             message,
         });
     } else {

@@ -828,6 +828,28 @@ the control plane without changing public wire or persistence formats.
 These boundaries are enforced by behavior, dependency, closed-inventory, and
 portable contract tests. Private source layout is not a release contract.
 
+## v0.4.0 ThreadActor Boundary Completion
+
+The remaining actor implementation is split into compile-time modules for
+Goal, generation/provider, interaction, operation recovery, and task/workflow
+orchestration. The main `ThreadActor` implementation retains mailbox dispatch,
+controller lifecycle, and cross-controller transactions.
+
+- `GenerationContextController` is the only constructor for provider response,
+  usage, stream-failure, and manual-compaction context events.
+- `InteractionController` owns resident interactions, cold-recovery owners,
+  origin attachment routing, detach retries, and capability-loss retries.
+- `OperationRecoveryController` owns manual-compaction completion, provider
+  transfer, live input capsules, reservation expiry, and terminal blocking.
+- `TaskWorkflowController` owns background tasks, workflow/provider completion
+  retries, approval/control retries, and task ownership transitions.
+- `ContextWindowId` is stable for a model-visible epoch, advances only after a
+  successful compaction, survives resume, and is isolated by fork identity.
+
+The five actor implementation modules can call only the parent actor's
+crate-private orchestration surface. They do not create another mutable runtime
+owner or change the TUI, ACP, JSONL, or Headless lifecycle contracts.
+
 ## Rejected Alternatives
 
 ### Add Another Surface Wrapper

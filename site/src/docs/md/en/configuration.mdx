@@ -99,8 +99,9 @@ auto_resume_last = false
 
 | Model | Best For | Cost | Speed |
 |-------|----------|------|-------|
-| `deepseek-v4-flash` | Quick edits, search, simple refactors | Low (~$0.001/1K tokens) | Fast (~30 tok/s) |
-| `deepseek-v4-pro` | Architecture design, complex debugging, multi-file changes | Medium (~$0.004/1K tokens) | Moderate (~15 tok/s) |
+| `deepseek-v4-flash` | Quick edits, search, simple refactors | CNY 3 input / 9 output per 1M tokens at peak | Fast |
+| `deepseek-v4-flash-vision-exp` | Screenshots, diagrams, charts, visual-agent tasks | Same as Flash | Fast |
+| `deepseek-v4-pro` | Architecture design, complex debugging, multi-file changes | CNY 9 input / 27 output per 1M tokens at peak | Moderate |
 
 > **Tip:** Start with `deepseek-v4-flash` for most tasks. Switch to `deepseek-v4-pro` when the agent needs to reason across many files or design new systems.
 

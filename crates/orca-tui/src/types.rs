@@ -19,10 +19,13 @@ use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 use orca_runtime::surface::{RuntimeSurfaceThreadHandle, SurfaceOperationId};
 
+use crate::clipboard_image::{ClipboardImagePayload, ImagePasteRequest};
+use crate::composer_images::{ComposerImageAttachment, ComposerImageState, TuiImage};
 use crate::display_text::truncate_to_display_width;
 use crate::edit_highlight::EditHighlightState;
 #[cfg(test)]
 use crate::edit_highlight::parsed_diff_structure_matches_target;
+use crate::image_preview::{ImageHitArea, ImageRenderState, ImageViewerState};
 use crate::input_history::load_input_history;
 use crate::plan_panel::PlanPanelState;
 use crate::queued_input::QueuedSubmissionState;
@@ -387,9 +390,15 @@ pub enum TuiEvent {
         generation: u64,
     },
     MentionRuntimeReady(RuntimeSurfaceThreadHandle),
+    ClipboardImagePasteCompleted {
+        request_id: u64,
+        result: Result<Vec<ClipboardImagePayload>, String>,
+    },
     SubmissionRejected {
         queued_id: Option<u64>,
         prompt: String,
+        bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
         message: String,
     },
     OperationRejected(String),
@@ -476,16 +485,23 @@ pub enum UserAction {
     SubmitWithMentions {
         prompt: String,
         bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
     },
     QueuePrompt {
         prompt: String,
         bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
     },
     PromptQueueControl(orca_runtime::prompt_queue::PromptQueueAction),
     SubmitQueued {
         id: u64,
         prompt: String,
         bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
+    },
+    PasteImages {
+        request_id: u64,
+        request: ImagePasteRequest,
     },
     ImplementApprovedPlan {
         prompt: String,
@@ -605,6 +621,7 @@ pub enum SessionPickerPhase {
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
     User(String),
+    Image(TuiImage),
     Reasoning(String),
     Assistant(String),
     AssistantChunk {
@@ -839,6 +856,9 @@ pub struct AppState {
     next_message_revision: u64,
     pub(crate) transcript_render_cache: TranscriptRenderCache,
     pub(crate) transcript_search: TranscriptSearchState,
+    pub(crate) image_viewer: Option<ImageViewerState>,
+    pub(crate) image_renderer: ImageRenderState,
+    pub(crate) image_hit_areas: Vec<ImageHitArea>,
     /// Separate cache for the welcome screen (no messages yet), so its text
     /// is selectable/copyable through the same machinery as the transcript.
     pub(crate) welcome_render_cache: TranscriptRenderCache,
@@ -883,6 +903,7 @@ pub struct AppState {
     pub show_shortcuts: bool,
     pub input_history: Vec<String>,
     pub(crate) pending_pastes: Vec<(String, String)>,
+    pub(crate) composer_images: ComposerImageState,
     pub(crate) queued_submission: QueuedSubmissionState,
     pub history_cursor: Option<usize>,
     pub draft_before_history: Option<String>,
@@ -1086,6 +1107,9 @@ impl AppState {
             next_message_revision: 1,
             transcript_render_cache: TranscriptRenderCache::default(),
             transcript_search: TranscriptSearchState::default(),
+            image_viewer: None,
+            image_renderer: ImageRenderState::default(),
+            image_hit_areas: Vec::new(),
             welcome_render_cache: TranscriptRenderCache::default(),
             finalized_count: 0,
             flushed_count: 0,
@@ -1119,6 +1143,7 @@ impl AppState {
             show_shortcuts: false,
             input_history: load_input_history(),
             pending_pastes: Vec::new(),
+            composer_images: ComposerImageState::default(),
             queued_submission: QueuedSubmissionState::default(),
             history_cursor: None,
             draft_before_history: None,
@@ -1512,6 +1537,21 @@ impl AppState {
         }
     }
 
+    pub(crate) fn push_user_message_with_images(
+        &mut self,
+        text: String,
+        images: &[ComposerImageAttachment],
+    ) {
+        self.push_message(ChatMessage::User(text));
+        for image in images {
+            self.push_message(ChatMessage::Image(image.preview()));
+        }
+    }
+
+    pub(crate) fn begin_image_render_frame(&mut self) {
+        self.image_hit_areas = Vec::new();
+    }
+
     pub(crate) fn replace_messages(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
         self.reset_assistant_stream();
         self.reset_queued_user_messages();
@@ -1571,6 +1611,7 @@ impl AppState {
         self.user_input_dialog = None;
         self.pre_plan_approval_mode = None;
         self.pending_pastes.clear();
+        self.composer_images.reset_for_new_session();
         self.reset_history_navigation();
         self.last_ctrl_c = None;
         self.panel_mode = PanelMode::Conversation;
@@ -2398,6 +2439,8 @@ impl AppState {
             TuiEvent::SubmissionRejected {
                 queued_id: _,
                 prompt: _,
+                bindings: _,
+                images: _,
                 message,
             } => {
                 self.remove_after_last_user();
@@ -2426,7 +2469,8 @@ impl AppState {
             }
             TuiEvent::MentionSearchDirty { .. }
             | TuiEvent::MentionCatalogDirty { .. }
-            | TuiEvent::MentionRuntimeReady(_) => {}
+            | TuiEvent::MentionRuntimeReady(_)
+            | TuiEvent::ClipboardImagePasteCompleted { .. } => {}
             TuiEvent::CompactionStarted => {
                 self.set_status(AppStatus::Compacting);
             }
@@ -2816,6 +2860,7 @@ impl AppState {
             | ChatMessage::ProposedPlan(_) => turn_ended || !is_last,
             ChatMessage::AssistantChunk { .. }
             | ChatMessage::User(_)
+            | ChatMessage::Image(_)
             | ChatMessage::Error(_)
             | ChatMessage::System(_)
             | ChatMessage::PlanUpdate { .. } => true,
@@ -4699,6 +4744,8 @@ mod tests {
         state.update(TuiEvent::SubmissionRejected {
             queued_id: None,
             prompt: "review @gone.txt".to_string(),
+            bindings: MentionBindings::default(),
+            images: Vec::new(),
             message: "bound file is no longer available".to_string(),
         });
 

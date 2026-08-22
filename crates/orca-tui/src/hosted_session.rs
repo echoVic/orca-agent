@@ -11,6 +11,7 @@ use orca_runtime::runtime_host::RuntimeThreadHandle;
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::attachment_routing::send_attached_event;
+use crate::composer_images::ComposerImageState;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
 use crate::types::{ChatMessage, SessionAttachmentId, TuiEvent};
@@ -83,8 +84,13 @@ pub(crate) fn read_hosted_projection_batch(
         .read_snapshot()
         .map(|snapshot| {
             let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
-            let messages =
+            let mut messages =
                 crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
+            if let Some(session_id) = thread.session_id()
+                && let Ok(transcript) = load_saved_history_fallback(session_id)
+            {
+                messages = attach_history_images(messages, &transcript.messages);
+            }
             (projection, messages)
         })
         .map_err(|error| error.to_string())
@@ -158,11 +164,15 @@ pub(crate) fn emit_typed_history_snapshot(
         messages = transcript
             .messages
             .into_iter()
-            .filter_map(chat_message_from_history)
+            .flat_map(chat_messages_from_history)
             .collect();
         if plan.is_none() {
             plan = transcript.plan;
         }
+    } else if let HistoryMode::Resume(selector) | HistoryMode::Fork(selector) = mode
+        && let Ok(transcript) = load_saved_history_fallback(selector)
+    {
+        messages = attach_history_images(messages, &transcript.messages);
     }
     let label = if matches!(mode, HistoryMode::Fork(_)) {
         "Forked saved conversation."
@@ -186,6 +196,44 @@ pub(crate) fn emit_typed_history_snapshot(
         )))
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn attach_history_images(projected: Vec<ChatMessage>, history: &[Message]) -> Vec<ChatMessage> {
+    let image_groups = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User {
+                content, images, ..
+            } => Some((content.as_str(), images.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut user_index = 0usize;
+    let mut enriched = Vec::with_capacity(projected.len());
+    for message in projected {
+        let is_user = matches!(message, ChatMessage::User(_));
+        let visible_text = match &message {
+            ChatMessage::User(text) => Some(text.clone()),
+            _ => None,
+        };
+        enriched.push(message);
+        if !is_user {
+            continue;
+        }
+        if let Some((history_text, images)) = image_groups.get(user_index)
+            && !images.is_empty()
+        {
+            let visible = visible_text.as_deref().unwrap_or(history_text);
+            let (_, attachments) = ComposerImageState::restore_from_inputs(visible, images.clone());
+            enriched.extend(
+                attachments
+                    .iter()
+                    .map(|attachment| ChatMessage::Image(attachment.preview())),
+            );
+        }
+        user_index = user_index.saturating_add(1);
+    }
+    enriched
 }
 
 pub(crate) fn load_saved_history_fallback(
@@ -224,10 +272,26 @@ pub(crate) fn emit_empty_history_snapshot(event_tx: &mpsc::Sender<TuiEvent>, lab
     });
 }
 
+#[cfg(test)]
 pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage> {
+    chat_messages_from_history(message).into_iter().next()
+}
+
+pub(crate) fn chat_messages_from_history(message: Message) -> Vec<ChatMessage> {
     match message {
-        Message::System { .. } => None,
-        Message::User { content, .. } => Some(ChatMessage::User(content)),
+        Message::System { .. } => Vec::new(),
+        Message::User {
+            content, images, ..
+        } => {
+            let (visible, attachments) = ComposerImageState::restore_from_inputs(&content, images);
+            let mut messages = vec![ChatMessage::User(visible)];
+            messages.extend(
+                attachments
+                    .iter()
+                    .map(|attachment| ChatMessage::Image(attachment.preview())),
+            );
+            messages
+        }
         Message::Assistant {
             content,
             reasoning_content,
@@ -235,21 +299,21 @@ pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage>
             ..
         } => {
             if let Some(content) = content.filter(|text| !text.trim().is_empty()) {
-                Some(ChatMessage::Assistant(content))
+                vec![ChatMessage::Assistant(content)]
             } else if let Some(reasoning) = reasoning_content.filter(|text| !text.trim().is_empty())
             {
-                Some(ChatMessage::Reasoning(reasoning))
+                vec![ChatMessage::Reasoning(reasoning)]
             } else if !tool_calls.is_empty() {
                 let names = tool_calls
                     .iter()
                     .map(|tool| tool.function_name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                Some(ChatMessage::System(format!(
+                vec![ChatMessage::System(format!(
                     "Previous assistant requested tools: {names}"
-                )))
+                ))]
             } else {
-                None
+                Vec::new()
             }
         }
         Message::Tool {
@@ -281,7 +345,7 @@ pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage>
                 }
                 output.push_str("State is unknown. Inspect external state before retrying.");
             }
-            Some(ChatMessage::ToolCall {
+            vec![ChatMessage::ToolCall {
                 id: tool_call_id.clone(),
                 name: format!("tool:{tool_call_id}"),
                 target: None,
@@ -290,7 +354,7 @@ pub(crate) fn chat_message_from_history(message: Message) -> Option<ChatMessage>
                 diff: None,
                 kind,
                 expanded: false,
-            })
+            }]
         }
     }
 }
@@ -335,6 +399,41 @@ mod tests {
         assert!(!typed_history_startup_eligible(
             &HistoryMode::Resume("named-session".to_string()),
             &preloaded,
+        ));
+    }
+
+    #[test]
+    fn projected_history_is_enriched_with_persisted_image_messages() {
+        let projected = vec![
+            ChatMessage::User("inspect [Image #1]".to_string()),
+            ChatMessage::Assistant("done".to_string()),
+        ];
+        let history = vec![
+            Message::user_with_images(
+                "inspect [Image #1]".to_string(),
+                vec![orca_core::conversation::ImageInput {
+                    source: orca_core::conversation::ImageSource::Url {
+                        url: "https://example.com/image.png".to_string(),
+                    },
+                    detail: orca_core::conversation::ImageDetail::High,
+                }],
+            ),
+            Message::Assistant {
+                content: Some("done".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                pinned: false,
+            },
+        ];
+
+        let enriched = attach_history_images(projected, &history);
+        assert!(matches!(
+            enriched.as_slice(),
+            [
+                ChatMessage::User(_),
+                ChatMessage::Image(image),
+                ChatMessage::Assistant(_)
+            ] if image.label == "[Image #1]"
         ));
     }
 

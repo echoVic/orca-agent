@@ -165,6 +165,7 @@ CapabilityRevision(Revision)
 PlanRevision(Revision)
 UsageRevision(Revision)
 ContextRevision(Revision)
+ContextWindowId(Uuid)
 PinnedFileRevision(Revision)
 PinnedUserRevision(Revision)
 PinnedSystemRevision(Revision)
@@ -452,6 +453,17 @@ SurfaceLegacyMentionTarget =
 SurfaceLegacyPath(DisplayText)
 SurfaceLegacyUri(DisplayText)
 
+SurfaceImageDetail = Low | High | Original | Auto
+
+SurfaceImageSource =
+  Base64 {
+    media_type: CanonicalMime,
+    data: String,
+    digest: Sha256Digest,
+  }
+  | Url { url: CanonicalUri }
+  | File { file_id: NonEmptyText }
+
 SurfaceInputBindingRequest =
   ExactCatalog {
     kind: SurfaceInputBindingKind,
@@ -483,6 +495,10 @@ SurfaceInputRequestBlock =
       text: DisplayText,
       digest: Sha256Digest,
     }
+  | Image {
+      source: SurfaceImageSource,
+      detail: SurfaceImageDetail,
+    }
 
 SurfaceInputBlock =
   Text { text: DisplayText }
@@ -499,6 +515,10 @@ SurfaceInputBlock =
       text: DisplayText,
       digest: Sha256Digest,
     }
+  | Image {
+      source: SurfaceImageSource,
+      detail: SurfaceImageDetail,
+    }
 
 SurfaceInput {
   blocks: NonEmptyVec<SurfaceInputBlock>,
@@ -513,13 +533,25 @@ SurfaceInputRequest {
 
 `canonical_text` is runtime-produced after decoding and is not a client-owned
 resource expansion. A binding is resolved only after its generation Started
-barrier. Unsupported images, audio, blobs, malformed typed resources, or unknown
-content fail before Requested unless a frozen legacy disposition explicitly
-says `LegacyAcceptedDropped`. A `SurfaceLegacyPath` or `SurfaceLegacyUri` is raw
-released-wire data: relative, nonexistent, out-of-root, and malformed values
-remain representable until the post-Started resolver canonicalizes and
-authorizes them. Failure there is an input-resolution terminal, not a
-pre-Requested decoder error.
+barrier. Image blocks preserve their source and detail level; inline bytes are
+digest-checked before admission, while unsupported image formats, audio, blobs,
+malformed typed resources, or unknown content fail before Requested unless a
+frozen legacy disposition explicitly says `LegacyAcceptedDropped`. A
+`SurfaceLegacyPath` or `SurfaceLegacyUri` is raw released-wire data: relative,
+nonexistent, out-of-root, and malformed values remain representable until the
+post-Started resolver canonicalizes and authorizes them. Failure there is an
+input-resolution terminal, not a pre-Requested decoder error.
+
+TUI clipboard acquisition is a presentation-local side effect. `PasteImages`
+starts one bounded background read and returns
+`ClipboardImagePasteCompleted { request_id, result }`; the composer accepts only
+the currently fenced request. Stable `[Image #N]` labels are presentation
+handles for atomic edit, queue, and rejection recovery. Submission, queued
+autosend, and restored edits remove those local labels before admission and
+carry the corresponding typed image inputs through the same
+`SurfaceInputRequest` path as mention-resolved images. Runtime canonicalization
+adds exactly one stable display marker per image block. A clipboard worker
+never mutates runtime state directly.
 
 `OperationRequestIntent`, `SteerOperation`, and Goal run input accept only
 `SurfaceInputRequest`. The runtime reconstructs `SurfaceInput.canonical_text`
@@ -2677,6 +2709,7 @@ SurfaceContextFragment {
 
 SurfaceContextSnapshot {
   revision: ContextRevision,
+  window_id: ContextWindowId,
   used_tokens: u64,
   limit_tokens: u64,
   compaction: CompactionState,
@@ -2688,6 +2721,11 @@ SurfaceContextSnapshot {
 Provider continuation bytes remain runtime-private. The surface exposes only a
 digest and health state. No adapter receives a provider DTO or uses replay
 health to resume execution.
+
+`window_id` is stable for one model-visible context epoch. Usage updates and a
+failed compaction retain it; a successfully committed compaction advances it.
+The initial identity is deterministic for the thread, so resume retains the
+current identity while a fork receives a distinct identity.
 
 ```text
 SurfaceReasoningEffort = Low | Medium | High | Max

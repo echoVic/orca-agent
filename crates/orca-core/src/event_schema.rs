@@ -567,7 +567,8 @@ impl EventFactory {
             json!({
                 "requested_model": decision.requested_model,
                 "actual_model": decision.actual_model,
-                "reason": decision.reason
+                "reason": decision.reason,
+                "image_route": decision.image_route
             }),
         )
     }

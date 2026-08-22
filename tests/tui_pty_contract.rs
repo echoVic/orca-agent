@@ -8,6 +8,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+
 const PROMPT: &str = "typed TUI PTY submit";
 const ASSISTANT_SENTINEL: &str = "Mock runtime completed the headless harness contract.";
 
@@ -133,6 +135,49 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
         "cancelled PTY turn must not display a post-terminal completion; output={}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn tui_bracketed_image_path_paste_materializes_an_atomic_attachment() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    let image_path = cwd.path().join("pty pasted image.png");
+    let png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        .expect("decode PNG fixture");
+    std::fs::write(&image_path, png).expect("write PNG fixture");
+    let mut process = PtyProcess::spawn_with_model_and_prompt(
+        home.path(),
+        cwd.path(),
+        orca_core::model::VISION_MODEL,
+        "mock_stream_delay_ms 10000",
+    )
+    .expect("spawn vision TUI in PTY");
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "running 0s",
+        Duration::from_secs(20),
+        "TUI did not render the active turn before image paste",
+    );
+
+    process
+        .write(format!("\x1b[200~{}\x1b[201~", image_path.display()).as_bytes())
+        .expect("paste image path");
+    receive_until(
+        &process,
+        &mut output,
+        "[Image #1]",
+        Duration::from_secs(10),
+        "TUI did not materialize the pasted image attachment",
+    );
+
+    process.write(&[0x15]).expect("clear composer with Ctrl+U");
+    cancel_running_turn_and_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
 }
 
 #[test]
@@ -511,7 +556,16 @@ impl PtyProcess {
         cwd: &std::path::Path,
         prompt: &str,
     ) -> io::Result<Self> {
-        Self::spawn_with_history(home, cwd, None, prompt)
+        Self::spawn_with_history_and_model(home, cwd, None, None, prompt)
+    }
+
+    fn spawn_with_model_and_prompt(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        model: &str,
+        prompt: &str,
+    ) -> io::Result<Self> {
+        Self::spawn_with_history_and_model(home, cwd, None, Some(model), prompt)
     }
 
     fn spawn_resumed(
@@ -529,6 +583,16 @@ impl PtyProcess {
         resume: Option<&str>,
         prompt: &str,
     ) -> io::Result<Self> {
+        Self::spawn_with_history_and_model(home, cwd, resume, None, prompt)
+    }
+
+    fn spawn_with_history_and_model(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        resume: Option<&str>,
+        model: Option<&str>,
+        prompt: &str,
+    ) -> io::Result<Self> {
         let (master, slave) = open_pty(120, 40)?;
         let stdout = duplicate_fd(&slave)?;
         let stderr = duplicate_fd(&slave)?;
@@ -538,6 +602,9 @@ impl PtyProcess {
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_orca"));
         command.args(["--provider", "mock", "--cwd"]).arg(cwd);
+        if let Some(model) = model {
+            command.args(["--model", model]);
+        }
         if let Some(selector) = resume {
             command.args(["--resume", selector]);
         }
@@ -648,17 +715,7 @@ impl Drop for PtyProcess {
 }
 
 fn arm_idle_exit(process: &mut PtyProcess, output: &mut Vec<u8>) {
-    std::thread::sleep(Duration::from_millis(250));
-    process.drain_output(output);
-    process.write(&[0x03]).expect("send first idle Ctrl-C");
-    receive_until(
-        process,
-        output,
-        "Press Ctrl+C again to quit.",
-        Duration::from_secs(2),
-        "TUI did not arm idle exit",
-    );
-    process.write(&[0x03]).expect("send second idle Ctrl-C");
+    cancel_running_turn_and_exit(process, output);
 }
 
 fn cancel_running_turn_and_exit(process: &mut PtyProcess, output: &mut Vec<u8>) {

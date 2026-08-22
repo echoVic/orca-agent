@@ -6,6 +6,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use orca_core::config::RunConfig;
+use orca_core::conversation::{ImageInput, ImageSource};
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
@@ -19,12 +20,12 @@ use orca_runtime::surface::{
     SessionMetadataPrecondition, SessionMetadataRevision, Sha256Digest, StaleMutationError,
     SurfaceAllowDeny, SurfaceAttachmentRole, SurfaceCapability, SurfaceCatalogEntryId,
     SurfaceClientInteractionAnswer, SurfaceCursor, SurfaceEvent, SurfaceFactFamily, SurfaceGoal,
-    SurfaceGoalFence, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
-    SurfaceOperationId, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId,
-    SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence,
-    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput,
-    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
-    WorkflowControlAction, WorkflowPatch,
+    SurfaceGoalFence, SurfaceImageDetail, SurfaceImageSource, SurfaceInputRequest,
+    SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
+    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
+    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceUnavailableReason,
+    SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput, UncommittedMutation,
+    WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -1221,7 +1222,7 @@ pub(crate) fn set_goal_and_run_with_committed(
                     .map(|goal| ExpectedGoal::Exact(goal_fence(goal)))
                     .unwrap_or(ExpectedGoal::None),
                 token_budget: snapshot.goal.as_ref().and_then(|goal| goal.token_budget),
-                input: supplied_goal_input(objective.as_str())?,
+                input: supplied_goal_input(objective.as_str(), &[])?,
                 objective,
             })
         },
@@ -1247,7 +1248,33 @@ pub(crate) fn resume_goal_and_run(
                 .ok_or_else(|| io::Error::other("no goal is currently set"))?;
             Ok(GoalMutationAction::ResumeAndRun {
                 fence: goal_fence(goal),
-                input: supplied_goal_input(&prompt)?,
+                input: supplied_goal_input(&prompt, &[])?,
+            })
+        },
+    )
+}
+
+pub(crate) fn resume_goal_and_run_multimodal(
+    thread: &RuntimeSurfaceThreadHandle,
+    prompt: String,
+    images: Vec<ImageInput>,
+    controller: &TuiSurfaceTaskControl,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> io::Result<TuiHostedOperationOutcome> {
+    run_goal_mutation(
+        thread,
+        controller,
+        event_tx,
+        || {},
+        || {},
+        move |snapshot| {
+            let goal = snapshot
+                .goal
+                .as_ref()
+                .ok_or_else(|| io::Error::other("no goal is currently set"))?;
+            Ok(GoalMutationAction::ResumeAndRun {
+                fence: goal_fence(goal),
+                input: supplied_goal_input(&prompt, &images)?,
             })
         },
     )
@@ -1273,7 +1300,7 @@ pub(crate) fn resume_goal_and_run_with_started(
                 .ok_or_else(|| io::Error::other("no goal is currently set"))?;
             Ok(GoalMutationAction::ResumeAndRun {
                 fence: goal_fence(goal),
-                input: supplied_goal_input(&prompt)?,
+                input: supplied_goal_input(&prompt, &[])?,
             })
         },
     )
@@ -1385,15 +1412,48 @@ fn committed_goal_output(
     }
 }
 
-fn supplied_goal_input(prompt: &str) -> io::Result<GoalRunInput> {
+fn supplied_goal_input(prompt: &str, images: &[ImageInput]) -> io::Result<GoalRunInput> {
+    let mut blocks = vec![SurfaceInputRequestBlock::Text {
+        text: DisplayText::new(prompt),
+    }];
+    blocks.extend(images.iter().map(surface_image_block));
     Ok(GoalRunInput::Supplied {
         request: SurfaceInputRequest {
-            blocks: NonEmptyVec::try_new(vec![SurfaceInputRequestBlock::Text {
-                text: DisplayText::new(prompt),
-            }])
-            .map_err(|error| io::Error::other(error.to_string()))?,
+            blocks: NonEmptyVec::try_new(blocks)
+                .map_err(|error| io::Error::other(error.to_string()))?,
         },
     })
+}
+
+fn surface_image_block(image: &ImageInput) -> SurfaceInputRequestBlock {
+    let detail = match image.detail {
+        orca_core::conversation::ImageDetail::Low => SurfaceImageDetail::Low,
+        orca_core::conversation::ImageDetail::High => SurfaceImageDetail::High,
+        orca_core::conversation::ImageDetail::Original => SurfaceImageDetail::Original,
+        orca_core::conversation::ImageDetail::Auto => SurfaceImageDetail::Auto,
+    };
+    let source = match &image.source {
+        ImageSource::Base64 { media_type, data } => SurfaceImageSource::Base64 {
+            media_type: orca_runtime::surface::CanonicalMime::try_new(media_type.clone())
+                .expect("validated image MIME"),
+            data: data.clone(),
+            digest: Sha256Digest::digest(
+                &base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    data.as_bytes(),
+                )
+                .expect("validated image base64"),
+            ),
+        },
+        ImageSource::Url { url } => SurfaceImageSource::Url {
+            url: orca_runtime::surface::CanonicalUri::try_new(url.clone())
+                .expect("validated image URL"),
+        },
+        ImageSource::File { file_id } => SurfaceImageSource::File {
+            file_id: NonEmptyText::try_new(file_id.clone()).expect("validated image file id"),
+        },
+    };
+    SurfaceInputRequestBlock::Image { source, detail }
 }
 
 fn goal_fence(goal: &SurfaceGoal) -> SurfaceGoalFence {
@@ -1755,16 +1815,16 @@ fn run_typed_surface(
     for event in projection.hydrate_open_streams() {
         let _ = event_tx.send(event);
     }
+    let mut input_blocks = vec![SurfaceInputRequestBlock::Text {
+        text: orca_runtime::surface::DisplayText::new(request.prompt()),
+    }];
+    input_blocks.extend(request.images().iter().map(surface_image_block));
     let intent = OperationRequestIntent {
         correlation: OperationIngressCorrelation::TuiUser,
         kind: OperationKind::UserTurn,
         input: Some(SurfaceInputRequest {
-            blocks: orca_runtime::surface::NonEmptyVec::try_new(vec![
-                SurfaceInputRequestBlock::Text {
-                    text: orca_runtime::surface::DisplayText::new(request.prompt()),
-                },
-            ])
-            .map_err(|error| io::Error::other(error.to_string()))?,
+            blocks: orca_runtime::surface::NonEmptyVec::try_new(input_blocks)
+                .map_err(|error| io::Error::other(error.to_string()))?,
         }),
         replayability: ReplayabilityRequest::CaptureReplayableCapsule,
         settings_preparation: OperationSettingsPreparation::UseCurrent {

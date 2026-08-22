@@ -299,6 +299,7 @@ fn task_actor_routes_model_turn_and_updates_cost_model() {
         &ModelSelection::from_unchecked(Some("auto".to_string())),
         &SubagentType::General,
         None,
+        false,
         &provider_config,
         &mut cost_tracker,
     );

@@ -8,7 +8,7 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
 };
-use orca_core::conversation::{Message, RawToolCall};
+use orca_core::conversation::{ImageInput, Message, RawToolCall};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventEnvelope;
 use orca_core::plan_types::PlanItem;
@@ -289,6 +289,8 @@ pub(crate) enum StoredMessage {
     },
     User {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageInput>,
         #[serde(default)]
         pinned: bool,
     },
@@ -453,6 +455,8 @@ enum StoredMessageWire {
     User {
         content: String,
         #[serde(default)]
+        images: Vec<ImageInput>,
+        #[serde(default)]
         pinned: bool,
     },
     Assistant {
@@ -479,7 +483,15 @@ impl<'de> Deserialize<'de> for StoredMessage {
     {
         match StoredMessageWire::deserialize(deserializer)? {
             StoredMessageWire::System { content, pinned } => Ok(Self::System { content, pinned }),
-            StoredMessageWire::User { content, pinned } => Ok(Self::User { content, pinned }),
+            StoredMessageWire::User {
+                content,
+                images,
+                pinned,
+            } => Ok(Self::User {
+                content,
+                images,
+                pinned,
+            }),
             StoredMessageWire::Assistant {
                 content,
                 reasoning_content,
@@ -516,8 +528,13 @@ impl From<&Message> for StoredMessage {
                 content: content.clone(),
                 pinned: *pinned,
             },
-            Message::User { content, pinned } => Self::User {
+            Message::User {
+                content,
+                images,
+                pinned,
+            } => Self::User {
                 content: content.clone(),
+                images: images.clone(),
                 pinned: *pinned,
             },
             Message::Assistant {
@@ -550,7 +567,15 @@ impl From<StoredMessage> for Message {
     fn from(message: StoredMessage) -> Self {
         match message {
             StoredMessage::System { content, pinned } => Self::System { content, pinned },
-            StoredMessage::User { content, pinned } => Self::User { content, pinned },
+            StoredMessage::User {
+                content,
+                images,
+                pinned,
+            } => Self::User {
+                content,
+                images,
+                pinned,
+            },
             StoredMessage::Assistant {
                 content,
                 reasoning_content,

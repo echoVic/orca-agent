@@ -72,7 +72,7 @@ Orchestration:
 context = [system_prompt] + [project_context] + [recent_turns] + [current_turn_scratch]
 ```
 
-The runtime also checks context size at this phase and triggers compaction if the window exceeds 85% of the 1M token limit.
+The runtime also checks context size at this phase and triggers compaction if the window exceeds 85% of the 1M token limit. Each model-visible window has a stable `ContextWindowId`: usage updates and resume retain it, successful compaction advances it, and forks start with a distinct identity.
 
 ### Phase 2: Provider Call
 
@@ -82,11 +82,18 @@ Orca sends the assembled context to the DeepSeek API with:
 - **Temperature** — controls output randomness
 - **Reasoning effort** — thinking depth (`low`, `medium`, `high`)
 - **Tool schema** — the set of available tools (file edit, shell, grep, glob, etc.)
+- **Image blocks** — sent directly to `deepseek-v4-flash-vision-exp`, or
+  converted into task-aware visual context before `auto`, Pro, or Flash runs
 
 The model responds with a stream of:
 - **Reasoning tokens** — internal chain-of-thought (not shown to user by default)
 - **Tool calls** — structured requests to use tools
 - **Text responses** — natural language output
+
+Provider stream normalization, usage projection, response completion, retry
+failure cleanup, and compaction decisions are owned by the generation-context
+controller. The main thread actor only coordinates mailbox dispatch, fences,
+and cross-controller commits.
 
 ### Phase 3: Tool Dispatch
 

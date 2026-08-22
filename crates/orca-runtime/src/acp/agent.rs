@@ -22,6 +22,7 @@ use agent_client_protocol::{
     SessionCapabilities, SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall,
     ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
+use base64::Engine as _;
 use orca_core::config::{AdditionalWorkingDirectory, HistoryMode, RunConfig};
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 use serde::{Deserialize, Serialize};
@@ -35,13 +36,13 @@ use crate::surface::{
     OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
     Sha256Digest, SurfaceAllowDeny, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability,
-    SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceInputRequest,
-    SurfaceInputRequestBlock, SurfaceInteractionId, SurfaceInteractionKind,
-    SurfaceInteractionRequest, SurfaceInteractionRoute, SurfaceInteractionView,
-    SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest, SurfaceOperationId,
-    SurfacePermissionClientDecision, SurfacePermissionProfile, SurfaceRequestId, SurfaceSchema,
-    SurfaceSubscriptionItem, SurfaceToolResultKind, SurfaceUserInputDecision, ToolPatch,
-    TurnRequestBudgetScope, UncommittedMutation,
+    SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceImageDetail,
+    SurfaceImageSource, SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionId,
+    SurfaceInteractionKind, SurfaceInteractionRequest, SurfaceInteractionRoute,
+    SurfaceInteractionView, SurfaceMcpElicitationDecision, SurfaceMcpElicitationRequest,
+    SurfaceOperationId, SurfacePermissionClientDecision, SurfacePermissionProfile,
+    SurfaceRequestId, SurfaceSchema, SurfaceSubscriptionItem, SurfaceToolResultKind,
+    SurfaceUserInputDecision, ToolPatch, TurnRequestBudgetScope, UncommittedMutation,
 };
 
 use crate::runtime_surface::{
@@ -53,6 +54,9 @@ use crate::runtime_surface::{
 pub(crate) const ACP_NOTIFICATION_CAPACITY: usize = 256;
 const ACP_INTERACTION_REQUEST_CAPACITY: usize = 64;
 const ACP_TERMINAL_CLEANUP_REQUEST_CAPACITY: usize = 32;
+const ACP_MAX_IMAGE_COUNT: usize = 600;
+const ACP_MAX_INLINE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const ACP_MAX_IMAGE_URL_BYTES: usize = 8_192;
 const ORCA_ACP_INTERACTION_EXTENSION_VERSION: u32 = 1;
 pub(crate) const ORCA_ACP_INTERACTION_CAPABILITIES_META_KEY: &str =
     "orca.dev/interactionCapabilities";
@@ -1241,11 +1245,66 @@ fn decode_prompt_content(
     client_capabilities: AcpClientCapabilityProfile,
 ) -> Result<SurfaceInputRequest, String> {
     let mut decoded = Vec::with_capacity(blocks.len());
+    let mut image_count = 0usize;
+    let mut inline_image_bytes = 0usize;
     for block in blocks {
         match block {
             ContentBlock::Text(text) => {
                 decoded.push(SurfaceInputRequestBlock::Text {
                     text: DisplayText::new(text.text.clone()),
+                });
+            }
+            ContentBlock::Image(image) => {
+                image_count = image_count.saturating_add(1);
+                if image_count > ACP_MAX_IMAGE_COUNT {
+                    return Err(format!(
+                        "ACP prompt exceeds the {ACP_MAX_IMAGE_COUNT}-image limit"
+                    ));
+                }
+                let media_type = CanonicalMime::try_new(image.mime_type.clone())
+                    .map_err(|error| format!("invalid ACP image MIME: {error}"))?;
+                if !matches!(
+                    media_type.as_str(),
+                    "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+                ) {
+                    return Err(format!(
+                        "unsupported ACP image MIME: {}",
+                        media_type.as_str()
+                    ));
+                }
+                let source = if let Some(uri) = image.uri.as_ref() {
+                    if !uri.starts_with("https://") && !uri.starts_with("http://") {
+                        return Err("ACP image URI must use http or https".to_string());
+                    }
+                    if uri.len() > ACP_MAX_IMAGE_URL_BYTES {
+                        return Err(format!(
+                            "ACP image URI exceeds {ACP_MAX_IMAGE_URL_BYTES} bytes"
+                        ));
+                    }
+                    SurfaceImageSource::Url {
+                        url: CanonicalUri::try_new(uri.clone())
+                            .map_err(|error| format!("invalid ACP image URI: {error}"))?,
+                    }
+                } else {
+                    let decoded_image = base64::engine::general_purpose::STANDARD
+                        .decode(image.data.as_bytes())
+                        .map_err(|_| "ACP image data is not valid base64".to_string())?;
+                    inline_image_bytes = inline_image_bytes.saturating_add(decoded_image.len());
+                    if inline_image_bytes > ACP_MAX_INLINE_IMAGE_BYTES {
+                        return Err(format!(
+                            "ACP image input exceeds Orca's {} MiB inline limit",
+                            ACP_MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+                        ));
+                    }
+                    SurfaceImageSource::Base64 {
+                        media_type,
+                        data: image.data.clone(),
+                        digest: Sha256Digest::new(Sha256::digest(&decoded_image).into()),
+                    }
+                };
+                decoded.push(SurfaceInputRequestBlock::Image {
+                    source,
+                    detail: SurfaceImageDetail::High,
                 });
             }
             ContentBlock::ResourceLink(link) => {
@@ -1301,12 +1360,13 @@ fn decode_prompt_content(
                     );
                 }
             },
-            _ => {
+            ContentBlock::Audio(_) => {
                 return Err(format!(
                     "unsupported ACP prompt content block: {}",
                     content_block_name(block)
                 ));
             }
+            _ => return Err("unsupported ACP prompt content block: unknown".to_string()),
         }
     }
     let blocks = NonEmptyVec::try_new(decoded)
@@ -2909,18 +2969,117 @@ mod tests {
     }
 
     #[test]
-    fn prompt_content_rejects_binary_blocks_before_surface_reservation() {
+    fn prompt_content_maps_image_blocks_before_surface_reservation() {
         use agent_client_protocol::ImageContent;
 
+        for media_type in ["image/jpeg", "image/png", "image/gif", "image/webp"] {
+            let decoded = decode_prompt_content(
+                &[ContentBlock::Image(ImageContent::new(
+                    "aGVsbG8=", media_type,
+                ))],
+                AcpClientCapabilityProfile::negotiated_for_test(),
+            )
+            .expect("supported image content");
+            assert!(matches!(
+                decoded.blocks.as_slice(),
+                [SurfaceInputRequestBlock::Image {
+                    source: SurfaceImageSource::Base64 {
+                        media_type: actual_media_type,
+                        data,
+                        digest,
+                    },
+                    detail: SurfaceImageDetail::High,
+                }] if actual_media_type.as_str() == media_type
+                    && data == "aGVsbG8="
+                    && digest == &Sha256Digest::new(Sha256::digest(b"hello").into())
+            ));
+        }
+    }
+
+    #[test]
+    fn prompt_content_maps_http_image_uri_before_surface_reservation() {
+        use agent_client_protocol::ImageContent;
+
+        let decoded = decode_prompt_content(
+            &[ContentBlock::Image(
+                ImageContent::new("", "image/png").uri("https://example.test/image.png"),
+            )],
+            AcpClientCapabilityProfile::negotiated_for_test(),
+        )
+        .expect("supported image URI");
+        assert!(matches!(
+            decoded.blocks.as_slice(),
+            [SurfaceInputRequestBlock::Image {
+                source: SurfaceImageSource::Url { url },
+                detail: SurfaceImageDetail::High,
+            }] if url.as_str() == "https://example.test/image.png"
+        ));
+    }
+
+    #[test]
+    fn prompt_content_rejects_every_invalid_image_boundary_before_surface_reservation() {
+        use agent_client_protocol::ImageContent;
+
+        let cases = [
+            (
+                ImageContent::new("AA==", "not a mime"),
+                "invalid ACP image MIME",
+            ),
+            (
+                ImageContent::new("AA==", "image/bmp"),
+                "unsupported ACP image MIME",
+            ),
+            (
+                ImageContent::new("", "image/png").uri("file:///tmp/image.png"),
+                "ACP image URI must use http or https",
+            ),
+            (
+                ImageContent::new("not-base64", "image/png"),
+                "ACP image data is not valid base64",
+            ),
+        ];
+        for (image, expected) in cases {
+            let error = decode_prompt_content(
+                &[ContentBlock::Image(image)],
+                AcpClientCapabilityProfile::negotiated_for_test(),
+            )
+            .expect_err(expected);
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let oversized_uri = format!(
+            "https://example.test/{}",
+            "a".repeat(ACP_MAX_IMAGE_URL_BYTES)
+        );
+        let error = decode_prompt_content(
+            &[ContentBlock::Image(
+                ImageContent::new("", "image/png").uri(oversized_uri),
+            )],
+            AcpClientCapabilityProfile::negotiated_for_test(),
+        )
+        .expect_err("oversized image URI");
+        assert!(error.contains("ACP image URI exceeds"));
+
+        let oversized_data =
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0u8; ACP_MAX_INLINE_IMAGE_BYTES + 1]);
         let error = decode_prompt_content(
             &[ContentBlock::Image(ImageContent::new(
-                "base64-payload",
+                oversized_data,
                 "image/png",
             ))],
             AcpClientCapabilityProfile::negotiated_for_test(),
         )
-        .expect_err("image content lacks a frozen runtime mapping");
-        assert!(error.contains("unsupported ACP prompt content block: image"));
+        .expect_err("oversized inline image");
+        assert!(error.contains("inline limit"));
+
+        let images = (0..=ACP_MAX_IMAGE_COUNT)
+            .map(|_| ContentBlock::Image(ImageContent::new("AA==", "image/png")))
+            .collect::<Vec<_>>();
+        let error =
+            decode_prompt_content(&images, AcpClientCapabilityProfile::negotiated_for_test())
+                .expect_err("too many images");
+        assert!(error.contains("image limit"));
     }
 
     #[test]

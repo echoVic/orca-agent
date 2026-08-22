@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use orca_core::config::RunConfig;
 use orca_core::goal_types::ThreadGoal;
-use orca_runtime::mentions::{MentionBindings, MentionCatalog};
+use orca_runtime::mentions::{ExpandedPrompt, MentionBindings, MentionCatalog};
 use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
     NonEmptyVec, RuntimeSettingsPatch, RuntimeSurfaceThreadHandle, SurfaceSettingsSnapshot,
@@ -212,9 +212,9 @@ impl TuiSurfaceActions {
         bindings: &MentionBindings,
         cwd: &Path,
         workspace_roots: &[PathBuf],
-    ) -> Result<String, String> {
+    ) -> Result<ExpandedPrompt, String> {
         self.thread
-            .expand_mentions(input, bindings, cwd, workspace_roots)
+            .expand_mentions_for_model(input, bindings, cwd, workspace_roots)
     }
 
     pub(crate) fn discover_mention_catalog(&self, roots: &[PathBuf]) -> MentionCatalog {
@@ -276,6 +276,22 @@ impl TuiSurfaceActions {
         event_tx: &mpsc::Sender<TuiEvent>,
     ) -> io::Result<TuiHostedOperationOutcome> {
         crate::surface_client::resume_goal_and_run(&self.thread, prompt, control, event_tx)
+    }
+
+    pub(crate) fn resume_goal_and_run_multimodal(
+        &self,
+        prompt: String,
+        images: Vec<orca_core::conversation::ImageInput>,
+        control: &TuiSurfaceTaskControl,
+        event_tx: &mpsc::Sender<TuiEvent>,
+    ) -> io::Result<TuiHostedOperationOutcome> {
+        crate::surface_client::resume_goal_and_run_multimodal(
+            &self.thread,
+            prompt,
+            images,
+            control,
+            event_tx,
+        )
     }
 
     pub(crate) fn resume_goal_and_run_with_started(

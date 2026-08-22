@@ -123,6 +123,8 @@ pub struct PromptQueueInput {
     pub text: String,
     #[serde(default)]
     pub mention_bindings: crate::mentions::MentionBindings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<orca_core::conversation::ImageInput>,
 }
 
 impl PromptQueueInput {
@@ -131,6 +133,7 @@ impl PromptQueueInput {
         Self {
             mention_bindings: crate::mentions::MentionBindings::new(&text),
             text,
+            images: Vec::new(),
         }
     }
 }
@@ -444,7 +447,7 @@ fn normalized_input(
 ) -> Result<PromptQueueInput, PromptQueueMutationError> {
     input.text = input.text.trim().to_string();
     input.mention_bindings.reconcile(&input.text);
-    if input.text.is_empty() {
+    if input.text.is_empty() && input.images.is_empty() {
         return Err(PromptQueueMutationError::InvalidInput {
             message: "queued input must not be blank".to_string(),
             current: current.clone(),
@@ -525,6 +528,32 @@ mod tests {
             ),
             Err(PromptQueueMutationError::RevisionConflict { .. })
         ));
+    }
+
+    #[test]
+    fn image_only_input_is_not_rejected_as_blank() {
+        let mut state = PromptQueueState::from_snapshot(PromptQueueSnapshot::default());
+        let snapshot = state
+            .apply(
+                PromptQueueAction::Add {
+                    input: PromptQueueInput {
+                        text: String::new(),
+                        mention_bindings: crate::mentions::MentionBindings::default(),
+                        images: vec![orca_core::conversation::ImageInput {
+                            source: orca_core::conversation::ImageSource::Url {
+                                url: "https://example.com/image.png".to_string(),
+                            },
+                            detail: orca_core::conversation::ImageDetail::High,
+                        }],
+                    },
+                },
+                1,
+            )
+            .expect("queue image-only input");
+
+        assert_eq!(snapshot.items.len(), 1);
+        assert!(snapshot.items[0].input.text.is_empty());
+        assert_eq!(snapshot.items[0].input.images.len(), 1);
     }
 
     #[test]

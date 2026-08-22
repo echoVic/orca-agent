@@ -327,9 +327,13 @@ pub(crate) fn hosted_tui_controller_loop(
                 &pending_workflow_notifications,
                 &host,
             ),
-            Ok(UserAction::SubmitWithMentions { prompt, bindings }) => {
+            Ok(UserAction::SubmitWithMentions {
+                prompt,
+                bindings,
+                images,
+            }) => {
                 handle_hosted_submitted_turn(
-                    SubmittedTurn::user_with_mentions(prompt, bindings),
+                    SubmittedTurn::user_with_mentions(prompt, bindings, images),
                     &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                     &preloaded,
                     &mut thread,
@@ -339,10 +343,15 @@ pub(crate) fn hosted_tui_controller_loop(
                     &host,
                 );
             }
-            Ok(UserAction::QueuePrompt { prompt, bindings }) => {
+            Ok(UserAction::QueuePrompt {
+                prompt,
+                bindings,
+                images,
+            }) => {
                 handle_hosted_queued_prompt(
                     prompt,
                     bindings,
+                    images,
                     &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                     &preloaded,
                     &mut thread,
@@ -381,9 +390,10 @@ pub(crate) fn hosted_tui_controller_loop(
                 id,
                 prompt,
                 bindings,
+                images,
             }) => {
                 handle_hosted_submitted_turn(
-                    SubmittedTurn::queued_user_with_mentions(id, prompt, bindings),
+                    SubmittedTurn::queued_user_with_mentions(id, prompt, bindings, images),
                     &hosted_config_for_active(side_parent.as_ref(), thread.as_ref(), &config),
                     &preloaded,
                     &mut thread,
@@ -415,7 +425,9 @@ pub(crate) fn hosted_tui_controller_loop(
                     &event_tx,
                 );
             }
-            Ok(UserAction::Interrupt) | Ok(UserAction::BackgroundCurrentTurn) => {}
+            Ok(UserAction::Interrupt)
+            | Ok(UserAction::BackgroundCurrentTurn)
+            | Ok(UserAction::PasteImages { .. }) => {}
             Ok(UserAction::ResumeOperation { operation_id }) => {
                 handle_hosted_operation_action(
                     HostedOperationAction::Resume { operation_id },

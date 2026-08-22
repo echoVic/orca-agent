@@ -5,7 +5,7 @@ use super::commands::{
 };
 use super::identity::{
     ByteCount, ByteOffset, CanonicalBackgroundFenceV1, CanonicalSurfaceScopeV1, CommitClass,
-    CursorSourceRevision, DisplayText, InteractionRevision, NonEmptyText,
+    ContextWindowId, CursorSourceRevision, DisplayText, InteractionRevision, NonEmptyText,
     PinnedContextSourceRevision, ResponseRouteEpoch, SafeDiagnosticText, SequenceNumber,
     Sha256Digest, SurfaceCommitId, SurfaceCursor, SurfaceEventId, SurfaceFinalizeIntentId,
     SurfaceGenerationId, SurfaceGoalId, SurfaceGoalIntentId, SurfaceGoalOuterTurnId,
@@ -1424,8 +1424,28 @@ fn apply_event(
             Ok(())
         }
         SurfaceEvent::Context(context) => {
+            let mut context = context.clone();
+            if context.window_id.is_legacy_unspecified() {
+                context.window_id = match (&state.snapshot.context.compaction, &context.compaction)
+                {
+                    (
+                        CompactionState::Running {
+                            operation_id: before,
+                            ..
+                        },
+                        CompactionState::Completed {
+                            operation_id: after,
+                            ..
+                        },
+                    ) if before == after => {
+                        ContextWindowId::for_compaction(&state.snapshot.context.window_id, after)
+                    }
+                    _ => state.snapshot.context.window_id.clone(),
+                };
+            }
             if state.snapshot.context.revision.get().checked_add(1) != Some(context.revision.get())
                 || context.used_tokens > context.limit_tokens
+                || !context_window_transition_valid(&state.snapshot.context, &context)
                 || matches!(
                     context.compaction,
                     CompactionState::Completed {
@@ -1443,7 +1463,7 @@ fn apply_event(
                     "context revision or counters are invalid",
                 ));
             }
-            state.snapshot.context = context.clone();
+            state.snapshot.context = context;
             Ok(())
         }
         SurfaceEvent::Task(patch) => apply_task_patch(&mut state.snapshot, envelope, patch),
@@ -1468,6 +1488,30 @@ fn apply_event(
             apply_pinned_context_patch(&mut state.snapshot, envelope, patch)
         }
         SurfaceEvent::Session(patch) => apply_session_patch(state, envelope, patch),
+    }
+}
+
+fn context_window_transition_valid(
+    current: &SurfaceContextSnapshot,
+    next: &SurfaceContextSnapshot,
+) -> bool {
+    let advances_window = matches!(
+        (&current.compaction, &next.compaction),
+        (
+            CompactionState::Running {
+                operation_id: before,
+                ..
+            },
+            CompactionState::Completed {
+                operation_id: after,
+                ..
+            }
+        ) if before == after
+    );
+    if advances_window {
+        current.window_id != next.window_id
+    } else {
+        current.window_id == next.window_id
     }
 }
 
@@ -8336,6 +8380,46 @@ pub(crate) mod tests {
         bytes
     }
 
+    #[test]
+    fn context_window_identity_advances_only_after_successful_compaction() {
+        let operation_id = SurfaceOperationId::try_from_bytes(uuid_v7_bytes(91)).unwrap();
+        let window_id = ContextWindowId::new();
+        let current = SurfaceContextSnapshot {
+            revision: ContextRevision::try_new(1).unwrap(),
+            window_id: window_id.clone(),
+            used_tokens: 100,
+            limit_tokens: 1_000,
+            compaction: CompactionState::Running {
+                operation_id: operation_id.clone(),
+                reason: CompactionReason::Manual,
+                before_messages: 10,
+            },
+            fragments: Vec::new(),
+            provider_replay: ProviderReplayHealth::None,
+        };
+        let mut completed = current.clone();
+        completed.revision = ContextRevision::try_new(2).unwrap();
+        completed.compaction = CompactionState::Completed {
+            operation_id,
+            reason: CompactionReason::Manual,
+            strategy: NonEmptyText::try_new("remote_summary").unwrap(),
+            before_messages: 10,
+            after_messages: 4,
+            collapsed_messages: 6,
+            status_text: DisplayText::new("compacted"),
+        };
+
+        assert!(!context_window_transition_valid(&current, &completed));
+        completed.window_id = ContextWindowId::new();
+        assert!(context_window_transition_valid(&current, &completed));
+
+        let mut usage_update = completed.clone();
+        usage_update.revision = ContextRevision::try_new(3).unwrap();
+        assert!(context_window_transition_valid(&completed, &usage_update));
+        usage_update.window_id = ContextWindowId::new();
+        assert!(!context_window_transition_valid(&completed, &usage_update));
+    }
+
     pub(crate) fn thread_id() -> SurfaceThreadId {
         SurfaceThreadId::try_from_bytes([1; 16]).unwrap()
     }
@@ -8505,6 +8589,7 @@ pub(crate) mod tests {
             },
             context: SurfaceContextSnapshot {
                 revision: ContextRevision::try_new(1).unwrap(),
+                window_id: ContextWindowId::initial_for_thread(&thread_id()),
                 used_tokens: 0,
                 limit_tokens: 128_000,
                 compaction: CompactionState::Idle,

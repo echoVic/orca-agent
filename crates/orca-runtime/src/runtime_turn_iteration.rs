@@ -61,7 +61,7 @@ impl RuntimeTurnIterationStep {
         let turn_context = input.request.turn_context;
         let continuation = turn_context.continuation.clone();
 
-        let turn_provider_config = {
+        let (turn_provider_config, image_route) = {
             let (conversation, history_writer) = input.prepared_conversation.parts_mut();
             match self.opening_step.open(RuntimeTurnOpeningInput {
                 actor: input.actor,
@@ -79,7 +79,10 @@ impl RuntimeTurnIterationStep {
                 model_override: input.loop_state.model_override,
                 cost_tracker: input.loop_state.cost_tracker,
             })? {
-                RuntimeTurnOpeningResult::Continue { provider_config } => provider_config,
+                RuntimeTurnOpeningResult::Continue {
+                    provider_config,
+                    image_route,
+                } => (provider_config, image_route),
                 RuntimeTurnOpeningResult::Return(result) => {
                     return Ok(RuntimeTurnIterationResult::Return(result));
                 }
@@ -94,6 +97,7 @@ impl RuntimeTurnIterationStep {
                 continuation,
                 turn_context,
                 turn_provider_config: &turn_provider_config,
+                image_route,
                 runtime_system_messages: input.loop_state.runtime_system_messages,
                 context_config: input.provider_context.context_config,
                 base_provider_config: input.provider_context.provider_config,

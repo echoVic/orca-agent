@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.0":
+        "Adds complete image input across every model selection: the vision model receives images directly, while auto, Pro, and Flash use a task-aware vision analysis before continuing with the selected coding model. Ctrl+V system-clipboard paste, Windows Alt+V, forwarded Cmd+V, dragged or pasted image paths and file URLs, and @file mentions become atomic [Image #N] attachments with composer previews, message-area thumbnails, and a zoomable viewer. Kitty, Ghostty, iTerm2, and WezTerm render native-pixel previews, while other terminals retain a true-color cell fallback. Background reads, request fencing, paste-before-send ordering, image-only turns, queue editing, rejection recovery, durable history, ACP image blocks, and provider replay preserve the same typed input across macOS, Linux, Windows, and WSL. RuntimeHost also delegates generation context, interaction routing, operation recovery, Goal control, and task/workflow ownership to focused controllers, with stable ContextWindowId compaction epochs.",
       "v0.3.26":
         "Makes the unsandboxed shell permission an explicit, reusable, session-scoped capability. The turn permission overlay and its delta now carry the capability with merge and apply semantics that preserve it, bash consumes it before prompting so a granted session never re-asks, and grants are recorded only after an allow response. Session-scope allow responses persist the capability into thread settings and JSONL metadata, restore it into every new turn and command_exec operation, validate grant deltas against the requested profile, and cannot be silently revoked.",
       "v0.3.25":
@@ -614,6 +616,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.0":
+        "完整接入 deepseek-v4-flash-vision-exp 图片输入：Ctrl+V 系统剪贴板、Windows Alt+V、终端转发的 Cmd+V、拖入或粘贴图片路径与 file URL、@file mention 都会形成原子的 [Image #N] 附件；Kitty、Ghostty、iTerm2 和 WezTerm 使用原生像素预览，其他终端保留真彩色字符降级。后台读取、request fence、先粘贴后提交顺序、纯图片回合、队列编辑、失败恢复、持久化历史、ACP 图片块与 provider replay 在 macOS、Linux、Windows 和 WSL 上共用同一类型化输入链路。RuntimeHost 同时把 generation context、interaction routing、operation recovery、Goal control 与 task/workflow ownership 下沉到专用 controller，并以稳定 ContextWindowId 标识 compaction epoch。",
       "v0.3.26":
         "把 unsandboxed shell 权限变成显式、可复用、会话级的能力。turn 权限 overlay 与其 delta 现在携带该能力，合并与应用语义保证它不会被无关权限更新抹掉；bash 在请求前先消费该能力，会话一旦授权就不再重复弹窗，且授权只在 allow 响应后记录。会话级 allow 会把能力持久化到 thread settings 与 JSONL 元数据，并在每个新 turn 和 command_exec 操作中恢复；授权 delta 会按请求 profile 校验，且一旦授予就不能被静默撤销。",
       "v0.3.25":

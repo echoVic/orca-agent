@@ -3,7 +3,21 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-20
+Last updated: 2026-08-22
+
+The v0.4.0 release adds complete image input across every model selection: TUI
+clipboard images, dragged or pasted image paths and `file://` URLs, `@file`
+image mentions, and ACP image blocks all enter the same typed runtime surface.
+The vision model consumes images directly; `auto`, Pro, and Flash persist a
+task-aware vision analysis before the selected coding model continues.
+Clipboard reads run off the renderer thread, `[Image #N]` attachments are
+atomic, paste-before-send ordering is fenced, and queue editing or rejected
+submissions restore the image bytes. Composer previews and message-area
+thumbnails open into a zoomable, pannable viewer using terminal-compatible
+true-color cells. Native macOS, Linux, Windows, and WSL paths are covered; SSH
+without a graphical clipboard uses a remote image path. The same release
+completes the `ThreadActor` controller split and gives each compacted context
+epoch a stable `ContextWindowId`.
 
 The v0.3.25 release publishes the checkpointable child-agent continuation
 lineage together with the runtime-owned durable prompt queue and Codex-style
@@ -117,7 +131,9 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.3.26 makes the unsandboxed shell permission an
+Current baseline: v0.4.0 adds DeepSeek vision and the complete TUI/ACP image
+input path, completes the focused `ThreadActor` controller split, and adds
+stable context-window epochs. v0.3.26 makes the unsandboxed shell permission an
 explicit, reusable, session-scoped capability: the turn permission overlay
 carries it with merge, delta, and apply semantics, bash consumes it before
 prompting, grants are recorded only on allow, and session-scope allow
@@ -1653,9 +1669,9 @@ working baseline used to prioritize the next patch releases.
 | File discovery | `glob` remains model-facing; interactive discovery now uses multi-root streaming `orca-file-search` with browse/fuzzy modes, exclude/Git-ignore controls, owned cancellation, million-path acceptance gates, and Codex-compatible app-server sessions | Claude `Glob`, Codex file search | Implemented |
 | Mention system | Files, Skills, Plugins, MCP Resources, and Resource Templates share one typed candidate model in TUI and thread-bound app-server search; visible tokens carry hidden atomic targets that survive preceding edits, invalidate on overlap, and expand against the selected root/registry | Codex atomic structured input and unified mentions; Claude resource/file typeahead | Implemented |
 | Shell execution | A thread-owned `TerminalService` exposes model-facing `exec_command` and `write_stdin` with retained session/task ids, optional PTY, raw control-character input, bounded incremental output, active permission-profile sandboxing, and immediate `task_stop` process-tree termination. A bounded-mailbox, single-owner supervisor actively reaps natural exits and registry stop requests without another poll, releases per-session resources, joins on shutdown, and injects exactly-once bounded completion notifications before the next model turn unless the terminal was already observed. Synchronous `bash` and JSONL server shell adapters remain compatible over the same low-level shell-session manager | Codex `exec_command` streaming/exit watcher; Grok Build exit watcher and completion notification | Implemented |
-| Context management | BPE token counting, local compaction, persisted collapse/summary records | Multi-level local/remote compaction | Partial |
+| Context management | BPE token counting, local compaction, persisted collapse/summary records, and a stable `ContextWindowId` per model-visible epoch | Multi-level local/remote compaction | Partial |
 | Tool output control | Runtime task output uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output. v0.2.24 additionally caps ordinary child stdout/stderr at 1 MiB per stream before final tool-result truncation, preserves omission metadata, and bounds regular-file reads, exact edits, and committed TUI diff previews at admission | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial; v0.2.24 published, persistent offset polling remains open |
-| Model metadata | `ModelSelection` plus DeepSeek defaults | Codex `models-manager` with model capability metadata | Partial |
+| Model metadata | `ModelSelection`, DeepSeek defaults, typed direct-vs-analysis image routing, and `deepseek-v4-flash-vision-exp` visual preprocessing for `auto`, Pro, and Flash | Codex `models-manager` with model capability metadata | Partial |
 | MCP | stdio/SSE config surface, tool routing, read-only resource list/read/template tools, unified Mention discovery, same-registry Resource expansion, and v0.2.24 timeout/cancel/error/drop cleanup with bounded stdio response framing and process reaping | Codex MCP client/server ecosystem | Partial; resource/tool/Mention integration and lifecycle hardening seeded |
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
 | Project instructions | User/project/rules files with includes | `AGENTS.md` style layered instructions | Implemented |
@@ -1663,8 +1679,8 @@ working baseline used to prioritize the next patch releases.
 | Execution budget | One `BudgetController` per operation owns independently optional `[budget]` dimensions (`max_turns`, `max_tool_calls`, `max_cost_usd_micros`, `max_wall_time_ms`); unlimited by default with no implicit 128-turn ceiling. Journal schema v2 durably records the immutable spec and cumulative `budget.usage`, so restart and provider-suspension settlement restore the same wall deadline and exactly-once provider accounting. A typed `OperationTerminal` (Completed/Stopped/Failed/Cancelled) is the one terminal fact every surface consumes; budget stops settle the current tool, create a checkpoint, and exit 4. Concurrent child agents atomically split the parent's actual remaining additive capacity under `BudgetLease`s, share one wall-clock deadline, and report complete consumed usage; the journal orders `tool.completed` → `checkpoint.created` → `operation.terminal` durably and restores unmatched tool starts as indeterminate. Goals own a cumulative token budget; exhausted Goal budgets disable automatic continuation | Codex/Grok explicit budgets, Claude Code checkpoints | Implemented |
 | Persistent goals | Runtime-owned `GoalActor` and composite `GoalRun` with SQLite state, run/turn ledgers, verified terminal intents, recovery, cancellation, usage, semantic continuation admission, cumulative timing, and goal-scoped `get_goal`, `create_goal`, and narrow `update_goal`. There is no fixed turn ceiling; continuation count is observability data only | Codex goal extension plus explicit call context patterns in Claude Code and Grok Build | Implemented |
 | Workflows | JavaScript workflow DSL, generated drafts, edit/save/run controls, reusable workflow commands, task state, notifications, runtime status events, evidence-bound reports, and worktree-isolated/recoverable agent runs | Codex/Claude workflow orchestration concepts | Implemented |
-| Runtime lifecycle | Headless, server-mode, and TUI agent runs seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` owns long-lived interactive state, and focused server processors/managers handle queries, turn control, shell and command execution, permission/user-input responses, and submit operations. Workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`. v0.2.24 closes accepted tool calls with truthful terminal metadata and gives external tools, MCP/workflow children, async subagents, verifier commands, server turns, ordinary shells, and mention-search reapers explicit cleanup ownership; recovered workers require identity checks, and internal worker credentials no longer use argv or persisted workflow records | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Seeded; v0.2.24 published, with Windows process-tree parity and deeper TUI loop delegation still open |
-| TUI | Markdown-ish rendering, themes, Vim mode, bounded committed diff previews, slash commands, atomic unified mentions, workflow panel, per-turn timers plus cumulative active-Goal timing, truthful interrupted/indeterminate tool rows, mouse text selection with OSC 52 clipboard copy, double-click word copy, edge auto-scroll, and a jump-to-bottom control | Codex/Claude richer terminal UX | Partial |
+| Runtime lifecycle | Headless, server-mode, and TUI agent runs seed an agent task lifecycle through a runtime turn runner; `RuntimeThread` owns long-lived interactive state, while `GenerationContextController`, `InteractionController`, `OperationRecoveryController`, and `TaskWorkflowController` own focused state transitions and return typed decisions or event batches. Workflow, subagent, task, permission, workflow IPC, and normal-tool dispatch route through `RuntimeToolRouter`; external processes and search workers retain explicit cleanup ownership | Codex `Session -> Task -> Turn`, app-server request processors; package 3 pending permission maps | Implemented |
+| TUI | Markdown-ish rendering, themes, Vim mode, bounded committed diff previews, slash commands, atomic unified mentions and `[Image #N]` attachments, background clipboard image reads, dragged/pasted image paths, composer previews, message-area image thumbnails, a zoomable/pannable true-color viewer, image-only and queued multimodal turns, workflow panel, per-turn timers plus cumulative active-Goal timing, truthful interrupted/indeterminate tool rows, mouse text selection with OSC 52 clipboard copy, double-click word copy, edge auto-scroll, and a jump-to-bottom control | Codex/Claude richer terminal UX | Partial |
 | History | JSONL transcripts, resume/fork/search/archive/compress with a dedicated `SessionStore` boundary; resume normalization drops legacy reasoning-only assistant turns before provider replay | Codex thread store with queryable metadata | Partial |
 | Release | GitHub release + npm alias distribution scripts, retrying post-publish GitHub/npm/npm-exec verification, and a reusable real API e2e release gate | Codex npm/native release model | Implemented |
 | Skills | Markdown discovery, `list_skills`/`read_skill`, explicit `$skill` injection, and atomic unified Mention candidates across runtime workspace roots | Codex skills and plugin-provided skill bundles | Implemented for discovery/injection; plugin tool bundles remain open |
@@ -1710,21 +1726,15 @@ end state.
 
 #### Evidence: What Is Still Open
 
-1. **ThreadActor is still a god object.** At the audited `HEAD`,
-   `crates/orca-runtime/src/runtime_host.rs` is 52,398 lines. Its
-   `impl ThreadActor` spans lines 13,868-37,181, contains 254 methods, and the
-   actor graph still carries eight pending state-machine categories. The four
-   controller extractions did not reduce the main implementation to the
-   approximately 8,000-line target. Every new feature therefore continues to
-   increase the largest structural risk in the repository. The 2026-08-13
-   capability extraction series (slices 1-5, spec
-   `docs/superpowers/specs/2026-08-13-threadactor-capability-extraction.md`)
-   moved batch construction, commit settlement sequencing, and the
-   read/write/terminal-create settlement state machines into
-   `runtime_actor::capability` (962 -> ~1,790 lines; the actor shed ~570
-   lines), and the remaining observation/cleanup flows stay in the actor
-   until the broker work gives their lease/waiter state a module owner —
-   a recorded deletion threshold, not an abandoned extraction.
+1. **ThreadActor split completed on 2026-08-21.** The main
+   `impl ThreadActor` is now below the approximately 8,000-line structural
+   target. Goal, generation/provider, interaction, operation-recovery, and
+   task/workflow implementations compile in separate modules. Dedicated
+   controllers own generation context and compaction decisions, durable
+   interaction and cold-recovery maps, operation retry state, task ownership,
+   capabilities, commits, background work, and Goal state. `ThreadActor`
+   retains mailbox dispatch, controller lifecycle, and cross-controller
+   transaction coordination.
 2. **P1.4 task supervision is implemented in the current slice.** Persistent
    `TaskRegistry` records now carry an owner lease, monotonically increasing
    fencing epoch, expiry, durable stop request, and publication revision.
@@ -1824,7 +1834,7 @@ size, then short-term implementation cost.
 | Order | Slice | Priority class | User value | Acceptance evidence |
 |------:|-------|----------------|------------|---------------------|
 | 1 | **P1.4 task supervision completion**: add `TaskRegistry` lease/fencing/stale-owner takeover and task-wide publication | Lifecycle / ownership | Background subagents can be stopped, reaped, reattached, and recovered after process failure without a detached owner | Cross-process PTY contract, crash-recovery test, stale-commit rejection, and focused/full task-lifecycle gates |
-| 2 | **ThreadActor split completion**: finish the four existing controller seams and reduce the main impl toward ~8k lines | Architecture boundary | Future runtime features become cheaper to change and less likely to regress lifecycle behavior | Behavior tests and focused runtime suites; do not make source shape the acceptance oracle |
+| 2 | **ThreadActor split completion (completed 2026-08-21)**: controller state has one owner and the main impl is below ~8k lines | Architecture boundary | Future runtime features are isolated from unrelated lifecycle state | Runtime controller traces, runtime-host integration suite, surface contract, and full workspace gates |
 | 3 | **TUI/runtime protocol convergence**: extract renderer-owned orchestration and make runtime surface state the single projection source | Architecture boundary | Fewer TUI regressions and one authoritative rendering/lifecycle state | Real TUI PTY contracts plus the runtime-surface contract validator in CI |
 | 4 | **P2.4 context/cache identity**: deterministic cache-critical prefixes, fork-state isolation, and explicit checkpoints | DeepSeek-native | Stable long sessions can realize prompt-cache savings instead of invalidating the prefix on incidental reorderings | Two real DeepSeek API requests with the same prefix and observed `prompt_cache_hit_tokens`, plus fork/checkpoint behavior tests |
 | 5 | **Pending-store deletion gate (completed 2026-08-18)**: the compatibility shim and legacy pending-store API are removed | Compatibility migration | The durable broker is the only interaction fact source across all four surfaces | 4×4 interaction matrix, exact fail-closed selector and cold-recovery coverage, zero old symbols, validator, runtime all-targets, and TUI checks pass |

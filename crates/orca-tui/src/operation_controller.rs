@@ -119,6 +119,7 @@ impl TuiSurfaceTaskControl {
         &self,
         prompt: String,
         bindings: orca_runtime::mentions::MentionBindings,
+        images: Vec<orca_core::conversation::ImageInput>,
     ) -> io::Result<Option<orca_runtime::prompt_queue::PromptQueueSnapshot>> {
         let surface = self.lock_hosted().surface_active.clone();
         let Some(surface) = surface else {
@@ -130,6 +131,7 @@ impl TuiSurfaceTaskControl {
                 input: orca_runtime::prompt_queue::PromptQueueInput {
                     text: prompt,
                     mention_bindings: bindings,
+                    images,
                 },
             })
             .map(Some)

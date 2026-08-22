@@ -33,6 +33,7 @@ pub mod goal_tracker;
 pub mod goal_verifier;
 pub mod history;
 pub mod hooks;
+mod image_routing;
 pub mod instructions;
 pub mod lifecycle;
 pub mod memory;
@@ -116,7 +117,7 @@ pub mod surface {
         CancelSessionCurrentResult, CanonicalDomainName, CanonicalMime, CanonicalPath,
         CanonicalUri, CapabilityCallResult, CapabilityRevision, CloseThreadOutput,
         ClosedThreadReceipt, CommitClass, CommitFailedMutationError, CommitProbe,
-        CommittedMutation, CompactionReason, CompactionState, ContextRevision,
+        CommittedMutation, CompactionReason, CompactionState, ContextRevision, ContextWindowId,
         CreateThreadMaterialization, CreateThreadOutput, CursorAttachRequest, CursorSourceRevision,
         CursorSurfaceAttachment, DeferredCommandValue, DeferredMutation, DeferredMutationState,
         DeferredRepair, Denied, DetachRequest, DetachResult, DetachRevocationReceipt,
@@ -241,12 +242,13 @@ pub mod surface {
         SurfaceHistoryToolKind, SurfaceHistoryToolRole, SurfaceHistoryTurn, SurfaceHistoryUserRole,
         SurfaceHostBoundCaller, SurfaceHostCommand, SurfaceHostShutdownReceipt,
         SurfaceHostShutdownStage, SurfaceHub, SurfaceHubBindError, SurfaceHubConfig,
-        SurfaceHubCreateError, SurfaceIncarnation, SurfaceInput, SurfaceInputBinding,
-        SurfaceInputBindingKind, SurfaceInputBindingRequest, SurfaceInputBlock,
-        SurfaceInputCatalogEntry, SurfaceInputCatalogPage, SurfaceInputCorrelationId,
-        SurfaceInputPresentation, SurfaceInputRequest, SurfaceInputRequestBlock,
-        SurfaceInteractionId, SurfaceInteractionKind, SurfaceInteractionLifecycle,
-        SurfaceInteractionRequest, SurfaceInteractionResolutionReceipt, SurfaceInteractionRoute,
+        SurfaceHubCreateError, SurfaceImageDetail, SurfaceImageSource, SurfaceIncarnation,
+        SurfaceInput, SurfaceInputBinding, SurfaceInputBindingKind, SurfaceInputBindingRequest,
+        SurfaceInputBlock, SurfaceInputCatalogEntry, SurfaceInputCatalogPage,
+        SurfaceInputCorrelationId, SurfaceInputPresentation, SurfaceInputRequest,
+        SurfaceInputRequestBlock, SurfaceInteractionId, SurfaceInteractionKind,
+        SurfaceInteractionLifecycle, SurfaceInteractionRequest,
+        SurfaceInteractionResolutionReceipt, SurfaceInteractionRoute,
         SurfaceInteractionSafeProjection, SurfaceInteractionView, SurfaceInternalOriginPermit,
         SurfaceItem, SurfaceItemId, SurfaceItemOrigin, SurfaceLedgerError,
         SurfaceLegacyMentionKind, SurfaceLegacyMentionTarget, SurfaceLegacyPath, SurfaceLegacyUri,

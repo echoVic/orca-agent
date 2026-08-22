@@ -33,6 +33,7 @@ function parseArgs(argv) {
     timeoutMs: 180000,
     skipBuild: false,
     skipProviderSummary: false,
+    skipProviderVision: false,
     skipGoalMode: false,
     skipCli: false,
     skipServer: false,
@@ -50,6 +51,8 @@ function parseArgs(argv) {
       args.skipBuild = true;
     } else if (arg === "--skip-provider-summary") {
       args.skipProviderSummary = true;
+    } else if (arg === "--skip-provider-vision") {
+      args.skipProviderVision = true;
     } else if (arg === "--skip-goal-mode") {
       args.skipGoalMode = true;
     } else if (arg === "--skip-cli") {
@@ -132,6 +135,21 @@ function runProviderSummary(args) {
     throw new Error(`Provider summary real API e2e did not report ALL TARGETS MET:\n${output}`);
   }
   console.log("Provider summary real API e2e verified");
+}
+
+function runProviderVision(args) {
+  if (args.skipProviderVision) {
+    console.log("Provider vision real API e2e skipped");
+    return;
+  }
+
+  const output = run("cargo", ["run", "-p", "orca-provider", "--example", "vision_realapi"], {
+    timeoutMs: args.timeoutMs,
+  });
+  if (!output.includes("vision smoke ok:")) {
+    throw new Error(`Provider vision real API e2e did not report success:\n${output}`);
+  }
+  console.log("Provider vision real API e2e verified");
 }
 
 function parseGoalMetrics(line, label) {
@@ -1747,6 +1765,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   runBuild(args);
   runProviderSummary(args);
+  runProviderVision(args);
   runGoalMode(args);
   runCli(args);
   runHistoryReplay(args);

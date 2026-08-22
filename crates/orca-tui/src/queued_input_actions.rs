@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use tui_textarea::TextArea;
 
 use crate::commands;
+use crate::composer_image_actions::handle_composer_image_preview_key;
+use crate::composer_images::DeferredImageSubmit;
 use crate::composer_input_actions::{
     apply_composer_key_input, handle_composer_editor_shortcut, insert_composer_newline,
 };
@@ -37,10 +39,13 @@ pub(crate) fn enqueue_composer_follow_up(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
-    let Some(message) = QueuedUserMessage::from_composer(
-        textarea_text(textarea),
+    let visible_text = textarea_text(textarea);
+    let images = state.composer_images.attachments_for_text(&visible_text);
+    let Some(message) = QueuedUserMessage::from_composer_with_images(
+        visible_text,
         state.pending_pastes.clone(),
         state.mention_bindings.clone(),
+        images,
     ) else {
         return false;
     };
@@ -53,6 +58,7 @@ pub(crate) fn enqueue_composer_follow_up(
     state.slash_menu = None;
     state.mention.clear_projection();
     state.pending_pastes.clear();
+    state.composer_images.clear_attachments();
     state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
@@ -68,10 +74,13 @@ pub(crate) fn enqueue_composer_follow_up_to_runtime(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
-    let Some(message) = QueuedUserMessage::from_composer(
-        textarea_text(textarea),
+    let visible_text = textarea_text(textarea);
+    let images = state.composer_images.attachments_for_text(&visible_text);
+    let Some(message) = QueuedUserMessage::from_composer_with_images(
+        visible_text,
         state.pending_pastes.clone(),
         state.mention_bindings.clone(),
+        images,
     ) else {
         return false;
     };
@@ -86,6 +95,7 @@ pub(crate) fn enqueue_composer_follow_up_to_runtime(
         .try_send(UserAction::QueuePrompt {
             prompt: message.submission_text().to_string(),
             bindings: message.submission_bindings().clone(),
+            images: message.images().to_vec(),
         })
         .is_err()
     {
@@ -96,6 +106,7 @@ pub(crate) fn enqueue_composer_follow_up_to_runtime(
     state.slash_menu = None;
     state.mention.clear_projection();
     state.pending_pastes.clear();
+    state.composer_images.clear_attachments();
     state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
@@ -188,6 +199,10 @@ pub(crate) fn handle_running_key(
     {
         return true;
     }
+    if handle_composer_image_preview_key(*key, state, textarea) {
+        vim_state.cancel_pending_command();
+        return true;
+    }
 
     if let Some(ShortcutAction::Running(shortcut)) =
         resolve_shortcut(ShortcutContext::Running, *key)
@@ -197,6 +212,12 @@ pub(crate) fn handle_running_key(
             RunningShortcut::SubmitQueued => {
                 if state.panel_mode != PanelMode::Conversation {
                     return false;
+                }
+                if state.composer_images.is_paste_in_flight() {
+                    state
+                        .composer_images
+                        .defer_submit(DeferredImageSubmit::Queue);
+                    return true;
                 }
                 let text = textarea_text(textarea).trim().to_string();
                 if text.starts_with('/') {
@@ -260,6 +281,7 @@ fn reset_after_running_slash(
     state.slash_menu = None;
     state.mention.clear_projection();
     state.pending_pastes.clear();
+    state.composer_images.clear_attachments();
     state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
@@ -479,7 +501,9 @@ mod tests {
             &theme,
         ));
         let (prompt, bindings) = match action_rx.try_recv() {
-            Ok(UserAction::QueuePrompt { prompt, bindings }) => (prompt, bindings),
+            Ok(UserAction::QueuePrompt {
+                prompt, bindings, ..
+            }) => (prompt, bindings),
             other => panic!("unexpected queue action: {other:?}"),
         };
         assert!(prompt.contains(payload.trim()));
@@ -494,6 +518,7 @@ mod tests {
                     input: orca_runtime::prompt_queue::PromptQueueInput {
                         text: prompt,
                         mention_bindings: bindings,
+                        images: Vec::new(),
                     },
                 },
                 1,

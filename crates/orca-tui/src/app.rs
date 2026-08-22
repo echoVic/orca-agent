@@ -667,6 +667,7 @@ mod tests {
             &Event::Paste("jj".to_string()),
             &mut paste_state,
             &paste_config,
+            &action_tx,
             &mut paste_area,
         ));
         assert_eq!(textarea_text(&paste_area), "jjj");
@@ -1777,6 +1778,7 @@ done
             harness.send(UserAction::SubmitWithMentions {
                 prompt: prompt.to_string(),
                 bindings,
+                images: Vec::new(),
             });
 
             let rejection =
@@ -1824,6 +1826,7 @@ done
                 id: 42,
                 prompt: prompt.to_string(),
                 bindings,
+                images: Vec::new(),
             });
 
             let rejection =
@@ -1834,6 +1837,7 @@ done
                     queued_id: Some(42),
                     prompt,
                     message,
+                    ..
                 } if prompt == "review @gone.txt"
                     && message.contains("failed to resolve bound @gone.txt")
             ));
@@ -4426,6 +4430,7 @@ done
                     42,
                     "restore queued prompt".to_string(),
                     orca_runtime::mentions::MentionBindings::new("restore queued prompt"),
+                    Vec::new(),
                 ),
                 orca_core::goal_runtime::GoalTurnOrigin::User,
                 &event_tx,
@@ -4438,6 +4443,7 @@ done
                     queued_id: Some(42),
                     prompt,
                     message,
+                    ..
                 }) if prompt == "restore queued prompt"
                     && message.contains("persistent goals require recorded history")
             ));
@@ -7034,6 +7040,7 @@ done
             &Event::Paste("alpha\r\nbeta".to_string()),
             &mut state,
             &config,
+            &action_tx,
             &mut textarea,
         ));
         assert_eq!(state.transcript_search.query(), "alpha beta");
@@ -7479,7 +7486,9 @@ done
 
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::SubmitWithMentions { prompt, bindings })
+            Ok(UserAction::SubmitWithMentions {
+                prompt, bindings, ..
+            })
                 if prompt == pasted.trim() && bindings.is_empty()
         ));
         assert!(state.pending_pastes.is_empty());
@@ -7537,7 +7546,10 @@ done
         ));
 
         let action = action_rx.try_recv().expect("submit action");
-        let UserAction::SubmitWithMentions { prompt, bindings } = action else {
+        let UserAction::SubmitWithMentions {
+            prompt, bindings, ..
+        } = action
+        else {
             panic!("expected mention-aware submit");
         };
         assert_eq!(prompt, format!("{pasted} review {mention}"));
@@ -7700,7 +7712,10 @@ done
         ));
 
         let action = action_rx.try_recv().expect("submit action");
-        let UserAction::SubmitWithMentions { prompt, bindings } = action else {
+        let UserAction::SubmitWithMentions {
+            prompt, bindings, ..
+        } = action
+        else {
             panic!("expected mention-aware submit");
         };
         assert_eq!(prompt, "review @same.txt");
@@ -7742,7 +7757,10 @@ done
         );
 
         let action = action_rx.try_recv().expect("literal submit action");
-        let UserAction::SubmitWithMentions { prompt, bindings } = action else {
+        let UserAction::SubmitWithMentions {
+            prompt, bindings, ..
+        } = action
+        else {
             panic!("expected mention-aware submit boundary");
         };
         assert_eq!(prompt, "@oai/sky还能逆向吗");

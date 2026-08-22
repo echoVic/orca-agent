@@ -51,7 +51,9 @@ fn manual_compaction_conversation_keys(
                     pinned: *pinned,
                 });
             }
-            orca_core::conversation::Message::User { content, pinned } => {
+            orca_core::conversation::Message::User {
+                content, pinned, ..
+            } => {
                 keys.push(ManualCompactionItemKey::User {
                     content: content.clone(),
                     pinned: *pinned,
@@ -2758,6 +2760,8 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 .and_then(|operation| operation.generations.last())
                 .map(|generation| generation.fence.clone())
                 .ok_or(SurfaceCommitError::CursorRangeAlreadyConsumed)?;
+            context.window_id =
+                super::ContextWindowId::for_compaction(&context.window_id, operation_id);
             context.compaction = super::CompactionState::Completed {
                 operation_id: operation_id.clone(),
                 reason: super::CompactionReason::Manual,

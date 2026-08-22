@@ -6,6 +6,7 @@ use tui_textarea::TextArea;
 use orca_core::config::RunConfig;
 
 use crate::commands;
+use crate::composer_images::{ComposerImageState, DeferredImageSubmit};
 use crate::composer_textarea::{
     MAX_USER_INPUT_TEXT_CHARS, expand_pending_pastes, make_textarea, make_textarea_with_text,
     textarea_text,
@@ -28,8 +29,15 @@ pub(crate) fn handle_idle_submit(
     _shared_config: &Arc<Mutex<RunConfig>>,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> bool {
+    if state.composer_images.is_paste_in_flight() {
+        state
+            .composer_images
+            .defer_submit(DeferredImageSubmit::Submit);
+        return true;
+    }
     state.slash_menu = None;
     let visible_text = textarea_text(textarea);
+    let images = state.composer_images.attachments_for_text(&visible_text);
     state.mention_bindings.reconcile(&visible_text);
     let pending_interaction_composer = (state.status == AppStatus::WaitingUserInput).then(|| {
         (
@@ -56,6 +64,12 @@ pub(crate) fn handle_idle_submit(
         return false;
     }
 
+    if state.status != AppStatus::WaitingUserInput && !images.is_empty() && text.starts_with('/') {
+        state.push_message(ChatMessage::Error(
+            "remove image attachments before running a slash command".to_string(),
+        ));
+        return true;
+    }
     if state.status != AppStatus::WaitingUserInput
         && let pending_pastes = state.pending_pastes.clone()
         && let Some(outcome) = handle_composer_slash_command(
@@ -70,6 +84,7 @@ pub(crate) fn handle_idle_submit(
         match outcome {
             SlashOutcome::Continue => {
                 state.pending_pastes.clear();
+                state.composer_images.clear_attachments();
                 state.mention_bindings.clear();
                 state.atomic_skill_tokens.clear();
                 reset_composer_after_submit(textarea, vim_state, theme);
@@ -77,6 +92,7 @@ pub(crate) fn handle_idle_submit(
             }
             SlashOutcome::Prefill(value) => {
                 state.pending_pastes.clear();
+                state.composer_images.clear_attachments();
                 state.mention_bindings.clear();
                 state.atomic_skill_tokens.clear();
                 *textarea = make_textarea_with_text(&value, vim_state, theme);
@@ -90,6 +106,7 @@ pub(crate) fn handle_idle_submit(
             &text,
         )));
         state.pending_pastes.clear();
+        state.composer_images.clear_attachments();
         state.mention_bindings.clear();
         state.atomic_skill_tokens.clear();
         reset_composer_after_submit(textarea, vim_state, theme);
@@ -150,19 +167,24 @@ pub(crate) fn handle_idle_submit(
             let _ = action_tx.send(UserAction::RespondToInteraction { key, response });
         }
     } else {
-        state.record_prompt(text.clone());
-        state.push_message(ChatMessage::User(visible_text.trim().to_string()));
+        let history_text = ComposerImageState::text_without_labels(&text, &images);
+        if !history_text.is_empty() {
+            state.record_prompt(history_text);
+        }
+        state.push_user_message_with_images(visible_text.trim().to_string(), &images);
         state.enter_running();
         state.scroll_to_bottom();
         let bindings = state.mention_bindings.clone();
         let _ = action_tx.send(UserAction::SubmitWithMentions {
             prompt: text,
             bindings,
+            images,
         });
         state.request_runtime_queue_start();
         state.resume_queued_follow_up_autosend();
     }
     state.pending_pastes.clear();
+    state.composer_images.clear_attachments();
     state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
     reset_composer_after_submit(textarea, vim_state, theme);
@@ -217,6 +239,27 @@ mod tests {
         TuiInteractionKey::new(OperationIdAllocator::default().allocate(), request_id, kind)
     }
 
+    fn attach_test_image(state: &mut AppState, textarea: &mut TextArea) {
+        state.model_name = orca_core::model::VISION_MODEL.to_string();
+        let request = state.composer_images.begin_paste().unwrap();
+        let (insertion, _, _) = state
+            .composer_images
+            .complete_paste(
+                request,
+                &textarea_text(textarea),
+                crate::composer_textarea::textarea_cursor_byte_index(textarea),
+                vec![crate::clipboard_image::ClipboardImagePayload {
+                    media_type: "image/png".to_string(),
+                    data: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+                    width: 2,
+                    height: 1,
+                    source_name: None,
+                }],
+            )
+            .unwrap();
+        assert!(textarea.insert_str(&insertion));
+    }
+
     #[test]
     fn idle_submit_resumes_queued_autosend() {
         let (action_tx, action_rx) = mpsc::unbounded();
@@ -247,6 +290,85 @@ mod tests {
             action_rx.try_recv(),
             Ok(UserAction::SubmitWithMentions { prompt, .. })
                 if prompt == "new foreground"
+        ));
+    }
+
+    #[test]
+    fn image_only_submit_carries_attachment_and_clears_composer() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            orca_core::model::VISION_MODEL.to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("", &vim, &theme);
+        let history_before = state.input_history.clone();
+        attach_test_image(&mut state, &mut textarea);
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, images, .. })
+                if prompt == "[Image #1]" && images.len() == 1
+        ));
+        assert!(textarea_text(&textarea).is_empty());
+        assert!(state.composer_images.is_empty());
+        assert_eq!(state.input_history, history_before);
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Image(image)) if image.label == "[Image #1]"
+        ));
+    }
+
+    #[test]
+    fn non_vision_model_submits_images_for_runtime_analysis() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            orca_core::model::VISION_MODEL.to_string(),
+            "/tmp".to_string(),
+        );
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("inspect", &vim, &theme);
+        attach_test_image(&mut state, &mut textarea);
+        state.model_name = orca_core::model::PRO_MODEL.to_string();
+
+        assert!(handle_idle_submit(
+            &mut textarea,
+            &mut vim,
+            &theme,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+        ));
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, images, .. })
+                if prompt == "inspect [Image #1]" && images.len() == 1
+        ));
+        assert!(textarea_text(&textarea).is_empty());
+        assert!(state.composer_images.is_empty());
+        assert!(matches!(
+            state.messages.last(),
+            Some(ChatMessage::Image(image)) if image.label == "[Image #1]"
         ));
     }
 

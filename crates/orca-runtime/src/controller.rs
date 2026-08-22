@@ -308,6 +308,7 @@ impl RuntimeBackgroundWorkflows {
 pub struct ThreadTurnRequest {
     turn_id: TurnId,
     prompt: String,
+    images: Vec<orca_core::conversation::ImageInput>,
     prompt_placement: ThreadTurnPromptPlacement,
     tool_mode: ThreadTurnToolMode,
     goal_turn_origin: Option<orca_core::goal_runtime::GoalTurnOrigin>,
@@ -461,6 +462,7 @@ impl<'a> ThreadTurnContext<'a> {
     ) -> io::Result<Self> {
         let cwd = config.cwd.clone().unwrap_or(std::env::current_dir()?);
         let prompt = request.prompt().to_string();
+        let images = request.images().to_vec();
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
             session.wait_for_automatic_memory_snapshot();
         }
@@ -487,8 +489,12 @@ impl<'a> ThreadTurnContext<'a> {
                 .conversation
                 .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
             let message = match request.prompt_placement() {
-                ThreadTurnPromptPlacement::BacktrackableUser => Message::user(prompt.clone()),
-                ThreadTurnPromptPlacement::PinnedUser => Message::pinned_user(prompt.clone()),
+                ThreadTurnPromptPlacement::BacktrackableUser => {
+                    Message::user_with_images(prompt.clone(), images)
+                }
+                ThreadTurnPromptPlacement::PinnedUser => {
+                    Message::pinned_user_with_images(prompt.clone(), images)
+                }
                 ThreadTurnPromptPlacement::PinnedSystem => Message::pinned_system(prompt.clone()),
                 ThreadTurnPromptPlacement::ExistingTurn => unreachable!(),
             };
@@ -993,6 +999,7 @@ impl ThreadTurnRequest {
         Self {
             turn_id: TurnId::new(),
             prompt: prompt.into(),
+            images: Vec::new(),
             prompt_placement: ThreadTurnPromptPlacement::BacktrackableUser,
             tool_mode: ThreadTurnToolMode::Standard,
             goal_turn_origin: None,
@@ -1016,6 +1023,15 @@ impl ThreadTurnRequest {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub fn with_images(mut self, images: Vec<orca_core::conversation::ImageInput>) -> Self {
+        self.images = images;
+        self
+    }
+
+    pub fn images(&self) -> &[orca_core::conversation::ImageInput] {
+        &self.images
     }
 
     pub fn turn_id(&self) -> &TurnId {

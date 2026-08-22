@@ -125,10 +125,29 @@ can also provide `.orca/config.toml`, `AGENTS.md`, rules, skills, and workflows.
 
 DeepSeek V4 thinking is enabled explicitly. Set `reasoning_effort` to `low`,
 `high`, or `max` (the default) in `config.toml`, or use
-`ORCA_REASONING_EFFORT`. Both `deepseek-v4-flash` and `deepseek-v4-pro` use a
-1M-token context window and allow up to 384K output tokens. Orca keeps the
-Chat Completions transport and fully replays any returned `reasoning_content`
-across tool turns as required by DeepSeek.
+`ORCA_REASONING_EFFORT`. `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`,
+and `deepseek-v4-pro` use a 1M-token context window and allow up to 384K output
+tokens. JPEG, PNG, GIF, and WebP inputs are accepted from ACP clients and the
+TUI with every model selection. The vision model consumes images directly;
+`auto`, Pro, and Flash use a task-aware vision analysis before continuing with
+the selected coding model. In the TUI, use `Ctrl+V` to attach the current
+clipboard image (`Alt+V` is also available on Windows), drag or paste image
+paths and `file://` URLs, or select an image through `@file`. Each attachment
+appears as an atomic `[Image #N]` item that can be deleted, cleared, queued,
+edited, and restored after a rejected submission. `Cmd+V` works when the
+terminal forwards it as `Super+V`; terminals that consume `Cmd+V` should use
+`Ctrl+V`. Clipboard reads run in the background, and pressing Enter while one
+is pending waits for the image before submitting. Place the cursor on an image
+item and press Enter to open its preview; submitted images also render in the
+message area and can be clicked. The viewer supports `+`/`-` zoom, arrow-key
+panning, `0` to fit, and Esc to close. Kitty and Ghostty use the Kitty graphics
+protocol for native-pixel previews; iTerm2 and WezTerm use the inline-image
+protocol. Terminals without an image protocol, including Apple Terminal, fall
+back to low-resolution true-color cells. SSH sessions without a graphical
+clipboard should paste or mention a path on the remote host. Inline attachments
+share a 5 MiB total limit. Orca keeps the Chat Completions transport and fully
+replays any returned `reasoning_content` across tool turns as required by
+DeepSeek.
 
 More detail:
 

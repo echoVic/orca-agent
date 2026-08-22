@@ -73,7 +73,7 @@ Orca 中的每个"回合"是从用户输入到工具执行再到结果呈现的�
 context = [系统提示词] + [项目上下文] + [最近回合] + [当前回合草稿]
 ```
 
-运行时还会在此阶段检查上下文大小，如果窗口超过 1M token 限制的 85%，则触发压缩。
+运行时还会在此阶段检查上下文大小，如果窗口超过 1M token 限制的 85%，则触发压缩。每个模型可见窗口都有稳定的 `ContextWindowId`：usage 更新与 resume 保持该 ID，成功 compaction 后推进 ID，fork 则创建独立身份。
 
 ### 阶段 2：提供商调用
 
@@ -83,11 +83,17 @@ Orca 使用以下参数将组装好的上下文发送到 DeepSeek API：
 - **温度**——控制输出随机性
 - **推理努力**——思考深度（`low`、`medium`、`high`）
 - **工具模式**——可用工具集（文件编辑、Shell、grep、glob 等）
+- **图片块**——选择 `deepseek-v4-flash-vision-exp` 时直接发送；选择
+  `auto`、Pro 或 Flash 时先转换为与任务相关的视觉上下文
 
 模型的响应流包括：
 - **推理 token**——内部链式思考（默认不向用户显示）
 - **工具调用**——使用工具的结构化请求
 - **文本响应**——自然语言输出
+
+provider 流归一化、usage 投影、response completion、重试失败清理和 compaction
+决策由 generation-context controller 负责。主 thread actor 只协调 mailbox
+dispatch、fence 和跨 controller 提交。
 
 ### 阶段 3：工具分发
 

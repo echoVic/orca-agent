@@ -1,5 +1,6 @@
 use orca_runtime::mentions;
 
+use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::surface_actions::TuiSurfaceActions;
 use crate::types::PendingWorkflowNotification;
 
@@ -7,6 +8,8 @@ enum SubmittedTurnKind {
     User {
         prompt: String,
         bindings: mentions::MentionBindings,
+        attachments: Vec<ComposerImageAttachment>,
+        resolved_images: Vec<orca_core::conversation::ImageInput>,
     },
     WorkflowNotification(PendingWorkflowNotification),
 }
@@ -44,15 +47,26 @@ impl SubmittedTurn {
             kind: SubmittedTurnKind::User {
                 bindings: mentions::MentionBindings::new(&prompt),
                 prompt,
+                attachments: Vec::new(),
+                resolved_images: Vec::new(),
             },
             presentation: SubmittedTurnPresentation::user(),
             queued_id: None,
         }
     }
 
-    pub(crate) fn user_with_mentions(prompt: String, bindings: mentions::MentionBindings) -> Self {
+    pub(crate) fn user_with_mentions(
+        prompt: String,
+        bindings: mentions::MentionBindings,
+        attachments: Vec<ComposerImageAttachment>,
+    ) -> Self {
         Self {
-            kind: SubmittedTurnKind::User { prompt, bindings },
+            kind: SubmittedTurnKind::User {
+                prompt,
+                bindings,
+                attachments,
+                resolved_images: Vec::new(),
+            },
             presentation: SubmittedTurnPresentation::user(),
             queued_id: None,
         }
@@ -62,9 +76,15 @@ impl SubmittedTurn {
         id: u64,
         prompt: String,
         bindings: mentions::MentionBindings,
+        attachments: Vec<ComposerImageAttachment>,
     ) -> Self {
         Self {
-            kind: SubmittedTurnKind::User { prompt, bindings },
+            kind: SubmittedTurnKind::User {
+                prompt,
+                bindings,
+                attachments,
+                resolved_images: Vec::new(),
+            },
             presentation: SubmittedTurnPresentation::user(),
             queued_id: Some(id),
         }
@@ -101,6 +121,29 @@ impl SubmittedTurn {
         self.presentation.task_label.as_deref()
     }
 
+    pub(crate) fn images(&self) -> &[orca_core::conversation::ImageInput] {
+        match &self.kind {
+            SubmittedTurnKind::User {
+                resolved_images, ..
+            } => resolved_images,
+            SubmittedTurnKind::WorkflowNotification(_) => &[],
+        }
+    }
+
+    pub(crate) fn rejection_images(&self) -> Vec<ComposerImageAttachment> {
+        match &self.kind {
+            SubmittedTurnKind::User { attachments, .. } => attachments.clone(),
+            SubmittedTurnKind::WorkflowNotification(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn rejection_bindings(&self) -> mentions::MentionBindings {
+        match &self.kind {
+            SubmittedTurnKind::User { bindings, .. } => bindings.clone(),
+            SubmittedTurnKind::WorkflowNotification(_) => mentions::MentionBindings::default(),
+        }
+    }
+
     pub(crate) fn is_backtrack_target(&self) -> bool {
         self.presentation.backtrack_target
     }
@@ -110,14 +153,31 @@ impl SubmittedTurn {
         actions: &TuiSurfaceActions,
         cwd: &std::path::Path,
         workspace_roots: &[std::path::PathBuf],
-    ) -> Result<String, String> {
+    ) -> Result<mentions::ExpandedPrompt, String> {
         match &self.kind {
-            SubmittedTurnKind::User { prompt, bindings } => {
-                actions.expand_mentions(prompt, bindings, cwd, workspace_roots)
+            SubmittedTurnKind::User {
+                prompt,
+                bindings,
+                attachments,
+                ..
+            } => {
+                let (model_prompt, model_bindings) =
+                    ComposerImageState::submission_text_and_bindings(prompt, attachments, bindings);
+                let mut input = actions.expand_mentions(
+                    &model_prompt,
+                    &model_bindings,
+                    cwd,
+                    workspace_roots,
+                )?;
+                input
+                    .images
+                    .extend(ComposerImageState::image_inputs(attachments));
+                Ok(input)
             }
-            SubmittedTurnKind::WorkflowNotification(notification) => {
-                Ok(notification.prompt.clone())
-            }
+            SubmittedTurnKind::WorkflowNotification(notification) => Ok(mentions::ExpandedPrompt {
+                text: notification.prompt.clone(),
+                images: Vec::new(),
+            }),
         }
     }
 
@@ -132,14 +192,16 @@ impl SubmittedTurn {
         }
     }
 
-    pub(crate) fn with_model_prompt(mut self, prompt: String) -> Self {
+    pub(crate) fn with_model_input(mut self, input: mentions::ExpandedPrompt) -> Self {
         self.kind = match self.kind {
-            SubmittedTurnKind::User { .. } => SubmittedTurnKind::User {
-                bindings: mentions::MentionBindings::new(&prompt),
-                prompt,
+            SubmittedTurnKind::User { attachments, .. } => SubmittedTurnKind::User {
+                bindings: mentions::MentionBindings::new(&input.text),
+                prompt: input.text,
+                attachments,
+                resolved_images: input.images,
             },
             SubmittedTurnKind::WorkflowNotification(mut notification) => {
-                notification.prompt = prompt;
+                notification.prompt = input.text;
                 SubmittedTurnKind::WorkflowNotification(notification)
             }
         };

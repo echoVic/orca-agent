@@ -10,6 +10,7 @@ use orca_core::config::{ProviderKind, RunConfig};
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
+use orca_core::model::{ImageRouteDecision, VISION_MODEL};
 use orca_core::provider_types::{
     ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
 };
@@ -29,6 +30,7 @@ use crate::compaction::{
 use crate::cost::CostTracker;
 use crate::extension::RuntimeExtensionContext;
 use crate::hooks::{HookRunner, conversation_with_hook_context};
+use crate::image_routing::prepare_image_conversation;
 #[cfg(test)]
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -80,6 +82,7 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) turn_provider_config: &'a ProviderConfig,
+    pub(crate) image_route: ImageRouteDecision,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) context_config: &'a context::ContextConfig,
     pub(crate) base_provider_config: &'a ProviderConfig,
@@ -101,6 +104,7 @@ pub(crate) struct RuntimeProviderTurnInput<'a, 'runtime, W: io::Write> {
     pub(crate) provider: ProviderKind,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) provider_config: &'a ProviderConfig,
+    pub(crate) image_route: ImageRouteDecision,
     pub(crate) turn_context: RuntimeTurnContext<'a>,
     pub(crate) hooks: &'a HookRunner,
     pub(crate) cancel: &'a CancelToken,
@@ -364,7 +368,86 @@ impl RuntimeProviderTurnStep {
             conversation,
             history_writer: history_writer.as_deref_mut(),
         })?;
-        let model_conversation = conversation_with_hook_context(conversation, &pre_model_outcome);
+        let prepared_images = prepare_image_conversation(
+            conversation,
+            input.image_route,
+            input.provider,
+            input.provider_config,
+            input.cancel,
+        );
+        let analysis_usage = match &prepared_images {
+            Ok(prepared) => prepared.usage,
+            Err(error) => error.usage,
+        };
+        if let Some(usage) = analysis_usage
+            && !usage.is_empty()
+        {
+            let main_model = input.provider_config.model.as_deref();
+            let spent_before = crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
+            cost_tracker.set_model(Some(VISION_MODEL));
+            let totals = match input.actor.record_usage(usage, cost_tracker, None) {
+                Ok(totals) => totals,
+                Err(error) => {
+                    cost_tracker.set_model(main_model);
+                    return Ok(RuntimeProviderTurnOutput::terminal(error));
+                }
+            };
+            cost_tracker.set_model(main_model);
+            let spent_total = crate::cost::usd_to_micros(totals.estimated_cost_usd);
+            let delta = spent_total.saturating_sub(spent_before);
+            if delta > 0
+                && let Err(stop) = input.operation.record_cost_usd_micros(
+                    delta,
+                    &format!("image-analysis:{}", input.turn_context.turn_id),
+                )?
+            {
+                let terminal = input.operation.commit_budget_stop_with_boundary(
+                    input.turn_context.turn_id.as_str(),
+                    events.run_id(),
+                    history_writer.as_deref_mut(),
+                    &totals,
+                    None,
+                    stop,
+                )?;
+                return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+                    status: RunStatus::Failed,
+                    reason: TurnEndReason::CostBudgetExhausted,
+                    message: "budget stopped during image analysis".to_string(),
+                    max_cost_usd_micros: 0,
+                    terminal: Some(terminal),
+                }));
+            }
+            if emit_deltas {
+                sink.emit(events.usage_updated(totals))?;
+                if let Some(writer) = history_writer.as_deref_mut() {
+                    writer.append_usage(totals)?;
+                }
+            }
+        }
+        let prepared_images = match prepared_images {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
+                    status: if input.cancel.is_cancelled() {
+                        RunStatus::Cancelled
+                    } else {
+                        RunStatus::Failed
+                    },
+                    reason: TurnEndReason::Unclassified,
+                    message: error.message,
+                    max_cost_usd_micros: 0,
+                    terminal: None,
+                }));
+            }
+        };
+        for analysis in prepared_images.persisted_analyses {
+            if let Some(writer) = history_writer.as_deref_mut() {
+                writer.append_message(&analysis)?;
+            }
+            conversation.messages.push(analysis);
+        }
+        let model_conversation =
+            conversation_with_hook_context(&prepared_images.conversation, &pre_model_outcome);
         let model_conversation = conversation_with_runtime_system_messages(
             &model_conversation,
             input.runtime_system_messages,
@@ -746,6 +829,7 @@ impl RuntimeTurnProviderCycleStep {
                     provider: input.provider,
                     runtime_system_messages: input.runtime_system_messages,
                     provider_config: input.turn_provider_config,
+                    image_route: input.image_route,
                     turn_context: turn_context.clone(),
                     hooks: capabilities.hooks,
                     cancel: capabilities.cancel,
@@ -1246,6 +1330,7 @@ mod tests {
                 provider: ProviderKind::Mock,
                 runtime_system_messages: &[],
                 provider_config: &provider_config,
+                image_route: ImageRouteDecision::None,
                 turn_context: RuntimeTurnContext::new(
                     Path::new("."),
                     "mock_usage_then_cancel",
@@ -1326,6 +1411,7 @@ mod tests {
                 provider: ProviderKind::Mock,
                 runtime_system_messages: &[],
                 provider_config: &provider_config,
+                image_route: ImageRouteDecision::None,
                 turn_context: RuntimeTurnContext::new(
                     Path::new("."),
                     "mock_usage_then_cancel",
@@ -1389,6 +1475,7 @@ mod tests {
                 provider: ProviderKind::Mock,
                 runtime_system_messages: runtime_system_messages.as_slice(),
                 provider_config: &provider_config,
+                image_route: ImageRouteDecision::None,
                 turn_context: RuntimeTurnContext::new(
                     Path::new("."),
                     "mock_system_echo",
@@ -1426,6 +1513,91 @@ mod tests {
                 .unwrap_or_default()
                 .contains("runtime directive context")
         }));
+    }
+
+    #[test]
+    fn provider_turn_describes_images_before_calling_a_non_vision_model() {
+        let mut lifecycle =
+            crate::lifecycle::RuntimeSessionLifecycle::new("provider-image-route".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
+        let mut conversation = Conversation::new();
+        conversation.add_user_with_images(
+            "mock_system_echo".to_string(),
+            vec![orca_core::conversation::ImageInput {
+                source: orca_core::conversation::ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "AA==".to_string(),
+                },
+                detail: orca_core::conversation::ImageDetail::High,
+            }],
+        );
+        let provider_config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(orca_core::model::PRO_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let hooks = HookRunner::default();
+        let cancel = CancelToken::new();
+        let mut cost_tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL));
+        let mut events = EventFactory::new("provider-image-route".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+
+        let result = RuntimeProviderTurnStep::new()
+            .run(RuntimeProviderTurnInput {
+                actor: &mut actor,
+                operation: &mut crate::operation_context::OperationContext::for_tests(
+                    orca_core::budget::BudgetSpec::default(),
+                    "provider-image-route",
+                ),
+                provider: ProviderKind::Mock,
+                runtime_system_messages: &[],
+                provider_config: &provider_config,
+                image_route: ImageRouteDecision::DescribeThenContinue,
+                turn_context: RuntimeTurnContext::new(
+                    Path::new("."),
+                    "mock_system_echo",
+                    0,
+                    true,
+                    &SubagentType::General,
+                ),
+                hooks: &hooks,
+                cancel: &cancel,
+                context_window: 1_000_000,
+                io: RuntimeProviderTurnIo {
+                    conversation: &mut conversation,
+                    cost_tracker: &mut cost_tracker,
+                    events: &mut events,
+                    sink: &mut sink,
+                    history_writer: None,
+                },
+            })
+            .expect("provider turn");
+
+        let RuntimeProviderTurnOutput::Response(response) = result else {
+            panic!("provider turn must return a response");
+        };
+        assert!(
+            response
+                .response
+                .assistant_content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Image #1: test image attachment")
+        );
+        assert!(conversation.messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::System { content, .. } if content.starts_with("[Image analysis:")
+            )
+        }));
+        assert!(matches!(
+            &conversation.messages[0],
+            Message::User { images, .. } if images.len() == 1
+        ));
     }
 
     #[test]
@@ -1787,6 +1959,7 @@ mod tests {
                         &orca_core::subagent_types::SubagentType::General,
                     ),
                     turn_provider_config: &provider_config,
+                    image_route: ImageRouteDecision::None,
                     runtime_system_messages: &[],
                     context_config: &context_config,
                     base_provider_config: &provider_config,

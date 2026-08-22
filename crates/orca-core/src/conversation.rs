@@ -1,16 +1,64 @@
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 use crate::approval_types::ActionKind;
 use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
 
 pub const MISSING_TOOL_TERMINAL_ERROR: &str = "Tool invocation outcome is indeterminate because its terminal result was missing from recovered history. Inspect external state before retrying.";
+pub const IMAGE_ANALYSIS_MESSAGE_PREFIX: &str = "[Image analysis:";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RawToolCall {
     pub id: String,
     pub function_name: String,
     pub arguments: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    Low,
+    #[default]
+    High,
+    Original,
+    Auto,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ImageSource {
+    Base64 { media_type: String, data: String },
+    Url { url: String },
+    File { file_id: String },
+}
+
+impl fmt::Debug for ImageSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Base64 { media_type, data } => formatter
+                .debug_struct("Base64")
+                .field("media_type", media_type)
+                .field("encoded_chars", &data.len())
+                .finish(),
+            Self::Url { url } => formatter
+                .debug_struct("Url")
+                .field("url_chars", &url.len())
+                .finish(),
+            Self::File { file_id } => formatter
+                .debug_struct("File")
+                .field("file_id_chars", &file_id.len())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ImageInput {
+    pub source: ImageSource,
+    #[serde(default)]
+    pub detail: ImageDetail,
 }
 
 #[derive(Clone, Debug)]
@@ -21,6 +69,7 @@ pub enum Message {
     },
     User {
         content: String,
+        images: Vec<ImageInput>,
         pinned: bool,
     },
     Assistant {
@@ -55,6 +104,15 @@ impl Message {
     pub fn user(content: String) -> Self {
         Self::User {
             content,
+            images: Vec::new(),
+            pinned: false,
+        }
+    }
+
+    pub fn user_with_images(content: String, images: Vec<ImageInput>) -> Self {
+        Self::User {
+            content,
+            images,
             pinned: false,
         }
     }
@@ -62,6 +120,15 @@ impl Message {
     pub fn pinned_user(content: String) -> Self {
         Self::User {
             content,
+            images: Vec::new(),
+            pinned: true,
+        }
+    }
+
+    pub fn pinned_user_with_images(content: String, images: Vec<ImageInput>) -> Self {
+        Self::User {
+            content,
+            images,
             pinned: true,
         }
     }
@@ -393,6 +460,11 @@ impl Conversation {
         self.messages.push(Message::user(content));
     }
 
+    pub fn add_user_with_images(&mut self, content: String, images: Vec<ImageInput>) {
+        self.messages
+            .push(Message::user_with_images(content, images));
+    }
+
     pub fn add_user_pinned(&mut self, content: String) {
         self.messages.push(Message::pinned_user(content));
     }
@@ -549,6 +621,24 @@ pub fn repaired_missing_tool_result(tool_call: &RawToolCall) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_source_debug_never_exposes_payload_or_remote_identifier() {
+        let base64 = ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "secret-base64-payload".to_string(),
+        };
+        let url = ImageSource::Url {
+            url: "https://example.com/private?token=secret".to_string(),
+        };
+        let file = ImageSource::File {
+            file_id: "file-secret".to_string(),
+        };
+
+        assert!(!format!("{base64:?}").contains("secret-base64-payload"));
+        assert!(!format!("{url:?}").contains("token=secret"));
+        assert!(!format!("{file:?}").contains("file-secret"));
+    }
 
     #[test]
     fn new_conversation_is_empty() {
@@ -863,7 +953,9 @@ mod tests {
             .iter()
             .map(|message| match message {
                 Message::System { content, pinned } => format!("sys|{pinned}|{content}"),
-                Message::User { content, pinned } => format!("usr|{pinned}|{content}"),
+                Message::User {
+                    content, pinned, ..
+                } => format!("usr|{pinned}|{content}"),
                 Message::Assistant {
                     content,
                     reasoning_content,
