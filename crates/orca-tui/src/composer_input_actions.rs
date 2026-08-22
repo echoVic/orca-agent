@@ -33,13 +33,16 @@ pub(crate) fn clear_composer_input(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
-    if textarea.is_empty() || (vim_state.enabled && vim_state.mode != crate::vim::VimMode::Insert) {
+    if (textarea.is_empty() && state.composer_images.is_empty())
+        || (vim_state.enabled && vim_state.mode != crate::vim::VimMode::Insert)
+    {
         return false;
     }
 
     state.slash_menu = None;
     state.mention.clear_projection();
     state.pending_pastes.clear();
+    state.composer_images.clear_attachments();
     state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
@@ -72,7 +75,11 @@ pub(crate) fn handle_composer_editor_shortcut(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
-    if !composer_editor_shortcut_is_active(*key, !textarea.is_empty(), vim_state) {
+    if !composer_editor_shortcut_is_active(
+        *key,
+        !textarea.is_empty() || !state.composer_images.is_empty(),
+        vim_state,
+    ) {
         return false;
     }
 
@@ -115,6 +122,7 @@ pub(crate) fn recall_previous_history(
         let draft = textarea_text(textarea);
         if let Some(history) = state.history_previous(draft) {
             state.atomic_skill_tokens.clear();
+            state.composer_images.clear_attachments();
             *textarea = make_textarea_with_text(&history, vim_state, theme);
         }
     }
@@ -132,6 +140,7 @@ pub(crate) fn recall_next_history(
         textarea.input(Input::from(ev.clone()));
     } else if let Some(history) = state.history_next() {
         state.atomic_skill_tokens.clear();
+        state.composer_images.clear_attachments();
         *textarea = make_textarea_with_text(&history, vim_state, theme);
     }
 }
@@ -145,6 +154,10 @@ pub(crate) fn apply_composer_key_input(
     vim_state: &mut VimState,
     theme: &Theme,
 ) -> bool {
+    if delete_composer_image_attachment(key, state, textarea, vim_state, theme) {
+        refresh_input_menus(textarea, state, config);
+        return true;
+    }
     if delete_atomic_skill_token(key, state, textarea, vim_state, theme) {
         refresh_input_menus(textarea, state, config);
         return true;
@@ -186,6 +199,7 @@ pub(crate) fn apply_composer_key_input(
         textarea.input(Input::from(normalized_event))
     };
     if changed {
+        state.composer_images.reconcile(&textarea_text(textarea));
         state
             .atomic_skill_tokens
             .reconcile(&textarea_text(textarea));
@@ -193,6 +207,28 @@ pub(crate) fn apply_composer_key_input(
         refresh_input_menus(textarea, state, config);
     }
     changed
+}
+
+fn delete_composer_image_attachment(
+    key: &KeyEvent,
+    state: &mut AppState,
+    textarea: &mut TextArea,
+    vim_state: &VimState,
+    theme: &Theme,
+) -> bool {
+    if vim_state.enabled && vim_state.mode != crate::vim::VimMode::Insert {
+        return false;
+    }
+    let text = textarea_text(textarea);
+    let cursor = textarea_cursor_byte_index(textarea);
+    let Some((next, next_cursor)) = state.composer_images.remove_for_key(key, &text, cursor) else {
+        return false;
+    };
+    state.mention_bindings.reconcile(&next);
+    state.atomic_skill_tokens.reconcile(&next);
+    *textarea = make_textarea_with_text_at_cursor(&next, next_cursor, vim_state, theme);
+    state.reset_history_navigation();
+    true
 }
 
 pub(crate) fn delete_atomic_skill_token(

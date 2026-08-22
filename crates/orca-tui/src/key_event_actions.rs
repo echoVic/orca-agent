@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orca_core::config::RunConfig;
 
 use crate::approval_mode_actions::cycle_approval_mode;
+use crate::composer_image_actions::{handle_image_paste_shortcut, handle_image_viewer_key};
 use crate::composer_input_actions::composer_editor_shortcut_is_active;
 use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
 use crate::shortcuts::{GlobalShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
@@ -338,6 +339,11 @@ where
         return Ok(KeyEventFlow::Continue);
     }
 
+    if handle_image_viewer_key(key, state) {
+        vim_state.cancel_pending_command();
+        return Ok(KeyEventFlow::Continue);
+    }
+
     if let Some(ShortcutAction::Global(GlobalShortcut::Cancel)) =
         resolve_shortcut(ShortcutContext::Global, key)
     {
@@ -369,6 +375,11 @@ where
     }
 
     if handle_transcript_search_key(key, state) == SearchKeyFlow::Handled {
+        vim_state.cancel_pending_command();
+        return Ok(KeyEventFlow::Continue);
+    }
+
+    if handle_image_paste_shortcut(key, state, action_tx) {
         vim_state.cancel_pending_command();
         return Ok(KeyEventFlow::Continue);
     }

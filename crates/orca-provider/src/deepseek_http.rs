@@ -1,12 +1,15 @@
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use orca_core::cancel::CancelToken;
 use orca_core::conversation::{
-    Conversation, Message, RawToolCall, SummaryState, assistant_message_has_payload,
-    normalize_tool_boundaries,
+    Conversation, ImageDetail, ImageInput, ImageSource, Message, RawToolCall, SummaryState,
+    assistant_message_has_payload, normalize_tool_boundaries,
 };
-use orca_core::provider_types::{ProviderReplayState, ProviderResponse, ProviderStep, Usage};
+use orca_core::provider_types::{
+    ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse, ProviderStep, Usage,
+};
 use orca_core::tool_types::{ToolName, ToolRequest};
 
 use crate::ProviderConfig;
@@ -15,6 +18,7 @@ use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_too
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 pub(crate) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+pub(crate) const VISION_MODEL: &str = orca_core::model::VISION_MODEL;
 const DEFAULT_CHAT_MAX_TOKENS: u32 = 384_000;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
@@ -24,23 +28,38 @@ const EMPTY_RESPONSE_RECOVERY_PROMPT: &str = "Continue the current turn. The pre
 
 #[derive(Debug, Eq, PartialEq)]
 struct DeepSeekRequestError {
+    kind: ProviderErrorKind,
     message: String,
     usage: Option<Usage>,
 }
 
 impl DeepSeekRequestError {
     fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
-            message: message.into(),
+            kind: classify_deepseek_error(&message),
+            message,
             usage: None,
         }
     }
 
     fn with_usage(message: impl Into<String>, usage: Option<Usage>) -> Self {
+        let message = message.into();
         Self {
-            message: message.into(),
+            kind: classify_deepseek_error(&message),
+            message,
             usage,
         }
+    }
+
+    fn into_provider_error(self) -> (ProviderError, Option<Usage>) {
+        (
+            ProviderError::new(
+                self.kind,
+                format!("DeepSeek provider error: {}", self.message),
+            ),
+            self.usage,
+        )
     }
 }
 
@@ -53,6 +72,42 @@ impl From<String> for DeepSeekRequestError {
 impl std::fmt::Display for DeepSeekRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
+    }
+}
+
+fn classify_deepseek_error(message: &str) -> ProviderErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("request cancelled") || lower == "cancelled" {
+        ProviderErrorKind::Cancelled
+    } else if crate::context::is_prompt_too_long_error(message) {
+        ProviderErrorKind::ContextExceeded
+    } else if lower.contains("429") || lower.contains("rate limit") {
+        ProviderErrorKind::RateLimit
+    } else if ["500", "502", "503", "504"]
+        .into_iter()
+        .any(|status| lower.contains(status))
+    {
+        ProviderErrorKind::Server
+    } else if lower.contains("idle read timed out") || lower.contains("timed out") {
+        ProviderErrorKind::Timeout
+    } else if lower.contains("stream ended before terminal marker") {
+        ProviderErrorKind::StreamClosed
+    } else if lower.contains("invalid sse data json")
+        || lower.contains("invalid utf-8 in sse data")
+        || lower.contains("malformed response")
+    {
+        ProviderErrorKind::MalformedResponse
+    } else if lower.contains(EMPTY_RESPONSE_ERROR) {
+        ProviderErrorKind::EmptyResponse
+    } else if lower.contains("stream read error")
+        || lower.contains("response body read failed")
+        || lower.contains("error decoding response body")
+        || lower.contains("request failed after")
+        || lower.contains("failed to build streaming http client")
+    {
+        ProviderErrorKind::Transport
+    } else {
+        ProviderErrorKind::Other
     }
 }
 
@@ -105,6 +160,7 @@ fn add_empty_response_recovery_instruction(request: &mut ChatRequest) {
     request.messages.push(ApiMessage {
         role: "user".to_string(),
         content: Some(EMPTY_RESPONSE_RECOVERY_PROMPT.to_string()),
+        images: Vec::new(),
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
@@ -126,17 +182,81 @@ struct StreamOptions {
     include_usage: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct ApiMessage {
     pub(crate) role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) images: Vec<ImageInput>,
     pub(crate) reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ApiToolCallRequest>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApiContentBlock {
+    Text { text: String },
+    ImageUrl { image_url: ApiImageUrl },
+    File { file_id: String },
+}
+
+#[derive(Serialize)]
+struct ApiImageUrl {
+    url: String,
+    detail: ImageDetail,
+}
+
+impl Serialize for ApiMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("role", &self.role)?;
+        if self.images.is_empty() {
+            if let Some(content) = &self.content {
+                map.serialize_entry("content", content)?;
+            }
+        } else {
+            let mut blocks =
+                Vec::with_capacity(self.images.len() + usize::from(self.content.is_some()));
+            if let Some(content) = self.content.as_ref().filter(|content| !content.is_empty()) {
+                blocks.push(ApiContentBlock::Text {
+                    text: content.clone(),
+                });
+            }
+            for image in &self.images {
+                blocks.push(match &image.source {
+                    ImageSource::Base64 { media_type, data } => ApiContentBlock::ImageUrl {
+                        image_url: ApiImageUrl {
+                            url: format!("data:{media_type};base64,{data}"),
+                            detail: image.detail,
+                        },
+                    },
+                    ImageSource::Url { url } => ApiContentBlock::ImageUrl {
+                        image_url: ApiImageUrl {
+                            url: url.clone(),
+                            detail: image.detail,
+                        },
+                    },
+                    ImageSource::File { file_id } => ApiContentBlock::File {
+                        file_id: file_id.clone(),
+                    },
+                });
+            }
+            map.serialize_entry("content", &blocks)?;
+        }
+        if let Some(reasoning_content) = &self.reasoning_content {
+            map.serialize_entry("reasoning_content", reasoning_content)?;
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            map.serialize_entry("tool_calls", tool_calls)?;
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            map.serialize_entry("tool_call_id", tool_call_id)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -215,15 +335,16 @@ impl From<ApiUsage> for Usage {
 pub fn call(conversation: &Conversation, config: &ProviderConfig) -> ProviderResponse {
     match request_chat(conversation, config) {
         Ok(response) => response,
-        Err(error) => ProviderResponse {
-            steps: vec![ProviderStep::Error(format!(
-                "DeepSeek provider error: {error}"
-            ))],
-            assistant_content: None,
-            assistant_reasoning: None,
-            tool_calls: Vec::new(),
-            usage: error.usage,
-        },
+        Err(error) => {
+            let (error, usage) = error.into_provider_error();
+            ProviderResponse {
+                steps: vec![ProviderStep::Error(error)],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage,
+            }
+        }
     }
 }
 
@@ -236,14 +357,15 @@ pub async fn call_streaming_async(
     match request_chat_streaming(conversation, config, cancel, &mut on_step).await {
         Ok(response) => response,
         Err(error) => {
-            let step = ProviderStep::Error(format!("DeepSeek provider error: {error}"));
+            let (error, usage) = error.into_provider_error();
+            let step = ProviderStep::Error(error);
             on_step(&step);
             ProviderResponse {
                 steps: vec![step],
                 assistant_content: None,
                 assistant_reasoning: None,
                 tool_calls: Vec::new(),
-                usage: error.usage,
+                usage,
             }
         }
     }
@@ -260,6 +382,7 @@ async fn request_chat_streaming(
     })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    validate_image_model(conversation, model)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let streaming_client = crate::http_client::streaming_client()?;
 
@@ -459,6 +582,7 @@ fn request_chat(
     })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    validate_image_model(conversation, model)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
@@ -537,9 +661,9 @@ fn request_chat(
             }
             "stop" | "tool_calls" | "" => {}
             other => {
-                steps.push(ProviderStep::Error(format!(
+                steps.push(ProviderStep::Error(ProviderError::other(format!(
                     "Unexpected finish_reason: {other}"
-                )));
+                ))));
             }
         }
 
@@ -678,6 +802,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                 let result = ApiMessage {
                     role: "system".to_string(),
                     content: Some(content.clone()),
+                    images: Vec::new(),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -690,9 +815,12 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                 }
                 result
             }
-            Message::User { content, .. } => ApiMessage {
+            Message::User {
+                content, images, ..
+            } => ApiMessage {
                 role: "user".to_string(),
                 content: Some(content.clone()),
+                images: images.clone(),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -723,6 +851,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                 ApiMessage {
                     role: "assistant".to_string(),
                     content: content.clone(),
+                    images: Vec::new(),
                     reasoning_content: replayable_reasoning_content(
                         reasoning_content,
                         !tool_calls.is_empty(),
@@ -738,6 +867,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
             } => ApiMessage {
                 role: "tool".to_string(),
                 content: Some(content.clone()),
+                images: Vec::new(),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: Some(tool_call_id.clone()),
@@ -761,6 +891,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
             ApiMessage {
                 role: "system".to_string(),
                 content: Some(overlay),
+                images: Vec::new(),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -771,11 +902,30 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
     messages
 }
 
+fn validate_image_model(
+    conversation: &Conversation,
+    model: &str,
+) -> Result<(), DeepSeekRequestError> {
+    let has_images = conversation.messages.iter().any(|message| {
+        matches!(
+            message,
+            Message::User { images, .. } if !images.is_empty()
+        )
+    });
+    if has_images && model != VISION_MODEL {
+        return Err(DeepSeekRequestError::new(format!(
+            "model '{model}' does not support image input; use {VISION_MODEL}"
+        )));
+    }
+    Ok(())
+}
+
 fn inject_summary_messages(summary: &SummaryState, messages: &mut Vec<ApiMessage>) {
     if let Some(baseline) = &summary.baseline {
         messages.push(ApiMessage {
             role: "system".to_string(),
             content: Some(format!("[Summary baseline]\n{baseline}")),
+            images: Vec::new(),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -785,6 +935,7 @@ fn inject_summary_messages(summary: &SummaryState, messages: &mut Vec<ApiMessage
         messages.push(ApiMessage {
             role: "system".to_string(),
             content: Some(format!("[Summary update {}]\n{delta}", i + 1)),
+            images: Vec::new(),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -802,6 +953,104 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn deepseek_errors_are_classified_for_attempt_retry_bits_spec_ut() {
+        assert_eq!(
+            classify_deepseek_error("stream read error: error decoding response body"),
+            ProviderErrorKind::Transport
+        );
+        assert_eq!(
+            classify_deepseek_error("stream read error: idle read timed out after 5s"),
+            ProviderErrorKind::Timeout
+        );
+        assert_eq!(
+            classify_deepseek_error("stream ended before terminal marker"),
+            ProviderErrorKind::StreamClosed
+        );
+        assert_eq!(
+            classify_deepseek_error("invalid SSE data JSON: unexpected EOF"),
+            ProviderErrorKind::MalformedResponse
+        );
+        assert_eq!(
+            classify_deepseek_error("request error (429 Too Many Requests): limited"),
+            ProviderErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_deepseek_error("max retries exceeded (last status: 503 Service Unavailable)"),
+            ProviderErrorKind::Server
+        );
+        assert_eq!(
+            classify_deepseek_error("prompt_too_long: context length exceeded"),
+            ProviderErrorKind::ContextExceeded
+        );
+    }
+
+    #[test]
+    fn vision_user_message_serializes_openai_compatible_image_blocks() {
+        let mut conversation = Conversation::new();
+        conversation.add_user_with_images(
+            "describe this image".to_string(),
+            vec![
+                ImageInput {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "aGVsbG8=".to_string(),
+                    },
+                    detail: ImageDetail::High,
+                },
+                ImageInput {
+                    source: ImageSource::Url {
+                        url: "https://example.com/image.webp".to_string(),
+                    },
+                    detail: ImageDetail::Low,
+                },
+                ImageInput {
+                    source: ImageSource::File {
+                        file_id: "file-api-example".to_string(),
+                    },
+                    detail: ImageDetail::Original,
+                },
+            ],
+        );
+
+        let value = serde_json::to_value(conversation_to_api_messages(&conversation))
+            .expect("serialize multimodal messages");
+        assert_eq!(value[0]["content"][0]["type"], "text");
+        assert_eq!(value[0]["content"][0]["text"], "describe this image");
+        assert_eq!(value[0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            value[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(value[0]["content"][1]["image_url"]["detail"], "high");
+        assert_eq!(
+            value[0]["content"][2]["image_url"]["url"],
+            "https://example.com/image.webp"
+        );
+        assert_eq!(value[0]["content"][2]["image_url"]["detail"], "low");
+        assert_eq!(value[0]["content"][3]["type"], "file");
+        assert_eq!(value[0]["content"][3]["file_id"], "file-api-example");
+    }
+
+    #[test]
+    fn image_input_requires_the_vision_model() {
+        let mut conversation = Conversation::new();
+        conversation.add_user_with_images(
+            "inspect".to_string(),
+            vec![ImageInput {
+                source: ImageSource::Url {
+                    url: "https://example.com/image.png".to_string(),
+                },
+                detail: ImageDetail::High,
+            }],
+        );
+
+        assert!(validate_image_model(&conversation, VISION_MODEL).is_ok());
+        let error = validate_image_model(&conversation, DEFAULT_MODEL)
+            .expect_err("text-only model must reject image input");
+        assert!(error.to_string().contains(VISION_MODEL));
+    }
 
     fn make_tc(name: &str, arguments: &str) -> ApiToolCallResponse {
         ApiToolCallResponse {
@@ -1737,7 +1986,8 @@ mod tests {
         assert!(matches!(
             response.steps.as_slice(),
             [ProviderStep::Error(message)]
-                if message == "DeepSeek provider error: response did not contain choices"
+                if message.message
+                    == "DeepSeek provider error: response did not contain choices"
         ));
         assert_eq!(
             response.usage,
@@ -1930,12 +2180,14 @@ mod tests {
         assert!(matches!(
             response.steps.as_slice(),
             [ProviderStep::Error(message)]
-                if message == "DeepSeek provider error: response did not contain content or tool calls"
+                if message.message
+                    == "DeepSeek provider error: response did not contain content or tool calls"
         ));
         assert!(matches!(
             emitted.as_slice(),
             [ProviderStep::Error(message)]
-                if message == "DeepSeek provider error: response did not contain content or tool calls"
+                if message.message
+                    == "DeepSeek provider error: response did not contain content or tool calls"
         ));
         assert_eq!(
             response.usage,

@@ -2260,6 +2260,7 @@ mod tests {
             turn_id: None,
             message: StoredMessage::User {
                 content: "valid".to_string(),
+                images: Vec::new(),
                 pinned: false,
             },
         })
@@ -2316,6 +2317,7 @@ mod tests {
             turn_id: None,
             message: StoredMessage::User {
                 content: "valid".to_string(),
+                images: Vec::new(),
                 pinned: false,
             },
         })

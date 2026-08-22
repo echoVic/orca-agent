@@ -74,6 +74,32 @@ pub enum SurfaceLegacyMentionTarget {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceImageDetail {
+    Low,
+    #[default]
+    High,
+    Original,
+    Auto,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum SurfaceImageSource {
+    Base64 {
+        media_type: CanonicalMime,
+        data: String,
+        digest: Sha256Digest,
+    },
+    Url {
+        url: CanonicalUri,
+    },
+    File {
+        file_id: NonEmptyText,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceInputBindingRequest {
     ExactCatalog {
@@ -112,6 +138,11 @@ pub enum SurfaceInputRequestBlock {
         text: DisplayText,
         digest: Sha256Digest,
     },
+    Image {
+        source: SurfaceImageSource,
+        #[serde(default)]
+        detail: SurfaceImageDetail,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -133,6 +164,10 @@ pub enum SurfaceInputBlock {
         mime: CanonicalMime,
         text: DisplayText,
         digest: Sha256Digest,
+    },
+    Image {
+        source: SurfaceImageSource,
+        detail: SurfaceImageDetail,
     },
 }
 

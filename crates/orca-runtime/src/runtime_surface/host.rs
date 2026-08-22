@@ -416,6 +416,22 @@ impl RuntimeSurfaceThreadHandle {
         )
     }
 
+    pub fn expand_mentions_for_model(
+        &self,
+        input: &str,
+        bindings: &crate::mentions::MentionBindings,
+        cwd: &Path,
+        workspace_roots: &[PathBuf],
+    ) -> Result<crate::mentions::ExpandedPrompt, String> {
+        crate::mentions::expand_mentions_for_model(
+            input,
+            bindings,
+            cwd,
+            workspace_roots,
+            &self.runtime.mcp_registry(),
+        )
+    }
+
     /// Discover immutable mention candidates with the runtime-owned MCP
     /// registry. Surface clients receive the result, never the registry.
     pub fn discover_mention_catalog(&self, roots: &[PathBuf]) -> crate::mentions::MentionCatalog {

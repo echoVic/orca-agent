@@ -842,7 +842,7 @@ fn workflow_runner_marks_task_and_run_failed_on_child_agent_error() {
 }
 
 #[test]
-fn workflow_runner_retries_transient_child_agent_failure() {
+fn workflow_runner_keeps_provider_retry_inside_single_child_agent_attempt() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
@@ -870,42 +870,43 @@ fn workflow_runner_retries_transient_child_agent_failure() {
         ))
         .unwrap();
 
-    assert!(launched.summary.contains("Mock runtime completed"));
+    assert!(
+        launched
+            .summary
+            .contains("Mock runtime completed after transient failure")
+    );
 
     let record = tasks.get(&launched.task_id).expect("task record");
     assert_eq!(record.status, TaskStatus::Completed);
     let progress = record.workflow_progress.expect("workflow progress");
-    assert_eq!(progress.total_agents, 2);
+    assert_eq!(progress.total_agents, 1);
     assert_eq!(progress.running_agents, 0);
     assert_eq!(progress.completed_agents, 1);
-    assert_eq!(progress.failed_agents, 1);
+    assert_eq!(progress.failed_agents, 0);
     assert_eq!(record.workflow_agents.len(), 1);
     assert_eq!(record.workflow_agents[0].call_path, "root:1");
     assert_eq!(
         record.workflow_agents[0].status,
         orca_core::workflow_types::WorkflowAgentStatus::Completed
     );
-    assert_eq!(record.workflow_agents[0].attempt, 2);
+    assert_eq!(record.workflow_agents[0].attempt, 1);
     assert_eq!(record.workflow_agents[0].max_attempts, 2);
-    assert_eq!(record.workflow_agents[0].previous_errors.len(), 1);
+    assert!(record.workflow_agents[0].previous_errors.is_empty());
 
     let run_id = record.workflow_run_id.as_deref().expect("run id");
     let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
     let state = store.load_run(run_id).expect("run state");
     assert_eq!(state.status, WorkflowRunStatus::Completed);
-    assert_eq!(state.total_agent_count, 2);
+    assert_eq!(state.total_agent_count, 1);
     let evidence = store.load_evidence_bundle(run_id).expect("evidence");
-    assert_eq!(evidence.total_agent_count, 2);
+    assert_eq!(evidence.total_agent_count, 1);
     assert_eq!(evidence.agents.len(), 1);
-    assert_eq!(evidence.agents[0].attempt, 2);
+    assert_eq!(evidence.agents[0].attempt, 1);
     assert_eq!(evidence.agents[0].max_attempts, 2);
-    assert_eq!(evidence.agents[0].previous_errors.len(), 1);
-    assert_eq!(evidence.agents[0].retryable, Some(true));
-    assert!(evidence.agents[0].retry_attempted);
-    assert_eq!(
-        evidence.agents[0].failure_kind,
-        Some(WorkflowAgentFailureKind::AgentFailed)
-    );
+    assert!(evidence.agents[0].previous_errors.is_empty());
+    assert_eq!(evidence.agents[0].retryable, None);
+    assert!(!evidence.agents[0].retry_attempted);
+    assert_eq!(evidence.agents[0].failure_kind, None);
     assert!(
         store
             .cached_agent_result(run_id, "root:1", &input_hash(&flaky_prompt, &json!({})))
@@ -917,9 +918,9 @@ fn workflow_runner_retries_transient_child_agent_failure() {
         serde_json::from_str(&fs::read_to_string(cache_path).unwrap()).unwrap();
     let cache_key = format!("root:1:{}", input_hash(&flaky_prompt, &json!({})));
     let record = &cache_json[cache_key];
-    assert_eq!(record["attempt"], 2);
+    assert_eq!(record["attempt"], 1);
     assert_eq!(record["maxAttempts"], 2);
-    assert_eq!(record["previousErrors"].as_array().unwrap().len(), 1);
+    assert!(record["previousErrors"].as_array().unwrap().is_empty());
 }
 
 #[test]

@@ -3,26 +3,29 @@ import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
 # 模型
 
 
-Orca 支持 DeepSeek 的 V4 模型系列，提供两种针对不同用例优化的变体。本页涵盖模型选择、推理努力级别以及成本/速度权衡。
+Orca 支持 DeepSeek V4 文本模型和实验性的 V4 Flash Vision 模型。本页涵盖模型选择、多模态输入、推理强度和成本权衡。
 
 ## 可用模型
 
 ### 模型对比表
 
-| 属性 | deepseek-v4-flash | deepseek-v4-pro |
-|------|-------------------|-----------------|
-| **主要用例** | 快速编辑、搜索、简单重构 | 架构设计、复杂调试、多文件变更 |
-| **上下文窗口** | 1M tokens | 1M tokens |
-| **最大输出 tokens** | 8K | 8K |
-| **推理** | 已启用（较轻量） | 已启用（更深入） |
-| **工具使用** | 是（所有工具） | 是（所有工具） |
-| **输入费用** | 约 $0.001 / 1K tokens | 约 $0.004 / 1K tokens |
-| **输出费用** | 约 $0.002 / 1K tokens | 约 $0.010 / 1K tokens |
-| **速度** | 约 30 tok/s（推理） | 约 15 tok/s（推理） |
-| **首个 token** | 约 2s | 约 4s |
-| **MMLU（基准测试）** | 78.2% | 85.7% |
-| **HumanEval（编程）** | 82.1% | 89.3% |
-| **SWE-Bench（智能体）** | 52.4% | 64.8% |
+| 属性 | deepseek-v4-flash | deepseek-v4-flash-vision-exp | deepseek-v4-pro |
+|------|-------------------|--------------------------------|-----------------|
+| **主要用例** | 快速编辑和常规编码 | 截图、图表、流程图和视觉智能体任务 | 架构设计和复杂调试 |
+| **图片输入** | 视觉预处理 | 直接输入 | 视觉预处理 |
+| **上下文窗口** | 1M tokens | 1M tokens | 1M tokens |
+| **最大输出 tokens** | 384K | 384K | 384K |
+| **推理** | 支持 | 支持 | 支持 |
+| **工具使用** | 支持 | 支持 | 支持 |
+| **高峰输入/输出价格** | 3 / 9 元每百万 tokens | 3 / 9 元每百万 tokens | 9 / 27 元每百万 tokens |
+
+<Callout type="info">
+
+`deepseek-v4-flash-vision-exp` 是 2026 年 8 月 21 日发布的实验模型。详见
+DeepSeek 官方[图像理解指南](https://api-docs.deepseek.com/zh-cn/guides/vision)
+和[价格说明](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)。
+
+</Callout>
 
 ### 何时使用每个模型
 
@@ -51,6 +54,41 @@ orca --model deepseek-v4-flash "修复所有文件中的导入顺序"
 orca exec "给 React 组件添加错误边界" --model deepseek-v4-flash
 ```
 
+
+</Tab>
+<Tab label={"deepseek-v4-flash-vision-exp"}>
+
+
+当任务依赖视觉输入时，选择 `deepseek-v4-flash-vision-exp`：
+
+- 检查 UI 截图和错误对话框
+- 读取流程图、图表或扫描文档
+- 将渲染结果与视觉参考进行比较
+- 把图片理解与 Orca 的常规编码工具结合使用
+
+TUI 在所有模型选择下都接受 JPEG、PNG、GIF 和 WebP 图片。视觉模型直接
+接收图片；`auto`、Pro 和 Flash 会先调用视觉模型生成与当前任务相关的图片
+分析，再由所选编码模型继续处理。
+
+- 按 `Ctrl+V` 读取当前系统剪贴板图片。Windows 还支持 `Alt+V`；如果终端
+  会把 `Super+V` 转发给应用而不是自行消费快捷键，也可以使用 `Cmd+V`。
+- 将图片文件拖入终端，或粘贴本地图片路径和 `file://` URL。
+- 通过普通 `@file` 选择器选择图片。
+
+附件在输入框中显示为原子的 `[Image #N]`。Backspace 或 Delete 会删除整个
+附件，`Ctrl+U` 会清空草稿及附件。仅图片消息、运行中的排队消息、队列编辑
+和提交失败恢复都会保留图片数据。剪贴板解码在后台执行；若读取完成前按
+Enter，Orca 会等待图片就绪后再提交。没有图形剪贴板的 SSH 会话应粘贴或
+提及远端主机上的图片路径；WSL 会在可用时读取 Windows 剪贴板。光标位于
+图片附件时按 Enter 可打开预览，消息区中的图片也可点击查看；查看器支持
+`+`/`-` 缩放、方向键平移、`0` 恢复适配和 Esc 关闭。
+Kitty 和 Ghostty 通过 Kitty Graphics 协议显示原生像素；iTerm2 和 WezTerm
+使用 inline-image 协议。不支持图片协议的终端（包括 Apple Terminal）会降级为
+低分辨率真彩色字符预览。
+
+ACP 客户端可以发送标准图片内容块。Orca 支持内联 base64 图片和公开的
+HTTP(S) 图片 URL，持久化可回放图片输入，并默认使用 `high` 细节级别。
+本地内联附件限制为 5 MiB，以确保完整请求始终位于 Orca 的持久化原子提交边界内。
 
 </Tab>
 <Tab label={"deepseek-v4-pro"}>
@@ -86,6 +124,9 @@ orca --model deepseek-v4-pro --reasoning-effort high "重构整个数据层以�
 
 ```
 任务是否为：
+├── 需要理解图片？
+│   ├── auto / Pro / Flash → 视觉预处理后交给所选模型
+│   └── deepseek-v4-flash-vision-exp → 直接输入图片
 ├── 简单/机械性？（搜索、编辑、格式化）
 │   └── deepseek-v4-flash
 ├── 中等复杂度？（多文件变更、测试编写）
@@ -101,7 +142,7 @@ orca --model deepseek-v4-pro --reasoning-effort high "重构整个数据层以�
 
 ## 推理努力级别
 
-两个 V4 模型都支持三个推理努力级别，控制模型在输出前的思考深度。
+所有受支持的 V4 模型都接受推理强度控制。
 
 ### 推理努力表
 
@@ -174,6 +215,8 @@ reasoning_effort = "medium"  # 所有会话的默认值
 /model deepseek-v4-pro
 # 或
 /model deepseek-v4-flash
+# 或
+/model deepseek-v4-flash-vision-exp
 ```
 
 > **注意：** 切换模型时，前缀缓存会中断（不同模型 = 不同的缓存键）。切换后的第一回合会较慢，因为上下文需要重新处理。

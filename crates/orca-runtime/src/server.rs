@@ -7355,6 +7355,7 @@ enabled = true
             thread
                 .append_items(&[Message::User {
                     content: "needle appears in this transcript".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 }])
                 .expect("append search message");
@@ -7369,6 +7370,7 @@ enabled = true
             second
                 .append_items(&[Message::User {
                     content: "needle appears again".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 }])
                 .expect("append second search message");
@@ -7447,6 +7449,7 @@ enabled = true
                 .append_items(&[
                     Message::User {
                         content: "server projected user".to_string(),
+                        images: Vec::new(),
                         pinned: false,
                     },
                     Message::Assistant {
@@ -7462,6 +7465,7 @@ enabled = true
                 .append_items(&[
                     Message::User {
                         content: "server projected second user".to_string(),
+                        images: Vec::new(),
                         pinned: false,
                     },
                     Message::Assistant {

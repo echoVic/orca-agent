@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossbeam_channel as mpsc;
@@ -7,8 +8,12 @@ use tui_textarea::TextArea;
 
 use crate::attachment_routing::accept_attached_tui_event;
 use crate::bridge;
+use crate::composer_images::DeferredImageSubmit;
+use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{textarea_cursor_byte_index, textarea_text};
+use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_search_manager::MentionSearchManager;
+use crate::queued_input_actions::enqueue_composer_follow_up_to_runtime;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::terminal_presentation::TerminalPresentation;
@@ -46,6 +51,12 @@ impl RendererRuntimeEventOwner {
         theme: &Theme,
         presentation: &mut TerminalPresentation,
     ) {
+        if let TuiEvent::ClipboardImagePasteCompleted { request_id, result } = tui_event {
+            self.handle_clipboard_image_paste(
+                request_id, result, state, config, action_tx, textarea, vim_state, theme,
+            );
+            return;
+        }
         let tui_event = match accept_attached_tui_event(state, tui_event) {
             Ok(Some(tui_event)) => tui_event,
             Ok(None) | Err(()) => return,
@@ -133,6 +144,67 @@ impl RendererRuntimeEventOwner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn handle_clipboard_image_paste(
+        &mut self,
+        request_id: u64,
+        result: Result<Vec<crate::clipboard_image::ClipboardImagePayload>, String>,
+        state: &mut AppState,
+        config: &mut RunConfig,
+        action_tx: &mpsc::Sender<UserAction>,
+        textarea: &mut TextArea,
+        vim_state: &mut VimState,
+        theme: &Theme,
+    ) {
+        if !state.composer_images.is_current_request(request_id) {
+            return;
+        }
+        let payloads = match result {
+            Ok(payloads) => payloads,
+            Err(error) => {
+                state.composer_images.fail_paste(request_id);
+                state.push_message(ChatMessage::Error(error));
+                return;
+            }
+        };
+        let visible_text = textarea_text(textarea);
+        let cursor = textarea_cursor_byte_index(textarea);
+        let previous_images = state.composer_images.clone();
+        let (insertion, _count, deferred) =
+            match state
+                .composer_images
+                .complete_paste(request_id, &visible_text, cursor, payloads)
+            {
+                Ok(completion) => completion,
+                Err(error) => {
+                    state.push_message(ChatMessage::Error(error));
+                    return;
+                }
+            };
+        if !textarea.insert_str(&insertion) {
+            state.composer_images = previous_images;
+            state.push_message(ChatMessage::Error(
+                "failed to insert image attachment into the composer".to_string(),
+            ));
+            return;
+        }
+        state.reset_history_navigation();
+        refresh_input_menus(textarea, state, config);
+
+        match deferred {
+            Some(DeferredImageSubmit::Submit) => {
+                let shared = Arc::new(Mutex::new(config.clone()));
+                handle_idle_submit(
+                    textarea, vim_state, theme, state, config, &shared, action_tx,
+                );
+            }
+            Some(DeferredImageSubmit::Queue) => {
+                enqueue_composer_follow_up_to_runtime(state, action_tx, textarea, vim_state, theme);
+            }
+            None => {}
+        }
+    }
+
     pub(crate) fn sync_composer(
         &mut self,
         config: &RunConfig,
@@ -148,6 +220,7 @@ impl RendererRuntimeEventOwner {
         let cursor = textarea_cursor_byte_index(textarea);
         state.mention_bindings.reconcile(&text);
         state.atomic_skill_tokens.reconcile(&text);
+        state.composer_images.reconcile(&text);
         self.mention_search
             .sync_at_cursor(&text, cursor, mention_enabled, state, now);
     }
@@ -190,6 +263,120 @@ mod tests {
                 tmux_passthrough: false,
             },
         )
+    }
+
+    fn clipboard_payload() -> crate::clipboard_image::ClipboardImagePayload {
+        crate::clipboard_image::ClipboardImagePayload {
+            media_type: "image/png".to_string(),
+            data: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            width: 2,
+            height: 1,
+            source_name: None,
+        }
+    }
+
+    #[test]
+    fn clipboard_image_completion_inserts_attachment_without_blocking_input() {
+        let root = tempfile::tempdir().expect("temp root");
+        let (mention_event_tx, _mention_event_rx) = mpsc::unbounded();
+        let mut owner = RendererRuntimeEventOwner::new(
+            MentionSearchManager::new(root.path().to_path_buf(), mention_event_tx),
+            None,
+        );
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            orca_core::model::VISION_MODEL.to_string(),
+            root.path().display().to_string(),
+        );
+        let request_id = state.composer_images.begin_paste().unwrap();
+        let mut config = crate::test_support::test_run_config();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let mut textarea =
+            crate::composer_textarea::make_textarea_with_text("describe this", &vim_state, &theme);
+        let mut terminal = presentation();
+
+        owner.handle(
+            TuiEvent::ClipboardImagePasteCompleted {
+                request_id,
+                result: Ok(vec![clipboard_payload()]),
+            },
+            &mut state,
+            &mut config,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            &mut terminal,
+        );
+
+        assert_eq!(
+            crate::composer_textarea::textarea_text(&textarea),
+            "describe this [Image #1] "
+        );
+        assert_eq!(
+            state
+                .composer_images
+                .attachments_for_text("describe this [Image #1] ")
+                .len(),
+            1
+        );
+        assert!(!state.composer_images.is_paste_in_flight());
+    }
+
+    #[test]
+    fn enter_while_clipboard_read_is_pending_submits_after_attachment_arrives() {
+        let root = tempfile::tempdir().expect("temp root");
+        let (mention_event_tx, _mention_event_rx) = mpsc::unbounded();
+        let mut owner = RendererRuntimeEventOwner::new(
+            MentionSearchManager::new(root.path().to_path_buf(), mention_event_tx),
+            None,
+        );
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            orca_core::model::VISION_MODEL.to_string(),
+            root.path().display().to_string(),
+        );
+        let request_id = state.composer_images.begin_paste().unwrap();
+        state
+            .composer_images
+            .defer_submit(crate::composer_images::DeferredImageSubmit::Submit);
+        let mut config = crate::test_support::test_run_config();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let mut textarea =
+            crate::composer_textarea::make_textarea_with_text("inspect", &vim_state, &theme);
+        let mut terminal = presentation();
+
+        owner.handle(
+            TuiEvent::ClipboardImagePasteCompleted {
+                request_id,
+                result: Ok(vec![clipboard_payload()]),
+            },
+            &mut state,
+            &mut config,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            &mut terminal,
+        );
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::SubmitWithMentions { prompt, images, .. })
+                if prompt == "inspect [Image #1]" && images.len() == 1
+        ));
+        assert!(crate::composer_textarea::textarea_text(&textarea).is_empty());
+        assert!(state.composer_images.is_empty());
     }
 
     #[test]

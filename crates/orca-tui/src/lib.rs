@@ -11,7 +11,10 @@ mod capability_backend;
 mod channels;
 pub mod cli;
 mod clipboard;
+mod clipboard_image;
 pub mod commands;
+mod composer_image_actions;
+mod composer_images;
 mod composer_input_actions;
 mod composer_textarea;
 mod config_dialog_actions;
@@ -39,6 +42,7 @@ mod hosted_workflow;
 mod idle_key_actions;
 mod idle_navigation_actions;
 mod idle_submit_actions;
+mod image_preview;
 mod input_adapter;
 mod input_event_actions;
 mod input_history;
@@ -101,6 +105,7 @@ mod workspace_config;
 mod workspace_status;
 
 pub use app::run_tui;
+pub use composer_images::TuiImage;
 
 #[cfg(test)]
 pub(crate) mod test_support {

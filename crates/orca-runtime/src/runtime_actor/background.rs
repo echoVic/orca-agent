@@ -84,6 +84,7 @@ pub(crate) struct BackgroundOperationController<
     ProviderCompletion,
     ApprovalResolution,
     Control,
+    TaskOwnership = (),
 > {
     tasks: HashMap<String, Task>,
     capacity: usize,
@@ -94,9 +95,32 @@ pub(crate) struct BackgroundOperationController<
     provider_completions: HashMap<surface::SurfaceOperationId, ProviderCompletion>,
     approval_resolutions: HashMap<surface::SurfaceOperationId, ApprovalResolution>,
     controls: HashMap<surface::SurfaceOperationId, Control>,
+    task_ownership: Option<TaskOwnership>,
     _workflow: std::marker::PhantomData<Workflow>,
     _provider: std::marker::PhantomData<Provider>,
 }
+
+pub(crate) type TaskWorkflowController<
+    Task,
+    Workflow,
+    Provider,
+    WorkflowCompletion,
+    ProviderPreparation,
+    ProviderCompletion,
+    ApprovalResolution,
+    Control,
+    TaskOwnership,
+> = BackgroundOperationController<
+    Task,
+    Workflow,
+    Provider,
+    WorkflowCompletion,
+    ProviderPreparation,
+    ProviderCompletion,
+    ApprovalResolution,
+    Control,
+    TaskOwnership,
+>;
 
 impl<
     Task,
@@ -107,6 +131,7 @@ impl<
     ProviderCompletion,
     ApprovalResolution,
     Control,
+    TaskOwnership,
 >
     BackgroundOperationController<
         Task,
@@ -117,6 +142,7 @@ impl<
         ProviderCompletion,
         ApprovalResolution,
         Control,
+        TaskOwnership,
     >
 where
     Task: ManagedBackgroundTask<Workflow, Provider>,
@@ -140,9 +166,22 @@ where
             provider_completions: HashMap::new(),
             approval_resolutions: HashMap::new(),
             controls: HashMap::new(),
+            task_ownership: None,
             _workflow: std::marker::PhantomData,
             _provider: std::marker::PhantomData,
         }
+    }
+
+    pub(crate) fn task_ownership(&self) -> Option<&TaskOwnership> {
+        self.task_ownership.as_ref()
+    }
+
+    pub(crate) fn take_task_ownership(&mut self) -> Option<TaskOwnership> {
+        self.task_ownership.take()
+    }
+
+    pub(crate) fn retain_task_ownership(&mut self, ownership: TaskOwnership) {
+        self.task_ownership = Some(ownership);
     }
 
     pub(crate) fn ensure_capacity(

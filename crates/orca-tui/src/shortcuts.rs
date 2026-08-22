@@ -604,6 +604,21 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
         action: "delete word, character, line end, or clear input",
     },
     ShortcutHint {
+        scope: ShortcutScope::Editor,
+        keys: "ctrl+v / win alt+v",
+        action: "attach image from clipboard",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Editor,
+        keys: "enter on image",
+        action: "open image preview",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Global,
+        keys: "+/- · arrows · 0",
+        action: "zoom, pan, or fit image",
+    },
+    ShortcutHint {
         scope: ShortcutScope::Idle,
         keys: "enter",
         action: "send message",

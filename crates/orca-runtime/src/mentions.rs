@@ -1,16 +1,18 @@
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
 use std::fs;
 
+use base64::Engine as _;
 use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo::{Config as MatcherConfig, Matcher, Utf32Str};
+use orca_core::conversation::{ImageDetail, ImageInput, ImageSource};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_MENTION_BYTES: usize = 32 * 1024;
 const MAX_MENTION_SOURCE_BYTES: usize = orca_tools::file_admission::MAX_EDIT_FILE_BYTES;
 const MAX_PLUGIN_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_INLINE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -609,6 +611,12 @@ pub struct MentionBindings {
     bindings: Vec<MentionBinding>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpandedPrompt {
+    pub text: String,
+    pub images: Vec<ImageInput>,
+}
+
 impl MentionBindings {
     pub fn new(text: &str) -> Self {
         Self {
@@ -739,6 +747,121 @@ pub fn expand_mentions(
         orca_home.as_deref(),
         agents_home.as_deref(),
     )
+}
+
+pub fn expand_mentions_for_model(
+    input: &str,
+    bindings: &MentionBindings,
+    cwd: &Path,
+    workspace_roots: &[PathBuf],
+    mcp_registry: &orca_mcp::McpRegistry,
+) -> Result<ExpandedPrompt, String> {
+    let (orca_home, agents_home) = skill_discovery_dirs_from_env();
+    let valid_bindings = bindings.bindings().iter().filter(|binding| {
+        binding.end <= input.len()
+            && input.is_char_boundary(binding.start)
+            && input.is_char_boundary(binding.end)
+            && input[binding.start..binding.end] == binding.visible
+    });
+    let mut text_blocks = Vec::new();
+    let mut images = Vec::new();
+    let mut inline_image_bytes = 0usize;
+    let mut seen_targets = std::collections::HashSet::new();
+    for binding in valid_bindings {
+        if !seen_targets.insert(binding.target.stable_id()) {
+            continue;
+        }
+        if let Some(image) = image_input_for_target(&binding.target, cwd, workspace_roots)? {
+            if let ImageSource::Base64 { data, .. } = &image.source {
+                inline_image_bytes =
+                    inline_image_bytes.saturating_add(data.len().saturating_mul(3) / 4);
+                if inline_image_bytes > MAX_INLINE_IMAGE_BYTES {
+                    return Err(format!(
+                        "attached images exceed Orca's {} MiB inline limit",
+                        MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+                    ));
+                }
+            }
+            images.push(image);
+            text_blocks.push(format!("[Attached image: {}]", binding.visible));
+        } else {
+            text_blocks.push(expand_bound_target(
+                &binding.target,
+                cwd,
+                workspace_roots,
+                mcp_registry,
+                orca_home.as_deref(),
+                agents_home.as_deref(),
+            )?);
+        }
+    }
+    Ok(ExpandedPrompt {
+        text: append_mention_blocks(input, text_blocks)?,
+        images,
+    })
+}
+
+fn image_input_for_target(
+    target: &MentionTarget,
+    cwd: &Path,
+    workspace_roots: &[PathBuf],
+) -> Result<Option<ImageInput>, String> {
+    let MentionTarget::File { root, path, kind } = target else {
+        return Ok(None);
+    };
+    if *kind != MentionFileKind::File {
+        return Ok(None);
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve mention root: {error}"))?;
+    if !allowed_workspace_roots(cwd, workspace_roots).contains(&root) {
+        return Err(format!(
+            "bound mention root {} is outside the active workspaces",
+            root.display()
+        ));
+    }
+    let resolved = root
+        .join(path)
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve bound @{path}: {error}"))?;
+    if !resolved.starts_with(&root) || !resolved.is_file() {
+        return Err(format!("bound @{path} is not a file inside its workspace"));
+    }
+    let metadata = fs::metadata(&resolved)
+        .map_err(|error| format!("failed to inspect bound @{path}: {error}"))?;
+    if metadata.len() > MAX_INLINE_IMAGE_BYTES as u64 {
+        return Err(format!(
+            "bound image @{path} exceeds Orca's {} MiB inline limit",
+            MAX_INLINE_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes =
+        fs::read(&resolved).map_err(|error| format!("failed to read bound @{path}: {error}"))?;
+    let Some(media_type) = sniff_image_media_type(&bytes) else {
+        return Ok(None);
+    };
+    Ok(Some(ImageInput {
+        source: ImageSource::Base64 {
+            media_type: media_type.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        },
+        detail: ImageDetail::High,
+    }))
+}
+
+fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 fn expand_mentions_with_skill_dirs(
@@ -1270,6 +1393,45 @@ mod tests {
         let err = file_block("image.png", &image, "image.png", None).unwrap_err();
 
         assert!(err.contains("binary file"));
+    }
+
+    #[test]
+    fn multimodal_expansion_attaches_recognized_image_without_text_inlining() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
+        let input = "inspect @image.png";
+        let bindings = MentionBindings::from_bindings(
+            input,
+            vec![MentionBinding {
+                start: 8,
+                end: input.len(),
+                visible: "@image.png".to_string(),
+                target: MentionTarget::File {
+                    root: dir.path().to_path_buf(),
+                    path: "image.png".to_string(),
+                    kind: MentionFileKind::File,
+                },
+            }],
+        );
+
+        let expanded = expand_mentions_for_model(
+            input,
+            &bindings,
+            dir.path(),
+            &[dir.path().to_path_buf()],
+            &orca_mcp::McpRegistry::default(),
+        )
+        .unwrap();
+
+        assert!(expanded.text.contains("[Attached image: @image.png]"));
+        assert!(matches!(
+            expanded.images.as_slice(),
+            [ImageInput {
+                source: ImageSource::Base64 { media_type, .. },
+                detail: ImageDetail::High,
+            }] if media_type == "image/png"
+        ));
     }
 
     #[test]

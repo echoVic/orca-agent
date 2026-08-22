@@ -15,7 +15,7 @@ use crate::bridge;
 use crate::goal_materialization::materialize_goal_draft;
 use crate::hosted_runtime::{
     TuiHostedOperationOutcome, emit_hosted_operation_error, hosted_turn_request,
-    run_hosted_ordinary_turn, send_submission_error,
+    run_hosted_ordinary_turn, send_submission_error_with_images,
 };
 use crate::hosted_session::announce_runtime_ready;
 use crate::hosted_session_lifecycle::{ensure_hosted_thread, resume_latest_active_goal_hosted};
@@ -39,13 +39,17 @@ pub(crate) fn run_hosted_goal_run(
     control: &TuiSurfaceTaskControl,
 ) {
     let rejection_prompt = submitted_turn.rejection_prompt().map(str::to_string);
+    let rejection_bindings = submitted_turn.rejection_bindings();
+    let rejection_images = submitted_turn.rejection_images();
     let queued_id = submitted_turn.queued_id();
     let Some(session_id) = thread.session_id().map(str::to_string) else {
         if queued_id.is_some() {
-            send_submission_error(
+            send_submission_error_with_images(
                 event_tx,
                 queued_id,
                 rejection_prompt.as_deref(),
+                rejection_bindings,
+                rejection_images,
                 goal_history_error_message().to_string(),
             );
         } else {
@@ -58,10 +62,12 @@ pub(crate) fn run_hosted_goal_run(
         Ok(goal) => goal.filter(|goal| goal.status.should_continue()),
         Err(error) => {
             if queued_id.is_some() {
-                send_submission_error(
+                send_submission_error_with_images(
                     event_tx,
                     queued_id,
                     rejection_prompt.as_deref(),
+                    rejection_bindings,
+                    rejection_images,
                     error.to_string(),
                 );
             } else {
@@ -76,9 +82,12 @@ pub(crate) fn run_hosted_goal_run(
         if let Some(id) = queued_id {
             let _ = event_tx.send(TuiEvent::QueuedSubmissionStarted { id });
         }
-        if let Err(error) =
-            actions.resume_goal_and_run(submitted_turn.prompt().to_string(), control, event_tx)
-        {
+        if let Err(error) = actions.resume_goal_and_run_multimodal(
+            submitted_turn.prompt().to_string(),
+            submitted_turn.images().to_vec(),
+            control,
+            event_tx,
+        ) {
             emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
         }
         return;

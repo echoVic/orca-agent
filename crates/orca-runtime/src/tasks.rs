@@ -15,7 +15,9 @@ use std::process::Command;
 use orca_core::cancel::CancelToken;
 use orca_core::conversation::RawToolCall;
 use orca_core::cost_types::UsageTotals;
-use orca_core::provider_types::{ProviderResponse, ProviderStep, ToolCallProgress, Usage};
+use orca_core::provider_types::{
+    ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, ToolCallProgress, Usage,
+};
 use orca_core::task_types::{
     BackgroundTaskSummary, PendingToolCallSummary, TaskActivitySummary, TaskContinuationSummary,
     TaskStatus, TaskType, WorkflowAgentTaskSummary, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
@@ -609,7 +611,17 @@ enum PersistedProviderStep {
     MessageDelta(String),
     ToolCallProgress(ToolCallProgress),
     ToolCall(ToolRequest),
-    Error(String),
+    Error(PersistedProviderError),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum PersistedProviderError {
+    Legacy(String),
+    Classified {
+        kind: ProviderErrorKind,
+        message: String,
+    },
 }
 
 impl TaskRegistry {
@@ -3231,7 +3243,10 @@ impl PersistedProviderStep {
             }
             ProviderStep::ToolCall(request) => Some(Self::ToolCall(request.clone())),
             ProviderStep::ReplayState(_) => None,
-            ProviderStep::Error(error) => Some(Self::Error(error.clone())),
+            ProviderStep::Error(error) => Some(Self::Error(PersistedProviderError::Classified {
+                kind: error.kind,
+                message: error.message.clone(),
+            })),
         }
     }
 
@@ -3241,7 +3256,12 @@ impl PersistedProviderStep {
             Self::MessageDelta(delta) => ProviderStep::MessageDelta(delta),
             Self::ToolCallProgress(progress) => ProviderStep::ToolCallProgress(progress),
             Self::ToolCall(request) => ProviderStep::ToolCall(request),
-            Self::Error(error) => ProviderStep::Error(error),
+            Self::Error(PersistedProviderError::Legacy(message)) => {
+                ProviderStep::Error(ProviderError::other(message))
+            }
+            Self::Error(PersistedProviderError::Classified { kind, message }) => {
+                ProviderStep::Error(ProviderError::new(kind, message))
+            }
         }
     }
 }

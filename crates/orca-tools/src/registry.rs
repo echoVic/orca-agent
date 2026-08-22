@@ -806,7 +806,12 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     },
                     "model": {
                         "type": "string",
-                        "enum": ["auto", "deepseek-v4-flash", "deepseek-v4-pro"],
+                        "enum": [
+                            "auto",
+                            "deepseek-v4-flash",
+                            "deepseek-v4-flash-vision-exp",
+                            "deepseek-v4-pro"
+                        ],
                         "description": "Optional model override for this child agent. auto uses Orca's router, flash is faster, pro is stronger for deep reasoning."
                     },
                     "mode": {

@@ -117,6 +117,7 @@ fn snapshot() -> SurfaceSnapshot {
         },
         context: SurfaceContextSnapshot {
             revision: ContextRevision::try_new(1).unwrap(),
+            window_id: ContextWindowId::new(),
             used_tokens: 0,
             limit_tokens: 128_000,
             compaction: CompactionState::Idle,
@@ -2055,6 +2056,7 @@ fn usage_context_settings_catalog_and_pinned_families_require_exact_revisions() 
             SurfaceScope::Thread,
             SurfaceEvent::Context(SurfaceContextSnapshot {
                 revision: ContextRevision::try_new(2).unwrap(),
+                window_id: with_usage.snapshot().context.window_id.clone(),
                 used_tokens: 8,
                 limit_tokens: 128_000,
                 compaction: CompactionState::Idle,

@@ -1,6 +1,7 @@
 use orca_runtime::mentions::MentionBindings;
 use std::collections::{HashMap, VecDeque};
 
+use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::composer_textarea::{expand_pending_pastes_with_bindings, retain_active_pending_pastes};
 use crate::types::{AppState, UserAction};
 #[cfg(test)]
@@ -14,6 +15,7 @@ pub(crate) struct QueuedUserMessage {
     composer_bindings: MentionBindings,
     submission_bindings: MentionBindings,
     pending_pastes: Vec<(String, String)>,
+    images: Vec<ComposerImageAttachment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +23,7 @@ pub(crate) struct QueuedComposerState {
     pub(crate) visible_text: String,
     pub(crate) mention_bindings: MentionBindings,
     pub(crate) pending_pastes: Vec<(String, String)>,
+    pub(crate) images: Vec<ComposerImageAttachment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +90,8 @@ impl QueuedSubmissionState {
             let Some(index) = self.pending_composers.iter().position(|pending| {
                 pending.submission_text == item.input.text
                     && pending.submission_bindings == item.input.mention_bindings
+                    && ComposerImageState::image_inputs(&pending.composer.images)
+                        == item.input.images
             }) else {
                 continue;
             };
@@ -120,6 +125,7 @@ impl QueuedSubmissionState {
                 visible_text: message.visible_text,
                 mention_bindings: message.composer_bindings,
                 pending_pastes: message.pending_pastes,
+                images: message.images,
             },
         });
     }
@@ -178,7 +184,8 @@ impl QueuedSubmissionState {
     #[cfg(test)]
     fn pop_latest(&mut self) -> Option<QueuedUserMessage> {
         let item = self.projection.items.pop()?;
-        let visible_text = item.input.text.clone();
+        let (visible_text, images) =
+            ComposerImageState::restore_from_inputs(&item.input.text, item.input.images.clone());
         Some(QueuedUserMessage {
             id: 0,
             visible_text,
@@ -186,6 +193,7 @@ impl QueuedSubmissionState {
             composer_bindings: item.input.mention_bindings.clone(),
             submission_bindings: item.input.mention_bindings,
             pending_pastes: Vec::new(),
+            images,
         })
     }
 
@@ -281,7 +289,7 @@ impl QueuedPreviewSnapshot {
             projection
                 .items
                 .get(index)
-                .map(|item| compact_preview(&item.input.text))
+                .map(|item| compact_preview(&runtime_queue_preview_text(&item.input)))
         };
         Some(Self {
             len,
@@ -338,6 +346,17 @@ impl QueuedPreviewSnapshot {
     }
 }
 
+fn runtime_queue_preview_text(input: &orca_runtime::prompt_queue::PromptQueueInput) -> String {
+    let mut text = input.text.trim().to_string();
+    for number in 1..=input.images.len() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&format!("[Image #{number}]"));
+    }
+    text
+}
+
 fn compact_preview(text: &str) -> String {
     const MAX_PREVIEW_CHARS: usize = 256;
     const MAX_SCANNED_CHARS: usize = MAX_PREVIEW_CHARS * 4;
@@ -385,18 +404,31 @@ fn append_preview_ellipsis(output: &mut String, output_chars: &mut usize, limit:
 fn queued_composer_from_runtime(
     item: &orca_runtime::prompt_queue::QueuedSubmission,
 ) -> QueuedComposerState {
+    let (visible_text, images) =
+        ComposerImageState::restore_from_inputs(&item.input.text, item.input.images.clone());
     QueuedComposerState {
-        visible_text: item.input.text.clone(),
+        visible_text,
         mention_bindings: item.input.mention_bindings.clone(),
         pending_pastes: Vec::new(),
+        images,
     }
 }
 
 impl QueuedUserMessage {
+    #[cfg(test)]
     pub(crate) fn from_composer(
         visible_text: String,
         pending_pastes: Vec<(String, String)>,
+        mention_bindings: MentionBindings,
+    ) -> Option<Self> {
+        Self::from_composer_with_images(visible_text, pending_pastes, mention_bindings, Vec::new())
+    }
+
+    pub(crate) fn from_composer_with_images(
+        visible_text: String,
+        pending_pastes: Vec<(String, String)>,
         mut mention_bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
     ) -> Option<Self> {
         mention_bindings.reconcile(&visible_text);
 
@@ -414,8 +446,12 @@ impl QueuedUserMessage {
             &pending_pastes,
             &mut submission_bindings,
         );
-        let submission_text = expanded.trim().to_string();
-        submission_bindings.reconcile(&submission_text);
+        let (submission_text, submission_bindings) =
+            ComposerImageState::submission_text_and_bindings(
+                &expanded,
+                &images,
+                &submission_bindings,
+            );
 
         let mut pending_pastes = pending_pastes;
         retain_active_pending_pastes(&trimmed_visible, &mut pending_pastes);
@@ -427,6 +463,7 @@ impl QueuedUserMessage {
             composer_bindings,
             submission_bindings,
             pending_pastes,
+            images,
         })
     }
 
@@ -453,6 +490,10 @@ impl QueuedUserMessage {
         &self.submission_bindings
     }
 
+    pub(crate) fn images(&self) -> &[ComposerImageAttachment] {
+        &self.images
+    }
+
     #[cfg(test)]
     pub(crate) fn preview_text(&self) -> String {
         self.visible_text
@@ -467,6 +508,7 @@ impl QueuedUserMessage {
             visible_text: self.visible_text,
             mention_bindings: self.composer_bindings,
             pending_pastes: self.pending_pastes,
+            images: self.images,
         }
     }
 }
@@ -529,13 +571,14 @@ impl AppState {
             return None;
         }
         let message = self.queued_submission.begin_next()?;
-        self.push_message(ChatMessage::User(message.visible_text().to_string()));
+        self.push_user_message_with_images(message.visible_text().to_string(), message.images());
         self.enter_running();
         self.scroll_to_bottom();
         Some(UserAction::SubmitQueued {
             id: message.id(),
             prompt: message.submission_text().to_string(),
             bindings: message.submission_bindings().clone(),
+            images: message.images().to_vec(),
         })
     }
 
@@ -668,6 +711,30 @@ mod tests {
             .unwrap()
     }
 
+    fn image_message() -> QueuedUserMessage {
+        let payload = crate::clipboard_image::ClipboardImagePayload {
+            media_type: "image/png".to_string(),
+            data: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            width: 2,
+            height: 1,
+            source_name: None,
+        };
+        let mut images = ComposerImageState::default();
+        let request = images.begin_paste().unwrap();
+        let (label, _, _) = images
+            .complete_paste(request, "inspect", 7, vec![payload])
+            .unwrap();
+        let visible = format!("inspect{label}");
+        let attachments = images.attachments_for_text(&visible);
+        QueuedUserMessage::from_composer_with_images(
+            visible,
+            Vec::new(),
+            MentionBindings::default(),
+            attachments,
+        )
+        .unwrap()
+    }
+
     fn binding(text: &str, visible: &str) -> MentionBindings {
         let start = text.find(visible).expect("visible mention");
         MentionBindings::from_bindings(
@@ -720,6 +787,16 @@ mod tests {
     }
 
     #[test]
+    fn queued_message_preserves_image_attachments_for_edit_restore() {
+        let message = image_message();
+        assert_eq!(message.images().len(), 1);
+        assert_eq!(message.submission_text(), "inspect");
+        let restored = message.into_composer_state();
+        assert_eq!(restored.visible_text, "inspect [Image #1]");
+        assert_eq!(restored.images.len(), 1);
+    }
+
+    #[test]
     fn queued_preview_collapses_whitespace_and_never_expands_large_paste() {
         let visible = "alpha\n  beta [Pasted Content 1001 chars]";
         let message = QueuedUserMessage::from_composer(
@@ -745,6 +822,22 @@ mod tests {
 
         assert_eq!(preview.chars().count(), 256);
         assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn runtime_queue_preview_labels_image_only_input() {
+        let input = orca_runtime::prompt_queue::PromptQueueInput {
+            text: String::new(),
+            mention_bindings: MentionBindings::default(),
+            images: vec![orca_core::conversation::ImageInput {
+                source: orca_core::conversation::ImageSource::Url {
+                    url: "https://example.com/image.png".to_string(),
+                },
+                detail: orca_core::conversation::ImageDetail::High,
+            }],
+        };
+
+        assert_eq!(runtime_queue_preview_text(&input), "[Image #1]");
     }
 
     #[test]
@@ -1045,6 +1138,8 @@ mod tests {
         state.update(TuiEvent::SubmissionRejected {
             queued_id: state.queued_in_flight_id(),
             prompt: "first".to_string(),
+            bindings: MentionBindings::default(),
+            images: Vec::new(),
             message: "rejected".to_string(),
         });
         let restored = state.take_rejected_queued_composer_state().unwrap();
@@ -1074,6 +1169,8 @@ mod tests {
         state.update(TuiEvent::SubmissionRejected {
             queued_id: Some(u64::MAX),
             prompt: "other prompt".to_string(),
+            bindings: MentionBindings::default(),
+            images: Vec::new(),
             message: "other rejection".to_string(),
         });
         assert!(state.queued_submission_in_flight());

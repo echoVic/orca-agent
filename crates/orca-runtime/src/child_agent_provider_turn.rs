@@ -44,6 +44,7 @@ pub fn route_child_agent_model(
     let route_decision = config.model.route(ModelRouteContext {
         subagent_type: &request.subagent_type,
         subagent_model: None,
+        has_images: false,
     });
     child_cost_tracker.set_model(Some(&route_decision.actual_model));
     let mut provider_config = setup.provider_config.clone();
@@ -233,7 +234,10 @@ pub fn handle_child_agent_provider_error(
         return Ok(None);
     };
 
-    match RuntimeCompactionPolicy::decide_for_provider_error(&error, &setup.compaction_retry) {
+    match RuntimeCompactionPolicy::decide_for_provider_error(
+        &error.message,
+        &setup.compaction_retry,
+    ) {
         RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
             let mut events = EventFactory::new("child-agent-compaction".to_string());
             let mut sink = EventSink::new(io::sink(), config.output_format);
@@ -256,7 +260,7 @@ pub fn handle_child_agent_provider_error(
             ChildAgentProviderErrorDecision::Fail(ChildAgentResult {
                 status: RunStatus::Failed,
                 final_message: None,
-                error: Some(error),
+                error: Some(error.message),
                 budget_usage: None,
             }),
         )),

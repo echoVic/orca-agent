@@ -1153,6 +1153,7 @@ mod tests {
             writer
                 .append_message(&orca_core::conversation::Message::User {
                     content: "previous".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 })
                 .expect("message");
@@ -1244,6 +1245,7 @@ mod tests {
             writer
                 .append_message(&orca_core::conversation::Message::User {
                     content: "previous".to_string(),
+                    images: Vec::new(),
                     pinned: false,
                 })
                 .expect("message");

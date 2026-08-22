@@ -1,10 +1,13 @@
 use std::time::Instant;
 
+use crossbeam_channel as mpsc;
 use crossterm::event::{Event, MouseButton, MouseEventKind};
 use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 
+use crate::clipboard_image::{ImagePasteRequest, image_paths_from_paste};
+use crate::composer_image_actions::begin_image_paste;
 use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{insert_composer_paste, insert_pasted_text};
 use crate::selection::{SelectionGranularity, TranscriptSelection};
@@ -107,12 +110,56 @@ mod search_paste_tests {
             &Event::Paste("one\r\ntwo".to_string()),
             &mut state,
             &config,
+            &tx,
             &mut textarea,
         ));
 
         assert_eq!(state.transcript_search.query(), "one two");
         assert_eq!(textarea_text(&textarea), "composer");
         assert!(state.pending_pastes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod image_path_paste_tests {
+    use crossterm::event::Event;
+    use tui_textarea::TextArea;
+
+    use super::handle_paste_event;
+    use crate::clipboard_image::ImagePasteRequest;
+    use crate::test_support::test_run_config;
+    use crate::types::{AppState, UserAction};
+
+    #[test]
+    fn pasted_image_path_routes_to_background_attachment_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("screen shot.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            tx.clone(),
+            "test".to_string(),
+            orca_core::model::VISION_MODEL.to_string(),
+            root.path().display().to_string(),
+        );
+        let mut textarea = TextArea::from(["caption"]);
+
+        assert!(handle_paste_event(
+            &Event::Paste(format!("'{}'", path.display())),
+            &mut state,
+            &test_run_config(),
+            &tx,
+            &mut textarea,
+        ));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::PasteImages {
+                request: ImagePasteRequest::Paths(paths),
+                ..
+            }) if paths == vec![path]
+        ));
+        assert_eq!(textarea.lines(), &["caption".to_string()]);
     }
 }
 
@@ -151,6 +198,7 @@ mod running_paste_tests {
             &Event::Paste(pasted.clone()),
             &mut state,
             &config,
+            &tx,
             &mut textarea,
         ));
         let placeholder = textarea_text(&textarea);
@@ -320,6 +368,7 @@ pub(crate) fn handle_paste_event(
     ev: &Event,
     state: &mut AppState,
     config: &RunConfig,
+    action_tx: &mpsc::Sender<crate::types::UserAction>,
     textarea: &mut TextArea,
 ) -> bool {
     let Event::Paste(pasted) = ev else {
@@ -338,7 +387,16 @@ pub(crate) fn handle_paste_event(
         AppStatus::Setup if state.setup_step == 1 => {
             insert_pasted_text(textarea, pasted);
         }
-        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput => {
+        AppStatus::Idle | AppStatus::Running => {
+            if let Some(paths) = image_paths_from_paste(pasted) {
+                return begin_image_paste(state, action_tx, ImagePasteRequest::Paths(paths));
+            }
+            if insert_composer_paste(textarea, &mut state.pending_pastes, pasted) {
+                state.reset_history_navigation();
+                refresh_input_menus(textarea, state, config);
+            }
+        }
+        AppStatus::WaitingUserInput => {
             if insert_composer_paste(textarea, &mut state.pending_pastes, pasted) {
                 state.reset_history_navigation();
                 refresh_input_menus(textarea, state, config);
@@ -370,6 +428,15 @@ pub(crate) fn handle_mouse_event(
     let Event::Mouse(mouse) = ev else {
         return MouseFlow::NotMouse;
     };
+    if let Some(viewer) = state.image_viewer.as_mut() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => viewer.zoom_in(),
+            MouseEventKind::ScrollDown => viewer.zoom_out(),
+            _ => {}
+        }
+        state.selection = None;
+        return MouseFlow::Handled;
+    }
     if state.config_dialog.is_some() || state.user_input_dialog.is_some() {
         state.selection = None;
         return MouseFlow::Handled;
@@ -386,6 +453,27 @@ pub(crate) fn handle_mouse_event(
         MouseEventKind::Down(MouseButton::Left) => {
             const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
             state.drag_edge_scroll = None;
+
+            if !state.show_shortcuts
+                && state.plan_approval_dialog.is_none()
+                && state.status != AppStatus::WaitingApproval
+                && state.panel_mode == PanelMode::Conversation
+                && let Some(image) = state
+                    .image_hit_areas
+                    .iter()
+                    .find(|hit| {
+                        hit.rect
+                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                    })
+                    .map(|hit| hit.image.clone())
+            {
+                state.selection = None;
+                match crate::image_preview::ImageViewerState::open(image) {
+                    Ok(viewer) => state.image_viewer = Some(viewer),
+                    Err(error) => state.push_message(crate::types::ChatMessage::Error(error)),
+                }
+                return MouseFlow::Handled;
+            }
 
             if state.plan_approval_dialog.is_some() {
                 state.selection = None;
@@ -481,6 +569,22 @@ pub(crate) fn handle_mouse_event(
             {
                 textarea.cancel_selection();
                 textarea.move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                let text = crate::composer_textarea::textarea_text(textarea);
+                let cursor = crate::composer_textarea::textarea_cursor_byte_index(textarea);
+                if let Some(image) = state
+                    .composer_images
+                    .activatable_preview_at_cursor(&text, cursor)
+                {
+                    match crate::image_preview::ImageViewerState::open(image) {
+                        Ok(viewer) => state.image_viewer = Some(viewer),
+                        Err(error) => {
+                            state.push_message(crate::types::ChatMessage::Error(error));
+                        }
+                    }
+                    state.composer_mouse_selecting = false;
+                    state.last_left_click = None;
+                    return MouseFlow::Handled;
+                }
                 textarea.start_selection();
                 state.composer_mouse_selecting = true;
                 state.last_left_click = None;

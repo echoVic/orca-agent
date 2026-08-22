@@ -17,7 +17,9 @@ use orca_core::external_config::ExternalToolConfig;
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::mcp_types::McpServerConfig;
 use orca_core::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection};
-use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
+use orca_core::provider_types::{
+    ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
+};
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolInvocationStarted, ToolName, ToolRequest, ToolResult, ToolStatus};
@@ -556,7 +558,10 @@ fn handle_child_agent_provider_error_retries_prompt_too_long_once() {
     }
     let before_messages = setup.conversation.messages.len();
     let response = ProviderResponse {
-        steps: vec![ProviderStep::Error("prompt_too_long".to_string())],
+        steps: vec![ProviderStep::Error(ProviderError::new(
+            ProviderErrorKind::ContextExceeded,
+            "prompt_too_long",
+        ))],
         assistant_content: None,
         assistant_reasoning: None,
         tool_calls: vec![],
@@ -621,7 +626,7 @@ fn child_agent_provider_error_records_usage_before_failure() {
         &memory,
     );
     let response = ProviderResponse {
-        steps: vec![ProviderStep::Error("quota exhausted".to_string())],
+        steps: vec![ProviderStep::Error(ProviderError::other("quota exhausted"))],
         assistant_content: None,
         assistant_reasoning: None,
         tool_calls: vec![],
@@ -678,7 +683,7 @@ fn observed_child_agent_provider_error_emits_cumulative_usage() {
         &memory,
     );
     let response = ProviderResponse {
-        steps: vec![ProviderStep::Error("quota exhausted".to_string())],
+        steps: vec![ProviderStep::Error(ProviderError::other("quota exhausted"))],
         assistant_content: None,
         assistant_reasoning: None,
         tool_calls: vec![],
@@ -860,7 +865,7 @@ fn child_agent_tool_requests_extracts_only_provider_tool_calls() {
         steps: vec![
             ProviderStep::MessageDelta("before".to_string()),
             ProviderStep::ToolCall(first.clone()),
-            ProviderStep::Error("ignored here".to_string()),
+            ProviderStep::Error(ProviderError::other("ignored here")),
             ProviderStep::ToolCall(second.clone()),
         ],
         assistant_content: Some("tool please".to_string()),

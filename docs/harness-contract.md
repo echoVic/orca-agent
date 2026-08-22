@@ -322,7 +322,20 @@ The default (and only production) provider is DeepSeek. Internal test providers 
 - Transport: OpenAI-compatible Chat Completions (the Responses API is not required by the runtime)
 - Thinking mode: explicitly enabled on every request with `thinking.type = "enabled"`
 - Default reasoning effort: `max`; supported values are `low`, `high`, and `max` via `reasoning_effort`, `ORCA_REASONING_EFFORT`, or `DEEPSEEK_REASONING_EFFORT`
-- Model limits: 1M-token context window and 384K maximum output for both `deepseek-v4-flash` and `deepseek-v4-pro`
+- Model limits: 1M-token context window and 384K maximum output for
+  `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, and `deepseek-v4-pro`
+- Multimodal input: every model selection accepts ordered text/image blocks
+  from ACP plus TUI clipboard images, dragged or pasted paths/`file://` URLs,
+  and image file mentions. The vision model receives images directly; `auto`,
+  Pro, and Flash first persist a task-aware vision analysis, strip unsupported
+  binary blocks from the coding-model request, and fail the complete turn if
+  analysis fails.
+- TUI clipboard input: background decoding produces fenced `[Image #N]`
+  attachments that survive queueing, queue edits, and submission rejection;
+  macOS, Linux, Windows, and WSL have native paths, while headless SSH sessions
+  use remote image paths instead. Composer previews and submitted message
+  thumbnails use terminal-compatible true-color cells; Enter/click opens a
+  zoomable and pannable viewer.
 - Streaming: SSE with real-time reasoning/content deltas
 - Authentication: `DEEPSEEK_API_KEY` (required)
 - HTTP retry: 3 attempts with exponential backoff for 429/5xx status codes

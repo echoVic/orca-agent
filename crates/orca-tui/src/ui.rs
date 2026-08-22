@@ -40,6 +40,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     state.frame_area = Some(frame.area());
     state.input_area = None;
     state.search_area = None;
+    state.begin_image_render_frame();
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
         return;
@@ -136,6 +137,29 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_mention_candidates(frame, chunks[6], state, theme);
     }
 
+    if composer_visible(state)
+        && state.panel_mode == PanelMode::Conversation
+        && state.image_viewer.is_none()
+        && state.user_input_dialog.is_none()
+        && state.config_dialog.is_none()
+        && state.plan_approval_dialog.is_none()
+        && !state.show_shortcuts
+        && state.slash_menu.is_none()
+        && state.mention.phase.is_none()
+        && let Some(image) = state.composer_images.preview_at_cursor(
+            &crate::composer_textarea::textarea_text(textarea),
+            crate::composer_textarea::textarea_cursor_byte_index(textarea),
+        )
+    {
+        crate::image_preview::render_composer_preview(
+            frame,
+            chunks[1],
+            &image,
+            &mut state.image_renderer,
+            theme,
+        );
+    }
+
     if state.status == AppStatus::WaitingApproval {
         render_approval_dialog(frame, state, theme);
     }
@@ -160,6 +184,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 
     if state.show_shortcuts {
         render_shortcuts(frame, state, theme);
+    }
+    if let Some(viewer) = state.image_viewer.clone() {
+        crate::image_preview::render_viewer(frame, &viewer, &mut state.image_renderer, theme);
     }
 }
 
@@ -284,6 +311,7 @@ fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
         && !state.show_shortcuts
         && state.config_dialog.is_none()
         && state.user_input_dialog.is_none()
+        && state.image_viewer.is_none()
 }
 
 fn search_visible(state: &AppState) -> bool {
@@ -291,6 +319,7 @@ fn search_visible(state: &AppState) -> bool {
         && state.config_dialog.is_none()
         && state.user_input_dialog.is_none()
         && state.plan_approval_dialog.is_none()
+        && state.image_viewer.is_none()
         && state.panel_mode == PanelMode::Conversation
         && matches!(
             state.status,
@@ -1051,7 +1080,65 @@ pub(crate) fn render_live_messages(
         theme,
     );
 
+    let visible_start = viewport.base_row;
+    let visible_end = visible_start.saturating_add(visible_height);
+    state.image_hit_areas = state
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let ChatMessage::Image(image) = message else {
+                return None;
+            };
+            let range = state.transcript_render_cache.message_row_range(index)?;
+            let start = range.start.max(visible_start);
+            let end = range.end.min(visible_end);
+            let preview_start = range.start.saturating_add(1);
+            let preview_end = preview_start.saturating_add(usize::from(
+                crate::image_preview::thumbnail_preview_rows(image, width),
+            ));
+            let preview_rect = (preview_start < preview_end
+                && preview_start >= visible_start
+                && preview_end <= visible_end
+                && area.width > 4)
+                .then(|| {
+                    Rect::new(
+                        area.x.saturating_add(2),
+                        area.y + preview_start.saturating_sub(visible_start) as u16,
+                        area.width.saturating_sub(4).min(40),
+                        preview_end.saturating_sub(preview_start) as u16,
+                    )
+                });
+            (start < end).then(|| crate::image_preview::ImageHitArea {
+                rect: Rect::new(
+                    area.x,
+                    area.y + start.saturating_sub(visible_start) as u16,
+                    area.width,
+                    end.saturating_sub(start) as u16,
+                ),
+                preview_rect,
+                image: image.clone(),
+            })
+        })
+        .collect();
+
     frame.render_widget(viewport_paragraph(lines), area);
+    let native_previews = state
+        .image_hit_areas
+        .iter()
+        .filter_map(|hit| hit.preview_rect.map(|rect| (rect, hit.image.clone())))
+        .collect::<Vec<_>>();
+    for (rect, image) in native_previews {
+        state.image_renderer.paint_native(
+            frame,
+            &image,
+            rect,
+            crate::image_preview::ImageRenderSurface::Transcript,
+            100,
+            0,
+            0,
+        );
+    }
 
     // Floating "jump to bottom" pill, shown while the user has scrolled away
     // from the tail (auto-follow disarmed). While detached it doubles as an
@@ -1992,6 +2079,9 @@ fn append_message_lines(
                 Span::styled(text, Style::default().fg(theme.user)),
             ]));
             lines.push(Line::from(""));
+        }
+        ChatMessage::Image(image) => {
+            lines.extend(crate::image_preview::thumbnail_lines(image, width, theme));
         }
         ChatMessage::Reasoning(text) => {
             let prefix = Span::styled(
@@ -3354,6 +3444,9 @@ fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> Color {
 /// clean; every other status renders a coloured dot, a label, and (while running) the
 /// elapsed wall-clock time.
 fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::style::Color)> {
+    if state.composer_images.is_paste_in_flight() {
+        return Some(("● reading image...".to_string(), theme.warning));
+    }
     match &state.status {
         AppStatus::Idle => background_task_activity_line(state.workflow_tasks(), theme),
         AppStatus::Setup | AppStatus::SessionPicker => None,

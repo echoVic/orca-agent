@@ -29,6 +29,9 @@ case "$*" in
     printf '== Acceptance ==\\n'
     printf 'ALL TARGETS MET\\n'
     ;;
+  "run -p orca-provider --example vision_realapi")
+    printf 'vision smoke ok: response_chars=24 input_tokens=32 output_tokens=8\\n'
+    ;;
   "run -p orca-runtime --example goal_mode_realapi -- --max-budget 0.01")
     printf 'Goal Mode real API scenario verified: scenario=completion state=complete reason=verified_complete outer_turns=1 update_goal_requests=1 update_goal_acks=1 accepted_acks=1 rejected_acks=0 persisted_intents=1 verifier_outcomes=1 verifier_tokens=42 usage_events=2 charged_tokens=320 cost_micros=4 journal_goal_events=10 continuations=0 stale_continuations=0 in_flight_runs=0\\n'
     rejected_persisted_intents="\${ORCA_FAKE_GOAL_REJECTED_PERSISTED_INTENTS:-0}"
@@ -632,6 +635,7 @@ if (args[0] === "--mode" && args[1] === "server") {
   for (const expected of [
     "Build verified",
     "Provider summary real API e2e verified",
+    "Provider vision real API e2e verified",
     "Goal Mode real API scenario verified: scenario=completion state=complete reason=verified_complete",
     "Goal Mode real API scenario verified: scenario=rejected_completion state=paused reason=paused rejection_code=plan_mode",
     "Goal Mode real API scenario verified: scenario=blocked state=blocked reason=verified_blocked",
@@ -680,6 +684,7 @@ if (args[0] === "--mode" && args[1] === "server") {
   for (const expected of [
     "cargo build --bin orca",
     "cargo run -p orca-provider --example summary_render_realapi",
+    "cargo run -p orca-provider --example vision_realapi",
     "cargo run -p orca-runtime --example goal_mode_realapi -- --max-budget 0.01",
     "orca exec --output-format jsonl --no-history --mode suggest --max-budget 0.01 Reply with exactly: ORCA_REAL_E2E_OK",
     "orca exec --output-format jsonl --mode full-auto --max-budget 0.01 --resume latest Do not call tools or retry prior work. Reply with exactly: ORCA_HISTORY_REPLAY_OK",
@@ -736,6 +741,7 @@ if (args[0] === "--mode" && args[1] === "server") {
         "0.01",
         "--skip-build",
         "--skip-provider-summary",
+        "--skip-provider-vision",
         "--skip-server",
       ],
       {
@@ -771,6 +777,7 @@ if (args[0] === "--mode" && args[1] === "server") {
         "0.01",
         "--skip-build",
         "--skip-provider-summary",
+        "--skip-provider-vision",
         "--skip-cli",
         "--skip-server",
       ],
@@ -807,6 +814,7 @@ if (args[0] === "--mode" && args[1] === "server") {
         "0.01",
         "--skip-build",
         "--skip-provider-summary",
+        "--skip-provider-vision",
         "--skip-cli",
         "--skip-server",
       ],

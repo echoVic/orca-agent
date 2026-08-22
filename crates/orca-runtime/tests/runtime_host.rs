@@ -1725,7 +1725,7 @@ fn typed_idle_session_commands_mutate_only_actor_owned_state() {
             .is_some_and(|context| context.contains("skill context"))
     );
     assert!(snapshot.messages().iter().any(|message| {
-        matches!(message, Message::User { content, pinned: true } if content == "remember this")
+        matches!(message, Message::User { content, pinned: true, .. } if content == "remember this")
     }));
 
     host.shutdown().expect("shutdown runtime host");

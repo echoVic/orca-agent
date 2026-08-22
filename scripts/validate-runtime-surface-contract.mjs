@@ -1810,11 +1810,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 38 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 39 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 38,
-          "current_tui_user_actions must contain 38 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 39,
+          "current_tui_user_actions must contain 39 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

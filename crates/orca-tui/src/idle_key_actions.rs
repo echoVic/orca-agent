@@ -6,6 +6,7 @@ use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 
+use crate::composer_image_actions::handle_composer_image_preview_key;
 use crate::composer_input_actions::{
     apply_composer_key_input, handle_composer_editor_shortcut, insert_composer_newline,
     recall_next_history, recall_previous_history,
@@ -66,6 +67,10 @@ pub(crate) fn handle_idle_key(
     }
 
     if handle_composer_editor_shortcut(ev, key, state, config, textarea, vim_state, theme) {
+        return;
+    }
+    if handle_composer_image_preview_key(*key, state, textarea) {
+        vim_state.cancel_pending_command();
         return;
     }
 

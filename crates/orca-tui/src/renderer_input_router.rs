@@ -111,7 +111,13 @@ impl<'a, 'text> RendererInputRouter<'a, 'text> {
                         self.config,
                     );
                 }
-                if handle_paste_event(&event, self.state, self.config, self.textarea) {
+                if handle_paste_event(
+                    &event,
+                    self.state,
+                    self.config,
+                    self.action_tx,
+                    self.textarea,
+                ) {
                     self.vim_state.cancel_pending_command();
                     return Ok(None);
                 }

@@ -463,12 +463,14 @@ impl<'a> RuntimeTaskActor<'a> {
         model: &ModelSelection,
         subagent_type: &SubagentType,
         subagent_model: Option<&str>,
+        has_images: bool,
         provider_config: &ProviderConfig,
         cost_tracker: &mut CostTracker,
     ) -> RuntimeModelTurn {
         let decision = model.route(ModelRouteContext {
             subagent_type,
             subagent_model,
+            has_images,
         });
         cost_tracker.set_model(Some(&decision.actual_model));
         let mut provider_config = provider_config.clone();
@@ -1949,7 +1951,9 @@ mod tests {
             .expect("open turn");
 
         match result {
-            RuntimeTurnOpeningResult::Continue { provider_config } => {
+            RuntimeTurnOpeningResult::Continue {
+                provider_config, ..
+            } => {
                 assert_eq!(provider_config.api_key.as_deref(), Some("test-key"));
                 assert_eq!(
                     provider_config.model.as_deref(),
@@ -2066,6 +2070,7 @@ mod tests {
                 actor: &mut actor,
                 model: &model,
                 turn_context,
+                has_images: false,
                 model_override: None,
                 provider_config: &provider_config,
                 cost_tracker: &mut cost_tracker,
@@ -2117,6 +2122,7 @@ mod tests {
                 actor: &mut actor,
                 model: &model,
                 turn_context,
+                has_images: false,
                 model_override: directive_state.model_override(),
                 provider_config: &provider_config,
                 cost_tracker: &mut cost_tracker,

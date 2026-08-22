@@ -4,7 +4,7 @@ use orca_core::config::ProviderKind;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
-use orca_core::model::ModelSelection;
+use orca_core::model::{ImageRouteDecision, ModelSelection};
 use orca_provider::{ProviderConfig, context};
 
 use crate::compaction::RuntimeCompactionStep;
@@ -39,7 +39,10 @@ pub(crate) struct RuntimeTurnOpeningInput<'a, 'runtime, W: io::Write> {
 }
 
 pub(crate) enum RuntimeTurnOpeningResult {
-    Continue { provider_config: ProviderConfig },
+    Continue {
+        provider_config: ProviderConfig,
+        image_route: ImageRouteDecision,
+    },
     Return(AgentLoopResult),
 }
 
@@ -133,18 +136,25 @@ impl RuntimeTurnOpeningStep {
             input.conversation.add_system_pinned(message);
         }
 
-        let turn_provider_config = RuntimeModelRouteStep::new()
-            .route(RuntimeModelRouteInput {
-                actor: input.actor,
-                model: input.model,
-                turn_context: turn_context.clone(),
-                model_override: input.model_override,
-                provider_config: input.provider_config,
-                cost_tracker: input.cost_tracker,
-                events: input.events,
-                sink: input.sink,
-            })?
-            .provider_config;
+        let routed_model = RuntimeModelRouteStep::new().route(RuntimeModelRouteInput {
+            actor: input.actor,
+            model: input.model,
+            turn_context: turn_context.clone(),
+            has_images: input.conversation.messages.iter().any(|message| {
+                matches!(
+                    message,
+                    orca_core::conversation::Message::User { images, .. }
+                        if !images.is_empty()
+                )
+            }),
+            model_override: input.model_override,
+            provider_config: input.provider_config,
+            cost_tracker: input.cost_tracker,
+            events: input.events,
+            sink: input.sink,
+        })?;
+        let image_route = routed_model.decision.image_route;
+        let turn_provider_config = routed_model.provider_config;
 
         RuntimeSteerStep::new().apply(RuntimeSteerInput {
             turn_context,
@@ -154,6 +164,7 @@ impl RuntimeTurnOpeningStep {
 
         Ok(RuntimeTurnOpeningResult::Continue {
             provider_config: turn_provider_config,
+            image_route,
         })
     }
 }

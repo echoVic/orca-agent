@@ -760,6 +760,48 @@ uuid_wrapper!(SurfaceCapabilityCallId, UuidV7);
 uuid_wrapper!(SurfaceConnectionId, UuidV7);
 uuid_wrapper!(HostIncarnation, UuidV7);
 uuid_wrapper!(SurfaceIncarnation, UuidV7);
+uuid_wrapper!(ContextWindowId, Uuid);
+
+impl ContextWindowId {
+    pub fn new() -> Self {
+        Self(Uuid::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).expect("UUIDv7 is a UUID"))
+    }
+
+    pub fn initial_for_thread(thread_id: &SurfaceThreadId) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"orca.context-window.v1");
+        hasher.update(thread_id.as_bytes());
+        Self::from_digest(hasher.finalize())
+    }
+
+    pub fn for_compaction(previous: &ContextWindowId, operation_id: &SurfaceOperationId) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"orca.context-window.compaction.v1");
+        hasher.update(previous.as_bytes());
+        hasher.update(operation_id.as_bytes());
+        Self::from_digest(hasher.finalize())
+    }
+
+    pub fn is_legacy_unspecified(&self) -> bool {
+        self.as_bytes().iter().all(|byte| *byte == 0)
+    }
+
+    fn from_digest(digest: impl AsRef<[u8]>) -> Self {
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest.as_ref()[..16]);
+        Self(Uuid::try_from_bytes(bytes).expect("digest bytes form a UUID"))
+    }
+}
+
+impl Default for ContextWindowId {
+    fn default() -> Self {
+        Self(Uuid::try_from_bytes([0; 16]).expect("zero bytes form a UUID"))
+    }
+}
 
 impl SurfaceRequestId {
     pub fn new() -> Self {
@@ -1254,5 +1296,20 @@ mod tests {
         assert!(signal.is_cancelled());
         signal.cancel();
         assert!(signal.is_cancelled());
+    }
+
+    #[test]
+    fn initial_context_window_identity_is_stable_per_thread_and_isolated_across_forks() {
+        let first = SurfaceThreadId::try_from_bytes([1; 16]).unwrap();
+        let second = SurfaceThreadId::try_from_bytes([2; 16]).unwrap();
+
+        assert_eq!(
+            ContextWindowId::initial_for_thread(&first),
+            ContextWindowId::initial_for_thread(&first)
+        );
+        assert_ne!(
+            ContextWindowId::initial_for_thread(&first),
+            ContextWindowId::initial_for_thread(&second)
+        );
     }
 }

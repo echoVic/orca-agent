@@ -54,7 +54,9 @@ mod tests {
     use super::*;
     use crate::history;
     use orca_core::approval_types::ActionKind;
-    use orca_core::conversation::{MISSING_TOOL_TERMINAL_ERROR, Message, RawToolCall};
+    use orca_core::conversation::{
+        ImageDetail, ImageInput, ImageSource, MISSING_TOOL_TERMINAL_ERROR, Message, RawToolCall,
+    };
     use orca_core::thread_identity::{ConversationItemId, TurnId};
     use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminalSource};
 
@@ -93,6 +95,55 @@ mod tests {
     }
 
     #[test]
+    fn session_store_round_trips_multimodal_user_input() {
+        let cwd = tempfile::tempdir().unwrap();
+        history::with_redirected_orca_home("thread-store-multimodal", |_home| {
+            let store = SessionStore::new();
+            let mut thread = store
+                .create_live_thread(
+                    cwd.path(),
+                    "deepseek",
+                    Some(orca_core::model::VISION_MODEL.to_string()),
+                    "inspect image",
+                )
+                .unwrap();
+            thread
+                .writer_mut()
+                .enter_turn(orca_core::thread_identity::TurnId::new());
+            thread
+                .append_items(&[Message::user_with_images(
+                    "inspect image".to_string(),
+                    vec![ImageInput {
+                        source: ImageSource::Url {
+                            url: "https://example.com/image.png".to_string(),
+                        },
+                        detail: ImageDetail::Low,
+                    }],
+                )])
+                .unwrap();
+            let thread_id = thread.thread_id().to_string();
+            drop(thread);
+
+            let loaded = store.load_session(&thread_id).unwrap();
+            assert!(matches!(
+                loaded.messages.as_slice(),
+                [Message::User {
+                    content,
+                    images,
+                    ..
+                }] if content == "inspect image"
+                    && matches!(
+                        images.as_slice(),
+                        [ImageInput {
+                            source: ImageSource::Url { url },
+                            detail: ImageDetail::Low,
+                        }] if url == "https://example.com/image.png"
+                    )
+            ));
+        });
+    }
+
+    #[test]
     fn thread_store_projects_conversation_turns() {
         let messages = vec![
             Message::System {
@@ -101,6 +152,7 @@ mod tests {
             },
             Message::User {
                 content: "hello".to_string(),
+                images: Vec::new(),
                 pinned: false,
             },
             Message::Assistant {
@@ -125,6 +177,7 @@ mod tests {
     fn thread_store_projects_messages_to_json_items() {
         let message = Message::User {
             content: "hello".to_string(),
+            images: Vec::new(),
             pinned: false,
         };
 

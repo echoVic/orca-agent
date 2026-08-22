@@ -478,6 +478,14 @@ pub(crate) struct TranscriptViewport {
 }
 
 impl TranscriptRenderCache {
+    pub(crate) fn message_row_range(&self, message_index: usize) -> Option<std::ops::Range<usize>> {
+        let start = *self.cumulative_heights.get(message_index)?;
+        let end = *self
+            .cumulative_heights
+            .get(message_index.saturating_add(1))?;
+        Some(start..end)
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()

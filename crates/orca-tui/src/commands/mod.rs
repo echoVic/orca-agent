@@ -679,10 +679,16 @@ mod tests {
     fn validates_supported_models() {
         assert_eq!(
             available_models(),
-            &["auto", "deepseek-v4-flash", "deepseek-v4-pro"]
+            &[
+                "auto",
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-vision-exp",
+                "deepseek-v4-pro"
+            ]
         );
         assert!(validate_model("auto").is_ok());
         assert!(validate_model("deepseek-v4-flash").is_ok());
+        assert!(validate_model("deepseek-v4-flash-vision-exp").is_ok());
         assert!(validate_model("deepseek-v4-pro").is_ok());
         assert!(validate_model("deepseek-reasoner").is_err());
         assert!(validate_model("bogus-model").is_err());

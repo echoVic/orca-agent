@@ -99,8 +99,9 @@ auto_resume_last = false
 
 | 模型 | 适用场景 | 费用 | 速度 |
 |------|----------|------|------|
-| `deepseek-v4-flash` | 快速编辑、搜索、简单重构 | 低（约 $0.001/1K tokens） | 快（约 30 tok/s） |
-| `deepseek-v4-pro` | 架构设计、复杂调试、多文件变更 | 中（约 $0.004/1K tokens） | 中（约 15 tok/s） |
+| `deepseek-v4-flash` | 快速编辑、搜索、简单重构 | 高峰期每百万 tokens 输入 3 元、输出 9 元 | 快 |
+| `deepseek-v4-flash-vision-exp` | 截图、图表、流程图和视觉智能体任务 | 与 Flash 相同 | 快 |
+| `deepseek-v4-pro` | 架构设计、复杂调试、多文件变更 | 高峰期每百万 tokens 输入 9 元、输出 27 元 | 中等 |
 
 > **提示：** 大多数任务从 `deepseek-v4-flash` 开始。当智能体需要跨文件推理或设计新系统时切换到 `deepseek-v4-pro`。
 

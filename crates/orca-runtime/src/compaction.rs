@@ -327,7 +327,7 @@ pub fn handle_tui_agent_provider_error<W: io::Write>(
         return Ok(TuiAgentProviderErrorAction::NoError);
     };
 
-    match RuntimeCompactionPolicy::decide_for_provider_error(&error, &state.retry) {
+    match RuntimeCompactionPolicy::decide_for_provider_error(&error.message, &state.retry) {
         RuntimeCompactionRetryDecision::CompactAndRetry { trigger, .. } => {
             let runtime_parts = session.runtime_parts();
             let mut sink = EventSink::new(input.writer, OutputFormat::Jsonl)
@@ -356,7 +356,7 @@ pub fn handle_tui_agent_provider_error<W: io::Write>(
         }
         RuntimeCompactionRetryDecision::SurfaceError => {
             state.retry.reset();
-            Ok(TuiAgentProviderErrorAction::SurfaceError(error))
+            Ok(TuiAgentProviderErrorAction::SurfaceError(error.message))
         }
     }
 }

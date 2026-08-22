@@ -53,6 +53,13 @@ pub trait RuntimeWorkflowLifecycleIngress: Send + Sync + std::fmt::Debug {
 
 pub trait RuntimeProviderResponseIngress: Send + Sync + std::fmt::Debug {
     fn commit_response(&self, response: &RuntimeModelResponse) -> io::Result<()>;
+    fn commit_provider_attempt_failure(
+        &self,
+        _identity: &ModelResponseIdentity,
+        _message: &str,
+    ) -> io::Result<()> {
+        Ok(())
+    }
     fn commit_provider_failure(
         &self,
         _identity: &ModelResponseIdentity,

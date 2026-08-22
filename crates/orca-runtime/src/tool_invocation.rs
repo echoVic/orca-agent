@@ -580,7 +580,7 @@ mod tests {
             ProviderStep::ToolCall(first.clone()),
             ProviderStep::ReasoningDelta("thinking".to_string()),
             ProviderStep::ToolCall(second.clone()),
-            ProviderStep::Error("ignored".to_string()),
+            ProviderStep::Error(orca_core::provider_types::ProviderError::other("ignored")),
         ];
 
         let requests = tool_requests_from_provider_steps(&steps);

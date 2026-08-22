@@ -132,9 +132,17 @@ pub(crate) fn handle_runtime_event(
     }
 
     let new_session_started = matches!(&tui_event, TuiEvent::NewSessionStarted);
-    let restored_prompt = match &tui_event {
+    let restored_composer = match &tui_event {
         TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
         TuiEvent::SubmissionRejected { prompt, .. } => Some(prompt.clone()),
+        _ => None,
+    };
+    let restored_images = match &tui_event {
+        TuiEvent::SubmissionRejected { images, .. } => Some(images.clone()),
+        _ => None,
+    };
+    let restored_bindings = match &tui_event {
+        TuiEvent::SubmissionRejected { bindings, .. } => Some(bindings.clone()),
         _ => None,
     };
     let workflow_notification_turn_boundary = is_workflow_notification_turn_boundary(&tui_event);
@@ -153,6 +161,7 @@ pub(crate) fn handle_runtime_event(
         state.mention_bindings = composer.mention_bindings;
         state.atomic_skill_tokens.clear();
         state.pending_pastes = composer.pending_pastes;
+        state.composer_images.restore(composer.images);
         state.reset_history_navigation();
     }
     if state.status != previous_status {
@@ -166,15 +175,29 @@ pub(crate) fn handle_runtime_event(
     if let Some(id) = batch_queued_workflow_notification_id {
         remove_pending_workflow_notification_by_id(state, &id);
     }
-    if let Some(prompt) = restored_prompt {
+    if let Some(prompt) = restored_composer {
         vim_state.flush_pending_insert_escape(textarea);
         vim_state.reset_insert(textarea, theme);
+        let prompt = restored_images.as_ref().map_or(prompt.clone(), |images| {
+            crate::composer_images::ComposerImageState::visible_text_with_attachments(
+                &prompt, images,
+            )
+        });
         *textarea = make_textarea_with_text(&prompt, vim_state, theme);
+        if let Some(images) = restored_images {
+            state.composer_images.restore(images);
+        } else {
+            state.composer_images.clear_attachments();
+        }
+        if let Some(bindings) = restored_bindings {
+            state.mention_bindings = bindings;
+        }
     }
     if new_session_started {
         vim_state.flush_pending_insert_escape(textarea);
         vim_state.reset_insert(textarea, theme);
         *textarea = make_textarea_with_text("", vim_state, theme);
+        state.composer_images.clear_attachments();
     }
     if state.plan_approval_dialog.is_none() {
         if workflow_notification_turn_boundary {
@@ -785,6 +808,8 @@ mod tests {
             TuiEvent::SubmissionRejected {
                 queued_id: state.queued_in_flight_id(),
                 prompt,
+                bindings: MentionBindings::default(),
+                images: Vec::new(),
                 message: "rejected".to_string(),
             },
             &mut state,
@@ -838,6 +863,8 @@ mod tests {
             TuiEvent::SubmissionRejected {
                 queued_id: Some(u64::MAX),
                 prompt: "other prompt".to_string(),
+                bindings: MentionBindings::default(),
+                images: Vec::new(),
                 message: "other rejection".to_string(),
             },
             &mut state,
@@ -856,15 +883,45 @@ mod tests {
     #[test]
     fn submission_rejection_restores_prompt_to_composer() {
         let (action_tx, _action_rx) = mpsc::unbounded();
+        let visible_prompt = "review @gone.txt [Image #1] ";
+        let rejected_prompt = "review @gone.txt";
         let mut state = AppState::new(
             action_tx.clone(),
             "0.0.0-test".to_string(),
             "mock".to_string(),
             "/tmp".to_string(),
         );
-        state.push_message(crate::types::ChatMessage::User(
-            "review @gone.txt".to_string(),
-        ));
+        let bindings = MentionBindings::from_bindings(
+            rejected_prompt,
+            vec![MentionBinding {
+                start: 7,
+                end: 16,
+                visible: "@gone.txt".to_string(),
+                target: MentionTarget::File {
+                    root: std::env::temp_dir(),
+                    path: "gone.txt".to_string(),
+                    kind: MentionFileKind::File,
+                },
+            }],
+        );
+        let mut images = crate::composer_images::ComposerImageState::default();
+        let request = images.begin_paste().unwrap();
+        let _ = images
+            .complete_paste(
+                request,
+                "review @gone.txt",
+                "review @gone.txt".len(),
+                vec![crate::clipboard_image::ClipboardImagePayload {
+                    media_type: "image/png".to_string(),
+                    data: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+                    width: 2,
+                    height: 1,
+                    source_name: None,
+                }],
+            )
+            .unwrap();
+        let attachments = images.attachments_for_text(visible_prompt);
+        state.push_message(crate::types::ChatMessage::User(visible_prompt.to_string()));
         state.enter_running();
         let pending = bridge::PendingWorkflowNotifications::new();
         let theme = Theme::named(ThemeName::Dark);
@@ -881,7 +938,9 @@ mod tests {
         handle_runtime_event(
             TuiEvent::SubmissionRejected {
                 queued_id: None,
-                prompt: "review @gone.txt".to_string(),
+                prompt: rejected_prompt.to_string(),
+                bindings,
+                images: attachments,
                 message: "bound file is no longer available".to_string(),
             },
             &mut state,
@@ -893,7 +952,15 @@ mod tests {
             &mut presentation,
         );
 
-        assert_eq!(textarea_text(&textarea), "review @gone.txt");
+        assert_eq!(textarea_text(&textarea), visible_prompt);
+        assert_eq!(state.mention_bindings.bindings().len(), 1);
+        assert_eq!(
+            state
+                .composer_images
+                .attachments_for_text(visible_prompt)
+                .len(),
+            1
+        );
         assert_eq!(state.status, AppStatus::Idle);
     }
 
