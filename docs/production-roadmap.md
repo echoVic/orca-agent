@@ -131,7 +131,10 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.4.1 batches provider step commits with deferred
+Current baseline: v0.4.2 indexes surface commit batches by id so
+recovery of long recorded surface logs scales linearly instead of
+quadratically, with a bounded-time regression gate. v0.4.1 batches
+provider step commits with deferred
 surface refresh, caches token counts, shards the reducer state, and
 coalesces consecutive delta events before renderer dispatch; it also
 hardens sandbox metadata handling so symlinked or forged metadata roots

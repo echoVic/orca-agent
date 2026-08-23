@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.2":
+        "Indexes prepared surface commit batches by commit id during surface JSONL log recovery, replacing a linear scan per record so recovery scales linearly instead of quadratically. A bounded-time regression test recovers 25,000 prepared/committed pairs within five seconds.",
       "v0.4.1":
         "Speeds up streaming surfaces by batching provider step commits behind deferred refresh, caching token counts, sharding the reducer state across BTreeMaps, and coalescing consecutive MessageDelta and ReasoningDelta events into bounded merged deltas before renderer dispatch. Hardens sandbox metadata permission handling: Linux/bubblewrap discovers nested protected metadata under writable roots and re-binds it read-only, symlinked metadata roots cannot widen an explicit grant, session grants are recorded only after a safety guard, and reserved session-metadata sources are ignored at the thread boundary and by ordinary permission updates. Workflow active-state classification switches from an allowlist to exclusion with reported status sequences.",
       "v0.4.0":
@@ -618,6 +620,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.2":
+        "在扫描录制 surface JSONL 日志时按 commit id 建立 prepared batch 索引，替代逐条线性查找，使恢复耗时从平方级降为线性。新增有界时间回归测试：5 秒内恢复 25,000 组 prepared/committed 记录。",
       "v0.4.1":
         "通过批量提交 provider 步骤并延迟 surface 刷新、缓存 token 计数、用分片 BTreeMap 重构 reducer 状态、以及在渲染器分发前把连续的 MessageDelta/ReasoningDelta 合并成有界增量，显著提升流式响应性能。同时加固沙箱元数据权限：Linux/bubblewrap 在启动前发现可写根目录下嵌套的受保护元数据并只读重绑定，符号链接元数据根无法扩大授权，会话授权需通过安全检查才会记录，保留的 session-metadata 来源在线程边界和普通权限更新中被忽略，伪造配置无法铸造元数据提权。Workflow 活动状态判定从 allowlist 改为排除法，并在失败时报告观测到的状态序列。",
       "v0.4.0":
