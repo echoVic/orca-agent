@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.1";
+export const releaseVersion = "v0.4.2";
 
 export const releases = [
+  {
+    version: "v0.4.2",
+    date: "2026-08-23",
+    title: "Linear surface commit recovery",
+    body: "Indexes prepared surface commit batches by commit id while scanning the recorded surface JSONL log, so recovery scales linearly with the number of commit records instead of quadratically. A bounded-time regression test recovers 25,000 prepared/committed pairs within five seconds.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.2",
+  },
   {
     version: "v0.4.1",
     date: "2026-08-23",
