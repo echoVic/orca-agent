@@ -68,16 +68,10 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
         return bwrap_command(bwrap, &request);
     }
 
-    // Some nested deny/read-only policies require namespace mounts that
-    // Landlock cannot express. They must fail before selecting the Landlock
-    // fallback, even when Landlock itself is available.
-    if policy_requires_bwrap(&request) {
-        return fail_closed_command("this Linux sandbox policy requires bubblewrap");
-    }
-
-    // No bwrap: try the in-process Landlock + seccomp fallback. Strict requests
-    // fail closed if that backend is unavailable; other capability modes retain
-    // their compatibility fallback.
+    // No bwrap: try the in-process Landlock + seccomp fallback. Policies that
+    // require namespace mounts (nested read-only or denied paths) are rejected
+    // by landlock_command below; strict requests then fail closed, while other
+    // capability modes retain their established compatibility fallback.
     match landlock_command(&request) {
         Ok(command) => command,
         Err(_) if request.strict => {
@@ -574,7 +568,42 @@ mod tests {
     }
 
     #[test]
-    fn nested_read_only_policy_without_backend_fails_closed_when_non_strict() {
+    fn nested_read_only_policy_without_backend_keeps_non_strict_compatibility_fallback() {
+        if bwrap_path(Path::new(".")).is_some() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let metadata = workspace.path().join(".git");
+        let marker = workspace.path().join("must-run");
+        std::fs::create_dir(&metadata).unwrap();
+        let request = LinuxSandboxRequest {
+            command: format!("touch {}", marker.display()),
+            policy: LinuxSandboxPolicy {
+                cwd: workspace.path().to_path_buf(),
+                read_scope: LinuxReadScope::Global,
+                readable_roots: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                writable_roots: vec![workspace.path().to_path_buf()],
+                metadata_protection_roots: vec![workspace.path().to_path_buf()],
+                metadata_writable_roots: Vec::new(),
+                read_only_roots: vec![metadata],
+                denied_roots: Vec::new(),
+                network_access: true,
+            },
+            strict: false,
+        };
+
+        let output = sandbox_command(request).output().unwrap();
+
+        // Non-strict capability modes retain the established compatibility
+        // fallback when bubblewrap is unavailable; only strict restricted-read
+        // requests fail closed.
+        assert_eq!(output.status.code(), Some(0));
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn nested_read_only_policy_without_backend_fails_closed_when_strict() {
         if bwrap_path(Path::new(".")).is_some() {
             return;
         }
@@ -596,7 +625,7 @@ mod tests {
                 denied_roots: Vec::new(),
                 network_access: true,
             },
-            strict: false,
+            strict: true,
         };
 
         let output = sandbox_command(request).output().unwrap();
