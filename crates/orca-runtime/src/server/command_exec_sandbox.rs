@@ -569,7 +569,9 @@ fn push_writable_root(
     root: PathBuf,
 ) {
     if orca_tools::sandbox::is_protected_metadata_root(&root) {
-        push_unique_path(metadata_writable_roots, root);
+        if orca_tools::sandbox::is_safe_metadata_writable_root(&root) {
+            push_unique_path(metadata_writable_roots, root);
+        }
     } else {
         push_unique_path(additional_writable_roots, root);
     }

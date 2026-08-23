@@ -22,7 +22,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::sandbox::bwrap::{LinuxReadScope, LinuxSandboxPolicy, build_bwrap_argv};
+use crate::sandbox::bwrap::{
+    LinuxReadScope, LinuxSandboxPolicy, build_bwrap_argv, effective_read_only_roots,
+};
 
 /// Resolved, canonicalized sandbox request shared by both backends.
 pub(crate) struct LinuxSandboxRequest {
@@ -66,15 +68,19 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
         return bwrap_command(bwrap, &request);
     }
 
-    // No bwrap: try the in-process Landlock + seccomp fallback.
     // Some nested deny/read-only policies require namespace mounts that
-    // Landlock cannot express. Only strict restricted-read requests must fail
-    // closed when no enforcing backend is available; non-strict capability
-    // modes retain their established compatibility fallback.
-    let must_fail_closed = request.strict;
+    // Landlock cannot express. They must fail before selecting the Landlock
+    // fallback, even when Landlock itself is available.
+    if policy_requires_bwrap(&request) {
+        return fail_closed_command("this Linux sandbox policy requires bubblewrap");
+    }
+
+    // No bwrap: try the in-process Landlock + seccomp fallback. Strict requests
+    // fail closed if that backend is unavailable; other capability modes retain
+    // their compatibility fallback.
     match landlock_command(&request) {
         Ok(command) => command,
-        Err(_) if must_fail_closed => {
+        Err(_) if request.strict => {
             fail_closed_command("no compatible Linux sandbox backend is available")
         }
         Err(_) => plain_command(&request.command, &request.policy.cwd),
@@ -86,14 +92,14 @@ fn policy_requires_bwrap(request: &LinuxSandboxRequest) -> bool {
     if !policy.network_access && !policy.allowed_unix_socket_roots.is_empty() {
         return true;
     }
-    let writable_overlap = policy
-        .read_only_roots
+    let writable_overlap = effective_read_only_roots(policy)
         .iter()
         .filter(|root| root.exists())
         .any(|read_only| {
             policy
                 .writable_roots
                 .iter()
+                .chain(&policy.metadata_writable_roots)
                 .any(|writable| paths_overlap(read_only, writable))
         });
     if writable_overlap {
@@ -115,6 +121,7 @@ fn policy_requires_bwrap(request: &LinuxSandboxRequest) -> bool {
     let mut accessible = vec![policy.cwd.as_path()];
     accessible.extend(policy.readable_roots.iter().map(PathBuf::as_path));
     accessible.extend(policy.writable_roots.iter().map(PathBuf::as_path));
+    accessible.extend(policy.metadata_writable_roots.iter().map(PathBuf::as_path));
     accessible.extend(
         policy
             .allowed_unix_socket_roots
@@ -270,6 +277,9 @@ mod linux_landlock {
             for root in &policy.writable_roots {
                 push_unique(&mut readable_roots, root.clone());
             }
+            for root in &policy.metadata_writable_roots {
+                push_unique(&mut readable_roots, root.clone());
+            }
             for root in &policy.allowed_unix_socket_roots {
                 push_unique(&mut readable_roots, root.clone());
             }
@@ -308,6 +318,7 @@ mod linux_landlock {
             let writable: Vec<&PathBuf> = policy
                 .writable_roots
                 .iter()
+                .chain(&policy.metadata_writable_roots)
                 .filter(|r| r.exists())
                 .collect();
             if !writable.is_empty() {
@@ -488,6 +499,8 @@ mod tests {
                 readable_roots: Vec::new(),
                 allowed_unix_socket_roots: Vec::new(),
                 writable_roots: Vec::new(),
+                metadata_protection_roots: Vec::new(),
+                metadata_writable_roots: Vec::new(),
                 read_only_roots: Vec::new(),
                 denied_roots: Vec::new(),
                 network_access: false,
@@ -544,6 +557,8 @@ mod tests {
                 readable_roots: Vec::new(),
                 allowed_unix_socket_roots: Vec::new(),
                 writable_roots: vec![workspace.path().to_path_buf()],
+                metadata_protection_roots: vec![workspace.path().to_path_buf()],
+                metadata_writable_roots: Vec::new(),
                 read_only_roots: vec![workspace.path().join(".git")],
                 denied_roots: Vec::new(),
                 network_access: false,
@@ -559,6 +574,38 @@ mod tests {
     }
 
     #[test]
+    fn nested_read_only_policy_without_backend_fails_closed_when_non_strict() {
+        if bwrap_path(Path::new(".")).is_some() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let metadata = workspace.path().join(".git");
+        let marker = workspace.path().join("must-not-run");
+        std::fs::create_dir(&metadata).unwrap();
+        let request = LinuxSandboxRequest {
+            command: format!("touch {}", marker.display()),
+            policy: LinuxSandboxPolicy {
+                cwd: workspace.path().to_path_buf(),
+                read_scope: LinuxReadScope::Global,
+                readable_roots: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                writable_roots: vec![workspace.path().to_path_buf()],
+                metadata_protection_roots: vec![workspace.path().to_path_buf()],
+                metadata_writable_roots: Vec::new(),
+                read_only_roots: vec![metadata],
+                denied_roots: Vec::new(),
+                network_access: true,
+            },
+            strict: false,
+        };
+
+        let output = sandbox_command(request).output().unwrap();
+
+        assert_eq!(output.status.code(), Some(126));
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn unix_socket_exceptions_require_bwrap_when_network_is_disabled() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_root = tempfile::tempdir().unwrap();
@@ -570,6 +617,8 @@ mod tests {
                 readable_roots: Vec::new(),
                 allowed_unix_socket_roots: vec![socket_root.path().to_path_buf()],
                 writable_roots: Vec::new(),
+                metadata_protection_roots: Vec::new(),
+                metadata_writable_roots: Vec::new(),
                 read_only_roots: Vec::new(),
                 denied_roots: Vec::new(),
                 network_access: false,

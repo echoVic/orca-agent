@@ -101,6 +101,13 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
             "TUI did not resume after the typed permission response",
         );
     }
+    receive_until(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        Duration::from_secs(10),
+        "TUI did not complete after the approved tool execution",
+    );
 
     arm_idle_exit(&mut process, &mut output);
     let status = process.wait_for_exit(Duration::from_secs(5));

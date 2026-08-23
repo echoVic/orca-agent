@@ -334,7 +334,7 @@
       "seatbelt-unix-api",
       "crates/orca-tools/src/sandbox/seatbelt.rs",
       "unix_std_api",
-      5,
+      6,
       "windows-sandbox-plan"
     ],
     [
@@ -399,6 +399,27 @@
       "unix_libc_process",
       2,
       "windows-test-portability"
+    ],
+    [
+      "runtime-permission-test-symlink",
+      "crates/orca-runtime/src/runtime_permission.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "bwrap-sandbox-test-symlink",
+      "crates/orca-tools/src/sandbox/bwrap.rs",
+      "unix_std_api",
+      1,
+      "windows-sandbox-plan"
+    ],
+    [
+      "sandbox-metadata-test-symlink",
+      "crates/orca-tools/src/sandbox/mod.rs",
+      "unix_std_api",
+      1,
+      "windows-sandbox-plan"
     ]
   ]
 }

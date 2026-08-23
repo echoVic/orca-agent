@@ -368,7 +368,9 @@ mod tests {
             &request,
             dir.path(),
             ToolOutputTruncation::bytes(1024),
-            Duration::from_millis(200),
+            // Leave enough startup budget for a loaded serial workspace run to
+            // install the TERM trap. This test checks exit-code preservation.
+            Duration::from_secs(3),
         );
 
         assert_eq!(result.status, ToolStatus::Failed);

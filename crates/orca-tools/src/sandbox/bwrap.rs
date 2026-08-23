@@ -29,6 +29,8 @@
 
 use std::path::{Path, PathBuf};
 
+use walkdir::WalkDir;
+
 /// How the sandboxed filesystem view is constructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinuxReadScope {
@@ -49,6 +51,14 @@ pub struct LinuxSandboxPolicy {
     pub allowed_unix_socket_roots: Vec<PathBuf>,
     /// Roots granted read-write access.
     pub writable_roots: Vec<PathBuf>,
+    /// Ordinary writable roots whose existing protected metadata descendants
+    /// must be discovered and re-bound read-only. This excludes implicit temp
+    /// roots, which would otherwise require an unbounded scan on every launch.
+    pub metadata_protection_roots: Vec<PathBuf>,
+    /// Protected metadata roots granted read-write access through the dedicated
+    /// escalation channel. Keeping provenance separate prevents an ordinary
+    /// writable-root grant from being mistaken for metadata authority.
+    pub metadata_writable_roots: Vec<PathBuf>,
     /// Roots that must stay read-only even when they fall under a writable
     /// root (re-bound with `--ro-bind` after the writable binds). Used to
     /// protect workspace metadata such as `.git` while preserving reads.
@@ -58,6 +68,67 @@ pub struct LinuxSandboxPolicy {
     pub denied_roots: Vec<PathBuf>,
     /// When false, the command runs in an isolated (empty) network namespace.
     pub network_access: bool,
+}
+
+pub(crate) fn effective_read_only_roots(policy: &LinuxSandboxPolicy) -> Vec<PathBuf> {
+    let mut roots = policy.read_only_roots.clone();
+    for writable_root in &policy.metadata_protection_roots {
+        if let Some(metadata) = writable_root
+            .ancestors()
+            .find(|path| crate::sandbox::is_protected_metadata_root(path))
+        {
+            let canonical = metadata
+                .canonicalize()
+                .unwrap_or_else(|_| metadata.to_path_buf());
+            if !is_explicit_metadata_writable_root(policy, metadata, &canonical) {
+                push_unique(&mut roots, canonical);
+            }
+        }
+
+        let mut entries = WalkDir::new(writable_root).follow_links(false).into_iter();
+        while let Some(entry) = entries.next() {
+            match entry {
+                Ok(entry) if crate::sandbox::is_protected_metadata_root(entry.path()) => {
+                    let canonical = entry
+                        .path()
+                        .canonicalize()
+                        .unwrap_or_else(|_| entry.path().to_path_buf());
+                    if !is_explicit_metadata_writable_root(policy, entry.path(), &canonical) {
+                        push_unique(&mut roots, canonical);
+                    }
+                    if entry.file_type().is_dir() {
+                        entries.skip_current_dir();
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // A subtree that cannot be inspected must not silently
+                    // inherit a broader writable grant.
+                    let unreadable = error
+                        .path()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| writable_root.clone());
+                    let canonical = unreadable
+                        .canonicalize()
+                        .unwrap_or_else(|_| unreadable.clone());
+                    push_unique(&mut roots, canonical);
+                }
+            }
+        }
+    }
+    roots
+}
+
+fn is_explicit_metadata_writable_root(
+    policy: &LinuxSandboxPolicy,
+    metadata: &Path,
+    canonical_metadata: &Path,
+) -> bool {
+    crate::sandbox::is_safe_metadata_writable_root(metadata)
+        && policy.metadata_writable_roots.iter().any(|root| {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            canonical == canonical_metadata
+        })
 }
 
 /// Build the full `bwrap` argument vector (excluding the leading `bwrap`
@@ -115,14 +186,21 @@ pub fn build_bwrap_argv(policy: &LinuxSandboxPolicy, command: &str) -> Vec<Strin
             argv.push(path_arg(root));
         }
     }
+    for root in &policy.metadata_writable_roots {
+        if root.exists() {
+            argv.push("--bind".to_string());
+            argv.push(path_arg(root));
+            argv.push(path_arg(root));
+        }
+    }
 
     // Re-assert read-only roots after writable binds so protected metadata
     // (e.g. `.git`) stays readable but not writable even under a writable root.
-    for root in &policy.read_only_roots {
+    for root in effective_read_only_roots(policy) {
         if root.exists() {
             argv.push("--ro-bind".to_string());
-            argv.push(path_arg(root));
-            argv.push(path_arg(root));
+            argv.push(path_arg(&root));
+            argv.push(path_arg(&root));
         }
     }
 
@@ -164,6 +242,9 @@ fn restricted_read_roots(policy: &LinuxSandboxPolicy) -> Vec<PathBuf> {
     for root in &policy.writable_roots {
         push_unique(&mut roots, root.clone());
     }
+    for root in &policy.metadata_writable_roots {
+        push_unique(&mut roots, root.clone());
+    }
     for root in crate::sandbox::linux_platform_default_read_roots() {
         push_unique(&mut roots, root);
     }
@@ -203,6 +284,8 @@ mod tests {
             readable_roots: Vec::new(),
             allowed_unix_socket_roots: Vec::new(),
             writable_roots: Vec::new(),
+            metadata_protection_roots: Vec::new(),
+            metadata_writable_roots: Vec::new(),
             read_only_roots: Vec::new(),
             denied_roots: Vec::new(),
             network_access: true,
@@ -283,6 +366,99 @@ mod tests {
                 "read-only rebind must come after writable bind: {joined}"
             );
         }
+    }
+
+    #[test]
+    fn ordinary_external_writable_root_rebinds_its_metadata_read_only() {
+        let external = tempfile::tempdir().unwrap();
+        let metadata = external.path().join(".git");
+        std::fs::create_dir(&metadata).unwrap();
+        let mut policy = base_policy();
+        policy.writable_roots = vec![external.path().to_path_buf()];
+        policy.metadata_protection_roots = policy.writable_roots.clone();
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let metadata = path_arg(&metadata.canonicalize().unwrap());
+        let read_only_position = argv
+            .windows(3)
+            .position(|args| args == ["--ro-bind", metadata.as_str(), metadata.as_str()]);
+
+        assert!(read_only_position.is_some());
+    }
+
+    #[test]
+    fn ordinary_exact_metadata_writable_root_is_rebound_read_only() {
+        let external = tempfile::tempdir().unwrap();
+        let metadata = external.path().join(".git");
+        std::fs::create_dir(&metadata).unwrap();
+        let mut policy = base_policy();
+        policy.writable_roots = vec![metadata.clone()];
+        policy.metadata_protection_roots = policy.writable_roots.clone();
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let metadata = path_arg(&metadata.canonicalize().unwrap());
+        let read_only_position = argv
+            .windows(3)
+            .position(|args| args == ["--ro-bind", metadata.as_str(), metadata.as_str()]);
+
+        assert!(read_only_position.is_some());
+    }
+
+    #[test]
+    fn ordinary_writable_root_rebinds_nested_metadata_read_only() {
+        let external = tempfile::tempdir().unwrap();
+        let metadata = external.path().join("project").join(".git");
+        std::fs::create_dir_all(&metadata).unwrap();
+        let mut policy = base_policy();
+        policy.writable_roots = vec![external.path().to_path_buf()];
+        policy.metadata_protection_roots = policy.writable_roots.clone();
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let metadata = path_arg(&metadata.canonicalize().unwrap());
+        let read_only_position = argv
+            .windows(3)
+            .position(|args| args == ["--ro-bind", metadata.as_str(), metadata.as_str()]);
+
+        assert!(read_only_position.is_some());
+    }
+
+    #[test]
+    fn explicit_metadata_writable_root_is_not_rebound_read_only() {
+        let external = tempfile::tempdir().unwrap();
+        let metadata = external.path().join(".git");
+        std::fs::create_dir(&metadata).unwrap();
+        let mut policy = base_policy();
+        policy.writable_roots = vec![external.path().to_path_buf()];
+        policy.metadata_protection_roots = policy.writable_roots.clone();
+        policy.metadata_writable_roots = vec![metadata.clone()];
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let metadata = path_arg(&metadata);
+        let read_only_position = argv
+            .windows(3)
+            .position(|args| args == ["--ro-bind", metadata.as_str(), metadata.as_str()]);
+
+        assert!(read_only_position.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_metadata_does_not_treat_its_writable_target_as_an_explicit_grant() {
+        let external = tempfile::tempdir().unwrap();
+        let metadata = external.path().join(".git");
+        std::os::unix::fs::symlink(external.path(), &metadata).unwrap();
+        let mut policy = base_policy();
+        let target = external.path().canonicalize().unwrap();
+        policy.writable_roots = vec![target.clone()];
+        policy.metadata_protection_roots = policy.writable_roots.clone();
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let target = path_arg(&target);
+        let read_only_position = argv
+            .windows(3)
+            .position(|args| args == ["--ro-bind", target.as_str(), target.as_str()]);
+
+        assert!(read_only_position.is_some());
     }
 
     #[test]

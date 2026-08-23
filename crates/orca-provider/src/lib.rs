@@ -901,9 +901,21 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
-    if let Some(command) = prompt.trim().strip_prefix("force_bash ") {
+    if !has_tool_results && let Some(command) = prompt.trim().strip_prefix("force_bash ") {
+        let tool_id = (1_u64..)
+            .map(|index| format!("mock-tool-{index}"))
+            .find(|candidate| {
+                !conversation.messages.iter().any(|message| match message {
+                    Message::Assistant { tool_calls, .. } => tool_calls
+                        .iter()
+                        .any(|tool_call| tool_call.id == *candidate),
+                    Message::Tool { tool_call_id, .. } => tool_call_id == candidate,
+                    Message::System { .. } | Message::User { .. } => false,
+                })
+            })
+            .expect("mock tool id space is not exhausted");
         let bash = ToolRequest {
-            id: "mock-tool-1".to_string(),
+            id: tool_id,
             name: ToolName::Bash,
             action: ActionKind::Shell,
             target: Some(command.to_string()),
@@ -1902,6 +1914,32 @@ mod tests {
                 ProviderStep::ToolCall(second)
             ] if first.name == ToolName::RequestPermissions && second.name == ToolName::Bash
         ));
+    }
+
+    #[test]
+    fn mock_force_bash_uses_fresh_tool_ids_across_turns_and_stops_after_result() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("force_bash printf first".to_string());
+        let first = mock_call(&conversation);
+        let first_call = first.tool_calls.first().unwrap().clone();
+        assert_eq!(first_call.id, "mock-tool-1");
+        conversation.add_assistant(None, None, vec![first_call.clone()]);
+        conversation.add_tool_result(first_call.id, "first".to_string());
+        conversation.add_assistant(Some("first done".to_string()), None, Vec::new());
+        conversation.add_user("force_bash printf second".to_string());
+
+        let second = mock_call(&conversation);
+        let second_call = second.tool_calls.first().unwrap().clone();
+        assert_eq!(second_call.id, "mock-tool-2");
+        conversation.add_assistant(None, None, vec![second_call.clone()]);
+        conversation.add_tool_result(second_call.id, "second".to_string());
+
+        let completed = mock_call(&conversation);
+        assert!(completed.tool_calls.is_empty());
+        assert_eq!(
+            completed.assistant_content.as_deref(),
+            Some("Mock completed after tool execution.")
+        );
     }
 
     #[test]

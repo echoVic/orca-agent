@@ -20,6 +20,43 @@ pub fn is_protected_metadata_root(path: &Path) -> bool {
         .is_some_and(|name| PROTECTED_METADATA_DIRS.contains(&name))
 }
 
+pub fn is_safe_metadata_writable_root(path: &Path) -> bool {
+    if !is_protected_metadata_root(path) {
+        return false;
+    }
+    match std::fs::symlink_metadata(path) {
+        // A path that does not exist yet cannot be a symlink escape; the
+        // sandbox platform layers re-check and canonicalize at launch time.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(metadata) => !metadata.file_type().is_symlink(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod metadata_root_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_grant_rejects_symlinked_metadata_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let metadata = workspace.join(".git");
+        std::fs::create_dir_all(&metadata).unwrap();
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let agents_link = workspace.join(".agents");
+        std::os::unix::fs::symlink(&outside, &agents_link).unwrap();
+
+        assert!(is_safe_metadata_writable_root(
+            &metadata.canonicalize().unwrap()
+        ));
+        assert!(is_safe_metadata_writable_root(&workspace.join(".codex")));
+        // A symlink with a protected name must never become a writable grant.
+        assert!(!is_safe_metadata_writable_root(&agents_link));
+    }
+}
+
 /// Platform read roots a Linux shell runtime needs when the sandbox root is a
 /// fresh tmpfs. Exposed here so the pure `bwrap` argv builder (compiled on all
 /// platforms) can consult the same list the Linux backend uses.
@@ -263,7 +300,7 @@ mod platform {
             &context
                 .metadata_writable_roots
                 .iter()
-                .filter(|root| is_protected_metadata_root(root))
+                .filter(|root| is_safe_metadata_writable_root(root))
                 .cloned()
                 .collect::<Vec<_>>(),
         );
@@ -273,11 +310,7 @@ mod platform {
                 writable_roots.push(root.clone());
             }
         }
-        for root in &metadata_writable_roots {
-            if !writable_roots.contains(root) {
-                writable_roots.push(root.clone());
-            }
-        }
+        let metadata_protection_roots = writable_roots.clone();
         if !context.exclude_slash_tmp {
             writable_roots.push(PathBuf::from("/tmp"));
         }
@@ -318,6 +351,8 @@ mod platform {
                 readable_roots: canonicalize_all(context.readable_roots),
                 allowed_unix_socket_roots: canonicalize_all(context.allowed_unix_socket_roots),
                 writable_roots,
+                metadata_protection_roots,
+                metadata_writable_roots,
                 read_only_roots,
                 denied_roots,
                 network_access: context.network_access,
@@ -414,19 +449,15 @@ mod platform {
         // Additional roots are writable even in read-only mode (e.g. an
         // explicitly granted output directory), matching the Seatbelt profile.
         let mut writable_roots = canonicalize_all(context.additional_roots);
+        let metadata_protection_roots = writable_roots.clone();
         let metadata_writable_roots = canonicalize_all(
             &context
                 .metadata_writable_roots
                 .iter()
-                .filter(|root| is_protected_metadata_root(root))
+                .filter(|root| is_safe_metadata_writable_root(root))
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-        for root in &metadata_writable_roots {
-            if !writable_roots.contains(root) {
-                writable_roots.push(root.clone());
-            }
-        }
 
         let mut read_only_roots = Vec::new();
         for name in PROTECTED_METADATA_DIRS {
@@ -460,6 +491,8 @@ mod platform {
                 readable_roots: canonicalize_all(context.readable_roots),
                 allowed_unix_socket_roots: canonicalize_all(context.allowed_unix_socket_roots),
                 writable_roots,
+                metadata_protection_roots,
+                metadata_writable_roots,
                 read_only_roots,
                 denied_roots,
                 network_access: context.network_access,

@@ -129,7 +129,7 @@ pub fn workspace_write_bash_command(context: WorkspaceWriteSandboxCommandContext
     let canonical_metadata_writable_roots = context
         .metadata_writable_roots
         .iter()
-        .filter(|root| crate::sandbox::is_protected_metadata_root(root))
+        .filter(|root| crate::sandbox::is_safe_metadata_writable_root(root))
         .map(|root| normalize_path_for_seatbelt(root))
         .collect::<Vec<_>>();
     let canonical_denied_roots = context
@@ -176,7 +176,7 @@ pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Com
     let canonical_metadata_writable_roots = context
         .metadata_writable_roots
         .iter()
-        .filter(|root| crate::sandbox::is_protected_metadata_root(root))
+        .filter(|root| crate::sandbox::is_safe_metadata_writable_root(root))
         .map(|root| normalize_path_for_seatbelt(root))
         .collect::<Vec<_>>();
     let canonical_additional_roots = context
@@ -1132,6 +1132,39 @@ mod tests {
             &workspace,
             &[parent.path().to_path_buf()],
         )
+        .output()
+        .unwrap();
+
+        assert!(!output.status.success());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_write_sandbox_rejects_explicit_symlinked_metadata_root() {
+        assert_seatbelt_available();
+
+        let parent = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+        let workspace = parent.path().join("workspace");
+        let metadata_target = parent.path().join("external-target");
+        let metadata_link = workspace.join(".agents");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&metadata_target).unwrap();
+        std::os::unix::fs::symlink(&metadata_target, &metadata_link).unwrap();
+        let target = metadata_target.join("blocked.txt");
+
+        let output = workspace_write_bash_command(WorkspaceWriteSandboxCommandContext {
+            command: &format!("printf blocked > {}", target.display()),
+            cwd: &workspace,
+            readable_roots: &[],
+            additional_roots: &[],
+            metadata_writable_roots: std::slice::from_ref(&metadata_link),
+            denied_roots: &[],
+            network_access: true,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+            allowed_unix_socket_roots: &[],
+        })
         .output()
         .unwrap();
 

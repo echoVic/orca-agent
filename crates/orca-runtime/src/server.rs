@@ -266,12 +266,21 @@ fn apply_permission_updates(config: &mut RunConfig, updates: Vec<PermissionUpdat
             }),
             PermissionUpdate::AddDirectories { directories } => {
                 for directory in directories {
+                    if directory.source
+                        == crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                    {
+                        continue;
+                    }
                     if let Some(existing) = config
                         .additional_working_directories
                         .iter_mut()
                         .find(|existing| existing.path == directory.path)
                     {
-                        existing.source = directory.source;
+                        if existing.source
+                            != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                        {
+                            existing.source = directory.source;
+                        }
                     } else {
                         config.additional_working_directories.push(directory);
                     }
@@ -281,7 +290,8 @@ fn apply_permission_updates(config: &mut RunConfig, updates: Vec<PermissionUpdat
                 destination,
                 directories,
             } => config.additional_working_directories.retain(|directory| {
-                directory.source != destination
+                directory.source == crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                    || directory.source != destination
                     || !directories.iter().any(|remove| remove == &directory.path)
             }),
         }
@@ -799,7 +809,9 @@ fn materialize_session_permission_grant(
     for root in roots {
         for root in materialize_workspace_roots_paths(&thread.cwd, runtime_workspace_roots, root) {
             if orca_tools::sandbox::is_protected_metadata_root(&root) {
-                push_unique_path(&mut thread.metadata_writable_directories, root);
+                if orca_tools::sandbox::is_safe_metadata_writable_root(&root) {
+                    push_unique_path(&mut thread.metadata_writable_directories, root);
+                }
             } else if !thread
                 .additional_working_directories
                 .iter()
@@ -1339,7 +1351,9 @@ fn run_command_exec<W: Write>(
                 requested,
             ) {
                 if orca_tools::sandbox::is_protected_metadata_root(&root) {
-                    push_unique_path(&mut metadata_writable_directories, root);
+                    if orca_tools::sandbox::is_safe_metadata_writable_root(&root) {
+                        push_unique_path(&mut metadata_writable_directories, root);
+                    }
                 } else {
                     push_unique_path(&mut additional_working_directories, root);
                 }

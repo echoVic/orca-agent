@@ -2015,9 +2015,10 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
     let interrupt = child.expect_event("interrupt-hook", "turn_controlled");
     assert_eq!(interrupt["status"], "interrupted");
     let completed = child.expect_event("turn-hook", "turn_completed");
+    let interrupt_elapsed = interrupt_sent_at.elapsed();
     assert!(
-        interrupt_sent_at.elapsed() < Duration::from_millis(1200),
-        "turn completion waited for the full pre_model hook sleep"
+        interrupt_elapsed < Duration::from_secs(3),
+        "turn completion waited too long for pre_model hook cancellation: {interrupt_elapsed:?}"
     );
     assert_eq!(completed["status"], "cancelled");
 

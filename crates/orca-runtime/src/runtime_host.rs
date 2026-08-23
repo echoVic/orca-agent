@@ -2205,7 +2205,10 @@ pub struct RuntimeThreadStartRequest {
 }
 
 impl RuntimeThreadStartRequest {
-    pub fn new(config: RunConfig, title: impl Into<String>) -> Self {
+    pub fn new(mut config: RunConfig, title: impl Into<String>) -> Self {
+        config.additional_working_directories.retain(|directory| {
+            directory.source != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+        });
         Self {
             config,
             title: title.into(),
