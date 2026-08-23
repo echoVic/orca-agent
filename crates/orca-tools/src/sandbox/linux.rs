@@ -567,6 +567,7 @@ mod tests {
         assert!(policy_requires_bwrap(&denied));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn nested_read_only_policy_without_backend_keeps_non_strict_compatibility_fallback() {
         if bwrap_path(Path::new(".")).is_some() {
@@ -602,6 +603,7 @@ mod tests {
         assert!(marker.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn nested_read_only_policy_without_backend_fails_closed_when_strict() {
         if bwrap_path(Path::new(".")).is_some() {
