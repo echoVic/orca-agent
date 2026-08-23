@@ -190,7 +190,7 @@ fn subagent_status_can_read_persisted_async_handle() {
         ])
         .output()
         .expect("run orca");
-    assert_eq!(launched.status.code(), Some(0));
+    assert_launched_ok(&launched);
     let launch_events = parse_jsonl(&launched.stdout);
     let launch_completed = find_event(&launch_events, "tool.call.completed");
     let launch_payload: Value =
@@ -246,7 +246,7 @@ fn async_subagent_completes_after_launching_exec_process_exits() {
         ])
         .output()
         .expect("run orca");
-    assert_eq!(launched.status.code(), Some(0));
+    assert_launched_ok(&launched);
     let launch_events = parse_jsonl(&launched.stdout);
     let launch_completed = find_event(&launch_events, "tool.call.completed");
     let launch_payload: Value =
@@ -397,7 +397,7 @@ fn async_subagent_schema_failure_persists_failed_task() {
         ])
         .output()
         .expect("run orca");
-    assert_eq!(launched.status.code(), Some(0));
+    assert_launched_ok(&launched);
     let launch_events = parse_jsonl(&launched.stdout);
     let launch_completed = find_event(&launch_events, "tool.call.completed");
     let launch_payload: Value =
@@ -572,6 +572,18 @@ fn subagent_cli_test_guard() -> MutexGuard<'static, ()> {
     SUBAGENT_CLI_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn assert_launched_ok(output: &std::process::Output) {
+    // Surface the child's captured streams so a Windows-only async launch
+    // failure is diagnosable from CI instead of collapsing to `Some(1)`.
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "orca exec exited non-zero\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) {

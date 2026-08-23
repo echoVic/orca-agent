@@ -10,6 +10,8 @@ use crate::protocol::{
     PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
     RequestNetworkPermissions, RequestPermissionProfile, RequestShellPermissions,
 };
+
+pub(crate) const SESSION_METADATA_DIRECTORY_SOURCE: &str = "session-metadata";
 use crate::sandbox_denial::{
     SandboxDenialDiagnostic, should_request_filesystem_permission_with_denied_roots,
 };
@@ -470,8 +472,10 @@ impl TurnPermissionOverlay {
                 if root.as_os_str().is_empty() {
                     continue;
                 }
-                if is_exact_metadata_root(root) {
-                    if !self.metadata_writable_directories.contains(root) {
+                if orca_tools::sandbox::is_protected_metadata_root(root) {
+                    if orca_tools::sandbox::is_safe_metadata_writable_root(root)
+                        && !self.metadata_writable_directories.contains(root)
+                    {
                         self.metadata_writable_directories.push(root.clone());
                     }
                 } else if !self.additional_working_directories.contains(root) {
@@ -488,13 +492,6 @@ impl TurnPermissionOverlay {
             self.unsandboxed_shell = true;
         }
     }
-}
-
-fn is_exact_metadata_root(path: &std::path::Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".git" | ".agents" | ".codex")
-    )
 }
 
 #[cfg(test)]
@@ -597,6 +594,28 @@ mod tests {
             overlay.additional_working_directories(),
             &[PathBuf::from("/repo"), PathBuf::from("/repo/.git/config"),]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_symlink_metadata_root_is_not_made_writable() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("outside");
+        let metadata_link = parent.path().join(".agents");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &metadata_link).unwrap();
+        let mut overlay = TurnPermissionOverlay::default();
+
+        overlay.merge_permissions(&RequestPermissionProfile {
+            file_system: Some(RequestFileSystemPermissions {
+                write: Some(vec![metadata_link]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(overlay.metadata_writable_directories().is_empty());
+        assert!(overlay.additional_working_directories().is_empty());
     }
 
     #[test]

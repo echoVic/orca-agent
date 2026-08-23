@@ -329,6 +329,10 @@ impl<'a> RuntimeToolRouter<'a> {
                 let additional_roots = config
                     .additional_working_directories
                     .iter()
+                    .filter(|directory| {
+                        directory.source
+                            != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
+                    })
                     .map(|directory| directory.path.clone())
                     .chain(
                         permission_overlay

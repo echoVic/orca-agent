@@ -1207,17 +1207,47 @@ fn server_thread_directory_update_cannot_forge_metadata_escalation() {
             .load_session(&thread_id)
             .expect("load session");
         assert!(
-            persisted
+            !persisted
                 .meta
                 .additional_working_directories
                 .iter()
                 .any(|directory| {
                     directory.path == git_dir && directory.source == "session-metadata"
-                })
+                }),
+            "reserved metadata sources must be ignored by ordinary directory updates"
         );
         assert!(
             persisted.meta.metadata_writable_directories.is_empty(),
             "ordinary permission updates must not mint metadata escalation authority"
+        );
+    });
+}
+
+#[test]
+fn server_thread_start_cannot_forge_metadata_escalation() {
+    with_orca_home(|home| {
+        let mut runtime = start_server_runtime();
+        let mut config = test_run_config(home);
+        config.history_mode = HistoryMode::Record;
+        let git_dir = home.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        config.additional_working_directories = vec![AdditionalWorkingDirectory::new(
+            git_dir.clone(),
+            "session-metadata",
+        )];
+
+        let thread_id = runtime.start_thread(&config).expect("start thread");
+        let persisted = SessionStore::new()
+            .load_session(&thread_id)
+            .expect("load session");
+
+        assert!(
+            persisted.meta.additional_working_directories.is_empty(),
+            "reserved metadata sources must be ignored at the runtime boundary"
+        );
+        assert!(
+            persisted.meta.metadata_writable_directories.is_empty(),
+            "runtime configuration must not mint metadata escalation authority"
         );
     });
 }
