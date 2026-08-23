@@ -529,7 +529,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       ],
       [
         "crates/orca-tui/src/renderer_runtime_inbox.rs",
-        /pub\(crate\)\s+struct\s+RendererRuntimeInboxOwner\s*\{\s*events:\s*TuiEventReceiver,\s*buffered:\s*Mutex<Option<TuiEvent>>,\s*\}[\s\S]*?pub\(crate\)\s+fn\s+new\(events:\s*TuiEventReceiver\)\s*->\s*Self\s*\{\s*Self\s*\{\s*events,\s*buffered:\s*Mutex::new\(None\),\s*\}\s*\}[\s\S]*?pub\(crate\)\s+fn\s+pending\(&self\)\s*->\s*CoalescedRuntimeEvents<'_>[\s\S]*?pub\(crate\)\s+fn\s+shutdown\(self\)\s*\{\s*drop\(self\.events\);\s*\}[\s\S]*?pub\(crate\)\s+struct\s+CoalescedRuntimeEvents<'a>[\s\S]*?impl\s+Iterator\s+for\s+CoalescedRuntimeEvents<'_>[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
+        /pub\(crate\)\s+struct\s+RendererRuntimeInboxOwner\s*\{\s*events:\s*TuiEventReceiver,\s*buffered:\s*Mutex<Option<TuiEvent>>,\s*\}[\s\S]*?pub\(crate\)\s+fn\s+new\(events:\s*TuiEventReceiver\)\s*->\s*Self\s*\{\s*Self\s*\{\s*events,\s*buffered:\s*Mutex::new\(None\),\s*\}\s*\}[\s\S]*?pub\(crate\)\s+fn\s+pending\(&self\)\s*->\s*CoalescedRuntimeEvents<'_>[\s\S]*?events:\s*self\.events\.try_iter\(\),[\s\S]*?pub\(crate\)\s+fn\s+shutdown\(self\)\s*\{\s*drop\(self\.events\);\s*\}[\s\S]*?pub\(crate\)\s+struct\s+CoalescedRuntimeEvents<'a>[\s\S]*?impl\s+Iterator\s+for\s+CoalescedRuntimeEvents<'_>[\s\S]*?#\[cfg\(test\)\]\s*mod\s+tests/,
       ],
     ]),
   ],

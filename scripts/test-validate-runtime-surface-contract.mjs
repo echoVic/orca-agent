@@ -1643,8 +1643,8 @@ expectFailure(
     ],
     [
       "receiver construction",
-      /Self\s*\{\s*events\s*\}/,
-      "Self { events: removed_receiver(events) }",
+      /Self\s*\{\s*events,\s*buffered:\s*Mutex::new\(None\),\s*\}/,
+      "Self { events: removed_receiver(events), buffered: Mutex::new(None) }",
       /RendererRuntimeInboxOwner::new\(event_rx\)/,
     ],
     [
