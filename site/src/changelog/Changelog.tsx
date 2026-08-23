@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.1":
+        "Speeds up streaming surfaces by batching provider step commits behind deferred refresh, caching token counts, sharding the reducer state across BTreeMaps, and coalescing consecutive MessageDelta and ReasoningDelta events into bounded merged deltas before renderer dispatch. Hardens sandbox metadata permission handling: Linux/bubblewrap discovers nested protected metadata under writable roots and re-binds it read-only, symlinked metadata roots cannot widen an explicit grant, session grants are recorded only after a safety guard, and reserved session-metadata sources are ignored at the thread boundary and by ordinary permission updates. Workflow active-state classification switches from an allowlist to exclusion with reported status sequences.",
       "v0.4.0":
         "Adds complete image input across every model selection: the vision model receives images directly, while auto, Pro, and Flash use a task-aware vision analysis before continuing with the selected coding model. Ctrl+V system-clipboard paste, Windows Alt+V, forwarded Cmd+V, dragged or pasted image paths and file URLs, and @file mentions become atomic [Image #N] attachments with composer previews, message-area thumbnails, and a zoomable viewer. Kitty, Ghostty, iTerm2, and WezTerm render native-pixel previews, while other terminals retain a true-color cell fallback. Background reads, request fencing, paste-before-send ordering, image-only turns, queue editing, rejection recovery, durable history, ACP image blocks, and provider replay preserve the same typed input across macOS, Linux, Windows, and WSL. RuntimeHost also delegates generation context, interaction routing, operation recovery, Goal control, and task/workflow ownership to focused controllers, with stable ContextWindowId compaction epochs.",
       "v0.3.26":
@@ -616,6 +618,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.1":
+        "通过批量提交 provider 步骤并延迟 surface 刷新、缓存 token 计数、用分片 BTreeMap 重构 reducer 状态、以及在渲染器分发前把连续的 MessageDelta/ReasoningDelta 合并成有界增量，显著提升流式响应性能。同时加固沙箱元数据权限：Linux/bubblewrap 在启动前发现可写根目录下嵌套的受保护元数据并只读重绑定，符号链接元数据根无法扩大授权，会话授权需通过安全检查才会记录，保留的 session-metadata 来源在线程边界和普通权限更新中被忽略，伪造配置无法铸造元数据提权。Workflow 活动状态判定从 allowlist 改为排除法，并在失败时报告观测到的状态序列。",
       "v0.4.0":
         "完整接入 deepseek-v4-flash-vision-exp 图片输入：Ctrl+V 系统剪贴板、Windows Alt+V、终端转发的 Cmd+V、拖入或粘贴图片路径与 file URL、@file mention 都会形成原子的 [Image #N] 附件；Kitty、Ghostty、iTerm2 和 WezTerm 使用原生像素预览，其他终端保留真彩色字符降级。后台读取、request fence、先粘贴后提交顺序、纯图片回合、队列编辑、失败恢复、持久化历史、ACP 图片块与 provider replay 在 macOS、Linux、Windows 和 WSL 上共用同一类型化输入链路。RuntimeHost 同时把 generation context、interaction routing、operation recovery、Goal control 与 task/workflow ownership 下沉到专用 controller，并以稳定 ContextWindowId 标识 compaction epoch。",
       "v0.3.26":

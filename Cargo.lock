@@ -235,7 +235,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "blade-deepseek"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "clap",

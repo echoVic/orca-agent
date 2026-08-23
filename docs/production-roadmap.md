@@ -131,7 +131,12 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.4.0 adds DeepSeek vision and the complete TUI/ACP image
+Current baseline: v0.4.1 batches provider step commits with deferred
+surface refresh, caches token counts, shards the reducer state, and
+coalesces consecutive delta events before renderer dispatch; it also
+hardens sandbox metadata handling so symlinked or forged metadata roots
+cannot widen grants, and classifies workflow active state by exclusion.
+v0.4.0 adds DeepSeek vision and the complete TUI/ACP image
 input path, completes the focused `ThreadActor` controller split, and adds
 stable context-window epochs. v0.3.26 makes the unsandboxed shell permission an
 explicit, reusable, session-scoped capability: the turn permission overlay
