@@ -603,9 +603,9 @@ fn wait_for_workflow_status(
     );
 }
 
-/// Poll `workflow show` until the task is observably active (`queued` or
-/// `running`), returning the status seen. Fails if the task reaches a terminal
-/// state or never becomes active within the deadline. This replaces fixed
+/// Poll `workflow show` until the task is observably active (any non-terminal
+/// status), returning the status seen. Fails if the task reaches a terminal
+/// state or never reports a status within the deadline. This replaces fixed
 /// sleeps that raced the background worker's startup on loaded CI runners.
 fn wait_until_active(
     cwd: &std::path::Path,
@@ -613,19 +613,31 @@ fn wait_until_active(
     task_id: &str,
 ) -> Value {
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen: Vec<String> = Vec::new();
     loop {
         let show = workflow_show(cwd, home, task_id);
         let status = show["status"].as_str().unwrap_or_default();
-        if status == "queued" || status == "running" {
-            return show;
+        if seen.last().map(String::as_str) != Some(status) {
+            seen.push(status.to_string());
         }
         assert!(
             !matches!(status, "completed" | "failed" | "stopped" | "cancelled"),
-            "workflow reached terminal state before it could be observed active: {show}"
+            "workflow reached terminal state before it could be observed active \
+             (status sequence: {seen:?}): {show}"
         );
+        // Classify by exclusion, not by allowlist. `WorkflowRunStatus` has nine
+        // variants; an allowlist of `queued`/`running` left the rest in a gap
+        // where the loop neither returned nor failed, so it spun for the whole
+        // run and only tripped once the run went terminal. Any non-terminal
+        // status means the run is live, which is all these tests need before
+        // issuing pause/stop. The status sequence is reported on failure so a
+        // future gap names itself instead of looking like a timing flake.
+        if !status.is_empty() {
+            return show;
+        }
         assert!(
             Instant::now() < deadline,
-            "workflow task {task_id} never became active within 20s (last: {show})"
+            "workflow task {task_id} never reported a status within 20s (last: {show})"
         );
         thread::sleep(Duration::from_millis(50));
     }
