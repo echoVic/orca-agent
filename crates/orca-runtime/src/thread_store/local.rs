@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -201,11 +201,8 @@ impl JsonlThreadStore {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let mut batches = Vec::<(
-            String,
-            bool,
-            crate::runtime_surface::StoredSurfaceCommitBatchV1,
-        )>::new();
+        let mut batches = Vec::<(bool, crate::runtime_surface::StoredSurfaceCommitBatchV1)>::new();
+        let mut batch_indices = HashMap::<String, usize>::new();
         for record in read_records(path)? {
             match record {
                 SessionRecord::SurfaceCommitPrepared {
@@ -213,13 +210,12 @@ impl JsonlThreadStore {
                     batch: Some(batch),
                     ..
                 } => {
-                    if let Some(existing) = batches
-                        .iter_mut()
-                        .find(|(existing_id, _, _)| existing_id == &commit_id)
-                    {
-                        existing.2 = batch;
+                    if let Some(index) = batch_indices.get(&commit_id).copied() {
+                        batches[index].1 = batch;
                     } else {
-                        batches.push((commit_id, false, batch));
+                        let index = batches.len();
+                        batch_indices.insert(commit_id, index);
+                        batches.push((false, batch));
                     }
                 }
                 SessionRecord::SurfaceCommitPrepared { batch: None, .. } => {
@@ -229,24 +225,18 @@ impl JsonlThreadStore {
                     ));
                 }
                 SessionRecord::SurfaceCommitCommitted { commit_id, .. } => {
-                    let Some(existing) = batches
-                        .iter_mut()
-                        .find(|(existing_id, _, _)| existing_id == &commit_id)
-                    else {
+                    let Some(index) = batch_indices.get(&commit_id).copied() else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "committed surface record has no prepared batch",
                         ));
                     };
-                    existing.1 = true;
+                    batches[index].0 = true;
                 }
                 _ => {}
             }
         }
-        Ok(batches
-            .into_iter()
-            .map(|(_, committed, batch)| (committed, batch))
-            .collect())
+        Ok(batches)
     }
 
     pub fn list_sessions(&self, limit: usize) -> io::Result<Vec<SessionSummary>> {
@@ -1241,6 +1231,91 @@ pub(crate) fn sort_thread_search_hits(hits: &mut [StoredThreadSearchHit], sort_k
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_commit_loader_recovers_large_log_within_bounded_time() {
+        use std::io::{BufWriter, Write};
+        use std::time::{Duration, Instant};
+
+        const COMMIT_COUNT: usize = 25_000;
+        const MAX_RECOVERY_TIME: Duration = Duration::from_secs(5);
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("surface.jsonl");
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        let digest = vec![0_u8; 32];
+        let batch = serde_json::json!({
+            "version": 1,
+            "cursor_before": {
+                "thread_id": "00000000-0000-7000-8000-000000000001",
+                "incarnation": "00000000-0000-7000-8000-000000000002",
+                "next_seq": 0,
+                "source_revision": { "Recorded": { "durable_revision": 1 } }
+            },
+            "cursor_after": {
+                "thread_id": "00000000-0000-7000-8000-000000000001",
+                "incarnation": "00000000-0000-7000-8000-000000000002",
+                "next_seq": 1,
+                "source_revision": { "Recorded": { "durable_revision": 2 } }
+            },
+            "commit_class": {
+                "Recorded": {
+                    "thread_owner_epoch": 1,
+                    "durable_revision": 2,
+                    "commit_id": "00000000-0000-7000-8000-000000000003"
+                }
+            },
+            "event_count": 1,
+            "batch_digest": digest,
+            "events": []
+        });
+
+        for index in 0..COMMIT_COUNT {
+            let commit_id = format!("commit-{index:05}");
+            serde_json::to_writer(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "runtime.surface_commit.prepared",
+                    "commit_id": commit_id,
+                    "event_count": 1,
+                    "batch_digest": digest,
+                    "cursor_before": index,
+                    "cursor_after": index + 1,
+                    "durable_revision": index + 1,
+                    "batch": &batch
+                }),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            serde_json::to_writer(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "runtime.surface_commit.committed",
+                    "commit_id": commit_id,
+                    "event_count": 1,
+                    "batch_digest": digest,
+                    "cursor_after": index + 1,
+                    "durable_revision": index + 1
+                }),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+        writer.flush().unwrap();
+
+        let started = Instant::now();
+        let recovered = JsonlThreadStore
+            .load_surface_commit_batches(&path)
+            .expect("load large surface commit log");
+        let elapsed = started.elapsed();
+
+        assert_eq!(recovered.len(), COMMIT_COUNT);
+        assert!(
+            elapsed <= MAX_RECOVERY_TIME,
+            "surface commit recovery took {elapsed:?}, expected at most {MAX_RECOVERY_TIME:?}"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
