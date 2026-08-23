@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.0";
+export const releaseVersion = "v0.4.1";
 
 export const releases = [
+  {
+    version: "v0.4.1",
+    date: "2026-08-23",
+    title: "Faster streaming surfaces and hardened sandbox metadata",
+    body: "Batches provider step commits with deferred surface refresh, caches token counts, shards the reducer state, and coalesces consecutive MessageDelta/ReasoningDelta events before renderer dispatch to cut UI render passes. Sandbox metadata handling hardens: Linux/bubblewrap re-binds nested protected metadata read-only, symlinked metadata roots cannot widen grants, session grants pass a safety guard before recording, and reserved session-metadata sources are ignored at the thread boundary so forged configuration cannot mint metadata escalation authority. Workflow active-state classification switches to exclusion with reported status sequences.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.1",
+  },
   {
     version: "v0.4.0",
     date: "2026-08-22",
