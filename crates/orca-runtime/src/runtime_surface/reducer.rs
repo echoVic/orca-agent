@@ -59,6 +59,8 @@ use super::projection::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 #[derive(Serialize)]
 enum CanonicalOperationPatchV1<'a> {
@@ -696,11 +698,72 @@ struct LiveToolArgumentProgress {
     arguments_bytes: ByteCount,
 }
 
+const APPLIED_HISTORY_SHARD_COUNT: usize = 64;
+
+#[derive(Clone, PartialEq)]
+struct CowShardedBTreeMap<K, V> {
+    shards: Vec<Arc<BTreeMap<K, V>>>,
+}
+
+impl<K, V> Default for CowShardedBTreeMap<K, V>
+where
+    K: Ord,
+{
+    fn default() -> Self {
+        Self {
+            shards: vec![Arc::new(BTreeMap::new()); APPLIED_HISTORY_SHARD_COUNT],
+        }
+    }
+}
+
+impl<K, V> CowShardedBTreeMap<K, V>
+where
+    K: Clone + Hash + Ord,
+    V: Clone,
+{
+    fn shard_index(key: &K) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish() as usize % APPLIED_HISTORY_SHARD_COUNT
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.shards[Self::shard_index(key)].get(key)
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let shard = Self::shard_index(&key);
+        Arc::make_mut(&mut self.shards[shard]).insert(key, value)
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        let shard = Self::shard_index(key);
+        Arc::make_mut(&mut self.shards[shard]).remove(key)
+    }
+
+    fn any_key(&self, predicate: impl Fn(&K) -> bool) -> bool {
+        self.shards.iter().any(|shard| shard.keys().any(&predicate))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.shards.iter().all(|shard| shard.is_empty())
+    }
+
+    #[cfg(test)]
+    fn shared_shard_count(&self, other: &Self) -> usize {
+        self.shards
+            .iter()
+            .zip(&other.shards)
+            .filter(|(left, right)| Arc::ptr_eq(left, right))
+            .count()
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct SurfaceReducerState {
     snapshot: SurfaceSnapshot,
-    applied: BTreeMap<(SurfaceEventId, SurfaceCommitId), AppliedTransitionRecord>,
-    applied_batches: BTreeMap<SurfaceCommitId, AppliedBatchRecord>,
+    applied: CowShardedBTreeMap<(SurfaceEventId, SurfaceCommitId), AppliedTransitionRecord>,
+    applied_batches: CowShardedBTreeMap<SurfaceCommitId, AppliedBatchRecord>,
     applied_control_intents: Vec<AppliedControlIntentRecord>,
     applied_goal_receipts: HashSet<(SurfaceCommitId, Sha256Digest)>,
     goal_recoveries: Vec<AppliedGoalRecoveryRecord>,
@@ -714,8 +777,8 @@ impl SurfaceReducerState {
     pub fn new(snapshot: SurfaceSnapshot) -> Self {
         Self {
             snapshot,
-            applied: BTreeMap::new(),
-            applied_batches: BTreeMap::new(),
+            applied: CowShardedBTreeMap::default(),
+            applied_batches: CowShardedBTreeMap::default(),
             applied_control_intents: Vec::new(),
             applied_goal_receipts: HashSet::new(),
             goal_recoveries: Vec::new(),
@@ -959,8 +1022,7 @@ fn duplicate_result(
 
     if state
         .applied
-        .keys()
-        .any(|(_, applied_commit_id)| applied_commit_id == id)
+        .any_key(|(_, applied_commit_id)| applied_commit_id == id)
     {
         return Some(batch_error(
             batch,
@@ -1277,8 +1339,7 @@ fn validate_batch_structure(
         }
         if state
             .applied
-            .keys()
-            .any(|(event_id, _)| event_id == &envelope.event_id)
+            .any_key(|(event_id, _)| event_id == &envelope.event_id)
         {
             return Err(SurfaceReduceResult::Rejected {
                 error: event_error(
@@ -8980,6 +9041,38 @@ pub(crate) mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn reducer_clone_shares_unmodified_applied_history_shards() {
+        let initial = SurfaceReducerState::new(reducer_snapshot());
+        let batch = reducer_batch(
+            &initial,
+            61,
+            SurfaceScope::Thread,
+            SurfaceEvent::Plan(SurfacePlanSnapshot {
+                revision: PlanRevision::try_new(2).unwrap(),
+                explanation: Some(DisplayText::new("copy on write history")),
+                items: Vec::new(),
+                causative_generation: None,
+            }),
+        );
+
+        let SurfaceReduceResult::Applied { state: applied } =
+            reduce_batch(SurfaceReduceMode::Live, &initial, &batch)
+        else {
+            panic!("expected initial application");
+        };
+
+        assert!(
+            initial.applied.shared_shard_count(&applied.applied) >= APPLIED_HISTORY_SHARD_COUNT - 1
+        );
+        assert!(
+            initial
+                .applied_batches
+                .shared_shard_count(&applied.applied_batches)
+                >= APPLIED_HISTORY_SHARD_COUNT - 1
+        );
     }
 
     #[test]

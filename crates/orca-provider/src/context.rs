@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{ModelRuntimeConfig, ProviderKind};
@@ -43,15 +45,84 @@ pub trait TokenCounter {
     fn count_text(&self, text: &str) -> usize;
 }
 
+const TOKEN_CACHE_MAX_ENTRIES: usize = 4096;
+const TOKEN_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const TOKEN_CACHE_MIN_TEXT_BYTES: usize = 32;
+
+#[derive(Default)]
+struct TokenCountCache {
+    values: HashMap<String, usize>,
+    order: VecDeque<String>,
+    resident_bytes: usize,
+}
+
+static TOKEN_COUNT_CACHE: OnceLock<Mutex<TokenCountCache>> = OnceLock::new();
+#[cfg(test)]
+static TOKEN_CACHE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn cached_default_token_count(text: &str) -> Option<usize> {
+    if text.len() < TOKEN_CACHE_MIN_TEXT_BYTES {
+        return None;
+    }
+    let cache = TOKEN_COUNT_CACHE.get_or_init(|| Mutex::new(TokenCountCache::default()));
+    let cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let value = cache.values.get(text).copied();
+    if value.is_some() {
+        #[cfg(test)]
+        TOKEN_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    value
+}
+
+fn remember_default_token_count(text: &str, value: usize) {
+    if text.len() < TOKEN_CACHE_MIN_TEXT_BYTES {
+        return;
+    }
+    let cache = TOKEN_COUNT_CACHE.get_or_init(|| Mutex::new(TokenCountCache::default()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.values.contains_key(text) {
+        return;
+    }
+    let key = text.to_string();
+    // The key is retained in both the lookup map and FIFO eviction queue.
+    // Account for both copies so the bound reflects resident key memory.
+    let key_bytes = key.len().saturating_mul(2);
+    if key_bytes > TOKEN_CACHE_MAX_BYTES {
+        return;
+    }
+    cache.values.insert(key.clone(), value);
+    cache.order.push_back(key);
+    cache.resident_bytes = cache.resident_bytes.saturating_add(key_bytes);
+    while cache.order.len() > TOKEN_CACHE_MAX_ENTRIES
+        || cache.resident_bytes > TOKEN_CACHE_MAX_BYTES
+    {
+        if let Some(oldest) = cache.order.pop_front() {
+            cache.resident_bytes = cache
+                .resident_bytes
+                .saturating_sub(oldest.len().saturating_mul(2));
+            cache.values.remove(&oldest);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultTokenCounter;
 
 impl TokenCounter for DefaultTokenCounter {
     fn count_text(&self, text: &str) -> usize {
+        if let Some(value) = cached_default_token_count(text) {
+            return value;
+        }
         // DeepSeek uses a custom BPE vocabulary. cl100k_base (GPT-4) is an approximation
         // with ~10-15% variance. Acceptable for compaction decisions; actual billing uses
         // the API-reported usage field.
-        cl100k_base_singleton().encode_ordinary(text).len()
+        let value = cl100k_base_singleton().encode_ordinary(text).len();
+        remember_default_token_count(text, value);
+        value
     }
 }
 
@@ -1423,6 +1494,21 @@ mod tests {
         let counter = DefaultTokenCounter;
 
         assert_eq!(counter.count_text("hellohellohello"), 3);
+    }
+
+    #[test]
+    fn default_token_counter_reuses_long_text_counts() {
+        TOKEN_CACHE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let counter = DefaultTokenCounter;
+        let text = "cached context fragment ".repeat(64);
+        let first = counter.count_text(&text);
+        let second = counter.count_text(&text);
+
+        assert_eq!(first, second);
+        assert!(
+            TOKEN_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "second count should hit the bounded token cache"
+        );
     }
 
     #[test]

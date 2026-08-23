@@ -194,57 +194,6 @@ impl JsonlThreadStore {
         Ok(found)
     }
 
-    pub(crate) fn probe_surface_commit(
-        &self,
-        path: &Path,
-        requested_commit_id: &str,
-    ) -> io::Result<Option<(bool, u32, Vec<u8>, u64, u64, u64)>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let mut found = None;
-        for record in read_records(path)? {
-            match record {
-                SessionRecord::SurfaceCommitPrepared {
-                    commit_id,
-                    event_count,
-                    batch_digest,
-                    cursor_before,
-                    cursor_after,
-                    durable_revision,
-                    batch: _,
-                } if commit_id == requested_commit_id => {
-                    found = Some((
-                        false,
-                        event_count,
-                        batch_digest,
-                        cursor_before,
-                        cursor_after,
-                        durable_revision,
-                    ));
-                }
-                SessionRecord::SurfaceCommitCommitted {
-                    commit_id,
-                    event_count,
-                    batch_digest,
-                    cursor_after,
-                    durable_revision,
-                } if commit_id == requested_commit_id => {
-                    found = Some((
-                        true,
-                        event_count,
-                        batch_digest,
-                        0,
-                        cursor_after,
-                        durable_revision,
-                    ));
-                }
-                _ => {}
-            }
-        }
-        Ok(found)
-    }
-
     pub(crate) fn load_surface_commit_batches(
         &self,
         path: &Path,

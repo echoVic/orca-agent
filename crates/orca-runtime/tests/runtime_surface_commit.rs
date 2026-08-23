@@ -1281,6 +1281,35 @@ fn jsonl_ledger_recovers_exact_prepared_and_committed_identity() {
 }
 
 #[test]
+fn jsonl_ledger_probes_the_loaded_index_without_rereading_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_owner_dir, owner) = test_owner_lease();
+    let path = dir.path().join("surface.jsonl");
+    let mut coordinator = RuntimeCommitCoordinator::new_with_owner_lease(
+        JsonlSurfaceCommitLedger::new(&path, cursor(0)),
+        SurfaceReducerState::new(snapshot()),
+        &owner,
+    )
+    .unwrap();
+    let batch = batch(13);
+    coordinator.commit_actor_batch(&batch).unwrap();
+    let commit_id = match &batch.commit_class {
+        CommitClass::Recorded { commit_id, .. } => commit_id,
+        CommitClass::Ephemeral { .. } => unreachable!(),
+    };
+
+    std::fs::write(&path, b"not-json\n").unwrap();
+
+    assert!(matches!(
+        coordinator
+            .ledger()
+            .probe_commit(commit_id, &batch.batch_digest),
+        CommitProbe::Present(SurfaceBatchReceipt::Recorded(receipt))
+            if receipt.batch_digest == batch.batch_digest
+    ));
+}
+
+#[test]
 fn jsonl_ledger_repairs_torn_prepared_tail_before_durable_append() {
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("complete-prepared.jsonl");

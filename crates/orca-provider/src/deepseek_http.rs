@@ -793,10 +793,34 @@ fn replayable_reasoning_content(
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
     let mut messages: Vec<ApiMessage> = Vec::new();
     let mut first_system_done = false;
-    let mut safe_messages = conversation.messages.clone();
-    normalize_tool_boundaries(&mut safe_messages);
+    let needs_normalization = conversation.messages.iter().any(|message| {
+        matches!(message, Message::Tool { .. })
+            || matches!(
+                message,
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } if !assistant_message_has_payload(content.as_deref(), tool_calls)
+            )
+            || matches!(
+                message,
+                Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()
+            )
+    });
+    let normalized_messages;
+    let source_messages = if needs_normalization {
+        normalized_messages = {
+            let mut messages = conversation.messages.clone();
+            normalize_tool_boundaries(&mut messages);
+            messages
+        };
+        &normalized_messages
+    } else {
+        &conversation.messages
+    };
 
-    for msg in &safe_messages {
+    for msg in source_messages {
         let api_msg = match msg {
             Message::System { content, .. } => {
                 let result = ApiMessage {

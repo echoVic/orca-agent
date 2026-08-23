@@ -2804,6 +2804,67 @@ pub struct JsonlSurfaceCommitLedger {
     path: PathBuf,
     cursor_template: SurfaceCursor,
     store: JsonlThreadStore,
+    commit_index: Result<SurfaceCommitIndex, SurfaceLedgerError>,
+}
+
+#[derive(Clone)]
+struct IndexedSurfaceCommit {
+    committed: bool,
+    batch: SurfaceCommitBatch,
+}
+
+#[derive(Clone, Default)]
+struct SurfaceCommitIndex {
+    ordered: Vec<IndexedSurfaceCommit>,
+    by_id: BTreeMap<SurfaceCommitId, usize>,
+}
+
+impl SurfaceCommitIndex {
+    fn commit_id(batch: &SurfaceCommitBatch) -> &SurfaceCommitId {
+        match &batch.commit_class {
+            CommitClass::Recorded { commit_id, .. } | CommitClass::Ephemeral { commit_id, .. } => {
+                commit_id
+            }
+        }
+    }
+
+    fn from_stored(
+        stored: Vec<(bool, StoredSurfaceCommitBatchV1)>,
+    ) -> Result<Self, SurfaceLedgerError> {
+        let mut index = Self::default();
+        for (committed, stored_batch) in stored {
+            let batch = stored_batch.into_live()?;
+            let commit_id = Self::commit_id(&batch).clone();
+            if index.by_id.contains_key(&commit_id) {
+                return Err(SurfaceLedgerError::CommitIdentityConflict);
+            }
+            index.by_id.insert(commit_id, index.ordered.len());
+            index
+                .ordered
+                .push(IndexedSurfaceCommit { committed, batch });
+        }
+        Ok(index)
+    }
+
+    fn get(&self, commit_id: &SurfaceCommitId) -> Option<&IndexedSurfaceCommit> {
+        self.by_id
+            .get(commit_id)
+            .and_then(|index| self.ordered.get(*index))
+    }
+
+    fn get_mut(&mut self, commit_id: &SurfaceCommitId) -> Option<&mut IndexedSurfaceCommit> {
+        let index = *self.by_id.get(commit_id)?;
+        self.ordered.get_mut(index)
+    }
+
+    fn insert_prepared(&mut self, batch: SurfaceCommitBatch) {
+        let commit_id = Self::commit_id(&batch).clone();
+        self.by_id.insert(commit_id, self.ordered.len());
+        self.ordered.push(IndexedSurfaceCommit {
+            committed: false,
+            batch,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3041,10 +3102,17 @@ fn canonical_id<T: serde::Serialize>(id: &T) -> String {
 
 impl JsonlSurfaceCommitLedger {
     pub fn new(path: impl Into<PathBuf>, cursor_template: SurfaceCursor) -> Self {
+        let path = path.into();
+        let store = JsonlThreadStore::new();
+        let commit_index = store
+            .load_surface_commit_batches(&path)
+            .map_err(Self::io_error)
+            .and_then(SurfaceCommitIndex::from_stored);
         Self {
-            path: path.into(),
+            path,
             cursor_template,
-            store: JsonlThreadStore::new(),
+            store,
+            commit_index,
         }
     }
 
@@ -4030,15 +4098,12 @@ impl JsonlSurfaceCommitLedger {
     }
 
     pub fn recover_batches(&self) -> Result<RecoveredSurfaceBatches, SurfaceLedgerError> {
-        let stored = self
-            .store
-            .load_surface_commit_batches(&self.path)
-            .map_err(Self::io_error)?;
+        let index = self.commit_index.as_ref().map_err(Clone::clone)?;
         let mut committed = Vec::new();
         let mut prepared = None;
         let mut previous_cursor_after = None;
-        for (is_committed, stored_batch) in stored {
-            let batch = stored_batch.into_live()?;
+        for indexed in &index.ordered {
+            let batch = indexed.batch.clone();
             if batch.cursor_before.thread_id != self.cursor_template.thread_id
                 || previous_cursor_after.as_ref().map_or_else(
                     || batch.cursor_before.incarnation != self.cursor_template.incarnation,
@@ -4048,7 +4113,7 @@ impl JsonlSurfaceCommitLedger {
                 return Err(SurfaceLedgerError::CommitIdentityConflict);
             }
             previous_cursor_after = Some(batch.cursor_after.clone());
-            if is_committed {
+            if indexed.committed {
                 if prepared.is_some() {
                     return Err(SurfaceLedgerError::CommitIdentityConflict);
                 }
@@ -4125,20 +4190,11 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
             } => (commit_id.clone(), *durable_revision),
             CommitClass::Ephemeral { .. } => return Err(SurfaceLedgerError::AppendFailed),
         };
-        let id = Self::id_string(&commit_id);
-        if let Some((committed, count, digest, _cursor_before, cursor_after, revision)) = self
-            .store
-            .probe_surface_commit(&self.path, &id)
-            .map_err(Self::io_error)?
-        {
-            if count != batch.event_count
-                || digest.as_slice() != batch.batch_digest.as_bytes()
-                || cursor_after != batch.cursor_after.next_seq.get()
-                || revision != durable_revision.get()
-            {
+        let index = self.commit_index.as_mut().map_err(|error| error.clone())?;
+        if let Some(existing) = index.get(&commit_id) {
+            if existing.batch != *batch {
                 return Err(SurfaceLedgerError::CommitIdentityConflict);
             }
-            let _ = committed;
             return Ok(SurfaceBatchReceipt::Recorded(DurableBatchReceipt {
                 commit_id,
                 durable_revision,
@@ -4147,6 +4203,7 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
                 cursor_after: batch.cursor_after.clone(),
             }));
         }
+        let id = Self::id_string(&commit_id);
         self.store
             .append_surface_commit_prepared(
                 &self.path,
@@ -4159,6 +4216,7 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
                 StoredSurfaceCommitBatchV1::from_live(batch)?,
             )
             .map_err(Self::io_error)?;
+        index.insert_prepared(batch.clone());
         let receipt = DurableBatchReceipt {
             commit_id,
             durable_revision,
@@ -4255,56 +4313,56 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
                 receipt.cursor_after.next_seq.get(),
                 receipt.durable_revision.get(),
             )
-            .map_err(|_| SurfaceLedgerError::CheckpointFailed)
+            .map_err(|_| SurfaceLedgerError::CheckpointFailed)?;
+        let index = self
+            .commit_index
+            .as_mut()
+            .map_err(|_| SurfaceLedgerError::CheckpointFailed)?;
+        let Some(indexed) = index.get_mut(&receipt.commit_id) else {
+            return Err(SurfaceLedgerError::CommitIdentityConflict);
+        };
+        if indexed.batch.batch_digest != receipt.batch_digest
+            || indexed.batch.event_count != receipt.event_count
+            || indexed.batch.cursor_after != receipt.cursor_after
+        {
+            return Err(SurfaceLedgerError::CommitIdentityConflict);
+        }
+        indexed.committed = true;
+        Ok(())
     }
 
     fn probe_commit(&self, commit_id: &SurfaceCommitId, digest: &Sha256Digest) -> CommitProbe {
-        let Ok(found) = self
-            .store
-            .probe_surface_commit(&self.path, &Self::id_string(commit_id))
-        else {
+        let Ok(index) = self.commit_index.as_ref() else {
             return CommitProbe::Absent;
         };
-        let Some((
-            committed,
-            event_count,
-            stored_digest,
-            cursor_before,
-            cursor_after,
-            durable_revision,
-        )) = found
-        else {
+        let Some(indexed) = index.get(commit_id) else {
             return CommitProbe::Absent;
         };
-        if stored_digest.as_slice() != digest.as_bytes() {
+        let batch = &indexed.batch;
+        if &batch.batch_digest != digest {
             return CommitProbe::Conflict;
         }
-        let Ok(durable_revision) = DurableRevision::try_new(durable_revision) else {
+        let CommitClass::Recorded {
+            durable_revision, ..
+        } = &batch.commit_class
+        else {
             return CommitProbe::Conflict;
         };
-        let cursor = SurfaceCursor {
-            next_seq: super::SequenceNumber::new(cursor_after),
-            source_revision: CursorSourceRevision::Recorded { durable_revision },
-            ..self.cursor_template.clone()
-        };
-        if committed {
+        if indexed.committed {
             CommitProbe::Present(SurfaceBatchReceipt::Recorded(DurableBatchReceipt {
                 commit_id: commit_id.clone(),
-                durable_revision,
-                event_count,
+                durable_revision: *durable_revision,
+                event_count: batch.event_count,
                 batch_digest: digest.clone(),
-                cursor_after: cursor,
+                cursor_after: batch.cursor_after.clone(),
             }))
         } else {
             CommitProbe::Prepared(PreparedSurfaceCommit {
                 commit_id: commit_id.clone(),
-                event_count,
+                event_count: batch.event_count,
                 batch_digest: digest.clone(),
-                cursor_before: SurfaceCursor {
-                    next_seq: super::SequenceNumber::new(cursor_before),
-                    ..self.cursor_template.clone()
-                },
-                cursor_after: cursor,
+                cursor_before: batch.cursor_before.clone(),
+                cursor_after: batch.cursor_after.clone(),
             })
         }
     }

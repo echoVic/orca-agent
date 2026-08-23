@@ -2,7 +2,7 @@ use std::io;
 #[cfg(test)]
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
@@ -73,6 +73,67 @@ pub(crate) struct RuntimeProviderResponseStep;
 pub(crate) struct RuntimeProviderResponseResultStep;
 pub(crate) struct RuntimeTurnProviderCycleStep {
     provider_error_step: RuntimeProviderErrorStep,
+}
+
+const PROVIDER_STEP_BATCH_LIMIT: usize = 32;
+const PROVIDER_STEP_BATCH_MAX_DELAY: Duration = Duration::from_millis(16);
+
+struct ProviderStepBatcher<'a> {
+    ingress: Option<&'a dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
+    identity: ModelResponseIdentity,
+    pending: Vec<ProviderStep>,
+    started_at: Instant,
+}
+
+impl<'a> ProviderStepBatcher<'a> {
+    fn new(
+        ingress: Option<&'a dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
+        identity: &ModelResponseIdentity,
+    ) -> Self {
+        Self {
+            ingress,
+            identity: identity.clone(),
+            pending: Vec::with_capacity(PROVIDER_STEP_BATCH_LIMIT),
+            started_at: Instant::now(),
+        }
+    }
+
+    fn push(&mut self, step: ProviderStep) -> io::Result<()> {
+        if self.ingress.is_none() {
+            return Ok(());
+        }
+        if self.pending.is_empty() {
+            self.started_at = Instant::now();
+        }
+        self.pending.push(step);
+        if self.pending.len() >= PROVIDER_STEP_BATCH_LIMIT
+            || self.started_at.elapsed() >= PROVIDER_STEP_BATCH_MAX_DELAY
+        {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush_if_due(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() && self.started_at.elapsed() >= PROVIDER_STEP_BATCH_MAX_DELAY {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let Some(ingress) = self.ingress else {
+            self.pending.clear();
+            return Ok(());
+        };
+        ingress.commit_provider_steps(&self.identity, &self.pending)?;
+        self.pending.clear();
+        self.started_at = Instant::now();
+        Ok(())
+    }
 }
 
 pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
@@ -480,20 +541,25 @@ impl RuntimeProviderTurnStep {
                 input.provider_config,
                 input.cancel.clone(),
             );
+            let mut step_batcher = ProviderStepBatcher::new(
+                input.turn_context.provider_response_ingress(),
+                &response_identity,
+            );
             let response = loop {
                 match stream.recv_timeout(Duration::from_millis(10)) {
                     Ok(ProviderStreamEvent::Step(delivery)) => {
+                        step_batcher.push(delivery.step().clone())?;
                         emit_provider_delta(
                             delivery.step(),
                             &response_identity,
-                            input.turn_context.provider_response_ingress(),
+                            None,
                             emit_deltas,
                             events,
                             sink,
                         )?;
                     }
                     Ok(ProviderStreamEvent::Completed(response)) => break response,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => step_batcher.flush_if_due()?,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         break provider_stream_disconnected_response();
                     }
@@ -503,6 +569,7 @@ impl RuntimeProviderTurnStep {
                     .provider_suspension_control
                     .is_some_and(|control| control.take_suspension_request())
                 {
+                    step_batcher.flush()?;
                     return Ok(RuntimeProviderTurnOutput::Suspended(
                         RuntimeProviderSuspension::new(
                             stream,
@@ -519,6 +586,7 @@ impl RuntimeProviderTurnStep {
                     ));
                 }
             };
+            step_batcher.flush()?;
 
             let Some(error) = response.error() else {
                 break (response, response_identity);
@@ -1068,6 +1136,8 @@ impl RuntimeProviderTurnOutput {
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+
     use orca_core::approval_rules::PermissionRules;
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::{
@@ -1107,12 +1177,89 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingProviderStepIngress {
+        batches: Mutex<Vec<Vec<ProviderStep>>>,
+    }
+
+    impl crate::runtime_surface::RuntimeProviderResponseIngress for RecordingProviderStepIngress {
+        fn commit_response(&self, _response: &RuntimeModelResponse) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_provider_step(
+            &self,
+            _identity: &ModelResponseIdentity,
+            _step: &ProviderStep,
+        ) -> io::Result<()> {
+            panic!("provider step batcher must use the batch ingress")
+        }
+
+        fn commit_provider_steps(
+            &self,
+            _identity: &ModelResponseIdentity,
+            steps: &[ProviderStep],
+        ) -> io::Result<()> {
+            self.batches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(steps.to_vec());
+            Ok(())
+        }
+
+        fn commit_tool_results(
+            &self,
+            _results: &[orca_core::tool_types::ToolResult],
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn runtime_response(response: ProviderResponse) -> RuntimeModelResponse {
         RuntimeModelResponse::new(response, orca_core::thread_identity::TurnId::new())
     }
 
     fn response_identity() -> ModelResponseIdentity {
         ModelResponseIdentity::new(orca_core::thread_identity::TurnId::new())
+    }
+
+    #[test]
+    fn provider_step_batcher_commits_at_the_limit_and_flushes_the_tail() {
+        let ingress = RecordingProviderStepIngress::default();
+        let identity = response_identity();
+        let mut batcher = ProviderStepBatcher::new(Some(&ingress), &identity);
+
+        for index in 0..PROVIDER_STEP_BATCH_LIMIT - 1 {
+            batcher
+                .push(ProviderStep::MessageDelta(index.to_string()))
+                .unwrap();
+        }
+        assert!(
+            ingress
+                .batches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+
+        batcher
+            .push(ProviderStep::MessageDelta("boundary".to_string()))
+            .unwrap();
+        batcher
+            .push(ProviderStep::ReasoningDelta("tail".to_string()))
+            .unwrap();
+        batcher.flush().unwrap();
+
+        let batches = ingress
+            .batches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), PROVIDER_STEP_BATCH_LIMIT);
+        assert!(matches!(
+            batches[1].as_slice(),
+            [ProviderStep::ReasoningDelta(text)] if text == "tail"
+        ));
     }
 
     fn config() -> RunConfig {

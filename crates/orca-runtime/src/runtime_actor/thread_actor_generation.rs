@@ -380,24 +380,24 @@ impl ThreadActor {
         Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
     }
 
-    pub(super) fn commit_surface_provider_step(
+    pub(super) fn commit_surface_provider_steps(
         &mut self,
         active: Option<&ActiveOperation>,
         fence: surface::SurfaceOperationFence,
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
-        step: &ProviderStep,
+        steps: &[ProviderStep],
     ) -> io::Result<()> {
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let active_generation = active.is_some_and(|active| {
             active.surface_operation.as_ref() == Some(&fence)
                 && !Self::surface_interaction_admission_closed(active)
         });
-        let Some(projection) = self.generation_context_controller.provider_step_events(
+        let Some(projection) = self.generation_context_controller.provider_steps_events(
             &snapshot,
             active_generation,
             fence.clone(),
             identity,
-            step,
+            steps,
         )?
         else {
             return Ok(());

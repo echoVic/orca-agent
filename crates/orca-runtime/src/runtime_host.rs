@@ -1813,13 +1813,20 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         step: &ProviderStep,
     ) -> io::Result<()> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.commit_provider_steps(identity, std::slice::from_ref(step))
+    }
+
+    fn commit_provider_steps(
+        &self,
+        identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+        steps: &[ProviderStep],
+    ) -> io::Result<()> {
         self.command_tx
             .try_send(ThreadCommand::SurfaceCommitProviderStep {
                 fence: self.fence.clone(),
                 identity: identity.clone(),
-                step: step.clone(),
-                reply: reply_tx,
+                steps: steps.to_vec(),
+                reply: None,
             })
             .map_err(|error| match error {
                 TrySendError::Full(_) => io::Error::new(
@@ -1831,12 +1838,7 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
                     "runtime semantic ingress actor is unavailable",
                 ),
             })?;
-        reply_rx.recv().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "runtime semantic ingress actor closed before commit acknowledgement",
-            )
-        })?
+        Ok(())
     }
 
     fn commit_tool_results(&self, results: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
@@ -4506,8 +4508,8 @@ enum ThreadCommand {
     SurfaceCommitProviderStep {
         fence: surface::SurfaceOperationFence,
         identity: orca_core::thread_item_projection::ModelResponseIdentity,
-        step: ProviderStep,
-        reply: SyncSender<io::Result<()>>,
+        steps: Vec<ProviderStep>,
+        reply: Option<SyncSender<io::Result<()>>>,
     },
     SurfaceCommitToolResults {
         fence: surface::SurfaceOperationFence,
@@ -16886,10 +16888,12 @@ impl ThreadActor {
                     )));
                 }
                 ThreadCommand::SurfaceCommitProviderStep { reply, .. } => {
-                    let _ = reply.send(Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "runtime thread is shutting down",
-                    )));
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "runtime thread is shutting down",
+                        )));
+                    }
                 }
                 ThreadCommand::SurfaceCommitToolResults { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
@@ -17380,11 +17384,15 @@ impl ThreadActor {
             ThreadCommand::SurfaceCommitProviderStep {
                 fence,
                 identity,
-                step,
+                steps,
                 reply,
             } => {
-                let result = self.commit_surface_provider_step(None, fence, &identity, &step);
-                let _ = reply.send(result);
+                let result = self.commit_surface_provider_steps(None, fence, &identity, &steps);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                } else if let Err(error) = result {
+                    eprintln!("orca: provider stream semantic commit failed while idle: {error}");
+                }
             }
             ThreadCommand::SurfaceCommitToolResults { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
@@ -18309,12 +18317,29 @@ impl ThreadActor {
             ThreadCommand::SurfaceCommitProviderStep {
                 fence,
                 identity,
-                step,
+                steps,
                 reply,
             } => {
                 let result =
-                    self.commit_surface_provider_step(Some(active), fence, &identity, &step);
-                let _ = reply.send(result);
+                    self.commit_surface_provider_steps(Some(active), fence, &identity, &steps);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                } else if let Err(error) = result {
+                    // A queued delta can outlive a user/host cancellation. Once
+                    // terminalization has started, that stale ingress must not
+                    // turn the intended cancellation into a runtime failure.
+                    if active.surface_terminalization.is_none()
+                        && !active.generation.cancel.is_cancelled()
+                    {
+                        active.surface_execution_failure =
+                            Some(surface::GenerationExecutionFailureClass::RuntimeInvariant);
+                        active.surface_execution_failure_diagnostic =
+                            Some(surface_safe_diagnostic(
+                                &error.to_string(),
+                                "provider stream commit failed",
+                            ));
+                    }
+                }
             }
             ThreadCommand::SurfaceCommitToolResults {
                 fence,

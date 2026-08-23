@@ -72,6 +72,16 @@ pub trait RuntimeProviderResponseIngress: Send + Sync + std::fmt::Debug {
         identity: &ModelResponseIdentity,
         step: &ProviderStep,
     ) -> io::Result<()>;
+    fn commit_provider_steps(
+        &self,
+        identity: &ModelResponseIdentity,
+        steps: &[ProviderStep],
+    ) -> io::Result<()> {
+        for step in steps {
+            self.commit_provider_step(identity, step)?;
+        }
+        Ok(())
+    }
     fn commit_tool_results(&self, results: &[ToolResult]) -> io::Result<()>;
     fn commit_plan_update(&self, _update: &UpdatePlanArgs) -> io::Result<()> {
         Ok(())

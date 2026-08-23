@@ -400,14 +400,13 @@ impl ThreadOperationExecutor for AssistantStreamingExecutor {
         let ingress = turn_request
             .provider_response_ingress()
             .expect("typed generation installs semantic ingress");
-        for step in [
+        let steps = [
             ProviderStep::MessageDelta("hel".to_string()),
             ProviderStep::ReasoningDelta("thi".to_string()),
             ProviderStep::MessageDelta("lo".to_string()),
             ProviderStep::ReasoningDelta("nk".to_string()),
-        ] {
-            ingress.commit_provider_step(&identity, &step)?;
-        }
+        ];
+        ingress.commit_provider_steps(&identity, &steps)?;
         ingress.commit_response(&RuntimeModelResponse::from_parts(
             ProviderResponse {
                 steps: Vec::new(),

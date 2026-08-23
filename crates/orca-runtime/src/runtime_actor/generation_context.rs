@@ -28,39 +28,17 @@ impl GenerationContextController {
         Self::default()
     }
 
-    /// Projects one provider stream delta against a frozen surface snapshot.
-    ///
-    /// The projection validates the exact generation/turn identity, preserves
-    /// sensitive-token redaction tails, and returns ordered events without
-    /// committing them.
-    pub(crate) fn provider_step_events(
+    /// Projects one bounded provider stream chunk against a frozen snapshot.
+    /// The local offset overlay preserves ordering without cloning or reducing
+    /// the complete surface state for every delta in the chunk.
+    pub(crate) fn provider_steps_events(
         &mut self,
         snapshot: &surface::SurfaceSnapshot,
         active_generation: bool,
         fence: surface::SurfaceOperationFence,
         identity: &ModelResponseIdentity,
-        step: &ProviderStep,
+        steps: &[ProviderStep],
     ) -> io::Result<Option<ProviderStepProjection>> {
-        let (channel, item_id, text) = match step {
-            ProviderStep::MessageDelta(text) => (
-                surface::AssistantChannel::Message,
-                identity.item_ids.conversation_item_id.clone(),
-                text,
-            ),
-            ProviderStep::ReasoningDelta(text) => (
-                surface::AssistantChannel::Reasoning,
-                identity.item_ids.reasoning_item_id.clone(),
-                text,
-            ),
-            _ => return Ok(None),
-        };
-        if text.is_empty() {
-            return Ok(None);
-        }
-        let Some(text) = self.take_stream_redacted_prefix(&fence, &item_id, text)? else {
-            return Ok(None);
-        };
-
         let foregrounded_background = snapshot
             .background_operations
             .iter()
@@ -76,26 +54,6 @@ impl GenerationContextController {
                     })
             })
             .map(|background| background.fence.clone());
-        if !active_generation && foregrounded_background.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "provider step generation fence is stale or not foreground-attached",
-            ));
-        }
-        let operation = surface_operation_record(snapshot, &fence.operation_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface operation missing"))?;
-        let generation = operation
-            .generations
-            .iter()
-            .find(|generation| generation.fence == fence)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface generation missing"))?;
-        if generation.logical_turn_id != identity.turn_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "provider step turn identity differs from active generation",
-            ));
-        }
-
         let scope = foregrounded_background
             .as_ref()
             .map(|fence| surface::SurfaceScope::Background {
@@ -104,65 +62,141 @@ impl GenerationContextController {
             .unwrap_or_else(|| surface::SurfaceScope::Generation {
                 fence: fence.clone(),
             });
-        let mut events = Vec::with_capacity(2);
-        let (stream_id, offset) = if let Some(stream) = snapshot
-            .assistant_streams
-            .iter()
-            .find(|stream| stream.item_id == item_id && stream.channel == channel)
-        {
-            if stream.fence != fence
-                || stream.turn_id != identity.turn_id
-                || stream.state != surface::SurfaceAssistantStreamState::Open
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "provider step targets a closed or foreign assistant stream",
-                ));
+        let mut events = Vec::with_capacity(steps.len().saturating_add(2));
+        let mut projected_offsets: HashMap<
+            surface::SurfaceItemId,
+            (
+                surface::SurfaceStreamId,
+                surface::ByteOffset,
+                surface::AssistantChannel,
+            ),
+        > = HashMap::new();
+        let mut generation_validated = false;
+
+        for step in steps {
+            let (channel, item_id, raw_text) = match step {
+                ProviderStep::MessageDelta(text) => (
+                    surface::AssistantChannel::Message,
+                    identity.item_ids.conversation_item_id.clone(),
+                    text,
+                ),
+                ProviderStep::ReasoningDelta(text) => (
+                    surface::AssistantChannel::Reasoning,
+                    identity.item_ids.reasoning_item_id.clone(),
+                    text,
+                ),
+                _ => continue,
+            };
+            if raw_text.is_empty() {
+                continue;
             }
-            (stream.stream_id.clone(), stream.next_offset)
-        } else {
-            let raw_id = item_id
-                .as_str()
-                .strip_prefix("item_")
-                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                .ok_or_else(|| {
-                    io::Error::new(
+
+            if !generation_validated {
+                if !active_generation && foregrounded_background.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "provider step generation fence is stale or not foreground-attached",
+                    ));
+                }
+                let operation = surface_operation_record(snapshot, &fence.operation_id)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "surface operation missing")
+                    })?;
+                let generation = operation
+                    .generations
+                    .iter()
+                    .find(|generation| generation.fence == fence)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "surface generation missing")
+                    })?;
+                if generation.logical_turn_id != identity.turn_id {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "provider step item identity is not UUIDv7-backed",
-                    )
-                })?;
-            let stream_id =
-                surface::SurfaceStreamId::try_from_bytes(*raw_id.as_bytes()).map_err(|_| {
-                    io::Error::new(
+                        "provider step turn identity differs from active generation",
+                    ));
+                }
+                generation_validated = true;
+            }
+
+            let Some(text) = self.take_stream_redacted_prefix(&fence, &item_id, raw_text)? else {
+                continue;
+            };
+
+            let (stream_id, offset) = if let Some((stream_id, offset, existing_channel)) =
+                projected_offsets.get(&item_id)
+            {
+                if *existing_channel != channel {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "provider step item identity is not UUIDv7-backed",
-                    )
-                })?;
+                        "provider step changes assistant stream channel",
+                    ));
+                }
+                (stream_id.clone(), *offset)
+            } else if let Some(stream) = snapshot
+                .assistant_streams
+                .iter()
+                .find(|stream| stream.item_id == item_id && stream.channel == channel)
+            {
+                if stream.fence != fence
+                    || stream.turn_id != identity.turn_id
+                    || stream.state != surface::SurfaceAssistantStreamState::Open
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "provider step targets a closed or foreign assistant stream",
+                    ));
+                }
+                (stream.stream_id.clone(), stream.next_offset)
+            } else {
+                let raw_id = item_id
+                    .as_str()
+                    .strip_prefix("item_")
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "provider step item identity is not UUIDv7-backed",
+                        )
+                    })?;
+                let stream_id = surface::SurfaceStreamId::try_from_bytes(*raw_id.as_bytes())
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "provider step item identity is not UUIDv7-backed",
+                        )
+                    })?;
+                events.push((
+                    scope.clone(),
+                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamOpened {
+                        stream: surface::SurfaceAssistantStream {
+                            stream_id: stream_id.clone(),
+                            fence: fence.clone(),
+                            turn_id: identity.turn_id.clone(),
+                            item_id: item_id.clone(),
+                            channel,
+                            next_offset: surface::ByteOffset::new(0),
+                            text: surface::DisplayText::new(""),
+                            state: surface::SurfaceAssistantStreamState::Open,
+                        },
+                    }),
+                ));
+                (stream_id, surface::ByteOffset::new(0))
+            };
+            let next_offset =
+                surface::ByteOffset::new(offset.get().saturating_add(text.as_str().len() as u64));
+            projected_offsets.insert(item_id, (stream_id.clone(), next_offset, channel));
             events.push((
                 scope.clone(),
-                surface::SurfaceEvent::Assistant(surface::AssistantPatch::StreamOpened {
-                    stream: surface::SurfaceAssistantStream {
-                        stream_id: stream_id.clone(),
-                        fence: fence.clone(),
-                        turn_id: identity.turn_id.clone(),
-                        item_id,
-                        channel,
-                        next_offset: surface::ByteOffset::new(0),
-                        text: surface::DisplayText::new(""),
-                        state: surface::SurfaceAssistantStreamState::Open,
-                    },
+                surface::SurfaceEvent::Assistant(surface::AssistantPatch::Delta {
+                    stream_id,
+                    offset,
+                    text,
                 }),
             ));
-            (stream_id, surface::ByteOffset::new(0))
-        };
-        events.push((
-            scope,
-            surface::SurfaceEvent::Assistant(surface::AssistantPatch::Delta {
-                stream_id,
-                offset,
-                text,
-            }),
-        ));
+        }
+        if events.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(ProviderStepProjection {
             events,
             background_fence: foregrounded_background,
