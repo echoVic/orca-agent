@@ -4037,7 +4037,7 @@ done
     }
 
     #[test]
-    fn hosted_tui_background_handoff_failure_publishes_terminal_after_operation_join() {
+    fn hosted_tui_background_handoff_without_capacity_completes_successfully() {
         with_orca_home(|_| {
             let mut harness = HostedTuiHarness::start_with_background_capacity(
                 test_config(HistoryMode::Record),
@@ -4053,9 +4053,12 @@ done
             let terminal =
                 harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
 
+            // With no background capacity the handoff auto-queues the turn
+            // instead of failing the session; the queued turn then runs to
+            // completion, so the session terminal reports success.
             assert!(matches!(
                 terminal,
-                TuiEvent::SessionCompleted { status } if status == "failed"
+                TuiEvent::SessionCompleted { status } if status == "success"
             ));
             assert_eq!(harness.runtime.controller().current_id(), None);
             harness.shutdown();
