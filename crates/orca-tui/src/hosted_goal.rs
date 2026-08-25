@@ -88,7 +88,26 @@ pub(crate) fn run_hosted_goal_run(
             control,
             event_tx,
         ) {
-            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
+            if queued_id.is_none() && rejection_prompt.is_some() && thread.is_busy() {
+                control.cancel_surface_activation_if_idle();
+                if let Err(queue_error) = crate::hosted_submission::queue_busy_submission(
+                    thread,
+                    submitted_turn.prompt().to_string(),
+                    submitted_turn.images().to_vec(),
+                    event_tx,
+                ) {
+                    send_submission_error_with_images(
+                        event_tx,
+                        None,
+                        rejection_prompt.as_deref(),
+                        rejection_bindings,
+                        rejection_images,
+                        queue_error,
+                    );
+                }
+            } else {
+                emit_hosted_operation_error(event_tx, error, &HostedOperationKind::GoalRun);
+            }
         }
         return;
     }
@@ -105,6 +124,24 @@ pub(crate) fn run_hosted_goal_run(
             let _ = event_tx.send(TuiEvent::Error(
                 "goal run returned a compaction result".to_string(),
             ));
+        }
+        Err(_error) if queued_id.is_none() && rejection_prompt.is_some() && thread.is_busy() => {
+            control.cancel_surface_activation_if_idle();
+            if let Err(queue_error) = crate::hosted_submission::queue_busy_submission(
+                thread,
+                submitted_turn.prompt().to_string(),
+                submitted_turn.images().to_vec(),
+                event_tx,
+            ) {
+                send_submission_error_with_images(
+                    event_tx,
+                    None,
+                    rejection_prompt.as_deref(),
+                    rejection_bindings,
+                    rejection_images,
+                    queue_error,
+                );
+            }
         }
         Err(error) => emit_hosted_operation_error(event_tx, error, &HostedOperationKind::Turn),
     }
@@ -224,7 +261,7 @@ pub(crate) fn handle_hosted_goal_action(
                 return;
             }
             if thread_was_missing {
-                announce_runtime_ready(thread.as_ref().expect("goal thread"), event_tx);
+                announce_runtime_ready(thread.as_ref().expect("goal thread"), event_tx, control);
             }
             let actions = TuiSurfaceActions::new(
                 thread
@@ -275,6 +312,7 @@ pub(crate) fn handle_hosted_goal_action(
                 announce_runtime_ready(
                     thread.as_ref().expect("restored Goal edit thread"),
                     event_tx,
+                    control,
                 );
             }
             let Some(runtime_thread) = thread.as_ref() else {
@@ -315,6 +353,7 @@ pub(crate) fn handle_hosted_goal_action(
                 announce_runtime_ready(
                     thread.as_ref().expect("restored Goal clear thread"),
                     event_tx,
+                    control,
                 );
             }
             let Some(runtime_thread) = thread.as_ref() else {
@@ -348,6 +387,7 @@ pub(crate) fn handle_hosted_goal_action(
                 announce_runtime_ready(
                     thread.as_ref().expect("restored Goal pause thread"),
                     event_tx,
+                    control,
                 );
             }
             let Some(runtime_thread) = thread.as_ref() else {

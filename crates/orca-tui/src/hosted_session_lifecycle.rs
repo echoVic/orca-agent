@@ -328,6 +328,7 @@ pub(crate) fn handle_hosted_session_action(
     event_tx: &mut mpsc::Sender<TuiEvent>,
     session_attachment: &mut SessionAttachmentId,
     attachment_routing: &Arc<Mutex<AttachmentRouting>>,
+    control: &TuiSurfaceTaskControl,
 ) {
     match action {
         HostedSessionAction::New => match start_new_hosted_session(
@@ -345,7 +346,11 @@ pub(crate) fn handle_hosted_session_action(
                     Some(attachment_routing),
                 );
                 let _ = event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
-                announce_runtime_ready(thread.as_ref().expect("new hosted thread"), event_tx);
+                announce_runtime_ready(
+                    thread.as_ref().expect("new hosted thread"),
+                    event_tx,
+                    control,
+                );
                 let _ = event_tx.send(TuiEvent::NewSessionStarted);
             }
             Err(error) => {
@@ -368,7 +373,11 @@ pub(crate) fn handle_hosted_session_action(
                     Some(attachment_routing),
                 );
                 let _ = event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
-                announce_runtime_ready(thread.as_ref().expect("forked hosted thread"), event_tx);
+                announce_runtime_ready(
+                    thread.as_ref().expect("forked hosted thread"),
+                    event_tx,
+                    control,
+                );
                 if let Some(runtime_thread) = thread.as_ref()
                     && let Err(error) = emit_typed_history_snapshot(
                         runtime_thread,
@@ -439,7 +448,7 @@ pub(crate) fn handle_hosted_session_action(
                     if let Some(runtime_thread) = thread.as_ref() {
                         let _ =
                             event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
-                        announce_runtime_ready(runtime_thread, event_tx);
+                        announce_runtime_ready(runtime_thread, event_tx, control);
                     }
                     if let Some(runtime_thread) = thread.as_ref()
                         && let Err(error) =
@@ -475,7 +484,7 @@ pub(crate) fn handle_hosted_session_action(
                     if let Some(runtime_thread) = thread.as_ref() {
                         let _ =
                             event_tx.send(TuiEvent::SessionProjectionReset(Box::new(projection)));
-                        announce_runtime_ready(runtime_thread, event_tx);
+                        announce_runtime_ready(runtime_thread, event_tx, control);
                         if let Err(error) = emit_typed_history_snapshot(
                             runtime_thread,
                             &mode,
@@ -711,6 +720,7 @@ mod tests {
         let routing = Arc::new(Mutex::new(
             crate::attachment_routing::AttachmentRouting::new(attachment),
         ));
+        let control = TuiSurfaceTaskControl::isolated_for_test();
         let runtime = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
         let host = runtime.handle();
         runtime.shutdown().expect("runtime host shutdown");
@@ -729,6 +739,7 @@ mod tests {
             &mut event_tx,
             &mut attachment,
             &routing,
+            &control,
         );
 
         assert!(matches!(
@@ -775,6 +786,7 @@ mod tests {
             crate::attachment_routing::AttachmentRouting::new(attachment),
         ));
         let mut thread = Some(current);
+        let control = TuiSurfaceTaskControl::isolated_for_test();
 
         for (action, expected) in [
             (
@@ -801,6 +813,7 @@ mod tests {
                 &mut event_tx,
                 &mut attachment,
                 &routing,
+                &control,
             );
 
             assert!(matches!(

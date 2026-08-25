@@ -1414,8 +1414,9 @@ done
                 .start_thread(config, "runtime-ready projection")
                 .expect("runtime thread");
             let (event_tx, event_rx) = mpsc::unbounded();
+            let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
 
-            announce_runtime_ready(&thread, &event_tx);
+            announce_runtime_ready(&thread, &event_tx, &control);
 
             let events = event_rx.try_iter().collect::<Vec<_>>();
             assert_eq!(events.len(), 3, "runtime-ready events: {events:?}");
@@ -1436,6 +1437,7 @@ done
             );
 
             thread.shutdown().expect("runtime thread shutdown");
+            control.shutdown();
             host.shutdown().expect("runtime host shutdown");
         });
     }
@@ -3201,6 +3203,85 @@ done
                 terminal,
                 TuiEvent::SessionCompleted { status } if status == "verification_failed"
             ));
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_tui_runtime_queue_continues_after_busy_submission() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("mock_stream_delay_ms 1000".to_string()));
+            harness.recv_until(|event| matches!(event, TuiEvent::TurnStarted { .. }));
+
+            harness.send(UserAction::QueuePrompt {
+                prompt: "mock_history_echo".to_string(),
+                bindings: orca_runtime::mentions::MentionBindings::new("mock_history_echo"),
+                images: Vec::new(),
+            });
+            let pending = harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::PromptQueueUpdated(snapshot)
+                        if snapshot.running_item().is_none()
+                            && snapshot.items.iter().any(|item| item.input.text == "mock_history_echo")
+                )
+            });
+            assert!(matches!(
+                pending,
+                TuiEvent::PromptQueueUpdated(snapshot)
+                    if snapshot.running_item().is_none()
+            ));
+
+            harness.send(UserAction::Submit("mock_history_echo".to_string()));
+            harness.recv_until(|event| {
+                matches!(
+                    event,
+                    TuiEvent::PromptQueueUpdated(snapshot)
+                        if snapshot.items.len() >= 2 && snapshot.running_item().is_some()
+                )
+            });
+
+            let second_turn = harness.recv_until(
+                |event| matches!(event, TuiEvent::TurnStarted { turn, .. } if *turn >= 2),
+            );
+            assert!(matches!(second_turn, TuiEvent::TurnStarted { turn, .. } if turn >= 2));
+            let echo = harness.recv_until(|event| {
+                matches!(event, TuiEvent::MessageDelta(text) if text.contains("mock_history_echo"))
+            });
+            assert!(
+                matches!(echo, TuiEvent::MessageDelta(text) if text.contains("mock_history_echo"))
+            );
+            harness.shutdown();
+        });
+    }
+
+    #[test]
+    fn hosted_tui_queued_user_input_round_trips_through_the_tui() {
+        with_orca_home(|_| {
+            let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+            harness.send(UserAction::Submit("mock_stream_delay_ms 500".to_string()));
+            harness.recv_until(|event| matches!(event, TuiEvent::TurnStarted { .. }));
+            harness.send(UserAction::QueuePrompt {
+                prompt: "ask continue?".to_string(),
+                bindings: orca_runtime::mentions::MentionBindings::new("ask continue?"),
+                images: Vec::new(),
+            });
+            let key = match harness
+                .recv_until(|event| matches!(event, TuiEvent::UserInputRequested { .. }))
+            {
+                TuiEvent::UserInputRequested { key, .. } => key,
+                _ => unreachable!(),
+            };
+            harness.send(UserAction::RespondToInteraction {
+                key,
+                response: TuiInteractionResponse::UserInput("yes".to_string()),
+            });
+            let terminal =
+                harness.recv_until(|event| matches!(event, TuiEvent::SessionCompleted { .. }));
+            assert!(
+                matches!(terminal, TuiEvent::SessionCompleted { status } if status == "success")
+            );
             harness.shutdown();
         });
     }

@@ -2899,6 +2899,20 @@ pub struct RuntimeThreadHandle {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     surface: surface::RuntimeSurfaceHandle,
     prompt_queue_updates: tokio::sync::watch::Sender<crate::prompt_queue::PromptQueueSnapshot>,
+    prompt_queue_observer: Arc<Mutex<Option<Arc<dyn EventObserver>>>>,
+    prompt_queue_interaction_handlers: Arc<Mutex<PromptQueueInteractionHandlers>>,
+    prompt_queue_dispatch_ready: Arc<AtomicBool>,
+}
+
+/// Interaction handlers used when the durable prompt queue starts a legacy
+/// hosted turn. The runtime owns the queue and only borrows these handlers for
+/// the lifetime of the dispatched turn.
+#[derive(Clone, Default)]
+pub struct PromptQueueInteractionHandlers {
+    pub approval: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
+    pub permission: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    pub user_input: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
+    pub mcp_elicitation: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -3148,6 +3162,28 @@ impl RuntimeThreadHandle {
 
     pub fn is_available(&self) -> bool {
         !self.command_tx.is_closed()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        match self.state() {
+            Ok(RuntimeThreadState::Running { .. })
+            | Err(RuntimeHostError::OperationActive { .. }) => true,
+            Ok(RuntimeThreadState::Idle | RuntimeThreadState::Unavailable) | Err(_) => false,
+        }
+    }
+
+    pub fn set_prompt_queue_event_observer(&self, observer: Arc<dyn EventObserver>) {
+        *self
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    pub fn set_prompt_queue_interaction_handlers(&self, handlers: PromptQueueInteractionHandlers) {
+        *self
+            .prompt_queue_interaction_handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handlers;
     }
 
     pub fn startup_warnings(&self) -> &[String] {
@@ -3441,6 +3477,18 @@ impl RuntimeThreadHandle {
         receive_reply(reply_rx, "runtime thread")?
     }
 
+    /// Interrupt whichever legacy hosted operation is currently active.
+    ///
+    /// The typed surface path carries its own operation identity, while a
+    /// durable prompt-queue dispatch is intentionally not exposed as a TUI
+    /// surface operation. This command gives the queue owner the same bounded
+    /// cancellation path without guessing the private active operation id.
+    pub fn interrupt_active(&self) -> Result<(), RuntimeHostError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::InterruptActive { reply: reply_tx })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     pub fn pause_goal_run(
         &self,
         operation_id: OperationId,
@@ -3512,6 +3560,8 @@ impl RuntimeThreadHandle {
         crate::prompt_queue::PromptQueueSnapshot,
         crate::prompt_queue::PromptQueueMutationError,
     > {
+        self.prompt_queue_dispatch_ready
+            .store(true, Ordering::Release);
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::PromptQueue {
             action,
@@ -4762,6 +4812,9 @@ enum ThreadCommand {
         operation_id: OperationId,
         reply: SyncSender<Result<InterruptOperationResult, RuntimeHostError>>,
     },
+    InterruptActive {
+        reply: SyncSender<Result<(), RuntimeHostError>>,
+    },
     PauseGoalRun {
         operation_id: OperationId,
         reply: SyncSender<Result<PauseGoalRunResult, RuntimeHostError>>,
@@ -5111,6 +5164,11 @@ async fn run_host_supervisor(
                     command_tx: command_tx.clone(),
                     surface: surface_handle,
                     prompt_queue_updates,
+                    prompt_queue_observer: Arc::new(Mutex::new(None)),
+                    prompt_queue_interaction_handlers: Arc::new(Mutex::new(
+                        PromptQueueInteractionHandlers::default(),
+                    )),
+                    prompt_queue_dispatch_ready: Arc::new(AtomicBool::new(false)),
                 };
                 let actor_handle = handle.clone();
                 let actor_executor = Arc::clone(&executor);
@@ -15712,6 +15770,26 @@ impl ThreadActor {
         });
     }
 
+    fn complete_prompt_queue_dispatch(&mut self, operation_id: OperationId) {
+        let expected = format!("{operation_id:?}");
+        let matches_operation = matches!(
+            self.prompt_queue.snapshot().dispatch.as_ref(),
+            Some(crate::prompt_queue::QueueDispatchFence::Accepted {
+                operation_id,
+                ..
+            }) if operation_id == &expected
+        );
+        if !matches_operation {
+            return;
+        }
+        let Some(completed) = self.prompt_queue.consume_accepted() else {
+            return;
+        };
+        if self.persist_prompt_queue(&completed).is_ok() {
+            self.handle.prompt_queue_updates.send_replace(completed);
+        }
+    }
+
     fn reconcile_prompt_queue_dispatch(&mut self) -> bool {
         let snapshot = self.prompt_queue.snapshot();
         let Some(dispatch) = snapshot.dispatch.as_ref() else {
@@ -15750,6 +15828,13 @@ impl ThreadActor {
     }
 
     fn try_drain_prompt_queue(&mut self) {
+        if !self
+            .handle
+            .prompt_queue_dispatch_ready
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
         if self.active.is_some()
             || self.goal_controller.is_blocking()
             || self.prompt_queue.snapshot().paused
@@ -15820,12 +15905,38 @@ impl ThreadActor {
                 return;
             }
         };
+        let mut request = HostedTurnRequest::new(prompt)
+            .with_images(item.input.images)
+            .with_turn_id(item.client_user_message_id.turn_id());
+        if let Some(observer) = self
+            .handle
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            request = request.with_event_observer(observer);
+        }
+        let interaction_handlers = self
+            .handle
+            .prompt_queue_interaction_handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(handler) = interaction_handlers.approval {
+            request = request.with_approval_handler(handler);
+        }
+        if let Some(handler) = interaction_handlers.permission {
+            request = request.with_permission_handler(handler);
+        }
+        if let Some(handler) = interaction_handlers.user_input {
+            request = request.with_user_input_handler(handler);
+        }
+        if let Some(handler) = interaction_handlers.mcp_elicitation {
+            request = request.with_mcp_elicitation_handler(handler);
+        }
         self.handle_idle_command(ThreadCommand::StartTurn {
-            request: Box::new(
-                HostedTurnRequest::new(prompt)
-                    .with_images(item.input.images)
-                    .with_turn_id(item.client_user_message_id.turn_id()),
-            ),
+            request: Box::new(request),
             writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
             config: None,
             reply: reply_tx,
@@ -15836,12 +15947,8 @@ impl ThreadActor {
                     .prompt_queue
                     .accept_dispatch(&item.id, format!("{:?}", operation.id()))
                 {
-                    if self.persist_prompt_queue(&accepted).is_ok()
-                        && let Some(consumed) = self.prompt_queue.consume_accepted()
-                    {
-                        if self.persist_prompt_queue(&consumed).is_ok() {
-                            self.handle.prompt_queue_updates.send_replace(consumed);
-                        }
+                    if self.persist_prompt_queue(&accepted).is_ok() {
+                        self.handle.prompt_queue_updates.send_replace(accepted);
                     }
                 }
             }
@@ -17020,6 +17127,9 @@ impl ThreadActor {
                 ThreadCommand::InterruptOperation { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::InterruptActive { reply } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::PauseGoalRun { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
@@ -17808,6 +17918,9 @@ impl ThreadActor {
                 let _ = reply.send(Ok(InterruptOperationResult::Idle {
                     requested_operation_id: operation_id,
                 }));
+            }
+            ThreadCommand::InterruptActive { reply } => {
+                let _ = reply.send(Ok(()));
             }
             ThreadCommand::PauseGoalRun {
                 operation_id,
@@ -18917,6 +19030,11 @@ impl ThreadActor {
                     InterruptOperationResult::Requested { generation }
                 };
                 let _ = reply.send(Ok(result));
+            }
+            ThreadCommand::InterruptActive { reply } => {
+                self.pause_prompt_queue_for_boundary();
+                Self::cancel_active_task_tree(active);
+                let _ = reply.send(Ok(()));
             }
             ThreadCommand::PauseGoalRun {
                 operation_id,
@@ -20237,6 +20355,7 @@ impl ThreadActor {
             self.generation_context_controller
                 .clear_operation(&fence.operation_id);
         }
+        self.complete_prompt_queue_dispatch(active.operation_id);
         self.goal_controller.clear_active(active.operation_id);
         let completed = active.completion.complete(OperationTerminal {
             operation_id: active.operation_id,
@@ -36628,6 +36747,11 @@ mod tests {
                 crate::prompt_queue::PromptQueueSnapshot::default(),
             )
             .0,
+            prompt_queue_observer: Arc::new(Mutex::new(None)),
+            prompt_queue_interaction_handlers: Arc::new(Mutex::new(
+                PromptQueueInteractionHandlers::default(),
+            )),
+            prompt_queue_dispatch_ready: Arc::new(AtomicBool::new(false)),
         };
         let responder = std::thread::spawn(move || {
             while let Some(ThreadCommand::ShutdownThread {
@@ -36906,10 +37030,12 @@ mod tests {
         first.wait();
 
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let mut observed_running = false;
         loop {
             let queue = thread
                 .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
                 .expect("read prompt queue");
+            observed_running |= queue.running_item().is_some();
             if queue.items.is_empty()
                 && queue.dispatch.is_none()
                 && matches!(thread.state(), Ok(RuntimeThreadState::Idle))
@@ -36919,6 +37045,10 @@ mod tests {
             assert!(Instant::now() < deadline, "prompt queue did not drain");
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(
+            observed_running,
+            "accepted queue work was never externally visible"
+        );
 
         let runtime_snapshot = thread.snapshot().expect("prompt queue snapshot");
         let users = runtime_snapshot
@@ -37023,5 +37153,55 @@ mod tests {
         assert_eq!(unchanged.items.len(), 1);
         assert_eq!(unchanged.items[0].id, paused.items[0].id);
         host.shutdown().expect("shutdown queue pause host");
+    }
+
+    #[test]
+    fn interrupt_active_pauses_a_running_prompt_queue_dispatch_bits_spec_ut() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start queue interrupt host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "interrupt active queue",
+            )
+            .expect("start queue interrupt thread");
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("mock_stream_delay_ms 30000"),
+            })
+            .expect("queue interruptible prompt");
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("queued after interrupt"),
+            })
+            .expect("queue prompt after interruptible prompt");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let snapshot = thread
+                .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+                .expect("read running queue");
+            if snapshot.running_item().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "queue dispatch did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        thread
+            .interrupt_active()
+            .expect("interrupt current queue dispatch");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let snapshot = thread
+                .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+                .expect("read paused queue");
+            if snapshot.paused && snapshot.running_item().is_none() {
+                assert_eq!(snapshot.items.len(), 1);
+                assert_eq!(snapshot.items[0].input.text, "queued after interrupt");
+                break;
+            }
+            assert!(Instant::now() < deadline, "queue dispatch did not pause");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        host.shutdown().expect("shutdown queue interrupt host");
     }
 }

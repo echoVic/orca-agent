@@ -29,6 +29,7 @@ pub(crate) struct QueuedComposerState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueuedPreviewSnapshot {
     pub(crate) len: usize,
+    pub(crate) running: bool,
     pub(crate) first: String,
     pub(crate) second: Option<String>,
     pub(crate) latest: Option<String>,
@@ -293,6 +294,7 @@ impl QueuedPreviewSnapshot {
         };
         Some(Self {
             len,
+            running: projection.running_item().is_some(),
             first: preview(0)?,
             second: (len == 2).then(|| preview(1)).flatten(),
             latest: (len > 2).then(|| preview(len - 1)).flatten(),
@@ -331,6 +333,7 @@ impl QueuedPreviewSnapshot {
         };
         Some(Self {
             len,
+            running: false,
             first,
             second,
             latest,
@@ -881,6 +884,35 @@ mod tests {
         assert_eq!(snapshot.first, "first");
         assert_eq!(snapshot.second.as_deref(), Some("second"));
         assert_eq!(snapshot.latest, None);
+    }
+
+    #[test]
+    fn runtime_queue_preview_marks_accepted_head_as_running() {
+        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        let added = runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "running".into(),
+                },
+                1,
+            )
+            .expect("queue item");
+        let submission_id = added.items[0].id.clone();
+        let client_user_message_id = added.items[0].client_user_message_id.clone();
+        let mut snapshot = added;
+        snapshot.dispatch = Some(orca_runtime::prompt_queue::QueueDispatchFence::Accepted {
+            submission_id,
+            client_user_message_id,
+            operation_id: "operation-1".to_string(),
+            accepted_revision: snapshot.revision,
+        });
+
+        let preview = QueuedPreviewSnapshot::from_projection(&snapshot).expect("preview");
+        assert!(preview.running);
+        assert_eq!(preview.len, 1);
+        assert_eq!(preview.first, "running");
     }
 
     #[test]

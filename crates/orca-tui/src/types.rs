@@ -1994,12 +1994,18 @@ impl AppState {
                 self.enter_running();
             }
             TuiEvent::PromptQueueUpdated(snapshot) => {
+                if snapshot.running_item().is_some() {
+                    self.enter_running();
+                }
                 self.replace_runtime_queue_projection(snapshot);
             }
             TuiEvent::PromptQueueControlUpdated {
                 deleted_id,
                 snapshot,
             } => {
+                if snapshot.running_item().is_some() {
+                    self.enter_running();
+                }
                 self.replace_runtime_queue_control_projection(snapshot, deleted_id.as_ref());
             }
             TuiEvent::BackgroundTaskOutputAttached { .. } => {

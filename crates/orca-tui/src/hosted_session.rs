@@ -3,36 +3,368 @@
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel as mpsc;
+use orca_core::approval_types::{ApprovalDecision, ApprovalResolution};
 use orca_core::config::HistoryMode;
 use orca_core::conversation::Message;
+use orca_core::event_schema::{EventEnvelope, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
+use orca_mcp::{
+    McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,
+};
 use orca_runtime::history;
-use orca_runtime::runtime_host::RuntimeThreadHandle;
+use orca_runtime::lifecycle::{
+    RuntimeApprovalHandler, RuntimePermissionRequestHandler, RuntimeUserInputHandler,
+    RuntimeUserInputRequest,
+};
+use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
+use orca_runtime::runtime_host::{PromptQueueInteractionHandlers, RuntimeThreadHandle};
+use orca_runtime::runtime_permission::{RuntimePermissionRequest, RuntimePermissionResponse};
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
+use std::io;
 
 use crate::attachment_routing::send_attached_event;
 use crate::composer_images::ComposerImageState;
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
-use crate::types::{ChatMessage, SessionAttachmentId, TuiEvent};
+use crate::types::{
+    ChatMessage, SessionAttachmentId, TuiEvent, TuiInteractionKind, TuiInteractionResponse,
+    TuiMcpElicitationMode,
+};
+
+struct QueueApprovalHandler {
+    control: TuiSurfaceTaskControl,
+}
+
+impl RuntimeApprovalHandler for QueueApprovalHandler {
+    fn resolve_interactive(
+        &self,
+        approval: &orca_core::approval_types::ApprovalRequest,
+        request: &orca_core::tool_types::ToolRequest,
+    ) -> io::Result<ApprovalResolution> {
+        let tool = approval
+            .tool
+            .as_deref()
+            .unwrap_or_else(|| request.name.as_str())
+            .to_string();
+        let response = self.control.await_queue_interaction(
+            approval.id.clone(),
+            TuiInteractionKind::Approval,
+            |key| TuiEvent::ApprovalNeeded {
+                key,
+                tool,
+                target: approval.target.clone().or_else(|| request.target.clone()),
+                preview: approval
+                    .preview
+                    .clone()
+                    .or_else(|| Some(approval.description.clone())),
+            },
+        )?;
+        match response {
+            TuiInteractionResponse::Approval(approved) => Ok(ApprovalResolution {
+                id: approval.id.clone(),
+                decision: if approved {
+                    ApprovalDecision::Allow
+                } else {
+                    ApprovalDecision::Deny
+                },
+                reason: if approved {
+                    "approved in TUI".to_string()
+                } else {
+                    "denied in TUI".to_string()
+                },
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "queued approval response kind did not match the request",
+            )),
+        }
+    }
+}
+
+struct QueuePermissionHandler {
+    control: TuiSurfaceTaskControl,
+}
+
+impl RuntimePermissionRequestHandler for QueuePermissionHandler {
+    fn request_permissions(
+        &self,
+        request: &RuntimePermissionRequest,
+    ) -> io::Result<RuntimePermissionResponse> {
+        let response = self.control.await_queue_interaction(
+            request.id.clone(),
+            TuiInteractionKind::Permission,
+            |key| TuiEvent::PermissionApprovalNeeded {
+                key,
+                tool: request.id.clone(),
+                target: None,
+                preview: request.reason.clone(),
+                permission_kind: permission_kind(request),
+            },
+        )?;
+        let approved = match response {
+            TuiInteractionResponse::Permission(approved) => approved,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "queued permission response kind did not match the request",
+                ));
+            }
+        };
+        Ok(RuntimePermissionResponse {
+            decision: if approved {
+                PermissionResponseDecision::Allow
+            } else {
+                PermissionResponseDecision::Deny
+            },
+            scope: PermissionGrantScope::Turn,
+            permissions: request.permissions.clone(),
+            strict_auto_review: false,
+        })
+    }
+}
+
+struct QueueUserInputHandler {
+    control: TuiSurfaceTaskControl,
+}
+
+impl RuntimeUserInputHandler for QueueUserInputHandler {
+    fn request_user_input(&self, request: &RuntimeUserInputRequest) -> io::Result<Option<String>> {
+        let response = self.control.await_queue_interaction(
+            request.id.clone(),
+            TuiInteractionKind::UserInput,
+            |key| TuiEvent::UserInputRequested {
+                key,
+                question: request.question.clone(),
+                choices: request.choices.clone(),
+            },
+        )?;
+        match response {
+            TuiInteractionResponse::UserInput(answer) => Ok(Some(answer)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "queued user-input response kind did not match the request",
+            )),
+        }
+    }
+}
+
+struct QueueMcpElicitationHandler {
+    control: TuiSurfaceTaskControl,
+}
+
+impl McpElicitationHandler for QueueMcpElicitationHandler {
+    fn handle_elicitation(
+        &self,
+        request: McpElicitationRequest,
+    ) -> Result<McpElicitationResponse, String> {
+        let mode = match request.mode {
+            McpElicitationMode::Form => TuiMcpElicitationMode::Form,
+            McpElicitationMode::Url => TuiMcpElicitationMode::Url,
+        };
+        let response = self
+            .control
+            .await_queue_interaction(
+                request.id.clone(),
+                TuiInteractionKind::McpElicitation,
+                |key| TuiEvent::McpElicitationRequested {
+                    key,
+                    server_name: request.server_name.clone(),
+                    mode,
+                    message: request.message.clone(),
+                    url: request.url.clone(),
+                    requested_schema_json: request.requested_schema.as_ref().map(|value| {
+                        serde_json::to_string(value).expect("MCP schema is serializable")
+                    }),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        match response {
+            TuiInteractionResponse::McpElicitation {
+                accepted: true,
+                content_json,
+            } => {
+                let content = serde_json::from_str(content_json.as_deref().unwrap_or("{}"))
+                    .map_err(|error| format!("invalid queued MCP elicitation content: {error}"))?;
+                Ok(McpElicitationResponse::accept(content))
+            }
+            TuiInteractionResponse::McpElicitation {
+                accepted: false, ..
+            } => Ok(McpElicitationResponse::decline()),
+            _ => Err("queued MCP elicitation response kind did not match the request".to_string()),
+        }
+    }
+}
+
+fn permission_kind(
+    request: &RuntimePermissionRequest,
+) -> orca_runtime::runtime_permission::RuntimePermissionRequestKind {
+    if request
+        .permissions
+        .network
+        .as_ref()
+        .is_some_and(|network| network.enabled == Some(true) || !network.domains.is_empty())
+    {
+        return orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock;
+    }
+    if request
+        .permissions
+        .file_system
+        .as_ref()
+        .and_then(|filesystem| filesystem.write.as_ref())
+        .is_some_and(|paths| !paths.is_empty())
+    {
+        return orca_runtime::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite;
+    }
+    orca_runtime::runtime_permission::RuntimePermissionRequestKind::UnsandboxedShellRetry
+}
+
+fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
+    let string = |key: &str| event.payload.get(key).and_then(|value| value.as_str());
+    match event.event_type {
+        EventType::TurnStarted => Some(TuiEvent::TurnStarted {
+            turn: event
+                .payload
+                .get("turn")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default() as u32,
+            task: None,
+        }),
+        EventType::AssistantReasoningDelta => {
+            Some(TuiEvent::ReasoningDelta(string("text")?.to_string()))
+        }
+        EventType::AssistantMessageDelta => {
+            Some(TuiEvent::MessageDelta(string("text")?.to_string()))
+        }
+        EventType::ContextCompactionStarted => Some(TuiEvent::CompactionStarted),
+        EventType::ContextCompacted => Some(TuiEvent::Compacted {
+            before_messages: event
+                .payload
+                .get("before_messages")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default() as usize,
+            after_messages: event
+                .payload
+                .get("after_messages")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default() as usize,
+            reason: string("reason").unwrap_or_default().to_string(),
+            strategy: string("strategy").unwrap_or_default().to_string(),
+            collapsed_messages: event
+                .payload
+                .get("collapsed_messages")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default() as usize,
+            status_text: string("status_text").unwrap_or_default().to_string(),
+        }),
+        EventType::ModelResponseCompleted => serde_json::from_value::<
+            orca_core::thread_item_projection::CompletedModelResponse,
+        >(event.payload.clone())
+        .ok()
+        .map(|response| {
+            TuiEvent::AssistantResponseCompleted(
+                response.assistant_content,
+                response.assistant_reasoning,
+            )
+        }),
+        EventType::ToolCallProgress => Some(TuiEvent::ToolCallProgress {
+            id: string("id")?.to_string(),
+            name: string("name").map(str::to_string),
+            arguments_bytes: event
+                .payload
+                .get("arguments_bytes")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default() as usize,
+        }),
+        EventType::ToolOutputDelta => Some(TuiEvent::ToolOutputDelta {
+            id: string("id")?.to_string(),
+            chunk: string("chunk")?.to_string(),
+        }),
+        EventType::ToolCallRequested => Some(TuiEvent::ToolRequested {
+            id: string("id")?.to_string(),
+            name: string("name")?.to_string(),
+            target: string("target").map(str::to_string),
+        }),
+        EventType::ToolCallCompleted => Some(TuiEvent::ToolCompleted {
+            id: string("id")?.to_string(),
+            name: string("name")?.to_string(),
+            status: string("status").unwrap_or("completed").to_string(),
+            output: string("output")
+                .or_else(|| string("error"))
+                .unwrap_or_default()
+                .to_string(),
+            diff: string("diff").map(str::to_string),
+            kind: string("kind").map(str::to_string),
+        }),
+        EventType::SubagentStarted => Some(TuiEvent::SubagentStarted {
+            id: string("id")?.to_string(),
+            description: string("description").unwrap_or("subagent").to_string(),
+        }),
+        EventType::SubagentProgress => Some(TuiEvent::SubagentProgress {
+            id: string("id")?.to_string(),
+            activity: string("activity").unwrap_or("running").to_string(),
+            turn: event
+                .payload
+                .get("turn")
+                .and_then(|value| value.as_u64())
+                .map(|turn| turn as u32),
+            usage: event
+                .payload
+                .get("usage")
+                .cloned()
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::from_value(value).ok()),
+        }),
+        EventType::SubagentCompleted => Some(TuiEvent::SubagentCompleted {
+            id: string("id")?.to_string(),
+            description: string("description").unwrap_or("subagent").to_string(),
+            status: string("status").unwrap_or("failed").to_string(),
+            output: string("output").map(str::to_string),
+            error: string("error").map(str::to_string),
+        }),
+        EventType::PlanUpdated => serde_json::from_value(event.payload.clone()).ok().map(
+            |plan: orca_core::plan_types::UpdatePlanArgs| TuiEvent::PlanUpdated {
+                explanation: plan.explanation,
+                plan: plan.plan,
+            },
+        ),
+        EventType::SessionCompleted => Some(TuiEvent::SessionCompleted {
+            status: string("status").unwrap_or("failed").to_string(),
+        }),
+        EventType::Error => Some(TuiEvent::Error(
+            string("message")
+                .unwrap_or("runtime operation failed")
+                .to_string(),
+        )),
+        _ => None,
+    }
+}
 
 fn start_prompt_queue_watcher(
     mut queue_updates: tokio::sync::watch::Receiver<
         orca_runtime::prompt_queue::PromptQueueSnapshot,
     >,
-    event_tx: &mpsc::Sender<TuiEvent>,
+    event_sink: Arc<Mutex<Option<mpsc::Sender<TuiEvent>>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
     spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
 ) {
-    let queue_events = event_tx.clone();
+    let watcher_event_sink = event_sink.clone();
+    let watcher_stop = stop.clone();
     let watcher = Box::new(move || {
-        loop {
+        while !watcher_stop.load(std::sync::atomic::Ordering::Acquire) {
             match queue_updates.has_changed() {
                 Ok(true) => {
                     let snapshot = queue_updates.borrow_and_update().clone();
-                    if queue_events
-                        .send(TuiEvent::PromptQueueUpdated(snapshot))
-                        .is_err()
+                    let queue_events = watcher_event_sink
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(queue_events) = queue_events
+                        && queue_events
+                            .send(TuiEvent::PromptQueueUpdated(snapshot))
+                            .is_err()
                     {
+                        watcher_stop.store(true, std::sync::atomic::Ordering::Release);
                         break;
                     }
                 }
@@ -42,26 +374,63 @@ fn start_prompt_queue_watcher(
         }
     });
     if let Err(error) = spawn(watcher) {
-        let _ = event_tx.send(TuiEvent::Error(format!(
-            "failed to start prompt queue watcher: {error}"
-        )));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(event_tx) = event_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "failed to start prompt queue watcher: {error}"
+            )));
+        }
     }
 }
 
 pub(crate) fn announce_runtime_ready(
     thread: &RuntimeThreadHandle,
     event_tx: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
 ) {
+    let watcher_stop = control.bind_prompt_queue_runtime(thread.clone(), event_tx);
+    thread.set_prompt_queue_interaction_handlers(PromptQueueInteractionHandlers {
+        approval: Some(Arc::new(QueueApprovalHandler {
+            control: control.clone(),
+        })),
+        permission: Some(Arc::new(QueuePermissionHandler {
+            control: control.clone(),
+        })),
+        user_input: Some(Arc::new(QueueUserInputHandler {
+            control: control.clone(),
+        })),
+        mcp_elicitation: Some(Arc::new(QueueMcpElicitationHandler {
+            control: control.clone(),
+        })),
+    });
+    let runtime_events = event_tx.clone();
+    thread.set_prompt_queue_event_observer(Arc::new(move |event: &EventEnvelope| {
+        if let Some(event) = runtime_event_to_tui(event) {
+            let _ = runtime_events.send(event);
+        }
+        Ok(())
+    }));
     let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
     if let Ok(snapshot) = thread.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List) {
         let _ = event_tx.send(TuiEvent::PromptQueueUpdated(snapshot));
     }
-    start_prompt_queue_watcher(thread.subscribe_prompt_queue(), event_tx, |watcher| {
-        std::thread::Builder::new()
-            .name("orca-tui-prompt-queue".to_string())
-            .spawn(watcher)
-            .map(|_| ())
-    });
+    if let Some(watcher_stop) = watcher_stop {
+        start_prompt_queue_watcher(
+            thread.subscribe_prompt_queue(),
+            control.prompt_queue_event_sender(),
+            watcher_stop,
+            |watcher| {
+                std::thread::Builder::new()
+                    .name("orca-tui-prompt-queue".to_string())
+                    .spawn(watcher)
+                    .map(|_| ())
+            },
+        );
+    }
     let actions = TuiSurfaceActions::new(thread.typed_surface());
     match actions.read_snapshot() {
         Ok(snapshot) => {
@@ -364,6 +733,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use orca_core::config::HistoryMode;
+    use orca_core::event_schema::{EventEnvelope, EventType};
 
     use super::*;
 
@@ -372,8 +742,10 @@ mod tests {
         let (_queue_tx, queue_updates) =
             tokio::sync::watch::channel(orca_runtime::prompt_queue::PromptQueueSnapshot::default());
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let event_sink = Arc::new(Mutex::new(Some(event_tx.clone())));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        start_prompt_queue_watcher(queue_updates, &event_tx, |_| {
+        start_prompt_queue_watcher(queue_updates, event_sink, stop, |_| {
             Err(std::io::Error::other("injected spawn failure"))
         });
 
@@ -383,6 +755,148 @@ mod tests {
                 if message == "failed to start prompt queue watcher: injected spawn failure"
         ));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn runtime_queue_event_projection_preserves_incremental_output() {
+        let event = EventEnvelope {
+            version: "1".to_string(),
+            run_id: "run".to_string(),
+            seq: 1,
+            timestamp_ms: 0,
+            event_type: EventType::AssistantMessageDelta,
+            payload: serde_json::json!({"text": "hello"}),
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&event),
+            Some(TuiEvent::MessageDelta(text)) if text == "hello"
+        ));
+
+        let failed_tool = EventEnvelope {
+            event_type: EventType::ToolCallCompleted,
+            payload: serde_json::json!({
+                "id": "tool-1",
+                "name": "shell",
+                "status": "failed",
+                "error": "permission denied"
+            }),
+            ..event.clone()
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&failed_tool),
+            Some(TuiEvent::ToolCompleted { output, .. }) if output == "permission denied"
+        ));
+
+        let completed_response_payload = serde_json::to_value(
+            orca_core::thread_item_projection::CompletedModelResponse::new(
+                orca_core::thread_item_projection::ModelResponseIdentity::new(
+                    orca_core::thread_identity::TurnId::new(),
+                ),
+                Some("final answer".to_string()),
+                Some("final reasoning".to_string()),
+                Vec::new(),
+            ),
+        )
+        .expect("completed model response should serialize");
+        let completed_response = EventEnvelope {
+            event_type: EventType::ModelResponseCompleted,
+            payload: completed_response_payload,
+            ..event
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&completed_response),
+            Some(TuiEvent::AssistantResponseCompleted(Some(message), Some(reasoning)))
+                if message == "final answer" && reasoning == "final reasoning"
+        ));
+    }
+
+    #[test]
+    fn runtime_queue_event_projection_preserves_subagents_and_compaction() {
+        let base = EventEnvelope {
+            version: "1".to_string(),
+            run_id: "run".to_string(),
+            seq: 1,
+            timestamp_ms: 0,
+            event_type: EventType::SubagentStarted,
+            payload: serde_json::json!({
+                "id": "agent-1",
+                "description": "inspect files"
+            }),
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&base),
+            Some(TuiEvent::SubagentStarted { id, description })
+                if id == "agent-1" && description == "inspect files"
+        ));
+
+        let progress = EventEnvelope {
+            event_type: EventType::SubagentProgress,
+            payload: serde_json::json!({
+                "id": "agent-1",
+                "description": "inspect files",
+                "activity": "reading",
+                "turn": 2,
+                "usage": null
+            }),
+            ..base.clone()
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&progress),
+            Some(TuiEvent::SubagentProgress { id, activity, turn, usage })
+                if id == "agent-1" && activity == "reading" && turn == Some(2) && usage.is_none()
+        ));
+
+        let completed = EventEnvelope {
+            event_type: EventType::SubagentCompleted,
+            payload: serde_json::json!({
+                "id": "agent-1",
+                "description": "inspect files",
+                "status": "success",
+                "output": "done",
+                "error": null
+            }),
+            ..base.clone()
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&completed),
+            Some(TuiEvent::SubagentCompleted { id, status, output, error, .. })
+                if id == "agent-1" && status == "success"
+                    && output.as_deref() == Some("done") && error.is_none()
+        ));
+
+        let compacting = EventEnvelope {
+            event_type: EventType::ContextCompactionStarted,
+            payload: serde_json::json!({}),
+            ..base.clone()
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&compacting),
+            Some(TuiEvent::CompactionStarted)
+        ));
+
+        let compacted = EventEnvelope {
+            event_type: EventType::ContextCompacted,
+            payload: serde_json::json!({
+                "before_messages": 12,
+                "after_messages": 4,
+                "reason": "pressure",
+                "strategy": "summary",
+                "collapsed_messages": 8,
+                "status_text": "context compacted"
+            }),
+            ..base
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&compacted),
+            Some(TuiEvent::Compacted {
+                before_messages: 12,
+                after_messages: 4,
+                reason,
+                strategy,
+                collapsed_messages: 8,
+                status_text,
+            }) if reason == "pressure" && strategy == "summary" && status_text == "context compacted"
+        ));
     }
 
     #[test]

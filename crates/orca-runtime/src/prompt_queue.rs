@@ -173,6 +173,18 @@ pub struct PromptQueueSnapshot {
     pub dispatch: Option<QueueDispatchFence>,
 }
 
+impl PromptQueueSnapshot {
+    /// Returns the queue head once the runtime has accepted it for execution.
+    /// The item remains in `items` until terminal settlement while the runtime
+    /// is live, so observers can distinguish a running head from pending work.
+    pub fn running_item(&self) -> Option<&QueuedSubmission> {
+        let QueueDispatchFence::Accepted { submission_id, .. } = self.dispatch.as_ref()? else {
+            return None;
+        };
+        self.items.iter().find(|item| &item.id == submission_id)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PromptQueueAction {
     List,
@@ -289,7 +301,7 @@ impl PromptQueueState {
                 id,
                 input,
             } => {
-                self.ensure_mutable(expected_revision)?;
+                self.ensure_pending_mutable(expected_revision, &id)?;
                 let input = normalized_input(input, &self.snapshot)?;
                 let Some(item) = self.snapshot.items.iter_mut().find(|item| item.id == id) else {
                     return Err(PromptQueueMutationError::NotFound {
@@ -303,7 +315,7 @@ impl PromptQueueState {
                 expected_revision,
                 id,
             } => {
-                self.ensure_mutable(expected_revision)?;
+                self.ensure_pending_mutable(expected_revision, &id)?;
                 let Some(index) = self.snapshot.items.iter().position(|item| item.id == id) else {
                     return Err(PromptQueueMutationError::NotFound {
                         current: self.snapshot(),
@@ -327,6 +339,14 @@ impl PromptQueueState {
                     return Err(PromptQueueMutationError::InvalidInput {
                         message: "reorder must contain every current queue id exactly once"
                             .to_string(),
+                        current: self.snapshot(),
+                    });
+                }
+                if let Some(QueueDispatchFence::Accepted { submission_id, .. }) =
+                    self.snapshot.dispatch.as_ref()
+                    && ordered_ids.first() != Some(submission_id)
+                {
+                    return Err(PromptQueueMutationError::DispatchInProgress {
                         current: self.snapshot(),
                     });
                 }
@@ -432,7 +452,28 @@ impl PromptQueueState {
 
     fn ensure_mutable(&self, expected: QueueRevision) -> Result<(), PromptQueueMutationError> {
         self.ensure_revision(expected)?;
-        if self.snapshot.dispatch.is_some() {
+        if matches!(
+            self.snapshot.dispatch,
+            Some(QueueDispatchFence::Prepared { .. })
+        ) {
+            return Err(PromptQueueMutationError::DispatchInProgress {
+                current: self.snapshot(),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_pending_mutable(
+        &self,
+        expected: QueueRevision,
+        id: &QueuedSubmissionId,
+    ) -> Result<(), PromptQueueMutationError> {
+        self.ensure_mutable(expected)?;
+        let running_id = match self.snapshot.dispatch.as_ref() {
+            Some(QueueDispatchFence::Accepted { submission_id, .. }) => Some(submission_id),
+            _ => None,
+        };
+        if running_id.is_some_and(|running_id| running_id == id) {
             return Err(PromptQueueMutationError::DispatchInProgress {
                 current: self.snapshot(),
             });
@@ -607,5 +648,132 @@ mod tests {
         let consumed = state.recover_dispatch(true).unwrap();
         assert!(consumed.items.is_empty());
         assert!(consumed.dispatch.is_none());
+    }
+
+    #[test]
+    fn accepted_dispatch_exposes_the_running_submission_until_completion_bits_spec_ut() {
+        let mut state = PromptQueueState::from_snapshot(PromptQueueSnapshot::default());
+        let queued = state
+            .apply(
+                PromptQueueAction::Add {
+                    input: "running item".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let item = queued.items[0].clone();
+        state.prepare_dispatch().expect("prepare queue head");
+        let accepted = state
+            .accept_dispatch(&item.id, "operation-1".to_string())
+            .expect("accept queue head");
+
+        let running = accepted
+            .running_item()
+            .expect("accepted item is visible as running");
+        assert_eq!(running.id, item.id);
+        assert_eq!(running.input.text, "running item");
+
+        let completed = state.consume_accepted().expect("complete queue head");
+        assert!(completed.running_item().is_none());
+        assert!(completed.items.is_empty());
+    }
+
+    #[test]
+    fn accepted_head_does_not_lock_pending_queue_mutations_bits_spec_ut() {
+        let mut state = PromptQueueState::from_snapshot(PromptQueueSnapshot::default());
+        state
+            .apply(
+                PromptQueueAction::Add {
+                    input: "running item".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let queued = state
+            .apply(
+                PromptQueueAction::Add {
+                    input: "pending item".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let running_id = queued.items[0].id.clone();
+        let pending_id = queued.items[1].id.clone();
+        state.prepare_dispatch().expect("prepare queue head");
+        let accepted = state
+            .accept_dispatch(&running_id, "operation-1".to_string())
+            .expect("accept queue head");
+
+        let updated = state
+            .apply(
+                PromptQueueAction::Update {
+                    expected_revision: accepted.revision,
+                    id: pending_id.clone(),
+                    input: "edited pending item".into(),
+                },
+                3,
+            )
+            .expect("update pending item while head runs");
+        assert_eq!(updated.items[1].input.text, "edited pending item");
+
+        let deleted = state
+            .apply(
+                PromptQueueAction::Delete {
+                    expected_revision: updated.revision,
+                    id: pending_id,
+                },
+                4,
+            )
+            .expect("delete pending item while head runs");
+        assert_eq!(deleted.items.len(), 1);
+
+        assert!(matches!(
+            state.apply(
+                PromptQueueAction::Delete {
+                    expected_revision: deleted.revision,
+                    id: running_id,
+                },
+                5,
+            ),
+            Err(PromptQueueMutationError::DispatchInProgress { .. })
+        ));
+    }
+
+    #[test]
+    fn accepted_head_must_remain_first_during_reorder_bits_spec_ut() {
+        let mut state = PromptQueueState::from_snapshot(PromptQueueSnapshot::default());
+        state
+            .apply(
+                PromptQueueAction::Add {
+                    input: "running item".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let queued = state
+            .apply(
+                PromptQueueAction::Add {
+                    input: "pending item".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let running_id = queued.items[0].id.clone();
+        let pending_id = queued.items[1].id.clone();
+        state.prepare_dispatch().expect("prepare queue head");
+        let accepted = state
+            .accept_dispatch(&running_id, "operation-1".to_string())
+            .expect("accept queue head");
+
+        assert!(matches!(
+            state.apply(
+                PromptQueueAction::Reorder {
+                    expected_revision: accepted.revision,
+                    ordered_ids: vec![pending_id, running_id],
+                },
+                3,
+            ),
+            Err(PromptQueueMutationError::DispatchInProgress { .. })
+        ));
     }
 }

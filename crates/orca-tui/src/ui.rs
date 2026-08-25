@@ -507,7 +507,16 @@ fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line
     let snapshot = view.preview;
     let width = width as usize;
     let header = view.error.as_ref().map_or_else(
-        || format!(" Queued {} · Alt+Up edit latest", snapshot.len),
+        || {
+            if snapshot.running {
+                format!(
+                    " Running queued task · {} pending · Alt+Up edit latest",
+                    snapshot.len.saturating_sub(1)
+                )
+            } else {
+                format!(" Queued {} · Alt+Up edit latest", snapshot.len)
+            }
+        },
         |error| format!(" Queue error · {error}"),
     );
     let header_color = if view.error.is_some() {
@@ -522,8 +531,9 @@ fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line
     let item_style = Style::default()
         .fg(theme.muted)
         .add_modifier(Modifier::ITALIC);
+    let first_prefix = if snapshot.running { " ▶ " } else { " ↳ " };
     lines.push(Line::from(Span::styled(
-        truncate_to_display_width(&format!(" ↳ {}", snapshot.first), width),
+        truncate_to_display_width(&format!("{first_prefix}{}", snapshot.first), width),
         item_style,
     )));
     if let Some(second) = snapshot.second {

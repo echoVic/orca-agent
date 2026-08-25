@@ -97,7 +97,11 @@ pub(crate) fn hosted_tui_controller_loop(
             }
         }
         if thread_was_missing && thread.is_some() {
-            announce_runtime_ready(thread.as_ref().expect("startup hosted thread"), &event_tx);
+            announce_runtime_ready(
+                thread.as_ref().expect("startup hosted thread"),
+                &event_tx,
+                &control,
+            );
         }
     }
 
@@ -199,6 +203,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &mut event_tx,
                     &mut session_attachment,
                     &attachment_routing,
+                    &control,
                 );
             }
             Ok(UserAction::ForkCurrentSession { title }) => {
@@ -213,6 +218,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &mut event_tx,
                     &mut session_attachment,
                     &attachment_routing,
+                    &control,
                 );
             }
             Ok(UserAction::RenameCurrentSession { title }) => {
@@ -227,6 +233,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &mut event_tx,
                     &mut session_attachment,
                     &attachment_routing,
+                    &control,
                 );
             }
             Ok(UserAction::ResumeSavedSession { session_id }) => {
@@ -241,6 +248,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &mut event_tx,
                     &mut session_attachment,
                     &attachment_routing,
+                    &control,
                 );
             }
             Ok(UserAction::ForkSavedSession { session_id }) => {
@@ -255,6 +263,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &mut event_tx,
                     &mut session_attachment,
                     &attachment_routing,
+                    &control,
                 );
             }
             Ok(UserAction::RenameSavedSession { session_id, title }) => {
@@ -269,6 +278,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &mut event_tx,
                     &mut session_attachment,
                     &attachment_routing,
+                    &control,
                 );
             }
             Ok(UserAction::ArchiveSavedSession { session_id }) => {
@@ -283,6 +293,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &mut event_tx,
                     &mut session_attachment,
                     &attachment_routing,
+                    &control,
                 );
             }
             Ok(UserAction::DeleteSavedSession { session_id }) => {
@@ -297,6 +308,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &mut event_tx,
                     &mut session_attachment,
                     &attachment_routing,
+                    &control,
                 );
             }
             Ok(UserAction::ImplementApprovedPlan {
@@ -356,6 +368,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &preloaded,
                     &mut thread,
                     &event_tx,
+                    &control,
                     &host,
                 );
             }
@@ -423,6 +436,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     &config,
                     &preloaded,
                     &event_tx,
+                    &control,
                 );
             }
             Ok(UserAction::Interrupt)

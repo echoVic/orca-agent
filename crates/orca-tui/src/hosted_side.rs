@@ -227,7 +227,7 @@ pub(crate) fn handle_hosted_side_action(
                 parent_title,
                 parent_status,
             });
-            announce_runtime_ready(thread.as_ref().expect("side thread"), event_tx);
+            announce_runtime_ready(thread.as_ref().expect("side thread"), event_tx, control);
             let _ = event_tx.send(TuiEvent::Notice(
                 "Side conversation opened. Inherited history is reference-only.".to_string(),
             ));
@@ -342,7 +342,11 @@ pub(crate) fn handle_hosted_side_action(
                         parent_title: side.parent_title.clone(),
                         parent_status: side_parent_status_for_runtime_thread(&side.thread),
                     });
-                    announce_runtime_ready(thread.as_ref().expect("parent thread"), event_tx);
+                    announce_runtime_ready(
+                        thread.as_ref().expect("parent thread"),
+                        event_tx,
+                        control,
+                    );
                 } else {
                     let parent_status = side_parent_status_for_runtime_thread(&side.thread);
                     let _ = event_tx.send(TuiEvent::SideConversationChanged {
@@ -352,7 +356,11 @@ pub(crate) fn handle_hosted_side_action(
                         parent_title: side.parent_title.clone(),
                         parent_status,
                     });
-                    announce_runtime_ready(thread.as_ref().expect("side thread"), event_tx);
+                    announce_runtime_ready(
+                        thread.as_ref().expect("side thread"),
+                        event_tx,
+                        control,
+                    );
                 }
             }
         }
@@ -428,7 +436,7 @@ pub(crate) fn handle_hosted_side_action(
                     parent_title: String::new(),
                     parent_status: SideParentStatus::Idle,
                 });
-                announce_runtime_ready(thread.as_ref().expect("parent thread"), event_tx);
+                announce_runtime_ready(thread.as_ref().expect("parent thread"), event_tx, control);
             }
         }
     }

@@ -20,6 +20,26 @@ use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::types::TuiEvent;
 
+pub(crate) fn queue_busy_submission(
+    runtime_thread: &RuntimeThreadHandle,
+    prompt: String,
+    images: Vec<orca_core::conversation::ImageInput>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    runtime_thread
+        .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Add {
+            input: orca_runtime::prompt_queue::PromptQueueInput {
+                text: prompt,
+                mention_bindings: orca_runtime::mentions::MentionBindings::default(),
+                images,
+            },
+        })
+        .map(|snapshot| {
+            let _ = event_tx.send(TuiEvent::PromptQueueUpdated(snapshot));
+        })
+        .map_err(|error| format!("failed to queue while the current task is running: {error}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_hosted_queued_prompt(
     prompt: String,
@@ -29,6 +49,7 @@ pub(crate) fn handle_hosted_queued_prompt(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     thread: &mut Option<RuntimeThreadHandle>,
     event_tx: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
     host: &RuntimeHostHandle,
 ) {
     let cfg = config.lock().unwrap().clone();
@@ -54,7 +75,11 @@ pub(crate) fn handle_hosted_queued_prompt(
         return;
     }
     if thread_was_missing {
-        announce_runtime_ready(thread.as_ref().expect("queued prompt thread"), event_tx);
+        announce_runtime_ready(
+            thread.as_ref().expect("queued prompt thread"),
+            event_tx,
+            control,
+        );
     }
     let runtime_thread = thread.as_ref().expect("queued prompt thread initialized");
     let roots = cfg
@@ -132,7 +157,11 @@ pub(crate) fn handle_hosted_submitted_turn(
         return;
     }
     if thread_was_missing {
-        announce_runtime_ready(thread.as_ref().expect("submitted thread"), event_tx);
+        announce_runtime_ready(
+            thread.as_ref().expect("submitted thread"),
+            event_tx,
+            control,
+        );
     }
     let runtime_thread = thread.as_ref().expect("hosted thread initialized");
     let workspace_roots = cfg
@@ -156,12 +185,55 @@ pub(crate) fn handle_hosted_submitted_turn(
         }
     };
     let submitted_turn = submitted_turn.with_model_input(input);
+    if queued_id.is_none() && rejection_prompt.is_some() && runtime_thread.is_busy() {
+        // Queue-driven legacy turns do not own a TUI surface activation. The
+        // dispatcher may have armed one while routing this ordinary submit;
+        // release it before returning so the next real turn can activate.
+        control.cancel_surface_activation_if_idle();
+        if let Err(error) = queue_busy_submission(
+            runtime_thread,
+            submitted_turn.prompt().to_string(),
+            submitted_turn.images().to_vec(),
+            event_tx,
+        ) {
+            send_submission_error_with_images(
+                event_tx,
+                None,
+                rejection_prompt.as_deref(),
+                rejection_bindings,
+                rejection_images,
+                error,
+            );
+        }
+        return;
+    }
     if runtime_thread.session_id().is_none() {
         let request = hosted_turn_request(&submitted_turn, false);
-        if let Err(error) =
-            run_hosted_ordinary_turn(&cfg, runtime_thread, request, event_tx, control)
-        {
-            emit_hosted_operation_error(event_tx, error, &HostedOperationKind::Turn);
+        match run_hosted_ordinary_turn(&cfg, runtime_thread, request, event_tx, control) {
+            Ok(_) => {}
+            Err(_error)
+                if queued_id.is_none()
+                    && rejection_prompt.is_some()
+                    && runtime_thread.is_busy() =>
+            {
+                control.cancel_surface_activation_if_idle();
+                if let Err(queue_error) = queue_busy_submission(
+                    runtime_thread,
+                    submitted_turn.prompt().to_string(),
+                    submitted_turn.images().to_vec(),
+                    event_tx,
+                ) {
+                    send_submission_error_with_images(
+                        event_tx,
+                        None,
+                        rejection_prompt.as_deref(),
+                        rejection_bindings,
+                        rejection_images,
+                        queue_error,
+                    );
+                }
+            }
+            Err(error) => emit_hosted_operation_error(event_tx, error, &HostedOperationKind::Turn),
         }
         return;
     }
@@ -301,10 +373,10 @@ mod tests {
             }],
         );
         let (event_tx, event_rx) = mpsc::unbounded();
-        let control = TuiSurfaceTaskControl::isolated_for_test();
         let pending = bridge::PendingWorkflowNotifications::new();
         let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
         let mut thread = None;
+        let control = TuiSurfaceTaskControl::isolated_for_test();
 
         super::handle_hosted_submitted_turn(
             SubmittedTurn::queued_user_with_mentions(42, prompt.to_string(), bindings, Vec::new()),
@@ -380,6 +452,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded();
         let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
         let mut thread = None;
+        let control = TuiSurfaceTaskControl::isolated_for_test();
 
         super::handle_hosted_queued_prompt(
             prompt.to_string(),
@@ -389,6 +462,7 @@ mod tests {
             &preloaded,
             &mut thread,
             &event_tx,
+            &control,
             &host.handle(),
         );
 

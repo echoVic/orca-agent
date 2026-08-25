@@ -9,6 +9,7 @@ use orca_runtime::runtime_host::{RuntimeHostHandle, RuntimeThreadHandle};
 
 use crate::hosted_session::announce_runtime_ready;
 use crate::hosted_session_lifecycle::ensure_hosted_thread;
+use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::types::TuiEvent;
 
@@ -23,6 +24,7 @@ pub(crate) fn handle_hosted_workflow_action(
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
 ) {
     match action {
         HostedWorkflowAction::Run { name, args } => {
@@ -40,7 +42,11 @@ pub(crate) fn handle_hosted_workflow_action(
                 return;
             }
             if thread_was_missing {
-                announce_runtime_ready(thread.as_ref().expect("workflow thread"), event_tx);
+                announce_runtime_ready(
+                    thread.as_ref().expect("workflow thread"),
+                    event_tx,
+                    control,
+                );
             }
             if let Some(runtime_thread) = thread.as_ref() {
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
@@ -74,6 +80,7 @@ mod tests {
         let config = Arc::new(Mutex::new(run_config));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
         let runtime = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
         let host = runtime.handle();
         let mut thread = None;
@@ -88,6 +95,7 @@ mod tests {
             &config,
             &preloaded,
             &event_tx,
+            &control,
         );
 
         let events: Vec<_> = event_rx.try_iter().collect();

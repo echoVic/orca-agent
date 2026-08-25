@@ -6,6 +6,7 @@ use std::{
     io,
 };
 
+use crossbeam_channel::Sender;
 use orca_core::cancel::{OperationId, OperationIdAllocator};
 
 use crate::surface_projection::TuiStreamDeliveryWatermark;
@@ -52,6 +53,11 @@ struct HostedOperationInner {
     surface_delivery_watermarks:
         HashMap<orca_runtime::surface::SurfaceOperationId, TuiStreamDeliveryWatermark>,
     surface_terminal_deliveries: HashSet<orca_runtime::surface::SurfaceOperationId>,
+    queue_event_tx: Arc<Mutex<Option<Sender<TuiEvent>>>>,
+    queue_runtime: Option<orca_runtime::runtime_host::RuntimeThreadHandle>,
+    queue_watcher_stop: Option<Arc<AtomicBool>>,
+    queue_interactions:
+        HashMap<TuiInteractionKey, std::sync::mpsc::SyncSender<io::Result<TuiInteractionResponse>>>,
     shutdown: bool,
 }
 
@@ -93,6 +99,35 @@ impl TuiSurfaceTaskControl {
         if cancel_surface_if_active_checked(&mut hosted)? {
             return Ok(true);
         }
+        let queue_runtime = hosted.queue_runtime.clone();
+        drop(hosted);
+        let queue_snapshot = queue_runtime.as_ref().and_then(|runtime| {
+            runtime.is_busy().then(|| {
+                runtime
+                    .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List)
+                    .ok()
+            })?
+        });
+        if let (Some(runtime), Some(snapshot)) = (queue_runtime, queue_snapshot) {
+            if snapshot.running_item().is_some() && !snapshot.paused {
+                // Persist the pause before waking a blocked interaction. The
+                // interaction may be the last thing keeping the active task
+                // alive; cancelling it first could let the next FIFO item
+                // start before the interrupt command reaches the actor.
+                let _ =
+                    runtime.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Pause {
+                        expected_revision: snapshot.revision,
+                    });
+            }
+            if snapshot.running_item().is_some() {
+                self.cancel_queue_interactions();
+                runtime
+                    .interrupt_active()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                return Ok(true);
+            }
+        }
+        let mut hosted = self.lock_hosted();
         if hosted.shutdown || !hosted.surface_activation_armed {
             return Ok(false);
         }
@@ -188,6 +223,9 @@ impl TuiSurfaceTaskControl {
         let surface_presentation_tasks = {
             let mut hosted = self.lock_hosted();
             hosted.shutdown = true;
+            if let Some(stop) = hosted.queue_watcher_stop.take() {
+                stop.store(true, Ordering::Release);
+            }
             hosted.surface_delivery_watermarks = HashMap::new();
             hosted.surface_terminal_deliveries = HashSet::new();
             for task in &hosted.surface_presentation_tasks {
@@ -196,6 +234,7 @@ impl TuiSurfaceTaskControl {
             std::mem::take(&mut hosted.surface_presentation_tasks)
         };
         self.cancel_surface_and_notify();
+        self.cancel_queue_interactions();
         for task in surface_presentation_tasks {
             let _ = task.handle.join();
         }
@@ -228,6 +267,147 @@ impl TuiSurfaceTaskControl {
         hosted.interrupt_requested = false;
         drop(hosted);
         self.hosted.changed.notify_all();
+    }
+
+    /// Drop a pre-activation arm left by an input that was redirected to the
+    /// runtime queue. A real typed operation owns `surface_active` and must
+    /// never have its activation state cleared by this recovery path.
+    pub(crate) fn cancel_surface_activation_if_idle(&self) {
+        let mut hosted = self.lock_hosted();
+        if hosted.surface_active.is_none() {
+            hosted.surface_activation_armed = false;
+            hosted.interrupt_requested = false;
+        }
+        drop(hosted);
+        self.hosted.changed.notify_all();
+    }
+
+    pub(crate) fn bind_prompt_queue_runtime(
+        &self,
+        runtime: orca_runtime::runtime_host::RuntimeThreadHandle,
+        event_tx: &Sender<TuiEvent>,
+    ) -> Option<Arc<AtomicBool>> {
+        let mut hosted = self.lock_hosted();
+        let watcher_needs_restart = hosted
+            .queue_runtime
+            .as_ref()
+            .is_none_or(|current| current.thread_id() != runtime.thread_id())
+            || hosted
+                .queue_watcher_stop
+                .as_ref()
+                .is_none_or(|stop| stop.load(Ordering::Acquire));
+        if watcher_needs_restart {
+            if let Some(stop) = hosted.queue_watcher_stop.take() {
+                stop.store(true, Ordering::Release);
+            }
+            hosted.queue_watcher_stop = Some(Arc::new(AtomicBool::new(false)));
+        }
+        hosted.queue_runtime = Some(runtime);
+        *hosted
+            .queue_event_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(event_tx.clone());
+        watcher_needs_restart.then(|| {
+            hosted
+                .queue_watcher_stop
+                .as_ref()
+                .expect("queue watcher stop token")
+                .clone()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_prompt_queue_event_sender(&self, event_tx: &Sender<TuiEvent>) {
+        let hosted = self.lock_hosted();
+        *hosted
+            .queue_event_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(event_tx.clone());
+    }
+
+    pub(crate) fn prompt_queue_event_sender(&self) -> Arc<Mutex<Option<Sender<TuiEvent>>>> {
+        self.lock_hosted().queue_event_tx.clone()
+    }
+
+    pub(crate) fn await_queue_interaction(
+        &self,
+        request_id: String,
+        kind: TuiInteractionKind,
+        event: impl FnOnce(TuiInteractionKey) -> TuiEvent,
+    ) -> io::Result<TuiInteractionResponse> {
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        let (key, event_tx) = {
+            let mut hosted = self.lock_hosted();
+            if hosted.shutdown {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "TUI surface task control is shutting down",
+                ));
+            }
+            let key = TuiInteractionKey::new(self.surface_ids.allocate(), request_id, kind);
+            let event_tx = hosted
+                .queue_event_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "queued runtime interaction channel is not installed",
+                    )
+                })?;
+            hosted.queue_interactions.insert(key.clone(), response_tx);
+            (key, event_tx)
+        };
+        if event_tx.send(event(key.clone())).is_err() {
+            self.lock_hosted().queue_interactions.remove(&key);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUI event channel closed while requesting queued interaction",
+            ));
+        }
+        let response = response_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "queued runtime interaction response channel closed",
+            )
+        })?;
+        self.lock_hosted().queue_interactions.remove(&key);
+        response
+    }
+
+    pub(crate) fn respond_queue_interaction(
+        &self,
+        key: &TuiInteractionKey,
+        response: &TuiInteractionResponse,
+    ) -> io::Result<bool> {
+        let Some(sender) = self.lock_hosted().queue_interactions.remove(key) else {
+            return Ok(false);
+        };
+        sender.send(Ok(response.clone())).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "queued runtime interaction waiter closed",
+            )
+        })?;
+        Ok(true)
+    }
+
+    fn cancel_queue_interactions(&self) {
+        let waiters = {
+            let mut hosted = self.lock_hosted();
+            hosted
+                .queue_interactions
+                .drain()
+                .map(|(_, sender)| sender)
+                .collect::<Vec<_>>()
+        };
+        for sender in waiters {
+            let _ = sender.send(Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "queued runtime interaction cancelled",
+            )));
+        }
     }
 
     pub(crate) fn is_shutdown(&self) -> bool {
@@ -777,7 +957,10 @@ impl TuiSurfaceTaskControl {
         key: &TuiInteractionKey,
         response: &TuiInteractionResponse,
     ) -> io::Result<bool> {
-        self.respond_surface_interaction(key, response)
+        if self.respond_surface_interaction(key, response)? {
+            return Ok(true);
+        }
+        self.respond_queue_interaction(key, response)
     }
 
     #[cfg(test)]
@@ -1161,6 +1344,47 @@ mod tests {
     }
 
     #[test]
+    fn queued_interaction_round_trip_wakes_runtime_waiter() {
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        controller.bind_prompt_queue_event_sender(&event_tx);
+        let waiting = controller.clone();
+        let waiter = std::thread::spawn(move || {
+            waiting.await_queue_interaction(
+                "request-1".to_string(),
+                crate::types::TuiInteractionKind::UserInput,
+                |key| crate::types::TuiEvent::UserInputRequested {
+                    key,
+                    question: "question".to_string(),
+                    choices: Vec::new(),
+                },
+            )
+        });
+        let key = match event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued event")
+        {
+            crate::types::TuiEvent::UserInputRequested { key, .. } => key,
+            event => panic!("unexpected queued event: {event:?}"),
+        };
+        assert!(
+            controller
+                .respond(
+                    &key,
+                    &crate::types::TuiInteractionResponse::UserInput("answer".to_string())
+                )
+                .expect("respond queued interaction")
+        );
+        assert_eq!(
+            waiter
+                .join()
+                .expect("waiter join")
+                .expect("waiter response"),
+            crate::types::TuiInteractionResponse::UserInput("answer".to_string())
+        );
+    }
+
+    #[test]
     fn surface_delivery_watermark_survives_background_detach_until_terminal_clear() {
         let controller = TuiSurfaceTaskControl::isolated_for_test();
         let mut operation_bytes = [7; 16];
@@ -1186,6 +1410,20 @@ mod tests {
             controller
                 .surface_delivery_watermark(&operation_id)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn queued_submission_releases_idle_surface_activation_arm() {
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        assert!(control.begin_surface_activation().expect("arm activation"));
+
+        control.cancel_surface_activation_if_idle();
+
+        assert!(
+            control
+                .begin_surface_activation()
+                .expect("re-arm activation")
         );
     }
 }

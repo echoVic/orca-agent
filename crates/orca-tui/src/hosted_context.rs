@@ -48,7 +48,11 @@ pub(crate) fn handle_hosted_context_action(
                 return;
             }
             if thread_was_missing {
-                announce_runtime_ready(thread.as_ref().expect("remember thread"), event_tx);
+                announce_runtime_ready(
+                    thread.as_ref().expect("remember thread"),
+                    event_tx,
+                    control,
+                );
             }
             if let Some(runtime_thread) = thread.as_ref() {
                 let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());
