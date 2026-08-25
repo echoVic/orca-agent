@@ -1261,6 +1261,10 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     1,
   ],
   [
+    "crates/orca-tui/src/operation_controller.rs:await_queue_interaction:hosted.queue_interactions.insert",
+    1,
+  ],
+  [
     "crates/orca-tui/src/queued_input.rs:replace_runtime_projection:self.composers_by_id.insert",
     1,
   ],
