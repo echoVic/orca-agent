@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.3":
+        "Shows the running queue head in the TUI queue preview and auto-queues submissions made while the session is busy through the durable prompt queue instead of rejecting them. Backgrounding a turn with no background capacity queues it the same way instead of failing the handoff, so the session completes successfully after the queued turn runs. Queue pause/delete interactions and task interruption are wired into the hosted operation controller.",
       "v0.4.2":
         "Indexes prepared surface commit batches by commit id during surface JSONL log recovery, replacing a linear scan per record so recovery scales linearly instead of quadratically. A bounded-time regression test recovers 25,000 prepared/committed pairs within five seconds.",
       "v0.4.1":
@@ -620,6 +622,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.3":
+        "TUI 队列预览现在显示正在运行的队列任务，会话繁忙时的提交会自动进入持久化 prompt queue 而不是被拒绝；无后台容量时把当前回合转入后台也会自动排队而不是让会话失败，排队回合运行完成后会话以 success 收尾。队列暂停/删除交互与任务中断已接入 hosted 操作控制器。",
       "v0.4.2":
         "在扫描录制 surface JSONL 日志时按 commit id 建立 prepared batch 索引，替代逐条线性查找，使恢复耗时从平方级降为线性。新增有界时间回归测试：5 秒内恢复 25,000 组 prepared/committed 记录。",
       "v0.4.1":

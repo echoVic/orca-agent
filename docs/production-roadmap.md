@@ -131,7 +131,11 @@ two real requests with `second cache_tokens=1024` (the first also reported
 `cache_tokens=1024` because the remote prefix was already warm), confirming a
 non-zero DeepSeek cache hit without exposing credentials.
 
-Current baseline: v0.4.2 indexes surface commit batches by id so
+Current baseline: v0.4.3 shows the running queue task in the TUI queue
+preview and auto-queues submissions made while the session is busy,
+routing them through the durable prompt queue instead of failing the
+handoff, with queue interactions wired into the hosted controller.
+v0.4.2 indexes surface commit batches by id so
 recovery of long recorded surface logs scales linearly instead of
 quadratically, with a bounded-time regression gate. v0.4.1 batches
 provider step commits with deferred

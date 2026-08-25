@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.2";
+export const releaseVersion = "v0.4.3";
 
 export const releases = [
+  {
+    version: "v0.4.3",
+    date: "2026-08-25",
+    title: "Queue running state and busy-submit auto-queueing",
+    body: "Shows the running queue head in the TUI queue preview, and auto-queues submissions made while the session is busy through the durable prompt queue instead of rejecting them. A backgrounded turn with no background capacity is queued the same way instead of failing the handoff, so the session completes successfully after the queued turn runs. Queue pause/delete interactions and task interruption are wired into the hosted operation controller.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.3",
+  },
   {
     version: "v0.4.2",
     date: "2026-08-23",
