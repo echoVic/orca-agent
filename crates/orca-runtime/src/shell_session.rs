@@ -324,7 +324,14 @@ impl RuntimeShellSessionManager {
         let shell = ShellResolver::for_current_host()
             .resolve_from_environment()
             .map_err(io::Error::other)?;
-        ensure_shell_sandbox_supported(shell.kind(), command.sandbox)?;
+        // An argv request is launched directly by the native adapter on
+        // Windows; it does not depend on the user's configured shell
+        // dialect. Shell eligibility checks must only inspect shell-script
+        // requests, otherwise a PowerShell 5.1 installation would reject
+        // safe commands such as `node -e ...` before the AppContainer starts.
+        if command.argv.is_none() {
+            ensure_shell_sandbox_supported(shell.kind(), command.sandbox)?;
+        }
         let uses_seatbelt = cfg!(target_os = "macos")
             && !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess);
         let capability =

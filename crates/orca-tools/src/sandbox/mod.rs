@@ -163,11 +163,11 @@ pub fn enforcement_state() -> orca_core::capability::EnforcementState {
     }
     #[cfg(target_os = "linux")]
     {
-        // Linux builders emit a fail-closed command when neither bwrap nor
-        // Landlock/seccomp can enforce the requested policy. Keep the broker
-        // state enforced so that policy-specific fallback remains in the
-        // backend and never becomes a host shell.
-        return orca_core::capability::EnforcementState::Enforced;
+        return if linux::enforced_available(std::path::Path::new(".")) {
+            orca_core::capability::EnforcementState::Enforced
+        } else {
+            orca_core::capability::EnforcementState::Unavailable
+        };
     }
     #[cfg(target_os = "windows")]
     {

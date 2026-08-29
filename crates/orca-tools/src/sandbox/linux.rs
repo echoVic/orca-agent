@@ -21,6 +21,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::sandbox::bwrap::{
     LinuxReadScope, LinuxSandboxPolicy, build_bwrap_argv, effective_read_only_roots,
@@ -51,6 +52,48 @@ pub fn platform_default_read_roots() -> Vec<PathBuf> {
     .map(PathBuf::from)
     .filter(|path| path.exists())
     .collect()
+}
+
+/// Probe the exact Linux backend that production launches use.  Merely
+/// finding `bwrap` or compiling a Landlock ruleset is insufficient: the
+/// runner may forbid user namespaces or filesystem restriction entirely.
+/// Keep this result stable for the process so receipts do not change midway
+/// through a run.
+pub fn enforced_available(cwd: &Path) -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if let Some(bwrap) = bwrap_path(cwd) {
+            let request = LinuxSandboxRequest {
+                command: "true".to_string(),
+                policy: LinuxSandboxPolicy {
+                    cwd: cwd.to_path_buf(),
+                    read_scope: LinuxReadScope::Global,
+                    readable_roots: Vec::new(),
+                    allowed_unix_socket_roots: Vec::new(),
+                    writable_roots: Vec::new(),
+                    metadata_protection_roots: Vec::new(),
+                    metadata_writable_roots: Vec::new(),
+                    read_only_roots: Vec::new(),
+                    denied_roots: Vec::new(),
+                    network_access: false,
+                },
+                strict: true,
+            };
+            return bwrap_command(bwrap, &request)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            return linux_landlock::probe_landlock_supported().is_ok()
+                && linux_landlock::build_seccomp_filter(false).is_ok();
+        }
+        #[allow(unreachable_code)]
+        false
+    })
 }
 
 /// Build a `Command` that runs `request.command` under the strongest available
@@ -411,7 +454,7 @@ mod linux_landlock {
             })
     }
 
-    fn build_seccomp_filter(network_access: bool) -> Result<BpfProgram, String> {
+    pub(super) fn build_seccomp_filter(network_access: bool) -> Result<BpfProgram, String> {
         use std::collections::BTreeMap;
 
         use seccompiler::{
