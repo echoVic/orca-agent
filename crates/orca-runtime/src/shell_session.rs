@@ -1590,8 +1590,11 @@ fn shell_effective_capability(
             CapabilityProcessClass::SandboxedTool,
             CapabilitySet {
                 read: true,
-                write: false,
-                metadata_write: false,
+                // Read-only profiles can still carry an explicit write
+                // overlay. The platform builders grant writes only to the
+                // listed additional roots, never to the workspace cwd.
+                write: !command.additional_working_directories.is_empty(),
+                metadata_write: !metadata_writable_directories.is_empty(),
                 network: network_access,
                 shell: true,
                 agent: false,
@@ -1636,8 +1639,8 @@ fn shell_capability_ceiling(
         },
         ShellSandboxMode::ReadOnly { network_access, .. } => CapabilitySet {
             read: true,
-            write: false,
-            metadata_write: false,
+            write: !command.additional_working_directories.is_empty(),
+            metadata_write: !metadata_writable_directories.is_empty(),
             network: network_access,
             shell: true,
             agent: false,
@@ -1652,7 +1655,11 @@ fn shell_capability_ceiling(
     read_roots.dedup();
 
     let write_roots = if capabilities.write {
-        let mut roots = vec![command.cwd.clone()];
+        let mut roots = match command.sandbox {
+            ShellSandboxMode::WorkspaceWrite { .. } => vec![command.cwd.clone()],
+            ShellSandboxMode::ReadOnly { .. } => Vec::new(),
+            ShellSandboxMode::DangerFullAccess => Vec::new(),
+        };
         roots.extend(command.additional_working_directories.iter().cloned());
         roots.sort();
         roots.dedup();
@@ -2098,6 +2105,46 @@ mod tests {
     #[test]
     fn shell_spawn_surface_requires_execution_broker() {
         let _ = spawn_configured_shell_with_broker;
+    }
+
+    #[test]
+    fn read_only_profile_can_carry_only_explicit_write_roots() {
+        let cwd = PathBuf::from("/workspace");
+        let approved = PathBuf::from("/approved-output");
+        let command = ShellSessionCommand {
+            command: "true".to_string(),
+            argv: None,
+            cwd: cwd.clone(),
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: vec![approved.clone()],
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: BTreeMap::new(),
+            description: "explicit write root".to_string(),
+            terminal: ShellTerminalMode::pipe(),
+            sandbox: ShellSandboxMode::ReadOnly {
+                network_access: false,
+                allow_global_read: false,
+            },
+        };
+
+        let effective =
+            shell_effective_capability(&command, "explicit-write", &[]).expect("capability");
+        let ceiling = shell_capability_ceiling(&command, &[]);
+
+        assert!(effective.capabilities.write);
+        assert_eq!(effective.write_roots, vec![approved.clone()]);
+        assert_eq!(ceiling.write_roots.as_ref(), Some(&vec![approved]));
+        assert!(
+            !ceiling
+                .write_roots
+                .as_ref()
+                .expect("write roots ceiling")
+                .contains(&cwd)
+        );
+        effective
+            .ensure_subset_of(&shell_capability_ceiling(&command, &[]))
+            .expect("explicit root stays inside the broker ceiling");
     }
     #[cfg(windows)]
     use orca_platform::shell::{PowerShellEdition, ShellKind};
