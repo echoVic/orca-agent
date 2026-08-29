@@ -8,7 +8,6 @@ use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
 };
-use orca_platform::process::ProcessJob;
 
 use crate::process;
 
@@ -145,7 +144,40 @@ pub fn execute_external_tool_with_policy_or_cancel(
     process::prepare_non_interactive_command(&mut command);
     command.stdin(Stdio::piped());
 
-    let (mut child, process_job) = match ProcessJob::spawn(&mut command) {
+    let capabilities = match config.action_kind {
+        orca_core::approval_types::ActionKind::Read => {
+            orca_core::capability::CapabilitySet::read_only()
+        }
+        orca_core::approval_types::ActionKind::Write
+        | orca_core::approval_types::ActionKind::Shell => {
+            orca_core::capability::CapabilitySet::workspace_write()
+        }
+        orca_core::approval_types::ActionKind::Network => orca_core::capability::CapabilitySet {
+            read: true,
+            write: false,
+            metadata_write: false,
+            network: true,
+            shell: true,
+            agent: false,
+        },
+        orca_core::approval_types::ActionKind::Agent => orca_core::capability::CapabilitySet {
+            read: true,
+            write: true,
+            metadata_write: false,
+            network: true,
+            shell: true,
+            agent: true,
+        },
+    };
+    let (mut child, process_job, _receipt) = match process::spawn_with_capability(
+        command,
+        format!("external:{}", config.name),
+        cwd,
+        orca_core::capability::CapabilityProcessClass::UserTrustedIntegration,
+        capabilities,
+        orca_core::capability::EnforcementState::Advisory,
+        "external-tool-user-trusted",
+    ) {
         Ok(spawned) => spawned,
         Err(error) => {
             return ToolResult::failed(
@@ -156,19 +188,19 @@ pub fn execute_external_tool_with_policy_or_cancel(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(error) = stdin.write_all(args.as_bytes()) {
-            process::terminate_child_tree(&mut child, &process_job);
-            let exit_code = child.wait().ok().and_then(|status| status.code());
-            return ToolResult::failed(
-                request,
-                format!(
-                    "external tool '{}' failed to receive input: {error}",
-                    config.name
-                ),
-                exit_code,
-            );
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(error) = stdin.write_all(args.as_bytes())
+    {
+        process::terminate_child_tree(&mut child, &process_job);
+        let exit_code = child.wait().ok().and_then(|status| status.code());
+        return ToolResult::failed(
+            request,
+            format!(
+                "external tool '{}' failed to receive input: {error}",
+                config.name
+            ),
+            exit_code,
+        );
     }
 
     let output = match process::wait_for_child_output_with_timeout_or_cancel(

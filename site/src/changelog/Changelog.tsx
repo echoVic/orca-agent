@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.6":
+        "Freezes capability intersection and Plan ceilings, routes shell and MCP stdio launches through an execution broker, rejects workspace escapes and backend fallbacks, makes project execution settings non-authoritative, and keeps sandbox denial text explanatory instead of authority-bearing.",
       "v0.4.5":
         "Completes the TUI state-owner migration by removing the stale types compatibility facade. Protocol, transcript, interaction, viewport, and surface projection values now have one import path enforced by an architecture contract, so new code cannot silently aggregate dedicated owner types back into types.rs.",
       "v0.4.4":
@@ -626,6 +628,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.6":
+        "固定 capability intersection 与 Plan 硬上限，把 shell 和 MCP stdio 启动统一收敛到 execution broker，拒绝 workspace 越界和后端降级，项目执行配置不再具有权威性，沙箱拒绝文本只作为解释，不再作为提权依据。",
       "v0.4.5":
         "完成 TUI 状态 owner 收敛，删除残留的 types 兼容 facade。协议、transcript、interaction、viewport 与 surface projection 类型现在各自只有一个导入路径，并由架构契约禁止新代码把专属 owner 类型重新聚合回 types.rs。",
       "v0.4.4":

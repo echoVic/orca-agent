@@ -168,8 +168,8 @@ pub use interaction::{
     SurfaceInteractionSafeProjection, SurfaceInteractionView, SurfaceMcpElicitationDecision,
     SurfaceMcpElicitationRequest, SurfacePermissionClientDecision, SurfacePermissionDomainPattern,
     SurfacePermissionNetworkProfile, SurfacePermissionPathLabel, SurfacePermissionProfile,
-    SurfaceSchema, SurfaceSchemaInteger, SurfaceSchemaProperty, SurfaceShellPermissionProfile,
-    SurfaceToolAction, SurfaceToolRequest, SurfaceUserInputDecision, ValidatedInteractionResponse,
+    SurfaceSchema, SurfaceSchemaInteger, SurfaceSchemaProperty, SurfaceToolAction,
+    SurfaceToolRequest, SurfaceUserInputDecision, ValidatedInteractionResponse,
 };
 pub(crate) use interaction::{
     ContinuationTurnAnswerType, ContinuationTurnContextKind, ContinuationTurnIntent,

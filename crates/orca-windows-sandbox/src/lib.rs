@@ -1,3 +1,5 @@
+#![deny(deprecated)]
+
 mod capabilities;
 mod policy;
 #[cfg(windows)]

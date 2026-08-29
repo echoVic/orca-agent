@@ -1,3 +1,5 @@
+#![deny(deprecated)]
+
 mod browse;
 mod discovery;
 mod eligibility;

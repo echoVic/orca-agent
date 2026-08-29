@@ -105,7 +105,6 @@ fn run_permission_respond<W: Write>(
                 additional_working_directories: Some(session_grants.additional_working_directories),
                 metadata_writable_directories: Some(session_grants.metadata_writable_directories),
                 network_domain_permissions: Some(session_grants.network_domain_permissions),
-                unsandboxed_shell: Some(session_grants.unsandboxed_shell),
             },
         );
     }
@@ -254,21 +253,13 @@ fn run_permission_respond<W: Write>(
     )?;
     match pending {
         JsonlPermissionRoute::Surface { .. } => unreachable!("surface response returned above"),
-        JsonlPermissionRoute::CommandExec { mut request } => {
+        JsonlPermissionRoute::CommandExec { request } => {
             if decision != protocol::PermissionResponseDecision::Allow {
                 return protocol::write_server_event(
                     writer,
                     &request.event_id,
                     ServerEvent::error(format!("command/exec permission denied: {request_id}")),
                 );
-            }
-            if permissions
-                .shell
-                .as_ref()
-                .is_some_and(|shell| shell.unsandboxed)
-            {
-                request.options.permission_profile = None;
-                request.options.sandbox_policy = protocol::CommandSandboxPolicy::DangerFullAccess;
             }
             run_command_exec(
                 config,
@@ -375,11 +366,6 @@ fn surface_permission_profile(
                         )
                     })
                     .collect(),
-            }
-        }),
-        shell: permissions.shell.as_ref().map(|shell| {
-            crate::surface::SurfaceShellPermissionProfile {
-                unsandboxed: shell.unsandboxed,
             }
         }),
     }

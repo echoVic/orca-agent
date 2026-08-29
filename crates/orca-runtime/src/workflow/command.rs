@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::SystemTime;
 
+use orca_core::capability::CapabilitySet;
 use orca_core::config::file::ConfigOverrides;
 use orca_core::config::{HistoryMode, OutputFormat, ProviderKind};
+use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::workflow_types::{WorkflowInput, WorkflowRunState};
 use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use serde::{Deserialize, Serialize};
@@ -131,6 +133,7 @@ struct WorkflowCliLaunchRecord {
     provider: ProviderKind,
     model: Option<String>,
     base_url: Option<String>,
+    capabilities: CapabilitySet,
     input: WorkflowInput,
 }
 
@@ -226,6 +229,7 @@ fn run_workflow_command(args: WorkflowRunRequest) -> i32 {
         args.model,
         run_config.api_key,
         args.base_url,
+        run_config.workflows.capabilities.clone(),
         &input,
     )
 }
@@ -546,6 +550,7 @@ fn workflow_restart_command(
                 record.model,
                 run.legacy_api_key,
                 record.base_url,
+                record.capabilities,
                 &input,
             )
         }
@@ -590,6 +595,7 @@ fn run_workflow_worker(args: WorkflowWorkerRequest) -> i32 {
         }
     };
 
+    let workflow_capabilities = config.workflows.capabilities.clone();
     let session_dir = workflow_session_root(&args.cwd).join(&args.session_id);
     let tasks = TaskRegistry::new(args.session_id.clone());
     let runner = WorkflowRunner::new(config, tasks, session_dir.clone());
@@ -609,6 +615,7 @@ fn run_workflow_worker(args: WorkflowWorkerRequest) -> i32 {
             provider: args.provider,
             model: args.model,
             base_url: args.base_url,
+            capabilities: workflow_capabilities,
             input,
         },
     ) {
@@ -673,6 +680,7 @@ fn spawn_workflow_worker(
     model: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
+    capabilities: CapabilitySet,
     input: &WorkflowInput,
 ) -> i32 {
     let current_exe = match std::env::current_exe() {
@@ -729,13 +737,28 @@ fn spawn_workflow_worker(
         return 1;
     }
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
+    let cwd_for_broker = cwd.to_path_buf();
+    let broker = ExecutionBroker::with_backend(
+        orca_core::capability::EnforcementState::Advisory,
+        "workflow-worker-user-trusted",
+    );
+    let launched = match broker.launch_user_trusted(
+        command,
+        format!("workflow-worker:{session_id}"),
+        cwd_for_broker,
+        capabilities,
+    ) {
+        Ok(launched) => launched,
+        Err(LaunchError::Spawn(error)) => {
             eprintln!("orca: failed to start workflow worker: {error}");
             return 1;
         }
+        Err(error) => {
+            eprintln!("orca: workflow worker broker rejected launch: {error:?}");
+            return 1;
+        }
     };
+    let mut child = launched.child;
     if let Err(error) = handoff_workflow_worker_api_key(&mut child, api_key.as_deref()) {
         eprintln!("orca: {error}");
         return 1;
@@ -1186,6 +1209,7 @@ mod tests {
             provider: ProviderKind::DeepSeek,
             model: Some("deepseek-v4-pro".to_string()),
             base_url: None,
+            capabilities: CapabilitySet::read_only(),
             input: workflow_input_for_launch(Path::new("/tmp/workspace"), "workflow", None, None),
         };
 
@@ -1208,6 +1232,7 @@ mod tests {
             "model": null,
             "apiKey": "legacy-secret",
             "baseUrl": null,
+            "capabilities": {"read": true, "write": false, "metadata_write": false, "network": false, "shell": false, "agent": false},
             "input": { "name": "workflow" }
         }))
         .unwrap();

@@ -14,9 +14,14 @@ fn shell_sandbox_mode_from_command_policy(
     policy: &protocol::CommandSandboxPolicy,
 ) -> ShellSandboxMode {
     match policy {
-        protocol::CommandSandboxPolicy::DangerFullAccess
-        | protocol::CommandSandboxPolicy::ExternalSandbox { .. } => {
-            ShellSandboxMode::DangerFullAccess
+        protocol::CommandSandboxPolicy::DangerFullAccess => ShellSandboxMode::DangerFullAccess,
+        protocol::CommandSandboxPolicy::ExternalSandbox { .. } => {
+            // External sandboxes have no enforcement seam in this runtime;
+            // never reinterpret one as host full access.
+            ShellSandboxMode::ReadOnly {
+                network_access: false,
+                allow_global_read: false,
+            }
         }
         protocol::CommandSandboxPolicy::ReadOnly { network_access } => ShellSandboxMode::ReadOnly {
             network_access: *network_access,
@@ -34,7 +39,7 @@ fn shell_sandbox_mode_from_command_policy(
         },
         protocol::CommandSandboxPolicy::Default | protocol::CommandSandboxPolicy::Other => {
             ShellSandboxMode::WorkspaceWrite {
-                network_access: true,
+                network_access: false,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
             }
@@ -158,6 +163,15 @@ fn command_exec_sandbox_mode_inner(
         );
     }
     if options.sandbox_policy != protocol::CommandSandboxPolicy::Default {
+        if matches!(
+            options.sandbox_policy,
+            protocol::CommandSandboxPolicy::ExternalSandbox { .. }
+        ) {
+            return Err(
+                "external sandbox policy requires a broker-owned backend; refusing host execution"
+                    .to_string(),
+            );
+        }
         return Ok(CommandExecSandbox::new(
             shell_sandbox_mode_from_command_policy(&options.sandbox_policy),
         ));
@@ -184,7 +198,7 @@ fn default_sandbox_mode(mode: ApprovalMode) -> ShellSandboxMode {
             allow_global_read: true,
         },
         ApprovalMode::Suggest | ApprovalMode::AutoEdit => ShellSandboxMode::WorkspaceWrite {
-            network_access: true,
+            network_access: false,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         },
@@ -232,7 +246,7 @@ fn shell_sandbox_mode_from_permission_profile(
             allow_global_read: false,
         },
         Some("workspace") => ShellSandboxMode::WorkspaceWrite {
-            network_access: true,
+            network_access: false,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         },
@@ -643,6 +657,17 @@ fn materialize_profile_special_path(
 mod folder_trust_tests {
     use super::*;
 
+    fn test_run_config() -> RunConfig {
+        crate::command::config::assemble_run_config(
+            crate::command::config::RunConfigRequest::new(
+                "0.0.0-test",
+                std::env::current_dir().expect("cwd"),
+            ),
+            orca_core::config::file::FileConfig::default(),
+        )
+        .expect("test config")
+    }
+
     #[test]
     fn default_sandbox_matches_approval_mode() {
         assert_eq!(
@@ -655,7 +680,7 @@ mod folder_trust_tests {
         assert_eq!(
             default_sandbox_mode(ApprovalMode::AutoEdit),
             ShellSandboxMode::WorkspaceWrite {
-                network_access: true,
+                network_access: false,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
             }
@@ -744,5 +769,27 @@ mod folder_trust_tests {
             &protocol::CommandExecOptions::default(),
             None
         ));
+    }
+
+    #[test]
+    fn external_sandbox_policy_fails_closed_without_backend() {
+        let config = test_run_config();
+        let options = protocol::CommandExecOptions {
+            sandbox_policy: protocol::CommandSandboxPolicy::ExternalSandbox {
+                network_access: protocol::NetworkAccess::Restricted,
+            },
+            ..Default::default()
+        };
+
+        let error = command_exec_sandbox_mode(
+            &config,
+            &options,
+            None,
+            config.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            &[],
+            None,
+        )
+        .expect_err("external sandbox must not degrade to host execution");
+        assert!(error.contains("external sandbox policy"));
     }
 }

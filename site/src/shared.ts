@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.5";
+export const releaseVersion = "v0.4.6";
 
 export const releases = [
+  {
+    version: "v0.4.6",
+    date: "2026-08-29",
+    title: "Capability kernel and fail-closed execution",
+    body: "Freezes capability intersection and Plan ceilings, routes shell and MCP stdio launches through an execution broker, rejects workspace escapes and backend fallbacks, makes project execution settings non-authoritative, and keeps sandbox denial text explanatory instead of authority-bearing.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.6",
+  },
   {
     version: "v0.4.5",
     date: "2026-08-29",

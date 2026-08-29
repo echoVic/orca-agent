@@ -163,6 +163,18 @@ allowlist_commands = []
 
 配置 MCP（模型上下文协议）服务器，让 Orca 能够访问外部工具和数据源。
 
+每个 stdio 服务器都必须有明确的能力声明。省略时默认为只读且关闭网络；项目目录下的 `.orca/config.toml` 不能新增或替换 MCP 服务器，也不能改变执行权限。
+
+```toml
+[mcp.servers.capabilities]
+read = true
+write = false
+metadata_write = false
+network = false
+shell = false
+agent = false
+```
+
 ### 示例：Filesystem MCP
 
 ```toml

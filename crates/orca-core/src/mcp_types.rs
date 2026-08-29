@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::capability::CapabilitySet;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransportKind {
@@ -31,6 +33,10 @@ pub struct McpServerConfig {
     pub headers: HashMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Explicit user-owned capabilities for this integration. The default is
+    /// read-only; write/network/shell access must be granted deliberately.
+    #[serde(default)]
+    pub capabilities: CapabilitySet,
     #[serde(default)]
     pub startup_timeout_ms: Option<u64>,
     #[serde(default)]

@@ -30,6 +30,9 @@ impl ProcessJob {
     ///
     /// On Windows the child is created suspended, assigned to a Job Object,
     /// and only then resumed, so none of its code can run outside the job.
+    #[deprecated(
+        note = "direct process launch bypasses the capability kernel; use ExecutionBroker"
+    )]
     pub fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
         let (child, platform) = platform::ProcessJob::spawn(command, None)?;
         Ok((child, Self { platform }))
@@ -37,6 +40,9 @@ impl ProcessJob {
 
     /// Spawns a child atomically inside a named Windows Job Object. The name
     /// allows a later Orca process to reopen and verify the ownership boundary.
+    #[deprecated(
+        note = "direct process launch bypasses the capability kernel; use ExecutionBroker"
+    )]
     pub fn spawn_named(command: &mut Command, name: &str) -> io::Result<(Child, Self)> {
         let (child, platform) = platform::ProcessJob::spawn(command, Some(name))?;
         Ok((child, Self { platform }))

@@ -49,7 +49,7 @@ pub(crate) fn execute_runtime_normal_tool(
         && let Some(task_registry) = invocation.task_registry.as_ref()
     {
         return execute_bash_with_shell_session(RuntimeBashInvocationContext {
-            config: invocation.config.as_ref(),
+            config: &invocation.config,
             request: &invocation.request,
             cwd: &invocation.cwd,
             additional_roots: &invocation.additional_roots,
@@ -117,7 +117,7 @@ fn execute_command(
             command,
             cwd: &cwd,
             additional_roots: &invocation.additional_roots,
-            config: invocation.config.as_ref(),
+            config: &invocation.config,
             permission_overlay: &invocation.permission_overlay,
             terminal,
             #[cfg(test)]
@@ -181,13 +181,32 @@ fn resolve_workdir(base: &Path, workdir: Option<&Path>) -> Result<PathBuf, Strin
         Some(workdir) => base.join(workdir),
         None => base.to_path_buf(),
     };
-    if !cwd.is_dir() {
-        return Err(format!(
-            "workdir is not an existing directory: {}",
-            cwd.display()
-        ));
+    let identity = orca_core::workspace_identity::WorkspaceIdentity::new(base)
+        .map_err(|error| format!("invalid workspace root: {error:?}"))?;
+    identity.resolve_cwd(&cwd).map_err(|error| match error {
+        orca_core::workspace_identity::WorkspacePathError::OutsideWorkspace => {
+            format!("workdir is outside the workspace: {}", cwd.display())
+        }
+        other => format!("workdir rejected: {other:?}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workdir;
+
+    #[test]
+    fn rejects_absolute_workdir_outside_base_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&base).expect("base");
+        std::fs::create_dir_all(&outside).expect("outside");
+
+        let result = resolve_workdir(&base, Some(&outside));
+
+        assert!(result.is_err(), "outside workdir must be rejected");
     }
-    Ok(cwd)
 }
 
 fn yield_time(requested: Option<u64>, default_ms: u64) -> Duration {

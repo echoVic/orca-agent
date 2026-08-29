@@ -10,7 +10,6 @@ use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::tool_types::truncate_output;
-use orca_platform::process::ProcessJob;
 
 use super::LiveThread;
 #[cfg(not(test))]
@@ -644,11 +643,13 @@ fn search_roots_with_ripgrep(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     orca_tools::process::prepare_non_interactive_command(&mut command);
-    let (child, process_job) = match ProcessJob::spawn(&mut command) {
-        Ok(spawned) => spawned,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (child, process_job, _receipt) =
+        match orca_tools::process::spawn_user_trusted(command, "thread-store:search", &cwd) {
+            Ok(spawned) => spawned,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
     let output = orca_tools::process::wait_for_child_stdout_lines_with_timeout(
         child,
         process_job,
@@ -958,10 +959,6 @@ impl ThreadStore for JsonlThreadStore {
                     meta.network_domain_permissions = network_domain_permissions;
                     patched = true;
                 }
-                if let Some(unsandboxed_shell) = patch.unsandboxed_shell {
-                    meta.unsandboxed_shell = unsandboxed_shell;
-                    patched = true;
-                }
                 break;
             }
         }
@@ -1013,7 +1010,6 @@ impl ThreadStore for JsonlThreadStore {
             additional_working_directories: meta.additional_working_directories,
             metadata_writable_directories: meta.metadata_writable_directories,
             network_domain_permissions: meta.network_domain_permissions,
-            unsandboxed_shell: meta.unsandboxed_shell,
             message_count: stored_messages.len(),
             messages: projected_messages,
             turns,

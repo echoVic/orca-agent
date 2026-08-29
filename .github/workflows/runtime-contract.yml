@@ -11,6 +11,8 @@ on:
       - "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract*"
       - "scripts/validate-runtime-surface-contract.mjs"
       - "scripts/test-validate-runtime-surface-contract.mjs"
+      - "scripts/validate-execution-broker-boundary.mjs"
+      - "scripts/test-validate-execution-broker-boundary.mjs"
       - ".github/workflows/runtime-contract.yml"
       - ".github/workflows/release.yml"
       - ".github/workflows/windows-ci.yml"
@@ -23,6 +25,8 @@ on:
       - "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract*"
       - "scripts/validate-runtime-surface-contract.mjs"
       - "scripts/test-validate-runtime-surface-contract.mjs"
+      - "scripts/validate-execution-broker-boundary.mjs"
+      - "scripts/test-validate-execution-broker-boundary.mjs"
       - ".github/workflows/runtime-contract.yml"
       - ".github/workflows/release.yml"
       - ".github/workflows/windows-ci.yml"
@@ -47,6 +51,8 @@ jobs:
         run: |
           node scripts/test-validate-runtime-surface-contract.mjs
           node scripts/validate-runtime-surface-contract.mjs
+          node scripts/test-validate-execution-broker-boundary.mjs
+          node scripts/validate-execution-broker-boundary.mjs
       - name: Validate dependency graph and Rust inventory
         run: |
           cargo metadata --locked --format-version 1 > /dev/null

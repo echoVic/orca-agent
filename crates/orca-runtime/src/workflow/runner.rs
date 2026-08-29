@@ -1858,7 +1858,10 @@ impl WorkflowRunner {
         let mut sink = EventSink::new(event_buffer.clone(), OutputFormat::Jsonl);
         let instructions = instructions::load_for_cwd_or_default(cwd);
         let memory = memory::load_for_cwd(cwd);
-        let hooks = HookRunner::new(self.config.hooks.clone());
+        let hooks = HookRunner::new_with_capabilities(
+            self.config.hooks.clone(),
+            orca_core::capability::CapabilitySet::for_approval_mode(self.config.approval_mode),
+        );
         let child_request = ChildAgentRequest {
             prompt: call.prompt.clone(),
             subagent_type: SubagentType::General,

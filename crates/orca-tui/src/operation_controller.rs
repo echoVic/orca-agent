@@ -1072,22 +1072,7 @@ fn permission_kind(
     {
         return orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock;
     }
-    if profile
-        .file_system
-        .as_ref()
-        .and_then(|filesystem| filesystem.write.as_ref())
-        .is_some_and(|paths| !paths.is_empty())
-    {
-        return orca_runtime::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite;
-    }
-    profile
-        .shell
-        .as_ref()
-        .and_then(|shell| shell.unsandboxed.then_some(()))
-        .map(|_| {
-            orca_runtime::runtime_permission::RuntimePermissionRequestKind::UnsandboxedShellRetry
-        })
-        .unwrap_or(orca_runtime::runtime_permission::RuntimePermissionRequestKind::FilesystemWrite)
+    orca_runtime::runtime_permission::RuntimePermissionRequestKind::CapabilityBoundary
 }
 
 #[cfg(test)]

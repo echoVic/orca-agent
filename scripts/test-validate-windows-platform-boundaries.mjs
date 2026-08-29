@@ -375,22 +375,22 @@ for (const [boundaryId] of baseline.foundation_exceptions) {
 }
 
 const atomicJobSpawnContracts = [
-  ["crates/orca-core/src/verification.rs", "ProcessJob::spawn(&mut child_command)"],
-  ["crates/orca-mcp/src/transport.rs", "ProcessJob::spawn(&mut child_command)"],
-  ["crates/orca-runtime/src/hooks.rs", "ProcessJob::spawn(&mut command)"],
-  ["crates/orca-runtime/src/subagent_async_worker.rs", "ProcessJob::spawn_named(&mut command"],
-  ["crates/orca-runtime/src/workflow/host.rs", "ProcessJob::spawn(&mut command)"],
-  ["crates/orca-runtime/src/shell_session.rs", "ProcessJob::spawn(&mut process)"],
-  ["crates/orca-tools/src/bash.rs", "ProcessJob::spawn(&mut process_command)"],
-  ["crates/orca-tools/src/external.rs", "ProcessJob::spawn(&mut command)"],
-  ["crates/orca-tools/src/git.rs", "ProcessJob::spawn(&mut command)"],
-  ["crates/orca-tools/src/grep.rs", "ProcessJob::spawn(&mut command)"],
+  ["crates/orca-core/src/verification.rs", "launch_user_trusted("],
+  ["crates/orca-mcp/src/transport.rs", "launch_user_trusted("],
+  ["crates/orca-runtime/src/hooks.rs", "launch_user_trusted("],
+  ["crates/orca-runtime/src/subagent_async_worker.rs", "launch_user_trusted("],
+  ["crates/orca-runtime/src/workflow/host.rs", "launch_user_trusted("],
+  ["crates/orca-runtime/src/shell_session.rs", "broker.launch(process, capability)"],
+  ["crates/orca-tools/src/bash.rs", "spawn_with_capability("],
+  ["crates/orca-tools/src/external.rs", "spawn_with_capability("],
+  ["crates/orca-tools/src/git.rs", "spawn_user_trusted("],
+  ["crates/orca-tools/src/grep.rs", "spawn_user_trusted("],
 ];
 for (const [relativePath, marker] of atomicJobSpawnContracts) {
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   assert.ok(
     source.includes(marker),
-    `${relativePath} must create its Windows child inside the Job Object`,
+    `${relativePath} must enter the execution broker before creating its Windows child`,
   );
 }
 const verificationSource = readFileSync(

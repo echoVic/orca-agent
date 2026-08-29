@@ -41,6 +41,22 @@ impl ApprovalPolicy {
         tool: &str,
         target: Option<&str>,
     ) -> ApprovalResolution {
+        // Plan is a hard capability ceiling. Configuration rules can tighten
+        // it further, but they can never mint write, network, agent, or shell
+        // authority.
+        if self.mode == ApprovalMode::Plan
+            && matches!(
+                request.action,
+                ActionKind::Write | ActionKind::Network | ActionKind::Agent | ActionKind::Shell
+            )
+        {
+            return ApprovalResolution {
+                id: request.id.clone(),
+                decision: ApprovalDecision::Deny,
+                reason: format!("plan denies {}", request.action.as_str()),
+            };
+        }
+
         if let Some(decision) = self.rules.matching_decision(tool, target) {
             let approval_decision = match decision {
                 Decision::Allow => ApprovalDecision::Allow,
@@ -203,6 +219,28 @@ mod tests {
             policy.resolve(&make_request(ActionKind::Shell)).decision,
             ApprovalDecision::Deny
         );
+    }
+
+    #[test]
+    fn plan_mode_hard_ceiling_cannot_be_overridden_by_allow_rule() {
+        let policy = ApprovalPolicy::new(ApprovalMode::Plan).with_rules(vec![PermissionRule::new(
+            "bash",
+            "cargo *",
+            Decision::Allow,
+        )]);
+        let request = ApprovalRequest {
+            id: "plan-shell".to_string(),
+            action: ActionKind::Shell,
+            description: "plan must not execute shell".to_string(),
+            tool: Some("bash".to_string()),
+            target: Some("cargo test".to_string()),
+            preview: None,
+        };
+
+        let resolution = policy.resolve_for_tool(&request, "bash", Some("cargo test"));
+
+        assert_eq!(resolution.decision, ApprovalDecision::Deny);
+        assert!(resolution.reason.contains("plan"));
     }
 
     #[test]

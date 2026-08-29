@@ -3283,7 +3283,6 @@ mod tests {
                                             entries: None,
                                         }),
                                         network: None,
-                                        shell: None,
                                     },
                                 })?;
                             StandardInteractionOutcome::PermissionRequest(permission.decision)

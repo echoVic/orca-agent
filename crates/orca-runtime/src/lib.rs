@@ -1,3 +1,5 @@
+#![deny(deprecated)]
+
 pub mod acp;
 pub mod agent_child;
 pub mod agent_common;
@@ -25,6 +27,7 @@ pub use compaction::{
 mod acp_stall_trace;
 pub mod controller;
 pub mod cost;
+pub mod execution_broker;
 pub mod execution_journal;
 pub mod extension;
 pub mod goal_actor;
@@ -278,34 +281,33 @@ pub mod surface {
         SurfaceSessionPageCursor, SurfaceSessionReadBundle, SurfaceSessionSearchHit,
         SurfaceSessionSearchPage, SurfaceSessionSummary, SurfaceSessionSummaryPage,
         SurfaceSettingsDestination, SurfaceSettingsSnapshot, SurfaceSettlementId,
-        SurfaceSettlementReceipt, SurfaceShellPermissionProfile, SurfaceShutdownReason,
-        SurfaceSnapshot, SurfaceStreamId, SurfaceSubagent, SurfaceSubagentId,
-        SurfaceSubagentStatus, SurfaceSubagentTerminalStatus, SurfaceSubscriptionHandle,
-        SurfaceSubscriptionItem, SurfaceSubscriptionReceiver, SurfaceSubscriptionSealReason,
-        SurfaceTask, SurfaceTaskFence, SurfaceTaskId, SurfaceTaskRunningStatus, SurfaceTaskStatus,
-        SurfaceTaskType, SurfaceTerminalExitStatus, SurfaceThreadCreateSpec, SurfaceThreadId,
-        SurfaceThreadPage, SurfaceThreadPageCursor, SurfaceThreadSnapshot, SurfaceToolAction,
-        SurfaceToolCallId, SurfaceToolRequest, SurfaceToolResult, SurfaceToolResultKind,
-        SurfaceToolTerminal, SurfaceToolView, SurfaceToolViewState, SurfaceTurnId,
-        SurfaceUnavailableReason, SurfaceUsageSnapshot, SurfaceUserInputDecision,
-        SurfaceUserInputState, SurfaceValueError, SurfaceVerificationResult, SurfaceWorkflow,
-        SurfaceWorkflowAgent, SurfaceWorkflowAgentStatus, SurfaceWorkflowFence,
-        SurfaceWorkflowPhase, SurfaceWorkflowResult, SurfaceWorkflowResultId,
-        SurfaceWorkflowResultStatus, SurfaceWorkflowRunId, SurfaceWorkflowStatus,
-        SuspendedFinalizationCause, SuspensionCause, TaskControlAction, TaskControlOutput,
-        TaskPatch, TaskRevision, TerminalProjectionDeferredState, TerminalizationCause,
-        ThreadCursorAckRequirement, ThreadItemTurnFilter, ThreadOwnerEpoch, ThreadOwnershipLease,
-        ThreadPageCursor, ThreadPageQuery, ThreadPersistence, ThreadSettingsReceipt,
-        ToolInvocationRevision, ToolInvocationStarted, ToolInvocationStartedReceiptV1, ToolPatch,
-        ToolTerminalSource, TransferBackgroundOutput, TrustRevision, TurnItemsView,
-        TurnRequestBudgetScope, UnavailableMutationError, UncommittedMutation, Unit, UnixMillis,
-        UsageRevision, UsageTotals, Uuid, UuidV7, ValidatedInteractionResponse,
-        WaitOperationTerminalRequest, WaitOperationTerminalResult, WorkflowCatalogRevision,
-        WorkflowControlAction, WorkflowControlOutput, WorkflowPatch, WorkflowRevision,
-        ZeroizingProcessLocalSecret, canonical_batch_digest, canonical_batch_encoded_bytes,
-        canonical_event_digest, canonical_replayability_digest,
-        decide_post_materialization_recovery, preflight_batch, reconcile_finalize_intent,
-        reduce_batch, select_shutdown_cause,
+        SurfaceSettlementReceipt, SurfaceShutdownReason, SurfaceSnapshot, SurfaceStreamId,
+        SurfaceSubagent, SurfaceSubagentId, SurfaceSubagentStatus, SurfaceSubagentTerminalStatus,
+        SurfaceSubscriptionHandle, SurfaceSubscriptionItem, SurfaceSubscriptionReceiver,
+        SurfaceSubscriptionSealReason, SurfaceTask, SurfaceTaskFence, SurfaceTaskId,
+        SurfaceTaskRunningStatus, SurfaceTaskStatus, SurfaceTaskType, SurfaceTerminalExitStatus,
+        SurfaceThreadCreateSpec, SurfaceThreadId, SurfaceThreadPage, SurfaceThreadPageCursor,
+        SurfaceThreadSnapshot, SurfaceToolAction, SurfaceToolCallId, SurfaceToolRequest,
+        SurfaceToolResult, SurfaceToolResultKind, SurfaceToolTerminal, SurfaceToolView,
+        SurfaceToolViewState, SurfaceTurnId, SurfaceUnavailableReason, SurfaceUsageSnapshot,
+        SurfaceUserInputDecision, SurfaceUserInputState, SurfaceValueError,
+        SurfaceVerificationResult, SurfaceWorkflow, SurfaceWorkflowAgent,
+        SurfaceWorkflowAgentStatus, SurfaceWorkflowFence, SurfaceWorkflowPhase,
+        SurfaceWorkflowResult, SurfaceWorkflowResultId, SurfaceWorkflowResultStatus,
+        SurfaceWorkflowRunId, SurfaceWorkflowStatus, SuspendedFinalizationCause, SuspensionCause,
+        TaskControlAction, TaskControlOutput, TaskPatch, TaskRevision,
+        TerminalProjectionDeferredState, TerminalizationCause, ThreadCursorAckRequirement,
+        ThreadItemTurnFilter, ThreadOwnerEpoch, ThreadOwnershipLease, ThreadPageCursor,
+        ThreadPageQuery, ThreadPersistence, ThreadSettingsReceipt, ToolInvocationRevision,
+        ToolInvocationStarted, ToolInvocationStartedReceiptV1, ToolPatch, ToolTerminalSource,
+        TransferBackgroundOutput, TrustRevision, TurnItemsView, TurnRequestBudgetScope,
+        UnavailableMutationError, UncommittedMutation, Unit, UnixMillis, UsageRevision,
+        UsageTotals, Uuid, UuidV7, ValidatedInteractionResponse, WaitOperationTerminalRequest,
+        WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction,
+        WorkflowControlOutput, WorkflowPatch, WorkflowRevision, ZeroizingProcessLocalSecret,
+        canonical_batch_digest, canonical_batch_encoded_bytes, canonical_event_digest,
+        canonical_replayability_digest, decide_post_materialization_recovery, preflight_batch,
+        reconcile_finalize_intent, reduce_batch, select_shutdown_cause,
     };
 }
 mod runtime_tool_actor;
@@ -631,7 +633,6 @@ mod tests {
                             enabled: None,
                             domains,
                         }),
-                        shell: None,
                     },
                 },
             )

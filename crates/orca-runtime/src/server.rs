@@ -161,7 +161,6 @@ pub struct ServerThreadView {
     additional_working_directories: Vec<AdditionalWorkingDirectory>,
     metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
-    unsandboxed_shell: bool,
     mcp_registry: McpRegistry,
 }
 
@@ -184,10 +183,6 @@ impl ServerThreadView {
 
     pub fn network_domain_permissions(&self) -> &HashMap<String, PermissionProfileNetworkAccess> {
         &self.network_domain_permissions
-    }
-
-    pub fn unsandboxed_shell(&self) -> bool {
-        self.unsandboxed_shell
     }
 
     pub fn cwd(&self) -> &str {
@@ -570,17 +565,6 @@ fn handle_line<W: Write + Send + 'static>(
                     ServerEvent::error(reason),
                 )?;
             }
-            CommandExecDrainOutcome::FileSystemPermissionRequired {
-                request,
-                diagnostic,
-            } => {
-                request_command_exec_file_system_permission(
-                    state,
-                    request,
-                    diagnostic,
-                    &mut *writer,
-                )?;
-            }
             CommandExecDrainOutcome::Drained => {}
         }
     }
@@ -785,7 +769,6 @@ struct PersistedSessionPermissionGrant {
     additional_working_directories: Vec<orca_core::config::AdditionalWorkingDirectory>,
     metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions: HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
-    unsandboxed_shell: bool,
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -834,10 +817,6 @@ fn materialize_session_permission_grant(
         additional_working_directories: thread.additional_working_directories,
         metadata_writable_directories: thread.metadata_writable_directories,
         network_domain_permissions: thread.network_domain_permissions,
-        unsandboxed_shell: permissions
-            .shell
-            .as_ref()
-            .is_some_and(|shell| shell.unsandboxed),
     })
 }
 
@@ -885,7 +864,7 @@ fn run_shell_start<W: Write>(
         description: description.unwrap_or_else(|| command_text.clone()),
         terminal,
         sandbox: ShellSandboxMode::WorkspaceWrite {
-            network_access: true,
+            network_access: false,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         },
@@ -1261,14 +1240,34 @@ fn run_command_exec<W: Write>(
     } else {
         command[0].clone()
     };
-    let cwd = cwd.cloned().unwrap_or(server_cwd(&config.run_config)?);
+    let workspace_root = server_cwd(&config.run_config)?;
+    let requested_cwd = cwd.cloned().unwrap_or_else(|| workspace_root.clone());
+    let identity = match orca_core::workspace_identity::WorkspaceIdentity::new(&workspace_root) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(format!("workspace identity unavailable: {error:?}")),
+            );
+        }
+    };
+    let cwd = match identity.resolve_cwd(&requested_cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(format!("command/exec cwd rejected: {error:?}")),
+            );
+        }
+    };
     let (
         mut additional_working_directories,
         mut metadata_writable_directories,
         thread_permission_profile,
         runtime_workspace_roots,
         thread_network_domain_permissions,
-        thread_unsandboxed_shell,
     ) = match thread_id {
         Some(thread_id) => {
             state.prune_finished_turns();
@@ -1283,7 +1282,6 @@ fn run_command_exec<W: Write>(
                     thread.active_permission_profile().cloned(),
                     thread.runtime_workspace_roots().to_vec(),
                     thread.network_domain_permissions().clone(),
-                    thread.unsandboxed_shell(),
                 ),
                 None => {
                     return protocol::write_server_event(
@@ -1304,7 +1302,6 @@ fn run_command_exec<W: Write>(
                 .clone()
                 .unwrap_or_default(),
             HashMap::new(),
-            false,
         ),
     };
     let mut effective_sandbox = match command_exec_sandbox_mode(
@@ -1320,10 +1317,6 @@ fn run_command_exec<W: Write>(
             return protocol::write_server_event(writer, &id, ServerEvent::error(error));
         }
     };
-    if thread_unsandboxed_shell {
-        effective_sandbox.mode = ShellSandboxMode::DangerFullAccess;
-        effective_sandbox.denied_writable_roots.clear();
-    }
     for (domain, access) in thread_network_domain_permissions {
         match access {
             orca_core::config::PermissionProfileNetworkAccess::Deny => {
@@ -1403,7 +1396,6 @@ fn run_command_exec<W: Write>(
                 command_event_id: id.clone(),
                 command: command.to_vec(),
                 cwd: cwd.clone(),
-                denied_writable_roots: denied_writable_directories.clone(),
                 stream_output: terminal.is_pty() || options.stream_stdout_stderr,
                 output_bytes_cap: options
                     .output_bytes_cap
@@ -1523,14 +1515,6 @@ fn run_command_exec<W: Write>(
                     ServerEvent::error(reason),
                 );
             }
-            CommandExecDrainOutcome::FileSystemPermissionRequired {
-                request,
-                diagnostic,
-            } => {
-                return request_command_exec_file_system_permission(
-                    state, request, diagnostic, writer,
-                );
-            }
             CommandExecDrainOutcome::Drained => {}
         }
         return Ok(());
@@ -1560,14 +1544,8 @@ fn run_command_exec<W: Write>(
         }
     }
     if let Some(diagnostic) = diagnose_sandbox_denial(&cwd, &output.stdout, &output.stderr) {
-        if CommandExecPermissionPolicy::should_request_filesystem_retry(
-            &cwd,
-            &diagnostic,
-            &denied_writable_directories,
-        ) && let Some(request) = command_permission_request
-        {
-            return request_command_exec_file_system_permission(state, request, diagnostic, writer);
-        }
+        // Parsed process output is explanatory only; only a structured
+        // backend receipt may authorize a capability escalation.
         append_sandbox_diagnostic_to_stderr(&mut output.stderr, &diagnostic);
     }
     protocol::write_server_event(
@@ -1604,17 +1582,6 @@ fn request_command_exec_network_permission<W: Write>(
     request_command_exec_permission(state, request, reason, permissions, writer)
 }
 
-fn request_command_exec_file_system_permission<W: Write>(
-    state: &mut ServerState,
-    request: JsonlCommandExecPermissionRequest,
-    diagnostic: SandboxDenialDiagnostic,
-    writer: &mut W,
-) -> io::Result<()> {
-    let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
-    let (_origin, _kind, reason, permissions) = prompt.into_request_parts();
-    request_command_exec_permission(state, request, reason, permissions, writer)
-}
-
 fn request_command_exec_permission<W: Write>(
     state: &mut ServerState,
     request: JsonlCommandExecPermissionRequest,
@@ -1623,6 +1590,13 @@ fn request_command_exec_permission<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let thread_id = request.thread_id.clone();
+    let command_value = Value::Array(request.command.iter().cloned().map(Value::String).collect());
+    let cwd_value = request
+        .cwd
+        .as_ref()
+        .map(|path| Value::String(path.display().to_string()))
+        .unwrap_or(Value::Null);
+    let capability = command_capability_receipt(&request);
     let request_id = format!(
         "permission-command-{}",
         request
@@ -1646,6 +1620,9 @@ fn request_command_exec_permission<W: Write>(
         "turnId": Value::Null,
         "reason": &reason,
         "permissions": &permissions,
+        "command": &command_value,
+        "cwd": &cwd_value,
+        "capability": &capability,
     }))?;
     state
         .permission_routes
@@ -1659,6 +1636,9 @@ fn request_command_exec_permission<W: Write>(
             turn_id: Value::Null,
             reason: json!(reason),
             permissions: serde_json::to_value(&permissions).unwrap_or(Value::Null),
+            command: command_value,
+            cwd: cwd_value,
+            capability,
         },
     )?;
     writer.flush()?;
@@ -1667,11 +1647,85 @@ fn request_command_exec_permission<W: Write>(
         .mark_published(&request_id, frame_digest)
 }
 
+fn command_capability_receipt(request: &JsonlCommandExecPermissionRequest) -> Value {
+    let (write_roots, network, capabilities) = match &request.options.sandbox_policy {
+        protocol::CommandSandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            ..
+        } => (
+            writable_roots.clone(),
+            *network_access,
+            orca_core::capability::CapabilitySet {
+                read: true,
+                write: true,
+                metadata_write: false,
+                network: *network_access,
+                shell: true,
+                agent: false,
+            },
+        ),
+        protocol::CommandSandboxPolicy::ReadOnly { network_access } => (
+            Vec::new(),
+            *network_access,
+            orca_core::capability::CapabilitySet {
+                read: true,
+                write: false,
+                metadata_write: false,
+                network: *network_access,
+                shell: true,
+                agent: false,
+            },
+        ),
+        protocol::CommandSandboxPolicy::ExternalSandbox { network_access } => (
+            Vec::new(),
+            matches!(network_access, protocol::NetworkAccess::Enabled),
+            orca_core::capability::CapabilitySet::read_only(),
+        ),
+        protocol::CommandSandboxPolicy::DangerFullAccess => (
+            Vec::new(),
+            true,
+            orca_core::capability::CapabilitySet::all(),
+        ),
+        protocol::CommandSandboxPolicy::Default | protocol::CommandSandboxPolicy::Other => (
+            Vec::new(),
+            false,
+            orca_core::capability::CapabilitySet::workspace_write(),
+        ),
+    };
+    let enforcement = match &request.options.sandbox_policy {
+        protocol::CommandSandboxPolicy::ExternalSandbox { .. } => "unavailable",
+        protocol::CommandSandboxPolicy::DangerFullAccess => "advisory",
+        _ => match orca_tools::sandbox::enforcement_state() {
+            orca_core::capability::EnforcementState::Enforced => "enforced",
+            orca_core::capability::EnforcementState::Advisory => "advisory",
+            orca_core::capability::EnforcementState::Unavailable => "unavailable",
+        },
+    };
+    json!({
+        "requestId": &request.event_id,
+        "processClass": "sandboxed-tool",
+        "enforcement": enforcement,
+        "backend": "execution-broker",
+        "capabilities": serde_json::to_value(capabilities).unwrap_or(Value::Null),
+        "readRoots": &request.runtime_workspace_roots,
+        "writeRoots": write_roots,
+        "metadataRoots": [],
+        "deniedRoots": [],
+        "network": network,
+        "networkTargets": [],
+    })
+}
+
 fn append_sandbox_diagnostic_to_stderr(stderr: &mut String, diagnostic: &SandboxDenialDiagnostic) {
+    let message = format!(
+        "Sandbox diagnostic (process output, non-authoritative): {}",
+        diagnostic.message
+    );
     if stderr.trim_end().is_empty() {
-        *stderr = diagnostic.message.clone();
+        *stderr = message;
     } else {
-        stderr.push_str(&format!("\n\nSandbox diagnostic: {}", diagnostic.message));
+        stderr.push_str(&format!("\n\n{message}"));
     }
 }
 
@@ -1756,10 +1810,6 @@ fn run_command_exec_read<W: Write>(
             command_event_id,
             reason,
         } => protocol::write_server_event(writer, &command_event_id, ServerEvent::error(reason)),
-        CommandExecDrainOutcome::FileSystemPermissionRequired {
-            request,
-            diagnostic,
-        } => request_command_exec_file_system_permission(state, request, diagnostic, writer),
         CommandExecDrainOutcome::Drained => Ok(()),
     }
 }
@@ -3203,7 +3253,6 @@ mod tests {
                     command_event_id: Value::from("cmd-shell-list"),
                     command: test_command_argv("true"),
                     cwd: cwd.path().to_path_buf(),
-                    denied_writable_roots: Vec::new(),
                     stream_output: false,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -3664,6 +3713,7 @@ enabled = true
     }
 
     #[cfg(not(windows))]
+    #[ignore = "legacy permission retries require a structured backend denial receipt"]
     #[test]
     fn command_exec_inherited_profile_allowlist_miss_requests_permission_and_retries() {
         with_orca_home(|home| {
@@ -3791,6 +3841,7 @@ enabled = true
     }
 
     #[cfg(target_os = "macos")]
+    #[ignore = "legacy permission retries require a structured backend denial receipt"]
     #[test]
     fn command_exec_filesystem_sandbox_denial_requests_permission_and_retries() {
         assert!(
@@ -3922,6 +3973,7 @@ enabled = true
     }
 
     #[cfg(target_os = "macos")]
+    #[ignore = "legacy permission retries require a structured backend denial receipt"]
     #[test]
     fn command_exec_pathless_sandbox_denial_requests_unsandboxed_permission_and_retries() {
         assert!(
@@ -4064,6 +4116,7 @@ enabled = true
     }
 
     #[cfg(target_os = "macos")]
+    #[ignore = "legacy permission retries require a structured backend denial receipt"]
     #[test]
     fn command_exec_streaming_pathless_sandbox_denial_requests_unsandboxed_permission_and_retries()
     {
@@ -4158,6 +4211,7 @@ enabled = true
     }
 
     #[cfg(target_os = "macos")]
+    #[ignore = "legacy permission retries require a structured backend denial receipt"]
     #[test]
     fn command_exec_streaming_filesystem_sandbox_denial_requests_permission_and_retries() {
         assert!(
@@ -4265,6 +4319,7 @@ enabled = true
     }
 
     #[cfg(not(windows))]
+    #[ignore = "legacy permission retries require a structured backend denial receipt"]
     #[test]
     fn command_exec_streaming_permission_profile_block_requests_permission_and_retries_process() {
         with_orca_home(|home| {
@@ -4398,6 +4453,7 @@ enabled = true
     }
 
     #[cfg(not(windows))]
+    #[ignore = "legacy permission retries require a structured backend denial receipt"]
     #[test]
     fn command_exec_streaming_permission_profile_delayed_block_requests_permission_on_next_drain() {
         with_orca_home(|home| {
@@ -5355,7 +5411,6 @@ enabled = true
             command_event_id: Value::from("cmd"),
             command: test_command_argv("true"),
             cwd: std::env::temp_dir(),
-            denied_writable_roots: Vec::new(),
             stream_output: false,
             output_bytes_cap: None,
             output_offset: 0,
@@ -8286,19 +8341,6 @@ rl.on("line", (line) => {
                         ServerEvent::error(reason),
                     )
                     .expect("write network denial");
-                }
-                CommandExecDrainOutcome::FileSystemPermissionRequired {
-                    request,
-                    diagnostic,
-                } => {
-                    let mut output = writer.lock().expect("writer");
-                    request_command_exec_file_system_permission(
-                        state,
-                        request,
-                        diagnostic,
-                        &mut *output,
-                    )
-                    .expect("request file-system permission");
                 }
                 CommandExecDrainOutcome::Drained => {}
             }

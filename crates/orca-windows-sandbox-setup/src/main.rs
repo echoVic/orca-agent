@@ -1,3 +1,5 @@
+#![deny(deprecated)]
+
 use std::io::{self, BufRead, Write as _};
 use std::path::PathBuf;
 

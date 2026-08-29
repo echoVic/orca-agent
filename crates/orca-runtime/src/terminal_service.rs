@@ -12,9 +12,11 @@ use serde::Serialize;
 
 use crate::lifecycle::TurnPermissionOverlay;
 use crate::network_proxy::{RuntimeNetworkPolicy, RuntimeNetworkProxy};
+#[cfg(test)]
+use crate::shell_session::ShellSandboxMode;
 use crate::shell_session::{
-    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellSessionHandle,
-    ShellSessionOutput, ShellSessionTermination, ShellTerminalMode,
+    RuntimeShellSessionManager, ShellSessionCommand, ShellSessionHandle, ShellSessionOutput,
+    ShellSessionTermination, ShellTerminalMode,
 };
 use crate::tasks::TaskRegistry;
 
@@ -91,7 +93,7 @@ pub(crate) struct TerminalExecRequest<'a> {
     pub(crate) command: &'a str,
     pub(crate) cwd: &'a Path,
     pub(crate) additional_roots: &'a [PathBuf],
-    pub(crate) config: Option<&'a RunConfig>,
+    pub(crate) config: &'a RunConfig,
     pub(crate) permission_overlay: &'a TurnPermissionOverlay,
     pub(crate) terminal: ShellTerminalMode,
     #[cfg(test)]
@@ -637,20 +639,8 @@ fn prepare_shell_command(
     Vec<PathBuf>,
     Option<RuntimeNetworkProxy>,
 )> {
-    let mut sandbox = match request.config {
-        Some(config) => {
-            crate::server::bash_sandbox_for_cwd(config, request.cwd).map_err(io::Error::other)?
-        }
-        None => crate::server::CommandExecSandbox {
-            mode: ShellSandboxMode::default(),
-            additional_readable_roots: Vec::new(),
-            additional_writable_roots: Vec::new(),
-            metadata_writable_roots: Vec::new(),
-            denied_writable_roots: Vec::new(),
-            allowed_unix_socket_roots: Vec::new(),
-            network_policy_domains: HashMap::new(),
-        },
-    };
+    let mut sandbox = crate::server::bash_sandbox_for_cwd(request.config, request.cwd)
+        .map_err(io::Error::other)?;
     #[cfg(test)]
     if let Some(sandbox_override) = request.sandbox_override {
         sandbox.mode = sandbox_override;
@@ -778,11 +768,18 @@ mod tests {
         overlay: &'a TurnPermissionOverlay,
         terminal: ShellTerminalMode,
     ) -> TerminalExecRequest<'a> {
+        let config = Box::leak(Box::new(
+            crate::command::config::assemble_run_config(
+                crate::command::config::RunConfigRequest::new("0.0.0-test", cwd.to_path_buf()),
+                orca_core::config::file::FileConfig::default(),
+            )
+            .expect("test config"),
+        ));
         TerminalExecRequest {
             command,
             cwd,
             additional_roots: &[],
-            config: None,
+            config,
             permission_overlay: overlay,
             terminal,
             sandbox_override: Some(ShellSandboxMode::DangerFullAccess),

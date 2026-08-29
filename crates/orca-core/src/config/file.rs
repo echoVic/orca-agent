@@ -203,6 +203,8 @@ pub struct WorkflowFileConfig {
     pub workflow_keyword_trigger_enabled: Option<bool>,
     #[serde(default)]
     pub teams: HashMap<String, WorkflowTeamConfig>,
+    #[serde(default)]
+    pub capabilities: Option<crate::capability::CapabilitySet>,
 }
 
 impl WorkflowFileConfig {
@@ -239,6 +241,9 @@ impl WorkflowFileConfig {
             .iter()
             .map(|(name, policy)| (name.clone(), policy.clone().normalized()))
             .collect();
+        if let Some(capabilities) = &self.capabilities {
+            config.capabilities = capabilities.clone();
+        }
 
         config
     }
@@ -397,9 +402,25 @@ fn merge_toml_values(base: &mut Value, overlay: Value) {
 
 fn remove_project_denied_fields(value: &mut Value) {
     if let Some(table) = value.as_table_mut() {
-        table.remove("api_key");
-        table.remove("base_url");
-        table.remove("hooks");
+        // Project files may tune presentation and model selection, but the
+        // user-owned config remains authoritative for every capability or
+        // process-launching surface.
+        for key in [
+            "api_key",
+            "base_url",
+            "mode",
+            "permissions",
+            "permission_profiles",
+            "mcp_servers",
+            "hooks",
+            "external_tools",
+            "subagents",
+            "workflows",
+            "tools",
+            "budget",
+        ] {
+            table.remove(key);
+        }
     }
 }
 
@@ -1308,15 +1329,83 @@ decision = "allow"
         assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(
             config.mode,
-            Some(crate::approval_types::ApprovalMode::FullAuto)
+            Some(crate::approval_types::ApprovalMode::Suggest)
         );
         assert_eq!(config.api_key.as_deref(), Some("sk-user"));
         assert_eq!(config.base_url.as_deref(), Some("https://user.example"));
         assert_eq!(config.hooks.len(), 1);
         assert_eq!(config.hooks[0].command, "echo user");
-        assert_eq!(config.permissions.rules.len(), 1);
+        assert_eq!(config.permissions.rules.len(), 0);
         assert_eq!(config.tools.max_read_parallel, 4);
         assert_eq!(config.tools.shell_timeout_secs, 77);
+    }
+
+    #[test]
+    fn trusted_project_config_cannot_change_execution_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        std::fs::write(
+            &user_path,
+            r#"
+model = "deepseek-v4-pro"
+mode = "suggest"
+
+[[permissions.rules]]
+tool = "bash"
+pattern = "rm -rf *"
+decision = "deny"
+
+[workflows]
+enabled = false
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join(".orca/config.toml"),
+            r#"
+model = "deepseek-v4-flash"
+mode = "full-auto"
+
+[[permissions.rules]]
+tool = "bash"
+pattern = "cargo *"
+decision = "allow"
+
+[[hooks]]
+event = "post_tool_use"
+tool = "bash"
+command = "echo project"
+
+[[mcp_servers]]
+name = "project-server"
+command = "untrusted"
+
+[workflows]
+enabled = true
+"#,
+        )
+        .unwrap();
+        crate::config::folder_trust::set_trust_with_config_dir(
+            &project_dir,
+            dir.path(),
+            crate::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+
+        let config = load_layered_config_from_paths(&user_path, &project_dir);
+
+        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(
+            config.mode,
+            Some(crate::approval_types::ApprovalMode::Suggest)
+        );
+        assert_eq!(config.permissions.rules.len(), 1);
+        assert_eq!(config.permissions.rules[0].pattern, "rm -rf *");
+        assert!(config.hooks.is_empty());
+        assert!(config.mcp_servers.is_empty());
+        assert!(!config.workflows.resolved().enabled);
     }
 
     #[test]
@@ -1427,16 +1516,11 @@ decision = "allow"
 
         let config = load_layered_config_from_paths(&user_path, &project_dir);
 
-        assert_eq!(config.permissions.rules.len(), 2);
+        assert_eq!(config.permissions.rules.len(), 1);
         assert_eq!(config.permissions.rules[0].pattern, "rm -rf *");
         assert_eq!(
             config.permissions.rules[0].decision,
             crate::approval_types::Decision::Deny
-        );
-        assert_eq!(config.permissions.rules[1].pattern, "cargo *");
-        assert_eq!(
-            config.permissions.rules[1].decision,
-            crate::approval_types::Decision::Allow
         );
     }
 
@@ -1474,7 +1558,7 @@ workflowKeywordTriggerEnabled = true
         let config = load_layered_config_from_paths(&user_path, &project_dir);
         let workflows = config.workflows.resolved();
 
-        assert!(workflows.enabled);
-        assert!(workflows.keyword_trigger_enabled);
+        assert!(!workflows.enabled);
+        assert!(!workflows.keyword_trigger_enabled);
     }
 }

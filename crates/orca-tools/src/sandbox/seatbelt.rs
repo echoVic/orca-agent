@@ -1,11 +1,12 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use crate::sandbox::{ReadOnlySandboxCommandContext, WorkspaceWriteSandboxCommandContext};
 
 static SEATBELT_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static SEATBELT_ENFORCED_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 /// Absolute path to the macOS Seatbelt binary. Invoking it by absolute path
 /// (rather than resolving `sandbox-exec` via `PATH`) prevents a spoofed
@@ -260,8 +261,27 @@ pub fn available() -> bool {
     })
 }
 
+/// Probe the actual restrictive path used for tool execution. A permissive
+/// binary probe is insufficient in privileged/container runtimes where the
+/// kernel refuses to install a sandbox profile.
+pub fn enforced_available() -> bool {
+    *SEATBELT_ENFORCED_AVAILABLE.get_or_init(|| {
+        Command::new(SEATBELT_EXECUTABLE)
+            .arg("-p")
+            .arg(
+                "(version 1) (deny default) (allow process*) (allow sysctl-read) (allow file-read* (literal \"/dev/null\"))",
+            )
+            .arg("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
 pub fn platform_default_read_roots() -> Vec<PathBuf> {
-    ["/bin", "/sbin", "/usr", "/System", "/Library"]
+    ["/bin", "/sbin", "/usr", "/System", "/Library", "/etc"]
         .into_iter()
         .map(PathBuf::from)
         .collect()
@@ -280,10 +300,13 @@ fn build_workspace_write_profile(context: WorkspaceWriteProfileContext<'_>) -> S
         allowed_unix_socket_roots,
     } = context;
     let mut profile = SeatbeltProfileBuilder::new();
-    profile.push_rule("(allow file-read*)");
     let cwd_param = profile.path_parameter("WORKSPACE", cwd);
+    append_read_allow_rules(&mut profile, &[cwd.to_path_buf()]);
+    append_path_ancestor_metadata_rules(&mut profile, cwd);
     profile.push_rule(format!("(allow file-write* (subpath {cwd_param}))"));
+    append_read_allow_rules(&mut profile, &platform_default_read_roots());
     append_read_allow_rules(&mut profile, readable_roots);
+    append_read_allow_rules(&mut profile, additional_roots);
     if !exclude_tmpdir_env_var && let Some(path) = std::env::var_os("TMPDIR").map(PathBuf::from) {
         let path = path.canonicalize().unwrap_or(path);
         append_write_allow_rule(&mut profile, "TMPDIR", &path);
@@ -332,7 +355,10 @@ fn build_read_only_profile(context: ReadOnlyProfileContext<'_>) -> SeatbeltProfi
         profile.push_rule("(allow file-read*)");
     }
     profile.push_rule("(allow file-read* (literal \"/\"))");
+    append_read_allow_rules(&mut profile, &[cwd.to_path_buf()]);
+    append_path_ancestor_metadata_rules(&mut profile, cwd);
     append_read_allow_rules(&mut profile, readable_roots);
+    append_read_allow_rules(&mut profile, additional_roots);
     append_write_allow_rules(&mut profile, "WRITABLE_ROOT", additional_roots);
     append_protected_metadata_name_deny_rule(&mut profile);
     append_protected_workspace_metadata_deny_rules(&mut profile, cwd);
@@ -396,6 +422,16 @@ fn append_read_allow_rules(profile: &mut SeatbeltProfileBuilder, readable_roots:
     for root in readable_roots {
         let path = profile.path_parameter("READABLE_ROOT", root);
         profile.push_rule(format!("(allow file-read* (subpath {path}))"));
+    }
+}
+
+fn append_path_ancestor_metadata_rules(profile: &mut SeatbeltProfileBuilder, path: &Path) {
+    for ancestor in path.ancestors() {
+        let parameter = profile.path_parameter("PATH_ANCESTOR", ancestor);
+        profile.push_rule(format!("(allow file-read-metadata (literal {parameter}))"));
+        if ancestor == Path::new("/") {
+            break;
+        }
     }
 }
 
@@ -727,6 +763,7 @@ mod tests {
         });
         assert!(content.contains("(version 1)"));
         assert!(content.contains(&workspace.path().display().to_string()));
+        assert!(!content.contains("\n(allow file-read*)\n"));
         assert!(content.contains(r#"(allow file-read* file-write* (literal "/dev/null"))"#));
     }
 

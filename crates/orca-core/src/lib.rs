@@ -1,12 +1,16 @@
+#![deny(deprecated)]
+
 pub mod approval_rules;
 pub mod approval_types;
 pub mod budget;
 pub mod cancel;
+pub mod capability;
 pub mod config;
 pub mod conversation;
 pub mod cost_types;
 pub mod event_schema;
 pub mod event_sink;
+pub mod execution_broker;
 pub mod external_config;
 pub mod goal_runtime;
 pub mod goal_types;
@@ -25,6 +29,7 @@ pub mod thread_item_projection;
 pub mod tool_types;
 pub mod verification;
 pub mod workflow_types;
+pub mod workspace_identity;
 
 #[cfg(test)]
 mod proposed_plan_tests {

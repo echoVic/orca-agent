@@ -15,10 +15,12 @@ use orca_platform::process::ProcessJob;
 use std::os::unix::process::CommandExt;
 
 use orca_core::cancel::CancelToken;
+use orca_core::capability::CapabilitySet;
 use orca_core::config::RunConfig;
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
+use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_core::tool_types;
@@ -295,7 +297,10 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
     );
     let instructions = instructions::load_for_cwd_or_default(&cwd);
     let memory = memory::load_for_cwd(&cwd);
-    let hooks = HookRunner::new(config.hooks.clone());
+    let hooks = HookRunner::new_with_capabilities(
+        config.hooks.clone(),
+        CapabilitySet::for_approval_mode(config.approval_mode),
+    );
     let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
     let cancel = CancelToken::new();
     let child_request = ChildAgentRequest {
@@ -921,6 +926,7 @@ fn spawn_async_subagent_worker(
             cwd,
             agent_id,
             api_key,
+            CapabilitySet::for_approval_mode(config.approval_mode),
         );
     }
     #[cfg(not(windows))]
@@ -939,8 +945,22 @@ fn spawn_async_subagent_worker(
             .args(&worker_args)
             .env_remove("ORCA_API_KEY")
             .env_remove("DEEPSEEK_API_KEY");
-        let (mut child, process_job) =
-            ProcessJob::spawn(&mut command).map_err(|error| error.to_string())?;
+        let broker = ExecutionBroker::with_backend(
+            orca_core::capability::EnforcementState::Advisory,
+            "subagent-user-trusted",
+        );
+        let launched = broker
+            .launch_user_trusted(
+                command,
+                format!("subagent:{agent_id}"),
+                cwd,
+                CapabilitySet::for_approval_mode(config.approval_mode),
+            )
+            .map_err(|error| match error {
+                LaunchError::Spawn(error) => error.to_string(),
+                other => format!("{other:?}"),
+            })?;
+        let (mut child, process_job) = (launched.child, launched.process_job);
         handoff_async_subagent_worker_api_key(&mut child, api_key)?;
         Ok((child, process_job))
     }
@@ -953,6 +973,7 @@ fn spawn_async_subagent_worker_via_runner(
     cwd: &Path,
     agent_id: &str,
     api_key: Option<&str>,
+    capabilities: CapabilitySet,
 ) -> Result<(Child, ProcessJob), String> {
     let executable_dir = current_exe
         .parent()
@@ -982,9 +1003,20 @@ fn spawn_async_subagent_worker_via_runner(
         .stderr(Stdio::null())
         .env_remove("ORCA_API_KEY")
         .env_remove("DEEPSEEK_API_KEY");
-    let (mut child, process_job) =
-        ProcessJob::spawn_named(&mut command, &crate::tasks::async_worker_job_name(agent_id))
-            .map_err(|error| format!("failed to spawn Windows runner: {error}"))?;
+    let broker = ExecutionBroker::with_backend(
+        orca_core::capability::EnforcementState::Advisory,
+        "subagent-windows-runner",
+    );
+    let launched = broker
+        .launch_user_trusted_named(
+            command,
+            format!("subagent:{agent_id}"),
+            cwd,
+            capabilities,
+            &crate::tasks::async_worker_job_name(agent_id),
+        )
+        .map_err(|error| format!("failed to spawn Windows runner: {error:?}"))?;
+    let (mut child, process_job) = (launched.child, launched.process_job);
     let result = child
         .stdin
         .take()

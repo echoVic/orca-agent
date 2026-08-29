@@ -7,14 +7,11 @@ use orca_core::config::PermissionProfileNetworkAccess;
 
 use crate::network_proxy::RuntimeNetworkBlockReport;
 use crate::protocol::{
-    PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
-    RequestNetworkPermissions, RequestPermissionProfile, RequestShellPermissions,
+    PermissionGrantScope, PermissionResponseDecision, RequestNetworkPermissions,
+    RequestPermissionProfile,
 };
 
 pub(crate) const SESSION_METADATA_DIRECTORY_SOURCE: &str = "session-metadata";
-use crate::sandbox_denial::{
-    SandboxDenialDiagnostic, should_request_filesystem_permission_with_denied_roots,
-};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimePermissionRequest {
@@ -74,8 +71,7 @@ impl RuntimePermissionOrigin {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimePermissionRequestKind {
     NetworkBlock,
-    FilesystemWrite,
-    UnsandboxedShellRetry,
+    CapabilityBoundary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,89 +162,9 @@ impl RuntimePermissionPolicy {
                         enabled: None,
                         domains,
                     }),
-                    shell: None,
                 },
             },
         })
-    }
-
-    pub fn filesystem_write_decision(
-        request_id: &str,
-        origin: RuntimePermissionOrigin,
-        diagnostic: &SandboxDenialDiagnostic,
-    ) -> Option<RuntimePermissionDecision> {
-        let write_root = diagnostic.suggested_write_root.as_ref()?.clone();
-        Some(RuntimePermissionDecision {
-            origin,
-            kind: RuntimePermissionRequestKind::FilesystemWrite,
-            request: RuntimePermissionRequest {
-                id: request_id.to_string(),
-                reason: Some(format!(
-                    "{} attempted filesystem write outside the current sandbox: {}",
-                    origin.label(),
-                    write_root.display()
-                )),
-                permissions: RequestPermissionProfile {
-                    file_system: Some(RequestFileSystemPermissions {
-                        read: None,
-                        write: Some(vec![write_root]),
-                        entries: None,
-                    }),
-                    network: None,
-                    shell: None,
-                },
-            },
-        })
-    }
-
-    pub fn unsandboxed_shell_decision(
-        request_id: &str,
-        origin: RuntimePermissionOrigin,
-        diagnostic: &SandboxDenialDiagnostic,
-    ) -> Option<RuntimePermissionDecision> {
-        if diagnostic.suggested_write_root.is_some() {
-            return None;
-        }
-
-        Some(RuntimePermissionDecision {
-            origin,
-            kind: RuntimePermissionRequestKind::UnsandboxedShellRetry,
-            request: RuntimePermissionRequest {
-                id: request_id.to_string(),
-                reason: Some(format!(
-                    "{} needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant",
-                    origin.label()
-                )),
-                permissions: RequestPermissionProfile {
-                    file_system: None,
-                    network: None,
-                    shell: Some(RequestShellPermissions { unsandboxed: true }),
-                },
-            },
-        })
-    }
-
-    pub fn sandbox_denial_decision(
-        request_id: &str,
-        origin: RuntimePermissionOrigin,
-        diagnostic: &SandboxDenialDiagnostic,
-    ) -> RuntimePermissionDecision {
-        Self::filesystem_write_decision(request_id, origin, diagnostic).unwrap_or_else(|| {
-            Self::unsandboxed_shell_decision(request_id, origin, diagnostic)
-                .expect("pathless sandbox denial should request unsandboxed shell retry")
-        })
-    }
-
-    pub(crate) fn should_request_filesystem_retry(
-        cwd: &std::path::Path,
-        diagnostic: &SandboxDenialDiagnostic,
-        denied_writable_roots: &[PathBuf],
-    ) -> bool {
-        should_request_filesystem_permission_with_denied_roots(
-            cwd,
-            diagnostic,
-            denied_writable_roots,
-        ) || diagnostic.suggested_write_root.is_none()
     }
 }
 
@@ -274,7 +190,6 @@ pub struct TurnPermissionOverlay {
     metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions:
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
-    unsandboxed_shell: bool,
     strict_auto_review: bool,
     preapproved_tool_call_id: Option<String>,
 }
@@ -285,7 +200,6 @@ pub struct TurnPermissionOverlayDelta {
     metadata_writable_directories: Vec<PathBuf>,
     network_domain_permissions:
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
-    unsandboxed_shell: bool,
     strict_auto_review: bool,
 }
 
@@ -307,10 +221,6 @@ impl TurnPermissionOverlayDelta {
     pub fn strict_auto_review(&self) -> bool {
         self.strict_auto_review
     }
-
-    pub fn unsandboxed_shell(&self) -> bool {
-        self.unsandboxed_shell
-    }
 }
 
 impl TurnPermissionOverlay {
@@ -330,10 +240,6 @@ impl TurnPermissionOverlay {
 
     pub fn strict_auto_review(&self) -> bool {
         self.strict_auto_review
-    }
-
-    pub fn unsandboxed_shell(&self) -> bool {
-        self.unsandboxed_shell
     }
 
     pub(crate) fn set_preapproved_tool_call_id(&mut self, id: Option<String>) {
@@ -363,7 +269,6 @@ impl TurnPermissionOverlay {
             self.network_domain_permissions
                 .insert(domain.clone(), *access);
         }
-        self.unsandboxed_shell |= other.unsandboxed_shell;
         self.strict_auto_review |= other.strict_auto_review;
     }
 
@@ -392,7 +297,6 @@ impl TurnPermissionOverlay {
             additional_working_directories,
             metadata_writable_directories,
             network_domain_permissions,
-            unsandboxed_shell: self.unsandboxed_shell && !baseline.unsandboxed_shell,
             strict_auto_review: self.strict_auto_review && !baseline.strict_auto_review,
         }
     }
@@ -412,7 +316,6 @@ impl TurnPermissionOverlay {
             self.network_domain_permissions
                 .insert(domain.clone(), *access);
         }
-        self.unsandboxed_shell |= delta.unsandboxed_shell;
         self.strict_auto_review |= delta.strict_auto_review;
     }
 
@@ -484,13 +387,6 @@ impl TurnPermissionOverlay {
             }
         }
         self.merge_network_permissions(permissions);
-        if permissions
-            .shell
-            .as_ref()
-            .is_some_and(|shell| shell.unsandboxed)
-        {
-            self.unsandboxed_shell = true;
-        }
     }
 }
 
@@ -504,7 +400,6 @@ mod tests {
 
     use crate::network_proxy::RuntimeNetworkBlockReport;
     use crate::protocol::{RequestFileSystemPermissions, RequestPermissionProfile};
-    use crate::sandbox_denial::SandboxDenialDiagnostic;
 
     use super::{
         RuntimePermissionEvaluation, RuntimePermissionOrigin, RuntimePermissionPolicy,
@@ -522,27 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_capability_is_reusable_and_survives_permission_delta() {
-        let mut overlay = TurnPermissionOverlay::default();
-        overlay.merge_permissions(&RequestPermissionProfile {
-            shell: Some(crate::protocol::RequestShellPermissions { unsandboxed: true }),
-            ..Default::default()
-        });
-
-        assert!(overlay.unsandboxed_shell());
-
-        let baseline = TurnPermissionOverlay::default();
-        let delta = overlay.delta_from(&baseline);
-        assert!(delta.unsandboxed_shell());
-
-        let mut restored = baseline;
-        restored.apply_delta(&delta);
-        assert!(restored.unsandboxed_shell());
-        assert_eq!(restored.preapproved_tool_call_id, None);
-    }
-
-    #[test]
-    fn unrelated_permission_delta_does_not_grant_unsandboxed_shell() {
+    fn permission_overlay_only_carries_scoped_capabilities() {
         let baseline = TurnPermissionOverlay::default();
         let mut current = baseline.clone();
         current.merge_permissions(&RequestPermissionProfile {
@@ -557,11 +432,13 @@ mod tests {
         });
 
         let delta = current.delta_from(&baseline);
-        assert!(!delta.unsandboxed_shell());
 
         let mut restored = baseline;
         restored.apply_delta(&delta);
-        assert!(!restored.unsandboxed_shell());
+        assert_eq!(
+            restored.network_domain_permissions(),
+            current.network_domain_permissions()
+        );
     }
 
     #[test]
@@ -627,7 +504,6 @@ mod tests {
                 "api.example.com".to_string(),
                 PermissionProfileNetworkAccess::Allow,
             )]),
-            unsandboxed_shell: false,
             strict_auto_review: false,
             preapproved_tool_call_id: Some("approval-only".to_string()),
         };
@@ -647,7 +523,6 @@ mod tests {
                     PermissionProfileNetworkAccess::Deny,
                 ),
             ]),
-            unsandboxed_shell: false,
             strict_auto_review: true,
             preapproved_tool_call_id: None,
         };
@@ -784,73 +659,6 @@ mod tests {
                 .as_ref()
                 .and_then(|network| network.domains.get("api.orca.invalid")),
             Some(&orca_core::config::PermissionProfileNetworkAccess::Allow)
-        );
-    }
-
-    #[test]
-    fn runtime_permission_policy_builds_sandbox_denial_requests() {
-        let write_diagnostic = SandboxDenialDiagnostic {
-            denied_path: Some(PathBuf::from("/repo/.git/index.lock")),
-            suggested_write_root: Some(PathBuf::from("/repo/.git")),
-            message: "sandbox denied filesystem access".to_string(),
-        };
-        let pathless_diagnostic = SandboxDenialDiagnostic {
-            denied_path: None,
-            suggested_write_root: None,
-            message: "sandbox denied filesystem access".to_string(),
-        };
-
-        let write_decision = RuntimePermissionPolicy::sandbox_denial_decision(
-            "permission-1",
-            RuntimePermissionOrigin::Bash,
-            &write_diagnostic,
-        );
-        let unsandboxed_decision = RuntimePermissionPolicy::sandbox_denial_decision(
-            "permission-2",
-            RuntimePermissionOrigin::CommandExec,
-            &pathless_diagnostic,
-        );
-
-        assert_eq!(write_decision.origin, RuntimePermissionOrigin::Bash);
-        assert_eq!(
-            write_decision.kind,
-            RuntimePermissionRequestKind::FilesystemWrite
-        );
-        assert_eq!(
-            write_decision
-                .request
-                .permissions
-                .file_system
-                .as_ref()
-                .and_then(|file_system| file_system.write.as_ref()),
-            Some(&vec![PathBuf::from("/repo/.git")])
-        );
-        assert_eq!(
-            write_decision.request.reason.as_deref(),
-            Some("bash attempted filesystem write outside the current sandbox: /repo/.git")
-        );
-        assert_eq!(
-            unsandboxed_decision.origin,
-            RuntimePermissionOrigin::CommandExec
-        );
-        assert_eq!(
-            unsandboxed_decision.kind,
-            RuntimePermissionRequestKind::UnsandboxedShellRetry
-        );
-        assert_eq!(
-            unsandboxed_decision
-                .request
-                .permissions
-                .shell
-                .as_ref()
-                .map(|shell| shell.unsandboxed),
-            Some(true)
-        );
-        assert_eq!(
-            unsandboxed_decision.request.reason.as_deref(),
-            Some(
-                "command/exec needs to re-run without the filesystem sandbox because the sandbox denied access but did not report a filesystem path to grant"
-            )
         );
     }
 

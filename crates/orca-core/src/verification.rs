@@ -18,6 +18,8 @@ use orca_platform::process::ProcessJob;
 use orca_platform::process::read_child_pipe_interruptibly;
 use orca_platform::shell::{ShellResolver, ShellSpec};
 
+use crate::capability::CapabilitySet;
+use crate::execution_broker::{ExecutionBroker, LaunchError};
 use crate::retained_output::{
     DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
 };
@@ -48,11 +50,37 @@ fn run_with_timeout(command: &str, timeout: Duration) -> VerificationResult {
             };
         }
     };
-    let mut child_command = build_verifier_command(&shell, command);
+    let child_command = build_verifier_command(&shell, command);
 
-    let output = ProcessJob::spawn(&mut child_command).and_then(|(child, process_job)| {
-        wait_for_child_output_with_timeout(child, process_job, timeout)
-    });
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let broker = ExecutionBroker::with_backend(
+        crate::capability::EnforcementState::Advisory,
+        "verification-user-trusted",
+    );
+    let output = broker
+        .launch_user_trusted(
+            child_command,
+            "verification",
+            cwd,
+            CapabilitySet::read_only(),
+        )
+        .map(|launched| (launched.child, launched.process_job))
+        .and_then(|(child, process_job)| {
+            wait_for_child_output_with_timeout(child, process_job, timeout)
+                .map_err(LaunchError::Spawn)
+        })
+        .map_err(|error| match error {
+            LaunchError::Cwd(error) => error,
+            LaunchError::Spawn(error) => error,
+            LaunchError::EnforcementUnavailable
+            | LaunchError::EnforcementAdvisory
+            | LaunchError::UntrustedProcessClass
+            | LaunchError::CapabilityCeilingExceeded
+            | LaunchError::NetworkTargetsUnsupported => io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("verification broker rejected launch: {error:?}"),
+            ),
+        });
 
     match output {
         Ok(output) => VerificationResult {

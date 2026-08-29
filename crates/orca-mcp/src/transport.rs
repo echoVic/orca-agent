@@ -13,6 +13,8 @@ use std::os::unix::process::CommandExt;
 
 use serde_json::{Value, json};
 
+use orca_core::capability::{CapabilityReceipt, EnforcementState};
+use orca_core::execution_broker::ExecutionBroker;
 use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
 use orca_platform::process::ProcessJob;
 use orca_platform::shell::resolve_program;
@@ -83,6 +85,9 @@ pub trait McpElicitationHandler {
 }
 
 pub trait McpTransport: Send + Sync {
+    fn capability_receipt(&self) -> Option<CapabilityReceipt> {
+        None
+    }
     fn initialize(&self) -> Result<Value, String>;
     fn list_tools(&self) -> Result<Value, String>;
     fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, String>;
@@ -145,6 +150,7 @@ pub fn connect(config: &McpServerConfig) -> Result<Box<dyn McpTransport>, String
 
 struct StdioTransport {
     server_name: String,
+    capability_receipt: CapabilityReceipt,
     state: Mutex<StdioState>,
     startup_timeout: Duration,
     tool_timeout: Duration,
@@ -223,6 +229,7 @@ impl StdioTransport {
             .map_or_else(|| command.into(), std::path::PathBuf::into_os_string);
         let mut child_command = Command::new(program);
         child_command
+            .env_clear()
             .args(&config.args)
             .envs(&config.env)
             .stdin(Stdio::piped())
@@ -232,8 +239,22 @@ impl StdioTransport {
         {
             child_command.process_group(0);
         }
-        let (child, process_job) = ProcessJob::spawn(&mut child_command)
-            .map_err(|error| format!("failed to start MCP server '{}': {error}", config.name))?;
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("failed to resolve MCP server cwd: {error}"))?;
+        let broker = ExecutionBroker::with_backend(
+            EnforcementState::Advisory,
+            "mcp-user-trusted-integration",
+        );
+        let launched = broker
+            .launch_user_trusted(
+                child_command,
+                format!("mcp:{}", config.name),
+                cwd,
+                config.capabilities.clone(),
+            )
+            .map_err(|error| format!("failed to start MCP server '{}': {error:?}", config.name))?;
+        let receipt = launched.receipt;
+        let (child, process_job) = (launched.child, launched.process_job);
         let mut child = StdioChild::new(child, process_job);
 
         let stdin = child
@@ -266,6 +287,7 @@ impl StdioTransport {
 
         Ok(Self {
             server_name: config.name.clone(),
+            capability_receipt: receipt,
             state: Mutex::new(StdioState {
                 child,
                 stdin,
@@ -280,6 +302,10 @@ impl StdioTransport {
 }
 
 impl McpTransport for StdioTransport {
+    fn capability_receipt(&self) -> Option<CapabilityReceipt> {
+        Some(self.capability_receipt.clone())
+    }
+
     fn initialize(&self) -> Result<Value, String> {
         let result = self.request_with_timeout(
             "initialize",
@@ -1879,6 +1905,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(timeout_ms),
             tool_timeout_ms: Some(timeout_ms),
         }
@@ -1978,6 +2005,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(tool_timeout_ms),
         })
@@ -2036,6 +2064,7 @@ done
             )]),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
         })
@@ -2103,6 +2132,7 @@ done
             )]),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
         })
@@ -2179,6 +2209,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
         })
@@ -2247,6 +2278,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(100),
         })
@@ -2355,6 +2387,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(1_000),
             tool_timeout_ms: Some(1_000),
         })
@@ -2397,6 +2430,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(1_000),
             tool_timeout_ms: Some(1_000),
         })
@@ -2434,6 +2468,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(1_000),
             tool_timeout_ms: Some(1_000),
         })
@@ -2470,6 +2505,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(1_000),
             tool_timeout_ms: Some(2_000),
         })
@@ -2620,6 +2656,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(5000),
         })
@@ -2669,6 +2706,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(5000),
         })
@@ -2810,6 +2848,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(5000),
             tool_timeout_ms: Some(5000),
         })
@@ -2871,6 +2910,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(100),
             tool_timeout_ms: Some(100),
         })

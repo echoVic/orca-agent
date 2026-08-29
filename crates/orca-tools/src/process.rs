@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc,
@@ -12,6 +13,10 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use orca_core::capability::{
+    CapabilityProcessClass, CapabilityReceipt, CapabilitySet, EffectiveCapability, EnforcementState,
+};
+use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::retained_output::{
     DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
 };
@@ -20,6 +25,86 @@ use orca_platform::process::read_child_pipe_interruptibly;
 use orca_platform::shell::ShellSpec;
 
 pub const DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM: usize = DEFAULT_RETAINED_OUTPUT_BYTES;
+
+/// All production tool subprocesses enter through the execution broker. The
+/// returned receipt is deliberately available to callers even when the
+/// integration is only advisory on the current host.
+pub fn spawn_with_capability(
+    command: Command,
+    request_id: impl Into<String>,
+    cwd: &Path,
+    process_class: CapabilityProcessClass,
+    capabilities: CapabilitySet,
+    enforcement: EnforcementState,
+    backend: &'static str,
+) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
+    let request_id = request_id.into();
+    let broker = ExecutionBroker::with_backend(enforcement, backend);
+    let launched = if process_class == CapabilityProcessClass::UserTrustedIntegration {
+        broker.launch_user_trusted(command, request_id, cwd.to_path_buf(), capabilities)
+    } else {
+        let request = orca_core::capability::CapabilityRequest::new(
+            request_id,
+            process_class,
+            capabilities.clone(),
+            cwd.to_path_buf(),
+        );
+        let effective = EffectiveCapability::resolve(
+            request,
+            capabilities,
+            orca_core::approval_types::ApprovalMode::FullAuto,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("invalid process capability: {error:?}"),
+            )
+        })?;
+        broker.launch(command, effective)
+    };
+    launched
+        .map(|launched| (launched.child, launched.process_job, launched.receipt))
+        .map_err(|error| match error {
+            LaunchError::Cwd(error) => error,
+            LaunchError::Spawn(error) => error,
+            LaunchError::EnforcementUnavailable => io::Error::new(
+                io::ErrorKind::Unsupported,
+                "process sandbox enforcement is unavailable",
+            ),
+            LaunchError::EnforcementAdvisory => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process sandbox would be advisory for this process class",
+            ),
+            LaunchError::UntrustedProcessClass => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "trusted process class requires the explicit user-trusted launcher",
+            ),
+            LaunchError::NetworkTargetsUnsupported => io::Error::new(
+                io::ErrorKind::Unsupported,
+                "target-scoped network capabilities are not supported by the selected backend",
+            ),
+            LaunchError::CapabilityCeilingExceeded => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process capability exceeds the broker hard ceiling",
+            ),
+        })
+}
+
+pub fn spawn_user_trusted(
+    command: Command,
+    request_id: impl Into<String>,
+    cwd: &Path,
+) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
+    spawn_with_capability(
+        command,
+        request_id,
+        cwd,
+        CapabilityProcessClass::UserTrustedIntegration,
+        CapabilitySet::read_only(),
+        EnforcementState::Advisory,
+        "user-trusted-integration",
+    )
+}
 
 pub fn shell_command(shell: &ShellSpec, script: &str) -> Command {
     let command_spec = shell.command(script);
@@ -555,7 +640,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
-        let (child, process_job) = ProcessJob::spawn(&mut command).expect("spawn noisy child");
+        let (child, process_job) = spawn_test(&mut command).expect("spawn noisy child");
 
         let output = wait_for_child_output_with_timeout_or_cancel_and_limit(
             child,
@@ -587,7 +672,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
-        let (child, process_job) = ProcessJob::spawn(&mut command).expect("spawn noisy child");
+        let (child, process_job) = spawn_test(&mut command).expect("spawn noisy child");
 
         let output = wait_for_child_stdout_lines_with_timeout(
             child,
@@ -622,7 +707,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
-        let (child, process_job) = ProcessJob::spawn(&mut command).expect("spawn child");
+        let (child, process_job) = spawn_test(&mut command).expect("spawn child");
         let started = Instant::now();
 
         let error = wait_for_child_stdout_lines_with_timeout(
@@ -654,7 +739,7 @@ mod tests {
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
         let (child, process_job) =
-            ProcessJob::spawn(&mut command).expect("spawn shell with pipe descendant");
+            spawn_test(&mut command).expect("spawn shell with pipe descendant");
         let start = Instant::now();
 
         let output = wait_for_child_output_with_timeout_or_cancel_and_limit(
@@ -690,7 +775,7 @@ mod tests {
             .stderr(Stdio::piped());
         prepare_non_interactive_command(&mut command);
         let (child, process_job) =
-            ProcessJob::spawn(&mut command).expect("spawn shell with escaped pipe descendant");
+            spawn_test(&mut command).expect("spawn shell with escaped pipe descendant");
         let start = Instant::now();
 
         let output = wait_for_child_output_with_timeout_or_cancel_and_limit(
@@ -834,6 +919,12 @@ fn join_reader(
         .map_err(|_| io::Error::other(format!("{stream} reader thread panicked")))?
 }
 
+#[cfg(test)]
+#[allow(deprecated)]
+fn spawn_test(command: &mut Command) -> io::Result<(Child, ProcessJob)> {
+    ProcessJob::spawn(command)
+}
+
 fn child_setup_error<T>(
     child: &mut Child,
     process_job: &ProcessJob,
@@ -899,7 +990,7 @@ mod cancellation_tests {
         ));
         prepare_non_interactive_command(&mut command);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let (child, process_job) = ProcessJob::spawn(&mut command).expect("spawn child");
+        let (child, process_job) = spawn_test(&mut command).expect("spawn child");
         let cancellation_observed = AtomicBool::new(false);
 
         let output = wait_for_child_output_with_timeout_or_cancel(

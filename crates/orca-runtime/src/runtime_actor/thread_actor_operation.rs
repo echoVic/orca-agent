@@ -1241,11 +1241,6 @@ impl ThreadActor {
                     self.commit_surface_actor_batch_with_retry(&settings_batch)
                         .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
                     self.config = next_config;
-                    if next_settings.effective.unsandboxed_shell {
-                        if let Some(state) = self.state.as_mut() {
-                            state.thread.session_mut().set_unsandboxed_shell(true);
-                        }
-                    }
                     self.persist_surface_settings_metadata_if_recorded(&next_settings.effective)
                         .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
                     let receipt =
@@ -1382,8 +1377,9 @@ impl ThreadActor {
                 settings_revision: settings.thread_revision,
                 policy_epoch: settings.effective.policy_epoch,
                 required_capabilities: Default::default(),
-                capability_fingerprint: surface_sha256(
-                    &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+                capability_fingerprint: crate::runtime_host::surface_capability_fingerprint(
+                    &settings.effective,
+                    &snapshot.tools,
                 ),
                 settings_receipt,
             },
@@ -1534,8 +1530,9 @@ impl ThreadActor {
                 incarnation: snapshot.cursor.incarnation.clone(),
             },
         };
-        let capability_fingerprint = surface_sha256(
-            &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+        let capability_fingerprint = crate::runtime_host::surface_capability_fingerprint(
+            &snapshot.settings.effective,
+            &snapshot.tools,
         );
         let operation = surface::OperationRecord {
             operation_id: operation_id.clone(),
@@ -3059,11 +3056,6 @@ impl ThreadActor {
             }
         }
         self.config = next_config;
-        if next_settings.effective.unsandboxed_shell {
-            if let Some(state) = self.state.as_mut() {
-                state.thread.session_mut().set_unsandboxed_shell(true);
-            }
-        }
         self.persist_surface_settings_metadata_if_recorded(&next_settings.effective)
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         Ok(self.committed_settings_mutation(

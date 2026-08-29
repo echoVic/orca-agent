@@ -1014,8 +1014,9 @@ impl ThreadActor {
                 settings_revision: snapshot.settings.thread_revision,
                 policy_epoch: snapshot.settings.effective.policy_epoch,
                 required_capabilities: Default::default(),
-                capability_fingerprint: surface_sha256(
-                    &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+                capability_fingerprint: crate::runtime_host::surface_capability_fingerprint(
+                    &snapshot.settings.effective,
+                    &snapshot.tools,
                 ),
                 settings_receipt: surface::OperationSettingsPreparationReceipt::Current {
                     settings_revision: snapshot.settings.thread_revision,

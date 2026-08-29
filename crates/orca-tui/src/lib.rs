@@ -1,3 +1,5 @@
+#![deny(deprecated)]
+
 mod action_dispatcher;
 mod agent_runtime;
 pub mod app;

@@ -15,7 +15,6 @@ pub use events::{
 pub use permissions::{
     FileSystemAccessMode, FileSystemSandboxEntry, PermissionGrantScope, PermissionResponseDecision,
     RequestFileSystemPermissions, RequestNetworkPermissions, RequestPermissionProfile,
-    RequestShellPermissions,
 };
 pub use shell::shell_join;
 pub use wire::{ClientOp, DecodeError, Submission};

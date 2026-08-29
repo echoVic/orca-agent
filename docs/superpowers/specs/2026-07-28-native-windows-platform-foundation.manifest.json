@@ -40,6 +40,24 @@
       "crates/orca-tui/src/goal_materialization.rs",
       "unix_std_api",
       4
+    ],
+    [
+      "workspace-identity-stable-cwd-shell-fixture",
+      "crates/orca-core/src/workspace_identity.rs",
+      "unix_shell_spawn",
+      1
+    ],
+    [
+      "workspace-identity-unix-api",
+      "crates/orca-core/src/workspace_identity.rs",
+      "unix_std_api",
+      7
+    ],
+    [
+      "workspace-identity-unix-flags",
+      "crates/orca-core/src/workspace_identity.rs",
+      "unix_libc_process",
+      2
     ]
   ],
   "deferred_boundaries": [
@@ -154,13 +172,6 @@
       "unix_std_api",
       1,
       "process-ownership-plan"
-    ],
-    [
-      "sandbox-denial-unix-fixture",
-      "crates/orca-runtime/src/sandbox_denial.rs",
-      "unix_std_api",
-      1,
-      "windows-sandbox-plan"
     ],
     [
       "shell-session-shell",

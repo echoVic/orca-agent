@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(unix)]
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -27,8 +27,13 @@ use orca_windows_sandbox::{
 };
 use uuid::Uuid;
 
+use crate::execution_broker::ExecutionBroker;
 use crate::task_output::{TaskOutputRead, TaskOutputStore};
 use crate::tasks::TaskRegistry;
+use orca_core::capability::{
+    CapabilityProcessClass, CapabilityReceipt, CapabilityRequest, CapabilitySet,
+    EffectiveCapability, EnforcementState,
+};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -163,6 +168,7 @@ pub struct ShellSessionHandle {
     pub task_id: String,
     pub requested_terminal: ShellTerminalMode,
     pub effective_terminal: ShellTerminalMode,
+    pub capability_receipt: CapabilityReceipt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,6 +223,7 @@ struct ShellSession {
     reader_stop: Arc<AtomicBool>,
     requested_terminal: ShellTerminalMode,
     effective_terminal: ShellTerminalMode,
+    capability_receipt: CapabilityReceipt,
 }
 
 struct SpawnedShellChild {
@@ -268,6 +275,18 @@ impl RuntimeShellSessionManager {
         self.output_store.clone()
     }
 
+    pub fn capability_receipt(&self, id: &str) -> io::Result<CapabilityReceipt> {
+        self.sessions
+            .get(id)
+            .map(|session| session.capability_receipt.clone())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("shell session '{id}' not found"),
+                )
+            })
+    }
+
     pub fn spawn(&mut self, command: ShellSessionCommand) -> io::Result<ShellSessionHandle> {
         self.spawn_with_metadata_roots(command, Vec::new())
     }
@@ -308,19 +327,47 @@ impl RuntimeShellSessionManager {
         ensure_shell_sandbox_supported(shell.kind(), command.sandbox)?;
         let uses_seatbelt = cfg!(target_os = "macos")
             && !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess);
+        let capability =
+            shell_effective_capability(&command, &task.id, &metadata_writable_directories)?;
+        let enforcement = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
+            EnforcementState::Advisory
+        } else if cfg!(target_os = "windows") {
+            // The Windows branch below uses the native AppContainer/Job
+            // adapter rather than the generic command builder.
+            EnforcementState::Enforced
+        } else {
+            orca_tools::sandbox::enforcement_state()
+        };
+        let broker = ExecutionBroker::with_backend_and_ceiling(
+            enforcement,
+            shell_backend_name(),
+            shell_capability_ceiling(&command, &metadata_writable_directories),
+        );
 
         #[cfg(windows)]
         if !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
-            let restricted =
-                spawn_windows_sandbox(&command, &metadata_writable_directories, &shell);
-            let (child, process_job, stdin, stdout_reader, stderr_reader, effective_terminal) =
-                match restricted {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
-                        return Err(error);
-                    }
-                };
+            let restricted = spawn_windows_sandbox(
+                &command,
+                &metadata_writable_directories,
+                &shell,
+                &broker,
+                &capability,
+            );
+            let (
+                child,
+                process_job,
+                stdin,
+                stdout_reader,
+                stderr_reader,
+                effective_terminal,
+                capability_receipt,
+            ) = match restricted {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
+                    return Err(error);
+                }
+            };
             let output_store = self.output_store.clone();
             let reader_stop = Arc::new(AtomicBool::new(false));
             let stdout_handle = Some(spawn_output_reader(
@@ -371,6 +418,7 @@ impl RuntimeShellSessionManager {
                     reader_stop,
                     requested_terminal,
                     effective_terminal,
+                    capability_receipt: capability_receipt.clone(),
                 },
             );
             return Ok(ShellSessionHandle {
@@ -378,6 +426,7 @@ impl RuntimeShellSessionManager {
                 task_id: task.id,
                 requested_terminal,
                 effective_terminal,
+                capability_receipt,
             });
         }
 
@@ -434,14 +483,15 @@ impl RuntimeShellSessionManager {
         }
         let stdio = configure_shell_stdio(&mut process, requested_terminal)?;
         let effective_terminal = stdio.effective_terminal();
-        let initialized = spawn_configured_shell(process, stdio);
-        let (child, process_job, stdin, stdout_reader, stderr_reader) = match initialized {
-            Ok(initialized) => initialized,
-            Err(error) => {
-                let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
-                return Err(error);
-            }
-        };
+        let initialized = spawn_configured_shell_with_broker(process, stdio, &broker, capability);
+        let (child, process_job, stdin, stdout_reader, stderr_reader, capability_receipt) =
+            match initialized {
+                Ok(initialized) => initialized,
+                Err(error) => {
+                    let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
+                    return Err(error);
+                }
+            };
         let output_store = self.output_store.clone();
         let reader_stop = Arc::new(AtomicBool::new(false));
         let stdout_handle = Some(spawn_output_reader(
@@ -492,6 +542,7 @@ impl RuntimeShellSessionManager {
                 reader_stop,
                 requested_terminal,
                 effective_terminal,
+                capability_receipt: capability_receipt.clone(),
             },
         );
 
@@ -500,6 +551,7 @@ impl RuntimeShellSessionManager {
             task_id: task.id,
             requested_terminal,
             effective_terminal,
+            capability_receipt,
         })
     }
 
@@ -936,6 +988,8 @@ fn spawn_windows_sandbox(
     command: &ShellSessionCommand,
     metadata_writable_directories: &[PathBuf],
     shell: &ShellSpec,
+    broker: &ExecutionBroker,
+    capability: &EffectiveCapability,
 ) -> io::Result<(
     ShellChild,
     ProcessJob,
@@ -943,7 +997,14 @@ fn spawn_windows_sandbox(
     Box<dyn Read + Send>,
     Option<Box<dyn Read + Send>>,
     ShellTerminalMode,
+    CapabilityReceipt,
 )> {
+    let capability_receipt = broker.authorize_platform(capability).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("Windows sandbox authorization rejected: {error:?}"),
+        )
+    })?;
     let (mode, network_access) = match command.sandbox {
         ShellSandboxMode::WorkspaceWrite { network_access, .. } => {
             (SandboxFilesystemMode::WorkspaceWrite, network_access)
@@ -1001,6 +1062,7 @@ fn spawn_windows_sandbox(
             output,
             None,
             terminal,
+            capability_receipt,
         ));
     }
 
@@ -1014,6 +1076,7 @@ fn spawn_windows_sandbox(
         stdout,
         Some(stderr),
         terminal,
+        capability_receipt,
     ))
 }
 
@@ -1478,15 +1541,155 @@ fn configure_shell_stdio(
     }
 }
 
-fn spawn_configured_shell(
-    mut process: std::process::Command,
+#[cfg(target_os = "macos")]
+fn shell_backend_name() -> &'static str {
+    "seatbelt"
+}
+
+#[cfg(target_os = "linux")]
+fn shell_backend_name() -> &'static str {
+    "bwrap+landlock+seccomp"
+}
+
+#[cfg(target_os = "windows")]
+fn shell_backend_name() -> &'static str {
+    "windows-sandbox"
+}
+
+#[cfg(all(
+    not(target_os = "macos"),
+    not(target_os = "linux"),
+    not(target_os = "windows")
+))]
+fn shell_backend_name() -> &'static str {
+    "platform-process"
+}
+
+fn shell_effective_capability(
+    command: &ShellSessionCommand,
+    request_id: &str,
+    metadata_writable_directories: &[PathBuf],
+) -> io::Result<EffectiveCapability> {
+    let (process_class, capabilities) = match command.sandbox {
+        ShellSandboxMode::DangerFullAccess => (
+            CapabilityProcessClass::UserTrustedIntegration,
+            CapabilitySet::all(),
+        ),
+        ShellSandboxMode::WorkspaceWrite { network_access, .. } => (
+            CapabilityProcessClass::SandboxedTool,
+            CapabilitySet {
+                read: true,
+                write: true,
+                metadata_write: !metadata_writable_directories.is_empty(),
+                network: network_access,
+                shell: true,
+                agent: false,
+            },
+        ),
+        ShellSandboxMode::ReadOnly { network_access, .. } => (
+            CapabilityProcessClass::SandboxedTool,
+            CapabilitySet {
+                read: true,
+                write: false,
+                metadata_write: false,
+                network: network_access,
+                shell: true,
+                agent: false,
+            },
+        ),
+    };
+    let mut request =
+        CapabilityRequest::new(request_id, process_class, capabilities, command.cwd.clone());
+    request.read_roots = command.additional_readable_directories.clone();
+    request.write_roots = command.additional_working_directories.clone();
+    request.metadata_roots = metadata_writable_directories.to_vec();
+    request.denied_roots = command.denied_working_directories.clone();
+    let resolved = if process_class == CapabilityProcessClass::UserTrustedIntegration {
+        EffectiveCapability::resolve_user_trusted(
+            request,
+            CapabilitySet::all(),
+            orca_core::approval_types::ApprovalMode::FullAuto,
+        )
+    } else {
+        EffectiveCapability::resolve(
+            request,
+            CapabilitySet::all(),
+            orca_core::approval_types::ApprovalMode::FullAuto,
+        )
+    };
+    resolved.map_err(|error| io::Error::other(format!("invalid shell capability: {error:?}")))
+}
+
+fn shell_capability_ceiling(
+    command: &ShellSessionCommand,
+    metadata_writable_directories: &[PathBuf],
+) -> orca_core::capability::CapabilityCeiling {
+    let capabilities = match command.sandbox {
+        ShellSandboxMode::DangerFullAccess => CapabilitySet::all(),
+        ShellSandboxMode::WorkspaceWrite { network_access, .. } => CapabilitySet {
+            read: true,
+            write: true,
+            metadata_write: !metadata_writable_directories.is_empty(),
+            network: network_access,
+            shell: true,
+            agent: false,
+        },
+        ShellSandboxMode::ReadOnly { network_access, .. } => CapabilitySet {
+            read: true,
+            write: false,
+            metadata_write: false,
+            network: network_access,
+            shell: true,
+            agent: false,
+        },
+    };
+    let mut read_roots = vec![command.cwd.clone()];
+    read_roots.extend(command.additional_readable_directories.iter().cloned());
+    read_roots.extend(command.additional_working_directories.iter().cloned());
+    read_roots.extend(metadata_writable_directories.iter().cloned());
+    read_roots.extend(command.allowed_unix_socket_roots.iter().cloned());
+    read_roots.sort();
+    read_roots.dedup();
+
+    let write_roots = if capabilities.write {
+        let mut roots = vec![command.cwd.clone()];
+        roots.extend(command.additional_working_directories.iter().cloned());
+        roots.sort();
+        roots.dedup();
+        Some(roots)
+    } else {
+        Some(Vec::new())
+    };
+    let metadata_roots = if capabilities.metadata_write {
+        Some(metadata_writable_directories.to_vec())
+    } else {
+        Some(Vec::new())
+    };
+    orca_core::capability::CapabilityCeiling {
+        capabilities,
+        read_roots: Some(read_roots),
+        write_roots,
+        metadata_roots,
+        denied_roots: command.denied_working_directories.clone(),
+        // Network target enforcement is not implemented by the current OS
+        // adapters; an empty allow-list prevents a target-bearing request from
+        // being silently interpreted as unrestricted network access.
+        network_targets: Some(BTreeSet::new()),
+    }
+}
+
+fn spawn_configured_shell_with_broker(
+    process: std::process::Command,
     stdio: ShellStdio,
+    broker: &ExecutionBroker,
+    capability: EffectiveCapability,
 ) -> io::Result<(
     ShellChild,
     ProcessJob,
     ShellInput,
     Box<dyn Read + Send>,
     Option<Box<dyn Read + Send>>,
+    CapabilityReceipt,
 )> {
     #[cfg(windows)]
     if matches!(&stdio, ShellStdio::WindowsPty { .. }) {
@@ -1500,10 +1703,23 @@ fn spawn_configured_shell(
             ShellInput::WindowsPty(spawned.input),
             spawned.reader,
             None,
+            capability.receipt(broker.enforcement(), "windows-conpty"),
         ));
     }
 
-    let (child, process_job) = ProcessJob::spawn(&mut process)?;
+    let launched = if capability.process_class == CapabilityProcessClass::UserTrustedIntegration {
+        broker.launch_user_trusted(
+            process,
+            capability.request_id.clone(),
+            capability.cwd.clone(),
+            capability.capabilities.clone(),
+        )
+    } else {
+        broker.launch(process, capability)
+    }
+    .map_err(|error| io::Error::other(format!("execution broker launch failed: {error:?}")))?;
+    let receipt = launched.receipt.clone();
+    let (child, process_job) = (launched.child, launched.process_job);
     let mut child = SpawnedShellChild::new(ShellChild::Process(child));
     let (stdin, stdout_reader, stderr_reader) = stdio.finish(child.child_mut())?;
     Ok((
@@ -1512,6 +1728,7 @@ fn spawn_configured_shell(
         stdin,
         stdout_reader,
         stderr_reader,
+        receipt,
     ))
 }
 
@@ -1877,6 +2094,11 @@ fn process_exit_code(status: ShellExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_spawn_surface_requires_execution_broker() {
+        let _ = spawn_configured_shell_with_broker;
+    }
     #[cfg(windows)]
     use orca_platform::shell::{PowerShellEdition, ShellKind};
 
@@ -2046,8 +2268,21 @@ mod tests {
             .current_dir(temp.path());
         let stdio = configure_shell_stdio(&mut process, ShellTerminalMode::pipe())
             .expect("configure shell stdio");
-        let (child, process_job, stdin, stdout_reader, stderr_reader) =
-            spawn_configured_shell(process, stdio).expect("spawn configured shell");
+        let capability = EffectiveCapability::resolve(
+            CapabilityRequest::new(
+                "registration-failure",
+                CapabilityProcessClass::SandboxedTool,
+                CapabilitySet::workspace_write(),
+                temp.path().to_path_buf(),
+            ),
+            CapabilitySet::all(),
+            orca_core::approval_types::ApprovalMode::FullAuto,
+        )
+        .expect("resolve shell capability");
+        let broker = ExecutionBroker::new(EnforcementState::Enforced);
+        let (child, process_job, stdin, stdout_reader, stderr_reader, _receipt) =
+            spawn_configured_shell_with_broker(process, stdio, &broker, capability)
+                .expect("spawn configured shell");
         let output_store = TaskOutputStore::new();
         let reader_stop = Arc::new(AtomicBool::new(false));
         let stdout_handle = Some(spawn_output_reader(

@@ -1077,6 +1077,7 @@ fn map_acp_mcp_server(server: McpServer) -> Result<McpServerConfig, String> {
                 env,
                 headers: HashMap::new(),
                 disabled: false,
+                capabilities: Default::default(),
                 startup_timeout_ms: None,
                 tool_timeout_ms: None,
             })
@@ -1125,6 +1126,7 @@ fn map_acp_mcp_server(server: McpServer) -> Result<McpServerConfig, String> {
                 env: HashMap::new(),
                 headers,
                 disabled: false,
+                capabilities: Default::default(),
                 startup_timeout_ms: None,
                 tool_timeout_ms: None,
             })
@@ -3293,7 +3295,6 @@ mod tests {
         let permissions = SurfacePermissionProfile {
             file_system: None,
             network: None,
-            shell: Some(crate::surface::SurfaceShellPermissionProfile { unsandboxed: true }),
         };
         for (option_id, expected) in [
             (

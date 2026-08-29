@@ -72,7 +72,10 @@ impl CompiledPermissionRule {
     }
 
     fn matches(&self, tool: &str, target: Option<&str>) -> bool {
-        self.tool == tool && target.is_some_and(|target| self.pattern.matches(target))
+        if self.tool != tool {
+            return false;
+        }
+        target.is_some_and(|target| self.pattern.matches(target))
     }
 }
 
@@ -84,7 +87,27 @@ impl CompiledGlob {
     }
 
     fn matches(&self, value: &str) -> bool {
-        glob_matches(&self.pattern, value.as_bytes())
+        #[cfg(windows)]
+        {
+            // Windows command names and filesystem paths are case-insensitive.
+            // Fold ASCII here because permission patterns are command-line
+            // syntax, while preserving byte-level glob semantics elsewhere.
+            let pattern = self
+                .pattern
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .collect::<Vec<_>>();
+            let value = value
+                .as_bytes()
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .collect::<Vec<_>>();
+            return glob_matches(&pattern, &value);
+        }
+        #[cfg(not(windows))]
+        {
+            glob_matches(&self.pattern, value.as_bytes())
+        }
     }
 }
 
@@ -217,6 +240,19 @@ mod tests {
         assert_eq!(
             compiled.matching_decision("bash", Some("cargo publish public-crate")),
             Some(Decision::Prompt)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_compiled_rules_match_command_case_insensitively() {
+        let compiled = CompiledPermissionRules::from_rules(PermissionRules {
+            rules: vec![PermissionRule::new("bash", "cargo *", Decision::Allow)],
+        });
+
+        assert_eq!(
+            compiled.matching_decision("bash", Some("Cargo test")),
+            Some(Decision::Allow)
         );
     }
 

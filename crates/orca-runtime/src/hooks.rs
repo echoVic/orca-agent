@@ -3,15 +3,17 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
+use orca_core::capability::CapabilitySet;
 use orca_core::conversation::Conversation;
+use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::hook_types::{HookConfig, HookEvent};
 use orca_core::provider_types::Usage;
 use orca_core::tool_types::{ToolRequest, ToolResult};
-use orca_platform::process::ProcessJob;
 
 #[derive(Clone, Debug, Default)]
 pub struct HookRunner {
     hooks: Vec<HookConfig>,
+    capabilities: CapabilitySet,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -53,7 +55,17 @@ pub struct HookContext<'a> {
 
 impl HookRunner {
     pub fn new(hooks: Vec<HookConfig>) -> Self {
-        Self { hooks }
+        Self {
+            hooks,
+            capabilities: CapabilitySet::read_only(),
+        }
+    }
+
+    pub fn new_with_capabilities(hooks: Vec<HookConfig>, capabilities: CapabilitySet) -> Self {
+        Self {
+            hooks,
+            capabilities,
+        }
     }
 
     pub fn run(&self, event: HookEvent, context: HookContext<'_>) -> Result<HookOutcome, String> {
@@ -187,9 +199,28 @@ impl HookRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             orca_tools::process::prepare_non_interactive_command(&mut command);
-            let (child, process_job) = ProcessJob::spawn(&mut command).map_err(|error| {
-                HookRunError::Failed(format!("hook '{}' failed to start: {error}", hook.command))
-            })?;
+            let broker = ExecutionBroker::with_backend(
+                orca_core::capability::EnforcementState::Advisory,
+                "hook-user-trusted",
+            );
+            let (child, process_job) = broker
+                .launch_user_trusted(
+                    command,
+                    format!("hook:{:?}", event),
+                    context.cwd,
+                    self.capabilities.clone(),
+                )
+                .map(|launched| (launched.child, launched.process_job))
+                .map_err(|error| {
+                    let detail = match error {
+                        LaunchError::Spawn(error) => error.to_string(),
+                        other => format!("{other:?}"),
+                    };
+                    HookRunError::Failed(format!(
+                        "hook '{}' failed to start: {detail}",
+                        hook.command
+                    ))
+                })?;
             let output = orca_tools::process::wait_for_child_output_with_timeout_or_cancel(
                 child,
                 process_job,

@@ -300,12 +300,7 @@ impl ApprovalDialog {
     pub fn title(&self) -> &'static str {
         match self.permission_kind {
             Some(RuntimePermissionRequestKind::NetworkBlock) => " Network Permission Required ",
-            Some(RuntimePermissionRequestKind::FilesystemWrite) => {
-                " Filesystem Permission Required "
-            }
-            Some(RuntimePermissionRequestKind::UnsandboxedShellRetry) => {
-                " Unsandboxed Shell Required "
-            }
+            Some(RuntimePermissionRequestKind::CapabilityBoundary) => " Capability Boundary ",
             None => " Approval Required ",
         }
     }

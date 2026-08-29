@@ -343,6 +343,8 @@ pub struct WorkflowConfig {
     pub keyword_trigger_enabled: bool,
     #[serde(default)]
     pub teams: HashMap<String, WorkflowTeamConfig>,
+    #[serde(default)]
+    pub capabilities: crate::capability::CapabilitySet,
 }
 
 impl Default for WorkflowConfig {
@@ -355,6 +357,7 @@ impl Default for WorkflowConfig {
             max_agent_tokens: None,
             keyword_trigger_enabled: true,
             teams: HashMap::new(),
+            capabilities: crate::capability::CapabilitySet::read_only(),
         }
     }
 }

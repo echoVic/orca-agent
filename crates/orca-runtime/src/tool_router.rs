@@ -354,7 +354,7 @@ impl<'a> RuntimeToolRouter<'a> {
                     })
                 });
                 let invocation = RuntimeNormalToolInvocation::snapshot(
-                    Some(config),
+                    config,
                     execution_request,
                     cwd,
                     &additional_roots,

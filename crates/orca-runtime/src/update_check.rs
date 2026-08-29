@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use orca_core::capability::CapabilitySet;
+use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use serde::{Deserialize, Serialize};
 
 use orca_platform::host::{HostPlatform, OperatingSystem};
@@ -219,15 +221,32 @@ fn update_preflight_with(
 }
 
 pub fn run_update(action: &UpdateAction) -> UpdateRunOutcome {
-    let command = action.command();
+    let update_command = action.command();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let broker = ExecutionBroker::with_backend(
+        orca_core::capability::EnforcementState::Advisory,
+        "update-user-trusted",
+    );
+    let launched = match broker.launch_user_trusted(
+        {
+            let mut command = Command::new(update_command.program);
+            command.args(&update_command.args);
+            command
+        },
+        "update-check",
+        cwd,
+        CapabilitySet::read_only(),
+    ) {
+        Ok(launched) => launched,
+        Err(LaunchError::Spawn(error)) => return UpdateRunOutcome::StartFailed(error.to_string()),
+        Err(error) => return UpdateRunOutcome::StartFailed(format!("{error:?}")),
+    };
+    let mut child = launched.child;
     if cfg!(windows) {
-        return match Command::new(command.program).args(&command.args).spawn() {
-            Ok(_) => UpdateRunOutcome::Started,
-            Err(error) => UpdateRunOutcome::StartFailed(error.to_string()),
-        };
+        return UpdateRunOutcome::Started;
     }
 
-    match Command::new(command.program).args(&command.args).status() {
+    match child.wait() {
         Ok(status) if status.success() => UpdateRunOutcome::Updated,
         Ok(status) => UpdateRunOutcome::Failed(status.code()),
         Err(error) => UpdateRunOutcome::StartFailed(error.to_string()),

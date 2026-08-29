@@ -74,12 +74,18 @@ fn local_clipboard_best_effort(_text: &str) -> bool {
 fn pipe_through(command: &[&str], text: &str, timeout: Duration) -> bool {
     use std::process::{Command, Stdio};
 
-    let Ok(mut child) = Command::new(command[0])
+    let mut child_command = Command::new(command[0]);
+    child_command
         .args(&command[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let cwd = std::env::current_dir().ok();
+    let Some(cwd) = cwd else {
+        return false;
+    };
+    let Ok((mut child, process_job, _receipt)) =
+        orca_tools::process::spawn_user_trusted(child_command, "tui:clipboard", &cwd)
     else {
         return false;
     };
@@ -98,6 +104,7 @@ fn pipe_through(command: &[&str], text: &str, timeout: Duration) -> bool {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) | Err(_) => {
+                let _ = process_job.terminate(1);
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;

@@ -231,7 +231,6 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
     pub(crate) wait_for_background_workflows: bool,
     pub(crate) defer_cancel_terminal: bool,
-    pub(crate) unsandboxed_shell: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -732,6 +731,7 @@ impl<'a> RuntimeTaskActor<'a> {
 
     pub fn execute_normal_tool(
         &mut self,
+        config: &RunConfig,
         request: &ToolRequest,
         cwd: &Path,
         mcp_registry: &McpRegistry,
@@ -741,6 +741,7 @@ impl<'a> RuntimeTaskActor<'a> {
         task_registry: Option<&TaskRegistry>,
     ) -> ToolResult {
         self.execute_normal_tool_with_cancel(
+            config,
             request,
             cwd,
             mcp_registry,
@@ -755,6 +756,7 @@ impl<'a> RuntimeTaskActor<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn execute_normal_tool_with_cancel(
         &mut self,
+        config: &RunConfig,
         request: &ToolRequest,
         cwd: &Path,
         mcp_registry: &McpRegistry,
@@ -765,7 +767,7 @@ impl<'a> RuntimeTaskActor<'a> {
         cancel: Option<&CancelToken>,
     ) -> ToolResult {
         self.execute_normal_tool_with_roots_and_cancel(
-            None,
+            config,
             request,
             cwd,
             &[],
@@ -782,7 +784,7 @@ impl<'a> RuntimeTaskActor<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn execute_normal_tool_with_roots_and_cancel(
         &mut self,
-        config: Option<&RunConfig>,
+        config: &RunConfig,
         request: &ToolRequest,
         cwd: &Path,
         additional_roots: &[PathBuf],
@@ -944,11 +946,6 @@ impl<'a> AgentLoopContext<'a> {
             mcp_registry,
             hooks,
         ));
-        self
-    }
-
-    pub(crate) fn with_unsandboxed_shell(mut self, enabled: bool) -> Self {
-        self.turn_context = self.turn_context.with_unsandboxed_shell(enabled);
         self
     }
 
@@ -1212,7 +1209,6 @@ impl<'a> RuntimeTurnContext<'a> {
             workflow_lifecycle_ingress: None,
             wait_for_background_workflows: true,
             defer_cancel_terminal: false,
-            unsandboxed_shell: false,
         }
     }
 
@@ -1280,15 +1276,6 @@ impl<'a> RuntimeTurnContext<'a> {
     pub(crate) fn with_deferred_cancel_terminal(mut self, defer: bool) -> Self {
         self.defer_cancel_terminal = defer;
         self
-    }
-
-    pub(crate) fn with_unsandboxed_shell(mut self, enabled: bool) -> Self {
-        self.unsandboxed_shell = enabled;
-        self
-    }
-
-    pub(crate) fn unsandboxed_shell(&self) -> bool {
-        self.unsandboxed_shell
     }
 
     #[cfg(test)]

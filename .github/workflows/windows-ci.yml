@@ -15,6 +15,8 @@ on:
       - "scripts/release/**"
       - "scripts/validate-runtime-surface-contract.mjs"
       - "scripts/test-validate-runtime-surface-contract.mjs"
+      - "scripts/validate-execution-broker-boundary.mjs"
+      - "scripts/test-validate-execution-broker-boundary.mjs"
       - "scripts/validate-windows-platform-boundaries.mjs"
       - "scripts/test-validate-windows-platform-boundaries.mjs"
       - "docs/superpowers/specs/2026-07-28-native-windows-platform-foundation.manifest.json"
@@ -35,6 +37,8 @@ on:
       - "scripts/release/**"
       - "scripts/validate-runtime-surface-contract.mjs"
       - "scripts/test-validate-runtime-surface-contract.mjs"
+      - "scripts/validate-execution-broker-boundary.mjs"
+      - "scripts/test-validate-execution-broker-boundary.mjs"
       - "scripts/validate-windows-platform-boundaries.mjs"
       - "scripts/test-validate-windows-platform-boundaries.mjs"
       - "docs/superpowers/specs/2026-07-28-native-windows-platform-foundation.manifest.json"
@@ -73,6 +77,8 @@ jobs:
           node scripts/validate-runtime-surface-contract.mjs
           node scripts/test-validate-windows-platform-boundaries.mjs
           node scripts/validate-windows-platform-boundaries.mjs
+          node scripts/test-validate-execution-broker-boundary.mjs
+          node scripts/validate-execution-broker-boundary.mjs
       - name: Check the full workspace
         run: cargo check --workspace --all-targets --locked
       - name: Run workspace clippy

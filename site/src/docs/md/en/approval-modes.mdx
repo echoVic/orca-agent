@@ -9,6 +9,11 @@ Orca implements a four-mode approval lattice that lets you trade autonomy for co
 
 Orca's approval modes form a lattice — each mode is a strict superset of the previous one's permissions:
 
+Plan is a hard read-only ceiling. Permission rules cannot override it, and a
+missing sandbox backend never falls back to a host shell. For matching rules,
+Orca intentionally chooses the strictest decision among all matching patterns;
+it does not use “most specific rule wins” semantics.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Approval Mode Lattice                          │

@@ -55,7 +55,6 @@ pub struct InteractiveSession {
     auto_memory_turn_starts: HashMap<String, usize>,
     task_registry: TaskRegistry,
     last_manual_compaction: Option<ManualCompactionOutcome>,
-    unsandboxed_shell: bool,
 }
 
 pub(crate) struct InteractiveSessionRuntimeParts<'a> {
@@ -67,7 +66,6 @@ pub(crate) struct InteractiveSessionRuntimeParts<'a> {
     pub hooks: &'a HookRunner,
     pub memory: &'a MemoryBlock,
     pub task_registry: &'a TaskRegistry,
-    pub unsandboxed_shell: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -241,7 +239,10 @@ impl InteractiveSession {
         let store = SessionStore::new();
         let instructions = instructions::load_for_cwd_or_default(&cwd);
         let memory = memory::load_for_cwd(&cwd);
-        let hooks = HookRunner::new(config.hooks.clone());
+        let hooks = HookRunner::new_with_capabilities(
+            config.hooks.clone(),
+            orca_core::capability::CapabilitySet::for_approval_mode(config.approval_mode),
+        );
         let system_prompt = agent_common::build_agent_system_prompt(
             &cwd,
             0,
@@ -308,12 +309,6 @@ impl InteractiveSession {
             0
         };
 
-        let unsandboxed_shell = loaded_transcript
-            .as_ref()
-            .is_some_and(|transcript| transcript.meta.unsandboxed_shell)
-            || prepared_record_meta
-                .as_ref()
-                .is_some_and(|meta| meta.unsandboxed_shell);
         let mut session_id = None;
         let writer = match &config.history_mode {
             HistoryMode::Disabled => None,
@@ -430,7 +425,6 @@ impl InteractiveSession {
             auto_memory_turn_starts: HashMap::new(),
             task_registry,
             last_manual_compaction: None,
-            unsandboxed_shell,
         };
         if let (Some(worker), Some(work)) = (
             session.auto_memory_worker.as_ref(),
@@ -475,10 +469,6 @@ impl InteractiveSession {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
-    }
-
-    pub(crate) fn unsandboxed_shell(&self) -> bool {
-        self.unsandboxed_shell
     }
 
     pub(crate) fn event_publication_store(&self) -> Option<(u64, SessionWriter)> {
@@ -652,7 +642,6 @@ impl InteractiveSession {
             hooks: &self.hooks,
             memory: &self.memory,
             task_registry: &self.task_registry,
-            unsandboxed_shell: self.unsandboxed_shell,
         }
     }
 
@@ -728,10 +717,6 @@ impl InteractiveSession {
 
     pub fn set_model(&mut self, model: Option<&str>) {
         self.cost_tracker.set_model(model);
-    }
-
-    pub(crate) fn set_unsandboxed_shell(&mut self, enabled: bool) {
-        self.unsandboxed_shell |= enabled;
     }
 
     pub fn add_pinned_context(&mut self, content: String) {

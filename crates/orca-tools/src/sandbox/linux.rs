@@ -68,16 +68,13 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
         return bwrap_command(bwrap, &request);
     }
 
-    // No bwrap: try the in-process Landlock + seccomp fallback. Policies that
+    // No bwrap: try the in-process Landlock + seccomp backend. Policies that
     // require namespace mounts (nested read-only or denied paths) are rejected
-    // by landlock_command below; strict requests then fail closed, while other
-    // capability modes retain their established compatibility fallback.
+    // by landlock_command below. Any backend failure is fail-closed: a
+    // non-dangerous request must never become a plain host shell.
     match landlock_command(&request) {
         Ok(command) => command,
-        Err(_) if request.strict => {
-            fail_closed_command("no compatible Linux sandbox backend is available")
-        }
-        Err(_) => plain_command(&request.command, &request.policy.cwd),
+        Err(_) => fail_closed_command("no compatible Linux sandbox backend is available"),
     }
 }
 
@@ -237,8 +234,8 @@ mod linux_landlock {
     use std::path::PathBuf;
 
     use landlock::{
-        ABI, Access, AccessFs, CompatLevel, Compatible, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus, path_beneath_rules,
+        ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus,
     };
     use seccompiler::BpfProgram;
 
@@ -287,26 +284,20 @@ mod linux_landlock {
 
             match policy.read_scope {
                 super::LinuxReadScope::Global => {
-                    ruleset = ruleset
-                        .add_rules(path_beneath_rules(["/"], access_ro))
-                        .map_err(landlock_prepare_error)?;
+                    ruleset = add_path_rule(ruleset, "/", access_ro, false)?;
                 }
                 super::LinuxReadScope::Restricted => {
                     let existing: Vec<&PathBuf> =
                         readable_roots.iter().filter(|root| root.exists()).collect();
-                    if !existing.is_empty() {
-                        ruleset = ruleset
-                            .add_rules(path_beneath_rules(existing, access_ro))
-                            .map_err(landlock_prepare_error)?;
+                    for root in existing {
+                        ruleset = add_path_rule(ruleset, root, access_ro, false)?;
                     }
                 }
             }
 
             // Always allow read+write on /dev/null; most tools need it.
             if PathBuf::from("/dev/null").exists() {
-                ruleset = ruleset
-                    .add_rules(path_beneath_rules(["/dev/null"], access_rw))
-                    .map_err(landlock_prepare_error)?;
+                ruleset = add_path_rule(ruleset, "/dev/null", access_rw, true)?;
             }
 
             let writable: Vec<&PathBuf> = policy
@@ -315,10 +306,8 @@ mod linux_landlock {
                 .chain(&policy.metadata_writable_roots)
                 .filter(|r| r.exists())
                 .collect();
-            if !writable.is_empty() {
-                ruleset = ruleset
-                    .add_rules(path_beneath_rules(writable, access_rw))
-                    .map_err(landlock_prepare_error)?;
+            for root in writable {
+                ruleset = add_path_rule(ruleset, root, access_rw, false)?;
             }
 
             let network_filter = build_seccomp_filter(policy.network_access)
@@ -353,6 +342,35 @@ mod linux_landlock {
         if !paths.contains(&path) {
             paths.push(path);
         }
+    }
+
+    /// Add a rule using an explicitly opened descriptor.  The convenience
+    /// `path_beneath_rules` iterator silently drops paths that cannot be
+    /// opened, which would turn a malformed policy into a weaker sandbox.
+    /// Keeping the descriptor alive in `PathBeneath` also means the kernel
+    /// rule remains tied to the opened filesystem object, not a later path
+    /// lookup.
+    fn add_path_rule(
+        ruleset: landlock::RulesetCreated,
+        path: impl AsRef<std::path::Path>,
+        access: landlock::BitFlags<AccessFs>,
+        file: bool,
+    ) -> io::Result<landlock::RulesetCreated> {
+        let path = path.as_ref();
+        let fd = PathFd::new(path).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("failed to open Landlock root {}: {error}", path.display()),
+            )
+        })?;
+        let access = if file {
+            access & AccessFs::from_file(ABI::V5)
+        } else {
+            access
+        };
+        ruleset
+            .add_rule(PathBeneath::new(fd, access))
+            .map_err(landlock_prepare_error)
     }
 
     fn landlock_prepare_error(error: landlock::RulesetError) -> io::Error {
@@ -417,8 +435,11 @@ mod linux_landlock {
         }
 
         if !network_access {
-            // Deny outbound/inbound network syscalls. recvfrom is intentionally
+            // Deny outbound/inbound network syscalls. `recvfrom` is intentionally
             // left allowed so socketpair-based subprocess IPC (e.g. cargo) works.
+            // IP sockets cannot be created or connected inside this policy; an
+            // inherited IP-socket fd would remain an explicit parent-owned
+            // capability rather than a new network escape.
             for nr in [
                 libc::SYS_connect,
                 libc::SYS_accept,
@@ -567,9 +588,8 @@ mod tests {
         assert!(policy_requires_bwrap(&denied));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn nested_read_only_policy_without_backend_keeps_non_strict_compatibility_fallback() {
+    fn nested_read_only_policy_without_backend_fails_closed_for_all_non_dangerous_modes() {
         if bwrap_path(Path::new(".")).is_some() {
             return;
         }
@@ -596,11 +616,8 @@ mod tests {
 
         let output = sandbox_command(request).output().unwrap();
 
-        // Non-strict capability modes retain the established compatibility
-        // fallback when bubblewrap is unavailable; only strict restricted-read
-        // requests fail closed.
-        assert_eq!(output.status.code(), Some(0));
-        assert!(marker.exists());
+        assert_eq!(output.status.code(), Some(126));
+        assert!(!marker.exists());
     }
 
     #[cfg(target_os = "linux")]

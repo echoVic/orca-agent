@@ -1532,7 +1532,6 @@ mod tests {
             additional_working_directories: Vec::new(),
             metadata_writable_directories: Vec::new(),
             network_domain_permissions: Default::default(),
-            unsandboxed_shell: false,
         };
         write_record(&path, &SessionRecord::Meta(meta)).expect("write metadata");
         let writer = SessionWriter {

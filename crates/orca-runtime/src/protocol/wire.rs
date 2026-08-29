@@ -2264,7 +2264,6 @@ mod tests {
                         entries: None,
                     }),
                     network: None,
-                    shell: None,
                 },
                 strict_auto_review: false,
             }
@@ -2374,7 +2373,6 @@ mod tests {
                         entries: None,
                     }),
                     network: None,
-                    shell: None,
                 },
                 strict_auto_review: false,
             }
@@ -2401,7 +2399,6 @@ mod tests {
                         entries: None,
                     }),
                     network: None,
-                    shell: None,
                 },
                 strict_auto_review: true,
             }
@@ -2409,24 +2406,13 @@ mod tests {
     }
 
     #[test]
-    fn submission_decodes_permission_response_shell_unsandboxed() {
-        let submission = Submission::decode(
+    fn submission_rejects_removed_unsandboxed_shell_permission() {
+        let error = Submission::decode(
             r#"{"id":"perm-response","method":"permission/respond","params":{"requestId":"perm-1","decision":"allow","scope":"turn","permissions":{"shell":{"unsandboxed":true}}}}"#,
         )
-        .expect("permission/respond submission");
-
-        let ClientOp::PermissionRespond { permissions, .. } = submission.op else {
-            panic!("expected permission response");
-        };
-
-        assert!(permissions.file_system.is_none());
-        assert!(permissions.network.is_none());
-        assert!(
-            permissions
-                .shell
-                .as_ref()
-                .is_some_and(|shell| shell.unsandboxed)
-        );
+        .expect_err("removed unsandboxed shell permission must be rejected");
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("unknown field") || rendered.contains("shell"));
     }
 
     #[test]

@@ -311,11 +311,6 @@ pub struct SurfaceFileSystemPermissionProfile {
     pub write: Option<Vec<SurfacePermissionPathLabel>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SurfaceShellPermissionProfile {
-    pub unsandboxed: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceAllowDeny {
     Allow,
@@ -332,7 +327,6 @@ pub struct SurfacePermissionNetworkProfile {
 pub struct SurfacePermissionProfile {
     pub file_system: Option<SurfaceFileSystemPermissionProfile>,
     pub network: Option<SurfacePermissionNetworkProfile>,
-    pub shell: Option<SurfaceShellPermissionProfile>,
 }
 
 impl SurfacePermissionProfile {
@@ -340,7 +334,6 @@ impl SurfacePermissionProfile {
         Self {
             file_system: None,
             network: None,
-            shell: None,
         }
     }
 }
@@ -596,8 +589,6 @@ pub(crate) struct PermissionRetryOverlay {
     pub additional_working_directories: Vec<CanonicalPath>,
     pub metadata_writable_directories: Vec<CanonicalPath>,
     pub network_domain_permissions: Vec<(SurfacePermissionDomainPattern, SurfaceAllowDeny)>,
-    #[serde(default)]
-    pub unsandboxed_shell: bool,
     pub strict_auto_review: bool,
 }
 
@@ -607,7 +598,6 @@ impl PermissionRetryOverlay {
             additional_working_directories: Vec::new(),
             metadata_writable_directories: Vec::new(),
             network_domain_permissions: Vec::new(),
-            unsandboxed_shell: false,
             strict_auto_review: false,
         }
     }

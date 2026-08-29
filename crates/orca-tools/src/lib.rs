@@ -1,3 +1,5 @@
+#![deny(deprecated)]
+
 use std::path::{Path, PathBuf};
 
 use orca_core::approval_types::ActionKind;
@@ -528,6 +530,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: None,
             tool_timeout_ms: None,
         }]);

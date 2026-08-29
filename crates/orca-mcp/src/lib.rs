@@ -1,3 +1,5 @@
+#![deny(deprecated)]
+
 pub mod client;
 pub mod transport;
 

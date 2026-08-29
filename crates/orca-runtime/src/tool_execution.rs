@@ -805,17 +805,9 @@ fn runtime_permission_profile_from_surface(
                     })
                     .collect(),
             });
-    let shell =
-        profile
-            .shell
-            .as_ref()
-            .map(|permissions| crate::protocol::RequestShellPermissions {
-                unsandboxed: permissions.unsandboxed,
-            });
     crate::protocol::RequestPermissionProfile {
         file_system,
         network,
-        shell,
     }
 }
 

@@ -125,6 +125,7 @@ impl RuntimeToolActorContext {
 
     pub fn execute_normal_tool(
         &mut self,
+        config: &RunConfig,
         request: &ToolRequest,
         cwd: &Path,
         mcp_registry: &McpRegistry,
@@ -134,7 +135,7 @@ impl RuntimeToolActorContext {
         task_registry: Option<&TaskRegistry>,
     ) -> ToolResult {
         self.execute_normal_tool_with_roots_and_cancel(
-            None,
+            config,
             request,
             cwd,
             &[],
@@ -151,6 +152,7 @@ impl RuntimeToolActorContext {
     #[allow(clippy::too_many_arguments)]
     pub fn execute_normal_tool_with_cancel(
         &mut self,
+        config: &RunConfig,
         request: &ToolRequest,
         cwd: &Path,
         mcp_registry: &McpRegistry,
@@ -161,7 +163,7 @@ impl RuntimeToolActorContext {
         cancel: Option<&CancelToken>,
     ) -> ToolResult {
         self.execute_normal_tool_with_roots_and_cancel(
-            None,
+            config,
             request,
             cwd,
             &[],
@@ -178,7 +180,7 @@ impl RuntimeToolActorContext {
     #[allow(clippy::too_many_arguments)]
     pub fn execute_normal_tool_with_roots_and_cancel(
         &mut self,
-        config: Option<&RunConfig>,
+        config: &RunConfig,
         request: &ToolRequest,
         cwd: &Path,
         additional_roots: &[PathBuf],

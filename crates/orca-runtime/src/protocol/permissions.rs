@@ -20,14 +20,12 @@ pub enum PermissionGrantScope {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestPermissionProfile {
     #[serde(default)]
     pub file_system: Option<RequestFileSystemPermissions>,
     #[serde(default)]
     pub network: Option<RequestNetworkPermissions>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shell: Option<RequestShellPermissions>,
 }
 
 impl RequestPermissionProfile {
@@ -48,13 +46,6 @@ pub struct RequestFileSystemPermissions {
     pub write: Option<Vec<PathBuf>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entries: Option<Vec<FileSystemSandboxEntry>>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestShellPermissions {
-    #[serde(default)]
-    pub unsandboxed: bool,
 }
 
 impl RequestFileSystemPermissions {

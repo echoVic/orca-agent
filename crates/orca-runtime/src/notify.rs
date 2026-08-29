@@ -1,5 +1,8 @@
 use std::process::Command;
 
+use orca_core::capability::CapabilitySet;
+use orca_core::execution_broker::{ExecutionBroker, LaunchError};
+
 pub fn notify(title: &str, message: &str) -> Result<(), String> {
     match std::env::consts::OS {
         "macos" => notify_macos(title, message),
@@ -14,17 +17,33 @@ fn notify_macos(title: &str, message: &str) -> Result<(), String> {
         applescript_string(message),
         applescript_string(title)
     );
-    run(Command::new("osascript").arg("-e").arg(script))
+    let mut command = Command::new("osascript");
+    command.arg("-e").arg(script);
+    run(command)
 }
 
 fn notify_linux(title: &str, message: &str) -> Result<(), String> {
-    run(Command::new("notify-send").arg(title).arg(message))
+    let mut command = Command::new("notify-send");
+    command.arg(title).arg(message);
+    run(command)
 }
 
-fn run(command: &mut Command) -> Result<(), String> {
-    let status = command
-        .status()
-        .map_err(|error| format!("failed to send notification: {error}"))?;
+fn run(command: Command) -> Result<(), String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let broker = ExecutionBroker::with_backend(
+        orca_core::capability::EnforcementState::Advisory,
+        "desktop-notification",
+    );
+    let mut launched = broker
+        .launch_user_trusted(command, "notification", cwd, CapabilitySet::read_only())
+        .map_err(|error| match error {
+            LaunchError::Spawn(error) => format!("failed to send notification: {error}"),
+            other => format!("notification broker rejected launch: {other:?}"),
+        })?;
+    let status = launched
+        .child
+        .wait()
+        .map_err(|error| format!("failed to wait for notification: {error}"))?;
     if status.success() {
         Ok(())
     } else {

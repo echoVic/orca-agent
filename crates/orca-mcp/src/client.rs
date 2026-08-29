@@ -1119,6 +1119,7 @@ mod tests {
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(1000),
         }
@@ -2294,6 +2295,7 @@ done
             env: Default::default(),
             headers: Default::default(),
             disabled: false,
+            capabilities: Default::default(),
             startup_timeout_ms: Some(STDIO_TEST_STARTUP_TIMEOUT_MS),
             tool_timeout_ms: Some(100),
         }]);

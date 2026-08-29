@@ -298,11 +298,23 @@ on run argv
   end try
 end run
 "#;
-    let output = std::process::Command::new("osascript")
+    let mut command = std::process::Command::new("osascript");
+    command
         .args(["-e", script, "--"])
         .arg(&path)
-        .output();
-    let output = match output {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let cwd = std::env::current_dir().map_err(|error| {
+        ClipboardImageError::ClipboardUnavailable(format!("failed to resolve cwd: {error}"))
+    })?;
+    let output = match orca_tools::process::spawn_user_trusted(command, "tui:clipboard-image", &cwd)
+        .and_then(|(child, process_job, _receipt)| {
+            orca_tools::process::wait_for_child_output_with_timeout(
+                child,
+                process_job,
+                std::time::Duration::from_secs(5),
+            )
+        }) {
         Ok(output) => output,
         Err(error) => {
             let _ = std::fs::remove_file(&path);
@@ -311,7 +323,7 @@ end run
     };
     if !output.status.success() {
         let _ = std::fs::remove_file(&path);
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = output.stderr_text().trim().to_string();
         return Err(ClipboardImageError::NoImage(if message.is_empty() {
             "the macOS pasteboard has no PNG-compatible image".to_string()
         } else {
@@ -359,10 +371,23 @@ if (items) {
 }
 JSON.stringify(paths);
 "#;
-    let output = std::process::Command::new("osascript")
+    let mut command = std::process::Command::new("osascript");
+    command
         .args(["-l", "JavaScript", "-e", script])
-        .output();
-    let Ok(output) = output else {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let Ok(output) = orca_tools::process::spawn_user_trusted(command, "tui:clipboard-paths", &cwd)
+        .and_then(|(child, process_job, _receipt)| {
+            orca_tools::process::wait_for_child_output_with_timeout(
+                child,
+                process_job,
+                std::time::Duration::from_secs(5),
+            )
+        })
+    else {
         return Vec::new();
     };
     if !output.status.success() {

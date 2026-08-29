@@ -44,7 +44,7 @@ pub(crate) struct RuntimeReadonlyToolInvocation {
 
 pub(crate) struct RuntimeNormalToolInvocation {
     pub(crate) request: ToolRequest,
-    pub(crate) config: Option<RunConfig>,
+    pub(crate) config: RunConfig,
     pub(crate) cwd: PathBuf,
     pub(crate) additional_roots: Vec<PathBuf>,
     pub(crate) mcp_registry: McpRegistry,
@@ -60,7 +60,7 @@ pub(crate) struct RuntimeNormalToolInvocation {
 impl RuntimeNormalToolInvocation {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn snapshot(
-        config: Option<&RunConfig>,
+        config: &RunConfig,
         request: &ToolRequest,
         cwd: &std::path::Path,
         additional_roots: &[PathBuf],
@@ -83,7 +83,7 @@ impl RuntimeNormalToolInvocation {
             });
         Self {
             request: request.clone(),
-            config: config.cloned(),
+            config: config.clone(),
             cwd: cwd.to_path_buf(),
             additional_roots: additional_roots.to_vec(),
             mcp_registry: mcp_registry.clone(),
@@ -799,6 +799,8 @@ mod tests {
     use std::sync::{Barrier, Condvar, mpsc};
 
     use orca_core::approval_types::ActionKind;
+    use orca_core::config::RunConfig;
+    use orca_core::config::file::FileConfig;
     use orca_core::tool_types::{
         InterruptSemantics, ReplaySemantics, ToolControlSemantics, ToolInvocationStarted, ToolName,
         ToolStatus, ToolTerminalSource,
@@ -1070,7 +1072,6 @@ mod tests {
                         entries: None,
                     }),
                     network: None,
-                    shell: None,
                 },
             };
             context
@@ -1135,7 +1136,7 @@ mod tests {
                 target: Some("printf test".to_string()),
                 raw_arguments: None,
             },
-            config: None,
+            config: test_config(),
             cwd: PathBuf::from("."),
             additional_roots: Vec::new(),
             mcp_registry: McpRegistry::default(),
@@ -1150,6 +1151,17 @@ mod tests {
                 replay: ReplaySemantics::IndeterminateAfterStart,
             },
         }
+    }
+
+    fn test_config() -> RunConfig {
+        crate::command::config::assemble_run_config(
+            crate::command::config::RunConfigRequest::new(
+                "0.0.0-test",
+                std::env::current_dir().expect("cwd"),
+            ),
+            FileConfig::default(),
+        )
+        .expect("test config")
     }
 
     #[test]

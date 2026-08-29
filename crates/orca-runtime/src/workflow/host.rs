@@ -14,6 +14,8 @@ use std::os::unix::process::CommandExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use orca_core::capability::CapabilitySet;
+use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::retained_output::{RetainedOutput, RetainedOutputSnapshot};
 use orca_platform::process::ProcessJob;
 
@@ -100,11 +102,30 @@ impl WorkflowHost {
     }
 
     pub fn node_available() -> bool {
-        Command::new(Self::node_executable())
+        let mut command = Command::new(Self::node_executable());
+        command
             .arg("--version")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::null());
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let broker = ExecutionBroker::with_backend(
+            orca_core::capability::EnforcementState::Advisory,
+            "workflow-node-probe",
+        );
+        broker
+            .launch_user_trusted(
+                command,
+                "workflow-node-probe",
+                cwd,
+                CapabilitySet::read_only(),
+            )
+            .and_then(|mut launched| {
+                launched
+                    .child
+                    .wait()
+                    .map_err(LaunchError::Spawn)
+                    .map_err(|_| LaunchError::EnforcementAdvisory)
+            })
             .map(|status| status.success())
             .unwrap_or(false)
     }
@@ -278,7 +299,21 @@ impl WorkflowHost {
         #[cfg(unix)]
         command.process_group(0);
 
-        let (child, process_job) = ProcessJob::spawn(&mut command)?;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let broker = ExecutionBroker::with_backend(
+            orca_core::capability::EnforcementState::Advisory,
+            "workflow-user-trusted",
+        );
+        let launched = broker
+            .launch_user_trusted(command, "workflow-host", cwd, CapabilitySet::read_only())
+            .map_err(|error| match error {
+                LaunchError::Spawn(error) => error,
+                other => io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("workflow host broker rejected launch: {other:?}"),
+                ),
+            })?;
+        let (child, process_job) = (launched.child, launched.process_job);
         let mut child = WorkflowHostChild::new(child, process_job);
         let stdin = child
             .child_mut()?

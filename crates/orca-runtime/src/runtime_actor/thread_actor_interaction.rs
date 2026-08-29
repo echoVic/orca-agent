@@ -2067,8 +2067,9 @@ impl ThreadActor {
                 &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
             ),
         };
-        let capability_fingerprint = surface_sha256(
-            &serde_json::to_vec(&snapshot.tools).expect("surface tools are serializable"),
+        let capability_fingerprint = crate::runtime_host::surface_capability_fingerprint(
+            &snapshot.settings.effective,
+            &snapshot.tools,
         );
         let operation_id = identity.operation_id().clone();
         let lease = surface::ReservationLease::new(

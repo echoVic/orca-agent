@@ -9832,7 +9832,7 @@ fn bootstrap_recorded_surface(
     let owner_lease = surface_owner.owner_lease;
     let current_owner_epoch = surface::ThreadOwnerEpoch::new(owner_lease.owner_epoch());
     let initial_owner_epoch = current_owner_epoch.get().saturating_sub(1).max(1);
-    let mut snapshot = initial_surface_snapshot(
+    let snapshot = initial_surface_snapshot(
         thread_id,
         incarnation,
         surface::ThreadOwnerEpoch::new(initial_owner_epoch),
@@ -9841,7 +9841,6 @@ fn bootstrap_recorded_surface(
         title,
         restored_context_tokens,
     )?;
-    snapshot.settings.effective.unsandboxed_shell = thread.session().unsandboxed_shell();
     let ledger = surface::JsonlSurfaceCommitLedger::new(path, snapshot.cursor.clone());
     let mut coordinator = surface::RuntimeCommitCoordinator::recover_with_owned_lease(
         ledger,
@@ -10430,7 +10429,6 @@ fn initial_surface_snapshot(
             enabled: None,
             domains: Vec::new(),
         },
-        unsandboxed_shell: false,
         policy_epoch: surface::PolicyEpoch::try_new(1).expect("one is a valid revision"),
     };
     let source_revision = match &persistence {
@@ -10636,12 +10634,6 @@ fn apply_runtime_settings_patch(
         surface::RuntimeSettingsPatch::ReplaceNetworkPermissions { permissions } => {
             settings.network_permissions = permissions.clone();
         }
-        surface::RuntimeSettingsPatch::SetUnsandboxedShell { enabled } => {
-            if !*enabled && settings.unsandboxed_shell {
-                return Err(surface::SurfaceClientCommandError::Unauthorized);
-            }
-            settings.unsandboxed_shell = *enabled;
-        }
         surface::RuntimeSettingsPatch::ApplyPermissionUpdate { .. } => {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -10659,7 +10651,6 @@ fn runtime_settings_patch_affects_policy(patch: &surface::RuntimeSettingsPatch) 
             | surface::RuntimeSettingsPatch::ReplacePermissionRules { .. }
             | surface::RuntimeSettingsPatch::ReplaceAdditionalWorkingDirectories { .. }
             | surface::RuntimeSettingsPatch::ReplaceNetworkPermissions { .. }
-            | surface::RuntimeSettingsPatch::SetUnsandboxedShell { .. }
             | surface::RuntimeSettingsPatch::ApplyPermissionUpdate { .. }
     )
 }
@@ -10813,7 +10804,6 @@ fn persist_surface_settings_metadata(
                 ),
                 metadata_writable_directories: None,
                 network_domain_permissions: Some(network_domain_permissions),
-                unsandboxed_shell: Some(settings.unsandboxed_shell),
             },
         )
         .map(|_| ())
@@ -11628,6 +11618,19 @@ pub(crate) fn surface_sha256(bytes: &[u8]) -> surface::Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     surface::Sha256Digest::new(hasher.finalize().into())
+}
+
+/// Fingerprint the complete execution authority, not only the tool catalog.
+/// Permission retry capsules carry this value so a settings/profile/root
+/// change cannot reuse a grant issued under an older capability policy.
+pub(crate) fn surface_capability_fingerprint(
+    settings: &surface::SurfaceRuntimeSettings,
+    tools: &[surface::SurfaceToolView],
+) -> surface::Sha256Digest {
+    surface_sha256(
+        &serde_json::to_vec(&("capability-kernel-v1", settings, tools))
+            .expect("surface capability authority is serializable"),
+    )
 }
 
 fn runtime_terminal_exit_status(
@@ -12761,15 +12764,9 @@ fn surface_permission_profile_from_runtime(
                 .collect(),
         }
     });
-    let shell = profile
-        .shell
-        .map(|permissions| surface::SurfaceShellPermissionProfile {
-            unsandboxed: permissions.unsandboxed,
-        });
     Ok(surface::SurfacePermissionProfile {
         file_system,
         network,
-        shell,
     })
 }
 
@@ -12817,17 +12814,9 @@ fn runtime_permission_profile_from_surface(
                     })
                     .collect(),
             });
-    let shell =
-        profile
-            .shell
-            .as_ref()
-            .map(|permissions| crate::protocol::RequestShellPermissions {
-                unsandboxed: permissions.unsandboxed,
-            });
     crate::protocol::RequestPermissionProfile {
         file_system,
         network,
-        shell,
     }
 }
 
@@ -12880,7 +12869,6 @@ fn surface_permission_retry_overlay_from_runtime(
         additional_working_directories,
         metadata_writable_directories,
         network_domain_permissions,
-        unsandboxed_shell: overlay.unsandboxed_shell(),
         strict_auto_review: overlay.strict_auto_review(),
     })
 }
@@ -12922,9 +12910,6 @@ fn runtime_permission_overlay_from_surface(
                 })
                 .collect(),
         }),
-        shell: overlay
-            .unsandboxed_shell
-            .then_some(crate::protocol::RequestShellPermissions { unsandboxed: true }),
     };
     runtime.merge_permissions(&permissions);
     runtime.merge_strict_auto_review(overlay.strict_auto_review);
@@ -12974,14 +12959,7 @@ fn surface_permission_profile_is_subset(
                 })
         })
     });
-    let shell_subset = candidate.shell.as_ref().is_none_or(|candidate| {
-        !candidate.unsandboxed
-            || requested
-                .shell
-                .as_ref()
-                .is_some_and(|requested| requested.unsandboxed)
-    });
-    file_system_subset && network_subset && shell_subset
+    file_system_subset && network_subset
 }
 
 fn surface_session_permission_grant_is_applied(
@@ -13029,11 +13007,7 @@ fn surface_session_permission_grant_is_applied(
                     })
             })
     });
-    let shell_applied = permissions
-        .shell
-        .as_ref()
-        .is_none_or(|shell| !shell.unsandboxed || settings.unsandboxed_shell);
-    paths_applied && network_applied && shell_applied
+    paths_applied && network_applied
 }
 
 fn surface_session_permission_settings_delta_authorized(
@@ -13048,7 +13022,6 @@ fn surface_session_permission_settings_delta_authorized(
         || current.workspace_roots != next.workspace_roots
         || current.active_permission_profile != next.active_permission_profile
         || current.permission_rules != next.permission_rules
-        || (current.unsandboxed_shell && !next.unsandboxed_shell)
     {
         return false;
     }
@@ -13086,15 +13059,6 @@ fn surface_session_permission_settings_delta_authorized(
     let requested_network = requested.network.as_ref();
     if current.network_permissions.enabled != next.network_permissions.enabled
         && requested_network.and_then(|network| network.enabled) != next.network_permissions.enabled
-    {
-        return false;
-    }
-    if current.unsandboxed_shell != next.unsandboxed_shell
-        && (!next.unsandboxed_shell
-            || !requested
-                .shell
-                .as_ref()
-                .is_some_and(|shell| shell.unsandboxed))
     {
         return false;
     }

@@ -73,6 +73,8 @@ jobs:
         run: |
           node scripts/test-validate-windows-platform-boundaries.mjs
           node scripts/validate-windows-platform-boundaries.mjs
+          node scripts/test-validate-execution-broker-boundary.mjs
+          node scripts/validate-execution-broker-boundary.mjs
       - id: version
         shell: bash
         env:

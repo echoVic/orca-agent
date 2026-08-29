@@ -5679,9 +5679,20 @@ while :; do :; done
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let (child, process_job) =
-            ProcessJob::spawn_named(&mut command, &async_worker_job_name(&task.id))
-                .expect("spawn Windows recovered worker fixture inside named job");
+        let broker = orca_core::execution_broker::ExecutionBroker::with_backend(
+            orca_core::capability::EnforcementState::Advisory,
+            "test-worker-fixture",
+        );
+        let launched = broker
+            .launch_user_trusted_named(
+                command,
+                format!("test-worker:{}", task.id),
+                &root,
+                orca_core::capability::CapabilitySet::read_only(),
+                &async_worker_job_name(&task.id),
+            )
+            .expect("spawn Windows recovered worker fixture inside named job");
+        let (child, process_job) = (launched.child, launched.process_job);
         let pid = child.id();
         owner
             .adopt_subagent_worker_with_job(&task.id, child, process_job)

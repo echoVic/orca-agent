@@ -999,7 +999,7 @@ mod tests {
                     target: Some("secret-target".to_string()),
                     preview: Some("secret-preview".to_string()),
                     permission_kind:
-                        orca_runtime::runtime_permission::RuntimePermissionRequestKind::UnsandboxedShellRetry,
+                        orca_runtime::runtime_permission::RuntimePermissionRequestKind::CapabilityBoundary,
                 },
                 "Permission approval required",
             ),

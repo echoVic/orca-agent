@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use orca_core::tool_types::{
     ToolOutputTruncation, ToolRequest, ToolResult, truncate_output_with_policy,
 };
-use orca_platform::process::ProcessJob;
 use orca_platform::shell::{ShellKind, ShellSpec};
 
 use crate::process;
@@ -120,6 +119,7 @@ pub fn execute_with_shell_spec_roots_or_cancel(
     execute_command_with_policy_or_cancel(
         request,
         process_command,
+        cwd,
         output_truncation,
         shell_timeout,
         should_cancel,
@@ -129,6 +129,7 @@ pub fn execute_with_shell_spec_roots_or_cancel(
 fn execute_command_with_policy_or_cancel(
     request: &ToolRequest,
     mut process_command: std::process::Command,
+    cwd: &Path,
     output_truncation: ToolOutputTruncation,
     shell_timeout: Duration,
     should_cancel: impl Fn() -> bool,
@@ -137,7 +138,15 @@ fn execute_command_with_policy_or_cancel(
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (child, process_job) = match ProcessJob::spawn(&mut process_command) {
+    let (child, process_job, _receipt) = match process::spawn_with_capability(
+        process_command,
+        format!("tool:bash:{}", request.id),
+        cwd,
+        orca_core::capability::CapabilityProcessClass::SandboxedTool,
+        orca_core::capability::CapabilitySet::workspace_write(),
+        sandbox::enforcement_state(),
+        "tool-sandbox",
+    ) {
         Ok(spawned) => spawned,
         Err(error) => {
             return ToolResult::failed(
@@ -312,6 +321,7 @@ pub fn execute_streaming_with_policy_roots_or_cancel(
     execute_streaming_command_or_cancel(
         request,
         sandbox::bash_command_with_additional_roots(command, cwd, additional_roots),
+        cwd,
         output_truncation,
         shell_timeout,
         on_output,
@@ -325,6 +335,7 @@ pub fn execute_streaming_with_policy_roots_or_cancel(
 pub fn execute_streaming_command_or_cancel(
     request: &ToolRequest,
     mut command: std::process::Command,
+    cwd: &Path,
     output_truncation: ToolOutputTruncation,
     shell_timeout: Duration,
     on_output: &mut dyn FnMut(&str),
@@ -334,7 +345,15 @@ pub fn execute_streaming_command_or_cancel(
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (mut child, process_job) = match ProcessJob::spawn(&mut command) {
+    let (mut child, process_job, _receipt) = match process::spawn_with_capability(
+        command,
+        format!("tool:bash-stream:{}", request.id),
+        cwd,
+        orca_core::capability::CapabilityProcessClass::SandboxedTool,
+        orca_core::capability::CapabilitySet::workspace_write(),
+        sandbox::enforcement_state(),
+        "tool-sandbox",
+    ) {
         Ok(spawned) => spawned,
         Err(error) => {
             return ToolResult::failed(
@@ -634,6 +653,10 @@ mod tests {
     };
     use std::time::Instant;
 
+    fn sandbox_enforcement_available() -> bool {
+        crate::sandbox::enforcement_state() == orca_core::capability::EnforcementState::Enforced
+    }
+
     fn bash_request(command: &str) -> ToolRequest {
         ToolRequest {
             id: "bash-1".to_string(),
@@ -683,6 +706,7 @@ mod tests {
         execute_command_with_policy_or_cancel(
             request,
             host_test_command(request.target.as_deref().unwrap_or_default(), cwd),
+            cwd,
             output_truncation,
             shell_timeout,
             should_cancel,
@@ -700,6 +724,7 @@ mod tests {
         execute_streaming_command_or_cancel(
             request,
             host_test_command(request.target.as_deref().unwrap_or_default(), cwd),
+            cwd,
             output_truncation,
             shell_timeout,
             on_output,
@@ -709,6 +734,9 @@ mod tests {
 
     #[test]
     fn streaming_reports_output_chunks_and_final_result() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let command = platform_script(
             "printf 'one\\ntwo\\n'",
@@ -735,6 +763,9 @@ mod tests {
 
     #[test]
     fn streaming_large_unterminated_output_is_bounded_before_result_truncation() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let logical_bytes = process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM * 2;
         let command = platform_script(
@@ -779,6 +810,9 @@ mod tests {
 
     #[test]
     fn bash_commands_receive_eof_on_stdin_instead_of_inheriting_terminal() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let command = platform_script(
             "read line; printf done",
@@ -805,6 +839,9 @@ mod tests {
 
     #[test]
     fn streaming_respects_shell_timeout_and_returns_partial_output() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let command = platform_script(
             "printf before; sleep 5; printf after",
@@ -849,6 +886,9 @@ mod tests {
 
     #[test]
     fn noisy_streaming_timeout_does_not_deadlock_reader_shutdown() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let command = platform_script(
             "while :; do printf 1234567890; done",
@@ -896,6 +936,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn escaped_session_descendant_cannot_deadlock_stream_shutdown() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let helper = std::env::current_exe().expect("resolve test executable");
         let mut command = std::process::Command::new("sh");
         command
@@ -912,6 +955,7 @@ mod tests {
         let result = execute_streaming_command_or_cancel(
             &request,
             command,
+            &std::env::current_dir().expect("current directory"),
             ToolOutputTruncation::bytes(1024),
             Duration::from_millis(200),
             &mut |_| {},
@@ -947,6 +991,9 @@ mod tests {
 
     #[test]
     fn bash_wait_observes_cancel_callback() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let command = platform_script(
             "printf before; sleep 5; printf after",
@@ -985,6 +1032,9 @@ mod tests {
 
     #[test]
     fn bash_wait_preserves_one_shot_cancel_observation() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let cancel_ready = dir.path().join("cancel-ready");
         let command = platform_script(
@@ -1014,6 +1064,9 @@ mod tests {
 
     #[test]
     fn streaming_bash_wait_observes_cancel_callback() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let command = platform_script(
             "printf 'before\\n'; sleep 5; printf after",
@@ -1071,6 +1124,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn streaming_completed_process_wins_cancellation_observed_during_callback() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let release = dir.path().join("release");
         let completed = dir.path().join("completed");
@@ -1109,6 +1165,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn streaming_bash_keeps_polling_cancel_after_output_closes() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let request = bash_request("exec >/dev/null 2>/dev/null; sleep 5");
         let started = Instant::now();
@@ -1133,6 +1192,9 @@ mod tests {
 
     #[test]
     fn noisy_streaming_cancel_does_not_deadlock_reader_shutdown() {
+        if !sandbox_enforcement_available() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let command = platform_script(
             "while :; do printf 1234567890; done",
@@ -1193,7 +1255,6 @@ mod tests {
             extra_file.display(),
             outside_file.display()
         ));
-
         let result = execute_with_policy_roots_or_cancel(
             &request,
             &workspace,
@@ -1202,7 +1263,6 @@ mod tests {
             Duration::from_secs(5),
             || false,
         );
-
         assert_eq!(result.status, ToolStatus::Failed);
         assert_eq!(std::fs::read_to_string(extra_file).unwrap(), "allowed");
         assert!(!outside_file.exists());

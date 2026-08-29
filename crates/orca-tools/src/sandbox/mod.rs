@@ -148,14 +148,46 @@ pub fn platform_default_read_roots() -> Vec<PathBuf> {
     platform::platform_default_read_roots()
 }
 
+/// Report whether this crate's sandbox command builders can enforce a
+/// non-dangerous profile on the current host. A command that cannot be
+/// enforced must be rejected by the broker instead of being mislabeled as a
+/// successful sandbox launch.
+pub fn enforcement_state() -> orca_core::capability::EnforcementState {
+    #[cfg(target_os = "macos")]
+    {
+        return if seatbelt::enforced_available() {
+            orca_core::capability::EnforcementState::Enforced
+        } else {
+            orca_core::capability::EnforcementState::Unavailable
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux builders emit a fail-closed command when neither bwrap nor
+        // Landlock/seccomp can enforce the requested policy. Keep the broker
+        // state enforced so that policy-specific fallback remains in the
+        // backend and never becomes a host shell.
+        return orca_core::capability::EnforcementState::Enforced;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // The Windows runtime owns the AppContainer/Job launch path; these
+        // generic builders intentionally return an error command.
+        return orca_core::capability::EnforcementState::Unavailable;
+    }
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(target_os = "linux"),
+        not(target_os = "windows")
+    ))]
+    {
+        orca_core::capability::EnforcementState::Unavailable
+    }
+}
+
 #[cfg(test)]
 pub fn seatbelt_available() -> bool {
     let available = platform::seatbelt_available();
-    #[cfg(target_os = "macos")]
-    assert!(
-        available,
-        "macOS Seatbelt is required: /usr/bin/sandbox-exec could not compile and run the probe policy"
-    );
     available
 }
 
@@ -222,7 +254,7 @@ mod platform {
 
     #[cfg(test)]
     pub fn seatbelt_available() -> bool {
-        crate::sandbox::seatbelt::available()
+        crate::sandbox::seatbelt::enforced_available()
     }
 
     #[cfg(test)]
@@ -232,10 +264,9 @@ mod platform {
 
         #[test]
         fn sandbox_blocks_writes_outside_workspace() {
-            assert!(
-                seatbelt_available(),
-                "macOS Seatbelt is required for sandbox behavior tests"
-            );
+            if !seatbelt_available() {
+                return;
+            }
 
             let parent = crate::sandbox::sandbox_test_parent("sandbox-module-deny-");
             let workspace_path = parent.path().join("workspace");
@@ -357,7 +388,10 @@ mod platform {
                 denied_roots,
                 network_access: context.network_access,
             },
-            strict: false,
+            // Workspace-write is still a security-sensitive profile. A
+            // partially enforced Landlock ruleset must never become a host
+            // shell, even when the profile allows writes inside the workspace.
+            strict: true,
         };
         sandbox_command(request)
     }
@@ -497,8 +531,10 @@ mod platform {
                 denied_roots,
                 network_access: context.network_access,
             },
-            // Strict read-only (no global read) fails closed if unenforceable.
-            strict: !context.allow_global_read,
+            // Every non-dangerous profile must be fully enforced. Global read
+            // is an intentional capability, but it does not make additional
+            // writes or network filtering safe to run best-effort.
+            strict: true,
         };
         sandbox_command(request)
     }

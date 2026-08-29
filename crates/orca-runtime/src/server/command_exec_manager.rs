@@ -17,7 +17,7 @@ use crate::runtime_permission::{
     RuntimePermissionDecision, RuntimePermissionEvaluation, RuntimePermissionOrigin,
     RuntimePermissionPolicy, RuntimePermissionRequestKind,
 };
-use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
+use crate::sandbox_denial::diagnose_sandbox_denial;
 use crate::shell_session::RuntimeShellSessionManager;
 
 pub(super) struct CommandExecProcess {
@@ -25,7 +25,6 @@ pub(super) struct CommandExecProcess {
     pub(super) command_event_id: Value,
     pub(super) command: Vec<String>,
     pub(super) cwd: PathBuf,
-    pub(super) denied_writable_roots: Vec<PathBuf>,
     pub(super) stream_output: bool,
     pub(super) output_bytes_cap: Option<usize>,
     pub(super) output_offset: usize,
@@ -64,10 +63,6 @@ pub(super) enum CommandExecDrainOutcome {
     NetworkPermissionDenied {
         command_event_id: Value,
         reason: String,
-    },
-    FileSystemPermissionRequired {
-        request: JsonlCommandExecPermissionRequest,
-        diagnostic: SandboxDenialDiagnostic,
     },
 }
 
@@ -139,29 +134,6 @@ impl CommandExecPermissionPolicy {
                 Some(CommandExecPermissionDenial { reason })
             }
         }
-    }
-
-    pub(super) fn sandbox_denial_prompt(
-        diagnostic: &SandboxDenialDiagnostic,
-    ) -> CommandExecPermissionPrompt {
-        RuntimePermissionPolicy::sandbox_denial_decision(
-            "command-exec",
-            RuntimePermissionOrigin::CommandExec,
-            diagnostic,
-        )
-        .into()
-    }
-
-    pub(super) fn should_request_filesystem_retry(
-        cwd: &std::path::Path,
-        diagnostic: &SandboxDenialDiagnostic,
-        denied_writable_roots: &[PathBuf],
-    ) -> bool {
-        RuntimePermissionPolicy::should_request_filesystem_retry(
-            cwd,
-            diagnostic,
-            denied_writable_roots,
-        )
     }
 }
 
@@ -465,7 +437,7 @@ impl CommandExecManager {
                 else {
                     continue;
                 };
-                let output =
+                let mut output =
                     match manager.read_preserving_output(&shell_id, Duration::from_millis(1)) {
                         Ok(output) => output,
                         Err(_) => continue,
@@ -560,17 +532,14 @@ impl CommandExecManager {
                     if let Some(diagnostic) =
                         diagnose_sandbox_denial(&process.cwd, &output.stdout, &output.stderr)
                     {
-                        if CommandExecPermissionPolicy::should_request_filesystem_retry(
-                            &process.cwd,
-                            &diagnostic,
-                            &process.denied_writable_roots,
-                        ) && let Some(request) = process.permission_request
-                        {
-                            manager.remove_output(&output.task_id);
-                            return Ok(CommandExecDrainOutcome::FileSystemPermissionRequired {
-                                request,
-                                diagnostic,
-                            });
+                        // stderr is explanatory only. A process-controlled
+                        // denial string is not a kernel receipt and cannot
+                        // mint a filesystem or shell escalation request.
+                        if output.stderr.trim_end().is_empty() {
+                            output.stderr = diagnostic.message;
+                        } else {
+                            output.stderr.push_str("\n\nSandbox diagnostic: ");
+                            output.stderr.push_str(&diagnostic.message);
                         }
                     }
                     protocol::write_server_event(
@@ -736,14 +705,12 @@ fn stream_omitted_prefix_notice(omitted_prefix_bytes: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::Duration;
 
     use super::{CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess};
     use crate::network_proxy::RuntimeNetworkBlockReport;
     use crate::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionRequestKind};
-    use crate::sandbox_denial::SandboxDenialDiagnostic;
     use crate::shell_session::{
         RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellTerminalMode,
     };
@@ -765,47 +732,6 @@ mod tests {
         } else {
             vec!["sh".to_string(), "-lc".to_string()]
         }
-    }
-
-    #[test]
-    fn command_exec_permission_policy_requests_pathless_sandbox_retry() {
-        let diagnostic = SandboxDenialDiagnostic {
-            denied_path: None,
-            suggested_write_root: None,
-            message: "sandbox denied filesystem access".to_string(),
-        };
-
-        assert!(
-            CommandExecPermissionPolicy::should_request_filesystem_retry(
-                &PathBuf::from("/repo"),
-                &diagnostic,
-                &[]
-            )
-        );
-    }
-
-    #[test]
-    fn command_exec_permission_policy_requests_write_root_unless_denied() {
-        let diagnostic = SandboxDenialDiagnostic {
-            denied_path: Some(PathBuf::from("/repo/.git/index.lock")),
-            suggested_write_root: Some(PathBuf::from("/repo/.git")),
-            message: "sandbox denied filesystem access".to_string(),
-        };
-
-        assert!(
-            CommandExecPermissionPolicy::should_request_filesystem_retry(
-                &PathBuf::from("/repo/worktree"),
-                &diagnostic,
-                &[]
-            )
-        );
-        assert!(
-            !CommandExecPermissionPolicy::should_request_filesystem_retry(
-                &PathBuf::from("/repo/worktree"),
-                &diagnostic,
-                &[PathBuf::from("/repo/.git")]
-            )
-        );
     }
 
     #[test]
@@ -881,61 +807,6 @@ mod tests {
     }
 
     #[test]
-    fn command_exec_permission_policy_builds_filesystem_prompt_for_write_root() {
-        let diagnostic = SandboxDenialDiagnostic {
-            denied_path: Some(PathBuf::from("/repo/.git/index.lock")),
-            suggested_write_root: Some(PathBuf::from("/repo/.git")),
-            message: "sandbox denied filesystem access".to_string(),
-        };
-
-        let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
-
-        assert_eq!(prompt.origin, RuntimePermissionOrigin::CommandExec);
-        assert_eq!(prompt.kind, RuntimePermissionRequestKind::FilesystemWrite);
-        assert_eq!(
-            prompt.reason,
-            "command/exec attempted filesystem write outside the current sandbox: /repo/.git"
-        );
-        assert_eq!(
-            prompt
-                .permissions
-                .file_system
-                .expect("file system permissions")
-                .write,
-            Some(vec![PathBuf::from("/repo/.git")])
-        );
-    }
-
-    #[test]
-    fn command_exec_permission_policy_builds_unsandboxed_prompt_for_pathless_denial() {
-        let diagnostic = SandboxDenialDiagnostic {
-            denied_path: None,
-            suggested_write_root: None,
-            message: "sandbox denied filesystem access".to_string(),
-        };
-
-        let prompt = CommandExecPermissionPolicy::sandbox_denial_prompt(&diagnostic);
-
-        assert_eq!(prompt.origin, RuntimePermissionOrigin::CommandExec);
-        assert_eq!(
-            prompt.kind,
-            RuntimePermissionRequestKind::UnsandboxedShellRetry
-        );
-        assert!(
-            prompt.reason.contains("without the filesystem sandbox"),
-            "unsandboxed retry prompt should explain why the sandbox cannot be amended: {}",
-            prompt.reason
-        );
-        assert!(
-            prompt
-                .permissions
-                .shell
-                .expect("shell permissions")
-                .unsandboxed
-        );
-    }
-
-    #[test]
     fn streaming_delta_survives_retained_output_rebase() {
         let cwd = tempfile::tempdir().expect("tempdir");
         let task_registry = TaskRegistry::new("command-exec-output-rebase".to_string());
@@ -970,7 +841,6 @@ mod tests {
                     command_event_id: Value::from("cmd-rebase"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
-                    denied_writable_roots: Vec::new(),
                     stream_output: true,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -1055,7 +925,6 @@ mod tests {
                     command_event_id: Value::from("cmd-cap"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
-                    denied_writable_roots: Vec::new(),
                     stream_output: true,
                     output_bytes_cap: Some(3),
                     output_offset: 0,
@@ -1148,7 +1017,6 @@ mod tests {
                     command_event_id: Value::from("cmd-omitted"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
-                    denied_writable_roots: Vec::new(),
                     stream_output: true,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -1217,7 +1085,6 @@ mod tests {
                     command_event_id: Value::from("cmd-stderr-omitted"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
-                    denied_writable_roots: Vec::new(),
                     stream_output: true,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -1290,7 +1157,6 @@ mod tests {
                     command_event_id: Value::from("cmd-omitted-cap"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
-                    denied_writable_roots: Vec::new(),
                     stream_output: true,
                     output_bytes_cap: Some(3),
                     output_offset: 0,
@@ -1368,7 +1234,6 @@ mod tests {
                     command_event_id: Value::from("cmd-denied"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
-                    denied_writable_roots: Vec::new(),
                     stream_output: false,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -1432,7 +1297,6 @@ mod tests {
                     command_event_id: Value::from("cmd-list-owned"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
-                    denied_writable_roots: Vec::new(),
                     stream_output: false,
                     output_bytes_cap: None,
                     output_offset: 0,

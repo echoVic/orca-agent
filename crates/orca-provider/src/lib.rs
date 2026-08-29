@@ -1,3 +1,5 @@
+#![deny(deprecated)]
+
 pub mod context;
 pub mod deepseek_fixture;
 pub mod deepseek_http;

@@ -163,6 +163,20 @@ allowlist_commands = []
 
 Configure MCP (Model Context Protocol) servers to give Orca access to external tools and data sources.
 
+Each stdio server has an explicit capability grant. Omitted capabilities are
+read-only and network-disabled; project `.orca/config.toml` cannot add or
+replace MCP servers or execution permissions.
+
+```toml
+[mcp.servers.capabilities]
+read = true
+write = false
+metadata_write = false
+network = false
+shell = false
+agent = false
+```
+
 ### Example: Filesystem MCP
 
 ```toml

@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use orca_platform::process::ProcessJob;
-
 const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const WORKTREE_GIT_RETAINED_BYTES: usize = 64 * 1024;
 
@@ -89,7 +87,8 @@ fn run_git(cwd: &Path, args: &[&str]) -> io::Result<orca_tools::process::Command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     orca_tools::process::prepare_non_interactive_command(&mut command);
-    let (child, process_job) = ProcessJob::spawn(&mut command)?;
+    let (child, process_job, _receipt) =
+        orca_tools::process::spawn_user_trusted(command, "worktree:git", cwd)?;
     orca_tools::process::wait_for_child_output_with_timeout_or_cancel_and_limit(
         child,
         process_job,

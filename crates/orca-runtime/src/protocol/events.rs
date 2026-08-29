@@ -297,6 +297,9 @@ pub enum ServerEvent {
         turn_id: Value,
         reason: Value,
         permissions: Value,
+        command: Value,
+        cwd: Value,
+        capability: Value,
     },
     PermissionResolved {
         #[serde(rename = "requestId")]
@@ -619,6 +622,9 @@ pub fn map_runtime_event_line(line: &str) -> Option<ServerEvent> {
             turn_id: payload["turn_id"].clone(),
             reason: payload["reason"].clone(),
             permissions: payload["permissions"].clone(),
+            command: payload["command"].clone(),
+            cwd: payload["cwd"].clone(),
+            capability: payload["capability"].clone(),
         }),
         "surface.user_input.requested" => Some(ServerEvent::UserInputRequest {
             request_id: payload["request_id"].clone(),
