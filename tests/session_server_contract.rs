@@ -3187,7 +3187,12 @@ fn server_mode_command_exec_returns_buffered_output() {
     let completed = events
         .iter()
         .find(|event| event["id"] == "cmd" && event["event"] == "command_exec_completed")
-        .expect("command_exec_completed event");
+        .unwrap_or_else(|| {
+            panic!(
+                "command_exec_completed event; events={events:?}; stdout={:?}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
     assert_eq!(completed["exitCode"], 0, "{completed:?}");
     assert_eq!(completed["stdout"], "legacy-out");
     assert_eq!(completed["stderr"], "legacy-err");
