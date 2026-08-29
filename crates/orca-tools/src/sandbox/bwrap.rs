@@ -381,13 +381,21 @@ mod tests {
         policy.cwd = platform_slash_tmp_path().join(".tmp123/workspace");
 
         let argv = build_bwrap_argv(&policy, "true");
-        let joined = argv_string(&argv);
         let tmp = platform_slash_tmp_path();
         let nested = tmp.join(".tmp123");
-        let cwd = nested.join("workspace");
-        assert!(joined.contains(&format!("--dir {}", tmp.display())));
-        assert!(joined.contains(&format!("--dir {}", nested.display())));
-        assert!(joined.contains(&format!("--chdir {}", cwd.display())));
+        assert!(
+            argv.windows(2)
+                .any(|pair| { pair[0] == "--dir" && pair[1] == tmp.display().to_string() })
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| { pair[0] == "--dir" && pair[1] == nested.display().to_string() })
+        );
+        assert!(
+            argv.windows(2).any(|pair| {
+                pair[0] == "--chdir" && pair[1] == policy.cwd.display().to_string()
+            })
+        );
     }
 
     #[test]
