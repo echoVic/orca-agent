@@ -1025,12 +1025,23 @@ fn spawn_windows_sandbox(
         ),
         ShellSandboxMode::DangerFullAccess => unreachable!("full access uses std process spawn"),
     };
+    let spec = session_command_spec(shell, command)?;
+    // AppContainer is denied by default from reading runner-managed runtime
+    // directories (for example the hosted Node or PowerShell install). Grant
+    // only the resolved executable's parent so the child can load its binary
+    // and adjacent runtime files; user data remains governed by the plan.
+    let mut readable_roots = command.additional_readable_directories.clone();
+    if let Some(parent) = spec.program.parent()
+        && !readable_roots.iter().any(|root| root == parent)
+    {
+        readable_roots.push(parent.to_path_buf());
+    }
     let mut writable_roots = command.additional_working_directories.clone();
     writable_roots.extend_from_slice(metadata_writable_directories);
     let plan = WindowsSandboxPlan::build(WindowsSandboxPolicyInput {
         mode,
         cwd: command.cwd.clone(),
-        readable_roots: command.additional_readable_directories.clone(),
+        readable_roots,
         writable_roots,
         denied_roots: command.denied_working_directories.clone(),
         network_access,
@@ -1048,7 +1059,6 @@ fn spawn_windows_sandbox(
     capabilities
         .verify_setup_for_workspace(&command.cwd, orca_windows_sandbox::SETUP_HELPER_VERSION)
         .map_err(io::Error::other)?;
-    let spec = session_command_spec(shell, command)?;
     let request = || SandboxSpawnRequest {
         program: &spec.program,
         args: &spec.args,

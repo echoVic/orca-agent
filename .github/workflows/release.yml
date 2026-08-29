@@ -16,7 +16,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04's hosted AppArmor profile blocks the unprivileged user
+    # namespaces required by bubblewrap. Pin the behavioral gate to 22.04 so
+    # the release path exercises the real namespace backend; production still
+    # fails closed when a host cannot enforce the same boundary.
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5

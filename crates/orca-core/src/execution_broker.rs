@@ -207,6 +207,11 @@ impl ExecutionBroker {
         capabilities: crate::capability::CapabilitySet,
         job_name: Option<&str>,
     ) -> Result<BrokerLaunch, LaunchError> {
+        // User-owned integrations may originate from hook/configuration
+        // contexts that still carry a relative cwd. Resolve it once at the
+        // broker boundary; the subsequent stable-cwd attachment binds the
+        // launch to the opened directory object.
+        let cwd = cwd.into().canonicalize().map_err(LaunchError::Cwd)?;
         let request = crate::capability::CapabilityRequest::new(
             request_id,
             CapabilityProcessClass::UserTrustedIntegration,
@@ -227,7 +232,7 @@ impl ExecutionBroker {
 mod tests {
     use std::process::Command;
 
-    use super::{ExecutionBroker, LaunchError};
+    use super::{BrokerLaunch, ExecutionBroker, LaunchError};
     use crate::approval_types::ApprovalMode;
     use crate::capability::{
         CapabilityCeiling, CapabilityProcessClass, CapabilityRequest, CapabilitySet,
@@ -310,6 +315,27 @@ mod tests {
         let mut child = launched.child;
         let _process_job = launched.process_job;
         assert!(child.wait().expect("wait child").success());
+    }
+
+    #[test]
+    fn user_trusted_launcher_normalizes_relative_cwd_at_the_boundary() {
+        let broker = ExecutionBroker::new(EnforcementState::Advisory);
+        let launched = broker
+            .launch_user_trusted(
+                Command::new("true"),
+                "broker-relative-cwd",
+                ".",
+                CapabilitySet::read_only(),
+            )
+            .expect("relative cwd should resolve before capability validation");
+        let BrokerLaunch {
+            mut child,
+            process_job,
+            receipt,
+        } = launched;
+        let _process_job = process_job;
+        assert!(child.wait().expect("wait child").success());
+        assert!(receipt.cwd.is_absolute());
     }
 
     #[test]
