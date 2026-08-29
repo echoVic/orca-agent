@@ -62,31 +62,8 @@ pub fn platform_default_read_roots() -> Vec<PathBuf> {
 pub fn enforced_available(cwd: &Path) -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        if let Some(bwrap) = bwrap_path(cwd) {
-            let request = LinuxSandboxRequest {
-                command: "true".to_string(),
-                policy: LinuxSandboxPolicy {
-                    cwd: cwd.to_path_buf(),
-                    read_scope: LinuxReadScope::Global,
-                    readable_roots: Vec::new(),
-                    allowed_unix_socket_roots: Vec::new(),
-                    writable_roots: Vec::new(),
-                    metadata_protection_roots: Vec::new(),
-                    metadata_writable_roots: Vec::new(),
-                    read_only_roots: Vec::new(),
-                    denied_roots: Vec::new(),
-                    network_access: false,
-                },
-                strict: true,
-            };
-            if bwrap_command(bwrap, &request)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                return true;
-            }
+        if bwrap_enforced_available(cwd) {
+            return true;
         }
 
         #[cfg(target_os = "linux")]
@@ -96,6 +73,40 @@ pub fn enforced_available(cwd: &Path) -> bool {
         }
         #[allow(unreachable_code)]
         false
+    })
+}
+
+/// Probe bubblewrap once and reuse the result for both capability reporting
+/// and command selection.  Keeping these decisions coupled prevents a failed
+/// bwrap network/user-namespace setup from being reported as Landlock-ready
+/// while the launcher still chooses bwrap on the next request.
+fn bwrap_enforced_available(cwd: &Path) -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let Some(bwrap) = bwrap_path(cwd) else {
+            return false;
+        };
+        let request = LinuxSandboxRequest {
+            command: "true".to_string(),
+            policy: LinuxSandboxPolicy {
+                cwd: cwd.to_path_buf(),
+                read_scope: LinuxReadScope::Global,
+                readable_roots: Vec::new(),
+                writable_roots: Vec::new(),
+                metadata_protection_roots: Vec::new(),
+                metadata_writable_roots: Vec::new(),
+                read_only_roots: Vec::new(),
+                denied_roots: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                network_access: false,
+            },
+            strict: true,
+        };
+        bwrap_command(bwrap, &request)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     })
 }
 
@@ -110,7 +121,10 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
     {
         return fail_closed_command("one or more sandbox deny paths do not exist");
     }
-    if let Some(bwrap) = bwrap_path(&request.policy.cwd) {
+    if bwrap_enforced_available(&request.policy.cwd) {
+        let Some(bwrap) = bwrap_path(&request.policy.cwd) else {
+            return fail_closed_command("bubblewrap disappeared after backend probe");
+        };
         return bwrap_command(bwrap, &request);
     }
 

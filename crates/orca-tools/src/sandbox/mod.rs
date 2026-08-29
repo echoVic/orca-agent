@@ -482,7 +482,7 @@ mod platform {
 
         // Additional roots are writable even in read-only mode (e.g. an
         // explicitly granted output directory), matching the Seatbelt profile.
-        let mut writable_roots = canonicalize_all(context.additional_roots);
+        let writable_roots = canonicalize_all(context.additional_roots);
         let metadata_protection_roots = writable_roots.clone();
         let metadata_writable_roots = canonicalize_all(
             &context
