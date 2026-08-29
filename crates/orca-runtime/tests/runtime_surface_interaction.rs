@@ -546,7 +546,6 @@ impl ThreadOperationExecutor for PermissionExecutor {
                         entries: None,
                     }),
                     network: None,
-                    shell: None,
                 },
             })?;
         self.response_tx.send(response).unwrap();
@@ -626,7 +625,6 @@ impl ThreadOperationExecutor for BlockingResolvedPermissionExecutor {
                         entries: None,
                     }),
                     network: None,
-                    shell: None,
                 },
             })?;
         self.response_tx.send(response).unwrap();
@@ -1662,7 +1660,6 @@ fn native_permission_allow_cannot_widen_requested_profile() {
             ]),
         }),
         network: None,
-        shell: None,
     };
     let rejected = attachment
         .client
