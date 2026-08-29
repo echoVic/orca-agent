@@ -983,7 +983,6 @@ fn turn_permission_overlay_requests_and_merges_network_grants() {
                             PermissionProfileNetworkAccess::Allow,
                         )]),
                     }),
-                    shell: None,
                 },
             },
         )
@@ -1022,7 +1021,6 @@ fn turn_permission_overlay_requests_and_merges_file_system_write_grants() {
                             .and_then(|file_system| file_system.entries.clone()),
                     }),
                     network: None,
-                    shell: None,
                 },
                 strict_auto_review: false,
             })
@@ -1046,7 +1044,6 @@ fn turn_permission_overlay_requests_and_merges_file_system_write_grants() {
                         entries: None,
                     }),
                     network: None,
-                    shell: None,
                 },
             },
         )
@@ -1092,7 +1089,6 @@ fn turn_permission_overlay_does_not_merge_denied_responses() {
                             PermissionProfileNetworkAccess::Allow,
                         )]),
                     }),
-                    shell: None,
                 },
             },
         )
@@ -1124,7 +1120,6 @@ fn tool_actor_context_includes_strict_auto_review_in_permission_output() {
                         entries: None,
                     }),
                     network: None,
-                    shell: None,
                 },
                 strict_auto_review: true,
             })
@@ -1181,7 +1176,7 @@ fn task_actor_executes_normal_tool_with_runtime_policy() {
     };
 
     let result = actor.execute_normal_tool_with_roots_and_cancel(
-        Some(&config),
+        &config,
         &request,
         std::env::current_dir().expect("cwd").as_path(),
         &[],
@@ -1229,7 +1224,7 @@ fn tool_actor_context_allows_bash_writes_to_additional_working_directories() {
     };
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
-        None,
+        &test_run_config(),
         &request,
         &workspace,
         std::slice::from_ref(&extra),
@@ -1296,7 +1291,7 @@ fn tool_actor_context_retries_bash_after_filesystem_permission_grant() {
     };
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
-        Some(&config),
+        &config,
         &request,
         &workspace,
         &[],
@@ -1362,7 +1357,7 @@ fn tool_actor_context_retries_workspace_git_write_after_permission_grant() {
     };
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
-        Some(&config),
+        &config,
         &request,
         repo.path(),
         &[],
@@ -1379,94 +1374,6 @@ fn tool_actor_context_retries_workspace_git_write_after_permission_grant() {
 
     assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
     assert_eq!(std::fs::read_to_string(index_lock).unwrap(), "locked");
-}
-
-#[test]
-fn tool_actor_context_retries_pathless_sandbox_denial_unsandboxed_after_permission_grant() {
-    if !sandbox_seatbelt_available() {
-        return;
-    }
-
-    struct AllowUnsandboxedShell;
-
-    impl RuntimePermissionRequestHandler for AllowUnsandboxedShell {
-        fn request_permissions(
-            &self,
-            request: &RuntimePermissionRequest,
-        ) -> std::io::Result<RuntimePermissionResponse> {
-            assert!(
-                request
-                    .reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("without the filesystem sandbox")),
-                "permission request should explain unsandboxed shell escalation: {request:?}"
-            );
-            assert!(
-                request.permissions.file_system.is_none(),
-                "pathless sandbox denials cannot be fixed by granting a write root"
-            );
-            assert!(request.permissions.network.is_none());
-            assert!(
-                request
-                    .permissions
-                    .shell
-                    .as_ref()
-                    .is_some_and(|shell| shell.unsandboxed),
-                "pathless sandbox denials must request unsandboxed shell access"
-            );
-
-            Ok(RuntimePermissionResponse {
-                decision: PermissionResponseDecision::Allow,
-                scope: PermissionGrantScope::Turn,
-                permissions: request.permissions.clone(),
-                strict_auto_review: false,
-            })
-        }
-    }
-
-    let parent = sandbox_test_parent("runtime-unsandboxed-grant-");
-    let workspace = parent.path().join("workspace");
-    let outside = parent.path().join("outside");
-    std::fs::create_dir(&workspace).expect("workspace dir");
-    std::fs::create_dir(&outside).expect("outside dir");
-    let outside_file = outside.join("credential-helper-output");
-    let command = format!(
-        "touch {} 2>/dev/null || {{ printf %s\\\\n \"fatal: could not read Username for 'https://github.com': Operation not permitted\" >&2; exit 128; }}",
-        outside_file.display()
-    );
-    let mut context = RuntimeToolActorContext::new("run-tools");
-    let mut config = test_run_config();
-    config.cwd = Some(workspace.clone());
-    let task_registry = TaskRegistry::new("run-tools".to_string());
-    let request = ToolRequest {
-        id: "tool-1".to_string(),
-        name: ToolName::Bash,
-        action: ActionKind::Shell,
-        target: Some(command),
-        raw_arguments: None,
-    };
-
-    let result = context.execute_normal_tool_with_roots_and_cancel(
-        Some(&config),
-        &request,
-        &workspace,
-        &[],
-        &McpRegistry::default(),
-        &[],
-        ToolConfig::default().output_truncation,
-        5,
-        Some(&task_registry),
-        None,
-        Some(&AllowUnsandboxedShell),
-    );
-
-    assert_eq!(
-        result.status,
-        orca_core::tool_types::ToolStatus::Completed,
-        "{:?}",
-        result.error
-    );
-    assert!(outside_file.exists());
 }
 
 #[test]
@@ -1499,7 +1406,7 @@ fn tool_actor_context_reports_git_index_lock_sandbox_denial() {
     };
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
-        Some(&config),
+        &config,
         &request,
         &workspace,
         &[],
@@ -1566,7 +1473,7 @@ fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution()
     assert!(pre_tool_outcome.injected_context.is_empty());
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
-        Some(&config),
+        &config,
         &request,
         std::env::current_dir().expect("cwd").as_path(),
         &[],
@@ -1619,6 +1526,7 @@ fn tool_actor_context_cancels_normal_tool_before_admission_without_shell_task() 
     let start = std::time::Instant::now();
 
     let result = context.execute_normal_tool_with_cancel(
+        &test_run_config(),
         &request,
         std::env::current_dir().expect("cwd").as_path(),
         &McpRegistry::default(),
@@ -1677,7 +1585,7 @@ fn tool_actor_context_preserves_shell_session_timeout_as_failure() {
     let start = std::time::Instant::now();
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
-        Some(&config),
+        &config,
         &request,
         std::env::current_dir().expect("cwd").as_path(),
         &[],
@@ -1729,7 +1637,7 @@ fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
         };
 
         context.execute_normal_tool_with_roots_and_cancel(
-            Some(&config),
+            &config,
             &request,
             std::env::current_dir().expect("cwd").as_path(),
             &[],
