@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted in v0.4.4.
+Accepted in v0.4.5; supersedes the v0.4.4 compatibility-facade wording.
 
 ## Context
 
@@ -20,7 +20,7 @@ Use `AppState` as a composition root and give each independently invariant domai
 | `interaction_state.rs` | pending user-input/MCP projections and staged acknowledgement payloads |
 | `viewport_state.rs` | scroll/follow state, selection, frame geometry, clipboard feedback, and unread counts |
 
-The aggregate owns composition and cross-owner transitions. Definitions are not duplicated; `types` provides only the exact public or crate-private re-exports needed by existing in-tree paths. New code imports the owner module directly. Tests that prove one owner invariant live with that owner; only behavior spanning multiple owners remains in the state integration suite.
+The aggregate owns composition and cross-owner transitions. Definitions are not duplicated, and `types` is not a compatibility facade: code imports every protocol or owner type from its owning module. An architecture contract rejects imports of dedicated owner types through `types`. Tests that prove one owner invariant live with that owner; only behavior spanning multiple owners remains in the state integration suite.
 
 ## Consequences
 

@@ -1,5 +1,10 @@
 use super::*;
-use crate::protocol::TuiInteractionKind;
+use crate::protocol::{
+    PendingWorkflowNotification, TuiEvent, TuiInteractionKey, TuiInteractionKind, UserAction,
+};
+use crate::surface_projection::SurfaceProjectionState;
+use crate::transcript_state::ChatMessage;
+use crate::viewport_state::CopyNotice;
 use orca_core::plan_types::PlanStatus;
 use orca_core::task_types::{TaskStatus, TaskType};
 

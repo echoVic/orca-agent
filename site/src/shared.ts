@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.4";
+export const releaseVersion = "v0.4.5";
 
 export const releases = [
+  {
+    version: "v0.4.5",
+    date: "2026-08-29",
+    title: "Direct TUI owner imports",
+    body: "Completes the TUI state-owner migration by removing the stale types compatibility facade. Protocol, transcript, interaction, viewport, and surface projection values now have one import path enforced by an architecture contract, so new code cannot silently aggregate dedicated owner types back into types.rs.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.5",
+  },
   {
     version: "v0.4.4",
     date: "2026-08-29",

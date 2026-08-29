@@ -9,6 +9,7 @@ import * as validator from "./validate-runtime-surface-contract.mjs";
 
 const {
   assertNoProductionRuntimeSurfaceSiblingGlobs,
+  assertNoTuiOwnerTypeImportsFromTypes,
   parseManifestText,
   parseRuntimeSurfacePublicExports,
   parseSurfaceFacadeExports,
@@ -170,6 +171,45 @@ function appSourceOverride(extraSource) {
 function sourceOverride(relativePath, source) {
   return new Map([[relativePath, source]]);
 }
+
+expectFailure(
+  "TUI owner types cannot be imported from types.rs",
+  () =>
+    assertNoTuiOwnerTypeImportsFromTypes({
+      repoRoot,
+      sourceOverrides: sourceOverride(
+        "crates/orca-tui/src/app.rs",
+        "use crate::types::{AppState, UserAction};",
+      ),
+    }),
+  /TUI owner types must be imported from their owner modules, not crate::types:[\s\S]*UserAction/,
+);
+
+expectFailure(
+  "TUI owner wildcard imports cannot be imported from types.rs",
+  () =>
+    assertNoTuiOwnerTypeImportsFromTypes({
+      repoRoot,
+      sourceOverrides: sourceOverride(
+        "crates/orca-tui/src/app.rs",
+        "use crate::types::*;",
+      ),
+    }),
+  /TUI owner types must be imported from their owner modules, not crate::types:[\s\S]*wildcard owner import/,
+);
+
+expectFailure(
+  "TUI owner qualified paths cannot use types.rs",
+  () =>
+    assertNoTuiOwnerTypeImportsFromTypes({
+      repoRoot,
+      sourceOverrides: sourceOverride(
+        "crates/orca-tui/src/app.rs",
+        "fn uses_owner() { let _ = crate::types::ChatMessage::System(String::new()); }",
+      ),
+    }),
+  /TUI owner types must be imported from their owner modules, not crate::types:[\s\S]*crate::types::ChatMessage/,
+);
 
 function expectUnlistedRuntimeMutation(label, functionName, body) {
   expectFailure(
@@ -1432,7 +1472,7 @@ fn synthetic_authority_function_import_alias() { update_trust(&cwd, TrustLevel::
   ],
   [
     "qualified UserAction paths retain routing authority",
-    `fn synthetic_qualified_user_action() { action_tx.send(crate::types::UserAction::Cancel); }`,
+    `fn synthetic_qualified_user_action() { action_tx.send(crate::protocol::UserAction::Cancel); }`,
   ],
   [
     "UserAction parameters retain routing authority",
@@ -1440,12 +1480,12 @@ fn synthetic_authority_function_import_alias() { update_trust(&cwd, TrustLevel::
   ],
   [
     "UserAction type import aliases retain routing authority",
-    `use crate::types::UserAction as Action;
+    `use crate::protocol::UserAction as Action;
 fn synthetic_user_action_type_alias() { action_tx.send(Action::Cancel); }`,
   ],
   [
     "UserAction variant import aliases retain routing authority",
-    `use crate::types::UserAction::Cancel as Stop;
+    `use crate::protocol::UserAction::Cancel as Stop;
 fn synthetic_user_action_variant_alias() { action_tx.send(Stop); }`,
   ],
   [

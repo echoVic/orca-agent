@@ -122,8 +122,8 @@ session change. Removing `TuiEvent::UsageUpdated` and
 adapter contract. Replacing the three public mutable AppState metric fields is
 also a Rust source change: callers migrate `state.usage` to `state.usage()`, and
 the two context fields to their same-named immutable methods. The old
-`types::SurfaceProjectionState` path remains as a doc-hidden re-export. This
-workspace-internal `orca-tui` 0.1 API tradeoff is accepted because retaining
+`SurfaceProjectionState` is imported directly from its `surface_projection`
+owner. This workspace-internal `orca-tui` 0.1 API tradeoff is accepted because retaining
 mutable public fields would preserve a second metric fact source; one-commit
 revert is the rollback boundary. Runtime `SurfaceEvent::Usage` and
 `SurfaceEvent::Context` remain unchanged. No compatibility wrapper, shadow

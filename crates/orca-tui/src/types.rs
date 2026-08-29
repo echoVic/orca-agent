@@ -32,31 +32,25 @@ use crate::interaction_state::InteractionState;
 use crate::plan_panel::PlanPanelState;
 use crate::queued_input::QueuedSubmissionState;
 #[cfg(test)]
-#[doc(hidden)]
-pub use crate::surface_projection::SurfaceProjectionState;
+use crate::surface_projection::SurfaceProjectionState;
 use crate::surface_projection::{
     SurfaceGoalProjectionState, SurfaceMetricsState, SurfaceOperationProjectionState,
     SurfaceSessionProjectionState, SurfaceWorkflowTaskProjectionState,
 };
-pub use crate::transcript_state::ChatMessage;
-use crate::transcript_state::TranscriptState;
+use crate::transcript_state::{ChatMessage, TranscriptState};
 use crate::transcript_view::TranscriptRenderCache;
 #[cfg(test)]
 use crate::transcript_view::TranscriptRenderContext;
 use crate::user_input_dialog::UserInputDialog;
-pub use crate::viewport_state::CopyNotice;
-use crate::viewport_state::ViewportState;
+use crate::viewport_state::{CopyNotice, ViewportState};
 #[cfg(test)]
 use crate::workflow_panel::sort_workflow_tasks_for_panel;
 use crate::workflow_panel::{WorkflowPanelState, push_pending_workflow_notification_unique};
 use crate::workspace_status::GitIdentity;
 
-pub(crate) use crate::interaction_state::PendingInteractionSubmission;
-pub(crate) use crate::protocol::SessionAttachmentId;
-pub use crate::protocol::{
-    AttachedTuiEvent, GoalDraft, PendingTuiInput, PendingWorkflowNotification, TuiEvent,
-    TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse, TuiMcpElicitationMode,
-    TuiMemoryScope, TuiTaskLifecycle, UserAction,
+use crate::interaction_state::PendingInteractionSubmission;
+use crate::protocol::{
+    PendingWorkflowNotification, SessionAttachmentId, TuiInteractionKey, UserAction,
 };
 #[derive(Debug, Clone, Default)]
 pub struct PendingWorkflowNotificationQueue {

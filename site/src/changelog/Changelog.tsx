@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.5":
+        "Completes the TUI state-owner migration by removing the stale types compatibility facade. Protocol, transcript, interaction, viewport, and surface projection values now have one import path enforced by an architecture contract, so new code cannot silently aggregate dedicated owner types back into types.rs.",
       "v0.4.4":
         "Moves TUI protocol values into protocol.rs, AppState event reduction into state_reducer.rs, and independent transcript, interaction, and viewport state into focused owners. Tests follow those boundaries, while the thin AppState aggregate remains the composition root and types keeps compatibility re-exports for existing in-tree consumers.",
       "v0.4.3":
@@ -624,6 +626,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.5":
+        "完成 TUI 状态 owner 收敛，删除残留的 types 兼容 facade。协议、transcript、interaction、viewport 与 surface projection 类型现在各自只有一个导入路径，并由架构契约禁止新代码把专属 owner 类型重新聚合回 types.rs。",
       "v0.4.4":
         "将 TUI 协议值集中到 protocol.rs，把 AppState 事件归约移到 state_reducer.rs，并把仍有独立不变量的 transcript、interaction、viewport 状态放入专用 owner。测试随 owner 归属，AppState 只保留组合根职责，types 继续提供现有代码路径所需的兼容 re-export。",
       "v0.4.3":

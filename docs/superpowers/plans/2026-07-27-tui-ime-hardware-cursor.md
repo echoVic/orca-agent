@@ -465,7 +465,7 @@ fn render_textarea_surface(
     frame: &mut Frame,
     area: Rect,
     textarea: &TextArea,
-    notice: Option<crate::types::CopyNotice>,
+    notice: Option<crate::viewport_state::CopyNotice>,
     theme: &Theme,
     show_hardware_cursor: bool,
 ) {
@@ -499,7 +499,7 @@ fn render_textarea_block_and_notice(
     frame: &mut Frame,
     area: Rect,
     textarea: &TextArea,
-    notice: Option<crate::types::CopyNotice>,
+    notice: Option<crate::viewport_state::CopyNotice>,
     theme: &Theme,
 ) -> Rect {
     let inner = if let Some(block) = textarea.block() {

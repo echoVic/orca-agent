@@ -202,7 +202,7 @@ interaction keys/responses, lifecycle values, and attachment values;
 `TranscriptState`, `InteractionState`, and `ViewportState` own only fields with
 independent invariants. `AppState` remains the composition root for cross-owner
 transitions, while `types.rs` is reduced to aggregate construction, shared
-operations, and precise compatibility re-exports. Owner-specific tests move
+operations, and common types without compatibility re-exports. Owner-specific tests move
 with those modules, leaving the state integration suite for lifecycle and
 projection behavior that genuinely crosses owners. New contributors should
 start from the owner module named by the invariant they are changing, not from

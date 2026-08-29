@@ -3107,6 +3107,58 @@ function tuiRustSourcePaths(repoRoot) {
   return rustSourcePaths(repoRoot, ["crates/orca-tui/src"]);
 }
 
+const TUI_OWNER_TYPES = [
+  "AttachedTuiEvent",
+  "ChatMessage",
+  "CopyNotice",
+  "GoalDraft",
+  "PendingInteractionSubmission",
+  "PendingTuiInput",
+  "PendingWorkflowNotification",
+  "SessionAttachmentId",
+  "SurfaceProjectionState",
+  "TuiEvent",
+  "TuiInteractionKey",
+  "TuiInteractionKind",
+  "TuiInteractionResponse",
+  "TuiMcpElicitationMode",
+  "TuiMemoryScope",
+  "TuiTaskLifecycle",
+  "UserAction",
+];
+
+export function assertNoTuiOwnerTypeImportsFromTypes({ repoRoot, sourceOverrides }) {
+  const violations = [];
+  for (const relativePath of tuiRustSourcePaths(repoRoot)) {
+    const source = maskRustNonCode(readRepoSource(repoRoot, relativePath, sourceOverrides));
+    for (const declaration of rustUseDeclarations(source)) {
+      const importPath = declaration.path;
+      if (!/^crate::types(?:::|$)/.test(importPath)) continue;
+      const importedOwners = TUI_OWNER_TYPES.filter((typeName) =>
+        new RegExp(`\\b${typeName}\\b`).test(importPath),
+      );
+      if (importPath.includes("*") || importedOwners.length > 0) {
+        const line = source.slice(0, declaration.start).split("\n").length;
+        const detail = importPath.includes("*")
+          ? "wildcard owner import"
+          : importedOwners.join(", ");
+        violations.push(`${relativePath}:${line} imports ${detail} from crate::types`);
+      }
+    }
+    for (const match of source.matchAll(
+      new RegExp(`\\bcrate::types::(${TUI_OWNER_TYPES.join("|")})\\b`, "g"),
+    )) {
+      const line = source.slice(0, match.index).split("\n").length;
+      violations.push(`${relativePath}:${line} references ${match[0]}`);
+    }
+  }
+  if (violations.length > 0) {
+    fail(
+      `TUI owner types must be imported from their owner modules, not crate::types:\n${violations.join("\n")}`,
+    );
+  }
+}
+
 export function unstableSurfaceReferenceLines(source) {
   const code = maskRustNonCode(source);
   const references = [];
@@ -4338,6 +4390,7 @@ function validateTuiMutationScan(repoRoot, sourceOverrides) {
 
 export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides }) {
   validateNoUnstableSurfaceReferences(repoRoot, sourceOverrides);
+  assertNoTuiOwnerTypeImportsFromTypes({ repoRoot, sourceOverrides });
 
   assertExactArray(
     parseSurfaceFacadeExports(

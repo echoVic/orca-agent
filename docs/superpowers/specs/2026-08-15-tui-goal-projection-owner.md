@@ -133,8 +133,8 @@ history format, or persisted session change. Removing `GoalUpdated` and
 `GoalCleared` changes the public-but-internal `TuiEvent` Rust surface. Replacing
 the public mutable `AppState.current_goal` field is a Rust source change;
 callers migrate to the public immutable `current_goal()` method. The
-doc-hidden `types::SurfaceProjectionState` re-export remains. This workspace
-`orca-tui` 0.1 source migration is accepted because preserving either mutable
+`SurfaceProjectionState` is imported directly from its `surface_projection`
+owner. This workspace `orca-tui` 0.1 source migration is accepted because preserving either mutable
 field or payload event would preserve a second fact source. A one-commit revert
 is the compatibility rollback boundary.
 
