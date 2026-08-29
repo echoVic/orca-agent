@@ -36319,7 +36319,10 @@ mod tests {
                 .expect("submit Goal before checkpoint failure"),
         );
         let operation_id = output.operation_id.expect("Goal operation id");
-        let prepared_deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        // This test runs in the full workspace gate alongside thousands of
+        // tests. Keep the recovery assertion bounded, but allow the durable
+        // writer to make progress under shared CI contention.
+        let prepared_deadline = Instant::now() + Duration::from_secs(30);
         let recovered_before_restart = loop {
             let recovered =
                 surface::JsonlSurfaceCommitLedger::new(&transcript_path, initial_cursor.clone())

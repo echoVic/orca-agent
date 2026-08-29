@@ -3464,8 +3464,8 @@ fn server_mode_command_exec_uses_thread_additional_working_directories() {
 fn server_mode_command_exec_uses_session_network_domain_grants() {
     let home = tempdir().expect("orca home");
     let home_path = home.path();
-    let workspace = home_path.join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
+    let workspace_root = tempdir().expect("workspace");
+    let workspace = workspace_root.path().to_path_buf();
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test server");
     let port = listener.local_addr().expect("server addr").port();
     let server = std::thread::spawn(move || -> std::io::Result<()> {
@@ -3662,8 +3662,8 @@ fn server_mode_command_exec_uses_session_network_domain_grants() {
 fn server_mode_session_network_deny_overrides_permission_profile_allow() {
     let home = tempdir().expect("orca home");
     let home_path = home.path();
-    let workspace = home_path.join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
+    let workspace_root = tempdir().expect("workspace");
+    let workspace = workspace_root.path().to_path_buf();
     std::fs::write(
         home_path.join("config.toml"),
         "mode = \"full-auto\"\n\n[permission_profiles.requester]\nextends = \":workspace\"\n\n[permission_profiles.requester.network]\nenabled = true\n\n[permission_profiles.requester.network.domains]\n\"seed.orca.invalid\" = \"allow\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"blocked.orca.invalid\" = \"allow\"\n",
