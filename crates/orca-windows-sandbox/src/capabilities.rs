@@ -67,8 +67,9 @@ impl CapabilityStore {
         workspace: &Path,
         helper_version: &str,
     ) -> Result<SandboxSetupReceipt, WindowsSandboxError> {
+        let workspace = normalize_workspace_path(workspace)?;
         let read_only_sid = self.read_only_sid()?;
-        let write_sid = self.write_sid(workspace)?;
+        let write_sid = self.write_sid(&workspace)?;
         let receipt = SandboxSetupReceipt {
             version: SETUP_RECEIPT_VERSION,
             helper_version: helper_version.to_string(),
@@ -77,7 +78,7 @@ impl CapabilityStore {
             write_sid,
         };
         let bytes = serde_json::to_vec_pretty(&receipt)?;
-        let receipt_path = self.receipt_path(workspace)?;
+        let receipt_path = self.receipt_path(&workspace)?;
         atomic_write(&receipt_path, &bytes, AtomicWritePolicy::NoFollow)?;
         let legacy_path = self.root.join(SETUP_RECEIPT_FILE);
         if let Ok(legacy) = fs::read(&legacy_path)
@@ -100,7 +101,8 @@ impl CapabilityStore {
         workspace: &Path,
         helper_version: &str,
     ) -> Result<SandboxSetupReceipt, WindowsSandboxError> {
-        if let Some((receipt, _path)) = self.read_setup_receipt_for_workspace(workspace)? {
+        let workspace = normalize_workspace_path(workspace)?;
+        if let Some((receipt, _path)) = self.read_setup_receipt_for_workspace(&workspace)? {
             validate_receipt(&receipt, helper_version)?;
             let requested_key = PathIdentity::windows(&workspace.to_string_lossy())?.storage_key();
             let receipt_key = PathIdentity::windows(&receipt.workspace)?.storage_key();
@@ -110,7 +112,7 @@ impl CapabilityStore {
                 ));
             }
         }
-        self.provision_setup(workspace, helper_version)
+        self.provision_setup(&workspace, helper_version)
     }
 
     /// Revoke one workspace capability and remove its setup receipt. Removal
@@ -120,7 +122,8 @@ impl CapabilityStore {
         workspace: &Path,
         helper_version: &str,
     ) -> Result<bool, WindowsSandboxError> {
-        let Some((receipt, receipt_path)) = self.read_setup_receipt_for_workspace(workspace)?
+        let workspace = normalize_workspace_path(workspace)?;
+        let Some((receipt, receipt_path)) = self.read_setup_receipt_for_workspace(&workspace)?
         else {
             return Ok(false);
         };
@@ -206,8 +209,9 @@ impl CapabilityStore {
         workspace: &Path,
         helper_version: &str,
     ) -> Result<SandboxSetupReceipt, WindowsSandboxError> {
+        let workspace = normalize_workspace_path(workspace)?;
         let receipt = self
-            .read_setup_receipt_for_workspace(workspace)?
+            .read_setup_receipt_for_workspace(&workspace)?
             .map(|(receipt, _)| receipt)
             .ok_or_else(|| {
                 WindowsSandboxError::InvalidState(
@@ -297,6 +301,18 @@ impl CapabilityStore {
             persist_state(&path, &state)?;
         }
         Ok(value)
+    }
+}
+
+// Windows canonicalization may switch a path to the extended-length spelling
+// or resolve an 8.3 alias. Capability receipts must use the same object path
+// that the launch adapter verifies, while synthetic contract fixtures may use
+// paths that do not exist on the host.
+fn normalize_workspace_path(path: &Path) -> Result<PathBuf, WindowsSandboxError> {
+    match path.canonicalize() {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error.into()),
     }
 }
 
