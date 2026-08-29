@@ -165,6 +165,14 @@ pub fn build_bwrap_argv(policy: &LinuxSandboxPolicy, command: &str) -> Vec<Strin
         LinuxReadScope::Restricted => {
             argv.push("--tmpfs".to_string());
             argv.push("/".to_string());
+            // A tmpfs root does not contain the host's parent directories.
+            // Create destination parents before binding absolute workspace
+            // roots such as `/tmp/.tmp123/workspace`; otherwise bwrap accepts
+            // the bind list but the final `--chdir` fails with ENOENT.
+            for parent in restricted_mount_parent_dirs(policy) {
+                argv.push("--dir".to_string());
+                argv.push(path_arg(&parent));
+            }
             for root in restricted_read_roots(policy) {
                 push_ro_bind_if_exists(&mut argv, &root);
             }
@@ -251,6 +259,35 @@ fn restricted_read_roots(policy: &LinuxSandboxPolicy) -> Vec<PathBuf> {
     roots
 }
 
+fn restricted_mount_parent_dirs(policy: &LinuxSandboxPolicy) -> Vec<PathBuf> {
+    let mut parents = Vec::new();
+    let mut add_parents = |root: &Path| {
+        for parent in root.ancestors().skip(1) {
+            if parent == Path::new("/") {
+                break;
+            }
+            push_unique(&mut parents, parent.to_path_buf());
+        }
+    };
+
+    add_parents(&policy.cwd);
+    for root in policy
+        .readable_roots
+        .iter()
+        .chain(&policy.allowed_unix_socket_roots)
+        .chain(&policy.writable_roots)
+        .chain(&policy.metadata_writable_roots)
+        .chain(&policy.read_only_roots)
+        .chain(&policy.denied_roots)
+    {
+        add_parents(root);
+    }
+
+    // bwrap requires parents to exist in the order they are created.
+    parents.sort_by_key(|path| path.components().count());
+    parents
+}
+
 fn push_ro_bind_if_exists(argv: &mut Vec<String>, root: &Path) {
     if root.exists() {
         argv.push("--ro-bind".to_string());
@@ -335,6 +372,19 @@ mod tests {
         let joined = argv_string(&argv);
         assert!(joined.contains("--tmpfs /"));
         assert!(!joined.contains("--ro-bind / /"));
+    }
+
+    #[test]
+    fn restricted_policy_creates_absolute_mount_parents_before_chdir() {
+        let mut policy = base_policy();
+        policy.read_scope = LinuxReadScope::Restricted;
+        policy.cwd = PathBuf::from("/tmp/.tmp123/workspace");
+
+        let argv = build_bwrap_argv(&policy, "true");
+        let joined = argv_string(&argv);
+        assert!(joined.contains("--dir /tmp"));
+        assert!(joined.contains("--dir /tmp/.tmp123"));
+        assert!(joined.contains("--chdir /tmp/.tmp123/workspace"));
     }
 
     #[test]

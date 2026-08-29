@@ -213,25 +213,35 @@ fn standard_windows_executable_candidates(
     candidates
 }
 
-/// Resolve a bare child-process name on Windows, including `.cmd`/`.bat`
-/// launchers exposed through `PATHEXT` (for example npm's `npx.cmd`).
+/// Resolve a bare child-process name to an absolute executable path before a
+/// broker clears the child environment. On Windows this also handles
+/// `.cmd`/`.bat` launchers exposed through `PATHEXT` (for example npm's
+/// `npx.cmd`).
 pub fn resolve_program(program: &str) -> Option<PathBuf> {
-    if !cfg!(windows) || program.contains('/') || program.contains('\\') {
+    if program.contains('/') || program.contains('\\') {
         return None;
     }
-    find_executable(program).or_else(|| {
-        env::var_os("PATHEXT")
-            .into_iter()
-            .flat_map(|value| {
-                value
-                    .to_string_lossy()
-                    .split(';')
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .map(|extension| format!("{program}{extension}"))
-            .find_map(|candidate| find_executable(&candidate))
-    })
+    let resolved = find_executable(program);
+    #[cfg(windows)]
+    {
+        resolved.or_else(|| {
+            env::var_os("PATHEXT")
+                .into_iter()
+                .flat_map(|value| {
+                    value
+                        .to_string_lossy()
+                        .split(';')
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .map(|extension| format!("{program}{extension}"))
+                .find_map(|candidate| find_executable(&candidate))
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        resolved
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -246,24 +256,25 @@ fn plan_program(
     resolve(program)
 }
 
-#[cfg(windows)]
 fn is_current_directory_executable(path: &Path, cwd: &Path) -> bool {
     let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let current = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let candidate = candidate
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_ascii_lowercase();
-    let current = current
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_ascii_lowercase();
-    candidate == current || candidate.starts_with(&format!("{current}\\"))
-}
-
-#[cfg(not(windows))]
-fn is_current_directory_executable(_path: &Path, _cwd: &Path) -> bool {
-    false
+    #[cfg(windows)]
+    {
+        let candidate = candidate
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase();
+        let current = current
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase();
+        return candidate == current || candidate.starts_with(&format!("{current}\\"));
+    }
+    #[cfg(not(windows))]
+    {
+        candidate.starts_with(&current)
+    }
 }
 
 fn absolute_existing_path(path: &Path) -> Option<PathBuf> {
@@ -351,5 +362,17 @@ mod windows_tests {
             )[0],
             comspec
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::resolve_program;
+
+    #[test]
+    fn bare_program_resolves_to_an_absolute_path_for_cleared_child_environments() {
+        let resolved = resolve_program("sh").expect("the POSIX shell must be discoverable");
+        assert!(resolved.is_absolute());
+        assert!(resolved.is_file());
     }
 }
