@@ -382,9 +382,12 @@ mod tests {
 
         let argv = build_bwrap_argv(&policy, "true");
         let joined = argv_string(&argv);
-        assert!(joined.contains("--dir /tmp"));
-        assert!(joined.contains("--dir /tmp/.tmp123"));
-        assert!(joined.contains("--chdir /tmp/.tmp123/workspace"));
+        let tmp = platform_slash_tmp_path();
+        let nested = tmp.join(".tmp123");
+        let cwd = nested.join("workspace");
+        assert!(joined.contains(&format!("--dir {}", tmp.display())));
+        assert!(joined.contains(&format!("--dir {}", nested.display())));
+        assert!(joined.contains(&format!("--chdir {}", cwd.display())));
     }
 
     #[test]
