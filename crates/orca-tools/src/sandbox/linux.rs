@@ -79,11 +79,14 @@ pub fn enforced_available(cwd: &Path) -> bool {
                 },
                 strict: true,
             };
-            return bwrap_command(bwrap, &request)
+            if bwrap_command(bwrap, &request)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .is_ok_and(|status| status.success());
+                .is_ok_and(|status| status.success())
+            {
+                return true;
+            }
         }
 
         #[cfg(target_os = "linux")]

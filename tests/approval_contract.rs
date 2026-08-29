@@ -38,6 +38,12 @@ fn suggest_denies_write_in_jsonl_mode() {
 
 #[test]
 fn auto_edit_allows_sandboxed_shell_in_jsonl_mode() {
+    if !matches!(
+        orca_tools::sandbox::enforcement_state(),
+        orca_core::capability::EnforcementState::Enforced
+    ) {
+        return;
+    }
     let home = TempDir::new().expect("temp home");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
@@ -68,6 +74,12 @@ fn auto_edit_allows_sandboxed_shell_in_jsonl_mode() {
 
 #[test]
 fn permission_allow_rule_allows_matching_shell_in_jsonl_mode() {
+    if !matches!(
+        orca_tools::sandbox::enforcement_state(),
+        orca_core::capability::EnforcementState::Enforced
+    ) {
+        return;
+    }
     let home = TempDir::new().expect("temp home");
     std::fs::write(
         home.path().join("config.toml"),

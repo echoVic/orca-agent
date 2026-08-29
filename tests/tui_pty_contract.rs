@@ -51,14 +51,13 @@ fn tui_submit_renders_and_restores_the_terminal() {
 
 #[test]
 fn tui_permission_round_trips_through_the_runtime_surface() {
-    #[cfg(target_os = "macos")]
     if !matches!(
         orca_tools::sandbox::enforcement_state(),
         orca_core::capability::EnforcementState::Enforced
     ) {
-        // Some macOS runners disallow installing Seatbelt profiles (for
-        // example when the test process itself is containerized). The runtime
-        // must fail closed there, so this integration contract is inapplicable.
+        // This contract verifies a successful approval followed by a real
+        // sandboxed process. Hosts that cannot install their OS backend must
+        // reject execution, so the success-path integration is inapplicable.
         return;
     }
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
