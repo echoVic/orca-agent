@@ -121,18 +121,6 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
     {
         return fail_closed_command("one or more sandbox deny paths do not exist");
     }
-    // A deny root that contains the execution cwd would mask the directory
-    // before bwrap applies `--chdir`. Reject the contradictory policy in the
-    // parent so callers get a deterministic security error instead of a
-    // namespace-local ENOENT.
-    if request
-        .policy
-        .denied_roots
-        .iter()
-        .any(|root| request.policy.cwd.starts_with(root))
-    {
-        return fail_closed_command("sandbox deny root contains execution cwd");
-    }
     if bwrap_enforced_available(&request.policy.cwd) {
         let Some(bwrap) = bwrap_path(&request.policy.cwd) else {
             return fail_closed_command("bubblewrap disappeared after backend probe");

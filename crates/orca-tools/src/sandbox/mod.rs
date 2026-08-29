@@ -368,7 +368,13 @@ mod platform {
         }
 
         let mut denied_roots = canonicalize_all(context.denied_roots);
-        for root in linux_sensitive_denied_roots() {
+        // The selected cwd is an explicit user capability. Do not mask it
+        // when a custom ORCA_HOME happens to contain the project; sibling
+        // sensitive roots such as `.ssh` and `.orca` remain denied.
+        for root in linux_sensitive_denied_roots()
+            .into_iter()
+            .filter(|root| !cwd.starts_with(root))
+        {
             if !denied_roots.contains(&root) {
                 denied_roots.push(root);
             }
@@ -511,7 +517,13 @@ mod platform {
         };
 
         let mut denied_roots = canonicalize_all(context.denied_roots);
-        for root in linux_sensitive_denied_roots() {
+        // The selected cwd is an explicit user capability. Do not mask it
+        // when a custom ORCA_HOME happens to contain the project; sibling
+        // sensitive roots such as `.ssh` and `.orca` remain denied.
+        for root in linux_sensitive_denied_roots()
+            .into_iter()
+            .filter(|root| !cwd.starts_with(root))
+        {
             if !denied_roots.contains(&root) {
                 denied_roots.push(root);
             }
