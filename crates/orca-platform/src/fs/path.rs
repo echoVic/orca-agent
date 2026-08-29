@@ -404,20 +404,22 @@ fn identity_key(value: &str) -> String {
 
 #[derive(Eq, PartialEq)]
 enum PrefixIdentity<'a> {
-    Drive(char, bool),
-    Unc(&'a str, &'a str, bool),
+    // DOS and extended-length spellings (C:\\... and \\?\\C:\\...) address
+    // the same Windows namespace. The syntax marker must not split capability
+    // or setup-receipt identity for one workspace.
+    Drive(char),
+    Unc(&'a str, &'a str),
     Device(&'a str),
 }
 
 fn prefix_identity(prefix: &WindowsPrefix) -> PrefixIdentity<'_> {
     match prefix {
-        WindowsPrefix::Drive { key, extended, .. } => PrefixIdentity::Drive(*key, *extended),
+        WindowsPrefix::Drive { key, .. } => PrefixIdentity::Drive(*key),
         WindowsPrefix::Unc {
             server_key,
             share_key,
-            extended,
             ..
-        } => PrefixIdentity::Unc(server_key, share_key, *extended),
+        } => PrefixIdentity::Unc(server_key, share_key),
         WindowsPrefix::Device { key, .. } => PrefixIdentity::Device(key),
     }
 }

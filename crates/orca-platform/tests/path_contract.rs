@@ -20,14 +20,17 @@ fn windows_identity_is_case_insensitive_and_component_aware() {
 }
 
 #[test]
-fn windows_unc_and_extended_roots_preserve_their_namespace() {
+fn windows_unc_and_extended_roots_share_object_identity() {
     let unc = PathIdentity::windows(r"\\server\share\repo\file.rs").expect("UNC path");
     assert_eq!(unc.root_display(), r"\\server\share");
 
     let extended_unc =
         PathIdentity::windows(r"\\?\UNC\server\share\repo\file.rs").expect("extended UNC");
     assert_eq!(extended_unc.root_display(), r"\\?\UNC\server\share");
-    assert_ne!(unc, extended_unc, "namespace kind must remain explicit");
+    assert_eq!(
+        unc, extended_unc,
+        "extended UNC is the same object namespace"
+    );
 
     let extended_drive = PathIdentity::windows(r"\\?\C:\repo\file.rs").expect("long path");
     assert_eq!(extended_drive.root_display(), r"\\?\C:\");
