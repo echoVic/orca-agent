@@ -8,9 +8,11 @@ use tui_textarea::{Input, TextArea};
 use orca_core::config::RunConfig;
 
 use crate::composer_textarea::{make_setup_textarea, make_textarea};
+use crate::protocol::UserAction;
 use crate::surface_actions::TuiHostActions;
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
+use crate::transcript_state::ChatMessage;
+use crate::types::{AppState, AppStatus};
 use crate::vim::VimState;
 
 pub(crate) enum SetupFlow {

@@ -18,10 +18,11 @@ use crate::insert_escape::{
     resolve_pending_insert_escape_before_routing,
 };
 use crate::key_event_actions::{KeyEventFlow, handle_key_event_preflight};
+use crate::protocol::UserAction;
 use crate::status_key_actions::{StatusKeyFlow, handle_status_key};
 use crate::terminal_presentation::TerminalPresentation;
 use crate::theme::Theme;
-use crate::types::{AppState, UserAction};
+use crate::types::AppState;
 use crate::vim::VimState;
 
 pub(crate) struct RendererInputRouter<'a, 'text> {
@@ -212,11 +213,12 @@ mod tests {
     use super::RendererInputRouter;
     use crate::composer_textarea::textarea_text;
     use crate::input_event_actions::BatchedInputEvent;
+    use crate::protocol::UserAction;
     use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
     use crate::test_support::test_run_config;
     use crate::theme::Theme;
-    use crate::types::{AppState, PlanApprovalDialog, UserAction};
+    use crate::types::{AppState, PlanApprovalDialog};
     use crate::vim::{VimMode, VimState};
 
     struct Fixture {
@@ -354,9 +356,9 @@ mod tests {
     #[test]
     fn config_dialog_consumes_coalesced_scroll_without_moving_transcript() {
         let mut fixture = Fixture::new();
-        fixture.state.total_lines = 100;
-        fixture.state.visible_height = 20;
-        fixture.state.scroll_offset = 40;
+        fixture.state.viewport.total_lines = 100;
+        fixture.state.viewport.visible_height = 20;
+        fixture.state.viewport.scroll_offset = 40;
         fixture.state.config_dialog = Some(crate::types::ConfigDialog {
             selected: 0,
             model: fixture.state.model_name.clone(),
@@ -372,7 +374,7 @@ mod tests {
             )
             .expect("config scroll routing");
 
-        assert_eq!(fixture.state.scroll_offset, 40);
+        assert_eq!(fixture.state.viewport.scroll_offset, 40);
         assert!(fixture.state.config_dialog.is_some());
     }
 
@@ -398,7 +400,7 @@ mod tests {
     fn resize_invalidates_selection_without_key_fallthrough() {
         let mut fixture = Fixture::new();
         let pos = SelectionPos { row: 0, col: 0 };
-        fixture.state.selection = Some(TranscriptSelection::unit(
+        fixture.state.viewport.selection = Some(TranscriptSelection::unit(
             SelectionGranularity::Cell,
             pos,
             pos,
@@ -412,14 +414,14 @@ mod tests {
             )
             .expect("resize routing");
 
-        assert!(fixture.state.selection.is_none());
+        assert!(fixture.state.viewport.selection.is_none());
         assert!(fixture.action_rx.try_recv().is_err());
     }
 
     #[test]
     fn mouse_confirmation_dispatches_the_selected_plan_action() {
         let mut fixture = Fixture::new();
-        fixture.state.frame_area = Some(Rect::new(0, 0, 100, 30));
+        fixture.state.viewport.frame_area = Some(Rect::new(0, 0, 100, 30));
         fixture.state.approval_mode = ApprovalMode::Plan;
         fixture.state.pre_plan_approval_mode = Some(ApprovalMode::FullAuto);
         fixture.state.plan_approval_dialog = Some(PlanApprovalDialog {
@@ -455,7 +457,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.state.enter_running();
         let pos = SelectionPos { row: 0, col: 0 };
-        fixture.state.selection = Some(TranscriptSelection::unit(
+        fixture.state.viewport.selection = Some(TranscriptSelection::unit(
             SelectionGranularity::Cell,
             pos,
             pos,
@@ -472,7 +474,7 @@ mod tests {
             )
             .expect("escape routing");
 
-        assert!(fixture.state.selection.is_none());
+        assert!(fixture.state.viewport.selection.is_none());
         assert!(fixture.action_rx.try_recv().is_err());
     }
 

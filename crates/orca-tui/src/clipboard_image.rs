@@ -519,7 +519,7 @@ $maxBytes = {max_bytes}
 $maxCount = {max_count}
 $records = @()
 $files = [System.Windows.Forms.Clipboard]::GetFileDropList()
-$imageFiles = @($files | Where-Object {{ $_ -match '\.(png|jpe?g|gif|webp)$' }})
+$imageFiles = @($files | Where-Object {{ $_ -match '.(png|jpe?g|gif|webp)$' }})
 if ($imageFiles.Count -gt 0) {{
   if ($imageFiles.Count -gt $maxCount) {{ throw "clipboard image count exceeds limit" }}
   $total = 0

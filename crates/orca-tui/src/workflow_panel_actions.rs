@@ -4,7 +4,8 @@ use crossterm::event::KeyCode;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 
 use crate::background_tasks::is_terminal_task_status;
-use crate::types::{AppState, PanelMode, UserAction};
+use crate::protocol::UserAction;
+use crate::types::{AppState, PanelMode};
 
 pub(crate) fn handle_workflows_panel_key(
     key_code: KeyCode,

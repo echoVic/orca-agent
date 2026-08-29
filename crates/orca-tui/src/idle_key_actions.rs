@@ -14,11 +14,12 @@ use crate::composer_input_actions::{
 use crate::idle_navigation_actions::handle_idle_navigation_shortcut;
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_menu_actions::handle_mention_menu_key;
+use crate::protocol::UserAction;
 use crate::queued_input_actions::restore_latest_queued_message;
 use crate::shortcuts::{IdleShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::slash_menu_actions::handle_slash_menu_key;
 use crate::theme::Theme;
-use crate::types::{AppState, UserAction};
+use crate::types::AppState;
 use crate::vim::VimState;
 use crate::workflow_panel_actions::handle_workflows_panel_key;
 
@@ -135,8 +136,8 @@ pub(crate) fn handle_idle_key(
 mod tests {
     use super::*;
     use crate::composer_textarea::{make_textarea_with_text, textarea_text};
+    use crate::protocol::TuiEvent;
     use crate::test_support::test_run_config;
-    use crate::types::TuiEvent;
     use crossterm::event::KeyModifiers;
     use orca_core::config::{ThemeName, VimInsertEscapeSequence};
 
@@ -149,9 +150,9 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         );
-        state.total_lines = 100;
-        state.visible_height = 20;
-        state.scroll_offset = 40;
+        state.viewport.total_lines = 100;
+        state.viewport.visible_height = 20;
+        state.viewport.scroll_offset = 40;
         let mut config = test_run_config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let theme = Theme::named(ThemeName::Dark);
@@ -172,7 +173,7 @@ mod tests {
         );
 
         assert_eq!(textarea_text(&textarea), "");
-        assert_eq!(state.scroll_offset, 40);
+        assert_eq!(state.viewport.scroll_offset, 40);
     }
 
     #[test]
@@ -184,9 +185,9 @@ mod tests {
             "mock".to_string(),
             "/tmp".to_string(),
         );
-        state.total_lines = 100;
-        state.visible_height = 20;
-        state.scroll_offset = 40;
+        state.viewport.total_lines = 100;
+        state.viewport.visible_height = 20;
+        state.viewport.scroll_offset = 40;
         let mut config = test_run_config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let theme = Theme::named(ThemeName::Dark);
@@ -207,7 +208,7 @@ mod tests {
         );
 
         assert!(textarea.is_empty());
-        assert_eq!(state.scroll_offset, 30);
+        assert_eq!(state.viewport.scroll_offset, 30);
     }
 
     #[test]
@@ -306,7 +307,7 @@ mod tests {
 
         assert_eq!(textarea.lines(), &["$".to_string()]);
         assert!(action_rx.try_recv().is_err());
-        assert!(state.messages.is_empty());
+        assert!(state.transcript.messages.is_empty());
     }
 
     #[test]
@@ -417,7 +418,9 @@ mod tests {
 
         assert!(textarea.is_empty());
         assert!(!vim.has_pending_insert_escape_for_test());
-        let crate::types::ChatMessage::ToolCall { expanded, .. } = &state.messages[0] else {
+        let crate::transcript_state::ChatMessage::ToolCall { expanded, .. } =
+            &state.transcript.messages[0]
+        else {
             panic!("expected tool call");
         };
         assert!(*expanded);

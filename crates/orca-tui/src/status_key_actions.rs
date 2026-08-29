@@ -12,13 +12,14 @@ use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::config_dialog_actions::handle_config_dialog_key;
 use crate::idle_key_actions::handle_idle_key;
 use crate::plan_approval_actions::handle_plan_approval_key;
+use crate::protocol::UserAction;
 use crate::queued_input_actions::handle_running_key;
 use crate::running_actions::handle_running_shortcut;
 use crate::session_picker_actions::handle_session_picker_key;
 use crate::setup_actions::{SetupFlow, handle_setup_key};
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, UserAction};
+use crate::types::{AppState, AppStatus};
 use crate::user_input_dialog::{UserInputDialogKeyFlow, handle_user_input_dialog_key};
 use crate::vim::{VimState, VimTranscriptSearchIntent};
 
@@ -113,11 +114,11 @@ where
                 state.open_transcript_search();
                 true
             }
-            VimTranscriptSearchIntent::Next if state.transcript_search.has_query() => {
+            VimTranscriptSearchIntent::Next if state.transcript.search.has_query() => {
                 state.search_next();
                 true
             }
-            VimTranscriptSearchIntent::Previous if state.transcript_search.has_query() => {
+            VimTranscriptSearchIntent::Previous if state.transcript.search.has_query() => {
                 state.search_previous();
                 true
             }
@@ -267,12 +268,16 @@ mod tests {
     }
 
     fn prepare_two_search_matches(state: &mut AppState) {
-        state.push_message(crate::types::ChatMessage::System("alpha one".to_string()));
-        state.push_message(crate::types::ChatMessage::System("alpha two".to_string()));
+        state.push_message(crate::transcript_state::ChatMessage::System(
+            "alpha one".to_string(),
+        ));
+        state.push_message(crate::transcript_state::ChatMessage::System(
+            "alpha two".to_string(),
+        ));
         let theme = Theme::named(ThemeName::Dark);
-        let messages = &state.messages;
-        let revisions = &state.message_revisions;
-        state.transcript_render_cache.prepare(
+        let messages = &state.transcript.messages;
+        let revisions = &state.transcript.message_revisions;
+        state.transcript.render_cache.prepare(
             messages,
             revisions,
             crate::transcript_view::TranscriptRenderContext::new(&theme, 40, 0, false),
@@ -333,10 +338,10 @@ mod tests {
             "/tmp".to_string(),
         );
         state.enter_running();
-        state.total_lines = 20;
-        state.visible_height = 5;
-        state.scroll_offset = 10;
-        state.auto_scroll = false;
+        state.viewport.total_lines = 20;
+        state.viewport.visible_height = 5;
+        state.viewport.scroll_offset = 10;
+        state.viewport.auto_scroll = false;
         let mut config = config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let theme = Theme::named(ThemeName::Dark);
@@ -397,7 +402,7 @@ mod tests {
             &mut vim,
             &theme,
         );
-        assert_eq!(state.scroll_offset, 9);
+        assert_eq!(state.viewport.scroll_offset, 9);
         assert!(action_rx.try_recv().is_err());
     }
 
@@ -605,7 +610,7 @@ mod tests {
             )
             .unwrap();
 
-            assert!(state.transcript_search.open, "{status:?}");
+            assert!(state.transcript.search.open, "{status:?}");
             assert_eq!(textarea.lines(), &["draft".to_string()]);
         }
     }
@@ -645,7 +650,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(state.transcript_search.open);
+        assert!(state.transcript.search.open);
         assert!(!vim.has_pending_command_for_test());
     }
 
@@ -661,7 +666,7 @@ mod tests {
         state.enter_running();
         prepare_two_search_matches(&mut state);
         state.close_transcript_search();
-        let first = state.transcript_search.active_ordinal();
+        let first = state.transcript.search.active_ordinal();
         let mut config = config();
         config.vim_mode = true;
         let shared = Arc::new(Mutex::new(config.clone()));
@@ -688,9 +693,9 @@ mod tests {
             )
             .unwrap();
             if code == KeyCode::Char('n') {
-                assert_ne!(state.transcript_search.active_ordinal(), first);
+                assert_ne!(state.transcript.search.active_ordinal(), first);
             } else {
-                assert_eq!(state.transcript_search.active_ordinal(), first);
+                assert_eq!(state.transcript.search.active_ordinal(), first);
             }
         }
         assert!(action_rx.try_recv().is_err());
@@ -732,7 +737,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(textarea.lines(), &["/".to_string()]);
-        assert!(!state.transcript_search.open);
+        assert!(!state.transcript.search.open);
     }
 
     #[test]

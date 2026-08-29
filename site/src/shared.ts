@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.3";
+export const releaseVersion = "v0.4.4";
 
 export const releases = [
+  {
+    version: "v0.4.4",
+    date: "2026-08-29",
+    title: "TUI state ownership convergence",
+    body: "Moves TUI protocol values into protocol.rs, AppState event reduction into state_reducer.rs, and independent transcript, interaction, and viewport state into focused owners. Tests follow those boundaries, while the thin AppState aggregate remains the composition root and types keeps compatibility re-exports for existing in-tree consumers.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.4",
+  },
   {
     version: "v0.4.3",
     date: "2026-08-25",

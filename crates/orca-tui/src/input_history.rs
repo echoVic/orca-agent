@@ -137,7 +137,8 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{AppState, UserAction};
+    use crate::protocol::UserAction;
+    use crate::types::AppState;
 
     fn state() -> AppState {
         let (tx, _rx) = crossbeam_channel::unbounded::<UserAction>();

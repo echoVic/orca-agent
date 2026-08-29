@@ -3,7 +3,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tui_textarea::TextArea;
 
 use crate::idle_submit_actions::submit_pending_user_input_choice;
-use crate::types::{AppState, UserAction};
+use crate::protocol::UserAction;
+use crate::types::AppState;
 
 const MULTI_SELECT_HINT: &str =
     "\nSelect one or more choices separated by commas, or type a custom answer.";
@@ -222,9 +223,10 @@ mod tests {
     use orca_core::cancel::OperationIdAllocator;
 
     use crate::composer_textarea::{make_textarea_with_text, textarea_text};
-    use crate::types::{
-        AppStatus, PendingTuiInput, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse,
+    use crate::protocol::{
+        PendingTuiInput, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse,
     };
+    use crate::types::AppStatus;
 
     fn state_with_dialog(question: &str) -> (AppState, TuiInteractionKey) {
         let (tx, _rx) = mpsc::unbounded();
@@ -235,7 +237,7 @@ mod tests {
         );
         let mut state = AppState::new(tx, "test".to_string(), "auto".to_string(), "/tmp".into());
         state.status = AppStatus::WaitingUserInput;
-        state.pending_input = Some(PendingTuiInput::UserInput(key.clone()));
+        state.interaction.pending_input = Some(PendingTuiInput::UserInput(key.clone()));
         state.user_input_dialog = Some(UserInputDialog::new(
             question,
             vec![
@@ -281,7 +283,7 @@ mod tests {
         );
         assert_eq!(state.status, AppStatus::Running);
         assert!(state.user_input_dialog.is_none());
-        assert!(state.pending_interaction_submission.is_some());
+        assert!(state.interaction.pending_submission.is_some());
     }
 
     #[test]

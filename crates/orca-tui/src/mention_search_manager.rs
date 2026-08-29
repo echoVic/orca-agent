@@ -10,8 +10,9 @@ use orca_file_search::{
 use orca_runtime::mentions::{self, MentionToken};
 use orca_runtime::mentions::{MentionCandidate, MentionCatalog, MentionKind, MentionSigil};
 
+use crate::protocol::TuiEvent;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::{AppState, AppStatus, PanelMode, TuiEvent};
+use crate::types::{AppState, AppStatus, PanelMode};
 
 const WARM_IDLE: Duration = Duration::from_secs(30);
 const CATALOG_RESULT_CAPACITY: usize = 8;

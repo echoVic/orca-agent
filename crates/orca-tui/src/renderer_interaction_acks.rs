@@ -43,10 +43,10 @@ mod tests {
     use super::RendererInteractionAckOwner;
     use crate::action_dispatcher::InteractionResponseAck;
     use crate::composer_textarea::textarea_text;
+    use crate::protocol::{PendingTuiInput, TuiInteractionKey, TuiInteractionKind};
     use crate::theme::Theme;
-    use crate::types::{
-        AppState, AppStatus, ChatMessage, PendingTuiInput, TuiInteractionKey, TuiInteractionKind,
-    };
+    use crate::transcript_state::ChatMessage;
+    use crate::types::{AppState, AppStatus};
     use crate::vim::VimState;
 
     struct Fixture {
@@ -96,7 +96,7 @@ mod tests {
         drop(ack_tx);
         assert!(!fixture.drain(&owner));
         assert_eq!(fixture.state.status, AppStatus::Idle);
-        assert!(fixture.state.messages.is_empty());
+        assert!(fixture.state.transcript.messages.is_empty());
     }
 
     #[test]
@@ -111,7 +111,7 @@ mod tests {
 
         assert!(fixture.drain(&owner));
         assert_eq!(fixture.state.status, AppStatus::Idle);
-        assert!(fixture.state.messages.is_empty());
+        assert!(fixture.state.transcript.messages.is_empty());
         assert_eq!(textarea_text(&fixture.textarea), "");
         assert!(!fixture.drain(&owner));
     }
@@ -133,6 +133,7 @@ mod tests {
         assert!(fixture.drain(&owner));
         let errors: Vec<&str> = fixture
             .state
+            .transcript
             .messages
             .iter()
             .filter_map(|message| match message {
@@ -151,14 +152,14 @@ mod tests {
         let mut fixture = Fixture::new();
         let key = interaction_key(TuiInteractionKind::UserInput, "retry");
         fixture.state.status = AppStatus::WaitingUserInput;
-        fixture.state.pending_input = Some(PendingTuiInput::UserInput(key.clone()));
+        fixture.state.interaction.pending_input = Some(PendingTuiInput::UserInput(key.clone()));
         assert_eq!(
             fixture
                 .state
                 .stage_pending_interaction_submission("exact answer".to_string()),
             Some(key.clone())
         );
-        fixture.state.pending_input = None;
+        fixture.state.interaction.pending_input = None;
         fixture.state.enter_running();
 
         ack_tx
@@ -171,11 +172,11 @@ mod tests {
         assert!(fixture.drain(&owner));
         assert_eq!(fixture.state.status, AppStatus::WaitingUserInput);
         assert!(matches!(
-            fixture.state.pending_input.as_ref(),
+            fixture.state.interaction.pending_input.as_ref(),
             Some(PendingTuiInput::UserInput(actual)) if actual == &key
         ));
         assert_eq!(textarea_text(&fixture.textarea), "exact answer");
-        assert!(fixture.state.messages.iter().any(
+        assert!(fixture.state.transcript.messages.iter().any(
             |message| matches!(message, ChatMessage::Error(text) if text == "runtime unavailable")
         ));
     }

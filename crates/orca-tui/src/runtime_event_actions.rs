@@ -5,9 +5,10 @@ use tui_textarea::TextArea;
 use crate::action_dispatcher::InteractionResponseAck;
 use crate::bridge;
 use crate::composer_textarea::make_textarea_with_text;
+use crate::protocol::{TuiEvent, UserAction};
 use crate::terminal_presentation::{TerminalNotification, TerminalPresentation};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, TuiEvent, UserAction};
+use crate::types::{AppState, AppStatus};
 use crate::vim::VimState;
 use crate::workflow_notifications::{
     drain_pending_workflow_notifications, is_workflow_notification_turn_boundary,
@@ -29,8 +30,8 @@ pub(crate) fn handle_interaction_response_ack(
         InteractionResponseAck::NoLongerPending { key, message } => {
             let input_submission = matches!(
                 key.kind,
-                crate::types::TuiInteractionKind::UserInput
-                    | crate::types::TuiInteractionKind::McpElicitation
+                crate::protocol::TuiInteractionKind::UserInput
+                    | crate::protocol::TuiInteractionKind::McpElicitation
             );
             if !input_submission || state.discard_pending_interaction_submission(&key) {
                 apply_interaction_operation_rejection(message, state, textarea, vim_state);
@@ -39,8 +40,8 @@ pub(crate) fn handle_interaction_response_ack(
         InteractionResponseAck::Failed { key, message } => {
             let input_submission = matches!(
                 key.kind,
-                crate::types::TuiInteractionKind::UserInput
-                    | crate::types::TuiInteractionKind::McpElicitation
+                crate::protocol::TuiInteractionKind::UserInput
+                    | crate::protocol::TuiInteractionKind::McpElicitation
             );
             if input_submission {
                 if let Some(visible_text) =
@@ -56,7 +57,7 @@ pub(crate) fn handle_interaction_response_ack(
             }
         }
     }
-    if state.auto_scroll {
+    if state.viewport.auto_scroll {
         state.scroll_to_bottom();
     }
 }
@@ -125,7 +126,7 @@ pub(crate) fn handle_runtime_event(
         vim_state.cancel_pending_command();
         let _ = action_tx.send(UserAction::RespondToInteraction {
             key: key.clone(),
-            response: crate::types::TuiInteractionResponse::Approval(true),
+            response: crate::protocol::TuiInteractionResponse::Approval(true),
         });
         state.enter_running();
         return;
@@ -213,7 +214,7 @@ pub(crate) fn handle_runtime_event(
         vim_state.flush_pending_insert_escape(textarea);
         vim_state.cancel_pending_command();
     }
-    if state.auto_scroll {
+    if state.viewport.auto_scroll {
         state.scroll_to_bottom();
     }
 }
@@ -223,13 +224,13 @@ mod tests {
     use super::*;
     use crate::composer_textarea::textarea_text;
     use crate::idle_submit_actions::handle_idle_submit;
+    use crate::protocol::{
+        PendingWorkflowNotification, TuiInteractionKey, TuiInteractionKind, TuiMcpElicitationMode,
+    };
     use crate::queued_input::QueuedUserMessage;
     use crate::queued_input_actions::{QueuedDispatch, dispatch_next_queued_user_message};
     use crate::terminal_presentation::TerminalNotification;
-    use crate::types::{
-        ChatMessage, PendingWorkflowNotification, TuiInteractionKey, TuiInteractionKind,
-        TuiMcpElicitationMode,
-    };
+    use crate::transcript_state::ChatMessage;
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::{ThemeName, VimInsertEscapeSequence};
     use orca_runtime::mentions::{MentionBinding, MentionBindings, MentionFileKind, MentionTarget};
@@ -261,7 +262,8 @@ mod tests {
             "/tmp".to_string(),
         );
         state.status = AppStatus::WaitingUserInput;
-        state.pending_input = Some(crate::types::PendingTuiInput::UserInput(key.clone()));
+        state.interaction.pending_input =
+            Some(crate::protocol::PendingTuiInput::UserInput(key.clone()));
         let visible = "retry @item.rs [Pasted Content 1001 chars]  ";
         let mention_start = visible.find("@item.rs").unwrap();
         let bindings = MentionBindings::from_bindings(
@@ -319,8 +321,8 @@ mod tests {
 
         assert_eq!(state.status, AppStatus::WaitingUserInput);
         assert!(matches!(
-            state.pending_input.as_ref(),
-            Some(crate::types::PendingTuiInput::UserInput(actual)) if actual == &key
+            state.interaction.pending_input.as_ref(),
+            Some(crate::protocol::PendingTuiInput::UserInput(actual)) if actual == &key
         ));
         assert_eq!(textarea_text(&textarea), visible);
         assert_eq!(state.mention_bindings, bindings);
@@ -328,7 +330,7 @@ mod tests {
         assert_eq!(state.pending_pastes, pending_pastes);
         assert!(state.user_input_dialog.is_none());
         assert!(!vim.has_pending_command_for_test());
-        assert!(state.messages.iter().any(
+        assert!(state.transcript.messages.iter().any(
             |message| matches!(message, ChatMessage::Error(text) if text == "runtime unavailable")
         ));
     }
@@ -344,7 +346,8 @@ mod tests {
             "/tmp".to_string(),
         );
         state.status = AppStatus::WaitingUserInput;
-        state.pending_input = Some(crate::types::PendingTuiInput::UserInput(key.clone()));
+        state.interaction.pending_input =
+            Some(crate::protocol::PendingTuiInput::UserInput(key.clone()));
         let theme = Theme::named(ThemeName::Dark);
         let mut vim = VimState::new(false);
         let mut textarea = crate::composer_textarea::make_textarea_with_text("stale", &vim, &theme);
@@ -375,7 +378,7 @@ mod tests {
         );
 
         assert_eq!(state.status, AppStatus::Idle);
-        assert!(state.pending_input.is_none());
+        assert!(state.interaction.pending_input.is_none());
     }
 
     #[test]
@@ -389,7 +392,8 @@ mod tests {
             "/tmp".to_string(),
         );
         state.status = AppStatus::WaitingUserInput;
-        state.pending_input = Some(crate::types::PendingTuiInput::UserInput(key.clone()));
+        state.interaction.pending_input =
+            Some(crate::protocol::PendingTuiInput::UserInput(key.clone()));
         let mut config = crate::test_support::test_run_config();
         let shared_config = std::sync::Arc::new(std::sync::Mutex::new(config.clone()));
         let theme = Theme::named(ThemeName::Dark);
@@ -407,7 +411,7 @@ mod tests {
             &action_tx,
         ));
         assert!(action_rx.try_recv().is_ok());
-        assert!(state.pending_interaction_submission.is_some());
+        assert!(state.interaction.pending_submission.is_some());
 
         handle_interaction_response_ack(
             InteractionResponseAck::Committed { key: key.clone() },
@@ -428,11 +432,11 @@ mod tests {
         );
 
         assert_eq!(state.status, AppStatus::Running);
-        assert!(state.pending_interaction_submission.is_none());
-        assert!(state.pending_input.is_none());
+        assert!(state.interaction.pending_submission.is_none());
+        assert!(state.interaction.pending_input.is_none());
         assert_eq!(textarea_text(&textarea), "");
         assert!(
-            !state.messages.iter().any(
+            !state.transcript.messages.iter().any(
                 |message| matches!(message, ChatMessage::Error(text) if text == "late failure")
             )
         );
@@ -450,9 +454,10 @@ mod tests {
             "/tmp".to_string(),
         );
         state.status = AppStatus::WaitingUserInput;
-        state.pending_input = Some(crate::types::PendingTuiInput::UserInput(old_key.clone()));
+        state.interaction.pending_input =
+            Some(crate::protocol::PendingTuiInput::UserInput(old_key.clone()));
         state.stage_pending_interaction_submission("old answer".to_string());
-        state.pending_input = None;
+        state.interaction.pending_input = None;
         state.enter_running();
         state.update(TuiEvent::UserInputRequested {
             key: new_key.clone(),
@@ -476,11 +481,11 @@ mod tests {
 
         assert_eq!(state.status, AppStatus::WaitingUserInput);
         assert!(matches!(
-            state.pending_input.as_ref(),
-            Some(crate::types::PendingTuiInput::UserInput(actual)) if actual == &new_key
+            state.interaction.pending_input.as_ref(),
+            Some(crate::protocol::PendingTuiInput::UserInput(actual)) if actual == &new_key
         ));
-        assert!(state.pending_interaction_submission.is_none());
-        assert!(!state.messages.iter().any(
+        assert!(state.interaction.pending_submission.is_none());
+        assert!(!state.transcript.messages.iter().any(
             |message| matches!(message, ChatMessage::Error(text) if text == "late old failure")
         ));
     }
@@ -517,7 +522,7 @@ mod tests {
         );
 
         assert_eq!(state.status, AppStatus::Idle);
-        assert!(state.messages.iter().any(
+        assert!(state.transcript.messages.iter().any(
             |message| matches!(message, ChatMessage::Error(text) if text == "approval failed")
         ));
     }
@@ -827,6 +832,7 @@ mod tests {
         assert!(!state.queued_submission_in_flight());
         assert!(
             !state
+                .transcript
                 .messages
                 .iter()
                 .any(|message| matches!(message, ChatMessage::User(text) if text == visible))
@@ -921,7 +927,9 @@ mod tests {
             )
             .unwrap();
         let attachments = images.attachments_for_text(visible_prompt);
-        state.push_message(crate::types::ChatMessage::User(visible_prompt.to_string()));
+        state.push_message(crate::transcript_state::ChatMessage::User(
+            visible_prompt.to_string(),
+        ));
         state.enter_running();
         let pending = bridge::PendingWorkflowNotifications::new();
         let theme = Theme::named(ThemeName::Dark);

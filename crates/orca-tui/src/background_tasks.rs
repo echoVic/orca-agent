@@ -4,8 +4,8 @@ use orca_core::task_types::TaskStatus;
 use orca_runtime::runtime_host::RuntimeThreadHandle;
 
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::TuiEvent;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::TuiEvent;
 
 pub(crate) enum HostedTaskAction {
     Stop { task_id: String },

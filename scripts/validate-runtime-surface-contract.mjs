@@ -463,7 +463,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       ],
       [
         "crates/orca-tui/src/renderer_frame.rs",
-        /pub\(crate\)\s+fn\s+present_iteration[\s\S]*?state\.pending_clipboard_copy\.take\(\)[\s\S]*?copy_clipboard\(&text\)/,
+        /pub\(crate\)\s+fn\s+present_iteration[\s\S]*?state\.viewport\.pending_clipboard_copy\.take\(\)[\s\S]*?copy_clipboard\(&text\)/,
       ],
       [
         "crates/orca-tui/src/hosted_submission.rs",
@@ -555,7 +555,7 @@ const TUI_ENTRYPOINT_SOURCE_ANCHORS = new Map([
       ],
       [
         "crates/orca-tui/src/renderer_frame.rs",
-        /pub\(crate\)\s+fn\s+prepare_iteration\s*\([\s\S]*?state\.poll_edit_highlight_results\(\)[\s\S]*?let\s+animation_active\s*=[\s\S]*?state\.copy_notice_at\(now\)\.is_none\(\)[\s\S]*?state\.advance_tick\(\)[\s\S]*?presentation\.advance_tick\(\)[\s\S]*?state\.apply_drag_edge_scroll\(\)[\s\S]*?self\.scheduler\.did_animate\(now\)[\s\S]*?self\.scheduler\.poll_timeout\(now,\s*animation_active\)[\s\S]*?pub\(crate\)\s+fn\s+run_iteration[\s\S]*?run_event_loop_iteration\([\s\S]*?pub\(crate\)\s+fn\s+present_iteration[\s\S]*?state\.pending_clipboard_copy\.take\(\)[\s\S]*?write_pending\(terminal,\s*presentation,\s*state\.status\)[\s\S]*?terminal\.draw\([\s\S]*?self\.scheduler\.did_draw\(draw_at\)/,
+        /pub\(crate\)\s+fn\s+prepare_iteration\s*\([\s\S]*?state\.poll_edit_highlight_results\(\)[\s\S]*?let\s+animation_active\s*=[\s\S]*?state\.copy_notice_at\(now\)\.is_none\(\)[\s\S]*?state\.advance_tick\(\)[\s\S]*?presentation\.advance_tick\(\)[\s\S]*?state\.apply_drag_edge_scroll\(\)[\s\S]*?self\.scheduler\.did_animate\(now\)[\s\S]*?self\.scheduler\.poll_timeout\(now,\s*animation_active\)[\s\S]*?pub\(crate\)\s+fn\s+run_iteration[\s\S]*?run_event_loop_iteration\([\s\S]*?pub\(crate\)\s+fn\s+present_iteration[\s\S]*?state\.viewport\.pending_clipboard_copy\.take\(\)[\s\S]*?write_pending\(terminal,\s*presentation,\s*state\.status\)[\s\S]*?terminal\.draw\([\s\S]*?self\.scheduler\.did_draw\(draw_at\)/,
       ],
     ]),
   ],
@@ -1174,7 +1174,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/surface_actions.rs:backtrack_last_user:thread.backtrack_last_user", 1],
   ["crates/orca-tui/src/surface_actions.rs:remember:memory.update", 2],
   ["crates/orca-tui/src/surface_actions.rs:save_api_key:credentials.update", 2],
-  ["crates/orca-tui/src/types.rs:update:input_history.record", 1],
+  ["crates/orca-tui/src/state_reducer.rs:update:input_history.record", 1],
   ["crates/orca-tui/src/workflow_notifications.rs:submit_pending_workflow_notification:user_action.route", 1],
   ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 2],
 ]);
@@ -1319,15 +1319,15 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/edit_highlight.rs:clear_applied:self.applied.clear", 1],
   ["crates/orca-tui/src/edit_highlight.rs:reconfigure_edit_highlighting:self.applied.clear", 1],
   ["crates/orca-tui/src/types.rs:clear_projection:self.candidates.clear", 1],
-  ["crates/orca-tui/src/types.rs:clear_messages:self.messages.clear", 1],
-  ["crates/orca-tui/src/types.rs:clear_messages:self.message_revisions.clear", 1],
-  ["crates/orca-tui/src/types.rs:clear_messages:self.tool_call_indices.clear", 1],
-  ["crates/orca-tui/src/types.rs:clear_messages:self.transcript_render_cache.clear", 1],
+  ["crates/orca-tui/src/types.rs:clear_messages:self.transcript.messages.clear", 1],
+  ["crates/orca-tui/src/types.rs:clear_messages:self.transcript.message_revisions.clear", 1],
+  ["crates/orca-tui/src/types.rs:clear_messages:self.transcript.tool_call_indices.clear", 1],
+  ["crates/orca-tui/src/types.rs:clear_messages:self.transcript.render_cache.clear", 1],
   ["crates/orca-tui/src/types.rs:clear:queue.clear", 1],
   ["crates/orca-tui/src/input_history.rs:load_input_history:seen.insert", 2],
-  ["crates/orca-tui/src/types.rs:rebuild_tool_call_indices:self.tool_call_indices.clear", 1],
-  ["crates/orca-tui/src/types.rs:reset_message_tracking:self.message_revisions.clear", 1],
-  ["crates/orca-tui/src/types.rs:reset_message_tracking:self.transcript_render_cache.clear", 1],
+  ["crates/orca-tui/src/types.rs:rebuild_tool_call_indices:self.transcript.tool_call_indices.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_message_tracking:self.transcript.message_revisions.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_message_tracking:self.transcript.render_cache.clear", 1],
   ["crates/orca-tui/src/types.rs:reset_session_projection:self.approval_allowlist.clear", 1],
   ["crates/orca-tui/src/types.rs:reset_session_projection:self.atomic_skill_tokens.clear", 1],
   ["crates/orca-tui/src/types.rs:reset_session_projection:self.mention_bindings.clear", 1],
@@ -1335,8 +1335,8 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/types.rs:reset_session_projection:self.pending_workflow_notifications.clear", 1],
   ["crates/orca-tui/src/types.rs:reset_session_projection:self.session_picker_query.clear", 1],
   ["crates/orca-tui/src/types.rs:reset_session_projection:self.session_picker_sessions.clear", 1],
-  ["crates/orca-tui/src/types.rs:update:self.atomic_skill_tokens.clear", 1],
-  ["crates/orca-tui/src/types.rs:update:self.mention_bindings.clear", 1],
+  ["crates/orca-tui/src/state_reducer.rs:update:self.atomic_skill_tokens.clear", 1],
+  ["crates/orca-tui/src/state_reducer.rs:update:self.mention_bindings.clear", 1],
   ["crates/orca-tui/src/ui.rs:append_code_block:source_line.insert", 1],
   ["crates/orca-tui/src/ui.rs:append_proposed_plan_lines:line.spans.insert", 1],
   ["crates/orca-tui/src/ui.rs:render_markdown:opts.insert", 1],
@@ -4392,7 +4392,7 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
     if (!line.includes(row[0])) fail(`${row[0]} source line ${row[1]} has drifted`);
   });
 
-  const userActionPath = checkedRepoFile(repoRoot, "crates/orca-tui/src/types.rs", "UserAction source");
+  const userActionPath = checkedRepoFile(repoRoot, "crates/orca-tui/src/protocol.rs", "UserAction source");
   const userActions = parseRustEnum(
     readRepoSource(repoRoot, relativeRepoPath(repoRoot, userActionPath), sourceOverrides),
     "pub enum UserAction {",

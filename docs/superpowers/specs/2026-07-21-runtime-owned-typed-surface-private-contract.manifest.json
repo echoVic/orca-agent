@@ -3917,7 +3917,7 @@
       "StartSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs:406",
+        "crates/orca-tui/src/protocol.rs:325",
         "crates/orca-tui/src/slash_command_actions.rs:188",
         "crates/orca-tui/src/hosted_side.rs:107",
         "crates/orca-tui/src/hosted_controller.rs:144"
@@ -3941,7 +3941,7 @@
       "ToggleSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs:409",
+        "crates/orca-tui/src/protocol.rs:328",
         "crates/orca-tui/src/global_actions.rs:52",
         "crates/orca-tui/src/hosted_side.rs:247",
         "crates/orca-tui/src/hosted_controller.rs:160"
@@ -3965,7 +3965,7 @@
       "CloseSideConversation",
       "current",
       [
-        "crates/orca-tui/src/types.rs:410",
+        "crates/orca-tui/src/protocol.rs:329",
         "crates/orca-tui/src/global_actions.rs:25",
         "crates/orca-tui/src/hosted_side.rs:359",
         "crates/orca-tui/src/hosted_controller.rs:176"
@@ -3989,9 +3989,9 @@
       "NewSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs:457",
+        "crates/orca-tui/src/protocol.rs:330",
         "crates/orca-tui/src/slash_command_actions.rs:31",
-        "crates/orca-tui/src/app.rs:7596",
+        "crates/orca-tui/src/app_integration_tests.rs:3991",
         "crates/orca-tui/src/hosted_controller.rs:192"
       ],
       "host_session_lifecycle_mutation",
@@ -4013,7 +4013,7 @@
       "ForkCurrentSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs:510",
+        "crates/orca-tui/src/protocol.rs:331",
         "crates/orca-tui/src/slash_command_actions.rs:203",
         "crates/orca-tui/src/hosted_controller.rs:206"
       ],
@@ -4036,7 +4036,7 @@
       "RenameCurrentSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs:513",
+        "crates/orca-tui/src/protocol.rs:334",
         "crates/orca-tui/src/slash_command_actions.rs:214",
         "crates/orca-tui/src/hosted_controller.rs:220"
       ],
@@ -4058,7 +4058,7 @@
       "ResumeSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs:516",
+        "crates/orca-tui/src/protocol.rs:337",
         "crates/orca-tui/src/session_picker_actions.rs:215",
         "crates/orca-tui/src/hosted_controller.rs:234"
       ],
@@ -4081,7 +4081,7 @@
       "ForkSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs:519",
+        "crates/orca-tui/src/protocol.rs:340",
         "crates/orca-tui/src/session_picker_actions.rs:244",
         "crates/orca-tui/src/hosted_controller.rs:248"
       ],
@@ -4104,7 +4104,7 @@
       "RenameSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs:522",
+        "crates/orca-tui/src/protocol.rs:343",
         "crates/orca-tui/src/session_picker_actions.rs:119",
         "crates/orca-tui/src/hosted_controller.rs:262"
       ],
@@ -4126,7 +4126,7 @@
       "ArchiveSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs:526",
+        "crates/orca-tui/src/protocol.rs:347",
         "crates/orca-tui/src/session_picker_actions.rs:155",
         "crates/orca-tui/src/hosted_controller.rs:276"
       ],
@@ -4148,7 +4148,7 @@
       "DeleteSavedSession",
       "current",
       [
-        "crates/orca-tui/src/types.rs:529",
+        "crates/orca-tui/src/protocol.rs:350",
         "crates/orca-tui/src/session_picker_actions.rs:188",
         "crates/orca-tui/src/hosted_controller.rs:290"
       ],
@@ -4170,7 +4170,7 @@
       "Submit",
       "current",
       [
-        "crates/orca-tui/src/types.rs:323",
+        "crates/orca-tui/src/protocol.rs:353",
         "crates/orca-tui/src/app.rs:238",
         "crates/orca-tui/src/setup_actions.rs:74",
         "crates/orca-tui/src/slash_command_actions.rs:125"
@@ -4193,7 +4193,7 @@
       "SubmitWithMentions",
       "current",
       [
-        "crates/orca-tui/src/types.rs:324",
+        "crates/orca-tui/src/protocol.rs:354",
         "crates/orca-tui/src/idle_submit_actions.rs:70"
       ],
       "runtime_mutation",
@@ -4217,7 +4217,7 @@
       "QueuePrompt",
       "current",
       [
-        "crates/orca-tui/src/types.rs:475",
+        "crates/orca-tui/src/protocol.rs:359",
         "crates/orca-tui/src/action_dispatcher.rs:205"
       ],
       "runtime_mutation",
@@ -4239,7 +4239,7 @@
       "PromptQueueControl",
       "current",
       [
-        "crates/orca-tui/src/types.rs:479",
+        "crates/orca-tui/src/protocol.rs:410",
         "crates/orca-tui/src/slash_command_actions.rs:214"
       ],
       "runtime_mutation",
@@ -4261,8 +4261,8 @@
       "SubmitQueued",
       "current",
       [
-        "crates/orca-tui/src/types.rs:453",
-        "crates/orca-tui/src/app.rs:7389"
+        "crates/orca-tui/src/protocol.rs:365",
+        "crates/orca-tui/src/app_integration_tests.rs:5185"
       ],
       "runtime_mutation",
       "UserAction::SubmitQueued{id,prompt,bindings,images}",
@@ -4285,7 +4285,7 @@
       "PasteImages",
       "current",
       [
-        "crates/orca-tui/src/types.rs:501",
+        "crates/orca-tui/src/protocol.rs:371",
         "crates/orca-tui/src/composer_image_actions.rs:24",
         "crates/orca-tui/src/action_dispatcher.rs:205",
         "crates/orca-tui/src/renderer_runtime.rs:54"
@@ -4304,7 +4304,7 @@
       "ImplementApprovedPlan",
       "current",
       [
-        "crates/orca-tui/src/types.rs:444",
+        "crates/orca-tui/src/protocol.rs:375",
         "crates/orca-tui/src/plan_approval_actions.rs:55",
         "crates/orca-tui/src/hosted_plan.rs:37",
         "crates/orca-tui/src/hosted_controller.rs:307"
@@ -4330,9 +4330,9 @@
       "SubmitWorkflowNotification",
       "current",
       [
-        "crates/orca-tui/src/types.rs:328",
+        "crates/orca-tui/src/protocol.rs:379",
         "crates/orca-tui/src/workflow_notifications.rs:17",
-        "crates/orca-tui/src/app.rs:4645"
+        "crates/orca-tui/src/app_integration_tests.rs:5354"
       ],
       "runtime_mutation",
       "UserAction::SubmitWorkflowNotification(PendingWorkflowNotification)",
@@ -4352,7 +4352,7 @@
       "RunWorkflow",
       "current",
       [
-        "crates/orca-tui/src/types.rs:449",
+        "crates/orca-tui/src/protocol.rs:380",
         "crates/orca-tui/src/slash_command_actions.rs:164",
         "crates/orca-tui/src/hosted_workflow.rs:28",
         "crates/orca-tui/src/hosted_controller.rs:372"
@@ -4377,7 +4377,7 @@
       "SetModel",
       "current",
       [
-        "crates/orca-tui/src/types.rs:333",
+        "crates/orca-tui/src/protocol.rs:384",
         "crates/orca-tui/src/slash_command_actions.rs:30",
         "crates/orca-tui/src/slash_menu_actions.rs:117"
       ],
@@ -4400,7 +4400,7 @@
       "Remember",
       "current",
       [
-        "crates/orca-tui/src/types.rs:454",
+        "crates/orca-tui/src/protocol.rs:385",
         "crates/orca-tui/src/slash_command_actions.rs:147",
         "crates/orca-tui/src/hosted_context.rs:33",
         "crates/orca-tui/src/hosted_controller.rs:419"
@@ -4425,7 +4425,7 @@
       "Compact",
       "current",
       [
-        "crates/orca-tui/src/types.rs:458",
+        "crates/orca-tui/src/protocol.rs:389",
         "crates/orca-tui/src/slash_command_actions.rs:151",
         "crates/orca-tui/src/hosted_context.rs:78",
         "crates/orca-tui/src/hosted_controller.rs:430"
@@ -4449,7 +4449,7 @@
       "GoalShow",
       "current",
       [
-        "crates/orca-tui/src/types.rs:336",
+        "crates/orca-tui/src/protocol.rs:390",
         "crates/orca-tui/src/slash_command_actions.rs:107"
       ],
       "authoritative_read",
@@ -4472,7 +4472,7 @@
       "GoalSet",
       "current",
       [
-        "crates/orca-tui/src/types.rs:337",
+        "crates/orca-tui/src/protocol.rs:391",
         "crates/orca-tui/src/slash_command_actions.rs:108"
       ],
       "goal_and_operation_mutation",
@@ -4495,7 +4495,7 @@
       "GoalEdit",
       "current",
       [
-        "crates/orca-tui/src/types.rs:338",
+        "crates/orca-tui/src/protocol.rs:392",
         "crates/orca-tui/src/slash_command_actions.rs:109"
       ],
       "goal_mutation",
@@ -4516,7 +4516,7 @@
       "GoalClear",
       "current",
       [
-        "crates/orca-tui/src/types.rs:339",
+        "crates/orca-tui/src/protocol.rs:393",
         "crates/orca-tui/src/slash_command_actions.rs:110"
       ],
       "goal_mutation",
@@ -4537,7 +4537,7 @@
       "GoalPause",
       "current",
       [
-        "crates/orca-tui/src/types.rs:340",
+        "crates/orca-tui/src/protocol.rs:394",
         "crates/orca-tui/src/slash_command_actions.rs:111",
         "crates/orca-tui/src/action_dispatcher.rs:205"
       ],
@@ -4560,9 +4560,9 @@
       "GoalResume",
       "current",
       [
-        "crates/orca-tui/src/types.rs:341",
+        "crates/orca-tui/src/protocol.rs:395",
         "crates/orca-tui/src/slash_command_actions.rs:112",
-        "crates/orca-tui/src/app.rs:5266"
+        "crates/orca-tui/src/app_integration_tests.rs:4642"
       ],
       "goal_session_operation_mutation",
       "UserAction::GoalResume",
@@ -4585,7 +4585,7 @@
       "ResolveBackgroundApproval",
       "current",
       [
-        "crates/orca-tui/src/types.rs:465",
+        "crates/orca-tui/src/protocol.rs:396",
         "crates/orca-tui/src/approval_actions.rs:50",
         "crates/orca-tui/src/background_tasks.rs:30",
         "crates/orca-tui/src/hosted_controller.rs:468"
@@ -4610,7 +4610,7 @@
       "StopTask",
       "current",
       [
-        "crates/orca-tui/src/types.rs:469",
+        "crates/orca-tui/src/protocol.rs:400",
         "crates/orca-tui/src/workflow_panel_actions.rs:32",
         "crates/orca-tui/src/background_tasks.rs:24",
         "crates/orca-tui/src/hosted_controller.rs:452"
@@ -4633,7 +4633,7 @@
       "ForegroundTask",
       "current",
       [
-        "crates/orca-tui/src/types.rs:472",
+        "crates/orca-tui/src/protocol.rs:403",
         "crates/orca-tui/src/workflow_panel_actions.rs:41",
         "crates/orca-tui/src/background_tasks.rs:27",
         "crates/orca-tui/src/hosted_controller.rs:460"
@@ -4656,7 +4656,7 @@
       "RespondToInteraction",
       "current",
       [
-        "crates/orca-tui/src/types.rs:486",
+        "crates/orca-tui/src/protocol.rs:417",
         "crates/orca-tui/src/approval_actions.rs:65",
         "crates/orca-tui/src/idle_submit_actions.rs:131",
         "crates/orca-tui/src/runtime_event_actions.rs:127",
@@ -4685,7 +4685,7 @@
       "Backtrack",
       "current",
       [
-        "crates/orca-tui/src/types.rs:479",
+        "crates/orca-tui/src/protocol.rs:410",
         "crates/orca-tui/src/idle_navigation_actions.rs:59",
         "crates/orca-tui/src/hosted_context.rs:90",
         "crates/orca-tui/src/hosted_controller.rs:441"
@@ -4709,7 +4709,7 @@
       "BackgroundCurrentTurn",
       "current",
       [
-        "crates/orca-tui/src/types.rs:357",
+        "crates/orca-tui/src/protocol.rs:411",
         "crates/orca-tui/src/running_actions.rs:15",
         "crates/orca-tui/src/action_dispatcher.rs:202"
       ],
@@ -4731,7 +4731,7 @@
       "Interrupt",
       "current",
       [
-        "crates/orca-tui/src/types.rs:358",
+        "crates/orca-tui/src/protocol.rs:412",
         "crates/orca-tui/src/global_actions.rs:33",
         "crates/orca-tui/src/running_actions.rs:18"
       ],
@@ -4754,7 +4754,7 @@
       "Cancel",
       "current",
       [
-        "crates/orca-tui/src/types.rs:359",
+        "crates/orca-tui/src/protocol.rs:413",
         "crates/orca-tui/src/global_actions.rs:42"
       ],
       "host_lifecycle_mutation",
@@ -4775,7 +4775,7 @@
       "ResumeOperation",
       "current",
       [
-        "crates/orca-tui/src/types.rs:483",
+        "crates/orca-tui/src/protocol.rs:414",
         "crates/orca-tui/src/status_key_actions.rs:171",
         "crates/orca-tui/src/hosted_operation.rs:30",
         "crates/orca-tui/src/hosted_controller.rs:383"
@@ -4800,7 +4800,7 @@
       "CancelOperation",
       "current",
       [
-        "crates/orca-tui/src/types.rs:486",
+        "crates/orca-tui/src/protocol.rs:417",
         "crates/orca-tui/src/status_key_actions.rs:173",
         "crates/orca-tui/src/slash_command_actions.rs:219",
         "crates/orca-tui/src/hosted_operation.rs:37",
@@ -5101,7 +5101,7 @@
       "approval_always",
       [
         "crates/orca-tui/src/approval_actions.rs:11",
-        "crates/orca-tui/src/types.rs:1455",
+        "crates/orca-tui/src/state_reducer.rs:499",
         "crates/orca-tui/src/runtime_event_actions.rs:25"
       ],
       "policy_and_interaction_mutation",
@@ -5117,7 +5117,7 @@
     [
       "background_approval_reconstruction",
       [
-        "crates/orca-tui/src/types.rs:1168",
+        "crates/orca-tui/src/workflow_panel.rs:103",
         "crates/orca-tui/src/approval_actions.rs:36"
       ],
       "interaction_mutation",
@@ -5261,7 +5261,7 @@
     [
       "app_state_update",
       [
-        "crates/orca-tui/src/types.rs:1472"
+        "crates/orca-tui/src/state_reducer.rs:56"
       ],
       "semantic_mirror",
       "raw_tui_event_drives_lifecycle_interactions_goal_workflow_terminal",
@@ -6066,7 +6066,7 @@
     {
       "id": "tui_user_action_inventory",
       "source": "tui_actions",
-      "compare_current_to": "crates/orca-tui/src/types.rs::UserAction",
+      "compare_current_to": "crates/orca-tui/src/protocol.rs::UserAction",
       "required_additions_completed_in": "Phase3",
       "assert": [
         "every_current_variant_once",

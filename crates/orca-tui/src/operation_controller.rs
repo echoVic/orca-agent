@@ -9,8 +9,8 @@ use std::{
 use crossbeam_channel::Sender;
 use orca_core::cancel::{OperationId, OperationIdAllocator};
 
+use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 use crate::surface_projection::TuiStreamDeliveryWatermark;
-use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 
 /// Presentation-side correlation for a typed runtime surface operation.
 ///
@@ -800,7 +800,7 @@ impl TuiSurfaceTaskControl {
                         requested_schema,
                         ..
                     } => (
-                        crate::types::TuiMcpElicitationMode::Form,
+                        crate::protocol::TuiMcpElicitationMode::Form,
                         None,
                         requested_schema.as_ref().map(|value| {
                             serde_json::to_string(value)
@@ -811,7 +811,7 @@ impl TuiSurfaceTaskControl {
                         raw_url,
                         requested_schema,
                     } => (
-                        crate::types::TuiMcpElicitationMode::Url,
+                        crate::protocol::TuiMcpElicitationMode::Url,
                         raw_url.as_ref().map(|value| value.as_str().to_string()),
                         requested_schema.as_ref().map(|value| {
                             serde_json::to_string(value)
@@ -1352,8 +1352,8 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             waiting.await_queue_interaction(
                 "request-1".to_string(),
-                crate::types::TuiInteractionKind::UserInput,
-                |key| crate::types::TuiEvent::UserInputRequested {
+                crate::protocol::TuiInteractionKind::UserInput,
+                |key| crate::protocol::TuiEvent::UserInputRequested {
                     key,
                     question: "question".to_string(),
                     choices: Vec::new(),
@@ -1364,14 +1364,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("queued event")
         {
-            crate::types::TuiEvent::UserInputRequested { key, .. } => key,
+            crate::protocol::TuiEvent::UserInputRequested { key, .. } => key,
             event => panic!("unexpected queued event: {event:?}"),
         };
         assert!(
             controller
                 .respond(
                     &key,
-                    &crate::types::TuiInteractionResponse::UserInput("answer".to_string())
+                    &crate::protocol::TuiInteractionResponse::UserInput("answer".to_string())
                 )
                 .expect("respond queued interaction")
         );
@@ -1380,7 +1380,7 @@ mod tests {
                 .join()
                 .expect("waiter join")
                 .expect("waiter response"),
-            crate::types::TuiInteractionResponse::UserInput("answer".to_string())
+            crate::protocol::TuiInteractionResponse::UserInput("answer".to_string())
         );
     }
 

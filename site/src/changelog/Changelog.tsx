@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.4":
+        "Moves TUI protocol values into protocol.rs, AppState event reduction into state_reducer.rs, and independent transcript, interaction, and viewport state into focused owners. Tests follow those boundaries, while the thin AppState aggregate remains the composition root and types keeps compatibility re-exports for existing in-tree consumers.",
       "v0.4.3":
         "Shows the running queue head in the TUI queue preview and auto-queues submissions made while the session is busy through the durable prompt queue instead of rejecting them. Backgrounding a turn with no background capacity queues it the same way instead of failing the handoff, so the session completes successfully after the queued turn runs. Queue pause/delete interactions and task interruption are wired into the hosted operation controller.",
       "v0.4.2":
@@ -622,6 +624,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.4":
+        "将 TUI 协议值集中到 protocol.rs，把 AppState 事件归约移到 state_reducer.rs，并把仍有独立不变量的 transcript、interaction、viewport 状态放入专用 owner。测试随 owner 归属，AppState 只保留组合根职责，types 继续提供现有代码路径所需的兼容 re-export。",
       "v0.4.3":
         "TUI 队列预览现在显示正在运行的队列任务，会话繁忙时的提交会自动进入持久化 prompt queue 而不是被拒绝；无后台容量时把当前回合转入后台也会自动排队而不是让会话失败，排队回合运行完成后会话以 success 收尾。队列暂停/删除交互与任务中断已接入 hosted 操作控制器。",
       "v0.4.2":

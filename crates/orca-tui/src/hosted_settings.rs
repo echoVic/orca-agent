@@ -6,9 +6,9 @@ use crossbeam_channel as mpsc;
 use orca_core::config::RunConfig;
 use orca_runtime::runtime_host::RuntimeThreadHandle;
 
+use crate::protocol::TuiEvent;
 use crate::slash_command_actions::SettingsIntent;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::TuiEvent;
 
 pub(crate) fn settings_intent_patches(
     intent: SettingsIntent,
@@ -192,8 +192,8 @@ mod tests {
         NonEmptyText, RuntimeSettingsPatch, SurfaceApprovalMode, SurfaceReasoningEffort,
     };
 
+    use crate::protocol::TuiEvent;
     use crate::slash_command_actions::SettingsIntent;
-    use crate::types::TuiEvent;
 
     #[test]
     fn settings_intent_preserves_model_reasoning_approval_patch_order() {

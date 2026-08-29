@@ -2,8 +2,10 @@ use crossbeam_channel as mpsc;
 use std::io;
 use std::time::{Duration, Instant};
 
+use crate::protocol::UserAction;
 use crate::shortcuts::GlobalShortcut;
-use crate::types::{AppState, AppStatus, ChatMessage, UserAction};
+use crate::transcript_state::ChatMessage;
+use crate::types::{AppState, AppStatus};
 
 pub(crate) enum GlobalShortcutFlow {
     Continue,
@@ -66,8 +68,8 @@ where
         }
         GlobalShortcut::ClearScreen => {
             state.clear_messages();
-            state.scroll_offset = 0;
-            state.auto_scroll = true;
+            state.viewport.scroll_offset = 0;
+            state.viewport.auto_scroll = true;
             clear_terminal()?;
         }
     }
@@ -79,8 +81,10 @@ mod tests {
     use crossbeam_channel as mpsc;
 
     use super::handle_global_shortcut;
+    use crate::protocol::{TuiEvent, UserAction};
     use crate::shortcuts::GlobalShortcut;
-    use crate::types::{AppState, AppStatus, ChatMessage, SideParentStatus, TuiEvent, UserAction};
+    use crate::transcript_state::ChatMessage;
+    use crate::types::{AppState, AppStatus, SideParentStatus};
 
     #[test]
     fn cancel_interrupts_while_context_is_compacting() {
@@ -185,16 +189,16 @@ mod tests {
             "/tmp".to_string(),
         );
         state.push_message(ChatMessage::Assistant("cached".to_string()));
-        assert_eq!(state.message_revisions.len(), 1);
-        assert_eq!(state.transcript_render_cache.len(), 1);
+        assert_eq!(state.transcript.message_revisions.len(), 1);
+        assert_eq!(state.transcript.render_cache.len(), 1);
 
         handle_global_shortcut(GlobalShortcut::ClearScreen, &mut state, &action_tx, || {
             Ok(())
         })
         .expect("clear screen");
 
-        assert!(state.messages.is_empty());
-        assert!(state.message_revisions.is_empty());
-        assert_eq!(state.transcript_render_cache.len(), 0);
+        assert!(state.transcript.messages.is_empty());
+        assert!(state.transcript.message_revisions.is_empty());
+        assert_eq!(state.transcript.render_cache.len(), 0);
     }
 }

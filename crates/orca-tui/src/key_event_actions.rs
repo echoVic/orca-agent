@@ -10,8 +10,9 @@ use crate::approval_mode_actions::cycle_approval_mode;
 use crate::composer_image_actions::{handle_image_paste_shortcut, handle_image_viewer_key};
 use crate::composer_input_actions::composer_editor_shortcut_is_active;
 use crate::global_actions::{GlobalShortcutFlow, handle_global_shortcut};
+use crate::protocol::UserAction;
 use crate::shortcuts::{GlobalShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
-use crate::types::{AppState, AppStatus, PanelMode, UserAction};
+use crate::types::{AppState, AppStatus, PanelMode};
 use crate::vim::VimState;
 
 pub(crate) enum KeyEventFlow {
@@ -28,7 +29,7 @@ pub(crate) enum SearchKeyFlow {
 
 pub(crate) fn handle_transcript_search_key(key: KeyEvent, state: &mut AppState) -> SearchKeyFlow {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        || !state.transcript_search.open
+        || !state.transcript.search.open
     {
         return SearchKeyFlow::NotSearch;
     }
@@ -47,24 +48,24 @@ pub(crate) fn handle_transcript_search_key(key: KeyEvent, state: &mut AppState) 
             }
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.transcript_search.clear_query();
+            state.transcript.search.clear_query();
             state.refresh_transcript_search();
         }
         KeyCode::Backspace => {
-            if state.transcript_search.backspace() {
+            if state.transcript.search.backspace() {
                 state.refresh_transcript_search();
             }
         }
-        KeyCode::Left => state.transcript_search.move_left(),
-        KeyCode::Right => state.transcript_search.move_right(),
-        KeyCode::Home => state.transcript_search.move_home(),
-        KeyCode::End => state.transcript_search.move_end(),
+        KeyCode::Left => state.transcript.search.move_left(),
+        KeyCode::Right => state.transcript.search.move_right(),
+        KeyCode::Home => state.transcript.search.move_home(),
+        KeyCode::End => state.transcript.search.move_end(),
         KeyCode::Char(character)
             if !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
         {
-            state.transcript_search.insert_char(character);
+            state.transcript.search.insert_char(character);
             state.refresh_transcript_search();
         }
         _ => {}
@@ -79,8 +80,8 @@ mod tests {
 
     use crate::test_support::test_run_config;
     use crate::theme::Theme;
+    use crate::transcript_state::ChatMessage;
     use crate::transcript_view::TranscriptRenderContext;
-    use crate::types::ChatMessage;
     use crate::ui::build_lines_for_messages;
 
     fn state_with_search_matches() -> AppState {
@@ -94,9 +95,9 @@ mod tests {
         state.push_message(ChatMessage::System("alpha one".to_string()));
         state.push_message(ChatMessage::System("alpha two".to_string()));
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
-        let messages = &state.messages;
-        let revisions = &state.message_revisions;
-        state.transcript_render_cache.prepare(
+        let messages = &state.transcript.messages;
+        let revisions = &state.transcript.message_revisions;
+        state.transcript.render_cache.prepare(
             messages,
             revisions,
             TranscriptRenderContext::new(&theme, 40, 0, false),
@@ -126,37 +127,37 @@ mod tests {
             ),
             SearchKeyFlow::Handled
         );
-        assert_eq!(state.transcript_search.query(), "alphaz");
+        assert_eq!(state.transcript.search.query(), "alphaz");
         handle_transcript_search_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut state);
         handle_transcript_search_key(
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
             &mut state,
         );
-        assert_eq!(state.transcript_search.query(), "alphz");
+        assert_eq!(state.transcript.search.query(), "alphz");
         handle_transcript_search_key(
             KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
             &mut state,
         );
-        assert_eq!(state.transcript_search.query(), "");
+        assert_eq!(state.transcript.search.query(), "");
 
         state.replace_transcript_search_query("alpha");
         state.refresh_transcript_search();
-        let first = state.transcript_search.active_ordinal();
+        let first = state.transcript.search.active_ordinal();
         handle_transcript_search_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut state,
         );
-        assert_ne!(state.transcript_search.active_ordinal(), first);
+        assert_ne!(state.transcript.search.active_ordinal(), first);
         handle_transcript_search_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             &mut state,
         );
-        assert_eq!(state.transcript_search.active_ordinal(), first);
+        assert_eq!(state.transcript.search.active_ordinal(), first);
         handle_transcript_search_key(
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
             &mut state,
         );
-        assert_ne!(state.transcript_search.active_ordinal(), first);
+        assert_ne!(state.transcript.search.active_ordinal(), first);
         handle_transcript_search_key(
             KeyEvent::new(
                 KeyCode::Char('g'),
@@ -164,10 +165,10 @@ mod tests {
             ),
             &mut state,
         );
-        assert_eq!(state.transcript_search.active_ordinal(), first);
+        assert_eq!(state.transcript.search.active_ordinal(), first);
 
         handle_transcript_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut state);
-        assert!(!state.transcript_search.open);
+        assert!(!state.transcript.search.open);
     }
 
     #[test]
@@ -260,7 +261,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(flow, KeyEventFlow::Unhandled));
-        assert!(!state.transcript_search.open);
+        assert!(!state.transcript.search.open);
         assert!(state.config_dialog.is_some());
     }
 
@@ -284,7 +285,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(draft_flow, KeyEventFlow::Unhandled));
-        assert!(!state.transcript_search.open);
+        assert!(!state.transcript.search.open);
 
         let empty_flow = handle_key_event_preflight(
             ctrl_f,
@@ -297,13 +298,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(empty_flow, KeyEventFlow::Continue));
-        assert!(state.transcript_search.open);
+        assert!(state.transcript.search.open);
     }
 
     #[test]
     fn release_and_unknown_search_keys_do_not_mutate_query() {
         let mut state = state_with_search_matches();
-        let before = state.transcript_search.query().to_string();
+        let before = state.transcript.search.query().to_string();
         let release = KeyEvent {
             kind: KeyEventKind::Release,
             ..KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
@@ -319,7 +320,7 @@ mod tests {
             ),
             SearchKeyFlow::Handled
         );
-        assert_eq!(state.transcript_search.query(), before);
+        assert_eq!(state.transcript.search.query(), before);
     }
 }
 
@@ -403,7 +404,7 @@ where
 
     // Esc dismisses an active mouse selection before any other Esc meaning
     // (cancel turn, close panel); a second Esc then does the usual thing.
-    if key.code == KeyCode::Esc && state.selection.is_some() {
+    if key.code == KeyCode::Esc && state.viewport.selection.is_some() {
         vim_state.cancel_pending_command();
         state.invalidate_selection();
         return Ok(KeyEventFlow::Continue);

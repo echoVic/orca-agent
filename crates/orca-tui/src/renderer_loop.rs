@@ -14,6 +14,7 @@ use orca_runtime::history::SessionTranscript;
 use crate::bridge;
 use crate::input_event_actions::coalesce_input_events;
 use crate::insert_escape::flush_expired_insert_escape;
+use crate::protocol::UserAction;
 use crate::renderer_event_router::RendererIterationEventRouter;
 use crate::renderer_frame::RendererFrameOwner;
 use crate::renderer_input_wake::RendererInputWakeOwner;
@@ -22,7 +23,7 @@ use crate::renderer_runtime::RendererRuntimeEventOwner;
 use crate::renderer_runtime_inbox::RendererRuntimeInboxOwner;
 use crate::terminal_presentation::TerminalPresentation;
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, UserAction};
+use crate::types::{AppState, AppStatus};
 use crate::vim::VimState;
 
 pub(crate) struct RendererLoopOwner<'a, 'text> {
@@ -207,6 +208,7 @@ mod tests {
     use crate::channels::{TUI_EVENT_CAPACITY, TuiEventSender, tui_event_channel};
     use crate::input_runtime::InputControl;
     use crate::mention_search_manager::MentionSearchManager;
+    use crate::protocol::{TuiEvent, UserAction};
     use crate::renderer_input_wake::RendererInputWakeOwner;
     use crate::renderer_interaction_acks::RendererInteractionAckOwner;
     use crate::renderer_runtime::RendererRuntimeEventOwner;
@@ -215,7 +217,8 @@ mod tests {
     use crate::terminal_session::TerminalInputReceivers;
     use crate::test_support::test_run_config;
     use crate::theme::Theme;
-    use crate::types::{AppState, ChatMessage, TuiEvent, UserAction};
+    use crate::transcript_state::ChatMessage;
+    use crate::types::AppState;
     use crate::vim::VimState;
 
     struct Fixture {
@@ -408,7 +411,7 @@ mod tests {
         assert_eq!(exit, 130);
         assert_eq!(presentations.get(), 1);
         assert!(matches!(
-            fixture.state.messages.as_slice(),
+            fixture.state.transcript.messages.as_slice(),
             [ChatMessage::System(message)] if message == "loop notice"
         ));
         assert!(matches!(

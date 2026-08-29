@@ -13,8 +13,9 @@ use orca_runtime::surface::{
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::TuiEvent;
+use crate::protocol::TuiMemoryScope;
 use crate::surface_projection::SurfaceProjectionState;
-use crate::types::{TuiEvent, TuiMemoryScope};
 
 #[cfg(test)]
 static RENAME_SAVED_SESSION_FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);

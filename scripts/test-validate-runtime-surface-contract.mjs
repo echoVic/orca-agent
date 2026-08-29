@@ -1816,8 +1816,8 @@ expectFailure(
     ],
     [
       "clipboard consumption",
-      /state\.pending_clipboard_copy\.take\(\)/,
-      "state.pending_clipboard_copy.removed_take()",
+      /state\.viewport\.pending_clipboard_copy\.take\(\)/,
+      "state.viewport.pending_clipboard_copy.removed_take()",
       /pending_clipboard_copy/,
       /(?:terminal_clipboard_notifications|renderer_frame) source does not contain its reviewed entrypoint anchor: crates\/orca-tui\/src\/renderer_frame\.rs/,
     ],

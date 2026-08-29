@@ -866,10 +866,10 @@ mod tests {
             "auto".to_string(),
             "/tmp".to_string(),
         );
-        state.push_message(crate::types::ChatMessage::User(
+        state.push_message(crate::transcript_state::ChatMessage::User(
             "inspect [Image #1]".to_string(),
         ));
-        state.push_message(crate::types::ChatMessage::Image(image()));
+        state.push_message(crate::transcript_state::ChatMessage::Image(image()));
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = tui_textarea::TextArea::default();
         let backend = ratatui::backend::TestBackend::new(80, 30);

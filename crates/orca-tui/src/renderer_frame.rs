@@ -43,12 +43,12 @@ impl RendererFrameOwner {
         // Compute demand before clearing an expired notice so this iteration
         // still schedules the final redraw that removes it from the screen.
         let animation_active = state.status == AppStatus::Running
-            || state.copy_notice.is_some()
-            || state.drag_edge_scroll.is_some()
+            || state.viewport.copy_notice.is_some()
+            || state.viewport.drag_edge_scroll.is_some()
             || state.edit_highlight_needs_tick()
             || presentation.animation_active(state.status);
-        if state.copy_notice.is_some() && state.copy_notice_at(now).is_none() {
-            state.copy_notice = None;
+        if state.viewport.copy_notice.is_some() && state.copy_notice_at(now).is_none() {
+            state.viewport.copy_notice = None;
         }
         if animation_active && self.scheduler.animation_due(now) {
             state.advance_tick();
@@ -115,7 +115,7 @@ impl RendererFrameOwner {
         CopyClipboard: FnOnce(&str),
         WritePending: FnOnce(&mut Terminal<B>, &mut TerminalPresentation, AppStatus),
     {
-        if let Some(text) = state.pending_clipboard_copy.take() {
+        if let Some(text) = state.viewport.pending_clipboard_copy.take() {
             copy_clipboard(&text);
         }
         write_pending(terminal, presentation, state.status);
@@ -145,9 +145,11 @@ mod tests {
     use tui_textarea::TextArea;
 
     use super::RendererFrameOwner;
+    use crate::protocol::{TuiEvent, UserAction};
     use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
     use crate::theme::Theme;
-    use crate::types::{AppState, AppStatus, ChatMessage, TuiEvent, UserAction};
+    use crate::transcript_state::ChatMessage;
+    use crate::types::{AppState, AppStatus};
 
     fn state() -> AppState {
         let (action_tx, _action_rx) = crossbeam_channel::unbounded::<UserAction>();
@@ -299,7 +301,7 @@ mod tests {
         let title_tick_before = presentation.title(AppStatus::Running);
         let timeout = owner.prepare_iteration(now, &mut state, &mut presentation);
 
-        assert!(state.copy_notice.is_none());
+        assert!(state.viewport.copy_notice.is_none());
         assert_eq!(
             state.tick, state_tick_before,
             "idle state tick remains idle"
@@ -332,7 +334,7 @@ mod tests {
         assert_eq!(outcome.draw_at, Some(draw_at));
 
         let mut state = state();
-        state.pending_clipboard_copy = Some("copy once".to_string());
+        state.viewport.pending_clipboard_copy = Some("copy once".to_string());
         let mut presentation = presentation();
         let textarea = TextArea::default();
         let theme = Theme::named(ThemeName::Dark);
@@ -357,7 +359,7 @@ mod tests {
             .expect("present frame");
 
         assert_eq!(calls.borrow().as_slice(), ["copy:copy once", "pending"]);
-        assert!(state.pending_clipboard_copy.is_none());
+        assert!(state.viewport.pending_clipboard_copy.is_none());
         assert!(
             terminal
                 .backend()
@@ -400,9 +402,10 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::render(frame, &mut state, &textarea, &theme))
             .expect("cold render");
-        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 2);
+        assert_eq!(state.transcript.render_cache.last_prepare_visited(), 2);
         let cold = state
-            .transcript_render_cache
+            .transcript
+            .render_cache
             .viewport(0, usize::MAX, usize::MAX);
         let cold_insert = inserted_source_line(&cold.lines, "value = 2");
         assert!(
@@ -412,7 +415,7 @@ mod tests {
                 .all(|span| span.style.fg != Some(ratatui::style::Color::Magenta))
         );
 
-        let revisions_before = state.message_revisions.clone();
+        let revisions_before = state.transcript.message_revisions.clone();
         let started = Instant::now();
         let draw_at = started + Duration::from_millis(16);
         let mut owner = RendererFrameOwner::new(
@@ -425,8 +428,8 @@ mod tests {
 
         assert!(state.edit_highlight_needs_tick());
         owner.prepare_iteration(started, &mut state, &mut presentation);
-        assert_ne!(state.message_revisions[0], revisions_before[0]);
-        assert_eq!(state.message_revisions[1], revisions_before[1]);
+        assert_ne!(state.transcript.message_revisions[0], revisions_before[0]);
+        assert_eq!(state.transcript.message_revisions[1], revisions_before[1]);
         assert_eq!(state.pending_edit_highlight_count_for_test(), 0);
         assert!(!state.edit_highlight_needs_tick());
 
@@ -452,9 +455,10 @@ mod tests {
                 |_terminal, _presentation, _status| {},
             )
             .expect("refined render");
-        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1);
+        assert_eq!(state.transcript.render_cache.last_prepare_visited(), 1);
         let warm = state
-            .transcript_render_cache
+            .transcript
+            .render_cache
             .viewport(0, usize::MAX, usize::MAX);
         let warm_insert = inserted_source_line(&warm.lines, "value = 2");
         assert_eq!(
@@ -467,12 +471,12 @@ mod tests {
             "value = 2"
         );
 
-        let revisions_after = state.message_revisions.clone();
+        let revisions_after = state.transcript.message_revisions.clone();
         terminal
             .draw(|frame| crate::ui::render(frame, &mut state, &textarea, &theme))
             .expect("steady render");
-        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 0);
-        assert_eq!(state.message_revisions, revisions_after);
+        assert_eq!(state.transcript.render_cache.last_prepare_visited(), 0);
+        assert_eq!(state.transcript.message_revisions, revisions_after);
         assert!(!owner.should_draw_for_test(draw_at + Duration::from_secs(1)));
     }
 

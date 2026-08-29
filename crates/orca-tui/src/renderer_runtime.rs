@@ -13,12 +13,14 @@ use crate::composer_input_actions::refresh_input_menus;
 use crate::composer_textarea::{textarea_cursor_byte_index, textarea_text};
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::mention_search_manager::MentionSearchManager;
+use crate::protocol::{TuiEvent, UserAction};
 use crate::queued_input_actions::enqueue_composer_follow_up_to_runtime;
 use crate::runtime_event_actions::handle_runtime_event;
 use crate::surface_actions::TuiSurfaceActions;
 use crate::terminal_presentation::TerminalPresentation;
 use crate::theme::Theme;
-use crate::types::{AppState, ChatMessage, TuiEvent, UserAction};
+use crate::transcript_state::ChatMessage;
+use crate::types::AppState;
 use crate::vim::VimState;
 use crate::workspace_config::mention_search_roots;
 
@@ -240,12 +242,12 @@ mod tests {
     use super::RendererRuntimeEventOwner;
     use crate::bridge;
     use crate::mention_search_manager::MentionSearchManager;
+    use crate::protocol::SessionAttachmentId;
+    use crate::protocol::{AttachedTuiEvent, TuiEvent, UserAction};
     use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
     use crate::theme::Theme;
-    use crate::types::{
-        AppState, AppStatus, AttachedTuiEvent, ChatMessage, SessionAttachmentId, TuiEvent,
-        UserAction,
-    };
+    use crate::transcript_state::ChatMessage;
+    use crate::types::{AppState, AppStatus};
     use crate::vim::VimState;
 
     fn attached(attachment: SessionAttachmentId, event: TuiEvent) -> TuiEvent {
@@ -434,7 +436,7 @@ mod tests {
 
         assert_eq!(owner.pending_initial_prompt.as_deref(), Some("follow up"));
         assert!(action_rx.try_recv().is_err());
-        assert!(state.messages.is_empty());
+        assert!(state.transcript.messages.is_empty());
 
         owner.handle(
             attached(
@@ -462,7 +464,7 @@ mod tests {
         ));
         assert!(action_rx.try_recv().is_err());
         assert!(matches!(
-            state.messages.as_slice(),
+            state.transcript.messages.as_slice(),
             [
                 ChatMessage::Assistant(history),
                 ChatMessage::System(label),

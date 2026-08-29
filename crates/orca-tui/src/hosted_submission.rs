@@ -16,9 +16,9 @@ use crate::hosted_runtime::{
 use crate::hosted_session::announce_runtime_ready;
 use crate::hosted_session_lifecycle::ensure_hosted_thread;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::TuiEvent;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::TuiEvent;
 
 pub(crate) fn queue_busy_submission(
     runtime_thread: &RuntimeThreadHandle,
@@ -260,8 +260,8 @@ mod tests {
 
     use crate::bridge;
     use crate::operation_controller::TuiSurfaceTaskControl;
+    use crate::protocol::TuiEvent;
     use crate::submitted_turn::SubmittedTurn;
-    use crate::types::TuiEvent;
 
     fn transcript(session_id: &str) -> history::SessionTranscript {
         history::SessionTranscript {

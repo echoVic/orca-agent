@@ -11,12 +11,11 @@ use crate::composer_textarea::{
     MAX_USER_INPUT_TEXT_CHARS, expand_pending_pastes, make_textarea, make_textarea_with_text,
     textarea_text,
 };
+use crate::protocol::{PendingTuiInput, TuiInteractionResponse, TuiMcpElicitationMode, UserAction};
 use crate::slash_command_actions::{SlashOutcome, handle_composer_slash_command};
 use crate::theme::Theme;
-use crate::types::{
-    AppState, AppStatus, ChatMessage, PendingTuiInput, TuiInteractionResponse,
-    TuiMcpElicitationMode, UserAction,
-};
+use crate::transcript_state::ChatMessage;
+use crate::types::{AppState, AppStatus};
 use crate::vim::VimState;
 
 #[allow(clippy::too_many_arguments)]
@@ -53,11 +52,11 @@ pub(crate) fn handle_idle_submit(
     let empty_mcp_url_response = text.is_empty()
         && state.status == AppStatus::WaitingUserInput
         && matches!(
-            state.pending_input,
+            state.interaction.pending_input,
             Some(PendingTuiInput::McpElicitation(_))
         )
         && matches!(
-            state.pending_mcp_elicitation_mode,
+            state.interaction.pending_mcp_elicitation_mode,
             Some(TuiMcpElicitationMode::Url)
         );
     if text.is_empty() && !empty_mcp_url_response {
@@ -124,7 +123,7 @@ pub(crate) fn handle_idle_submit(
     }
 
     if state.status == AppStatus::WaitingUserInput {
-        let response = match state.pending_input.as_ref() {
+        let response = match state.interaction.pending_input.as_ref() {
             Some(PendingTuiInput::UserInput(key)) => {
                 Some((key.clone(), TuiInteractionResponse::UserInput(text)))
             }
@@ -162,8 +161,8 @@ pub(crate) fn handle_idle_submit(
                 pending_pastes,
             );
             debug_assert_eq!(staged_key.as_ref(), Some(&key));
-            state.pending_input = None;
-            state.pending_mcp_elicitation_mode = None;
+            state.interaction.pending_input = None;
+            state.interaction.pending_mcp_elicitation_mode = None;
             let _ = action_tx.send(UserAction::RespondToInteraction { key, response });
         }
     } else {
@@ -197,7 +196,7 @@ pub(crate) fn submit_pending_user_input_choice(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> bool {
-    let Some(PendingTuiInput::UserInput(key)) = state.pending_input.as_ref() else {
+    let Some(PendingTuiInput::UserInput(key)) = state.interaction.pending_input.as_ref() else {
         return false;
     };
     let key = key.clone();
@@ -209,8 +208,8 @@ pub(crate) fn submit_pending_user_input_choice(
         state.pending_pastes.clone(),
     );
     debug_assert_eq!(staged_key.as_ref(), Some(&key));
-    state.pending_input = None;
-    state.pending_mcp_elicitation_mode = None;
+    state.interaction.pending_input = None;
+    state.interaction.pending_mcp_elicitation_mode = None;
     state.user_input_dialog = None;
     state.enter_running();
     state.scroll_to_bottom();
@@ -230,8 +229,8 @@ fn reset_composer_after_submit(textarea: &mut TextArea, vim_state: &mut VimState
 mod tests {
     use super::*;
     use crate::composer_textarea::{make_textarea_with_text, textarea_text};
+    use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiMcpElicitationMode};
     use crate::test_support::test_run_config;
-    use crate::types::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiMcpElicitationMode};
     use orca_core::cancel::OperationIdAllocator;
     use orca_core::config::ThemeName;
 
@@ -328,7 +327,7 @@ mod tests {
         assert!(state.composer_images.is_empty());
         assert_eq!(state.input_history, history_before);
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::Image(image)) if image.label == "[Image #1]"
         ));
     }
@@ -367,7 +366,7 @@ mod tests {
         assert!(textarea_text(&textarea).is_empty());
         assert!(state.composer_images.is_empty());
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::Image(image)) if image.label == "[Image #1]"
         ));
     }
@@ -398,7 +397,7 @@ mod tests {
         ));
         assert!(action_rx.try_recv().is_err());
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::Error(message))
                 if message.contains("/workflow:<name>")
         ));
@@ -430,7 +429,7 @@ mod tests {
         ));
         assert!(action_rx.try_recv().is_err());
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::Error(message)) if message.contains("unknown slash command")
         ));
     }
@@ -474,7 +473,7 @@ mod tests {
             }) if actual_key == key && answer == "/new"
         ));
         assert_eq!(state.status, AppStatus::Running);
-        assert!(state.pending_input.is_none());
+        assert!(state.interaction.pending_input.is_none());
         assert_eq!(textarea_text(&textarea), "");
     }
 
@@ -515,12 +514,12 @@ mod tests {
         assert!(action_rx.try_recv().is_err());
         assert_eq!(state.status, AppStatus::WaitingUserInput);
         assert!(matches!(
-            state.pending_input.as_ref(),
+            state.interaction.pending_input.as_ref(),
             Some(PendingTuiInput::McpElicitation(actual_key)) if actual_key == &key
         ));
         assert_eq!(textarea_text(&textarea), "not-json");
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::Error(message))
                 if message.starts_with("invalid typed MCP elicitation content:")
         ));
@@ -571,7 +570,7 @@ mod tests {
             }) if actual_key == key && content == "{}"
         ));
         assert_eq!(state.status, AppStatus::Running);
-        assert!(state.pending_input.is_none());
+        assert!(state.interaction.pending_input.is_none());
         assert_eq!(textarea_text(&textarea), "");
     }
 
@@ -631,10 +630,17 @@ mod tests {
             assert!(action_rx.try_recv().is_err());
             assert_eq!(state.status, AppStatus::WaitingUserInput);
             assert_eq!(
-                state.pending_input.as_ref().map(PendingTuiInput::key),
+                state
+                    .interaction
+                    .pending_input
+                    .as_ref()
+                    .map(PendingTuiInput::key),
                 Some(&key)
             );
-            assert_eq!(state.pending_mcp_elicitation_mode, expected_mode);
+            assert_eq!(
+                state.interaction.pending_mcp_elicitation_mode,
+                expected_mode
+            );
             assert_eq!(textarea_text(&textarea), "");
         }
     }
@@ -673,7 +679,7 @@ mod tests {
         assert_eq!(textarea_text(&textarea), placeholder);
         assert_eq!(state.pending_pastes.len(), 1);
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::Error(message))
                 if message.contains("Message exceeds the maximum length")
         ));

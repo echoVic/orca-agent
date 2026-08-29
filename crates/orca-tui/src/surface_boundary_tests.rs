@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::types::UserAction;
+use crate::protocol::UserAction;
 
 // Exact bytes of the reviewed runtime-surface manifest are the test fixture.
 const MANIFEST: &str = include_str!(

@@ -12,8 +12,8 @@ use crate::bridge;
 use crate::hosted_settings::{apply_hosted_settings_action, surface_approval_mode};
 use crate::hosted_submission::handle_hosted_submitted_turn;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::TuiEvent;
 use crate::submitted_turn::SubmittedTurn;
-use crate::types::TuiEvent;
 
 pub(crate) enum HostedPlanAction {
     ImplementApproved {

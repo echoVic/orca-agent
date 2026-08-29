@@ -15,9 +15,11 @@ use crate::hosted_session::{
 use crate::hosted_session_lifecycle::{preflight_started_session, reap_hosted_thread};
 use crate::hosted_submission::handle_hosted_submitted_turn;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::SessionAttachmentId;
+use crate::protocol::TuiEvent;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::{SessionAttachmentId, SideParentStatus, TuiEvent};
+use crate::types::SideParentStatus;
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_runtime::history;

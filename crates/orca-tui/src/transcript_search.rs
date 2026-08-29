@@ -479,25 +479,29 @@ impl AppState {
                 AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
             )
         {
-            self.transcript_search.open_new();
+            self.transcript.search.open_new();
         }
     }
 
     pub(crate) fn close_transcript_search(&mut self) {
-        self.transcript_search.close();
+        self.transcript.search.close();
     }
 
     #[cfg(test)]
     pub(crate) fn replace_transcript_search_query(&mut self, query: &str) {
-        self.transcript_search.replace_query(query);
+        self.transcript.search.replace_query(query);
     }
 
     pub(crate) fn refresh_transcript_search(&mut self) {
-        let generation = self.transcript_render_cache.content_generation();
-        let viewport_base = self.viewport_base_row;
-        let live_start = self.flushed_count.min(self.messages.len());
-        let cache = &self.transcript_render_cache;
-        self.transcript_search
+        let generation = self.transcript.render_cache.content_generation();
+        let viewport_base = self.viewport.viewport_base_row;
+        let live_start = self
+            .transcript
+            .flushed_count
+            .min(self.transcript.messages.len());
+        let cache = &self.transcript.render_cache;
+        self.transcript
+            .search
             .refresh_with(generation, viewport_base, |query| {
                 cache.search(live_start, query)
             });
@@ -505,29 +509,29 @@ impl AppState {
 
     pub(crate) fn search_next(&mut self) {
         self.refresh_transcript_search();
-        let Some(found) = self.transcript_search.next().cloned() else {
+        let Some(found) = self.transcript.search.next().cloned() else {
             return;
         };
-        self.scroll_offset = self.transcript_render_cache.reveal_offset(
-            self.flushed_count,
-            self.scroll_offset,
-            self.visible_height,
+        self.viewport.scroll_offset = self.transcript.render_cache.reveal_offset(
+            self.transcript.flushed_count,
+            self.viewport.scroll_offset,
+            self.viewport.visible_height,
             &found,
         );
-        self.auto_scroll = false;
+        self.viewport.auto_scroll = false;
     }
 
     pub(crate) fn search_previous(&mut self) {
         self.refresh_transcript_search();
-        let Some(found) = self.transcript_search.previous().cloned() else {
+        let Some(found) = self.transcript.search.previous().cloned() else {
             return;
         };
-        self.scroll_offset = self.transcript_render_cache.reveal_offset(
-            self.flushed_count,
-            self.scroll_offset,
-            self.visible_height,
+        self.viewport.scroll_offset = self.transcript.render_cache.reveal_offset(
+            self.transcript.flushed_count,
+            self.viewport.scroll_offset,
+            self.viewport.visible_height,
             &found,
         );
-        self.auto_scroll = false;
+        self.viewport.auto_scroll = false;
     }
 }

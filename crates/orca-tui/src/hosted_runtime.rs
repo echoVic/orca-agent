@@ -3,9 +3,9 @@ use std::io;
 use orca_runtime::runtime_host::{HostedOperationKind, HostedTurnRequest, RuntimeThreadHandle};
 
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::TuiEvent;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::TuiEvent;
 
 pub(crate) enum TuiHostedOperationOutcome {
     Turn { status: String },
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn hosted_turn_request_preserves_pinned_workflow_notification_semantics() {
         let submitted =
-            SubmittedTurn::workflow_notification(crate::types::PendingWorkflowNotification {
+            SubmittedTurn::workflow_notification(crate::protocol::PendingWorkflowNotification {
                 id: "notification-42".to_string(),
                 prompt: "<task-notification>done</task-notification>".to_string(),
             });

@@ -11,11 +11,12 @@ use orca_runtime::history::SessionTranscript;
 use crate::bridge;
 use crate::frame_scheduler::IterationEvent;
 use crate::input_event_actions::BatchedInputEvent;
+use crate::protocol::{TuiEvent, UserAction};
 use crate::renderer_input_router::RendererInputRouter;
 use crate::renderer_runtime::RendererRuntimeEventOwner;
 use crate::terminal_presentation::TerminalPresentation;
 use crate::theme::Theme;
-use crate::types::{AppState, TuiEvent, UserAction};
+use crate::types::AppState;
 use crate::vim::VimState;
 
 pub(crate) struct RendererIterationEventRouter<'a, 'text> {
@@ -121,11 +122,13 @@ mod tests {
     use crate::frame_scheduler::IterationEvent;
     use crate::input_event_actions::BatchedInputEvent;
     use crate::mention_search_manager::MentionSearchManager;
+    use crate::protocol::{TuiEvent, UserAction};
     use crate::renderer_runtime::RendererRuntimeEventOwner;
     use crate::terminal_presentation::{TerminalPresentation, TerminalPresentationProfile};
     use crate::test_support::test_run_config;
     use crate::theme::Theme;
-    use crate::types::{AppState, ChatMessage, TuiEvent, UserAction};
+    use crate::transcript_state::ChatMessage;
+    use crate::types::AppState;
     use crate::vim::VimState;
 
     struct Fixture {
@@ -223,7 +226,7 @@ mod tests {
 
         assert_eq!(exit, None);
         assert!(matches!(
-            fixture.state.messages.as_slice(),
+            fixture.state.transcript.messages.as_slice(),
             [ChatMessage::System(message)] if message == "routed notice"
         ));
         assert!(fixture.action_rx.try_recv().is_err());

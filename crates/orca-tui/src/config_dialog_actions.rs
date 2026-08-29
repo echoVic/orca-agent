@@ -5,8 +5,9 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::config::ReasoningEffort;
 
 use crate::commands;
+use crate::protocol::UserAction;
 use crate::slash_command_actions::encode_settings_intent;
-use crate::types::{AppState, UserAction};
+use crate::types::AppState;
 
 const CONFIG_ROW_COUNT: usize = 3;
 

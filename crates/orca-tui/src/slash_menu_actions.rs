@@ -9,10 +9,11 @@ use orca_core::config::{ReasoningEffort, RunConfig};
 
 use crate::commands;
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
+use crate::protocol::UserAction;
 use crate::slash_command_actions::encode_settings_intent;
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command, parse_approval_mode};
 use crate::theme::Theme;
-use crate::types::{AppState, SlashMenu, SlashMenuItem, SubMenu, UserAction};
+use crate::types::{AppState, SlashMenu, SlashMenuItem, SubMenu};
 use crate::vim::VimState;
 
 pub(crate) fn update_slash_menu(textarea: &TextArea, state: &mut AppState, config: &RunConfig) {

@@ -18,7 +18,7 @@ use crate::selection::{SelectionPos, TranscriptSelection, slice_row_by_columns};
 use crate::terminal_capabilities::TerminalColorLevel;
 use crate::theme::Theme;
 use crate::transcript_search::{SearchQuery, TranscriptLineIdentity, TranscriptSearchMatch};
-use crate::types::ChatMessage;
+use crate::transcript_state::ChatMessage;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -1550,12 +1550,14 @@ mod tests {
         SPINNER_FRAMES, TranscriptRenderCache, TranscriptRenderContext, viewport_paragraph,
         wrap_line_ratatui_compatible,
     };
+    use crate::protocol::TuiEvent;
     use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
     use crate::theme::Theme;
     use crate::transcript_search::{
         SearchQuery, TranscriptLineIdentity, TranscriptSearchMatch, TranscriptSearchState,
     };
-    use crate::types::{AppState, ChatMessage, TuiEvent};
+    use crate::transcript_state::ChatMessage;
+    use crate::types::AppState;
     use crate::ui::build_lines_for_messages;
 
     fn theme() -> Theme {
@@ -2604,20 +2606,21 @@ mod tests {
             state.update(TuiEvent::MessageDelta(format!("block {index}\n\n")));
         }
 
-        assert_eq!(state.messages.len(), 1_000);
+        assert_eq!(state.transcript.messages.len(), 1_000);
         assert!(
             state
+                .transcript
                 .messages
                 .iter()
                 .all(|message| matches!(message, ChatMessage::AssistantChunk { .. }))
         );
-        let frozen_revisions = state.message_revisions.clone();
+        let frozen_revisions = state.transcript.message_revisions.clone();
         let theme = theme();
         let built_indices = RefCell::new(Vec::new());
         let rebuilt_text_bytes = Cell::new(0);
-        state.transcript_render_cache.prepare(
-            &state.messages,
-            &state.message_revisions,
+        state.transcript.render_cache.prepare(
+            &state.transcript.messages,
+            &state.transcript.message_revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false).with_syntax_theme_revision(1),
             |index, message, theme, width, tick, force_expand| {
                 built_indices.borrow_mut().push(index);
@@ -2635,14 +2638,14 @@ mod tests {
                 )
             },
         );
-        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1_000);
+        assert_eq!(state.transcript.render_cache.last_prepare_visited(), 1_000);
 
         built_indices.borrow_mut().clear();
         rebuilt_text_bytes.set(0);
         state.update(TuiEvent::MessageDelta("live tail\n".to_string()));
-        state.transcript_render_cache.prepare(
-            &state.messages,
-            &state.message_revisions,
+        state.transcript.render_cache.prepare(
+            &state.transcript.messages,
+            &state.transcript.message_revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false).with_syntax_theme_revision(1),
             |index, message, theme, width, tick, force_expand| {
                 built_indices.borrow_mut().push(index);
@@ -2662,17 +2665,17 @@ mod tests {
         );
 
         assert_eq!(*built_indices.borrow(), vec![1_000]);
-        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1);
+        assert_eq!(state.transcript.render_cache.last_prepare_visited(), 1);
         assert_eq!(rebuilt_text_bytes.get(), "live tail\n".len());
         assert_eq!(
-            &state.message_revisions[..1_000],
+            &state.transcript.message_revisions[..1_000],
             frozen_revisions.as_slice()
         );
 
         built_indices.borrow_mut().clear();
-        state.transcript_render_cache.prepare(
-            &state.messages,
-            &state.message_revisions,
+        state.transcript.render_cache.prepare(
+            &state.transcript.messages,
+            &state.transcript.message_revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false).with_syntax_theme_revision(1),
             |index, message, theme, width, tick, force_expand| {
                 built_indices.borrow_mut().push(index);
@@ -2686,12 +2689,12 @@ mod tests {
             },
         );
         assert!(built_indices.borrow().is_empty());
-        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 0);
+        assert_eq!(state.transcript.render_cache.last_prepare_visited(), 0);
 
-        let _ = state.transcript_render_cache.viewport(0, 500, 20);
-        state.transcript_render_cache.prepare(
-            &state.messages,
-            &state.message_revisions,
+        let _ = state.transcript.render_cache.viewport(0, 500, 20);
+        state.transcript.render_cache.prepare(
+            &state.transcript.messages,
+            &state.transcript.message_revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false).with_syntax_theme_revision(1),
             |index, message, theme, width, tick, force_expand| {
                 built_indices.borrow_mut().push(index);
@@ -2705,7 +2708,7 @@ mod tests {
             },
         );
         assert!(built_indices.borrow().is_empty());
-        assert_eq!(state.transcript_render_cache.last_prepare_visited(), 0);
+        assert_eq!(state.transcript.render_cache.last_prepare_visited(), 0);
 
         for (width, theme, syntax_revision, force_expand) in [
             (79, theme, 1, false),
@@ -2729,9 +2732,9 @@ mod tests {
             ),
         ] {
             built_indices.borrow_mut().clear();
-            state.transcript_render_cache.prepare(
-                &state.messages,
-                &state.message_revisions,
+            state.transcript.render_cache.prepare(
+                &state.transcript.messages,
+                &state.transcript.message_revisions,
                 TranscriptRenderContext::new(&theme, width, 0, force_expand)
                     .with_syntax_theme_revision(syntax_revision),
                 |index, message, theme, width, tick, force_expand| {
@@ -2746,7 +2749,7 @@ mod tests {
                 },
             );
             assert_eq!(built_indices.borrow().len(), 1_001);
-            assert_eq!(state.transcript_render_cache.last_prepare_visited(), 1_001);
+            assert_eq!(state.transcript.render_cache.last_prepare_visited(), 1_001);
         }
     }
 

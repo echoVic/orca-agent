@@ -30,9 +30,10 @@ use crate::hosted_side::{
 use crate::hosted_submission::{handle_hosted_queued_prompt, handle_hosted_submitted_turn};
 use crate::hosted_workflow::{HostedWorkflowAction, handle_hosted_workflow_action};
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::SessionAttachmentId;
+use crate::protocol::{TuiEvent, UserAction};
 use crate::slash_command_actions::decode_settings_intent;
 use crate::submitted_turn::SubmittedTurn;
-use crate::types::{SessionAttachmentId, TuiEvent, UserAction};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_tui_controller_loop(
@@ -631,7 +632,7 @@ mod tests {
     use crate::agent_runtime::TuiAgentRuntime;
     use crate::bridge;
     use crate::operation_controller::TuiSurfaceTaskControl;
-    use crate::types::{AttachedTuiEvent, TuiEvent, UserAction};
+    use crate::protocol::{AttachedTuiEvent, TuiEvent, UserAction};
 
     fn next_controller_event(event_rx: &mpsc::Receiver<TuiEvent>) -> TuiEvent {
         loop {

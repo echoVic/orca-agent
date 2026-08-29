@@ -7,7 +7,7 @@ use orca_runtime::runtime_host::{RuntimeHost, RuntimeHostHandle};
 use crate::action_dispatcher::{InteractionResponseAck, TuiActionDispatcher};
 use crate::channels::USER_ACTION_CAPACITY;
 use crate::operation_controller::TuiSurfaceTaskControl;
-use crate::types::{TuiEvent, UserAction};
+use crate::protocol::{TuiEvent, UserAction};
 
 pub(crate) struct TuiAgentRuntime {
     controller: TuiSurfaceTaskControl,

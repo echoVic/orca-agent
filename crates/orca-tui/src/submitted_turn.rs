@@ -1,8 +1,8 @@
 use orca_runtime::mentions;
 
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
+use crate::protocol::PendingWorkflowNotification;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::PendingWorkflowNotification;
 
 enum SubmittedTurnKind {
     User {

@@ -30,10 +30,10 @@ use orca_runtime::surface::{
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::operation_controller::{SurfacePresentationCancellation, TuiSurfaceTaskControl};
+use crate::protocol::TuiEvent;
 use crate::surface_projection::{
     GoalProjectionPresentation, SurfaceProjectionState, TuiSurfaceProjection,
 };
-use crate::types::TuiEvent;
 
 #[derive(Debug)]
 pub(crate) struct TerminalRecoveryRequired(&'static str);
@@ -2833,7 +2833,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use crate::types::TuiTaskLifecycle;
+    use crate::protocol::TuiTaskLifecycle;
 
     fn run_through_dispatch(
         thread: &RuntimeThreadHandle,
@@ -3014,28 +3014,33 @@ mod tests {
                     (
                         SurfaceInteractionKind::ToolApproval,
                         TuiEvent::ApprovalNeeded { key, .. },
-                    ) => break (key, crate::types::TuiInteractionResponse::Approval(true)),
+                    ) => break (key, crate::protocol::TuiInteractionResponse::Approval(true)),
                     (
                         SurfaceInteractionKind::PermissionRequest,
                         TuiEvent::PermissionApprovalNeeded { key, .. },
-                    ) => break (key, crate::types::TuiInteractionResponse::Permission(true)),
+                    ) => {
+                        break (
+                            key,
+                            crate::protocol::TuiInteractionResponse::Permission(true),
+                        );
+                    }
                     (
                         SurfaceInteractionKind::UserInput,
                         TuiEvent::UserInputRequested { key, .. },
                     ) => {
                         break (
                             key,
-                            crate::types::TuiInteractionResponse::UserInput("yes".to_string()),
+                            crate::protocol::TuiInteractionResponse::UserInput("yes".to_string()),
                         );
                     }
                     (
                         SurfaceInteractionKind::McpElicitation,
                         TuiEvent::McpElicitationRequested { key, mode, .. },
                     ) => {
-                        assert_eq!(mode, crate::types::TuiMcpElicitationMode::Url);
+                        assert_eq!(mode, crate::protocol::TuiMcpElicitationMode::Url);
                         break (
                             key,
-                            crate::types::TuiInteractionResponse::McpElicitation {
+                            crate::protocol::TuiInteractionResponse::McpElicitation {
                                 accepted: false,
                                 content_json: None,
                             },
@@ -4091,7 +4096,7 @@ mod tests {
             controller
                 .respond_surface_interaction(
                     &key,
-                    &crate::types::TuiInteractionResponse::Approval(true)
+                    &crate::protocol::TuiInteractionResponse::Approval(true)
                 )
                 .expect("typed approval response")
         );
@@ -4164,7 +4169,7 @@ mod tests {
             controller
                 .respond_surface_interaction(
                     &key,
-                    &crate::types::TuiInteractionResponse::Permission(true)
+                    &crate::protocol::TuiInteractionResponse::Permission(true)
                 )
                 .expect("typed permission response")
         );
@@ -4229,7 +4234,7 @@ mod tests {
             controller
                 .respond_surface_interaction(
                     &key,
-                    &crate::types::TuiInteractionResponse::UserInput("yes".to_string()),
+                    &crate::protocol::TuiInteractionResponse::UserInput("yes".to_string()),
                 )
                 .expect("typed user input response")
         );
@@ -4290,7 +4295,7 @@ mod tests {
                 .expect("MCP elicitation event")
             {
                 TuiEvent::McpElicitationRequested { key, mode, .. } => {
-                    assert_eq!(mode, crate::types::TuiMcpElicitationMode::Url);
+                    assert_eq!(mode, crate::protocol::TuiMcpElicitationMode::Url);
                     break key;
                 }
                 _ => {}
@@ -4300,7 +4305,7 @@ mod tests {
             controller
                 .respond_surface_interaction(
                     &key,
-                    &crate::types::TuiInteractionResponse::McpElicitation {
+                    &crate::protocol::TuiInteractionResponse::McpElicitation {
                         accepted: false,
                         content_json: None,
                     },

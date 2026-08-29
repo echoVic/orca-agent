@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::commands::{self, GoalSlashCommand, QueueSlashCommand, SlashCommand, TrustSlashCommand};
+use crate::protocol::TuiMemoryScope;
+use crate::protocol::{GoalDraft, UserAction};
 use crate::session_picker_actions::open_session_picker;
 use crate::surface_actions::TuiHostActions;
-use crate::types::{
-    AppState, AppStatus, ChatMessage, ConfigDialog, GoalDraft, TuiMemoryScope, UserAction,
-};
+use crate::transcript_state::ChatMessage;
+use crate::types::{AppState, AppStatus, ConfigDialog};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::RunConfig;
 
@@ -491,9 +492,9 @@ pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::TuiEvent;
     use crate::surface_projection::SurfaceProjectionState;
     use crate::test_support::test_run_config;
-    use crate::types::TuiEvent;
 
     fn state() -> AppState {
         let (action_tx, _) = mpsc::unbounded();
@@ -536,7 +537,10 @@ mod tests {
 
         handle_slash_command("/copy 2", &mut config, &shared, &mut state, &action_tx);
 
-        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("older"));
+        assert_eq!(
+            state.viewport.pending_clipboard_copy.as_deref(),
+            Some("older")
+        );
     }
 
     #[test]
@@ -550,8 +554,14 @@ mod tests {
 
             handle_slash_command(command, &mut config, &shared, &mut state, &action_tx);
 
-            assert!(state.pending_clipboard_copy.is_none(), "accepted {command}");
-            assert!(matches!(state.messages.last(), Some(ChatMessage::Error(_))));
+            assert!(
+                state.viewport.pending_clipboard_copy.is_none(),
+                "accepted {command}"
+            );
+            assert!(matches!(
+                state.transcript.messages.last(),
+                Some(ChatMessage::Error(_))
+            ));
         }
     }
 
@@ -593,7 +603,7 @@ mod tests {
 
         handle_slash_command("/status", &mut config, &shared, &mut state, &action_tx);
 
-        let Some(ChatMessage::System(status)) = state.messages.last() else {
+        let Some(ChatMessage::System(status)) = state.transcript.messages.last() else {
             panic!("status output was not appended");
         };
         for expected in [
@@ -623,7 +633,7 @@ mod tests {
         handle_slash_command("/mode", &mut config, &shared, &mut state, &action_tx);
 
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::System(message)) if message == "Current mode: full-auto"
         ));
 
@@ -666,7 +676,10 @@ mod tests {
                 assert_eq!(state.status, AppStatus::Running);
             } else {
                 assert!(action_rx.try_recv().is_err());
-                assert!(matches!(state.messages.last(), Some(ChatMessage::Error(_))));
+                assert!(matches!(
+                    state.transcript.messages.last(),
+                    Some(ChatMessage::Error(_))
+                ));
             }
         }
     }
@@ -684,7 +697,7 @@ mod tests {
             outcome,
             Some(SlashOutcome::Prefill(value)) if value == "$"
         ));
-        assert!(state.messages.is_empty());
+        assert!(state.transcript.messages.is_empty());
         assert!(action_rx.try_recv().is_err());
     }
 
@@ -707,7 +720,7 @@ mod tests {
             orca_core::config::ReasoningEffort::High
         );
         assert_eq!(dialog.approval_mode, ApprovalMode::AutoEdit);
-        assert!(state.messages.is_empty());
+        assert!(state.transcript.messages.is_empty());
         assert!(action_rx.try_recv().is_err());
     }
 

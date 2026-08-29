@@ -8,7 +8,8 @@ use crate::edit_highlight_worker::{
 };
 use crate::syntax_highlight::{SyntaxTheme, highlighter_for_path};
 use crate::terminal_capabilities::{TerminalColorLevel, syntax_style_revision};
-use crate::types::{AppState, ChatMessage};
+use crate::transcript_state::ChatMessage;
+use crate::types::AppState;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AppliedDiffHighlight {
@@ -238,14 +239,14 @@ impl AppState {
         message_index: usize,
         tool_id: &str,
     ) -> Option<&RefinedDiffStyles> {
-        let message = self.messages.get(message_index)?;
+        let message = self.transcript.messages.get(message_index)?;
         let ChatMessage::ToolCall { id, .. } = message else {
             return None;
         };
         (id == tool_id)
             .then(|| {
                 Self::refined_diff_styles_for_message(
-                    &self.message_revisions,
+                    &self.transcript.message_revisions,
                     self.edit_highlights.applied(),
                     message_index,
                     message,
@@ -312,7 +313,7 @@ impl AppState {
             status,
             diff: Some(diff),
             ..
-        }) = self.messages.get(message_index)
+        }) = self.transcript.messages.get(message_index)
         else {
             return;
         };
@@ -343,7 +344,12 @@ impl AppState {
             return;
         }
 
-        let Some(message_revision) = self.message_revisions.get(message_index).copied() else {
+        let Some(message_revision) = self
+            .transcript
+            .message_revisions
+            .get(message_index)
+            .copied()
+        else {
             return;
         };
         let tool_id = id.clone();
@@ -398,7 +404,12 @@ impl AppState {
                 self.edit_highlights.syntax_theme,
                 self.edit_highlights.syntax_color_level,
             ) != job.syntax_theme_revision
-            || self.message_revisions.get(job.message_index).copied() != Some(job.message_revision)
+            || self
+                .transcript
+                .message_revisions
+                .get(job.message_index)
+                .copied()
+                != Some(job.message_revision)
         {
             return false;
         }
@@ -408,7 +419,7 @@ impl AppState {
             status,
             diff: Some(diff),
             ..
-        }) = self.messages.get(job.message_index)
+        }) = self.transcript.messages.get(job.message_index)
         else {
             return false;
         };
@@ -432,7 +443,12 @@ impl AppState {
         if !self.touch_message(job.message_index) {
             return false;
         }
-        let Some(applied_revision) = self.message_revisions.get(job.message_index).copied() else {
+        let Some(applied_revision) = self
+            .transcript
+            .message_revisions
+            .get(job.message_index)
+            .copied()
+        else {
             return false;
         };
         self.edit_highlights.applied.insert(
@@ -470,8 +486,10 @@ impl AppState {
     }
 
     pub(crate) fn remove_applied_highlight_for_message(&mut self, index: usize) {
-        if matches!(self.messages.get(index), Some(ChatMessage::ToolCall { .. }))
-            && let Some(revision) = self.message_revisions.get(index)
+        if matches!(
+            self.transcript.messages.get(index),
+            Some(ChatMessage::ToolCall { .. })
+        ) && let Some(revision) = self.transcript.message_revisions.get(index)
         {
             self.edit_highlights.applied.remove(revision);
         }
@@ -485,9 +503,10 @@ impl AppState {
 
     pub(crate) fn prune_applied_diff_highlights(&mut self) {
         let present_revisions = self
+            .transcript
             .messages
             .iter()
-            .zip(&self.message_revisions)
+            .zip(&self.transcript.message_revisions)
             .filter_map(|(message, revision)| match message {
                 ChatMessage::ToolCall { id, .. } => Some((*revision, id.as_str())),
                 _ => None,

@@ -25,21 +25,22 @@ use crate::shortcuts::{self, ShortcutScope};
 use crate::syntax_highlight::highlight_code;
 use crate::theme::Theme;
 use crate::transcript_search::TranscriptSearchState;
+use crate::transcript_state::ChatMessage;
 use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
 use crate::types::{
-    AppState, AppStatus, ApprovalOption, ChatMessage, ConfigDialog, CopyNotice, PanelMode,
-    SessionPickerPhase,
+    AppState, AppStatus, ApprovalOption, ConfigDialog, PanelMode, SessionPickerPhase,
 };
 use crate::user_input_dialog::UserInputDialog;
+use crate::viewport_state::CopyNotice;
 use crate::workspace_status::{GitIdentity, compact_cwd};
 
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     // Recomputed below when the widgets are actually shown; cleared here so
     // panel/status switches never leave stale mouse hit targets behind.
-    state.jump_to_bottom_area = None;
-    state.frame_area = Some(frame.area());
-    state.input_area = None;
-    state.search_area = None;
+    state.viewport.jump_to_bottom_area = None;
+    state.viewport.frame_area = Some(frame.area());
+    state.viewport.input_area = None;
+    state.viewport.search_area = None;
     state.begin_image_render_frame();
     if state.status == AppStatus::Setup {
         render_setup(frame, state, textarea, theme);
@@ -105,11 +106,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         frame.render_widget(Paragraph::new(queue_preview_lines), chunks[4]);
     }
     if search_height > 0 {
-        state.search_area = Some(chunks[5]);
+        state.viewport.search_area = Some(chunks[5]);
         render_search_bar(frame, chunks[5], state, theme);
     }
     if composer_visible(state) {
-        state.input_area = Some(chunks[6]);
+        state.viewport.input_area = Some(chunks[6]);
         render_input(
             frame,
             chunks[6],
@@ -123,14 +124,14 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     render_status(frame, chunks[7], state, theme);
 
     if state.user_input_dialog.is_none()
-        && !state.transcript_search.open
+        && !state.transcript.search.open
         && state.slash_menu.is_some()
     {
         render_slash_menu(frame, chunks[6], state, theme);
     }
 
     if state.user_input_dialog.is_none()
-        && !state.transcript_search.open
+        && !state.transcript.search.open
         && state.mention.phase.is_some()
         && state.slash_menu.is_none()
     {
@@ -315,7 +316,7 @@ fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
 }
 
 fn search_visible(state: &AppState) -> bool {
-    state.transcript_search.open
+    state.transcript.search.open
         && state.config_dialog.is_none()
         && state.user_input_dialog.is_none()
         && state.plan_approval_dialog.is_none()
@@ -999,12 +1000,13 @@ pub(crate) fn render_live_messages(
     let width = area.width.max(1) as usize;
     let visible_height = area.height as usize;
     state.reconcile_message_tracking();
-    state.transcript_area = Some(area);
+    state.viewport.transcript_area = Some(area);
 
-    if state.messages.is_empty() {
+    if state.transcript.messages.is_empty() {
         state
-            .transcript_search
-            .clear_matches(state.transcript_render_cache.content_generation());
+            .transcript
+            .search
+            .clear_matches(state.transcript.render_cache.content_generation());
         // The welcome screen renders through its own cache so its text is
         // selectable and copyable exactly like transcript content.
         let lines = build_welcome_lines(state, theme);
@@ -1012,29 +1014,31 @@ pub(crate) fn render_live_messages(
         // Sentinel revision: never collides with allocated ones, and the
         // explicit invalidate below forces a rebuild whenever we redraw.
         let welcome_revisions = [u64::MAX];
-        state.welcome_render_cache.invalidate(0);
-        state.welcome_render_cache.prepare(
+        state.transcript.welcome_render_cache.invalidate(0);
+        state.transcript.welcome_render_cache.prepare(
             &welcome_message,
             &welcome_revisions,
             TranscriptRenderContext::new(theme, width, state.tick, false),
             |_, _, _, _, _, _| lines.clone(),
         );
-        let requested_scroll = if state.auto_scroll {
+        let requested_scroll = if state.viewport.auto_scroll {
             usize::MAX
         } else {
-            state.scroll_offset
+            state.viewport.scroll_offset
         };
-        let viewport = state
-            .welcome_render_cache
-            .viewport(0, requested_scroll, visible_height);
-        state.total_lines = viewport.total_height;
-        state.visible_height = visible_height;
-        state.scroll_offset = viewport.scroll_offset;
-        state.viewport_base_row = viewport.base_row;
+        let viewport =
+            state
+                .transcript
+                .welcome_render_cache
+                .viewport(0, requested_scroll, visible_height);
+        state.viewport.total_lines = viewport.total_height;
+        state.viewport.visible_height = visible_height;
+        state.viewport.scroll_offset = viewport.scroll_offset;
+        state.viewport.viewport_base_row = viewport.base_row;
         let lines = apply_transcript_overlays(
             viewport.lines,
-            &state.transcript_search,
-            state.selection,
+            &state.transcript.search,
+            state.viewport.selection,
             viewport.base_row,
             theme,
         );
@@ -1042,17 +1046,20 @@ pub(crate) fn render_live_messages(
         return;
     }
 
-    let mut requested_scroll = if state.auto_scroll {
+    let mut requested_scroll = if state.viewport.auto_scroll {
         usize::MAX
     } else {
-        state.scroll_offset
+        state.viewport.scroll_offset
     };
-    let live_start = state.flushed_count.min(state.messages.len());
-    let messages = &state.messages;
-    let revisions = &state.message_revisions;
+    let live_start = state
+        .transcript
+        .flushed_count
+        .min(state.transcript.messages.len());
+    let messages = &state.transcript.messages;
+    let revisions = &state.transcript.message_revisions;
     let highlights = state.edit_highlights.applied();
     {
-        let cache = &mut state.transcript_render_cache;
+        let cache = &mut state.transcript.render_cache;
         let outcome = cache.prepare(
             messages,
             revisions,
@@ -1073,19 +1080,20 @@ pub(crate) fn render_live_messages(
     state.refresh_transcript_search();
     let viewport =
         state
-            .transcript_render_cache
+            .transcript
+            .render_cache
             .viewport(live_start, requested_scroll, visible_height);
-    state.total_lines = viewport.total_height;
-    state.visible_height = visible_height;
-    state.scroll_offset = viewport.scroll_offset;
-    state.viewport_base_row = viewport.base_row;
+    state.viewport.total_lines = viewport.total_height;
+    state.viewport.visible_height = visible_height;
+    state.viewport.scroll_offset = viewport.scroll_offset;
+    state.viewport.viewport_base_row = viewport.base_row;
 
     // Overlay the mouse selection on the materialized rows; the render cache
     // itself stays selection-agnostic so highlighting never invalidates it.
     let lines = apply_transcript_overlays(
         viewport.lines,
-        &state.transcript_search,
-        state.selection,
+        &state.transcript.search,
+        state.viewport.selection,
         viewport.base_row,
         theme,
     );
@@ -1093,6 +1101,7 @@ pub(crate) fn render_live_messages(
     let visible_start = viewport.base_row;
     let visible_end = visible_start.saturating_add(visible_height);
     state.image_hit_areas = state
+        .transcript
         .messages
         .iter()
         .enumerate()
@@ -1100,7 +1109,7 @@ pub(crate) fn render_live_messages(
             let ChatMessage::Image(image) = message else {
                 return None;
             };
-            let range = state.transcript_render_cache.message_row_range(index)?;
+            let range = state.transcript.render_cache.message_row_range(index)?;
             let start = range.start.max(visible_start);
             let end = range.end.min(visible_end);
             let preview_start = range.start.saturating_add(1);
@@ -1154,8 +1163,8 @@ pub(crate) fn render_live_messages(
     // from the tail (auto-follow disarmed). While detached it doubles as an
     // unread indicator: messages landing below bump `unseen_messages`.
     // Clicking it re-arms follow and clears the count.
-    if !state.auto_scroll && viewport.total_height > visible_height && area.height > 0 {
-        let label = match state.unseen_messages {
+    if !state.viewport.auto_scroll && viewport.total_height > visible_height && area.height > 0 {
+        let label = match state.viewport.unseen_messages {
             0 => " Jump to bottom (click) ↓ ".to_string(),
             1 => " 1 new message (click) ↓ ".to_string(),
             count => format!(" {count} new messages (click) ↓ "),
@@ -1172,7 +1181,7 @@ pub(crate) fn render_live_messages(
                 Paragraph::new(Span::styled(label, theme.selection_style().fg(theme.text))),
                 pill,
             );
-            state.jump_to_bottom_area = Some(pill);
+            state.viewport.jump_to_bottom_area = Some(pill);
         }
     }
 }
@@ -2554,8 +2563,8 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     }
     let count = format!(
         " {}/{} ",
-        state.transcript_search.active_ordinal().unwrap_or(0),
-        state.transcript_search.match_count()
+        state.transcript.search.active_ordinal().unwrap_or(0),
+        state.transcript.search.match_count()
     );
     let count_width = UnicodeWidthStr::width(count.as_str()).min(area.width as usize) as u16;
     let prefix = if area.width.saturating_sub(count_width) >= 7 {
@@ -2582,14 +2591,14 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         return;
     }
 
-    let mut textarea = TextArea::from([state.transcript_search.query()]);
+    let mut textarea = TextArea::from([state.transcript.search.query()]);
     textarea.set_cursor_line_style(Style::default());
     textarea.set_cursor_style(
         Style::default()
             .fg(theme.border)
             .add_modifier(Modifier::REVERSED),
     );
-    let cursor_column = state.transcript_search.query()[..state.transcript_search.cursor()]
+    let cursor_column = state.transcript.search.query()[..state.transcript.search.cursor()]
         .chars()
         .count()
         .min(u16::MAX as usize) as u16;
@@ -3675,8 +3684,8 @@ fn popup_geometry(
 /// lands on.
 pub(crate) fn slash_menu_hit_index(state: &AppState, column: u16, row: u16) -> Option<usize> {
     let menu = state.slash_menu.as_ref()?;
-    let frame_area = state.frame_area?;
-    let input_area = state.input_area?;
+    let frame_area = state.viewport.frame_area?;
+    let input_area = state.viewport.input_area?;
     let (len, selected) = match &menu.sub_menu {
         Some(sub) => (sub.items.len(), sub.selected),
         None => (menu.items.len(), menu.selected),
@@ -3698,8 +3707,8 @@ pub(crate) fn mention_menu_hit_index(state: &AppState, column: u16, row: u16) ->
         return None;
     }
     state.mention.phase.as_ref()?;
-    let frame_area = state.frame_area?;
-    let input_area = state.input_area?;
+    let frame_area = state.viewport.frame_area?;
+    let input_area = state.viewport.input_area?;
     let candidates = &state.mention.candidates;
     let status = mention_popup_status(state);
     let geometry = popup_geometry(
@@ -3935,7 +3944,7 @@ pub(crate) fn plan_approval_option_hit_index(
     row: u16,
 ) -> Option<usize> {
     state.plan_approval_dialog.as_ref()?;
-    let popup = plan_approval_popup(state.frame_area?);
+    let popup = plan_approval_popup(state.viewport.frame_area?);
     if column <= popup.x || column + 1 >= popup.right() {
         return None;
     }
@@ -4059,7 +4068,7 @@ fn approval_dialog_geometry(
 /// Which approval option a click lands on, if any.
 pub(crate) fn approval_option_hit_index(state: &AppState, column: u16, row: u16) -> Option<usize> {
     let dialog = state.approval_dialog.as_ref()?;
-    let area = state.frame_area?;
+    let area = state.viewport.frame_area?;
     let geometry = approval_dialog_geometry(area, dialog);
     let popup = geometry.popup;
     if popup.width < 3 || popup.height < 3 {
@@ -4194,7 +4203,7 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
 /// Long wrapped titles can shift rows below them; the mapping is then off by
 /// the wrapped amount, which degrades to selecting a neighbour.
 pub(crate) fn session_picker_hit_index(state: &AppState, row: u16) -> Option<usize> {
-    let area = state.frame_area?;
+    let area = state.viewport.frame_area?;
     if area.width < 3 || area.height < 3 {
         return None;
     }
@@ -4908,11 +4917,9 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind};
     use crate::surface_projection::SurfaceProjectionState;
-    use crate::types::{
-        PlanApprovalDialog, SlashMenu, SlashMenuItem, TuiEvent, TuiInteractionKey,
-        TuiInteractionKind,
-    };
+    use crate::types::{PlanApprovalDialog, SlashMenu, SlashMenuItem};
     use chrono::Utc;
     use crossbeam_channel as mpsc;
     use orca_core::config::{AdditionalWorkingDirectory, ThemeName};
@@ -5217,8 +5224,8 @@ mod tests {
 
         let rendered = format!("{:?}", terminal.backend().inner.buffer());
         assert!(rendered.contains("Queued 1"));
-        let search = state.search_area.unwrap();
-        let input = state.input_area.unwrap();
+        let search = state.viewport.search_area.unwrap();
+        let input = state.viewport.input_area.unwrap();
         assert!(search.bottom() <= input.y);
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
         assert!(search.contains(cursor));
@@ -5246,7 +5253,7 @@ mod tests {
                     .draw(|frame| render(frame, &mut state, &textarea, &theme))
                     .unwrap();
 
-                if let Some(input) = state.input_area {
+                if let Some(input) = state.viewport.input_area {
                     assert!(input.bottom() <= height, "{width}x{height}: {input:?}");
                 }
                 assert_eq!(terminal.backend().buffer().area.width, width);
@@ -5489,7 +5496,13 @@ mod tests {
         assert!(rendered.contains("alpha"));
         assert!(rendered.contains("1/2"));
         let cursor = terminal.get_cursor_position().expect("hardware cursor");
-        assert!(state.search_area.expect("search area").contains(cursor));
+        assert!(
+            state
+                .viewport
+                .search_area
+                .expect("search area")
+                .contains(cursor)
+        );
     }
 
     #[test]
@@ -5582,7 +5595,7 @@ mod tests {
                 .expect("missing query draw");
             let missing = format!("{:?}", terminal.backend().buffer());
             assert!(missing.contains("0/0"), "{status:?}: {missing}");
-            assert!(state.search_area.is_some());
+            assert!(state.viewport.search_area.is_some());
         }
     }
 
@@ -5607,8 +5620,8 @@ mod tests {
         assert!(rendered.contains("0/0"));
         assert!(rendered.contains("tail"));
         let cursor = terminal.get_cursor_position().expect("search cursor");
-        assert!(state.search_area.unwrap().contains(cursor));
-        assert!(!state.input_area.unwrap().contains(cursor));
+        assert!(state.viewport.search_area.unwrap().contains(cursor));
+        assert!(!state.viewport.input_area.unwrap().contains(cursor));
     }
 
     #[test]
@@ -6289,7 +6302,7 @@ mod tests {
                 ("indeterminate", "(state unknown)"),
             ] {
                 let mut state = test_state();
-                state.messages.push(ChatMessage::ToolCall {
+                state.transcript.messages.push(ChatMessage::ToolCall {
                     id: status.to_string(),
                     name: "deploy".to_string(),
                     target: None,
@@ -6588,8 +6601,8 @@ mod tests {
     #[test]
     fn compact_popup_hit_testing_matches_constrained_render_geometry() {
         let mut state = test_state();
-        state.frame_area = Some(Rect::new(0, 0, 40, 16));
-        state.input_area = Some(Rect::new(0, 12, 40, 3));
+        state.viewport.frame_area = Some(Rect::new(0, 0, 40, 16));
+        state.viewport.input_area = Some(Rect::new(0, 12, 40, 3));
         state.slash_menu = Some(SlashMenu {
             items: (0..12)
                 .map(|index| SlashMenuItem {
@@ -6748,8 +6761,10 @@ mod tests {
 
         // Auto-scroll on: the pane pins to the bottom and shows the last lines.
         let mut auto = test_state();
-        auto.messages.push(ChatMessage::Assistant(body.clone()));
-        auto.auto_scroll = true;
+        auto.transcript
+            .messages
+            .push(ChatMessage::Assistant(body.clone()));
+        auto.viewport.auto_scroll = true;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6))
             .expect("test backend");
         terminal
@@ -6767,9 +6782,12 @@ mod tests {
 
         // Scrolled to the top: the pane shows the earliest lines instead of the tail.
         let mut scrolled = test_state();
-        scrolled.messages.push(ChatMessage::Assistant(body));
-        scrolled.auto_scroll = false;
-        scrolled.scroll_offset = 0;
+        scrolled
+            .transcript
+            .messages
+            .push(ChatMessage::Assistant(body));
+        scrolled.viewport.auto_scroll = false;
+        scrolled.viewport.scroll_offset = 0;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6))
             .expect("test backend");
         terminal
@@ -6798,8 +6816,8 @@ mod tests {
             .join("\n");
 
         let mut state = test_state();
-        state.messages.push(ChatMessage::Assistant(body));
-        state.auto_scroll = true;
+        state.transcript.messages.push(ChatMessage::Assistant(body));
+        state.viewport.auto_scroll = true;
 
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 8))
             .expect("test backend");
@@ -6865,8 +6883,8 @@ mod tests {
         ] {
             let mut state = test_state();
             state.status = AppStatus::Idle;
-            state.auto_scroll = true;
-            state.messages.push(ChatMessage::ToolCall {
+            state.viewport.auto_scroll = true;
+            state.transcript.messages.push(ChatMessage::ToolCall {
                 id: "tool-1".to_string(),
                 name: "edit".to_string(),
                 target: Some("site/styles.css".to_string()),
@@ -6876,11 +6894,14 @@ mod tests {
                 kind: None,
                 expanded: false,
             });
-            state.messages.push(ChatMessage::Reasoning(
+            state.transcript.messages.push(ChatMessage::Reasoning(
                 "The HTML report has been created. Let me verify it and provide a summary to the user."
                     .to_string(),
             ));
-            state.messages.push(ChatMessage::Assistant(answer.clone()));
+            state
+                .transcript
+                .messages
+                .push(ChatMessage::Assistant(answer.clone()));
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
                     .expect("test backend");
@@ -7236,6 +7257,7 @@ mod tests {
         let mut state = test_state();
         for index in 0..80 {
             state
+                .transcript
                 .messages
                 .push(ChatMessage::System(format!("line {index}")));
         }
@@ -7251,13 +7273,13 @@ mod tests {
         // Following the tail: no pill.
         let following = draw(&mut state);
         assert!(!following.contains("Jump to bottom"));
-        assert_eq!(state.jump_to_bottom_area, None);
+        assert_eq!(state.viewport.jump_to_bottom_area, None);
 
         // Scrolled up: the pill appears and registers its click target.
         state.scroll_up(10);
         let scrolled = draw(&mut state);
         assert!(scrolled.contains("Jump to bottom (click) ↓"));
-        assert!(state.jump_to_bottom_area.is_some());
+        assert!(state.viewport.jump_to_bottom_area.is_some());
 
         // Messages landing while detached turn it into an unread counter.
         state.push_message(ChatMessage::System("late one".to_string()));
@@ -7272,12 +7294,12 @@ mod tests {
         let back = draw(&mut state);
         assert!(!back.contains("Jump to bottom"));
         assert!(!back.contains("new message"));
-        assert_eq!(state.jump_to_bottom_area, None);
-        assert_eq!(state.unseen_messages, 0);
+        assert_eq!(state.viewport.jump_to_bottom_area, None);
+        assert_eq!(state.viewport.unseen_messages, 0);
 
         // Messages arriving while FOLLOWING never count as unread.
         state.push_message(ChatMessage::System("seen".to_string()));
-        assert_eq!(state.unseen_messages, 0);
+        assert_eq!(state.viewport.unseen_messages, 0);
         state.scroll_up(10);
         let detached_again = draw(&mut state);
         assert!(detached_again.contains("Jump to bottom (click) ↓"));
@@ -7290,6 +7312,7 @@ mod tests {
         let mut state = test_state();
         for index in 0..80 {
             state
+                .transcript
                 .messages
                 .push(ChatMessage::System(format!("line {index}")));
         }
@@ -7304,7 +7327,7 @@ mod tests {
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .expect("draw");
 
-        let pill = state.jump_to_bottom_area.expect("jump pill area");
+        let pill = state.viewport.jump_to_bottom_area.expect("jump pill area");
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(pill.x + 1, pill.y)].symbol(), "J");
         assert!(
@@ -7321,7 +7344,7 @@ mod tests {
         let mut state = test_state();
         state.push_message(ChatMessage::System("abc".to_string()));
         let pos = crate::selection::SelectionPos { row: 0, col: 0 };
-        state.selection = Some(crate::selection::TranscriptSelection::begin(pos));
+        state.viewport.selection = Some(crate::selection::TranscriptSelection::begin(pos));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8))
             .expect("test backend");
 
@@ -7343,7 +7366,10 @@ mod tests {
         let mut state = test_state();
         let staged_at = std::time::Instant::now();
         state.stage_clipboard_copy("hello".to_string(), staged_at);
-        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello"));
+        assert_eq!(
+            state.viewport.pending_clipboard_copy.as_deref(),
+            Some("hello")
+        );
 
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
             .expect("test backend");
@@ -7366,7 +7392,7 @@ mod tests {
         );
 
         // Expired: gone again.
-        state.copy_notice = state.copy_notice.take().map(|mut notice| {
+        state.viewport.copy_notice = state.viewport.copy_notice.take().map(|mut notice| {
             notice.at = staged_at
                 .checked_sub(crate::types::AppState::COPY_NOTICE_TTL)
                 .expect("test instant");
@@ -7390,13 +7416,16 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
         let mut state = test_state();
-        assert!(state.messages.is_empty());
+        assert!(state.transcript.messages.is_empty());
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(92, 24))
             .expect("test backend");
         terminal
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .expect("draw");
-        let area = state.transcript_area.expect("transcript area recorded");
+        let area = state
+            .viewport
+            .transcript_area
+            .expect("transcript area recorded");
 
         let mut scratch = TextArea::default();
         let now = std::time::Instant::now();
@@ -7440,6 +7469,7 @@ mod tests {
         );
 
         let copied = state
+            .viewport
             .pending_clipboard_copy
             .as_deref()
             .expect("welcome text should be copyable");
@@ -7620,7 +7650,7 @@ mod tests {
         task.status = TaskStatus::Running;
         state.enter_running();
         state.replace_workflow_tasks_for_test(vec![task]);
-        state.update(crate::types::TuiEvent::SessionCompleted {
+        state.update(crate::protocol::TuiEvent::SessionCompleted {
             status: "success".to_string(),
         });
 
@@ -9769,17 +9799,17 @@ mod tests {
         let mut state = test_state();
         state.push_message(ChatMessage::User("prompt".to_string()));
         state.update(TuiEvent::MessageDelta("alpha bravo charlie\n".to_string()));
-        let before = state.message_revisions.clone();
+        let before = state.transcript.message_revisions.clone();
 
         state.update(TuiEvent::MessageDelta(" delta".to_string()));
 
-        assert_eq!(state.message_revisions[0], before[0]);
-        assert_eq!(state.message_revisions[1], before[1]);
+        assert_eq!(state.transcript.message_revisions[0], before[0]);
+        assert_eq!(state.transcript.message_revisions[1], before[1]);
 
         state.update(TuiEvent::MessageDelta("\n".to_string()));
 
-        assert_eq!(state.message_revisions[0], before[0]);
-        assert_ne!(state.message_revisions[1], before[1]);
+        assert_eq!(state.transcript.message_revisions[0], before[0]);
+        assert_ne!(state.transcript.message_revisions[1], before[1]);
     }
 
     #[test]
@@ -9810,7 +9840,7 @@ mod tests {
         assert!(completed.contains("visible line"));
         assert!(completed.contains("hidden half"));
 
-        let lines = build_lines_for_messages(&state.messages, &theme, 80, 0, false);
+        let lines = build_lines_for_messages(&state.transcript.messages, &theme, 80, 0, false);
         assert_eq!(
             lines
                 .iter()
@@ -9883,7 +9913,7 @@ mod tests {
         let streaming = format!("{:?}", terminal.backend().buffer());
         assert!(streaming.contains("block 099"));
         assert!(!streaming.contains("HIDDEN_PARTIAL_TAIL"));
-        assert!(state.auto_scroll);
+        assert!(state.viewport.auto_scroll);
 
         state.update(TuiEvent::SessionCompleted {
             status: "success".to_string(),
@@ -9893,13 +9923,13 @@ mod tests {
             .expect("completed checkpoints draw");
         let completed = format!("{:?}", terminal.backend().buffer());
         assert!(completed.contains("HIDDEN_PARTIAL_TAIL"));
-        assert!(state.auto_scroll);
+        assert!(state.viewport.auto_scroll);
     }
 
     #[test]
     fn completed_turn_keeps_tail_marker_visible_after_large_diff() {
         let mut state = test_state();
-        state.messages.push(ChatMessage::User(
+        state.transcript.messages.push(ChatMessage::User(
             "生成一份长报告，并在最后输出固定尾部标记。".to_string(),
         ));
         let diff = (0..96)
@@ -9910,7 +9940,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        state.messages.push(ChatMessage::ToolCall {
+        state.transcript.messages.push(ChatMessage::ToolCall {
             id: "tool-write".to_string(),
             name: "write_file".to_string(),
             target: Some("stock_report_20260702.html".to_string()),
@@ -9929,7 +9959,10 @@ mod tests {
             ));
         }
         answer.push_str("EXACT_TAIL_VISIBLE_20260702");
-        state.messages.push(ChatMessage::Assistant(answer));
+        state
+            .transcript
+            .messages
+            .push(ChatMessage::Assistant(answer));
         state.update(TuiEvent::SessionCompleted {
             status: "success".to_string(),
         });
@@ -9981,7 +10014,7 @@ mod tests {
 
     fn completed_table_tail_state() -> AppState {
         let mut state = test_state();
-        state.messages.push(ChatMessage::User(
+        state.transcript.messages.push(ChatMessage::User(
             "生成一份包含宽表格的市场报告，并在最后输出固定尾部标记。".to_string(),
         ));
         let diff = (0..96)
@@ -9992,7 +10025,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        state.messages.push(ChatMessage::ToolCall {
+        state.transcript.messages.push(ChatMessage::ToolCall {
             id: "tool-write".to_string(),
             name: "write_file".to_string(),
             target: Some("market_table_report_20260702.html".to_string()),
@@ -10028,7 +10061,10 @@ mod tests {
             ));
         }
         answer.push_str("EXACT_TABLE_TAIL_VISIBLE_20260702");
-        state.messages.push(ChatMessage::Assistant(answer));
+        state
+            .transcript
+            .messages
+            .push(ChatMessage::Assistant(answer));
         state.update(TuiEvent::SessionCompleted {
             status: "success".to_string(),
         });
@@ -10076,7 +10112,7 @@ mod tests {
         for &(width, paragraphs) in cases {
             for height in [24u16, 36, 48] {
                 let mut state = test_state();
-                state.messages.push(ChatMessage::User(
+                state.transcript.messages.push(ChatMessage::User(
                     "输出多段中英混排长文本，并在最后输出固定尾部标记。".to_string(),
                 ));
                 let mut answer = String::new();
@@ -10087,7 +10123,10 @@ mod tests {
                     }
                 }
                 answer.push_str("EXACT_CJK_TAIL_VISIBLE_20260702");
-                state.messages.push(ChatMessage::Assistant(answer));
+                state
+                    .transcript
+                    .messages
+                    .push(ChatMessage::Assistant(answer));
                 state.update(TuiEvent::SessionCompleted {
                     status: "success".to_string(),
                 });
@@ -10121,6 +10160,7 @@ mod tests {
         let textarea = TextArea::default();
         let mut state = test_state();
         state
+            .transcript
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
@@ -10134,7 +10174,7 @@ mod tests {
             state.update(TuiEvent::MessageDelta(format!(
                 "第{index:03}段:混排AI模型栈能力闭环片全2芯业是、型环训（练力栈全3首b3/片闭b）尾标{index:03}\n\n"
             )));
-            if state.auto_scroll {
+            if state.viewport.auto_scroll {
                 state.scroll_to_bottom();
             }
             terminal
@@ -10144,10 +10184,10 @@ mod tests {
             assert!(
                 rendered.contains(&format!("尾标{index:03}")),
                 "delta {index} scrolled out of view; auto_scroll={} scroll_offset={} total={} visible={}",
-                state.auto_scroll,
-                state.scroll_offset,
-                state.total_lines,
-                state.visible_height,
+                state.viewport.auto_scroll,
+                state.viewport.scroll_offset,
+                state.viewport.total_lines,
+                state.viewport.visible_height,
             );
         }
     }
@@ -10162,6 +10202,7 @@ mod tests {
         let textarea = TextArea::default();
         let mut state = test_state();
         state
+            .transcript
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
@@ -10175,7 +10216,7 @@ mod tests {
             state.update(TuiEvent::MessageDelta(format!(
                 "第{index:03}段:混排AI模型栈能力闭环片全2芯业是、型环训（练力栈全3首b3/片闭b）尾标{index:03}\n\n"
             )));
-            if state.auto_scroll {
+            if state.viewport.auto_scroll {
                 state.scroll_to_bottom();
             }
             terminal
@@ -10189,10 +10230,10 @@ mod tests {
             assert!(
                 rendered.contains(&format!("尾标{index:03}")),
                 "delta {index} scrolled out of view; auto_scroll={} scroll_offset={} total={} visible={}",
-                state.auto_scroll,
-                state.scroll_offset,
-                state.total_lines,
-                state.visible_height,
+                state.viewport.auto_scroll,
+                state.viewport.scroll_offset,
+                state.viewport.total_lines,
+                state.viewport.visible_height,
             );
         }
     }
@@ -10203,6 +10244,7 @@ mod tests {
         let textarea = TextArea::default();
         let mut state = test_state();
         state
+            .transcript
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
@@ -10213,7 +10255,7 @@ mod tests {
             .expect("test backend");
 
         let mut draw = |state: &mut AppState| {
-            if state.auto_scroll {
+            if state.viewport.auto_scroll {
                 state.scroll_to_bottom();
             }
             terminal
@@ -10232,13 +10274,13 @@ mod tests {
         state.scroll_up(6);
         draw(&mut state);
         assert!(
-            !state.auto_scroll,
+            !state.viewport.auto_scroll,
             "deliberate scroll-up should disarm follow"
         );
 
         // Wheel back down until the bottom is reached: follow re-arms and new
         // deltas are tracked again without further input.
-        while !state.auto_scroll {
+        while !state.viewport.auto_scroll {
             state.scroll_down(3);
             draw(&mut state);
         }
@@ -10326,8 +10368,8 @@ mod tests {
             .map(|i| format!("数据行内容{i}测试"))
             .collect::<Vec<_>>()
             .join("\n");
-        state.messages.push(ChatMessage::Assistant(body));
-        state.auto_scroll = true;
+        state.transcript.messages.push(ChatMessage::Assistant(body));
+        state.viewport.auto_scroll = true;
         // Real composer carries a bordered "Input" block (3 rows tall), like make_textarea.
         let mut textarea = TextArea::default();
         textarea.set_block(
@@ -10358,9 +10400,9 @@ mod tests {
         // The composer (input) needs its full height; the messages area is everything above
         // the input + status, so visible_height must leave room for them.
         assert!(
-            state.visible_height <= (h - 2) as usize,
+            state.viewport.visible_height <= (h - 2) as usize,
             "messages area ({}) must not consume the input/status rows (term {h})",
-            state.visible_height
+            state.viewport.visible_height
         );
     }
 }

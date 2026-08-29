@@ -18,9 +18,10 @@ use crate::hosted_goal::{goal_continuation_prompt, send_goal_history_error};
 use crate::hosted_runtime::emit_hosted_operation_error;
 use crate::hosted_session::{announce_runtime_ready, emit_typed_history_snapshot};
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::SessionAttachmentId;
+use crate::protocol::TuiEvent;
 use crate::surface_actions::{TuiHostActions, TuiSurfaceActions};
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
-use crate::types::{SessionAttachmentId, TuiEvent};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_hosted_thread(
@@ -715,7 +716,7 @@ mod tests {
         let pending = crate::bridge::PendingWorkflowNotifications::new();
         let (root_event_tx, event_rx) = mpsc::unbounded();
         let mut event_tx = root_event_tx.clone();
-        let mut attachment = crate::types::SessionAttachmentId::new(1);
+        let mut attachment = crate::protocol::SessionAttachmentId::new(1);
         let initial_attachment = attachment;
         let routing = Arc::new(Mutex::new(
             crate::attachment_routing::AttachmentRouting::new(attachment),
@@ -780,7 +781,7 @@ mod tests {
         let (root_event_tx, root_event_rx) = mpsc::unbounded();
         let (attached_event_tx, attached_event_rx) = mpsc::unbounded();
         let mut event_tx = attached_event_tx;
-        let mut attachment = crate::types::SessionAttachmentId::new(7);
+        let mut attachment = crate::protocol::SessionAttachmentId::new(7);
         let initial_attachment = attachment;
         let routing = Arc::new(Mutex::new(
             crate::attachment_routing::AttachmentRouting::new(attachment),

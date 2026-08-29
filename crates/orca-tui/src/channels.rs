@@ -1,6 +1,6 @@
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::types::{TuiEvent, UserAction};
+use crate::protocol::{TuiEvent, UserAction};
 
 pub(crate) const TUI_EVENT_CAPACITY: usize = 256;
 pub(crate) const USER_ACTION_CAPACITY: usize = 64;

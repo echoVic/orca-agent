@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::composer_textarea::{expand_pending_pastes, locate_pending_pastes};
-use crate::types::GoalDraft;
+use crate::protocol::GoalDraft;
 
 pub(crate) const MAX_GOAL_OBJECTIVE_CHARS: usize = 4_000;
 

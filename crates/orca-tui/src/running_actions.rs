@@ -1,7 +1,8 @@
 use crossbeam_channel as mpsc;
 
+use crate::protocol::UserAction;
 use crate::shortcuts::RunningShortcut;
-use crate::types::{AppState, AppStatus, UserAction};
+use crate::types::{AppState, AppStatus};
 
 pub(crate) fn handle_running_shortcut(
     shortcut: RunningShortcut,
@@ -27,19 +28,19 @@ pub(crate) fn handle_running_shortcut(
             state.scroll_down(1);
         }
         RunningShortcut::PageUp => {
-            let page = state.visible_height.saturating_sub(2);
+            let page = state.viewport.visible_height.saturating_sub(2);
             state.scroll_up(page);
         }
         RunningShortcut::PageDown => {
-            let page = state.visible_height.saturating_sub(2);
+            let page = state.viewport.visible_height.saturating_sub(2);
             state.scroll_down(page);
         }
         RunningShortcut::HalfPageUp => {
-            let page = state.visible_height / 2;
+            let page = state.viewport.visible_height / 2;
             state.scroll_up(page);
         }
         RunningShortcut::HalfPageDown => {
-            let page = state.visible_height / 2;
+            let page = state.viewport.visible_height / 2;
             state.scroll_down(page);
         }
         RunningShortcut::SubmitQueued

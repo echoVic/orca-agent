@@ -3,7 +3,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use orca_core::approval_types::ApprovalMode;
 
-use crate::types::{AppState, UserAction};
+use crate::protocol::UserAction;
+use crate::types::AppState;
 
 pub(crate) const IMPLEMENT_APPROVED_PLAN_PROMPT: &str = "Implement the approved plan.";
 
@@ -19,8 +20,8 @@ pub(crate) fn handle_plan_approval_key(
                 dialog.selected = (dialog.selected + 1) % 2;
             }
         }
-        KeyCode::PageUp => state.scroll_up(state.visible_height.max(1)),
-        KeyCode::PageDown => state.scroll_down(state.visible_height.max(1)),
+        KeyCode::PageUp => state.scroll_up(state.viewport.visible_height.max(1)),
+        KeyCode::PageDown => state.scroll_down(state.viewport.visible_height.max(1)),
         KeyCode::Char('1') => implement(state, action_tx),
         KeyCode::Char('2') | KeyCode::Esc => stay_in_plan_mode(state),
         KeyCode::Enter => {
@@ -63,7 +64,7 @@ fn stay_in_plan_mode(state: &mut AppState) {
     state.plan_approval_dialog = None;
     state.request_runtime_queue_start();
     state.resume_queued_follow_up_autosend();
-    state.push_message(crate::types::ChatMessage::System(
+    state.push_message(crate::transcript_state::ChatMessage::System(
         "Staying in Plan mode. Send feedback to revise the plan.".to_string(),
     ));
     state.scroll_to_bottom();

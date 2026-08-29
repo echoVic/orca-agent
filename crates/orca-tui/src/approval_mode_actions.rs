@@ -1,7 +1,8 @@
 use orca_core::config::RunConfig;
 
+use crate::protocol::UserAction;
 use crate::slash_command_actions::encode_settings_intent;
-use crate::types::{AppState, UserAction};
+use crate::types::AppState;
 
 pub(crate) fn cycle_approval_mode(
     config: &RunConfig,
@@ -14,7 +15,7 @@ pub(crate) fn cycle_approval_mode(
         None,
         Some(next),
     )));
-    state.push_message(crate::types::ChatMessage::System(format!(
+    state.push_message(crate::transcript_state::ChatMessage::System(format!(
         "Approval mode change requested: {}.",
         next.as_str()
     )));
@@ -24,8 +25,9 @@ pub(crate) fn cycle_approval_mode(
 #[cfg(test)]
 mod tests {
     use super::cycle_approval_mode;
+    use crate::protocol::UserAction;
     use crate::slash_command_actions::decode_settings_intent;
-    use crate::types::{AppState, UserAction};
+    use crate::types::AppState;
     use orca_core::approval_types::ApprovalMode;
 
     #[test]

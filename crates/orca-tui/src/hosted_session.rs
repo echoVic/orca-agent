@@ -25,12 +25,13 @@ use std::io;
 use crate::attachment_routing::send_attached_event;
 use crate::composer_images::ComposerImageState;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::SessionAttachmentId;
+use crate::protocol::{
+    TuiEvent, TuiInteractionKind, TuiInteractionResponse, TuiMcpElicitationMode,
+};
 use crate::surface_actions::TuiSurfaceActions;
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
-use crate::types::{
-    ChatMessage, SessionAttachmentId, TuiEvent, TuiInteractionKind, TuiInteractionResponse,
-    TuiMcpElicitationMode,
-};
+use crate::transcript_state::ChatMessage;
 
 struct QueueApprovalHandler {
     control: TuiSurfaceTaskControl,
@@ -958,7 +959,7 @@ mod tests {
 
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(crate::types::TuiEvent::HistoryLoaded {
+            Ok(crate::protocol::TuiEvent::HistoryLoaded {
                 messages,
                 plan: None,
                 label,

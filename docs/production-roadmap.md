@@ -3,7 +3,7 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-22
+Last updated: 2026-08-29
 
 The v0.4.0 release adds complete image input across every model selection: TUI
 clipboard images, dragged or pasted image paths and `file://` URLs, `@file`
@@ -193,6 +193,20 @@ verify the resulting handle is regular, so a concurrent FIFO replacement cannot
 stall a picker or transcript read. Stateless server checks distinguish recorded
 catalog/transcript state from the empty index infrastructure created by listing.
 This changes no public protocol, SQLite schema, or persisted transcript format.
+
+The v0.4.4 TUI state-owner convergence slice completes the last large local
+state boundary left after the renderer, input, interaction, queue, projection,
+and runtime-controller work. `protocol.rs` now owns `TuiEvent`, `UserAction`,
+interaction keys/responses, lifecycle values, and attachment values;
+`state_reducer.rs` owns `AppState::update` and event-dispatch helpers;
+`TranscriptState`, `InteractionState`, and `ViewportState` own only fields with
+independent invariants. `AppState` remains the composition root for cross-owner
+transitions, while `types.rs` is reduced to aggregate construction, shared
+operations, and precise compatibility re-exports. Owner-specific tests move
+with those modules, leaving the state integration suite for lifecycle and
+projection behavior that genuinely crosses owners. New contributors should
+start from the owner module named by the invariant they are changing, not from
+the aggregate.
 
 The current TUI convergence slice gives input-history persistence and
 draft-restoring recall one module owner. `AppState` remains the single aggregate

@@ -5,7 +5,9 @@ use tui_textarea::TextArea;
 use crate::clipboard_image::ImagePasteRequest;
 use crate::composer_textarea::{textarea_cursor_byte_index, textarea_text};
 use crate::image_preview::{ImageViewerState, VIEWER_PAN_STEP};
-use crate::types::{AppState, AppStatus, ChatMessage, PanelMode, UserAction};
+use crate::protocol::UserAction;
+use crate::transcript_state::ChatMessage;
+use crate::types::{AppState, AppStatus, PanelMode};
 
 pub(crate) fn handle_image_paste_shortcut(
     key: KeyEvent,
@@ -20,7 +22,7 @@ pub(crate) fn handle_image_paste_shortcut(
         || state.config_dialog.is_some()
         || state.plan_approval_dialog.is_some()
         || state.user_input_dialog.is_some()
-        || state.transcript_search.open
+        || state.transcript.search.open
     {
         return false;
     }
@@ -189,7 +191,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(state.messages.is_empty());
+        assert!(state.transcript.messages.is_empty());
     }
 
     #[test]

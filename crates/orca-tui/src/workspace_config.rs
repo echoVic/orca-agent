@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::transcript_state::ChatMessage;
 use crate::types::AppState;
-use crate::types::ChatMessage;
 use orca_core::config::RunConfig;
 
 pub(crate) fn mention_search_roots(config: &RunConfig, workspace_fallback: &Path) -> Vec<PathBuf> {

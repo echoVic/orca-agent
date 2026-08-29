@@ -15,12 +15,13 @@ use crate::composer_textarea::{
     textarea_text,
 };
 use crate::mention_menu_actions::handle_mention_menu_key;
+use crate::protocol::UserAction;
 use crate::queued_input::QueuedUserMessage;
 use crate::running_actions::handle_running_shortcut;
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::slash_command_actions::{SlashOutcome, handle_composer_slash_command};
 use crate::theme::Theme;
-use crate::types::{AppState, AppStatus, PanelMode, UserAction};
+use crate::types::{AppState, AppStatus, PanelMode};
 use crate::vim::VimState;
 
 #[cfg(test)]
@@ -121,7 +122,7 @@ pub(crate) fn restore_latest_queued_message(
 ) -> bool {
     if state.panel_mode != PanelMode::Conversation
         || !matches!(state.status, AppStatus::Idle | AppStatus::Running)
-        || state.transcript_search.open
+        || state.transcript.search.open
         || state.show_shortcuts
         || state.slash_menu.is_some()
         || state.mention.phase.is_some()
@@ -233,7 +234,7 @@ pub(crate) fn handle_running_key(
                     ) {
                         reset_after_running_slash(state, textarea, vim_state, theme, outcome);
                     } else {
-                        state.push_message(crate::types::ChatMessage::Error(
+                        state.push_message(crate::transcript_state::ChatMessage::Error(
                             commands::invalid_slash_command_message(&text),
                         ));
                         reset_after_running_slash(
@@ -302,7 +303,8 @@ mod tests {
         make_textarea_with_text, textarea_cursor_byte_index, textarea_text,
     };
     use crate::queued_input::QueuedUserMessage;
-    use crate::types::{AppState, AppStatus, ChatMessage};
+    use crate::transcript_state::ChatMessage;
+    use crate::types::{AppState, AppStatus};
     use crate::vim::VimState;
 
     fn state() -> AppState {
@@ -330,9 +332,9 @@ mod tests {
     fn running_ctrl_u_clears_non_empty_follow_up_before_half_page_scroll() {
         let (action_tx, _action_rx) = mpsc::unbounded();
         let mut state = state();
-        state.total_lines = 100;
-        state.visible_height = 20;
-        state.scroll_offset = 40;
+        state.viewport.total_lines = 100;
+        state.viewport.visible_height = 20;
+        state.viewport.scroll_offset = 40;
         let mut config = crate::test_support::test_run_config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let theme = theme();
@@ -353,7 +355,7 @@ mod tests {
         ));
 
         assert_eq!(textarea_text(&textarea), "");
-        assert_eq!(state.scroll_offset, 40);
+        assert_eq!(state.viewport.scroll_offset, 40);
     }
 
     #[test]
@@ -405,6 +407,7 @@ mod tests {
         assert!(state.mention_bindings.is_empty());
         assert!(
             !state
+                .transcript
                 .messages
                 .iter()
                 .any(|message| matches!(message, ChatMessage::User(_)))
@@ -433,6 +436,7 @@ mod tests {
         assert!(state.queued_input_error().is_some());
         assert!(
             !state
+                .transcript
                 .messages
                 .iter()
                 .any(|message| matches!(message, ChatMessage::Error(_)))
@@ -466,7 +470,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        state.update(crate::types::TuiEvent::PromptQueueControlUpdated {
+        state.update(crate::protocol::TuiEvent::PromptQueueControlUpdated {
             deleted_id: Some(deleted_id),
             snapshot,
         });
@@ -524,7 +528,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        state.update(crate::types::TuiEvent::PromptQueueUpdated(snapshot));
+        state.update(crate::protocol::TuiEvent::PromptQueueUpdated(snapshot));
 
         assert!(restore_latest_queued_message(&mut state, &action_tx));
         let (deleted_id, delete) = match action_rx.try_recv() {
@@ -538,7 +542,7 @@ mod tests {
             other => panic!("unexpected delete action: {other:?}"),
         };
         let snapshot = runtime.apply(delete, 2).unwrap();
-        state.update(crate::types::TuiEvent::PromptQueueControlUpdated {
+        state.update(crate::protocol::TuiEvent::PromptQueueControlUpdated {
             deleted_id: Some(deleted_id),
             snapshot,
         });
@@ -565,7 +569,7 @@ mod tests {
                 orca_runtime::prompt_queue::PromptQueueAction::Delete { .. }
             ))
         ));
-        state.update(crate::types::TuiEvent::OperationRejected(
+        state.update(crate::protocol::TuiEvent::OperationRejected(
             "queue control disconnected".to_string(),
         ));
 
@@ -616,7 +620,7 @@ mod tests {
             } else {
                 action_tx
                     .send(UserAction::Remember {
-                        scope: crate::types::TuiMemoryScope::User,
+                        scope: crate::protocol::TuiMemoryScope::User,
                         note: "occupy".to_string(),
                     })
                     .unwrap();
@@ -635,6 +639,7 @@ mod tests {
             assert!(!state.queued_submission_in_flight());
             assert!(
                 !state
+                    .transcript
                     .messages
                     .iter()
                     .any(|message| matches!(message, ChatMessage::User(text) if text == "first"))
@@ -725,7 +730,7 @@ mod tests {
         ));
         assert!(state.queued_pending_visible_text().is_empty());
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::Error(message)) if message.contains("unknown slash command")
         ));
         assert!(action_rx.try_recv().is_err());

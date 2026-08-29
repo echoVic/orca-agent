@@ -22,7 +22,8 @@ use orca_runtime::surface::{
     SurfaceWorkflowStatus, ThreadPersistence, ToolPatch, UnixMillis,
 };
 
-use crate::types::{AppState, TuiEvent, TuiTaskLifecycle};
+use crate::protocol::{TuiEvent, TuiTaskLifecycle};
+use crate::types::AppState;
 
 /// Runtime-derived values that the TUI must keep in lockstep with the
 /// authoritative surface reducer after each projected batch.
@@ -533,7 +534,7 @@ impl AppState {
 
 pub(crate) fn history_messages_from_surface_snapshot(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
-) -> Vec<crate::types::ChatMessage> {
+) -> Vec<crate::transcript_state::ChatMessage> {
     history_messages_from_surface_items(&snapshot.items)
 }
 
@@ -558,7 +559,9 @@ pub(crate) fn test_surface_cursor(next_seq: u64) -> SurfaceCursor {
     }
 }
 
-fn history_messages_from_surface_items(items: &[SurfaceItem]) -> Vec<crate::types::ChatMessage> {
+fn history_messages_from_surface_items(
+    items: &[SurfaceItem],
+) -> Vec<crate::transcript_state::ChatMessage> {
     let mut messages = Vec::new();
     let mut index = 0;
     while index < items.len() {
@@ -609,21 +612,27 @@ fn assistant_item_turn_id(item: &SurfaceItem) -> Option<&orca_runtime::surface::
     }
 }
 
-fn history_message_from_surface_item(item: &SurfaceItem) -> Option<crate::types::ChatMessage> {
+fn history_message_from_surface_item(
+    item: &SurfaceItem,
+) -> Option<crate::transcript_state::ChatMessage> {
     match item {
         SurfaceItem::UserMessage { input, .. } => match input {
             SurfaceUserInputState::Pending { presentation, .. }
             | SurfaceUserInputState::ResolutionFailed { presentation, .. } => {
-                visible_input_text(presentation).map(crate::types::ChatMessage::User)
+                visible_input_text(presentation).map(crate::transcript_state::ChatMessage::User)
             }
             SurfaceUserInputState::Resolved { fact } => match fact {
-                orca_runtime::surface::SurfaceResolvedInputFact::Replayable { input, .. } => Some(
-                    crate::types::ChatMessage::User(input.canonical_text.as_str().to_string()),
-                ),
+                orca_runtime::surface::SurfaceResolvedInputFact::Replayable { input, .. } => {
+                    Some(crate::transcript_state::ChatMessage::User(
+                        input.canonical_text.as_str().to_string(),
+                    ))
+                }
                 orca_runtime::surface::SurfaceResolvedInputFact::NonReplayable {
                     presentation,
                     ..
-                } => visible_input_text(presentation).map(crate::types::ChatMessage::User),
+                } => {
+                    visible_input_text(presentation).map(crate::transcript_state::ChatMessage::User)
+                }
             },
         },
         SurfaceItem::SystemMessage { content, .. }
@@ -633,11 +642,11 @@ fn history_message_from_surface_item(item: &SurfaceItem) -> Option<crate::types:
         {
             None
         }
-        SurfaceItem::SystemMessage { content, .. } => Some(crate::types::ChatMessage::System(
-            content.as_str().to_string(),
-        )),
+        SurfaceItem::SystemMessage { content, .. } => Some(
+            crate::transcript_state::ChatMessage::System(content.as_str().to_string()),
+        ),
         SurfaceItem::AssistantMessage { text, .. } => (!text.as_str().trim().is_empty())
-            .then(|| crate::types::ChatMessage::Assistant(text.as_str().to_string())),
+            .then(|| crate::transcript_state::ChatMessage::Assistant(text.as_str().to_string())),
         SurfaceItem::AssistantReasoning {
             content, summary, ..
         } => {
@@ -647,10 +656,10 @@ fn history_message_from_surface_item(item: &SurfaceItem) -> Option<crate::types:
                 content.as_str()
             };
             (!text.trim().is_empty())
-                .then(|| crate::types::ChatMessage::Reasoning(text.to_string()))
+                .then(|| crate::transcript_state::ChatMessage::Reasoning(text.to_string()))
         }
         SurfaceItem::AssistantPlan { text, .. } => (!text.as_str().trim().is_empty())
-            .then(|| crate::types::ChatMessage::ProposedPlan(text.as_str().to_string())),
+            .then(|| crate::transcript_state::ChatMessage::ProposedPlan(text.as_str().to_string())),
         SurfaceItem::ToolResultMessage {
             tool_call_id,
             content,
@@ -658,7 +667,7 @@ fn history_message_from_surface_item(item: &SurfaceItem) -> Option<crate::types:
             ..
         } => {
             let output = (!content.as_str().is_empty()).then(|| content.as_str().to_string());
-            Some(crate::types::ChatMessage::ToolCall {
+            Some(crate::transcript_state::ChatMessage::ToolCall {
                 id: tool_call_id.as_str().to_string(),
                 name: format!("tool:{}", tool_call_id.as_str()),
                 target: None,
@@ -2567,11 +2576,11 @@ mod tests {
         assert!(matches!(
             messages.as_slice(),
             [
-                crate::types::ChatMessage::User(prompt),
-                crate::types::ChatMessage::System(system),
-                crate::types::ChatMessage::Reasoning(reasoning),
-                crate::types::ChatMessage::Assistant(answer),
-                crate::types::ChatMessage::ProposedPlan(plan),
+                crate::transcript_state::ChatMessage::User(prompt),
+                crate::transcript_state::ChatMessage::System(system),
+                crate::transcript_state::ChatMessage::Reasoning(reasoning),
+                crate::transcript_state::ChatMessage::Assistant(answer),
+                crate::transcript_state::ChatMessage::ProposedPlan(plan),
             ] if prompt == "visible prompt"
                 && system == "system"
                 && answer == "answer"

@@ -1,7 +1,8 @@
 use crossbeam_channel as mpsc;
 
 use crate::bridge;
-use crate::types::{AppState, AppStatus, PendingWorkflowNotification, TuiEvent, UserAction};
+use crate::protocol::{PendingWorkflowNotification, TuiEvent, UserAction};
+use crate::types::{AppState, AppStatus};
 
 pub(crate) fn submit_pending_workflow_notification(
     state: &mut AppState,

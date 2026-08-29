@@ -3,8 +3,9 @@ use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::approval_actions::resolve_approval_option;
+use crate::protocol::UserAction;
 use crate::shortcuts::{ApprovalShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
-use crate::types::{AppState, ApprovalOption, UserAction};
+use crate::types::{AppState, ApprovalOption};
 
 pub(crate) fn handle_approval_dialog_key(
     key: &KeyEvent,

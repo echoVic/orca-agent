@@ -20,9 +20,9 @@ use crate::hosted_runtime::{
 use crate::hosted_session::announce_runtime_ready;
 use crate::hosted_session_lifecycle::{ensure_hosted_thread, resume_latest_active_goal_hosted};
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::{GoalDraft, TuiEvent};
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::{GoalDraft, TuiEvent};
 
 pub(crate) fn goal_continuation_prompt(objective: &str, continuation: usize) -> String {
     format!(

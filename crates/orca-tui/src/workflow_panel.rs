@@ -6,7 +6,8 @@ use std::collections::VecDeque;
 
 use orca_core::task_types::BackgroundTaskSummary;
 
-use crate::types::{AppState, AppStatus, ApprovalDialog, PanelMode, PendingWorkflowNotification};
+use crate::protocol::PendingWorkflowNotification;
+use crate::types::{AppState, AppStatus, ApprovalDialog, PanelMode};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkflowPanelState {

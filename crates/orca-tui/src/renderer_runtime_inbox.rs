@@ -2,7 +2,7 @@ use crossbeam_channel::TryIter;
 use std::sync::Mutex;
 
 use crate::channels::TuiEventReceiver;
-use crate::types::TuiEvent;
+use crate::protocol::TuiEvent;
 
 const MAX_COALESCED_DELTA_BYTES: usize = 64 * 1024;
 
@@ -123,7 +123,7 @@ mod tests {
 
     use super::RendererRuntimeInboxOwner;
     use crate::channels::{TUI_EVENT_CAPACITY, tui_event_channel};
-    use crate::types::TuiEvent;
+    use crate::protocol::TuiEvent;
 
     #[test]
     fn empty_and_disconnected_pending_iterators_are_inert() {

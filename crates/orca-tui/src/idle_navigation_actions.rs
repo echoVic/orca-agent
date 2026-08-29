@@ -7,9 +7,10 @@ use orca_core::config::RunConfig;
 
 use crate::composer_input_actions::apply_composer_key_input;
 use crate::composer_textarea::textarea_text;
+use crate::protocol::UserAction;
 use crate::shortcuts::IdleShortcut;
 use crate::theme::Theme;
-use crate::types::{AppState, UserAction};
+use crate::types::AppState;
 use crate::vim::VimState;
 
 #[allow(clippy::too_many_arguments)]
@@ -40,19 +41,19 @@ pub(crate) fn handle_idle_navigation_shortcut(
             }
         }
         IdleShortcut::PageUp => {
-            let page = state.visible_height.saturating_sub(2);
+            let page = state.viewport.visible_height.saturating_sub(2);
             state.scroll_up(page);
         }
         IdleShortcut::PageDown => {
-            let page = state.visible_height.saturating_sub(2);
+            let page = state.viewport.visible_height.saturating_sub(2);
             state.scroll_down(page);
         }
         IdleShortcut::HalfPageUp => {
-            let page = state.visible_height / 2;
+            let page = state.viewport.visible_height / 2;
             state.scroll_up(page);
         }
         IdleShortcut::HalfPageDown => {
-            let page = state.visible_height / 2;
+            let page = state.viewport.visible_height / 2;
             state.scroll_down(page);
         }
         IdleShortcut::Backtrack => {

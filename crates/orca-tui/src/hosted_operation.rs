@@ -5,8 +5,8 @@ use orca_runtime::runtime_host::RuntimeThreadHandle;
 use orca_runtime::surface::SurfaceOperationId;
 
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::TuiEvent;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::TuiEvent;
 
 pub(crate) enum HostedOperationAction {
     Resume { operation_id: SurfaceOperationId },

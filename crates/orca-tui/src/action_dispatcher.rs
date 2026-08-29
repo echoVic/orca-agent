@@ -7,7 +7,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use crate::channels::{TUI_EVENT_CAPACITY, USER_ACTION_CAPACITY};
 use crate::operation_controller::TuiSurfaceTaskControl;
-use crate::types::{TuiEvent, TuiInteractionKey, UserAction};
+use crate::protocol::{TuiEvent, TuiInteractionKey, UserAction};
 
 // One runtime-event batch, one already-full action mailbox, and one direct
 // interaction response can be produced before the frame loop drains acks.
@@ -486,7 +486,7 @@ mod tests {
 
     use super::{InteractionResponseAck, TuiActionDispatcher, interaction_response_ack};
     use crate::operation_controller::TuiSurfaceTaskControl;
-    use crate::types::{
+    use crate::protocol::{
         TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse, UserAction,
     };
 

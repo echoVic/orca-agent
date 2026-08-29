@@ -114,7 +114,7 @@ mod search_paste_tests {
             &mut textarea,
         ));
 
-        assert_eq!(state.transcript_search.query(), "one two");
+        assert_eq!(state.transcript.search.query(), "one two");
         assert_eq!(textarea_text(&textarea), "composer");
         assert!(state.pending_pastes.is_empty());
     }
@@ -127,8 +127,9 @@ mod image_path_paste_tests {
 
     use super::handle_paste_event;
     use crate::clipboard_image::ImagePasteRequest;
+    use crate::protocol::UserAction;
     use crate::test_support::test_run_config;
-    use crate::types::{AppState, UserAction};
+    use crate::types::AppState;
 
     #[test]
     fn pasted_image_path_routes_to_background_attachment_reader() {
@@ -368,7 +369,7 @@ pub(crate) fn handle_paste_event(
     ev: &Event,
     state: &mut AppState,
     config: &RunConfig,
-    action_tx: &mpsc::Sender<crate::types::UserAction>,
+    action_tx: &mpsc::Sender<crate::protocol::UserAction>,
     textarea: &mut TextArea,
 ) -> bool {
     let Event::Paste(pasted) = ev else {
@@ -378,8 +379,8 @@ pub(crate) fn handle_paste_event(
         return true;
     }
     state.user_input_dialog = None;
-    if state.transcript_search.open {
-        state.transcript_search.insert_paste(pasted);
+    if state.transcript.search.open {
+        state.transcript.search.insert_paste(pasted);
         state.refresh_transcript_search();
         return true;
     }
@@ -434,11 +435,11 @@ pub(crate) fn handle_mouse_event(
             MouseEventKind::ScrollDown => viewer.zoom_out(),
             _ => {}
         }
-        state.selection = None;
+        state.viewport.selection = None;
         return MouseFlow::Handled;
     }
     if state.config_dialog.is_some() || state.user_input_dialog.is_some() {
-        state.selection = None;
+        state.viewport.selection = None;
         return MouseFlow::Handled;
     }
     match mouse.kind {
@@ -452,7 +453,7 @@ pub(crate) fn handle_mouse_event(
         }
         MouseEventKind::Down(MouseButton::Left) => {
             const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
-            state.drag_edge_scroll = None;
+            state.viewport.drag_edge_scroll = None;
 
             if !state.show_shortcuts
                 && state.plan_approval_dialog.is_none()
@@ -467,16 +468,18 @@ pub(crate) fn handle_mouse_event(
                     })
                     .map(|hit| hit.image.clone())
             {
-                state.selection = None;
+                state.viewport.selection = None;
                 match crate::image_preview::ImageViewerState::open(image) {
                     Ok(viewer) => state.image_viewer = Some(viewer),
-                    Err(error) => state.push_message(crate::types::ChatMessage::Error(error)),
+                    Err(error) => {
+                        state.push_message(crate::transcript_state::ChatMessage::Error(error))
+                    }
                 }
                 return MouseFlow::Handled;
             }
 
             if state.plan_approval_dialog.is_some() {
-                state.selection = None;
+                state.viewport.selection = None;
                 if let Some(index) =
                     crate::ui::plan_approval_option_hit_index(state, mouse.column, mouse.row)
                     && let Some(dialog) = state.plan_approval_dialog.as_mut()
@@ -493,7 +496,7 @@ pub(crate) fn handle_mouse_event(
             // already-selected option confirms it, anywhere else is inert.
             // (Two-step so a stray click can never approve a command.)
             if state.status == AppStatus::WaitingApproval {
-                state.selection = None;
+                state.viewport.selection = None;
                 if let Some(index) =
                     crate::ui::approval_option_hit_index(state, mouse.column, mouse.row)
                     && let Some(dialog) = state.approval_dialog.as_mut()
@@ -563,7 +566,7 @@ pub(crate) fn handle_mouse_event(
             if matches!(
                 state.status,
                 AppStatus::Idle | AppStatus::WaitingUserInput | AppStatus::Setup
-            ) && let Some(area) = state.input_area
+            ) && let Some(area) = state.viewport.input_area
                 && let Some((row, col)) =
                     crate::ui::composer_click_target(textarea, area, mouse.column, mouse.row)
             {
@@ -578,27 +581,27 @@ pub(crate) fn handle_mouse_event(
                     match crate::image_preview::ImageViewerState::open(image) {
                         Ok(viewer) => state.image_viewer = Some(viewer),
                         Err(error) => {
-                            state.push_message(crate::types::ChatMessage::Error(error));
+                            state.push_message(crate::transcript_state::ChatMessage::Error(error));
                         }
                     }
-                    state.composer_mouse_selecting = false;
-                    state.last_left_click = None;
+                    state.viewport.composer_mouse_selecting = false;
+                    state.viewport.last_left_click = None;
                     return MouseFlow::Handled;
                 }
                 textarea.start_selection();
-                state.composer_mouse_selecting = true;
-                state.last_left_click = None;
+                state.viewport.composer_mouse_selecting = true;
+                state.viewport.last_left_click = None;
                 return MouseFlow::Handled;
             }
 
             // The floating "jump to bottom" pill eats the click before any
             // selection handling: re-arm follow instead of starting a drag.
             if state.panel_mode == PanelMode::Conversation
-                && let Some(pill) = state.jump_to_bottom_area
+                && let Some(pill) = state.viewport.jump_to_bottom_area
                 && pill.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
             {
                 state.scroll_to_bottom();
-                state.last_left_click = None;
+                state.viewport.last_left_click = None;
                 return MouseFlow::Handled;
             }
 
@@ -606,7 +609,7 @@ pub(crate) fn handle_mouse_event(
             // (trackpads rarely double-click on exactly the same cell).
             // Single → cell drag, double → word, triple → line; a fourth
             // quick click cycles back to a plain single click.
-            let count = match state.last_left_click {
+            let count = match state.viewport.last_left_click {
                 Some((at, column, row, previous))
                     if now.duration_since(at) <= MULTI_CLICK_WINDOW
                         && column.abs_diff(mouse.column) <= 1
@@ -616,9 +619,9 @@ pub(crate) fn handle_mouse_event(
                 }
                 _ => 1,
             };
-            state.last_left_click = Some((now, mouse.column, mouse.row, count));
+            state.viewport.last_left_click = Some((now, mouse.column, mouse.row, count));
 
-            state.selection = if state.panel_mode == PanelMode::Conversation {
+            state.viewport.selection = if state.panel_mode == PanelMode::Conversation {
                 let pos = state.transcript_pos_at(mouse.column, mouse.row);
                 match (count, pos) {
                     (2, Some(pos)) => state
@@ -641,8 +644,8 @@ pub(crate) fn handle_mouse_event(
             };
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if state.composer_mouse_selecting {
-                if let Some(area) = state.input_area {
+            if state.viewport.composer_mouse_selecting {
+                if let Some(area) = state.viewport.input_area {
                     // Clamp into the composer so the drag keeps tracking.
                     let column = mouse
                         .column
@@ -664,19 +667,22 @@ pub(crate) fn handle_mouse_event(
                 // screen. The top edge must trigger on the row itself: the
                 // transcript usually starts at y=0, so "above the area"
                 // does not exist there.
-                if let Some(area) = state.transcript_area {
+                if let Some(area) = state.viewport.transcript_area {
                     if mouse.row <= area.y {
                         state.scroll_up(1usize);
-                        state.drag_edge_scroll = Some((-1, mouse.column));
+                        state.viewport.drag_edge_scroll = Some((-1, mouse.column));
                     } else if mouse.row >= area.y.saturating_add(area.height).saturating_sub(1) {
                         state.scroll_down(1usize);
-                        state.drag_edge_scroll = Some((1, mouse.column));
+                        state.viewport.drag_edge_scroll = Some((1, mouse.column));
                     } else {
-                        state.drag_edge_scroll = None;
+                        state.viewport.drag_edge_scroll = None;
                     }
                 }
                 let pos = state.transcript_pos_at_clamped(mouse.column, mouse.row);
-                let dragging = state.selection.filter(|selection| selection.dragging);
+                let dragging = state
+                    .viewport
+                    .selection
+                    .filter(|selection| selection.dragging);
                 if let (Some(mut selection), Some(pos)) = (dragging, pos) {
                     match selection.granularity {
                         SelectionGranularity::Cell => selection.head = pos,
@@ -689,14 +695,14 @@ pub(crate) fn handle_mouse_event(
                             selection.extend_to_unit(pos, unit);
                         }
                     }
-                    state.selection = Some(selection);
+                    state.viewport.selection = Some(selection);
                 }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            state.drag_edge_scroll = None;
-            if state.composer_mouse_selecting {
-                state.composer_mouse_selecting = false;
+            state.viewport.drag_edge_scroll = None;
+            if state.viewport.composer_mouse_selecting {
+                state.viewport.composer_mouse_selecting = false;
                 // A click without a drag leaves no active selection behind.
                 if textarea
                     .selection_range()
@@ -706,7 +712,7 @@ pub(crate) fn handle_mouse_event(
                 }
                 return MouseFlow::Handled;
             }
-            if let Some(selection) = state.selection.filter(|sel| sel.dragging) {
+            if let Some(selection) = state.viewport.selection.filter(|sel| sel.dragging) {
                 let mut settled = selection;
                 settled.dragging = false;
                 // A plain single click selects nothing; word/line units are
@@ -714,9 +720,9 @@ pub(crate) fn handle_mouse_event(
                 let plain_click =
                     settled.granularity == SelectionGranularity::Cell && settled.is_empty();
                 if plain_click {
-                    state.selection = None;
+                    state.viewport.selection = None;
                 } else {
-                    state.selection = Some(settled);
+                    state.viewport.selection = Some(settled);
                     let text = state.extract_selection_text(&settled);
                     if !text.is_empty() {
                         state.stage_clipboard_copy(text, now);
@@ -744,12 +750,11 @@ mod tests {
         BatchedInputEvent, MouseFlow, coalesce_input_events, handle_resize_event,
         handle_scroll_lines, should_queue_input_event,
     };
+    use crate::protocol::UserAction;
     use crate::theme::Theme;
+    use crate::transcript_state::ChatMessage;
     use crate::transcript_view::TranscriptRenderContext;
-    use crate::types::{
-        AppState, AppStatus, ApprovalDialog, ApprovalOption, ChatMessage, PlanApprovalDialog,
-        UserAction,
-    };
+    use crate::types::{AppState, AppStatus, ApprovalDialog, ApprovalOption, PlanApprovalDialog};
 
     /// Test shim: most cases don't care about the composer, so route the real
     /// handler through a throwaway textarea.
@@ -789,14 +794,14 @@ mod tests {
         state.push_message(ChatMessage::System("seed".to_string()));
         state.reconcile_message_tracking();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
-        state.transcript_render_cache.prepare(
-            &state.messages,
-            &state.message_revisions,
+        state.transcript.render_cache.prepare(
+            &state.transcript.messages,
+            &state.transcript.message_revisions,
             TranscriptRenderContext::new(&theme, 20, 0, false),
             |_, _, _, _, _, _| vec![Line::from("hello world")],
         );
-        state.transcript_area = Some(Rect::new(0, 0, 20, 5));
-        state.viewport_base_row = 0;
+        state.viewport.transcript_area = Some(Rect::new(0, 0, 20, 5));
+        state.viewport.viewport_base_row = 0;
         state
     }
 
@@ -810,7 +815,7 @@ mod tests {
             &mut state,
             now,
         );
-        assert!(state.selection.is_some_and(|sel| sel.dragging));
+        assert!(state.viewport.selection.is_some_and(|sel| sel.dragging));
 
         handle_mouse_event(
             &mouse_at(MouseEventKind::Drag(MouseButton::Left), 10, 0),
@@ -823,8 +828,11 @@ mod tests {
             now,
         );
 
-        assert!(state.selection.is_some_and(|sel| !sel.dragging));
-        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("world"));
+        assert!(state.viewport.selection.is_some_and(|sel| !sel.dragging));
+        assert_eq!(
+            state.viewport.pending_clipboard_copy.as_deref(),
+            Some("world")
+        );
     }
 
     #[test]
@@ -843,8 +851,8 @@ mod tests {
             now,
         );
 
-        assert_eq!(state.selection, None);
-        assert_eq!(state.pending_clipboard_copy, None);
+        assert_eq!(state.viewport.selection, None);
+        assert_eq!(state.viewport.pending_clipboard_copy, None);
     }
 
     #[test]
@@ -867,7 +875,7 @@ mod tests {
             &mut state,
             now,
         );
-        assert!(state.selection.is_some());
+        assert!(state.viewport.selection.is_some());
 
         // Next press lands below the transcript area (row 30).
         handle_mouse_event(
@@ -875,7 +883,7 @@ mod tests {
             &mut state,
             now,
         );
-        assert_eq!(state.selection, None);
+        assert_eq!(state.viewport.selection, None);
     }
 
     #[test]
@@ -901,7 +909,10 @@ mod tests {
 
         // Clamped to the area's bottom-right cell; extraction still stops at
         // the actual content, so the whole line is copied.
-        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello world"));
+        assert_eq!(
+            state.viewport.pending_clipboard_copy.as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]
@@ -910,8 +921,8 @@ mod tests {
         let now = Instant::now();
 
         handle_mouse_event(&mouse(MouseEventKind::ScrollUp), &mut state, now);
-        assert_eq!(state.selection, None);
-        assert_eq!(state.pending_clipboard_copy, None);
+        assert_eq!(state.viewport.selection, None);
+        assert_eq!(state.viewport.pending_clipboard_copy, None);
     }
 
     #[test]
@@ -932,8 +943,11 @@ mod tests {
             );
         }
 
-        assert!(state.selection.is_some_and(|sel| !sel.dragging));
-        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("world"));
+        assert!(state.viewport.selection.is_some_and(|sel| !sel.dragging));
+        assert_eq!(
+            state.viewport.pending_clipboard_copy.as_deref(),
+            Some("world")
+        );
     }
 
     #[test]
@@ -963,18 +977,18 @@ mod tests {
             later,
         );
 
-        assert_eq!(state.selection, None);
-        assert_eq!(state.pending_clipboard_copy, None);
+        assert_eq!(state.viewport.selection, None);
+        assert_eq!(state.viewport.pending_clipboard_copy, None);
     }
 
     #[test]
     fn dragging_past_the_edges_scrolls_the_transcript() {
         let mut state = state_with_transcript();
         // Pretend the transcript overflows the area so scrolling is possible.
-        state.total_lines = 50;
-        state.visible_height = 5;
-        state.scroll_offset = 10;
-        state.auto_scroll = false;
+        state.viewport.total_lines = 50;
+        state.viewport.visible_height = 5;
+        state.viewport.scroll_offset = 10;
+        state.viewport.auto_scroll = false;
         let now = Instant::now();
 
         handle_mouse_event(
@@ -988,7 +1002,7 @@ mod tests {
             &mut state,
             now,
         );
-        assert_eq!(state.scroll_offset, 11);
+        assert_eq!(state.viewport.scroll_offset, 11);
         // ...and dragging onto the TOP ROW scrolls up. The transcript area
         // starts at y=0, so there is no "above the area" — the first row
         // itself must trigger.
@@ -997,16 +1011,16 @@ mod tests {
             &mut state,
             now,
         );
-        assert_eq!(state.scroll_offset, 10);
+        assert_eq!(state.viewport.scroll_offset, 10);
     }
 
     #[test]
     fn parked_pointer_at_the_edge_keeps_scrolling_via_animation_ticks() {
         let mut state = state_with_transcript();
-        state.total_lines = 50;
-        state.visible_height = 5;
-        state.scroll_offset = 10;
-        state.auto_scroll = false;
+        state.viewport.total_lines = 50;
+        state.viewport.visible_height = 5;
+        state.viewport.scroll_offset = 10;
+        state.viewport.auto_scroll = false;
         let now = Instant::now();
 
         handle_mouse_event(
@@ -1020,16 +1034,16 @@ mod tests {
             &mut state,
             now,
         );
-        assert_eq!(state.drag_edge_scroll, Some((-1, 3)));
-        assert_eq!(state.scroll_offset, 9);
-        let head_before = state.selection.unwrap().head;
+        assert_eq!(state.viewport.drag_edge_scroll, Some((-1, 3)));
+        assert_eq!(state.viewport.scroll_offset, 9);
+        let head_before = state.viewport.selection.unwrap().head;
 
         // With the pointer parked (no further mouse events), animation ticks
         // keep scrolling and keep growing the selection upward.
         state.apply_drag_edge_scroll();
         state.apply_drag_edge_scroll();
-        assert_eq!(state.scroll_offset, 7);
-        let head_after = state.selection.unwrap().head;
+        assert_eq!(state.viewport.scroll_offset, 7);
+        let head_after = state.viewport.selection.unwrap().head;
         assert_eq!(head_after.row, head_before.row.saturating_sub(2));
 
         // Dragging back inside the area disarms it...
@@ -1038,7 +1052,7 @@ mod tests {
             &mut state,
             now,
         );
-        assert_eq!(state.drag_edge_scroll, None);
+        assert_eq!(state.viewport.drag_edge_scroll, None);
 
         // ...and so does releasing the button at the edge.
         handle_mouse_event(
@@ -1046,27 +1060,27 @@ mod tests {
             &mut state,
             now,
         );
-        assert!(state.drag_edge_scroll.is_some());
+        assert!(state.viewport.drag_edge_scroll.is_some());
         handle_mouse_event(
             &mouse_at(MouseEventKind::Up(MouseButton::Left), 3, 0),
             &mut state,
             now,
         );
-        assert_eq!(state.drag_edge_scroll, None);
+        assert_eq!(state.viewport.drag_edge_scroll, None);
         // A settled (non-dragging) selection is no longer grown by ticks.
-        let settled_head = state.selection.unwrap().head;
+        let settled_head = state.viewport.selection.unwrap().head;
         state.apply_drag_edge_scroll();
-        assert_eq!(state.selection.unwrap().head, settled_head);
+        assert_eq!(state.viewport.selection.unwrap().head, settled_head);
     }
 
     #[test]
     fn clicking_the_jump_pill_rearms_follow_instead_of_selecting() {
         let mut state = state_with_transcript();
-        state.total_lines = 50;
-        state.visible_height = 5;
-        state.scroll_offset = 10;
-        state.auto_scroll = false;
-        state.jump_to_bottom_area = Some(Rect::new(5, 4, 10, 1));
+        state.viewport.total_lines = 50;
+        state.viewport.visible_height = 5;
+        state.viewport.scroll_offset = 10;
+        state.viewport.auto_scroll = false;
+        state.viewport.jump_to_bottom_area = Some(Rect::new(5, 4, 10, 1));
         let now = Instant::now();
 
         handle_mouse_event(
@@ -1075,10 +1089,10 @@ mod tests {
             now,
         );
 
-        assert!(state.auto_scroll);
-        assert_eq!(state.scroll_offset, 45);
+        assert!(state.viewport.auto_scroll);
+        assert_eq!(state.viewport.scroll_offset, 45);
         // The click was consumed by the pill: no selection was started.
-        assert_eq!(state.selection, None);
+        assert_eq!(state.viewport.selection, None);
 
         // A click elsewhere still starts a selection as usual.
         handle_mouse_event(
@@ -1086,7 +1100,7 @@ mod tests {
             &mut state,
             now,
         );
-        assert!(state.selection.is_some());
+        assert!(state.viewport.selection.is_some());
     }
 
     #[test]
@@ -1154,10 +1168,10 @@ mod tests {
             &mut state,
             now,
         );
-        assert!(state.selection.is_some());
+        assert!(state.viewport.selection.is_some());
 
         assert!(handle_resize_event(&Event::Resize(100, 40), &mut state));
-        assert_eq!(state.selection, None);
+        assert_eq!(state.viewport.selection, None);
         assert!(!handle_resize_event(
             &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             &mut state
@@ -1190,7 +1204,10 @@ mod tests {
             &mut state,
             now,
         );
-        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("world"));
+        assert_eq!(
+            state.viewport.pending_clipboard_copy.as_deref(),
+            Some("world")
+        );
     }
 
     #[test]
@@ -1211,7 +1228,10 @@ mod tests {
             );
         }
 
-        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello world"));
+        assert_eq!(
+            state.viewport.pending_clipboard_copy.as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]
@@ -1247,14 +1267,17 @@ mod tests {
             now,
         );
 
-        assert_eq!(state.pending_clipboard_copy.as_deref(), Some("hello world"));
+        assert_eq!(
+            state.viewport.pending_clipboard_copy.as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]
     fn approval_clicks_select_then_confirm_and_suppress_transcript_selection() {
         let mut state = state_with_transcript();
         state.status = AppStatus::WaitingApproval;
-        state.frame_area = Some(Rect::new(0, 0, 80, 24));
+        state.viewport.frame_area = Some(Rect::new(0, 0, 80, 24));
         state.approval_dialog = Some(ApprovalDialog {
             id: "1".to_string(),
             interaction: None,
@@ -1298,7 +1321,7 @@ mod tests {
             Some(2)
         );
         // No transcript selection was started underneath the dialog.
-        assert_eq!(state.selection, None);
+        assert_eq!(state.viewport.selection, None);
 
         // Click it again: confirm via the synthetic Enter path.
         assert_eq!(
@@ -1318,7 +1341,7 @@ mod tests {
     #[test]
     fn plan_approval_clicks_select_then_confirm() {
         let mut state = state_with_transcript();
-        state.frame_area = Some(Rect::new(0, 0, 100, 30));
+        state.viewport.frame_area = Some(Rect::new(0, 0, 100, 30));
         state.plan_approval_dialog = Some(PlanApprovalDialog {
             plan: "- inspect\n- implement".to_string(),
             selected: 0,
@@ -1444,7 +1467,7 @@ mod tests {
     fn session_picker_click_selects_then_resumes() {
         let mut state = state_with_transcript();
         state.status = AppStatus::SessionPicker;
-        state.frame_area = Some(Rect::new(0, 0, 80, 24));
+        state.viewport.frame_area = Some(Rect::new(0, 0, 80, 24));
         state.session_picker_sessions =
             vec![test_session_summary("alpha"), test_session_summary("beta")];
         state.session_picker_selected = 0;
@@ -1473,8 +1496,8 @@ mod tests {
     #[test]
     fn slash_menu_click_selects_then_accepts() {
         let mut state = state_with_transcript();
-        state.frame_area = Some(Rect::new(0, 0, 60, 24));
-        state.input_area = Some(Rect::new(0, 20, 60, 3));
+        state.viewport.frame_area = Some(Rect::new(0, 0, 60, 24));
+        state.viewport.input_area = Some(Rect::new(0, 20, 60, 3));
         state.slash_menu = Some(crate::types::SlashMenu {
             items: vec![
                 crate::types::SlashMenuItem {
@@ -1515,7 +1538,7 @@ mod tests {
     #[test]
     fn composer_click_positions_cursor_and_drag_selects() {
         let mut state = state_with_transcript();
-        state.input_area = Some(Rect::new(0, 20, 40, 2));
+        state.viewport.input_area = Some(Rect::new(0, 20, 40, 2));
         let mut textarea = TextArea::from(["hello world", "second line"]);
         let now = Instant::now();
 
@@ -1528,7 +1551,7 @@ mod tests {
         );
         assert_eq!(flow, MouseFlow::Handled);
         assert_eq!(textarea.cursor(), (1, 6));
-        assert!(state.composer_mouse_selecting);
+        assert!(state.viewport.composer_mouse_selecting);
 
         // Drag to column 11 on the same row: an in-composer selection forms.
         super::handle_mouse_event(
@@ -1543,7 +1566,7 @@ mod tests {
             &mut textarea,
             now,
         );
-        assert!(!state.composer_mouse_selecting);
+        assert!(!state.viewport.composer_mouse_selecting);
         assert_eq!(
             textarea.selection_range(),
             Some(((1, 6), (1, 11))),

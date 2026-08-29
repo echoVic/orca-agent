@@ -3,9 +3,12 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::composer_textarea::{expand_pending_pastes_with_bindings, retain_active_pending_pastes};
-use crate::types::{AppState, UserAction};
+use crate::protocol::UserAction;
 #[cfg(test)]
-use crate::types::{AppStatus, ChatMessage};
+use crate::transcript_state::ChatMessage;
+use crate::types::AppState;
+#[cfg(test)]
+use crate::types::AppStatus;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueuedUserMessage {
@@ -697,7 +700,7 @@ mod tests {
     use orca_runtime::mentions::{MentionBinding, MentionBindings, MentionFileKind, MentionTarget};
 
     use super::*;
-    use crate::types::TuiEvent;
+    use crate::protocol::TuiEvent;
 
     fn app_state() -> AppState {
         let (tx, _rx) = crossbeam_channel::unbounded();
@@ -1098,7 +1101,7 @@ mod tests {
         assert!(state.queued_submission_in_flight());
         assert!(state.begin_next_queued_message().is_none());
         assert!(matches!(
-            state.messages.last(),
+            state.transcript.messages.last(),
             Some(ChatMessage::User(text)) if text == "first"
         ));
         assert!(!state.input_history.iter().any(|entry| entry == "first"));
@@ -1160,6 +1163,7 @@ mod tests {
         );
         assert!(
             !state
+                .transcript
                 .messages
                 .iter()
                 .any(|message| matches!(message, ChatMessage::User(text) if text == "first"))

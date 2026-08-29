@@ -10,8 +10,8 @@ use orca_runtime::runtime_host::{RuntimeHostHandle, RuntimeThreadHandle};
 use crate::hosted_session::announce_runtime_ready;
 use crate::hosted_session_lifecycle::ensure_hosted_thread;
 use crate::operation_controller::TuiSurfaceTaskControl;
+use crate::protocol::TuiEvent;
 use crate::surface_actions::TuiSurfaceActions;
-use crate::types::TuiEvent;
 
 pub(crate) enum HostedWorkflowAction {
     Run { name: String, args: Option<String> },

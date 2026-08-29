@@ -2,7 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_channel as mpsc;
 
-use crate::types::{AppState, AttachedTuiEvent, SessionAttachmentId, SideParentStatus, TuiEvent};
+use crate::protocol::SessionAttachmentId;
+use crate::protocol::{AttachedTuiEvent, TuiEvent};
+use crate::types::{AppState, SideParentStatus};
 
 #[derive(Default)]
 pub(crate) struct AttachmentRouting {
@@ -270,7 +272,7 @@ mod tests {
     use orca_core::cost_types::UsageTotals;
 
     use super::*;
-    use crate::types::{TuiInteractionKey, TuiInteractionKind};
+    use crate::protocol::{TuiInteractionKey, TuiInteractionKind};
 
     fn approval(request_id: &str) -> TuiEvent {
         TuiEvent::ApprovalNeeded {

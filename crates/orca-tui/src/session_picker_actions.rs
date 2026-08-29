@@ -5,7 +5,8 @@ use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent};
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
-use crate::types::{AppState, AppStatus, SessionPickerPhase, UserAction};
+use crate::protocol::UserAction;
+use crate::types::{AppState, AppStatus, SessionPickerPhase};
 
 pub(crate) const SESSION_PICKER_PAGE_SIZE: usize = 20;
 

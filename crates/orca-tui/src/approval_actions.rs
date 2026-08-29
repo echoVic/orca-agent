@@ -1,8 +1,7 @@
 use crossbeam_channel as mpsc;
 
-use crate::types::{
-    AppState, AppStatus, ApprovalOption, TuiInteractionKind, TuiInteractionResponse, UserAction,
-};
+use crate::protocol::{TuiInteractionKind, TuiInteractionResponse, UserAction};
+use crate::types::{AppState, AppStatus, ApprovalOption};
 
 /// Resolve the approval dialog by the chosen option. The "always allow"
 /// options record a session allowlist entry so later matching approvals are
