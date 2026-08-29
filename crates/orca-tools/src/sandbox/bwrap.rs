@@ -378,7 +378,7 @@ mod tests {
     fn restricted_policy_creates_absolute_mount_parents_before_chdir() {
         let mut policy = base_policy();
         policy.read_scope = LinuxReadScope::Restricted;
-        policy.cwd = PathBuf::from("/tmp/.tmp123/workspace");
+        policy.cwd = platform_slash_tmp_path().join(".tmp123/workspace");
 
         let argv = build_bwrap_argv(&policy, "true");
         let joined = argv_string(&argv);
