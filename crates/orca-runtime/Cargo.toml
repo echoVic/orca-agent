@@ -24,6 +24,7 @@ rusqlite = { workspace = true }
 hickory-resolver = { workspace = true }
 tokio = { workspace = true }
 sha2 = { workspace = true }
+ring = { workspace = true }
 base64 = { workspace = true }
 globset = { workspace = true }
 nucleo = { workspace = true }

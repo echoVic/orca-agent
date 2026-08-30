@@ -1900,6 +1900,7 @@ dependencies = [
  "orca-tools",
  "orca-windows-sandbox",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

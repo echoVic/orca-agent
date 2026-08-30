@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,8 +28,10 @@ use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::tool_types::ToolRequest;
 use orca_core::workflow_types::WorkflowInput;
-use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write};
+use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write, open_nofollow};
 use orca_platform::process::ProcessJob;
+use ring::rand::SystemRandom;
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_continuation::{
@@ -40,9 +43,12 @@ use crate::lifecycle::{
     RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord, RuntimeUsageTotals,
 };
 use crate::model_response::RuntimeModelResponse;
+use crate::runtime_permission::{
+    RuntimePermissionContext, RuntimePermissionRequest, RuntimePermissionResponse,
+};
 use crate::runtime_surface::{
-    DisplayText, Sha256Digest, SurfaceOperationFence, SurfaceTask, SurfaceTaskId,
-    SurfaceTaskStatus, SurfaceTaskType, TaskRevision, UnixMillis,
+    DisplayText, Sha256Digest, SurfaceInteractionId, SurfaceOperationFence, SurfaceSubagentId,
+    SurfaceTask, SurfaceTaskId, SurfaceTaskStatus, SurfaceTaskType, TaskRevision, UnixMillis,
     UsageTotals as SurfaceUsageTotals,
 };
 use crate::subagent_event_relay::{
@@ -141,6 +147,14 @@ pub struct TaskRegistry {
     /// be imported by id, while a binding is scoped to this session and the
     /// exact continuation attempt that the actor admitted.
     detached_bindings: Arc<Mutex<HashMap<String, DetachedSubagentBinding>>>,
+    /// Durable request/response mailbox used by detached workers when a
+    /// capability prompt crosses the process boundary. The surface actor is
+    /// the only component that may resolve a pending entry.
+    detached_permission_requests: Arc<Mutex<HashMap<String, DetachedPermissionRequest>>>,
+    /// Actor-only signing keys for detached permission responses. Private
+    /// material is process-local and is never persisted or passed to workers;
+    /// a process restart therefore fails closed (it can still issue Deny).
+    detached_permission_signers: Arc<Mutex<HashMap<String, Arc<Ed25519KeyPair>>>>,
     persistence: Option<Arc<TaskPersistence>>,
     persistent_open_error: Option<Arc<str>>,
     recover_persisted_active_tasks: bool,
@@ -148,6 +162,7 @@ pub struct TaskRegistry {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DetachedSubagentBinding {
     pub(crate) task_id: String,
     pub(crate) subagent_id: String,
@@ -162,6 +177,473 @@ pub(crate) struct DetachedSubagentBinding {
     /// Random actor-issued capability digest.  It is never derived solely
     /// from compatibility/configuration data.
     pub(crate) authority_digest: Sha256Digest,
+    /// Public half of the actor-only Ed25519 response signer. The private key
+    /// remains in the parent process and is never persisted or given to the
+    /// detached worker.
+    pub(crate) permission_response_public_key: [u8; 32],
+}
+
+fn validate_detached_subagent_binding(
+    map_key: Option<&str>,
+    binding: &DetachedSubagentBinding,
+) -> Result<(), String> {
+    if map_key.is_some_and(|key| key != binding.task_id)
+        || SurfaceTaskId::try_new(binding.task_id.clone()).is_err()
+        || SurfaceSubagentId::try_new(binding.subagent_id.clone()).is_err()
+        || binding.attempt_id.as_str().is_empty()
+        || binding.task_revision.get() == 0
+        || binding
+            .authority_digest
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        || binding
+            .permission_response_public_key
+            .iter()
+            .all(|byte| *byte == 0)
+    {
+        return Err("detached subagent binding failed identity validation".to_string());
+    }
+    if let Some(parent_fence) = binding.parent_fence.as_ref()
+        && (parent_fence
+            .thread_id
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+            || parent_fence
+                .operation_id
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || parent_fence.generation_id.get() == 0
+            || parent_fence.thread_owner_epoch.get() == 0)
+    {
+        return Err("detached subagent binding has an invalid parent fence".to_string());
+    }
+    Ok(())
+}
+
+fn validate_detached_subagent_binding_map(
+    bindings: &HashMap<String, DetachedSubagentBinding>,
+) -> Result<(), String> {
+    if bindings.len() > MAX_DETACHED_BINDINGS {
+        return Err(format!(
+            "detached binding map contains too many records ({} > {})",
+            bindings.len(),
+            MAX_DETACHED_BINDINGS
+        ));
+    }
+    let encoded_bytes = serde_json::to_vec(bindings)
+        .map_err(|error| format!("detached binding map is not serializable: {error}"))?
+        .len();
+    if encoded_bytes > MAX_DETACHED_BINDING_FILE_BYTES {
+        return Err(format!(
+            "detached binding map is too large ({} > {})",
+            encoded_bytes, MAX_DETACHED_BINDING_FILE_BYTES
+        ));
+    }
+    for (map_key, binding) in bindings {
+        let encoded_entry_bytes = serde_json::to_vec(binding)
+            .map_err(|error| format!("detached binding is not serializable: {error}"))?
+            .len();
+        if encoded_entry_bytes > MAX_DETACHED_BINDING_ENTRY_BYTES {
+            return Err(format!(
+                "detached binding '{}' exceeds the {} byte limit",
+                map_key, MAX_DETACHED_BINDING_ENTRY_BYTES
+            ));
+        }
+        validate_detached_subagent_binding(Some(map_key), binding)?;
+    }
+    Ok(())
+}
+
+const DETACHED_PERMISSION_SCHEMA_VERSION: u16 = 3;
+/// Bound the process-independent mailbox before parsing or rewriting it. A
+/// detached child is untrusted input and must not be able to make every actor
+/// tick deserialize an unbounded JSON map.
+const MAX_DETACHED_PERMISSION_REQUESTS: usize = 256;
+const MAX_DETACHED_PERMISSION_REQUEST_ID_BYTES: usize = 256;
+const MAX_DETACHED_PERMISSION_REASON_BYTES: usize = 64 * 1024;
+const MAX_DETACHED_PERMISSION_ENTRY_BYTES: usize = 256 * 1024;
+const MAX_DETACHED_PERMISSION_MAILBOX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DETACHED_PERMISSION_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DETACHED_BINDINGS: usize = 256;
+const MAX_DETACHED_BINDING_ENTRY_BYTES: usize = 64 * 1024;
+const MAX_DETACHED_BINDING_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+/// A process-independent permission handoff. It intentionally repeats the
+/// child owner tuple instead of relying on a task id lookup: every field is
+/// checked against the durable detached binding before a response is written.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DetachedPermissionRequest {
+    pub(crate) schema_version: u16,
+    pub(crate) key: String,
+    /// Stable surface identity allocated at the mailbox boundary. Persisting
+    /// it makes actor restart idempotent: a request can be reattached to its
+    /// existing interaction instead of creating a second prompt.
+    pub(crate) interaction_id: SurfaceInteractionId,
+    pub(crate) request: RuntimePermissionRequest,
+    pub(crate) attempt_id: AgentAttemptId,
+    pub(crate) authority_digest: Sha256Digest,
+    /// Public key used to authenticate an actor-issued Allow response.
+    pub(crate) permission_response_public_key: [u8; 32],
+    pub(crate) request_digest: Sha256Digest,
+    pub(crate) response: Option<RuntimePermissionResponse>,
+    pub(crate) response_digest: Option<Sha256Digest>,
+    /// Ed25519 signature over the request-bound response. Deny responses are
+    /// intentionally unsigned because an unauthenticated Deny is fail-closed.
+    pub(crate) response_signature: Option<Vec<u8>>,
+}
+
+impl DetachedPermissionRequest {
+    pub(crate) fn is_pending(&self) -> bool {
+        self.response.is_none()
+    }
+
+    pub(crate) fn verify_request_digest(&self) -> bool {
+        detached_permission_request_digest(
+            &self.request,
+            &self.attempt_id,
+            &self.authority_digest,
+            &self.interaction_id,
+            &self.permission_response_public_key,
+        )
+        .is_ok_and(|digest| digest == self.request_digest)
+    }
+
+    pub(crate) fn verify_response_digest(&self) -> bool {
+        match (&self.response, &self.response_digest) {
+            (None, None) => true,
+            (Some(response), Some(digest)) => {
+                detached_permission_response_digest(&self.request_digest, response)
+                    .is_ok_and(|expected| *digest == expected)
+            }
+            _ => false,
+        }
+    }
+
+    /// Verifies an actor response against the public key carried by this
+    /// record. This is useful for intrinsic mailbox validation, but callers
+    /// at a worker/actor trust boundary must use
+    /// `verify_response_signature_with_key` with the immutable binding key.
+    pub(crate) fn verify_response_signature(&self) -> bool {
+        self.verify_response_signature_with_key(&self.permission_response_public_key)
+    }
+
+    pub(crate) fn verify_response_signature_with_key(&self, public_key: &[u8; 32]) -> bool {
+        match (&self.response, &self.response_signature) {
+            (None, None) => true,
+            (Some(response), None)
+                if response.decision == crate::protocol::PermissionResponseDecision::Deny =>
+            {
+                true
+            }
+            (Some(response), Some(signature))
+                if response.decision == crate::protocol::PermissionResponseDecision::Allow
+                    && signature.len() == DETACHED_PERMISSION_SIGNATURE_BYTES =>
+            {
+                verify_detached_permission_response_signature(
+                    &self.request_digest,
+                    response,
+                    signature,
+                    public_key,
+                )
+            }
+            _ => false,
+        }
+    }
+}
+
+fn detached_permission_request_digest(
+    request: &RuntimePermissionRequest,
+    attempt_id: &AgentAttemptId,
+    authority_digest: &Sha256Digest,
+    interaction_id: &SurfaceInteractionId,
+    permission_response_public_key: &[u8; 32],
+) -> Result<Sha256Digest, String> {
+    let bytes = canonical_json_bytes(&(
+        request,
+        attempt_id,
+        authority_digest,
+        interaction_id,
+        permission_response_public_key,
+    ))
+    .map_err(|error| format!("detached permission request is not serializable: {error}"))?;
+    Ok(Sha256Digest::digest(bytes))
+}
+
+fn detached_permission_response_digest(
+    request_digest: &Sha256Digest,
+    response: &RuntimePermissionResponse,
+) -> Result<Sha256Digest, String> {
+    let bytes = canonical_json_bytes(&(request_digest, response))
+        .map_err(|error| format!("detached permission response is not serializable: {error}"))?;
+    Ok(Sha256Digest::digest(bytes))
+}
+
+const DETACHED_PERMISSION_SIGNATURE_BYTES: usize = 64;
+
+fn detached_permission_response_signing_bytes(
+    request_digest: &Sha256Digest,
+    response: &RuntimePermissionResponse,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut bytes = b"orca.detached-permission.response.v1\0".to_vec();
+    bytes.extend(canonical_json_bytes(&(request_digest, response))?);
+    Ok(bytes)
+}
+
+fn verify_detached_permission_response_signature(
+    request_digest: &Sha256Digest,
+    response: &RuntimePermissionResponse,
+    signature: &[u8],
+    public_key: &[u8; 32],
+) -> bool {
+    let Ok(message) = detached_permission_response_signing_bytes(request_digest, response) else {
+        return false;
+    };
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(&message, signature)
+        .is_ok()
+}
+
+fn detached_signer_key(task_id: &str, attempt_id: &AgentAttemptId) -> String {
+    format!("{task_id}:{}", attempt_id.as_str())
+}
+
+/// Derive the surface interaction identity from actor-issued capability
+/// material.  The detached worker may write the mailbox record, but it must
+/// not be able to choose which interaction the actor will attach to it.
+pub(crate) fn detached_permission_interaction_id(
+    binding: &DetachedSubagentBinding,
+    request_id: &str,
+) -> Result<SurfaceInteractionId, String> {
+    let material = canonical_json_bytes(&(
+        "orca.detached-permission.interaction.v1",
+        &binding.task_id,
+        &binding.subagent_id,
+        &binding.task_revision,
+        &binding.attempt_id,
+        &binding.authority_digest,
+        request_id,
+    ))
+    .map_err(|error| format!("detached interaction identity is not serializable: {error}"))?;
+    let digest = Sha256Digest::digest(material);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    // SurfaceInteractionId intentionally accepts UUIDv7 only.  Preserve that
+    // wire invariant while using the digest as the deterministic payload.
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    SurfaceInteractionId::try_from_bytes(bytes)
+        .map_err(|error| format!("detached interaction identity is invalid: {error}"))
+}
+
+fn generate_detached_permission_signer() -> Result<([u8; 32], Arc<Ed25519KeyPair>), String> {
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|_| "failed to generate detached permission response signer".to_string())?;
+    let signer = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+        .map_err(|_| "failed to parse detached permission response signer".to_string())?;
+    let public_key =
+        signer.public_key().as_ref().try_into().map_err(|_| {
+            "detached permission response public key has an invalid length".to_string()
+        })?;
+    Ok((public_key, Arc::new(signer)))
+}
+
+/// serde_json preserves a `HashMap`'s iteration order, which is not stable
+/// across process boundaries because each map gets a fresh hash seed. Mailbox
+/// digests therefore use a canonical JSON representation with object keys
+/// sorted recursively; arrays retain their order because it is part of the
+/// request semantics.
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+    fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(canonicalize).collect::<Vec<_>>())
+            }
+            serde_json::Value::Object(values) => {
+                let mut entries = values.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                let mut sorted = serde_json::Map::with_capacity(entries.len());
+                for (key, value) in entries {
+                    sorted.insert(key, canonicalize(value));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            scalar => scalar,
+        }
+    }
+
+    serde_json::to_vec(&canonicalize(serde_json::to_value(value)?))
+}
+
+/// Validate a mailbox record before it is exposed to either a worker or the
+/// surface actor.  The map key is part of the authenticated identity: a
+/// record copied under another key must never become addressable through that
+/// alias.
+fn validate_detached_permission_entry(
+    map_key: Option<&str>,
+    entry: &DetachedPermissionRequest,
+) -> Result<(), String> {
+    let encoded_entry_bytes = serde_json::to_vec(entry)
+        .map_err(|error| {
+            format!("detached permission mailbox record is not serializable: {error}")
+        })?
+        .len();
+    let owner_key_matches = match &entry.request.context {
+        RuntimePermissionContext::Child {
+            task_id,
+            agent_id,
+            tool_call_id,
+            origin,
+            ..
+        } => {
+            *origin == crate::runtime_surface::SurfacePermissionOrigin::ChildAgent
+                && !entry.request.id.is_empty()
+                && entry.request.id == tool_call_id.as_str()
+                && !agent_id.as_str().is_empty()
+                && entry.key
+                    == format!(
+                        "{}:{}:{}",
+                        task_id.as_str(),
+                        entry.attempt_id.as_str(),
+                        entry.request.id
+                    )
+        }
+        RuntimePermissionContext::Foreground { .. } => false,
+    };
+    if entry.schema_version != DETACHED_PERMISSION_SCHEMA_VERSION
+        || encoded_entry_bytes > MAX_DETACHED_PERMISSION_ENTRY_BYTES
+        || map_key.is_some_and(|key| key != entry.key)
+        || !owner_key_matches
+        || entry
+            .permission_response_public_key
+            .iter()
+            .all(|byte| *byte == 0)
+        || entry.request.id.len() > MAX_DETACHED_PERMISSION_REQUEST_ID_BYTES
+        || entry
+            .request
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.len() > MAX_DETACHED_PERMISSION_REASON_BYTES)
+        || !entry.verify_request_digest()
+        || !entry.verify_response_digest()
+        || !entry.verify_response_signature()
+    {
+        return Err("detached permission mailbox record failed integrity validation".to_string());
+    }
+    Ok(())
+}
+
+/// The interaction id is allocated once, when a mailbox key is first
+/// inserted.  Retries compare the request payload and actor-issued owner
+/// tuple directly, rather than deriving a new digest from a fresh UUID.
+fn detached_permission_identity_matches(
+    existing: &DetachedPermissionRequest,
+    request: &RuntimePermissionRequest,
+    binding: &DetachedSubagentBinding,
+) -> bool {
+    existing.request == *request
+        && existing.attempt_id == binding.attempt_id
+        && existing.authority_digest == binding.authority_digest
+        && existing.permission_response_public_key == binding.permission_response_public_key
+}
+
+/// Binds a mailbox record to the actor-issued detached capability. The
+/// mailbox is writable by the child process, so its self-reported authority
+/// digest and public key are not sufficient evidence on their own.
+fn validate_detached_permission_binding(
+    entry: &DetachedPermissionRequest,
+    binding: &DetachedSubagentBinding,
+) -> Result<(), String> {
+    let owner_matches = match &entry.request.context {
+        RuntimePermissionContext::Child {
+            task_id,
+            task_revision,
+            agent_id,
+            origin,
+            ..
+        } => {
+            *origin == crate::runtime_surface::SurfacePermissionOrigin::ChildAgent
+                && task_id.as_str() == binding.task_id
+                && *task_revision == binding.task_revision
+                && agent_id.as_str() == binding.subagent_id
+        }
+        RuntimePermissionContext::Foreground { .. } => false,
+    };
+    let expected_key = format!(
+        "{}:{}:{}",
+        binding.task_id,
+        binding.attempt_id.as_str(),
+        entry.request.id
+    );
+    let request_digest_matches = detached_permission_request_digest(
+        &entry.request,
+        &entry.attempt_id,
+        &entry.authority_digest,
+        &entry.interaction_id,
+        &binding.permission_response_public_key,
+    )
+    .is_ok_and(|digest| digest == entry.request_digest);
+    let interaction_id_matches = detached_permission_interaction_id(binding, &entry.request.id)
+        .is_ok_and(|expected| expected == entry.interaction_id);
+    if !owner_matches
+        || entry.key != expected_key
+        || entry.attempt_id != binding.attempt_id
+        || entry.authority_digest != binding.authority_digest
+        || entry.permission_response_public_key != binding.permission_response_public_key
+        || !interaction_id_matches
+        || !request_digest_matches
+    {
+        return Err("detached permission request does not match its actor binding".to_string());
+    }
+    Ok(())
+}
+
+fn detached_permission_binding_from_map(
+    bindings: &HashMap<String, DetachedSubagentBinding>,
+    entry: &DetachedPermissionRequest,
+) -> Result<DetachedSubagentBinding, String> {
+    let task_id = match &entry.request.context {
+        RuntimePermissionContext::Child { task_id, .. } => task_id.as_str(),
+        RuntimePermissionContext::Foreground { .. } => {
+            return Err("detached permission response owner is not child-scoped".to_string());
+        }
+    };
+    let binding = bindings
+        .get(task_id)
+        .cloned()
+        .ok_or_else(|| "detached permission owner binding is unavailable".to_string())?;
+    validate_detached_subagent_binding(Some(task_id), &binding)?;
+    validate_detached_permission_binding(entry, &binding)?;
+    Ok(binding)
+}
+
+fn validate_detached_permission_map(
+    entries: &HashMap<String, DetachedPermissionRequest>,
+) -> Result<(), String> {
+    if entries.len() > MAX_DETACHED_PERMISSION_REQUESTS {
+        return Err(format!(
+            "detached permission mailbox contains too many records ({} > {})",
+            entries.len(),
+            MAX_DETACHED_PERMISSION_REQUESTS
+        ));
+    }
+    let encoded_bytes = serde_json::to_vec(entries)
+        .map_err(|error| format!("detached permission mailbox is not serializable: {error}"))?
+        .len();
+    if encoded_bytes > MAX_DETACHED_PERMISSION_MAILBOX_BYTES {
+        return Err(format!(
+            "detached permission mailbox is too large ({} > {})",
+            encoded_bytes, MAX_DETACHED_PERMISSION_MAILBOX_BYTES
+        ));
+    }
+    for (map_key, entry) in entries {
+        validate_detached_permission_entry(Some(map_key), entry)?;
+    }
+    Ok(())
 }
 
 impl fmt::Debug for TaskRegistry {
@@ -722,6 +1204,8 @@ impl TaskRegistry {
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
             continuation_store,
             detached_bindings: Arc::new(Mutex::new(HashMap::new())),
+            detached_permission_requests: Arc::new(Mutex::new(HashMap::new())),
+            detached_permission_signers: Arc::new(Mutex::new(HashMap::new())),
             persistence: None,
             persistent_open_error: None,
             recover_persisted_active_tasks: false,
@@ -768,6 +1252,11 @@ impl TaskRegistry {
         let typed_provider_outcomes =
             persistence.load_typed_provider_outcomes_unlocked(&session_id)?;
         let detached_bindings = persistence.load_detached_bindings_unlocked(&session_id)?;
+        validate_detached_subagent_binding_map(&detached_bindings).map_err(io::Error::other)?;
+        let detached_permission_requests =
+            persistence.load_detached_permission_requests_unlocked(&session_id)?;
+        validate_detached_permission_map(&detached_permission_requests)
+            .map_err(io::Error::other)?;
         let mut records = persistence.load_session_records_unlocked(&session_id)?;
         let mut changed = false;
         if recover_interrupted {
@@ -830,6 +1319,8 @@ impl TaskRegistry {
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
             continuation_store,
             detached_bindings: Arc::new(Mutex::new(detached_bindings)),
+            detached_permission_requests: Arc::new(Mutex::new(detached_permission_requests)),
+            detached_permission_signers: Arc::new(Mutex::new(HashMap::new())),
             persistence: Some(persistence),
             persistent_open_error: None,
             recover_persisted_active_tasks: recover_interrupted,
@@ -975,6 +1466,7 @@ impl TaskRegistry {
                 .cloned()
         };
         if let Some(existing) = existing {
+            validate_detached_subagent_binding(Some(&key), &existing)?;
             if existing.subagent_id == subagent_id
                 && existing.parent_task_id == task.parent_task_id
                 && existing.task_revision == task_revision
@@ -999,15 +1491,19 @@ impl TaskRegistry {
         authority_material.extend_from_slice(task_id.as_bytes());
         authority_material.extend_from_slice(subagent_id.as_bytes());
         authority_material.extend_from_slice(attempt_id.as_str().as_bytes());
+        let (permission_response_public_key, permission_response_signer) =
+            generate_detached_permission_signer()?;
         let binding = DetachedSubagentBinding {
             task_id: task_id.to_string(),
             subagent_id: subagent_id.to_string(),
-            parent_task_id: task.parent_task_id,
+            parent_task_id: task.parent_task_id.clone(),
             task_revision,
-            attempt_id,
-            parent_fence,
+            attempt_id: attempt_id.clone(),
+            parent_fence: parent_fence.clone(),
             authority_digest: Sha256Digest::digest(authority_material),
+            permission_response_public_key,
         };
+        validate_detached_subagent_binding(Some(&key), &binding)?;
         if let Some(persistence) = self.persistence.as_ref() {
             let _lock =
                 ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
@@ -1015,19 +1511,61 @@ impl TaskRegistry {
             let mut bindings = persistence
                 .load_detached_bindings_unlocked(&self.session_id)
                 .map_err(|error| error.to_string())?;
-            if bindings.insert(key.clone(), binding.clone()).is_some() {
+            // Another actor can register the same attempt after the first
+            // optimistic lookup above. Never use `insert` as a check here:
+            // it would overwrite the actor-issued binding before returning
+            // the conflict, invalidating the private response signer that
+            // belongs to the existing binding. Reuse an exact identity and
+            // leave the durable record untouched; reject all other races.
+            if let Some(existing) = bindings.get(&key).cloned() {
+                validate_detached_subagent_binding(Some(&key), &existing)?;
+                if existing.subagent_id == subagent_id
+                    && existing.parent_task_id == task.parent_task_id
+                    && existing.task_revision == task_revision
+                    && existing.attempt_id == attempt_id
+                    && existing.parent_fence == parent_fence
+                {
+                    self.detached_bindings
+                        .lock()
+                        .map_err(|_| "detached binding lock poisoned".to_string())?
+                        .insert(key.clone(), existing.clone());
+                    return Ok(existing);
+                }
                 return Err(format!(
                     "detached subagent task '{task_id}' already has a conflicting binding"
                 ));
             }
+            bindings.insert(key.clone(), binding.clone());
             persistence
                 .write_detached_bindings_unlocked(&self.session_id, &bindings)
                 .map_err(|error| error.to_string())?;
         }
-        self.detached_bindings
+        let mut detached_bindings = self
+            .detached_bindings
             .lock()
-            .map_err(|_| "detached binding lock poisoned".to_string())?
-            .insert(key, binding.clone());
+            .map_err(|_| "detached binding lock poisoned".to_string())?;
+        if let Some(existing) = detached_bindings.get(&key) {
+            if existing.subagent_id == subagent_id
+                && existing.parent_task_id == task.parent_task_id
+                && existing.task_revision == task_revision
+                && existing.attempt_id == attempt_id
+                && existing.parent_fence == parent_fence
+            {
+                return Ok(existing.clone());
+            }
+            return Err(format!(
+                "detached subagent task '{task_id}' already has a conflicting binding"
+            ));
+        }
+        detached_bindings.insert(key, binding.clone());
+        drop(detached_bindings);
+        self.detached_permission_signers
+            .lock()
+            .map_err(|_| "detached permission signer lock poisoned".to_string())?
+            .insert(
+                detached_signer_key(&binding.task_id, &binding.attempt_id),
+                permission_response_signer,
+            );
         Ok(binding)
     }
 
@@ -1060,9 +1598,7 @@ impl TaskRegistry {
         let Some(binding) = binding else {
             return Ok(None);
         };
-        if binding.task_id != task_id {
-            return Ok(None);
-        }
+        validate_detached_subagent_binding(Some(task_id), &binding)?;
         let Some(task) = self.get(task_id) else {
             return Ok(None);
         };
@@ -1116,6 +1652,498 @@ impl TaskRegistry {
         }
         valid.sort_by(|left, right| left.task_id.cmp(&right.task_id));
         Ok(valid)
+    }
+
+    /// Enqueue a child permission request at a durable process boundary. The
+    /// request is idempotent for the exact `(attempt, request_id, digest)`
+    /// tuple and rejects any conflicting reuse of that identity.
+    pub(crate) fn enqueue_detached_permission_request(
+        &self,
+        binding: &DetachedSubagentBinding,
+        request: RuntimePermissionRequest,
+    ) -> Result<String, String> {
+        let RuntimePermissionContext::Child {
+            task_id,
+            task_revision,
+            agent_id,
+            origin,
+            ..
+        } = &request.context
+        else {
+            return Err("detached permission request must carry a child owner".to_string());
+        };
+        if *origin != crate::runtime_surface::SurfacePermissionOrigin::ChildAgent
+            || task_id.as_str() != binding.task_id
+            || *task_revision != binding.task_revision
+            || agent_id.as_str() != binding.subagent_id
+            || request.id.is_empty()
+        {
+            return Err("detached permission request owner does not match its binding".to_string());
+        }
+        if request.id.len() > MAX_DETACHED_PERMISSION_REQUEST_ID_BYTES
+            || request
+                .reason
+                .as_ref()
+                .is_some_and(|reason| reason.len() > MAX_DETACHED_PERMISSION_REASON_BYTES)
+        {
+            return Err("detached permission request exceeds mailbox field limits".to_string());
+        }
+        let key = format!(
+            "{}:{}:{}",
+            binding.task_id,
+            binding.attempt_id.as_str(),
+            request.id
+        );
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        match self.detached_subagent_binding(&binding.task_id)? {
+            Some(registered_binding) if registered_binding == *binding => {}
+            Some(_) => {
+                return Err("detached permission binding is not actor-issued".to_string());
+            }
+            None => {
+                // A worker may be replaying an already persisted handoff after
+                // continuation recovery removed the live binding. Permit only
+                // that exact existing request; never let an expired binding
+                // create a new mailbox entry.
+                if let Some(existing) = self.detached_permission_request(&key)?
+                    && detached_permission_identity_matches(&existing, &request, binding)
+                {
+                    return Ok(key);
+                }
+                return Err("detached permission binding is no longer active".to_string());
+            }
+        }
+
+        // Allocate the interaction id only for a new mailbox record.  A
+        // retry must observe and return the first id/digest; generating a new
+        // UUID before the lookup would make an otherwise identical retry look
+        // like a conflicting request.
+        let make_candidate = || {
+            let interaction_id = detached_permission_interaction_id(binding, &request.id)?;
+            let request_digest = detached_permission_request_digest(
+                &request,
+                &binding.attempt_id,
+                &binding.authority_digest,
+                &interaction_id,
+                &binding.permission_response_public_key,
+            )?;
+            Ok::<DetachedPermissionRequest, String>(DetachedPermissionRequest {
+                schema_version: DETACHED_PERMISSION_SCHEMA_VERSION,
+                key: key.clone(),
+                interaction_id,
+                request: request.clone(),
+                attempt_id: binding.attempt_id.clone(),
+                authority_digest: binding.authority_digest.clone(),
+                permission_response_public_key: binding.permission_response_public_key,
+                request_digest,
+                response: None,
+                response_digest: None,
+                response_signature: None,
+            })
+        };
+
+        match self.persistence.as_ref() {
+            Some(persistence) => {
+                let _lock =
+                    ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                        .map_err(|error| error.to_string())?;
+                let mut requests = persistence
+                    .load_detached_permission_requests_unlocked(&self.session_id)
+                    .map_err(|error| error.to_string())?;
+                validate_detached_permission_map(&requests)?;
+                if let Some(existing) = requests.get(&key) {
+                    if !detached_permission_identity_matches(existing, &request, binding) {
+                        return Err(
+                            "detached permission request id was reused with a conflicting request"
+                                .to_string(),
+                        );
+                    }
+                    self.detached_permission_requests
+                        .lock()
+                        .map_err(|_| "detached permission mailbox lock poisoned".to_string())?
+                        .insert(key.clone(), existing.clone());
+                    return Ok(key);
+                }
+                let candidate = make_candidate()?;
+                requests.insert(key.clone(), candidate.clone());
+                persistence
+                    .write_detached_permission_requests_unlocked(&self.session_id, &requests)
+                    .map_err(|error| error.to_string())?;
+                self.detached_permission_requests
+                    .lock()
+                    .map_err(|_| "detached permission mailbox lock poisoned".to_string())?
+                    .insert(key.clone(), candidate);
+                Ok(key)
+            }
+            None => {
+                let mut requests = self
+                    .detached_permission_requests
+                    .lock()
+                    .map_err(|_| "detached permission mailbox lock poisoned".to_string())?;
+                validate_detached_permission_map(&requests)?;
+                if let Some(existing) = requests.get(&key) {
+                    if !detached_permission_identity_matches(existing, &request, binding) {
+                        return Err(
+                            "detached permission request id was reused with a conflicting request"
+                                .to_string(),
+                        );
+                    }
+                    return Ok(key);
+                }
+                let candidate = make_candidate()?;
+                requests.insert(key.clone(), candidate);
+                Ok(key)
+            }
+        }
+    }
+
+    /// Returns a validated mailbox entry. Invalid or cross-session records
+    /// are errors rather than being silently skipped.
+    pub(crate) fn detached_permission_request(
+        &self,
+        key: &str,
+    ) -> Result<Option<DetachedPermissionRequest>, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        let value = if let Some(persistence) = self.persistence.as_ref() {
+            let _lock =
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                    .map_err(|error| error.to_string())?;
+            let requests = persistence
+                .load_detached_permission_requests_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?;
+            validate_detached_permission_map(&requests)?;
+            requests.get(key).cloned()
+        } else {
+            let requests = self
+                .detached_permission_requests
+                .lock()
+                .map_err(|_| "detached permission mailbox lock poisoned".to_string())?
+                .clone();
+            validate_detached_permission_map(&requests)?;
+            requests.get(key).cloned()
+        };
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        validate_detached_permission_entry(Some(key), &value)?;
+        self.detached_permission_requests
+            .lock()
+            .map_err(|_| "detached permission mailbox lock poisoned".to_string())?
+            .insert(key.to_string(), value.clone());
+        Ok(Some(value))
+    }
+
+    pub(crate) fn detached_permission_requests(
+        &self,
+    ) -> Result<Vec<DetachedPermissionRequest>, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        let entries = if let Some(persistence) = self.persistence.as_ref() {
+            let _lock =
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                    .map_err(|error| error.to_string())?;
+            persistence
+                .load_detached_permission_requests_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            self.detached_permission_requests
+                .lock()
+                .map_err(|_| "detached permission mailbox lock poisoned".to_string())?
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut result = Vec::with_capacity(entries.len());
+        for (map_key, value) in entries {
+            validate_detached_permission_entry(Some(&map_key), &value)?;
+            result.push(value);
+        }
+        result.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(result)
+    }
+
+    /// Returns whether any unresolved detached permission handoff remains.
+    /// A pending mailbox entry is a live child boundary even when the parent
+    /// operation has already reached a terminal state.
+    pub(crate) fn has_pending_detached_permission_requests(&self) -> Result<bool, String> {
+        Ok(self
+            .detached_permission_requests()?
+            .into_iter()
+            .any(|request| request.response.is_none()))
+    }
+
+    /// Resolve exactly one pending request. A stale or already resolved key
+    /// is rejected so an old actor cannot overwrite a newer decision.
+    fn sign_detached_permission_response(
+        &self,
+        entry: &DetachedPermissionRequest,
+        response: &RuntimePermissionResponse,
+        binding: &DetachedSubagentBinding,
+    ) -> Result<Vec<u8>, String> {
+        validate_detached_permission_binding(entry, binding)?;
+        let signer_key = detached_signer_key(&binding.task_id, &binding.attempt_id);
+        let signer = self
+            .detached_permission_signers
+            .lock()
+            .map_err(|_| "detached permission signer lock poisoned".to_string())?
+            .get(&signer_key)
+            .cloned()
+            .ok_or_else(|| {
+                "detached permission response signer is unavailable; refusing Allow".to_string()
+            })?;
+        let public_key: [u8; 32] = signer.public_key().as_ref().try_into().map_err(|_| {
+            "detached permission signer public key has an invalid length".to_string()
+        })?;
+        if public_key != binding.permission_response_public_key {
+            return Err(
+                "detached permission response signer does not match the admitted child".to_string(),
+            );
+        }
+        let message = detached_permission_response_signing_bytes(&entry.request_digest, response)
+            .map_err(|error| {
+            format!("failed to encode detached permission response: {error}")
+        })?;
+        Ok(signer.sign(&message).as_ref().to_vec())
+    }
+
+    pub(crate) fn resolve_detached_permission_request(
+        &self,
+        key: &str,
+        request_digest: &Sha256Digest,
+        response: RuntimePermissionResponse,
+    ) -> Result<(), String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        if let Some(persistence) = self.persistence.as_ref() {
+            let _lock =
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                    .map_err(|error| error.to_string())?;
+            let mut requests = persistence
+                .load_detached_permission_requests_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?;
+            let bindings = persistence
+                .load_detached_bindings_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?;
+            for (map_key, binding) in &bindings {
+                validate_detached_subagent_binding(Some(map_key), binding)?;
+            }
+            validate_detached_permission_map(&requests)?;
+            let existing = requests
+                .get(key)
+                .cloned()
+                .ok_or_else(|| "detached permission request disappeared".to_string())?;
+            if &existing.request_digest != request_digest {
+                return Err("detached permission resolution owner or digest is stale".to_string());
+            }
+            if let Some(current) = existing.response.as_ref() {
+                if current != &response {
+                    return Err(
+                        "detached permission request already has a different resolution"
+                            .to_string(),
+                    );
+                }
+                if current.decision == crate::protocol::PermissionResponseDecision::Allow {
+                    let binding = detached_permission_binding_from_map(&bindings, &existing)?;
+                    if !existing
+                        .verify_response_signature_with_key(&binding.permission_response_public_key)
+                    {
+                        return Err(
+                            "detached permission request has an invalid actor response signature"
+                                .to_string(),
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            let response_signature =
+                if response.decision == crate::protocol::PermissionResponseDecision::Allow {
+                    let binding = detached_permission_binding_from_map(&bindings, &existing)?;
+                    Some(self.sign_detached_permission_response(&existing, &response, &binding)?)
+                } else {
+                    None
+                };
+            let response_digest = detached_permission_response_digest(request_digest, &response)?;
+            let updated_entry = {
+                let entry = requests
+                    .get_mut(key)
+                    .ok_or_else(|| "detached permission request disappeared".to_string())?;
+                if &entry.request_digest != request_digest {
+                    return Err(
+                        "detached permission resolution owner or digest is stale".to_string()
+                    );
+                }
+                entry.response = Some(response.clone());
+                entry.response_digest = Some(response_digest.clone());
+                entry.response_signature = response_signature;
+                entry.clone()
+            };
+            persistence
+                .write_detached_permission_requests_unlocked(&self.session_id, &requests)
+                .map_err(|error| error.to_string())?;
+            self.detached_permission_requests
+                .lock()
+                .map_err(|_| "detached permission mailbox lock poisoned".to_string())?
+                .insert(key.to_string(), updated_entry);
+            return Ok(());
+        }
+        let bindings = self
+            .detached_bindings
+            .lock()
+            .map_err(|_| "detached binding lock poisoned".to_string())?
+            .clone();
+        let mut requests = self
+            .detached_permission_requests
+            .lock()
+            .map_err(|_| "detached permission mailbox lock poisoned".to_string())?;
+        validate_detached_permission_map(&requests)?;
+        let existing = requests
+            .get(key)
+            .cloned()
+            .ok_or_else(|| "detached permission request disappeared".to_string())?;
+        if &existing.request_digest != request_digest {
+            return Err("detached permission resolution owner or digest is stale".to_string());
+        }
+        if let Some(current) = existing.response.as_ref() {
+            if current != &response {
+                return Err(
+                    "detached permission request already has a different resolution".to_string(),
+                );
+            }
+            if current.decision == crate::protocol::PermissionResponseDecision::Allow {
+                let binding = detached_permission_binding_from_map(&bindings, &existing)?;
+                if !existing
+                    .verify_response_signature_with_key(&binding.permission_response_public_key)
+                {
+                    return Err(
+                        "detached permission request has an invalid actor response signature"
+                            .to_string(),
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let response_signature =
+            if response.decision == crate::protocol::PermissionResponseDecision::Allow {
+                let binding = detached_permission_binding_from_map(&bindings, &existing)?;
+                Some(self.sign_detached_permission_response(&existing, &response, &binding)?)
+            } else {
+                None
+            };
+        let response_digest = detached_permission_response_digest(request_digest, &response)?;
+        let entry = requests
+            .get_mut(key)
+            .ok_or_else(|| "detached permission request disappeared".to_string())?;
+        entry.response = Some(response);
+        entry.response_digest = Some(response_digest);
+        entry.response_signature = response_signature;
+        Ok(())
+    }
+
+    pub(crate) fn acknowledge_detached_permission_request(
+        &self,
+        key: &str,
+        request_digest: &Sha256Digest,
+        response_digest: &Sha256Digest,
+    ) -> Result<(), String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        if let Some(persistence) = self.persistence.as_ref() {
+            let _lock =
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                    .map_err(|error| error.to_string())?;
+            let mut requests = persistence
+                .load_detached_permission_requests_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?;
+            let bindings = persistence
+                .load_detached_bindings_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?;
+            for (map_key, binding) in &bindings {
+                validate_detached_subagent_binding(Some(map_key), binding)?;
+            }
+            validate_detached_permission_map(&requests)?;
+            let Some(entry) = requests.get(key) else {
+                // The durable record may have been acknowledged by another
+                // registry clone. Drop a stale local mirror as well; keeping
+                // it would let a later in-process scan resurrect a terminal
+                // request that no longer exists on disk.
+                self.detached_permission_requests
+                    .lock()
+                    .map_err(|_| "detached permission mailbox lock poisoned".to_string())?
+                    .remove(key);
+                return Ok(());
+            };
+            if &entry.request_digest != request_digest
+                || entry.response_digest.as_ref() != Some(response_digest)
+            {
+                return Err("detached permission acknowledgement is stale".to_string());
+            }
+            if entry.response.as_ref().is_some_and(|response| {
+                response.decision == crate::protocol::PermissionResponseDecision::Allow
+            }) {
+                let binding = detached_permission_binding_from_map(&bindings, entry)?;
+                if !entry
+                    .verify_response_signature_with_key(&binding.permission_response_public_key)
+                {
+                    return Err(
+                        "detached permission acknowledgement has an invalid actor response signature"
+                            .to_string(),
+                    );
+                }
+            }
+            requests.remove(key);
+            persistence
+                .write_detached_permission_requests_unlocked(&self.session_id, &requests)
+                .map_err(|error| error.to_string())?;
+            // Keep the process-local cache coherent with the durable removal;
+            // otherwise a later actor tick could resurrect an acknowledged
+            // response from stale memory and reattach a dead child.
+            self.detached_permission_requests
+                .lock()
+                .map_err(|_| "detached permission mailbox lock poisoned".to_string())?
+                .remove(key);
+        } else {
+            let bindings = self
+                .detached_bindings
+                .lock()
+                .map_err(|_| "detached binding lock poisoned".to_string())?
+                .clone();
+            let mut requests = self
+                .detached_permission_requests
+                .lock()
+                .map_err(|_| "detached permission mailbox lock poisoned".to_string())?;
+            validate_detached_permission_map(&requests)?;
+            if let Some(entry) = requests.get(key) {
+                if &entry.request_digest != request_digest
+                    || entry.response_digest.as_ref() != Some(response_digest)
+                {
+                    return Err("detached permission acknowledgement is stale".to_string());
+                }
+                if entry.response.as_ref().is_some_and(|response| {
+                    response.decision == crate::protocol::PermissionResponseDecision::Allow
+                }) {
+                    let binding = detached_permission_binding_from_map(&bindings, entry)?;
+                    if !entry
+                        .verify_response_signature_with_key(&binding.permission_response_public_key)
+                    {
+                        return Err(
+                            "detached permission acknowledgement has an invalid actor response signature"
+                                .to_string(),
+                        );
+                    }
+                }
+                requests.remove(key);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn install_continuation_projection(
@@ -3453,15 +4481,43 @@ impl TaskPersistence {
             .join("detached-subagent-bindings.json")
     }
 
+    fn session_detached_permission_requests_path(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(safe_path_component(session_id))
+            .join("detached-permission-requests.json")
+    }
+
     fn load_detached_bindings_unlocked(
         &self,
         session_id: &str,
     ) -> io::Result<HashMap<String, DetachedSubagentBinding>> {
         let path = self.session_detached_bindings_path(session_id);
-        if !path.exists() {
-            return Ok(HashMap::new());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("detached binding file '{}' is a symlink", path.display()),
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "detached binding file '{}' is not a regular file",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(HashMap::new());
+            }
+            Err(error) => return Err(error),
         }
-        read_json(&path)
+        let bindings: HashMap<String, DetachedSubagentBinding> =
+            read_json_bounded(&path, MAX_DETACHED_BINDING_FILE_BYTES)?;
+        validate_detached_subagent_binding_map(&bindings).map_err(io::Error::other)?;
+        Ok(bindings)
     }
 
     fn write_detached_bindings_unlocked(
@@ -3469,7 +4525,85 @@ impl TaskPersistence {
         session_id: &str,
         bindings: &HashMap<String, DetachedSubagentBinding>,
     ) -> io::Result<()> {
-        write_json_pretty(&self.session_detached_bindings_path(session_id), bindings)
+        validate_detached_subagent_binding_map(bindings).map_err(io::Error::other)?;
+        let path = self.session_detached_bindings_path(session_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(bindings)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if content.len() > MAX_DETACHED_BINDING_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "detached binding file exceeds the {} byte limit",
+                    MAX_DETACHED_BINDING_FILE_BYTES
+                ),
+            ));
+        }
+        atomic_write(&path, content.as_bytes(), AtomicWritePolicy::NoFollow)
+            .map_err(io::Error::other)
+    }
+
+    fn load_detached_permission_requests_unlocked(
+        &self,
+        session_id: &str,
+    ) -> io::Result<HashMap<String, DetachedPermissionRequest>> {
+        let path = self.session_detached_permission_requests_path(session_id);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "detached permission mailbox '{}' is a symlink",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "detached permission mailbox '{}' is not a regular file",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(HashMap::new());
+            }
+            Err(error) => return Err(error),
+        }
+        let requests: HashMap<String, DetachedPermissionRequest> =
+            read_json_bounded(&path, MAX_DETACHED_PERMISSION_FILE_BYTES)?;
+        validate_detached_permission_map(&requests).map_err(io::Error::other)?;
+        Ok(requests)
+    }
+
+    fn write_detached_permission_requests_unlocked(
+        &self,
+        session_id: &str,
+        requests: &HashMap<String, DetachedPermissionRequest>,
+    ) -> io::Result<()> {
+        validate_detached_permission_map(requests).map_err(io::Error::other)?;
+        let path = self.session_detached_permission_requests_path(session_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(requests)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if content.len() > MAX_DETACHED_PERMISSION_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "detached permission mailbox file exceeds the {} byte limit",
+                    MAX_DETACHED_PERMISSION_FILE_BYTES
+                ),
+            ));
+        }
+        atomic_write(&path, content.as_bytes(), AtomicWritePolicy::NoFollow)
+            .map_err(io::Error::other)
     }
 
     fn session_lock_path(&self, session_id: &str) -> PathBuf {
@@ -4262,7 +5396,7 @@ fn task_type_label(task_type: TaskType) -> &'static str {
 }
 
 pub(crate) fn safe_path_component(value: &str) -> String {
-    value
+    let mut sanitized = value
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
@@ -4271,7 +5405,14 @@ pub(crate) fn safe_path_component(value: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect::<String>();
+    // A session id is used as one path component. Keep dot-containing ids
+    // readable, but never allow an empty, `.` or `..` component to escape the
+    // task-session root when joined to a filesystem path.
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        sanitized.insert(0, '_');
+    }
+    sanitized
 }
 
 fn task_state_error(action: &str, status: TaskStatus) -> String {
@@ -4290,6 +5431,39 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
     let content = fs::read_to_string(path)?;
     serde_json::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn read_json_bounded<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    maximum_bytes: usize,
+) -> io::Result<T> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > maximum_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "JSON file '{}' exceeds the {} byte limit",
+                path.display(),
+                maximum_bytes
+            ),
+        ));
+    }
+    let file = open_nofollow(path).map_err(io::Error::other)?;
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.take(maximum_bytes as u64 + 1)
+        .read_to_end(&mut content)?;
+    if content.len() > maximum_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "JSON file '{}' exceeds the {} byte limit",
+                path.display(),
+                maximum_bytes
+            ),
+        ));
+    }
+    serde_json::from_slice(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
@@ -4360,6 +5534,433 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
 mod tests {
     use super::*;
     use crate::subagent_event_relay::RelayTaskType;
+
+    #[test]
+    fn safe_path_component_never_returns_dot_path_components() {
+        assert_eq!(safe_path_component("."), "_.");
+        assert_eq!(safe_path_component(".."), "_..");
+        assert_eq!(safe_path_component(""), "_");
+        assert_eq!(safe_path_component("session-01.v3"), "session-01.v3");
+        assert_eq!(safe_path_component("../outside"), ".._outside");
+    }
+
+    #[test]
+    fn detached_binding_round_trips_parent_operation_fence() {
+        let fence = SurfaceOperationFence {
+            thread_id: crate::runtime_surface::SurfaceThreadId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            thread_owner_epoch: crate::runtime_surface::ThreadOwnerEpoch::new(7),
+            operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            generation_id: crate::runtime_surface::SurfaceGenerationId::new(3),
+        };
+        let binding = DetachedSubagentBinding {
+            task_id: "task-1".to_string(),
+            subagent_id: "agent-1".to_string(),
+            parent_task_id: Some("parent-1".to_string()),
+            task_revision: TaskRevision::try_new(1).unwrap(),
+            attempt_id: AgentAttemptId::new(),
+            parent_fence: Some(fence.clone()),
+            authority_digest: Sha256Digest::new([9; 32]),
+            permission_response_public_key: [1; 32],
+        };
+
+        let encoded = serde_json::to_vec(&binding).unwrap();
+        let decoded: DetachedSubagentBinding = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.parent_fence, Some(fence));
+    }
+
+    #[test]
+    fn persistent_detached_permission_ack_clears_process_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let session_id = "detached-permission-ack".to_string();
+        let registry = TaskRegistry::new_persistent(session_id.clone(), root).unwrap();
+        let interaction_id =
+            SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let attempt_id = AgentAttemptId::new();
+        let authority_digest = Sha256Digest::new([7; 32]);
+        let request = detached_mailbox_test_request("child-tool");
+        let key = format!("task-1:{}:child-tool", attempt_id.as_str());
+        let request_digest = detached_permission_request_digest(
+            &request,
+            &attempt_id,
+            &authority_digest,
+            &interaction_id,
+            &[1; 32],
+        )
+        .unwrap();
+        let entry = DetachedPermissionRequest {
+            schema_version: DETACHED_PERMISSION_SCHEMA_VERSION,
+            key: key.clone(),
+            interaction_id,
+            request,
+            attempt_id,
+            authority_digest,
+            request_digest: request_digest.clone(),
+            response: None,
+            response_digest: None,
+            permission_response_public_key: [1; 32],
+            response_signature: None,
+        };
+        let persistence = registry.persistence.as_ref().expect("persistent registry");
+        let mut persisted = HashMap::new();
+        persisted.insert(key.clone(), entry.clone());
+        persistence
+            .write_detached_permission_requests_unlocked(&session_id, &persisted)
+            .unwrap();
+        registry
+            .detached_permission_requests
+            .lock()
+            .unwrap()
+            .insert(key.clone(), entry);
+
+        let response = RuntimePermissionResponse {
+            decision: crate::protocol::PermissionResponseDecision::Deny,
+            scope: crate::protocol::PermissionGrantScope::Turn,
+            permissions: crate::protocol::RequestPermissionProfile::default(),
+            strict_auto_review: false,
+        };
+        registry
+            .resolve_detached_permission_request(&key, &request_digest, response)
+            .unwrap();
+        let resolved = registry
+            .detached_permission_request(&key)
+            .unwrap()
+            .expect("resolved mailbox entry");
+        let response_digest = resolved
+            .response_digest
+            .clone()
+            .expect("resolved response digest");
+        registry
+            .acknowledge_detached_permission_request(&key, &request_digest, &response_digest)
+            .unwrap();
+
+        assert!(
+            registry
+                .detached_permission_requests
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_none()
+        );
+        assert!(registry.detached_permission_requests().unwrap().is_empty());
+    }
+
+    #[test]
+    fn detached_permission_digests_are_stable_for_hash_map_profiles() {
+        let task_id = SurfaceTaskId::try_new("task-1").unwrap();
+        let agent_id = crate::runtime_surface::SurfaceSubagentId::try_new("agent-1").unwrap();
+        let tool_call_id =
+            crate::runtime_surface::SurfaceToolCallId::try_new("child-tool").unwrap();
+        let turn_id = crate::runtime_surface::SurfaceTurnId::new();
+        let context = RuntimePermissionContext::child(
+            task_id,
+            TaskRevision::try_new(1).unwrap(),
+            agent_id,
+            crate::runtime_surface::SubagentRevision::try_new(1).unwrap(),
+            crate::runtime_surface::SurfaceActivityId::try_new("child-tool").unwrap(),
+            turn_id,
+            tool_call_id,
+        );
+        let profile = |domains| crate::protocol::RequestPermissionProfile {
+            file_system: None,
+            network: Some(crate::protocol::RequestNetworkPermissions {
+                enabled: Some(true),
+                domains,
+            }),
+        };
+        let mut first_domains = HashMap::new();
+        first_domains.insert(
+            "z.example".to_string(),
+            orca_core::config::PermissionProfileNetworkAccess::Allow,
+        );
+        first_domains.insert(
+            "a.example".to_string(),
+            orca_core::config::PermissionProfileNetworkAccess::Deny,
+        );
+        let mut second_domains = HashMap::new();
+        second_domains.insert(
+            "a.example".to_string(),
+            orca_core::config::PermissionProfileNetworkAccess::Deny,
+        );
+        second_domains.insert(
+            "z.example".to_string(),
+            orca_core::config::PermissionProfileNetworkAccess::Allow,
+        );
+        let first = RuntimePermissionRequest {
+            id: "child-tool".to_string(),
+            reason: Some("network access".to_string()),
+            permissions: profile(first_domains),
+            context: context.clone(),
+        };
+        let second = RuntimePermissionRequest {
+            permissions: profile(second_domains),
+            ..first.clone()
+        };
+        let attempt_id = AgentAttemptId::new();
+        let authority_digest = Sha256Digest::new([6; 32]);
+        let interaction_id =
+            SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        assert_eq!(
+            detached_permission_request_digest(
+                &first,
+                &attempt_id,
+                &authority_digest,
+                &interaction_id,
+                &[1; 32],
+            )
+            .unwrap(),
+            detached_permission_request_digest(
+                &second,
+                &attempt_id,
+                &authority_digest,
+                &interaction_id,
+                &[1; 32],
+            )
+            .unwrap()
+        );
+
+        let first_response = RuntimePermissionResponse {
+            decision: crate::protocol::PermissionResponseDecision::Allow,
+            scope: crate::protocol::PermissionGrantScope::Session,
+            permissions: first.permissions.clone(),
+            strict_auto_review: false,
+        };
+        let second_response = RuntimePermissionResponse {
+            permissions: second.permissions.clone(),
+            ..first_response.clone()
+        };
+        let request_digest = Sha256Digest::new([5; 32]);
+        assert_eq!(
+            detached_permission_response_digest(&request_digest, &first_response).unwrap(),
+            detached_permission_response_digest(&request_digest, &second_response).unwrap()
+        );
+    }
+
+    #[test]
+    fn detached_permission_mailbox_rejects_a_map_key_alias() {
+        let registry = TaskRegistry::new("detached-permission-alias".to_string());
+        let interaction_id =
+            SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let attempt_id = AgentAttemptId::new();
+        let authority_digest = Sha256Digest::new([8; 32]);
+        let key = format!("task-1:{}:child-tool", attempt_id.as_str());
+        let request = detached_mailbox_test_request("child-tool");
+        let request_digest = detached_permission_request_digest(
+            &request,
+            &attempt_id,
+            &authority_digest,
+            &interaction_id,
+            &[1; 32],
+        )
+        .unwrap();
+        let entry = DetachedPermissionRequest {
+            schema_version: DETACHED_PERMISSION_SCHEMA_VERSION,
+            key: key.clone(),
+            interaction_id,
+            request,
+            attempt_id,
+            authority_digest,
+            request_digest,
+            response: None,
+            response_digest: None,
+            permission_response_public_key: [1; 32],
+            response_signature: None,
+        };
+        registry
+            .detached_permission_requests
+            .lock()
+            .unwrap()
+            .insert("detached:alias".to_string(), entry);
+
+        let error = registry.detached_permission_requests().unwrap_err();
+        assert!(error.contains("integrity validation"));
+    }
+
+    #[test]
+    fn detached_permission_schema_rejects_unknown_fields() {
+        let interaction_id =
+            SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let attempt_id = AgentAttemptId::new();
+        let authority_digest = Sha256Digest::new([8; 32]);
+        let key = format!("task-1:{}:child-tool", attempt_id.as_str());
+        let request = detached_mailbox_test_request("child-tool");
+        let request_digest = detached_permission_request_digest(
+            &request,
+            &attempt_id,
+            &authority_digest,
+            &interaction_id,
+            &[1; 32],
+        )
+        .unwrap();
+        let entry = DetachedPermissionRequest {
+            schema_version: DETACHED_PERMISSION_SCHEMA_VERSION,
+            key,
+            interaction_id,
+            request,
+            attempt_id,
+            authority_digest,
+            request_digest,
+            response: None,
+            response_digest: None,
+            permission_response_public_key: [1; 32],
+            response_signature: None,
+        };
+        let mut encoded = serde_json::to_value(entry).unwrap();
+        encoded
+            .as_object_mut()
+            .expect("permission request object")
+            .insert("unexpected".to_string(), serde_json::json!(true));
+        assert!(serde_json::from_value::<DetachedPermissionRequest>(encoded).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_permission_digest_rejects_non_utf8_paths_without_panicking() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut request = detached_mailbox_test_request("child-tool");
+        request.permissions.file_system = Some(crate::protocol::RequestFileSystemPermissions {
+            read: Some(vec![std::path::PathBuf::from(OsString::from_vec(vec![
+                b'/', 0xff,
+            ]))]),
+            write: None,
+            entries: None,
+        });
+        let attempt_id = AgentAttemptId::new();
+        let interaction_id =
+            SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let error = detached_permission_request_digest(
+            &request,
+            &attempt_id,
+            &Sha256Digest::new([3; 32]),
+            &interaction_id,
+            &[1; 32],
+        )
+        .expect_err("non-UTF-8 paths must fail closed");
+        assert!(error.contains("not serializable"));
+    }
+
+    #[test]
+    fn detached_permission_mailbox_fails_closed_when_persistence_is_unavailable() {
+        let mut registry = TaskRegistry::new("detached-permission-unavailable".to_string());
+        registry.persistent_open_error = Some(Arc::from("simulated persistence failure"));
+
+        let error = registry.detached_permission_requests().unwrap_err();
+        assert!(error.contains("persistent task registry is unavailable"));
+        assert!(registry.has_pending_detached_permission_requests().is_err());
+    }
+
+    #[test]
+    fn detached_permission_mailbox_rejects_an_oversized_record() {
+        let registry = TaskRegistry::new("detached-permission-size".to_string());
+        let interaction_id =
+            SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let attempt_id = AgentAttemptId::new();
+        let authority_digest = Sha256Digest::new([4; 32]);
+        let key = format!("task-1:{}:child-tool", attempt_id.as_str());
+        let mut request = detached_mailbox_test_request("child-tool");
+        request.reason = Some("x".repeat(MAX_DETACHED_PERMISSION_ENTRY_BYTES));
+        let request_digest = detached_permission_request_digest(
+            &request,
+            &attempt_id,
+            &authority_digest,
+            &interaction_id,
+            &[1; 32],
+        )
+        .unwrap();
+        registry
+            .detached_permission_requests
+            .lock()
+            .unwrap()
+            .insert(
+                key.clone(),
+                DetachedPermissionRequest {
+                    schema_version: DETACHED_PERMISSION_SCHEMA_VERSION,
+                    key,
+                    interaction_id,
+                    request,
+                    attempt_id,
+                    authority_digest,
+                    request_digest,
+                    response: None,
+                    response_digest: None,
+                    permission_response_public_key: [1; 32],
+                    response_signature: None,
+                },
+            );
+
+        let error = registry.detached_permission_requests().unwrap_err();
+        assert!(error.contains("integrity validation"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_detached_permission_mailbox_rejects_a_symlinked_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let session_id = "detached-permission-symlink".to_string();
+        let registry = TaskRegistry::new_persistent(session_id.clone(), root.clone()).unwrap();
+        let persistence = registry.persistence.as_ref().expect("persistent registry");
+        let mailbox_path = persistence.session_detached_permission_requests_path(&session_id);
+        let target_path = temp.path().join("mailbox-target.json");
+        fs::write(&target_path, b"{}").unwrap();
+        symlink(&target_path, &mailbox_path).unwrap();
+
+        let error = registry.detached_permission_requests().unwrap_err();
+        assert!(
+            error.contains("is a symlink")
+                || error.contains("reparse")
+                || error.contains("without following links")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_detached_permission_mailbox_rejects_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let session_id = "detached-permission-dangling-symlink".to_string();
+        let registry = TaskRegistry::new_persistent(session_id.clone(), root.clone()).unwrap();
+        let persistence = registry.persistence.as_ref().expect("persistent registry");
+        let mailbox_path = persistence.session_detached_permission_requests_path(&session_id);
+        symlink(temp.path().join("missing-mailbox.json"), &mailbox_path).unwrap();
+
+        let error = registry.detached_permission_requests().unwrap_err();
+        assert!(error.contains("is a symlink"));
+    }
+
+    fn detached_mailbox_test_request(id: &str) -> RuntimePermissionRequest {
+        let task_id = SurfaceTaskId::try_new("task-1").unwrap();
+        let agent_id = crate::runtime_surface::SurfaceSubagentId::try_new("agent-1").unwrap();
+        let tool_call_id = crate::runtime_surface::SurfaceToolCallId::try_new(id).unwrap();
+        let turn_id = crate::runtime_surface::SurfaceTurnId::new();
+        RuntimePermissionRequest {
+            id: id.to_string(),
+            reason: Some("test permission".to_string()),
+            permissions: crate::protocol::RequestPermissionProfile::default(),
+            context: RuntimePermissionContext::child(
+                task_id,
+                TaskRevision::try_new(1).unwrap(),
+                agent_id,
+                crate::runtime_surface::SubagentRevision::try_new(1).unwrap(),
+                crate::runtime_surface::SurfaceActivityId::try_new(id).unwrap(),
+                turn_id,
+                tool_call_id,
+            ),
+        }
+    }
 
     fn test_surface_commit_id(seed: u8) -> crate::surface::SurfaceCommitId {
         let mut bytes = [seed; 16];
