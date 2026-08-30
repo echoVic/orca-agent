@@ -308,6 +308,12 @@ impl DetachedPermissionHandler {
                         "detached permission request was cancelled",
                     ));
                 }
+                if Instant::now() >= deadline {
+                    return Err(terminal_error(
+                        io::ErrorKind::TimedOut,
+                        "detached permission request timed out waiting for the runtime actor",
+                    ));
+                }
                 return Ok(response);
             }
             thread::sleep(Duration::from_millis(50));
@@ -329,6 +335,11 @@ impl DetachedPermissionHandler {
             // to re-prompt, so this is already a terminal outcome.
             return Ok(());
         };
+        // Re-check the complete actor-issued owner binding before changing a
+        // terminal mailbox record.  The mailbox is child-writable, so the
+        // task/attempt tuple alone is not sufficient evidence here.
+        crate::tasks::validate_detached_permission_binding(&record, &self.binding)
+            .map_err(io::Error::other)?;
         let owner_matches = matches!(
             &record.request.context,
             RuntimePermissionContext::Child {

@@ -581,7 +581,7 @@ fn detached_permission_identity_matches(
 /// Binds a mailbox record to the actor-issued detached capability. The
 /// mailbox is writable by the child process, so its self-reported authority
 /// digest and public key are not sufficient evidence on their own.
-fn validate_detached_permission_binding(
+pub(crate) fn validate_detached_permission_binding(
     entry: &DetachedPermissionRequest,
     binding: &DetachedSubagentBinding,
 ) -> Result<(), String> {
