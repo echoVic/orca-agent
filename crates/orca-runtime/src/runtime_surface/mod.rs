@@ -151,6 +151,7 @@ pub use identity::{
     ZeroizingProcessLocalSecret,
 };
 
+pub use ingress::RuntimeSubagentActivityIngress;
 pub use ingress::{
     RuntimeProviderResponseIngress, RuntimeWorkflowFinished, RuntimeWorkflowIngressReceipt,
     RuntimeWorkflowLifecycleIngress, RuntimeWorkflowOutcome, RuntimeWorkflowStarted,

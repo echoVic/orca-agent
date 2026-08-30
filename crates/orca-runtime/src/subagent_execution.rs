@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
@@ -77,6 +78,8 @@ pub(crate) struct RuntimeSubagentBatchToolTurnRuntime<'a> {
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) root_task_id: Option<&'a str>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
+    pub(crate) activity_ingress:
+        Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
 }
 
 struct SubagentBatchExecution {
@@ -205,6 +208,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         task_registry,
         root_task_id,
         workflow_ipc,
+        activity_ingress,
     } = runtime;
     let execution = execute_subagent_batch(
         config,
@@ -224,6 +228,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         root_task_id,
         workflow_ipc,
         child_executor,
+        activity_ingress,
         &child_budgets,
     );
 
@@ -283,6 +288,7 @@ fn execute_subagent_batch(
     root_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
+    activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
     child_budgets: &[Option<orca_core::budget::BudgetSpec>],
 ) -> SubagentBatchExecution {
     // Each child's own lease bounds it (parent remaining minus outstanding
@@ -425,6 +431,7 @@ fn execute_subagent_batch(
             workflow_ipc,
             subagent_depth + 1,
             child_executor,
+            activity_ingress.clone(),
             task_registry,
             root_task_id,
         );
@@ -492,6 +499,7 @@ fn execute_subagent_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn execute_subagent_tool<W: io::Write>(
     config: &RunConfig,
     cwd: &Path,
@@ -510,6 +518,56 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     root_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
+    event_error: &mut Option<io::Error>,
+    child_budget: Option<&orca_core::budget::BudgetSpec>,
+) -> io::Result<(
+    tool_types::ToolResult,
+    Option<orca_core::budget::BudgetUsage>,
+)> {
+    execute_subagent_tool_with_activity_ingress(
+        config,
+        cwd,
+        events,
+        sink,
+        tool_request,
+        subagent_depth,
+        instructions,
+        memory,
+        mcp_registry,
+        hooks,
+        emit_deltas,
+        cost_tracker,
+        cancel,
+        task_registry,
+        root_task_id,
+        workflow_ipc,
+        child_executor,
+        None,
+        event_error,
+        child_budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
+    config: &RunConfig,
+    cwd: &Path,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    tool_request: &tool_types::ToolRequest,
+    subagent_depth: u32,
+    instructions: &ProjectInstructions,
+    memory: &MemoryBlock,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    emit_deltas: bool,
+    cost_tracker: &mut CostTracker,
+    cancel: &CancelToken,
+    task_registry: &TaskRegistry,
+    root_task_id: Option<&str>,
+    workflow_ipc: Option<&WorkflowIpcContext>,
+    child_executor: ChildAgentExecutor<io::Sink>,
+    activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
     event_error: &mut Option<io::Error>,
     child_budget: Option<&orca_core::budget::BudgetSpec>,
 ) -> io::Result<(
@@ -584,6 +642,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         workflow_ipc,
         subagent_depth + 1,
         child_executor,
+        activity_ingress,
         task_registry,
         root_task_id,
     );
@@ -1049,6 +1108,7 @@ mod tests {
                     task_registry: &task_registry,
                     root_task_id: None,
                     workflow_ipc: None,
+                    activity_ingress: None,
                 },
                 child_executor: fake_child_executor::<std::io::Sink>,
             });
@@ -1221,6 +1281,7 @@ mod tests {
                     task_registry: &task_registry,
                     root_task_id: None,
                     workflow_ipc: None,
+                    activity_ingress: None,
                 },
                 child_executor: cancelling_child_executor::<std::io::Sink>,
             });
@@ -1294,6 +1355,7 @@ mod tests {
                     task_registry: &task_registry,
                     root_task_id: None,
                     workflow_ipc: None,
+                    activity_ingress: None,
                 },
                 child_executor: delayed_child_executor::<std::io::Sink>,
             });
@@ -1369,6 +1431,7 @@ mod tests {
                     task_registry: &task_registry,
                     root_task_id: None,
                     workflow_ipc: None,
+                    activity_ingress: None,
                 },
                 child_executor: panic_child_executor::<std::io::Sink>,
             });
@@ -1632,6 +1695,7 @@ mod tests {
                     task_registry: &task_registry,
                     root_task_id: None,
                     workflow_ipc: None,
+                    activity_ingress: None,
                 },
                 child_executor: cancelled_child_executor::<std::io::Sink>,
             });
@@ -2012,6 +2076,7 @@ mod tests {
                     task_registry: &task_registry,
                     root_task_id: None,
                     workflow_ipc: None,
+                    activity_ingress: None,
                 },
                 child_executor: receipt_child_executor::<std::io::Sink>,
             });

@@ -38,6 +38,7 @@ use crate::lifecycle::{
     RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskLifecycle, RuntimeTaskStatus,
 };
 use crate::memory::MemoryBlock;
+use crate::runtime_surface::RuntimeSubagentActivityIngress;
 use crate::runtime_surface::{
     DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId, TaskRevision,
 };
@@ -60,6 +61,7 @@ pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) workflow_ipc: Option<WorkflowIpcContext>,
     pub(crate) child_depth: u32,
     pub(crate) child_executor: ChildAgentExecutor<io::Sink>,
+    pub(crate) activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
     pub(crate) task_registry: TaskRegistry,
     pub(crate) root_task_id: Option<String>,
 }
@@ -70,6 +72,24 @@ pub(crate) struct RuntimeSubagentInvocation {
 pub(crate) struct TaskRegistryActivitySink {
     pub(crate) task_registry: TaskRegistry,
     pub(crate) task_id: String,
+}
+
+/// Synchronous child delivery boundary. The child retains the source event on
+/// failure, so retries present the same commit id and digest to the actor.
+pub(crate) struct RuntimeSubagentActivitySink {
+    pub(crate) ingress: Arc<dyn RuntimeSubagentActivityIngress>,
+}
+
+impl ChildAgentActivitySink for RuntimeSubagentActivitySink {
+    fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        if !event.verify_digest() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child activity digest verification failed",
+            ));
+        }
+        self.ingress.commit_activity(event)
+    }
 }
 
 impl ChildAgentActivitySink for TaskRegistryActivitySink {
@@ -184,6 +204,7 @@ impl RuntimeSubagentInvocation {
         workflow_ipc: Option<&WorkflowIpcContext>,
         child_depth: u32,
         child_executor: ChildAgentExecutor<io::Sink>,
+        activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
         task_registry: &TaskRegistry,
         root_task_id: Option<&str>,
     ) -> Self {
@@ -199,6 +220,7 @@ impl RuntimeSubagentInvocation {
             workflow_ipc: workflow_ipc.cloned(),
             child_depth,
             child_executor,
+            activity_ingress,
             task_registry: task_registry.clone(),
             root_task_id: root_task_id.map(str::to_string),
         }
@@ -399,6 +421,7 @@ fn run_subagent_worker(
         workflow_ipc,
         child_depth,
         child_executor,
+        activity_ingress,
         task_registry,
         root_task_id,
     } = invocation;
@@ -654,6 +677,7 @@ fn run_subagent_worker(
             workflow_ipc,
             child_depth,
             child_executor,
+            activity_ingress,
             task_registry.clone(),
             root_task_id,
             lifecycle,
@@ -715,6 +739,7 @@ fn execute_acquired_sync_subagent(
     workflow_ipc: Option<WorkflowIpcContext>,
     child_depth: u32,
     child_executor: ChildAgentExecutor<io::Sink>,
+    activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
     task_registry: TaskRegistry,
     root_task_id: Option<String>,
     mut lifecycle: RuntimeSessionLifecycle,
@@ -789,21 +814,28 @@ fn execute_acquired_sync_subagent(
     };
     let surface_task_id = SurfaceTaskId::try_new(registry_task_id.clone())
         .expect("task registry created a non-empty task id");
-    let activity_sink: Arc<dyn ChildAgentActivitySink> = Arc::new(TaskRegistryActivitySink {
-        task_registry: task_registry.clone(),
-        task_id: registry_task_id.clone(),
-    });
+    let activity_owner = activity_ingress.as_ref().map_or_else(
+        || SubagentActivityOwner::DetachedTask {
+            task_id: surface_task_id.clone(),
+            task_revision: TaskRevision::try_new(1).expect("one is a valid task revision"),
+            authority_digest: prepared.compatibility.compatibility_hash,
+        },
+        |ingress| ingress.owner(),
+    );
+    let activity_sink: Arc<dyn ChildAgentActivitySink> = match activity_ingress {
+        Some(ingress) => Arc::new(RuntimeSubagentActivitySink { ingress }),
+        None => Arc::new(TaskRegistryActivitySink {
+            task_registry: task_registry.clone(),
+            task_id: registry_task_id.clone(),
+        }),
+    };
     let activity = Arc::new(ChildAgentActivityEmitter::new(
         SubagentActivityIdentity {
             task_id: surface_task_id.clone(),
             subagent_id: SurfaceSubagentId::try_new(tool_request.id.clone())
                 .expect("tool requests have a non-empty id"),
             attempt_id: prepared.attempt_id.clone(),
-            owner: SubagentActivityOwner::DetachedTask {
-                task_id: surface_task_id,
-                task_revision: TaskRevision::try_new(1).expect("one is a valid task revision"),
-                authority_digest: prepared.compatibility.compatibility_hash,
-            },
+            owner: activity_owner,
         },
         activity_sink,
     ));
@@ -1700,7 +1732,61 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_continuation::ToolBoundary;
+    use crate::agent_continuation::{AgentAttemptId, ToolBoundary};
+    use crate::runtime_surface::RuntimeSubagentActivityIngress;
+
+    #[derive(Debug, Default)]
+    struct RecordingActivityIngress {
+        events: Mutex<Vec<SubagentActivityEvent>>,
+    }
+
+    impl RuntimeSubagentActivityIngress for RecordingActivityIngress {
+        fn owner(&self) -> SubagentActivityOwner {
+            SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new("task-sync-activity").expect("task id"),
+                task_revision: TaskRevision::try_new(1).expect("revision"),
+                authority_digest: crate::runtime_surface::Sha256Digest::new([9; 32]),
+            }
+        }
+
+        fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            self.events
+                .lock()
+                .expect("recording ingress lock")
+                .push(event);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runtime_activity_sink_acknowledges_the_original_source_event() {
+        let ingress = Arc::new(RecordingActivityIngress::default());
+        let sink = RuntimeSubagentActivitySink {
+            ingress: ingress.clone(),
+        };
+        let event = SubagentActivityEvent::new(
+            SurfaceTaskId::try_new("task-sync-activity").expect("task id"),
+            SurfaceSubagentId::try_new("subagent-sync-activity").expect("subagent id"),
+            AgentAttemptId::new(),
+            1,
+            SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new("task-sync-activity").expect("task id"),
+                task_revision: TaskRevision::try_new(1).expect("revision"),
+                authority_digest: crate::runtime_surface::Sha256Digest::new([9; 32]),
+            },
+            SubagentActivityPayload::Started {
+                description: DisplayText::new("inspect the runtime"),
+            },
+        );
+
+        sink.publish(event.clone())
+            .expect("ingress acknowledgement");
+
+        assert_eq!(
+            ingress.events.lock().expect("recorded events").as_slice(),
+            &[event]
+        );
+    }
 
     #[test]
     fn inherited_sync_worktree_is_preserved_on_finish() {

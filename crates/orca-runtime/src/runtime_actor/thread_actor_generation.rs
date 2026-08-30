@@ -1,6 +1,51 @@
 // Mechanical ThreadActor method boundary; state ownership lives in runtime_actor controllers.
 use super::*;
 
+fn subagent_activity_projection(
+    payload: &SubagentActivityPayload,
+) -> (surface::DisplayText, Option<u32>, Option<UsageTotals>) {
+    match payload {
+        SubagentActivityPayload::Started { description } => (description.clone(), None, None),
+        SubagentActivityPayload::PhaseChanged { phase, turn } => (
+            surface::DisplayText::new(format!("phase: {phase:?}")),
+            *turn,
+            None,
+        ),
+        SubagentActivityPayload::ToolStarted { name, target, .. } => (
+            target
+                .as_ref()
+                .map(|target| surface::DisplayText::new(format!("{name}: {}", target.as_str())))
+                .unwrap_or_else(|| surface::DisplayText::new(name)),
+            None,
+            None,
+        ),
+        SubagentActivityPayload::ToolCompleted {
+            status, summary, ..
+        } => (
+            summary.clone().unwrap_or_else(|| {
+                surface::DisplayText::new(format!("tool completed: {status:?}"))
+            }),
+            None,
+            None,
+        ),
+        SubagentActivityPayload::Usage { totals } => (
+            surface::DisplayText::new("usage updated"),
+            None,
+            Some(totals.clone()),
+        ),
+        SubagentActivityPayload::CheckpointPublished {
+            checkpoint_revision,
+        } => (
+            surface::DisplayText::new(format!("checkpoint {checkpoint_revision}")),
+            None,
+            None,
+        ),
+        SubagentActivityPayload::Completed { .. } => {
+            (surface::DisplayText::new("completed"), None, None)
+        }
+    }
+}
+
 impl ThreadActor {
     pub(super) fn admits_surface_client(
         &self,
@@ -408,6 +453,303 @@ impl ThreadActor {
                 self.commit_surface_background_batch_with_retry(background_fence, &batch)
             }
             None => self.commit_surface_generation_batch_with_retry(fence, &batch),
+        }
+    }
+
+    pub(super) fn commit_surface_subagent_activity(
+        &mut self,
+        active: &ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        event: SubagentActivityEvent,
+    ) -> io::Result<()> {
+        if active.surface_operation.as_ref() != Some(&fence)
+            || Self::surface_interaction_admission_closed(active)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "subagent activity generation fence is stale or terminalizing",
+            ));
+        }
+        if event.schema_version != SubagentActivityEvent::SCHEMA_VERSION || !event.verify_digest() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "subagent activity envelope failed schema or digest validation",
+            ));
+        }
+        let owner_matches_generation = matches!(
+            &event.owner,
+            SubagentActivityOwner::Generation { operation_id }
+                if operation_id == &fence.operation_id
+        );
+        let owner_matches_detached_task = matches!(
+            &event.owner,
+            SubagentActivityOwner::DetachedTask { task_id, .. }
+                if task_id == &event.task_id
+        );
+        if !owner_matches_generation && !owner_matches_detached_task {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "subagent activity owner does not match the active generation",
+            ));
+        }
+
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let existing_subagent = snapshot
+            .subagents
+            .iter()
+            .find(|subagent| subagent.subagent_id == event.subagent_id);
+        let existing_task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == event.task_id);
+        let (activity, turn, usage) = subagent_activity_projection(&event.payload);
+        let terminal = match &event.payload {
+            SubagentActivityPayload::Completed {
+                status,
+                output,
+                error,
+                usage,
+            } => Some((status.clone(), output.clone(), error.clone(), usage.clone())),
+            _ => None,
+        };
+
+        let (task_patch, subagent_patch) = match (existing_task, existing_subagent, terminal) {
+            (None, None, None) if event.source_sequence == 1 => {
+                let SubagentActivityPayload::Started { description } = &event.payload else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "first subagent activity must be started",
+                    ));
+                };
+                let task = surface::SurfaceTask {
+                    task_id: event.task_id.clone(),
+                    revision: surface::TaskRevision::try_new(1)
+                        .expect("one is a valid task revision"),
+                    task_type: surface::SurfaceTaskType::Subagent,
+                    status: surface::SurfaceTaskStatus::Running,
+                    backgrounded: false,
+                    description: description.clone(),
+                    created_at: event.occurred_at,
+                    started_at: Some(event.occurred_at),
+                    completed_at: None,
+                    parent_operation: Some(fence.operation_id.clone()),
+                    parent_task_id: None,
+                    background_fence: None,
+                    workflow_run_id: None,
+                    subagent_id: Some(event.subagent_id.clone()),
+                    pending_interaction_id: None,
+                    usage: None,
+                    result: None,
+                    error: None,
+                    retry_count: 0,
+                    output_truncated: false,
+                };
+                let subagent = surface::RunningSurfaceSubagent::try_new(surface::SurfaceSubagent {
+                    subagent_id: event.subagent_id.clone(),
+                    task_id: event.task_id.clone(),
+                    revision: surface::SubagentRevision::try_new(1)
+                        .expect("one is a valid subagent revision"),
+                    description: description.clone(),
+                    status: surface::SurfaceSubagentStatus::Running,
+                    activity: Some(description.clone()),
+                    turn: None,
+                    usage: None,
+                    output: None,
+                    error: None,
+                    parent: fence.clone(),
+                })
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid subagent start")
+                })?;
+                (
+                    surface::TaskPatch::Upserted {
+                        expected_revision: None,
+                        task,
+                    },
+                    surface::SubagentPatch::Started {
+                        expected_revision: surface::ExpectedAbsentSubagentRevision,
+                        subagent,
+                    },
+                )
+            }
+            (Some(task), Some(subagent), terminal) => {
+                if subagent.task_id != event.task_id || subagent.parent != fence {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "subagent activity identity is not owned by this generation",
+                    ));
+                }
+                let expected_sequence =
+                    subagent.revision.get().checked_add(1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "subagent revision overflow")
+                    })?;
+                if event.source_sequence != expected_sequence {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "subagent activity source sequence is not contiguous",
+                    ));
+                }
+                let next_task_revision =
+                    surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
+                        || io::Error::new(io::ErrorKind::InvalidData, "task revision overflow"),
+                    )?)
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "task revision overflow")
+                    })?;
+                let next_subagent_revision = surface::SubagentRevision::try_new(expected_sequence)
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "subagent revision overflow")
+                    })?;
+                let mut next_task = task.clone();
+                next_task.revision = next_task_revision;
+                next_task.usage = usage
+                    .clone()
+                    .map(surface_usage_totals)
+                    .or_else(|| task.usage.clone());
+                let subagent_patch = match terminal {
+                    Some((status, output, error, terminal_usage)) => {
+                        next_task.status = match status {
+                            surface::SurfaceSubagentTerminalStatus::Completed => {
+                                surface::SurfaceTaskStatus::Completed
+                            }
+                            surface::SurfaceSubagentTerminalStatus::Failed => {
+                                surface::SurfaceTaskStatus::Failed
+                            }
+                            surface::SurfaceSubagentTerminalStatus::Cancelled => {
+                                surface::SurfaceTaskStatus::Cancelled
+                            }
+                        };
+                        next_task.completed_at = Some(event.occurred_at);
+                        next_task.result = output.clone();
+                        next_task.error = error.clone();
+                        next_task.usage = terminal_usage
+                            .clone()
+                            .map(surface_usage_totals)
+                            .or(next_task.usage.clone());
+                        surface::SubagentPatch::Completed {
+                            subagent_id: event.subagent_id.clone(),
+                            expected_revision: subagent.revision,
+                            next_revision: next_subagent_revision,
+                            parent: fence.clone(),
+                            status,
+                            output,
+                            error,
+                            usage: terminal_usage
+                                .map(surface_usage_totals)
+                                .or_else(|| subagent.usage.clone()),
+                        }
+                    }
+                    None => surface::SubagentPatch::Progress {
+                        subagent_id: event.subagent_id.clone(),
+                        expected_revision: subagent.revision,
+                        next_revision: next_subagent_revision,
+                        parent: fence.clone(),
+                        activity: activity.clone(),
+                        turn: turn.or(subagent.turn),
+                        usage: usage
+                            .map(surface_usage_totals)
+                            .or_else(|| subagent.usage.clone()),
+                    },
+                };
+                (
+                    surface::TaskPatch::Upserted {
+                        expected_revision: Some(task.revision),
+                        task: next_task,
+                    },
+                    subagent_patch,
+                )
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "subagent activity start/progress state is inconsistent",
+                ));
+            }
+        };
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![
+                (
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(task_patch),
+                ),
+                (
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    surface::SurfaceEvent::Subagent(subagent_patch),
+                ),
+            ],
+            Some(event.surface_commit_id),
+        );
+        self.commit_surface_generation_batch_with_retry(fence, &batch)?;
+
+        // This is deliberately a repairable latest-state mirror. The source
+        // event reached the surface ledger before the registry is touched.
+        let _ = active.task_registry.update_subagent_activity(
+            event.task_id.as_str(),
+            activity.as_str().to_string(),
+            turn,
+            usage,
+        );
+        Ok(())
+    }
+
+    /// Replays detached child events through the same actor-owned commit path.
+    /// Relay frames are never acknowledged by mutating the task mirror; the
+    /// surface ledger's commit id is the replay cursor and deduplication key.
+    pub(super) fn drain_subagent_relay(
+        &mut self,
+        active: &ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> io::Result<()> {
+        let reader = active
+            .task_registry
+            .open_subagent_event_relay_reader(task_id, attempt_id)
+            .map_err(io::Error::other)?;
+        let mut after_sequence = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .subagents
+            .iter()
+            .find(|subagent| subagent.task_id.as_str() == task_id)
+            .map_or(0, |subagent| subagent.revision.get());
+        loop {
+            let page = reader.read_page(after_sequence).map_err(io::Error::other)?;
+            if page.records.is_empty() {
+                return Ok(());
+            }
+            for record in &page.records {
+                if record.task_id != task_id
+                    || record.attempt_id != attempt_id
+                    || record.source_sequence <= after_sequence
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "detached relay record identity or sequence is invalid",
+                    ));
+                }
+                let event: SubagentActivityEvent =
+                    serde_json::from_slice(&record.payload).map_err(io::Error::other)?;
+                if event.surface_commit_id != record.surface_commit_id
+                    || event.source_sequence != record.source_sequence
+                    || event.task_id.as_str() != task_id
+                    || event.attempt_id.as_str() != attempt_id
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "detached relay payload does not match its frame",
+                    ));
+                }
+                self.commit_surface_subagent_activity(active, fence.clone(), event)?;
+                after_sequence = record.source_sequence;
+            }
+            if !page.has_more {
+                return Ok(());
+            }
         }
     }
 

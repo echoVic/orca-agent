@@ -589,6 +589,8 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     task_registry,
                     root_task_id,
                     workflow_ipc,
+                    activity_ingress: workflow_lifecycle_ingress
+                        .and_then(|ingress| ingress.subagent_activity_ingress()),
                 },
                 child_executor: batch_child_executor,
             });

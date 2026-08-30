@@ -27,7 +27,7 @@ use crate::runtime_surface::RuntimeWorkflowLifecycleIngress;
 use crate::runtime_tool_call::{
     RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
 };
-use crate::subagent_execution::execute_subagent_tool;
+use crate::subagent_execution::execute_subagent_tool_with_activity_ingress;
 use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
@@ -230,7 +230,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 workflow_lifecycle_ingress,
             ),
             RuntimeSpecialToolDispatch::Subagent => {
-                let (result, child_budget_usage) = execute_subagent_tool(
+                let (result, child_budget_usage) = execute_subagent_tool_with_activity_ingress(
                     config,
                     cwd,
                     events,
@@ -248,6 +248,8 @@ impl<'a> RuntimeToolRouter<'a> {
                     root_task_id,
                     workflow_ipc,
                     subagent_child_executor,
+                    workflow_lifecycle_ingress
+                        .and_then(|ingress| ingress.subagent_activity_ingress()),
                     event_error,
                     child_budget.as_ref(),
                 )?;

@@ -36,8 +36,8 @@ use crate::agent_continuation::{
 };
 use crate::agent_loop::execute_child_agent_loop;
 use crate::child_agent_types::{
-    ChildAgentActivityEmitter, ChildAgentActivitySink, SubagentActivityIdentity,
-    SubagentActivityOwner, SubagentActivityPayload, child_event_output,
+    ChildAgentActivityEmitter, ChildAgentActivitySink, SubagentActivityEvent,
+    SubagentActivityIdentity, SubagentActivityOwner, SubagentActivityPayload, child_event_output,
 };
 use crate::child_agent_types::{ChildAgentCompatibilityIdentity, ChildAgentContinuationStart};
 use crate::hooks::HookRunner;
@@ -45,15 +45,15 @@ use crate::instructions;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
 use crate::memory;
 use crate::runtime_subagent_call::{
-    ChildEventActivityObserver, TaskRegistryActivitySink, append_worktree_outcome,
-    build_checkpoint_observer, commit_continuation_write_with_retry, continuation_error,
-    continuation_footer, serialized_subagent_type, validate_resume_overrides,
-    validate_subagent_output_schema,
+    ChildEventActivityObserver, append_worktree_outcome, build_checkpoint_observer,
+    commit_continuation_write_with_retry, continuation_error, continuation_footer,
+    serialized_subagent_type, validate_resume_overrides, validate_subagent_output_schema,
 };
 use crate::runtime_surface::{
     DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId, TaskRevision,
 };
 use crate::subagent::{self, SubagentIsolation};
+use crate::subagent_event_relay::RelayRecord;
 use crate::tasks::TaskRegistry;
 use crate::worktree::WorktreeGuard;
 
@@ -124,6 +124,50 @@ struct AsyncLaunchWorktree {
     child_cwd: PathBuf,
     worker: Option<AsyncSubagentWorktree>,
     fresh_guard: Option<WorktreeGuard>,
+}
+
+/// Lease-fenced detached activity publisher. The relay is the source delivery
+/// boundary; the task registry remains only a repairable post-append mirror.
+#[derive(Clone)]
+struct DetachedRelayActivitySink {
+    task_registry: TaskRegistry,
+    task_lease: crate::tasks::TaskLease,
+    task_id: String,
+    attempt_id: String,
+}
+
+impl ChildAgentActivitySink for DetachedRelayActivitySink {
+    fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        if !event.verify_digest() || event.attempt_id.as_str() != self.attempt_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "detached activity envelope failed digest or attempt validation",
+            ));
+        }
+        let payload = serde_json::to_vec(&event).map_err(io::Error::other)?;
+        let record = RelayRecord::new(
+            &crate::subagent_event_relay::RelayLease::new(
+                self.task_id.clone(),
+                crate::subagent_event_relay::RelayTaskType::Subagent,
+                self.task_lease.owner_id(),
+                self.task_lease.epoch(),
+                self.attempt_id.clone(),
+            )
+            .map_err(io::Error::other)?,
+            event.source_sequence,
+            event.surface_commit_id,
+            payload,
+        );
+        self.task_registry
+            .append_subagent_event_with_lease(
+                &self.task_lease,
+                &self.task_id,
+                &self.attempt_id,
+                record,
+            )
+            .map(|_| ())
+            .map_err(io::Error::other)
+    }
 }
 
 impl AsyncLaunchWorktree {
@@ -324,9 +368,11 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
     };
     let surface_task_id = SurfaceTaskId::try_new(agent_id.clone())
         .expect("async task registry created a non-empty task id");
-    let activity_sink: Arc<dyn ChildAgentActivitySink> = Arc::new(TaskRegistryActivitySink {
+    let activity_sink: Arc<dyn ChildAgentActivitySink> = Arc::new(DetachedRelayActivitySink {
         task_registry: task_registry.clone(),
+        task_lease: task_lease.clone(),
         task_id: agent_id.clone(),
+        attempt_id: prepared.attempt_id.as_str().to_string(),
     });
     let activity = Arc::new(ChildAgentActivityEmitter::new(
         SubagentActivityIdentity {
@@ -1277,6 +1323,43 @@ mod tests {
 
         assert!(outcome.preserved);
         assert_eq!(outcome.path, PathBuf::from("/missing/inherited-worktree"));
+    }
+
+    #[test]
+    fn detached_relay_sink_rejects_tampered_activity_before_append() {
+        let registry = TaskRegistry::new("relay-sink-validation".to_string());
+        let lease = crate::tasks::TaskLease {
+            task_id: "missing-task".to_string(),
+            owner_id: "worker".to_string(),
+            epoch: 1,
+            expires_at_ms: i64::MAX,
+        };
+        let sink = DetachedRelayActivitySink {
+            task_registry: registry,
+            task_lease: lease,
+            task_id: "missing-task".to_string(),
+            attempt_id: "attempt".to_string(),
+        };
+        let mut event = SubagentActivityEvent::new(
+            SurfaceTaskId::try_new("missing-task").unwrap(),
+            SurfaceSubagentId::try_new("missing-subagent").unwrap(),
+            crate::agent_continuation::AgentAttemptId::new(),
+            1,
+            SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new("missing-task").unwrap(),
+                task_revision: TaskRevision::try_new(1).unwrap(),
+                authority_digest: crate::runtime_surface::Sha256Digest::new([7; 32]),
+            },
+            SubagentActivityPayload::Started {
+                description: DisplayText::new("start"),
+            },
+        );
+        event.digest = crate::runtime_surface::Sha256Digest::new([0; 32]);
+
+        let error = sink
+            .publish(event)
+            .expect_err("tampered event must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

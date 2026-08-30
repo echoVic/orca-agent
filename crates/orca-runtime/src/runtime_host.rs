@@ -31,6 +31,9 @@ use tokio::sync::mpsc::{self as tokio_mpsc, error::TrySendError};
 use tokio::task::JoinHandle;
 
 use crate::background_turn::RuntimeTurnContinuation;
+use crate::child_agent_types::{
+    SubagentActivityEvent, SubagentActivityOwner, SubagentActivityPayload,
+};
 use crate::controller::{
     ControllerRunOptions, RuntimeBackgroundWorkflows, ThreadTurnPromptPlacement, ThreadTurnRequest,
     ThreadTurnToolMode,
@@ -1920,6 +1923,93 @@ impl surface::RuntimeWorkflowLifecycleIngress for RuntimeSurfaceWorkflowLifecycl
         reply_rx
             .recv()
             .map_err(|_| surface_semantic_ingress_ack_error())?
+    }
+
+    fn subagent_activity_ingress(
+        &self,
+    ) -> Option<Arc<dyn surface::RuntimeSubagentActivityIngress>> {
+        Some(Arc::new(RuntimeSurfaceSubagentActivityIngress {
+            command_tx: self.command_tx.clone(),
+            fence: self.fence.clone(),
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }))
+    }
+
+    fn drain_subagent_relay(&self, task_id: &str, attempt_id: &str) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceDrainSubagentRelay {
+                fence: self.fence.clone(),
+                task_id: task_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(surface_semantic_ingress_send_error)?;
+        reply_rx
+            .recv()
+            .map_err(|_| surface_semantic_ingress_ack_error())?
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeSurfaceSubagentActivityIngress {
+    command_tx: tokio_mpsc::Sender<ThreadCommand>,
+    fence: surface::SurfaceOperationFence,
+    seen: Arc<std::sync::Mutex<Vec<(surface::SurfaceCommitId, surface::Sha256Digest)>>>,
+}
+
+impl surface::RuntimeSubagentActivityIngress for RuntimeSurfaceSubagentActivityIngress {
+    fn owner(&self) -> SubagentActivityOwner {
+        SubagentActivityOwner::Generation {
+            operation_id: self.fence.operation_id.clone(),
+        }
+    }
+
+    fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        if !event.verify_digest() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child activity digest verification failed",
+            ));
+        }
+        {
+            let seen = self
+                .seen
+                .lock()
+                .map_err(|_| io::Error::other("activity ingress dedupe state poisoned"))?;
+            if let Some((_, digest)) = seen
+                .iter()
+                .find(|(commit_id, _)| *commit_id == event.surface_commit_id)
+            {
+                if *digest == event.digest {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "child activity commit id was reused with a conflicting digest",
+                ));
+            }
+        }
+        let commit_id = event.surface_commit_id.clone();
+        let digest = event.digest.clone();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceCommitSubagentActivity {
+                fence: self.fence.clone(),
+                event,
+                reply: reply_tx,
+            })
+            .map_err(surface_semantic_ingress_send_error)?;
+        let result = reply_rx
+            .recv()
+            .map_err(|_| surface_semantic_ingress_ack_error())?;
+        if result.is_ok() {
+            self.seen
+                .lock()
+                .map_err(|_| io::Error::other("activity ingress dedupe state poisoned"))?
+                .push((commit_id, digest));
+        }
+        result
     }
 }
 
@@ -4588,6 +4678,17 @@ enum ThreadCommand {
     SurfaceCommitWorkflowFinished {
         fence: surface::SurfaceOperationFence,
         finished: surface::RuntimeWorkflowFinished,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceCommitSubagentActivity {
+        fence: surface::SurfaceOperationFence,
+        event: SubagentActivityEvent,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceDrainSubagentRelay {
+        fence: surface::SurfaceOperationFence,
+        task_id: String,
+        attempt_id: String,
         reply: SyncSender<io::Result<()>>,
     },
     SurfaceRequestToolApproval {
@@ -16968,6 +17069,18 @@ impl ThreadActor {
                         "runtime thread is shutting down",
                     )));
                 }
+                ThreadCommand::SurfaceCommitSubagentActivity { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
+                ThreadCommand::SurfaceDrainSubagentRelay { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
                 ThreadCommand::SurfaceCommitProviderFailure { reply, .. }
                 | ThreadCommand::SurfaceCommitProviderAttemptFailure { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
@@ -17460,6 +17573,18 @@ impl ThreadActor {
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
+            ThreadCommand::SurfaceCommitSubagentActivity { reply, .. } => {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                )));
+            }
+            ThreadCommand::SurfaceDrainSubagentRelay { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "runtime generation is not active",
@@ -18386,6 +18511,23 @@ impl ThreadActor {
                 reply,
             } => {
                 let result = self.commit_surface_provider_response(active, fence, &response);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCommitSubagentActivity {
+                fence,
+                event,
+                reply,
+            } => {
+                let result = self.commit_surface_subagent_activity(active, fence, event);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceDrainSubagentRelay {
+                fence,
+                task_id,
+                attempt_id,
+                reply,
+            } => {
+                let result = self.drain_subagent_relay(active, fence, &task_id, &attempt_id);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderFailure {

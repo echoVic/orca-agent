@@ -57,10 +57,10 @@ const TASK_LEASE_DURATION_MS: i64 = 30_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskLease {
-    task_id: String,
-    owner_id: String,
-    epoch: u64,
-    expires_at_ms: i64,
+    pub(crate) task_id: String,
+    pub(crate) owner_id: String,
+    pub(crate) epoch: u64,
+    pub(crate) expires_at_ms: i64,
 }
 
 impl TaskLease {
