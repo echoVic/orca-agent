@@ -10,12 +10,13 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 
 use super::local::{
-    collect_session_files, is_regular_history_file, orca_home, summarize_session_with_archive_flag,
+    collect_session_files, is_regular_history_file, orca_home, storage_identity_for_path,
+    summarize_session_with_archive_flag,
 };
-use super::types::{SessionMeta, SessionSummary};
+use super::types::{SessionMeta, SessionSummary, StoredSessionHealth, StoredSessionHealthIssue};
 
 const DATABASE_FILENAME: &str = "sessions-index.sqlite3";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 const RECENT_SEED_LIMIT: usize = 20;
 
 static BACKFILLS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -82,22 +83,43 @@ fn list_page_at(
         let (summary_json, path, archived, updated_at_ms) = row.map_err(io::Error::other)?;
         let path = PathBuf::from(path);
         if !is_regular_history_file(&path) {
+            // A deleted, replaced, or unsafe entry is no longer a catalog
+            // record. Parse failures are different: those remain visible.
             stale_paths.push(path);
             continue;
         }
-        let mut summary = match serde_json::from_str::<SessionSummary>(&summary_json) {
+        let cached_summary = serde_json::from_str::<SessionSummary>(&summary_json).ok();
+        let mut summary = match summarize_session_with_archive_flag(&path, archived) {
             Ok(summary) => summary,
-            Err(_) => match summarize_session_with_archive_flag(&path, archived) {
-                Ok(summary) => {
-                    repaired_summaries.push(summary.clone());
-                    summary
-                }
-                Err(_) => {
-                    stale_paths.push(path);
-                    continue;
-                }
-            },
+            Err(_error) => {
+                // Keep the old catalog row visible even if a transient read
+                // fails. The SQLite cache is rebuildable, so malformed cache
+                // JSON must not turn one row into a whole-page failure.
+                let mut cached = cached_summary
+                    .clone()
+                    .unwrap_or_else(|| unreadable_summary(&path, archived, updated_at_ms));
+                cached.health = StoredSessionHealth::Quarantined;
+                cached.health_issue = Some(StoredSessionHealthIssue {
+                    code: "scan_failed".to_string(),
+                    line: None,
+                    offset: None,
+                });
+                cached.path = path.clone();
+                cached.archived = archived;
+                cached
+            }
         };
+        // The source can change after index insertion. Re-scan before
+        // returning the row and repair derived health in place.
+        let needs_repair = cached_summary.as_ref().is_none_or(|cached| {
+            cached.source_fingerprint != summary.source_fingerprint
+                || cached.health != summary.health
+                || cached.health_issue != summary.health_issue
+                || cached.storage_identity != summary.storage_identity
+        });
+        if needs_repair {
+            repaired_summaries.push(summary.clone());
+        }
         summary.path = path;
         summary.archived = archived;
         if let Some(updated_at) = DateTime::<Utc>::from_timestamp_millis(updated_at_ms) {
@@ -130,7 +152,11 @@ pub(crate) fn upsert_meta(path: &Path, meta: &SessionMeta, archived: bool) -> io
     let Some((home, inferred_archived)) = managed_home(path) else {
         return Ok(());
     };
-    let summary = summary_from_meta(path, meta.clone(), inferred_archived || archived)?;
+    let archived = inferred_archived || archived;
+    // This write-side fast path still scans the just-written bytes. Health is
+    // derived cache data, never an assumption based solely on the metadata.
+    let summary = summarize_session_with_archive_flag(path, archived)
+        .or_else(|_| summary_from_meta(path, meta.clone(), archived))?;
     let connection = open_index(&home)?;
     upsert_summary_with_connection(&connection, &summary)
 }
@@ -231,7 +257,10 @@ pub(crate) fn find_path(session_id: &str, include_archived: bool) -> io::Result<
     let path = connection
         .query_row(
             "SELECT path FROM sessions
-             WHERE session_id = ?1 AND (?2 = 1 OR archived = 0)",
+             WHERE (session_id = ?1 OR storage_identity = ?1)
+               AND (?2 = 1 OR archived = 0)
+             ORDER BY updated_at_ms DESC, created_at_ms DESC, path DESC
+             LIMIT 1",
             params![session_id, include_archived],
             |row| row.get::<_, String>(0),
         )
@@ -324,7 +353,7 @@ fn open_and_initialize(path: &Path) -> rusqlite::Result<Connection> {
         )
         .optional()?;
     match schema_version.as_deref() {
-        Some("2") => {}
+        Some("4") => {}
         Some(_) => {
             connection.execute_batch(
                 "DROP TABLE IF EXISTS sessions;
@@ -336,16 +365,22 @@ fn open_and_initialize(path: &Path) -> rusqlite::Result<Connection> {
     }
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
-                 session_id TEXT PRIMARY KEY,
-                 path TEXT NOT NULL UNIQUE,
+                 path TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
                  archived INTEGER NOT NULL,
                  title TEXT NOT NULL,
                  created_at_ms INTEGER NOT NULL,
                  updated_at_ms INTEGER NOT NULL,
-                 summary_json TEXT NOT NULL
+                 summary_json TEXT NOT NULL,
+                 health TEXT NOT NULL DEFAULT 'healthy',
+                 health_issue_json TEXT,
+                 source_fingerprint TEXT,
+                 storage_identity TEXT NOT NULL DEFAULT ''
              );
              CREATE INDEX IF NOT EXISTS sessions_recency
-                 ON sessions(archived, updated_at_ms DESC, created_at_ms DESC, session_id DESC);",
+                 ON sessions(archived, updated_at_ms DESC, created_at_ms DESC, session_id DESC);
+             CREATE INDEX IF NOT EXISTS sessions_session_id
+                 ON sessions(session_id, archived, updated_at_ms DESC);",
     )?;
     Ok(connection)
 }
@@ -480,35 +515,37 @@ fn upsert_summary_with_connection(
     connection
         .execute(
             "INSERT INTO sessions(
-                 session_id, path, archived, title, created_at_ms, updated_at_ms, summary_json
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(session_id) DO UPDATE SET
-                 path = CASE
-                     WHEN excluded.updated_at_ms >= sessions.updated_at_ms THEN excluded.path
-                     ELSE sessions.path
-                 END,
-                 archived = CASE
-                     WHEN excluded.updated_at_ms >= sessions.updated_at_ms THEN excluded.archived
-                     ELSE sessions.archived
-                 END,
-                 title = CASE
-                     WHEN excluded.updated_at_ms >= sessions.updated_at_ms THEN excluded.title
-                     ELSE sessions.title
-                 END,
+                 path, session_id, archived, title, created_at_ms, updated_at_ms, summary_json,
+                 health, health_issue_json, source_fingerprint, storage_identity
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(path) DO UPDATE SET
+                 session_id = excluded.session_id,
+                 archived = excluded.archived,
+                 title = excluded.title,
                  created_at_ms = excluded.created_at_ms,
-                 updated_at_ms = MAX(sessions.updated_at_ms, excluded.updated_at_ms),
-                 summary_json = CASE
-                     WHEN excluded.updated_at_ms >= sessions.updated_at_ms THEN excluded.summary_json
-                     ELSE sessions.summary_json
-                 END",
+                 updated_at_ms = excluded.updated_at_ms,
+                 summary_json = excluded.summary_json,
+                 health = excluded.health,
+                 health_issue_json = excluded.health_issue_json,
+                 source_fingerprint = excluded.source_fingerprint,
+                 storage_identity = excluded.storage_identity",
             params![
-                summary.session_id,
                 summary.path.to_string_lossy(),
+                summary.session_id,
                 summary.archived,
                 summary.title,
                 summary.created_at.timestamp_millis(),
                 summary.updated_at.timestamp_millis(),
-                summary_json
+                summary_json,
+                summary.health.as_str(),
+                summary
+                    .health_issue
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(io::Error::other)?,
+                summary.source_fingerprint,
+                summary.storage_identity
             ],
         )
         .map_err(io::Error::other)?;
@@ -531,6 +568,7 @@ fn summary_from_meta(path: &Path, meta: SessionMeta, archived: bool) -> io::Resu
         .ok()
         .map(DateTime::<Utc>::from)
         .unwrap_or(meta.created_at);
+    let storage_identity = storage_identity_for_path(path);
     Ok(SessionSummary {
         session_id: meta.session_id,
         title: meta.title,
@@ -549,7 +587,47 @@ fn summary_from_meta(path: &Path, meta: SessionMeta, archived: bool) -> io::Resu
         permission_rule_count: meta.permission_rules.rules.len(),
         additional_working_directories: meta.additional_working_directories,
         network_domain_permissions: meta.network_domain_permissions,
+        health: StoredSessionHealth::Healthy,
+        health_issue: None,
+        source_fingerprint: None,
+        storage_identity,
     })
+}
+
+fn unreadable_summary(path: &Path, archived: bool, updated_at_ms: i64) -> SessionSummary {
+    let updated_at = DateTime::<Utc>::from_timestamp_millis(updated_at_ms).unwrap_or_else(Utc::now);
+    let storage_identity = storage_identity_for_path(path);
+    SessionSummary {
+        session_id: storage_identity.clone(),
+        title: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Unreadable session")
+            .to_string(),
+        cwd: String::new(),
+        provider: "unknown".to_string(),
+        model: None,
+        created_at: updated_at,
+        updated_at,
+        path: path.to_path_buf(),
+        archived,
+        parent_id: None,
+        forked: false,
+        approval_mode: None,
+        active_permission_profile: None,
+        runtime_workspace_roots: Vec::new(),
+        permission_rule_count: 0,
+        additional_working_directories: Vec::new(),
+        network_domain_permissions: HashMap::new(),
+        health: StoredSessionHealth::Quarantined,
+        health_issue: Some(StoredSessionHealthIssue {
+            code: "scan_failed".to_string(),
+            line: None,
+            offset: None,
+        }),
+        source_fingerprint: None,
+        storage_identity,
+    }
 }
 
 fn modified_millis(path: &Path) -> Option<i64> {
@@ -745,6 +823,85 @@ mod tests {
         let second = list_page_at(home.path(), 20, 20, false, None).unwrap();
         assert_eq!(second.sessions.len(), 5);
         assert!(second.backfill_complete);
+    }
+
+    #[test]
+    fn malformed_session_remains_visible_as_a_quarantined_catalog_row() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("01")
+            .join("01")
+            .join("unreadable.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let source = b"{\"type\":\"session.meta\",bad}\n";
+        fs::write(&path, source).unwrap();
+
+        let page = list_page_at(home.path(), 0, 20, false, None).unwrap();
+        assert_eq!(page.sessions.len(), 1);
+        let summary = &page.sessions[0];
+        assert_eq!(summary.health, StoredSessionHealth::Quarantined);
+        assert_eq!(summary.path, path);
+        assert!(summary.session_id.starts_with("storage-"));
+        assert_eq!(summary.session_id, summary.storage_identity);
+        assert_eq!(fs::read(&summary.path).unwrap(), source);
+
+        let connection = open_index(home.path()).unwrap();
+        let health: String = connection
+            .query_row(
+                "SELECT health FROM sessions WHERE path = ?1",
+                [path.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(health, "quarantined");
+    }
+
+    #[test]
+    fn duplicate_metadata_ids_do_not_hide_each_other_in_the_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let first = write_legacy_session(home.path(), 1);
+        let second_path = home
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("01")
+            .join("02")
+            .join("duplicate.jsonl");
+        fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+        let mut second_meta = history::create_meta(home.path(), "mock", None, "duplicate id");
+        second_meta.session_id = first.session_id.clone();
+        fs::write(
+            &second_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&SessionRecord::Meta(second_meta)).unwrap()
+            ),
+        )
+        .unwrap();
+        let second = summarize_session_with_archive_flag(&second_path, false).unwrap();
+
+        let connection = open_index(home.path()).unwrap();
+        upsert_summary_with_connection(&connection, &first).unwrap();
+        upsert_summary_with_connection(&connection, &second).unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO index_meta(key, value)
+                 VALUES('backfill_complete', '1')",
+                [],
+            )
+            .unwrap();
+
+        let page = list_page_at(home.path(), 0, 20, false, None).unwrap();
+        assert_eq!(
+            page.sessions
+                .iter()
+                .filter(|summary| summary.session_id == first.session_id)
+                .count(),
+            2
+        );
     }
 
     #[cfg(unix)]

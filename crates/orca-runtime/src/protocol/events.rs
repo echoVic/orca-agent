@@ -226,6 +226,14 @@ pub enum ServerEvent {
         thread_id: Value,
         title: Value,
         cwd: Value,
+        #[serde(rename = "storageHealth")]
+        storage_health: Value,
+        #[serde(rename = "storageHealthIssue")]
+        storage_health_issue: Value,
+        #[serde(rename = "sourceFingerprint")]
+        source_fingerprint: Value,
+        #[serde(rename = "storageIdentity")]
+        storage_identity: Value,
         #[serde(rename = "runtimeWorkspaceRoots")]
         runtime_workspace_roots: Value,
         #[serde(rename = "activePermissionProfile")]
@@ -252,6 +260,8 @@ pub enum ServerEvent {
     },
     ThreadSearch {
         data: Value,
+        #[serde(rename = "diagnostics")]
+        diagnostics: Value,
         #[serde(rename = "nextCursor")]
         next_cursor: Value,
         #[serde(rename = "backwardsCursor")]
@@ -564,6 +574,12 @@ pub enum ServerEvent {
     },
     Error {
         message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<&'static str>,
+        #[serde(rename = "storageHealth", skip_serializing_if = "Value::is_null")]
+        storage_health: Value,
+        #[serde(rename = "storageHealthIssue", skip_serializing_if = "Value::is_null")]
+        storage_health_issue: Value,
     },
     TurnCompleted {
         status: Value,
@@ -574,6 +590,22 @@ impl ServerEvent {
     pub fn error(message: impl Into<String>) -> Self {
         Self::Error {
             message: message.into(),
+            code: None,
+            storage_health: Value::Null,
+            storage_health_issue: Value::Null,
+        }
+    }
+
+    pub fn stored_session_health_error(
+        message: impl Into<String>,
+        health: crate::thread_store::StoredSessionHealth,
+        issue: Option<crate::thread_store::StoredSessionHealthIssue>,
+    ) -> Self {
+        Self::Error {
+            message: message.into(),
+            code: Some("stored_session_health"),
+            storage_health: serde_json::to_value(health).unwrap_or(Value::Null),
+            storage_health_issue: serde_json::to_value(issue).unwrap_or(Value::Null),
         }
     }
 }
@@ -691,6 +723,9 @@ pub fn map_runtime_event_line(line: &str) -> Option<ServerEvent> {
         }),
         "error" => Some(ServerEvent::Error {
             message: payload["message"].as_str().unwrap_or_default().to_string(),
+            code: None,
+            storage_health: Value::Null,
+            storage_health_issue: Value::Null,
         }),
         "session.completed" => Some(ServerEvent::TurnCompleted {
             status: payload["status"].clone(),

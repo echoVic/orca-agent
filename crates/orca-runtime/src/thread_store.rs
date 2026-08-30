@@ -31,7 +31,8 @@ pub use session_index::SessionSummaryPage;
 pub(crate) use types::{ManualCompactionDurableSnapshot, StoredConversationRecord};
 pub use types::{
     SessionCheckpointRecord, SessionMeta, SessionSummary, SessionTranscript, SortDirection,
-    StoredThreadItem, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
+    StoredSessionHealth, StoredSessionHealthIssue, StoredThreadItem, StoredThreadItemPage,
+    StoredThreadProjection, StoredThreadSearchDiagnostic, StoredThreadSearchHit,
     StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn,
     StoredThreadTurnPage, ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter,
     ThreadSortKey, ThreadStore, TurnItemsView,
@@ -39,7 +40,8 @@ pub use types::{
 pub use writer::SessionWriter;
 pub(crate) use writer::{
     read_latest_context_tokens, read_manual_compaction_snapshot, read_prompt_queue_snapshot,
-    redact_sensitive_text, truncate_transcript_at_boundary, write_prompt_queue_snapshot,
+    redact_sensitive_text, stored_session_health_error_details, truncate_transcript_at_boundary,
+    write_prompt_queue_snapshot,
 };
 
 pub(crate) fn resume_conversation(

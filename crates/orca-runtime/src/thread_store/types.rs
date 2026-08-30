@@ -23,6 +23,49 @@ use serde_json::Value;
 use super::LiveThread;
 use crate::history::{CompactionRecord, ContextSummaryRecord};
 
+/// Health of a persisted session transcript as observed by the bounded
+/// storage scanner. This is deliberately separate from live runtime/session
+/// health: it describes the bytes on disk, not an active actor connection.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredSessionHealth {
+    #[default]
+    Healthy,
+    RecoverableTail,
+    Quarantined,
+    InspectionLimited,
+}
+
+impl StoredSessionHealth {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::RecoverableTail => "recoverable_tail",
+            Self::Quarantined => "quarantined",
+            Self::InspectionLimited => "inspection_limited",
+        }
+    }
+
+    pub fn is_readable(self) -> bool {
+        matches!(self, Self::Healthy | Self::RecoverableTail)
+    }
+
+    pub fn blocks_mutation(self) -> bool {
+        matches!(self, Self::Quarantined | Self::InspectionLimited)
+    }
+}
+
+/// Safe, bounded evidence explaining a non-healthy transcript classification.
+/// The scanner never stores raw malformed bytes or process diagnostics here.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StoredSessionHealthIssue {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionMeta {
@@ -72,6 +115,16 @@ pub struct SessionSummary {
     pub permission_rule_count: usize,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    #[serde(default)]
+    pub health: StoredSessionHealth,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_issue: Option<StoredSessionHealthIssue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint: Option<String>,
+    /// Storage-derived catalog identity, independent from JSONL metadata. It
+    /// is the only selector trusted for an unreadable session.
+    #[serde(default)]
+    pub storage_identity: String,
 }
 
 #[derive(Clone, Debug)]
@@ -618,6 +671,10 @@ pub struct StoredThreadProjection {
     pub thread_id: String,
     pub title: String,
     pub cwd: String,
+    pub health: StoredSessionHealth,
+    pub health_issue: Option<StoredSessionHealthIssue>,
+    pub source_fingerprint: Option<String>,
+    pub storage_identity: String,
     pub runtime_workspace_roots: Vec<PathBuf>,
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
@@ -679,6 +736,14 @@ pub struct StoredThreadSearchPage {
     pub data: Vec<StoredThreadSearchHit>,
     pub next_cursor: Option<String>,
     pub backwards_cursor: Option<String>,
+    pub diagnostics: Vec<StoredThreadSearchDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredThreadSearchDiagnostic {
+    pub storage_identity: String,
+    pub health: StoredSessionHealth,
+    pub issue: Option<StoredSessionHealthIssue>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -747,6 +812,10 @@ pub struct StoredThreadSummary {
     pub runtime_workspace_roots: Vec<PathBuf>,
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    pub health: StoredSessionHealth,
+    pub health_issue: Option<StoredSessionHealthIssue>,
+    pub source_fingerprint: Option<String>,
+    pub storage_identity: String,
 }
 
 pub trait ThreadStore {

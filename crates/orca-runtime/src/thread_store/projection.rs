@@ -718,6 +718,10 @@ impl From<SessionSummary> for StoredThreadSummary {
             runtime_workspace_roots: summary.runtime_workspace_roots,
             additional_working_directories: summary.additional_working_directories,
             network_domain_permissions: summary.network_domain_permissions,
+            health: summary.health,
+            health_issue: summary.health_issue,
+            source_fingerprint: summary.source_fingerprint,
+            storage_identity: summary.storage_identity,
         }
     }
 }

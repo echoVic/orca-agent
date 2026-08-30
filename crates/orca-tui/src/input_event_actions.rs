@@ -1461,6 +1461,10 @@ mod tests {
             permission_rule_count: 0,
             additional_working_directories: Vec::new(),
             network_domain_permissions: Default::default(),
+            health: orca_runtime::history::StoredSessionHealth::Healthy,
+            health_issue: None,
+            source_fingerprint: None,
+            storage_identity: title.to_string(),
         }
     }
 

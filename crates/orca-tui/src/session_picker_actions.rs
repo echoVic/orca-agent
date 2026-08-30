@@ -3,9 +3,11 @@ use std::time::Instant;
 
 use crossbeam_channel as mpsc;
 use crossterm::event::{KeyCode, KeyEvent};
+use orca_runtime::history::{SessionSummary, StoredSessionHealth};
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
 use crate::protocol::UserAction;
+use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, AppStatus, SessionPickerPhase};
 
 pub(crate) const SESSION_PICKER_PAGE_SIZE: usize = 20;
@@ -33,31 +35,108 @@ impl SessionPickerAction {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn available_session_actions(
     current_session_id: Option<&str>,
     selected_session_id: &str,
 ) -> Vec<SessionPickerAction> {
-    let mut actions = vec![
-        SessionPickerAction::Resume,
-        SessionPickerAction::Fork,
-        SessionPickerAction::Rename,
-    ];
-    if current_session_id != Some(selected_session_id) {
-        actions.extend([SessionPickerAction::Archive, SessionPickerAction::Delete]);
+    available_session_actions_with_health(
+        current_session_id,
+        selected_session_id,
+        StoredSessionHealth::Healthy,
+    )
+}
+
+pub(crate) fn available_session_actions_with_health(
+    current_session_id: Option<&str>,
+    selected_session_id: &str,
+    health: StoredSessionHealth,
+) -> Vec<SessionPickerAction> {
+    let mut actions = vec![SessionPickerAction::CopySessionId];
+    if !health.blocks_mutation() {
+        actions.splice(
+            0..0,
+            [
+                SessionPickerAction::Resume,
+                SessionPickerAction::Fork,
+                SessionPickerAction::Rename,
+            ],
+        );
     }
-    actions.push(SessionPickerAction::CopySessionId);
+    if current_session_id != Some(selected_session_id) {
+        actions.splice(
+            actions.len().saturating_sub(1)..actions.len().saturating_sub(1),
+            [SessionPickerAction::Archive, SessionPickerAction::Delete],
+        );
+    }
     actions
 }
 
-fn session_action_index(
-    current_session_id: Option<&str>,
-    selected_session_id: &str,
-    action: SessionPickerAction,
-) -> usize {
-    available_session_actions(current_session_id, selected_session_id)
+fn session_summary<'a>(state: &'a AppState, session_id: &str) -> Option<&'a SessionSummary> {
+    state
+        .session_picker_sessions
         .iter()
-        .position(|candidate| *candidate == action)
-        .expect("picker phase action must remain available")
+        .find(|session| session_matches_selector(session, session_id))
+}
+
+fn session_matches_selector(session: &SessionSummary, selector: &str) -> bool {
+    session.session_id == selector || session_catalog_identity(session) == selector
+}
+
+fn session_catalog_identity(session: &SessionSummary) -> &str {
+    if session.storage_identity.is_empty() {
+        &session.session_id
+    } else {
+        &session.storage_identity
+    }
+}
+
+fn session_selector(session: &SessionSummary) -> String {
+    if session.health.blocks_mutation() {
+        session_catalog_identity(session).to_string()
+    } else {
+        session.session_id.clone()
+    }
+}
+
+fn selected_session_selector(state: &AppState) -> Option<String> {
+    state
+        .session_picker_sessions
+        .get(state.session_picker_selected)
+        .map(session_selector)
+}
+
+fn session_health(state: &AppState, session_id: &str) -> StoredSessionHealth {
+    session_summary(state, session_id)
+        .map(|session| session.health)
+        .unwrap_or(StoredSessionHealth::Healthy)
+}
+
+fn session_actions(state: &AppState, selector: &str) -> Vec<SessionPickerAction> {
+    let session = session_summary(state, selector);
+    available_session_actions_with_health(
+        state.current_session_id(),
+        session
+            .map(|session| session.session_id.as_str())
+            .unwrap_or(selector),
+        session
+            .map(|session| session.health)
+            .unwrap_or(StoredSessionHealth::Healthy),
+    )
+}
+
+fn blocked_storage_message(session: &SessionSummary) -> String {
+    format!(
+        "Session '{}' is {:?}; resume, fork, and rename are disabled. Copy, archive, or delete the source instead.",
+        session.title, session.health
+    )
+}
+
+fn recoverable_storage_message(session: &SessionSummary, action: &str) -> String {
+    format!(
+        "Session '{}' has an incomplete final record. {action} will use the last complete boundary.",
+        session.title
+    )
 }
 
 pub(crate) fn handle_session_picker_key<F>(
@@ -97,7 +176,7 @@ where
             }
             KeyCode::Enter => dispatch_selected_resume(state, action_tx, clear_terminal)?,
             KeyCode::Tab => {
-                if let Some(session_id) = state.selected_session_id() {
+                if let Some(session_id) = selected_session_selector(state) {
                     state.session_picker_phase = SessionPickerPhase::Actions {
                         session_id,
                         selected: 0,
@@ -119,8 +198,7 @@ where
                 };
             }
             KeyCode::Down => {
-                let action_count =
-                    available_session_actions(state.current_session_id(), &session_id).len();
+                let action_count = session_actions(state, &session_id).len();
                 selected = (selected + 1).min(action_count.saturating_sub(1));
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
@@ -155,11 +233,10 @@ where
                 });
             }
             KeyCode::Esc => {
-                let selected = session_action_index(
-                    state.current_session_id(),
-                    &session_id,
-                    SessionPickerAction::Rename,
-                );
+                let selected = session_actions(state, &session_id)
+                    .iter()
+                    .position(|action| *action == SessionPickerAction::Rename)
+                    .unwrap_or(0);
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
                     selected,
@@ -193,11 +270,10 @@ where
                 let _ = action_tx.send(UserAction::ArchiveSavedSession { session_id });
             }
             KeyCode::Enter | KeyCode::Esc => {
-                let selected = session_action_index(
-                    state.current_session_id(),
-                    &session_id,
-                    SessionPickerAction::Archive,
-                );
+                let selected = session_actions(state, &session_id)
+                    .iter()
+                    .position(|action| *action == SessionPickerAction::Archive)
+                    .unwrap_or(0);
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
                     selected,
@@ -231,11 +307,10 @@ where
                 let _ = action_tx.send(UserAction::DeleteSavedSession { session_id });
             }
             KeyCode::Enter | KeyCode::Esc => {
-                let selected = session_action_index(
-                    state.current_session_id(),
-                    &session_id,
-                    SessionPickerAction::Delete,
-                );
+                let selected = session_actions(state, &session_id)
+                    .iter()
+                    .position(|action| *action == SessionPickerAction::Delete)
+                    .unwrap_or(0);
                 state.session_picker_phase = SessionPickerPhase::Actions {
                     session_id,
                     selected,
@@ -255,9 +330,21 @@ fn dispatch_selected_resume<F>(
 where
     F: FnOnce() -> io::Result<()>,
 {
-    let Some(session_id) = state.selected_session_id() else {
+    let Some(session_id) = selected_session_selector(state) else {
         return Ok(());
     };
+    if let Some(session) = session_summary(state, &session_id)
+        && session.health.blocks_mutation()
+    {
+        state.session_picker_error = Some(blocked_storage_message(session));
+        return Ok(());
+    }
+    let warning = session_summary(state, &session_id)
+        .filter(|session| session.health == StoredSessionHealth::RecoverableTail)
+        .map(|session| recoverable_storage_message(session, "Resume"));
+    if let Some(warning) = warning {
+        state.push_message(ChatMessage::System(warning));
+    }
     clear_terminal()?;
     state.enter_running();
     let _ = action_tx.send(UserAction::ResumeSavedSession { session_id });
@@ -274,24 +361,55 @@ fn activate_action<F>(
 where
     F: FnOnce() -> io::Result<()>,
 {
-    let Some(action) = available_session_actions(state.current_session_id(), &session_id)
-        .get(selected)
-        .copied()
-    else {
+    let health = session_health(state, &session_id);
+    let Some(action) = session_actions(state, &session_id).get(selected).copied() else {
         state.session_picker_phase = SessionPickerPhase::Browsing;
         return Ok(());
     };
     match action {
         SessionPickerAction::Resume => {
+            if health.blocks_mutation() {
+                if let Some(session) = session_summary(state, &session_id) {
+                    state.session_picker_error = Some(blocked_storage_message(session));
+                }
+                state.session_picker_phase = SessionPickerPhase::Browsing;
+                return Ok(());
+            }
+            let warning = session_summary(state, &session_id)
+                .filter(|session| session.health == StoredSessionHealth::RecoverableTail)
+                .map(|session| recoverable_storage_message(session, "Resume"));
+            if let Some(warning) = warning {
+                state.push_message(ChatMessage::System(warning));
+            }
             clear_terminal()?;
             state.enter_running();
             let _ = action_tx.send(UserAction::ResumeSavedSession { session_id });
         }
         SessionPickerAction::Fork => {
+            if health.blocks_mutation() {
+                if let Some(session) = session_summary(state, &session_id) {
+                    state.session_picker_error = Some(blocked_storage_message(session));
+                }
+                state.session_picker_phase = SessionPickerPhase::Browsing;
+                return Ok(());
+            }
+            let warning = session_summary(state, &session_id)
+                .filter(|session| session.health == StoredSessionHealth::RecoverableTail)
+                .map(|session| recoverable_storage_message(session, "Fork"));
+            if let Some(warning) = warning {
+                state.push_message(ChatMessage::System(warning));
+            }
             state.enter_running();
             let _ = action_tx.send(UserAction::ForkSavedSession { session_id });
         }
         SessionPickerAction::Rename => {
+            if health.blocks_mutation() {
+                if let Some(session) = session_summary(state, &session_id) {
+                    state.session_picker_error = Some(blocked_storage_message(session));
+                }
+                state.session_picker_phase = SessionPickerPhase::Browsing;
+                return Ok(());
+            }
             state.session_picker_phase = SessionPickerPhase::Renaming {
                 session_id,
                 value: String::new(),
@@ -301,7 +419,7 @@ where
             let title = state
                 .session_picker_sessions
                 .iter()
-                .find(|session| session.session_id == session_id)
+                .find(|session| session_matches_selector(session, &session_id))
                 .map(|session| session.title.clone())
                 .unwrap_or_else(|| session_id.clone());
             state.session_picker_phase = if action == SessionPickerAction::Archive {
@@ -369,13 +487,13 @@ pub(crate) fn load_next_session_page(state: &mut AppState) -> usize {
             let mut seen = state
                 .session_picker_sessions
                 .iter()
-                .map(|session| session.session_id.clone())
+                .map(|session| session_catalog_identity(session).to_string())
                 .collect::<std::collections::HashSet<_>>();
             let before = state.session_picker_sessions.len();
             state.session_picker_sessions.extend(
                 page.sessions
                     .into_iter()
-                    .filter(|session| seen.insert(session.session_id.clone())),
+                    .filter(|session| seen.insert(session_catalog_identity(session).to_string())),
             );
             state.session_picker_next_offset = page.next_offset;
             state.session_picker_backfill_complete = page.backfill_complete;
@@ -401,7 +519,7 @@ fn refresh_after_backfill(state: &mut AppState) {
     if !page.backfill_complete {
         return;
     }
-    let selected_id = state.selected_session_id();
+    let selected_id = selected_session_selector(state);
     state.session_picker_sessions = page.sessions;
     state.session_picker_next_offset = page.next_offset;
     state.session_picker_backfill_complete = true;
@@ -411,7 +529,7 @@ fn refresh_after_backfill(state: &mut AppState) {
             state
                 .session_picker_sessions
                 .iter()
-                .position(|session| session.session_id == selected_id)
+                .position(|session| session_matches_selector(session, selected_id))
         })
         .unwrap_or(0);
 }
@@ -478,6 +596,10 @@ mod tests {
             permission_rule_count: 0,
             additional_working_directories: Vec::new(),
             network_domain_permissions: Default::default(),
+            health: orca_runtime::history::StoredSessionHealth::Healthy,
+            health_issue: None,
+            source_fingerprint: None,
+            storage_identity: id.to_string(),
         }
     }
 
@@ -573,22 +695,56 @@ mod tests {
     }
 
     #[test]
-    fn session_action_indices_follow_available_actions() {
+    fn session_actions_change_with_storage_health() {
         assert_eq!(
-            session_action_index(None, "two", SessionPickerAction::Rename),
-            2
+            available_session_actions_with_health(
+                None,
+                "corrupt",
+                StoredSessionHealth::Quarantined,
+            ),
+            vec![
+                SessionPickerAction::Archive,
+                SessionPickerAction::Delete,
+                SessionPickerAction::CopySessionId,
+            ]
         );
+        assert!(
+            available_session_actions_with_health(
+                None,
+                "tail",
+                StoredSessionHealth::RecoverableTail,
+            )
+            .contains(&SessionPickerAction::Resume)
+        );
+    }
+
+    #[test]
+    fn quarantined_picker_row_uses_storage_selector_and_blocks_resume() {
+        let (mut state, rx) = state();
+        let corrupt = state
+            .session_picker_sessions
+            .get_mut(1)
+            .expect("selected session");
+        corrupt.health = StoredSessionHealth::Quarantined;
+        corrupt.storage_identity = "storage-corrupt".to_string();
+
+        press(KeyCode::Tab, &mut state);
         assert_eq!(
-            session_action_index(None, "two", SessionPickerAction::Archive),
-            3
+            state.session_picker_phase,
+            SessionPickerPhase::Actions {
+                session_id: "storage-corrupt".to_string(),
+                selected: 0,
+            }
         );
-        assert_eq!(
-            session_action_index(None, "two", SessionPickerAction::Delete),
-            4
+        state.session_picker_phase = SessionPickerPhase::Browsing;
+        press(KeyCode::Enter, &mut state);
+
+        assert!(
+            state
+                .session_picker_error
+                .as_deref()
+                .is_some_and(|message| message.contains("Quarantined"))
         );
-        assert_eq!(
-            session_action_index(Some("two"), "two", SessionPickerAction::CopySessionId),
-            3
-        );
+        assert!(rx.try_recv().is_err());
     }
 }

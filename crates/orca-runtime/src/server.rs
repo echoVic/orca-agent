@@ -37,7 +37,7 @@ use crate::sandbox_denial::{SandboxDenialDiagnostic, diagnose_sandbox_denial};
 use crate::shell_session::{ShellSandboxMode, ShellSessionCommand};
 use crate::thread_store::{
     SortDirection, StoredThreadItem, StoredThreadSummary, StoredThreadTurn, ThreadListFilters,
-    ThreadMetadataPatch, ThreadSortKey, TurnItemsView,
+    ThreadMetadataPatch, ThreadSortKey, TurnItemsView, stored_session_health_error_details,
 };
 use command_exec_manager::{
     CommandExecDrainOutcome, CommandExecManager, CommandExecPermissionPolicy, CommandExecProcess,
@@ -2174,11 +2174,23 @@ fn run_thread_search<W: Write>(
             })
         })
         .collect::<Vec<_>>();
+    let diagnostics = page
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            serde_json::json!({
+                "storageIdentity": diagnostic.storage_identity,
+                "storageHealth": diagnostic.health,
+                "storageHealthIssue": diagnostic.issue,
+            })
+        })
+        .collect::<Vec<_>>();
     protocol::write_server_event(
         writer,
         &id,
         ServerEvent::ThreadSearch {
             data: Value::from(data),
+            diagnostics: Value::from(diagnostics),
             next_cursor: optional_string_to_json(page.next_cursor),
             backwards_cursor: optional_string_to_json(page.backwards_cursor),
         },
@@ -2205,6 +2217,10 @@ fn thread_summary_to_json(summary: StoredThreadSummary) -> Value {
         "additionalWorkingDirectories": additional_working_directories_to_json(summary.additional_working_directories),
         "networkDomainPermissionCount": summary.network_domain_permissions.len(),
         "networkDomainPermissions": network_domain_permissions_to_json(summary.network_domain_permissions),
+        "storageHealth": summary.health,
+        "storageHealthIssue": summary.health_issue,
+        "sourceFingerprint": summary.source_fingerprint,
+        "storageIdentity": summary.storage_identity,
     })
 }
 
@@ -2511,6 +2527,13 @@ fn run_thread_read<W: Write>(
                 ServerEvent::error(format!("unknown thread: {thread_id}")),
             );
         }
+        Err(error) if let Some((health, issue)) = stored_session_health_error_details(&error) => {
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::stored_session_health_error(error.to_string(), health, issue),
+            );
+        }
         Err(error) => return Err(error),
     };
 
@@ -2521,6 +2544,10 @@ fn run_thread_read<W: Write>(
             thread_id: Value::from(thread.thread_id),
             title: Value::from(thread.title),
             cwd: Value::from(thread.cwd),
+            storage_health: serde_json::to_value(thread.health).unwrap_or(Value::Null),
+            storage_health_issue: serde_json::to_value(thread.health_issue).unwrap_or(Value::Null),
+            source_fingerprint: optional_string_to_json(thread.source_fingerprint),
+            storage_identity: Value::from(thread.storage_identity),
             runtime_workspace_roots: runtime_workspace_roots_to_json(
                 thread.runtime_workspace_roots,
             ),
@@ -6825,6 +6852,18 @@ enabled = true
             assert_eq!(read["id"], "read");
             assert_eq!(read["event"], "thread_read");
             assert_eq!(read["threadId"], thread_id);
+            assert_eq!(read["storageHealth"], "healthy");
+            assert!(read["storageHealthIssue"].is_null());
+            assert!(
+                read["sourceFingerprint"]
+                    .as_str()
+                    .is_some_and(|fingerprint| !fingerprint.is_empty())
+            );
+            assert!(
+                read["storageIdentity"]
+                    .as_str()
+                    .is_some_and(|identity| identity.starts_with("storage-"))
+            );
             let messages = read["messages"].as_array().expect("messages");
             assert_eq!(read["messageCount"], messages.len());
             assert!(messages.iter().any(|message| {
@@ -6919,6 +6958,52 @@ enabled = true
                 1,
                 "cold projection must preserve one canonical user item: {cold_users:#?}"
             );
+        });
+    }
+
+    #[test]
+    fn thread_read_reports_typed_quarantine_without_mutating_the_source() {
+        with_orca_home(|home| {
+            let path = home
+                .join("sessions")
+                .join("2026")
+                .join("01")
+                .join("01")
+                .join("corrupt.jsonl");
+            std::fs::create_dir_all(path.parent().expect("session parent"))
+                .expect("create session parent");
+            let source = b"{\"type\":\"session.meta\",bad}\n";
+            std::fs::write(&path, source).expect("write corrupt session");
+            let summary = SessionStore::new()
+                .list_sessions(1)
+                .expect("catalog corrupt session")
+                .into_iter()
+                .next()
+                .expect("corrupt summary");
+
+            let server_config = ServerConfig {
+                run_config: test_run_config(),
+            };
+            let mut state = ServerState::default();
+            let mut output = Vec::new();
+            handle_line_for_test(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"read-corrupt","method":"thread/read","params":{{"threadId":"{}","includeMessages":true}}}}"#,
+                    summary.storage_identity
+                ),
+                &mut output,
+            )
+            .expect("typed corrupt thread read");
+
+            let events = parse_jsonl(&output);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event"], "error");
+            assert_eq!(events[0]["code"], "stored_session_health");
+            assert_eq!(events[0]["storageHealth"], "quarantined");
+            assert_eq!(events[0]["storageHealthIssue"]["code"], "malformed_record");
+            assert_eq!(std::fs::read(path).expect("read source"), source);
         });
     }
 
@@ -7477,6 +7562,8 @@ enabled = true
                     .as_str()
                     .is_some_and(|snippet| snippet.contains("needle"))
             );
+            assert_eq!(data[0]["thread"]["storageHealth"], "healthy");
+            assert!(events[0]["diagnostics"].is_array());
             assert_eq!(events[0]["nextCursor"], "1");
 
             let mut page_output = Vec::new();

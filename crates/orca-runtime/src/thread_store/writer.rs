@@ -18,6 +18,7 @@ use orca_core::tool_types::ToolResult;
 use orca_platform::fs::{
     AtomicWritePolicy, ExclusiveFileLock, atomic_write_with, open_nofollow_nonblocking,
 };
+use sha2::Digest;
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
@@ -25,8 +26,56 @@ use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 use super::session_index;
 use super::types::{
     ManualCompactionDurableSnapshot, ManualCompactionSnapshotRecord, SessionMeta, SessionRecord,
-    SessionTranscript, StoredConversationRecord, StoredMessage,
+    SessionTranscript, StoredConversationRecord, StoredMessage, StoredSessionHealth,
+    StoredSessionHealthIssue,
 };
+
+/// Bounds shared by every persisted-session reader. Keeping these limits in
+/// the scanner prevents a malformed transcript (or a compressed bomb) from
+/// turning indexing/search into an unbounded allocation.
+pub(crate) const MAX_SESSION_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_SESSION_DECODED_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_SESSION_LINE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SESSION_RECORDS: usize = 100_000;
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionScan {
+    pub records: Vec<SessionRecord>,
+    /// Decoded JSONL lines retained only up to the same record/line bounds.
+    /// Search uses these snippets instead of opening the source a second time.
+    pub lines: Vec<String>,
+    pub health: StoredSessionHealth,
+    pub health_issue: Option<StoredSessionHealthIssue>,
+    pub source_fingerprint: Option<String>,
+}
+
+impl SessionScan {
+    fn new(path: &Path) -> Self {
+        Self {
+            records: Vec::new(),
+            lines: Vec::new(),
+            health: StoredSessionHealth::Healthy,
+            health_issue: None,
+            source_fingerprint: source_fingerprint(path),
+        }
+    }
+
+    fn issue(
+        mut self,
+        health: StoredSessionHealth,
+        code: impl Into<String>,
+        line: Option<u64>,
+        offset: Option<u64>,
+    ) -> Self {
+        self.health = health;
+        self.health_issue = Some(StoredSessionHealthIssue {
+            code: code.into(),
+            line,
+            offset,
+        });
+        self
+    }
+}
 
 #[cfg(test)]
 static MANUAL_COMPACTION_SNAPSHOT_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -184,72 +233,15 @@ pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) 
 }
 
 pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
-    let lines = read_history_lines(path)?;
-    let mut records = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<SessionRecord>(line) {
-            Ok(SessionRecord::Message { id, turn_id, .. }) if id.is_some() != turn_id.is_some() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid conversation identity at {} line {}: id and turn_id must be present together",
-                        path.display(),
-                        i + 1
-                    ),
-                ));
-            }
-            Ok(SessionRecord::SemanticEvent { event }) => {
-                conversation_record_from_semantic_event(&event).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid semantic event record at {} line {}: {error}",
-                            path.display(),
-                            i + 1
-                        ),
-                    )
-                })?;
-                records.push(SessionRecord::SemanticEvent { event });
-            }
-            Ok(record) => records.push(record),
-            Err(error) if line_has_record_type(line, "event.semantic") => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid semantic event record at {} line {}: {error}",
-                        path.display(),
-                        i + 1
-                    ),
-                ));
-            }
-            Err(error) if line_has_invalid_tool_terminal(line) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid session record at {} line {}: {error}",
-                        path.display(),
-                        i + 1
-                    ),
-                ));
-            }
-            Err(error) if line_has_conversation_identity(line) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid conversation identity at {} line {}: {error}",
-                        path.display(),
-                        i + 1
-                    ),
-                ));
-            }
-            Err(_) if i == lines.len() - 1 => break,
-            Err(_) => continue,
-        }
+    let scan = scan_session(path)?;
+    match scan.health {
+        StoredSessionHealth::Healthy | StoredSessionHealth::RecoverableTail => Ok(scan.records),
+        health => Err(session_health_error(
+            path,
+            health,
+            scan.health_issue.as_ref(),
+        )),
     }
-    Ok(records)
 }
 
 pub(crate) fn conversation_record_from_semantic_event(
@@ -270,10 +262,6 @@ fn line_has_conversation_identity(line: &str) -> bool {
         value["type"] == "conversation.message"
             && (!value["id"].is_null() || !value["turn_id"].is_null())
     })
-}
-
-fn line_has_record_type(line: &str, record_type: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| value["type"] == record_type)
 }
 
 fn line_has_invalid_tool_terminal(line: &str) -> bool {
@@ -320,8 +308,327 @@ fn write_records_to(
     Ok(())
 }
 
+/// Scan a persisted transcript once, classifying corruption without mutating
+/// the source bytes. The returned records are the valid prefix; callers must
+/// respect `health` before treating that prefix as resumable history.
+pub(crate) fn scan_session(path: &Path) -> io::Result<SessionScan> {
+    scan_session_inner(path, false)
+}
+
+fn scan_session_with_lines(path: &Path) -> io::Result<SessionScan> {
+    scan_session_inner(path, true)
+}
+
+fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionScan> {
+    let file = match open_regular_history_file(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let metadata = fs::symlink_metadata(path).ok();
+            if metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.file_type().is_file())
+            {
+                return Ok(SessionScan::new(path).issue(
+                    StoredSessionHealth::Quarantined,
+                    "open_failed",
+                    None,
+                    None,
+                ));
+            }
+            return Err(error);
+        }
+    };
+    let encoded_bytes = file.metadata()?.len();
+    let scan = SessionScan::new(path);
+    if encoded_bytes > MAX_SESSION_ENCODED_BYTES {
+        return Ok(scan.issue(
+            StoredSessionHealth::InspectionLimited,
+            "encoded_bytes_limit",
+            None,
+            Some(MAX_SESSION_ENCODED_BYTES),
+        ));
+    }
+
+    let compressed = path.extension().and_then(|ext| ext.to_str()) == Some("zst");
+    if compressed {
+        let decoder = match zstd::stream::read::Decoder::new(file) {
+            Ok(decoder) => decoder,
+            Err(_) => {
+                return Ok(scan.issue(StoredSessionHealth::Quarantined, "zstd_header", None, None));
+            }
+        };
+        scan_reader(std::io::BufReader::new(decoder), scan, true, collect_lines)
+    } else {
+        scan_reader(std::io::BufReader::new(file), scan, false, collect_lines)
+    }
+}
+
+fn scan_reader<R: BufRead>(
+    mut reader: R,
+    mut scan: SessionScan,
+    compressed: bool,
+    collect_lines: bool,
+) -> io::Result<SessionScan> {
+    let mut line = Vec::new();
+    let mut decoded_offset = 0_u64;
+    let mut line_number = 0_u64;
+    loop {
+        line.clear();
+        let (bytes_read, terminated) =
+            match read_bounded_line(&mut reader, &mut line, MAX_SESSION_LINE_BYTES) {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(_) => {
+                    return Ok(scan.issue(
+                        StoredSessionHealth::Quarantined,
+                        if compressed {
+                            "zstd_stream"
+                        } else {
+                            "read_error"
+                        },
+                        (line_number > 0).then_some(line_number),
+                        Some(decoded_offset),
+                    ));
+                }
+            };
+        let next_offset = decoded_offset.saturating_add(bytes_read as u64);
+        if next_offset > MAX_SESSION_DECODED_BYTES {
+            return Ok(scan.issue(
+                StoredSessionHealth::InspectionLimited,
+                "decoded_bytes_limit",
+                Some(line_number.saturating_add(1)),
+                Some(decoded_offset),
+            ));
+        }
+        decoded_offset = next_offset;
+        line_number = line_number.saturating_add(1);
+        if line.len() > MAX_SESSION_LINE_BYTES {
+            return Ok(scan.issue(
+                StoredSessionHealth::InspectionLimited,
+                "record_bytes_limit",
+                Some(line_number),
+                Some(decoded_offset.saturating_sub(bytes_read as u64)),
+            ));
+        }
+
+        let content = line_content(&line);
+        if content.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let text = match std::str::from_utf8(content) {
+            Ok(text) => text,
+            Err(_) => {
+                return Ok(scan.issue(
+                    StoredSessionHealth::Quarantined,
+                    "invalid_utf8",
+                    Some(line_number),
+                    Some(decoded_offset.saturating_sub(bytes_read as u64)),
+                ));
+            }
+        };
+
+        let record = match parse_session_record(text) {
+            Ok(record) => record,
+            Err(code) => {
+                if !terminated && code == "incomplete_record" && !compressed {
+                    return Ok(scan.issue(
+                        StoredSessionHealth::RecoverableTail,
+                        "recoverable_tail",
+                        Some(line_number),
+                        Some(decoded_offset.saturating_sub(bytes_read as u64)),
+                    ));
+                }
+                return Ok(scan.issue(
+                    StoredSessionHealth::Quarantined,
+                    code,
+                    Some(line_number),
+                    Some(decoded_offset.saturating_sub(bytes_read as u64)),
+                ));
+            }
+        };
+        if scan.records.len() >= MAX_SESSION_RECORDS {
+            return Ok(scan.issue(
+                StoredSessionHealth::InspectionLimited,
+                "record_count_limit",
+                Some(line_number),
+                Some(decoded_offset),
+            ));
+        }
+        scan.records.push(record);
+        if collect_lines {
+            scan.lines.push(text.to_string());
+        }
+    }
+    Ok(scan)
+}
+
+/// Reads at most `max_bytes + 1` bytes for one line. `read_until` is not used
+/// here because it allocates the entire attacker-controlled line before a
+/// caller can enforce the record limit.
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<Option<(usize, bool)>> {
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some((line.len(), false)))
+            };
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let available = newline.map(|index| index + 1).unwrap_or(buffer.len());
+        let remaining = max_bytes.saturating_add(1).saturating_sub(line.len());
+        let take = available.min(remaining.max(1));
+        line.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        if line.len() > max_bytes {
+            return Ok(Some((line.len(), newline.is_some() && take == available)));
+        }
+        if newline.is_some() && take == available {
+            return Ok(Some((line.len(), true)));
+        }
+        if take == 0 {
+            return Ok(Some((line.len(), false)));
+        }
+    }
+}
+
+fn line_content(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn parse_session_record(line: &str) -> Result<SessionRecord, &'static str> {
+    let value = match serde_json::from_str::<SessionRecord>(line) {
+        Ok(record) => record,
+        Err(error) if error.classify() == serde_json::error::Category::Eof => {
+            return Err("incomplete_record");
+        }
+        Err(_) => {
+            let value = serde_json::from_str::<serde_json::Value>(line).ok();
+            if value
+                .as_ref()
+                .is_some_and(|value| value["type"] == "event.semantic")
+            {
+                return Err("invalid_semantic_record");
+            }
+            if value
+                .as_ref()
+                .is_some_and(|value| value["type"] == "conversation.message")
+            {
+                if line_has_invalid_tool_terminal(line) {
+                    return Err("invalid_tool_terminal");
+                }
+                if line_has_conversation_identity(line) {
+                    return Err("invalid_conversation_identity");
+                }
+            }
+            return Err("malformed_record");
+        }
+    };
+
+    match &value {
+        SessionRecord::Message { id, turn_id, .. } if id.is_some() != turn_id.is_some() => {
+            Err("invalid_conversation_identity")
+        }
+        SessionRecord::SemanticEvent { event } => conversation_record_from_semantic_event(event)
+            .map(|_| value)
+            .map_err(|_| "invalid_semantic_record"),
+        _ => Ok(value),
+    }
+}
+
+fn source_fingerprint(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(path.as_os_str().to_string_lossy().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified.as_secs().to_le_bytes());
+    hasher.update(modified.subsec_nanos().to_le_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
-    open_history_reader(path)?.lines().collect()
+    let scan = scan_session_with_lines(path)?;
+    match scan.health {
+        StoredSessionHealth::Healthy | StoredSessionHealth::RecoverableTail => Ok(scan.lines),
+        health => Err(session_health_error(
+            path,
+            health,
+            scan.health_issue.as_ref(),
+        )),
+    }
+}
+
+pub(crate) fn session_health_error(
+    path: &Path,
+    health: StoredSessionHealth,
+    issue: Option<&StoredSessionHealthIssue>,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        StoredSessionHealthError {
+            path: path.to_path_buf(),
+            health,
+            issue: issue.cloned(),
+        },
+    )
+}
+
+#[derive(Debug)]
+struct StoredSessionHealthError {
+    path: PathBuf,
+    health: StoredSessionHealth,
+    issue: Option<StoredSessionHealthIssue>,
+}
+
+impl std::fmt::Display for StoredSessionHealthError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let detail = self
+            .issue
+            .as_ref()
+            .map(|issue| {
+                format!(
+                    "{}{}{}",
+                    issue.code,
+                    issue
+                        .line
+                        .map(|line| format!(" at line {line}"))
+                        .unwrap_or_default(),
+                    issue
+                        .offset
+                        .map(|offset| format!(" offset {offset}"))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| "unknown storage issue".to_string());
+        write!(
+            formatter,
+            "stored session {} ({:?}): {detail}",
+            self.path.display(),
+            self.health
+        )
+    }
+}
+
+impl std::error::Error for StoredSessionHealthError {}
+
+pub(crate) fn stored_session_health_error_details(
+    error: &io::Error,
+) -> Option<(StoredSessionHealth, Option<StoredSessionHealthIssue>)> {
+    error
+        .get_ref()?
+        .downcast_ref::<StoredSessionHealthError>()
+        .map(|error| (error.health, error.issue.clone()))
 }
 
 pub(crate) fn open_regular_history_file(path: &Path) -> io::Result<File> {
@@ -335,6 +642,7 @@ pub(crate) fn open_regular_history_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+#[cfg(test)]
 pub(crate) fn open_history_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
     let file = open_regular_history_file(path)?;
     if path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
@@ -345,16 +653,20 @@ pub(crate) fn open_history_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
 }
 
 pub(crate) fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
-    let reader = open_history_reader(path)?;
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(SessionRecord::Meta(meta)) = serde_json::from_str::<SessionRecord>(&line) {
-            return Ok(meta);
-        }
-        break;
+    let scan = scan_session(path)?;
+    if scan.health.blocks_mutation() {
+        return Err(session_health_error(
+            path,
+            scan.health,
+            scan.health_issue.as_ref(),
+        ));
+    }
+    if let Some(SessionRecord::Meta(meta)) = scan
+        .records
+        .into_iter()
+        .find(|record| matches!(record, SessionRecord::Meta(_)))
+    {
+        return Ok(meta);
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -993,6 +1305,17 @@ impl SessionWriter {
                 format!("history file not found: {}", path.display()),
             ));
         }
+        // Classify the original bytes before any resume path can restore a
+        // compressed file or repair a recoverable plaintext tail. Quarantined
+        // and inspection-limited transcripts remain source-preserving.
+        let scan = scan_session(&path)?;
+        if scan.health.blocks_mutation() {
+            return Err(session_health_error(
+                &path,
+                scan.health,
+                scan.health_issue.as_ref(),
+            ));
+        }
         // Appends write plaintext JSONL; raw bytes after a zstd frame would
         // make the whole transcript undecodable, so a compressed session must
         // be restored to plaintext before it can be continued.
@@ -1371,6 +1694,10 @@ impl EventPublicationStore for SessionWriter {
 fn append_usage_baseline(path: &Path) -> io::Result<()> {
     let _lock = acquire_file_lock(path)?;
     let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+    // `append_to_existing` has already classified this as either healthy or
+    // a recoverable plaintext tail. Repair only that accepted tail while the
+    // append lock is held, before any new JSONL record can be written.
+    repair_incomplete_final_record(&mut file)?;
     let result = (|| {
         let Some(usage) = read_transcript(path)?.usage else {
             return Ok(());
@@ -1994,7 +2321,7 @@ mod tests {
             read_records(path.path())
                 .expect_err("partial identity must fail closed")
                 .to_string()
-                .contains("id and turn_id must be present together")
+                .contains("invalid_conversation_identity")
         );
 
         fs::write(
@@ -2011,7 +2338,7 @@ mod tests {
             read_records(path.path())
                 .expect_err("malformed identity must fail closed")
                 .to_string()
-                .contains("invalid conversation identity")
+                .contains("invalid_conversation_identity")
         );
     }
 
@@ -2304,7 +2631,7 @@ mod tests {
         let error =
             read_records(&path).expect_err("known invalid semantic record must fail closed");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("invalid semantic event record"));
+        assert!(error.to_string().contains("invalid_semantic_record"));
         assert!(error.to_string().contains("line 2"));
     }
 
@@ -2332,7 +2659,172 @@ mod tests {
     }
 
     #[test]
-    fn read_records_preserves_legacy_skip_for_unrelated_invalid_record() {
+    fn scanner_accepts_a_complete_final_record_without_a_newline() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let valid = serde_json::to_string(&SessionRecord::Message {
+            id: None,
+            turn_id: None,
+            message: StoredMessage::User {
+                content: "complete without newline".to_string(),
+                images: Vec::new(),
+                pinned: false,
+            },
+        })
+        .expect("serialize valid record");
+        fs::write(path.path(), valid).expect("write transcript");
+
+        let scan = scan_session(path.path()).expect("scan transcript");
+        assert_eq!(scan.health, StoredSessionHealth::Healthy);
+        assert_eq!(scan.records.len(), 1);
+    }
+
+    #[test]
+    fn scanner_recovers_only_a_plaintext_incomplete_final_record_without_mutating_source() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let valid = serde_json::to_string(&SessionRecord::Message {
+            id: None,
+            turn_id: None,
+            message: StoredMessage::User {
+                content: "valid prefix".to_string(),
+                images: Vec::new(),
+                pinned: false,
+            },
+        })
+        .expect("serialize valid record");
+        let source =
+            format!("{valid}\n{{\"type\":\"conversation.message\",\"message\":{{\"role\":\"tool\"");
+        fs::write(path.path(), &source).expect("write truncated transcript");
+
+        let scan = scan_session(path.path()).expect("scan transcript");
+        assert_eq!(scan.health, StoredSessionHealth::RecoverableTail);
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(
+            scan.health_issue.as_ref().map(|issue| issue.code.as_str()),
+            Some("recoverable_tail")
+        );
+        assert_eq!(
+            fs::read(path.path()).expect("read source after scan"),
+            source.as_bytes()
+        );
+    }
+
+    #[test]
+    fn scanner_quarantines_a_malformed_middle_record() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let valid = serde_json::to_string(&SessionRecord::Message {
+            id: None,
+            turn_id: None,
+            message: StoredMessage::User {
+                content: "valid prefix".to_string(),
+                images: Vec::new(),
+                pinned: false,
+            },
+        })
+        .expect("serialize valid record");
+        fs::write(
+            path.path(),
+            format!("{valid}\n{{\"type\":\"conversation.message\",bad}}\n{valid}\n"),
+        )
+        .expect("write malformed transcript");
+
+        let scan = scan_session(path.path()).expect("scan transcript");
+        assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(
+            scan.health_issue.as_ref().and_then(|issue| issue.line),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn scanner_quarantines_bad_and_truncated_zstd_streams() {
+        let directory = tempfile::tempdir().expect("temporary transcript directory");
+        let path = directory.path().join("corrupt.jsonl.zst");
+        fs::write(&path, b"not a zstd stream").expect("write bad zstd header");
+        let scan = scan_session(&path).expect("scan bad zstd header");
+        assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+        assert!(matches!(
+            scan.health_issue.as_ref().map(|issue| issue.code.as_str()),
+            Some("zstd_header" | "zstd_stream")
+        ));
+
+        let valid = serde_json::to_string(&SessionRecord::Message {
+            id: None,
+            turn_id: None,
+            message: StoredMessage::User {
+                content: "compressed prefix".to_string(),
+                images: Vec::new(),
+                pinned: false,
+            },
+        })
+        .expect("serialize valid record");
+        let mut encoded = zstd::stream::encode_all(format!("{valid}\n").as_bytes(), 1)
+            .expect("encode transcript");
+        encoded.pop();
+        fs::write(&path, encoded).expect("write truncated zstd stream");
+        let scan = scan_session(&path).expect("scan truncated zstd stream");
+        assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+    }
+
+    #[test]
+    fn scanner_limits_an_oversized_record_without_allocating_the_full_line() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        fs::write(path.path(), vec![b'x'; MAX_SESSION_LINE_BYTES + 1])
+            .expect("write oversized record");
+
+        let scan = scan_session(path.path()).expect("scan oversized record");
+        assert_eq!(scan.health, StoredSessionHealth::InspectionLimited);
+        assert_eq!(
+            scan.health_issue.as_ref().map(|issue| issue.code.as_str()),
+            Some("record_bytes_limit")
+        );
+    }
+
+    #[test]
+    fn append_to_existing_does_not_mutate_quarantined_source() {
+        let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let source = b"{\"type\":\"conversation.message\",bad}\n";
+        fs::write(path.path(), source).expect("write malformed transcript");
+
+        let error = SessionWriter::append_to_existing(path.path().to_path_buf())
+            .expect_err("quarantined session must not resume");
+        assert!(error.to_string().contains("Quarantined"));
+        assert_eq!(
+            fs::read(path.path()).expect("read source after resume"),
+            source
+        );
+    }
+
+    #[test]
+    fn append_to_existing_repairs_a_recoverable_tail_before_future_appends() {
+        let (_directory, path, _writer) = new_transcript();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open transcript for truncated tail");
+        file.write_all(b"{\"type\":\"conversation.message\",\"message\":{\"role\":\"tool\"")
+            .expect("write truncated tail");
+        file.flush().expect("flush truncated tail");
+        assert_eq!(
+            scan_session(&path).expect("scan truncated tail").health,
+            StoredSessionHealth::RecoverableTail
+        );
+
+        let resumed = SessionWriter::append_to_existing(path.clone())
+            .expect("resume at the last complete boundary");
+
+        assert_eq!(resumed.session_id().as_deref(), Some("resume-usage"));
+        assert_eq!(
+            scan_session(&path)
+                .expect("scan repaired transcript")
+                .health,
+            StoredSessionHealth::Healthy
+        );
+        assert_eq!(read_records(&path).expect("read repaired records").len(), 1);
+    }
+
+    #[test]
+    fn read_records_quarantines_complete_incomplete_record() {
         let path = tempfile::NamedTempFile::new().expect("temp transcript");
         fs::write(
             path.path(),
@@ -2340,12 +2832,22 @@ mod tests {
         )
         .expect("write transcript");
 
-        let records = read_records(path.path()).expect("legacy malformed tail is skipped");
-        assert!(records.is_empty());
+        let scan = scan_session(path.path()).expect("scan malformed record");
+        assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+        assert_eq!(
+            scan.health_issue.as_ref().map(|issue| issue.code.as_str()),
+            Some("incomplete_record")
+        );
+        assert!(
+            read_records(path.path())
+                .expect_err("complete incomplete record must remain quarantined")
+                .to_string()
+                .contains("incomplete_record")
+        );
     }
 
     #[test]
-    fn read_records_skips_terminal_shaped_record_with_unrelated_error() {
+    fn read_records_quarantines_terminal_shaped_record_with_unrelated_error() {
         let path = tempfile::NamedTempFile::new().expect("temp transcript");
         fs::write(
             path.path(),
@@ -2356,8 +2858,18 @@ mod tests {
         )
         .expect("write transcript");
 
-        let records = read_records(path.path()).expect("unrelated old bad record is skipped");
-        assert_eq!(records.len(), 1);
+        let scan = scan_session(path.path()).expect("scan malformed record");
+        assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+        assert_eq!(
+            scan.health_issue.as_ref().map(|issue| issue.code.as_str()),
+            Some("malformed_record")
+        );
+        assert!(
+            read_records(path.path())
+                .expect_err("malformed record must not be skipped")
+                .to_string()
+                .contains("malformed_record")
+        );
     }
 
     #[test]

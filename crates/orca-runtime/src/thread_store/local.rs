@@ -13,7 +13,6 @@ use orca_core::tool_types::truncate_output;
 
 use super::LiveThread;
 #[cfg(not(test))]
-#[cfg(not(test))]
 use super::ORCA_HOME_ENV;
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
@@ -23,15 +22,15 @@ use super::projection::{
 use super::session_index::{self, SessionSummaryPage};
 use super::types::{
     SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection,
-    StoredConversationRecord, StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit,
-    StoredThreadSearchPage, StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurnPage,
-    ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
-    TurnItemsView,
+    StoredConversationRecord, StoredSessionHealth, StoredThreadItemPage, StoredThreadProjection,
+    StoredThreadSearchDiagnostic, StoredThreadSearchHit, StoredThreadSearchPage,
+    StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurnPage, ThreadListFilters,
+    ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore, TurnItemsView,
 };
 use super::writer::{
     acquire_file_lock, conversation_record_from_semantic_event, open_regular_history_file,
     read_history_lines, read_records, read_session_meta, read_transcript, read_transcript_until,
-    rewrite_records_unlocked, write_durable_record,
+    rewrite_records_unlocked, scan_session, session_health_error, write_durable_record,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -362,6 +361,14 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         return Ok(path);
     }
+    let scan = scan_session(&path)?;
+    if scan.health != StoredSessionHealth::Healthy {
+        return Err(session_health_error(
+            &path,
+            scan.health,
+            scan.health_issue.as_ref(),
+        ));
+    }
     let compressed_path = path.with_extension("jsonl.zst");
     let _lock = acquire_file_lock(&path)?;
     let result = (|| {
@@ -497,32 +504,104 @@ pub(crate) fn summarize_session_with_archive_flag(
     path: &Path,
     archived: bool,
 ) -> io::Result<SessionSummary> {
-    let meta = read_session_meta(path)?;
+    let scan = scan_session(path)?;
     let updated_at = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .map(DateTime::<Utc>::from)
-        .unwrap_or(meta.created_at);
+        .unwrap_or_else(Utc::now);
+    let meta = scan.records.iter().find_map(|record| match record {
+        SessionRecord::Meta(meta) => Some(meta.clone()),
+        _ => None,
+    });
+    // The catalog identity deliberately comes from storage rather than the
+    // JSONL metadata. A damaged file may contain an absent, malformed, or
+    // duplicated session id, but it must still have its own visible row.
+    let storage_identity = storage_identity_for_path(path);
+    let (
+        session_id,
+        title,
+        cwd,
+        provider,
+        model,
+        created_at,
+        parent_id,
+        forked,
+        approval_mode,
+        active_permission_profile,
+        runtime_workspace_roots,
+        permission_rule_count,
+        additional_working_directories,
+        network_domain_permissions,
+    ) = match meta {
+        Some(meta) => (
+            meta.session_id,
+            meta.title,
+            meta.cwd,
+            meta.provider,
+            meta.model,
+            meta.created_at,
+            meta.parent_id,
+            meta.forked,
+            meta.approval_mode,
+            meta.active_permission_profile,
+            meta.runtime_workspace_roots,
+            meta.permission_rules.rules.len(),
+            meta.additional_working_directories,
+            meta.network_domain_permissions,
+        ),
+        None => (
+            storage_identity.clone(),
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Unreadable session")
+                .to_string(),
+            String::new(),
+            "unknown".to_string(),
+            None,
+            updated_at,
+            None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            0,
+            Vec::new(),
+            HashMap::new(),
+        ),
+    };
 
     Ok(SessionSummary {
-        session_id: meta.session_id,
-        title: meta.title,
-        cwd: meta.cwd,
-        provider: meta.provider,
-        model: meta.model,
-        created_at: meta.created_at,
+        session_id,
+        title,
+        cwd,
+        provider,
+        model,
+        created_at,
         updated_at,
         path: path.to_path_buf(),
         archived,
-        parent_id: meta.parent_id,
-        forked: meta.forked,
-        approval_mode: meta.approval_mode,
-        active_permission_profile: meta.active_permission_profile,
-        permission_rule_count: meta.permission_rules.rules.len(),
-        runtime_workspace_roots: meta.runtime_workspace_roots,
-        additional_working_directories: meta.additional_working_directories,
-        network_domain_permissions: meta.network_domain_permissions,
+        parent_id,
+        forked,
+        approval_mode,
+        active_permission_profile,
+        runtime_workspace_roots,
+        permission_rule_count,
+        additional_working_directories,
+        network_domain_permissions,
+        health: scan.health,
+        health_issue: scan.health_issue,
+        source_fingerprint: scan.source_fingerprint,
+        storage_identity,
     })
+}
+
+pub(crate) fn storage_identity_for_path(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"orca-storage-identity-v1\n");
+    hasher.update(path.to_string_lossy().as_bytes());
+    format!("storage-{:x}", hasher.finalize())
 }
 
 pub fn search_sessions(query: &str, include_archived: bool) -> io::Result<Vec<SearchHit>> {
@@ -813,7 +892,11 @@ fn collect_matching_paths(
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return;
         };
-        if file_name.contains(selector) {
+        // A quarantined transcript may not have a trusted or parseable
+        // metadata session id. Its picker row therefore uses the
+        // storage-derived identity. Keep that selector usable even when the
+        // rebuildable SQLite catalog is unavailable or still backfilling.
+        if file_name.contains(selector) || storage_identity_for_path(path) == selector {
             candidates.push(path.to_path_buf());
         }
     })
@@ -981,6 +1064,16 @@ impl ThreadStore for JsonlThreadStore {
         include_messages: bool,
         include_turns: bool,
     ) -> io::Result<StoredThreadProjection> {
+        let path = find_session_path(thread_id, true)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no saved session matches '{thread_id}'"),
+            )
+        })?;
+        // Project the same persisted health that catalog/search callers see.
+        // `load_thread_records` still rescans before reading the records, so a
+        // source that changes after this summary cannot be resumed silently.
+        let summary = summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))?;
         let (meta, conversation_records) = load_thread_records(thread_id)?;
         let stored_messages = normalized_stored_messages(&conversation_records);
         let projected_messages = if include_messages {
@@ -1005,6 +1098,10 @@ impl ThreadStore for JsonlThreadStore {
             thread_id: meta.session_id,
             title: meta.title,
             cwd: meta.cwd,
+            health: summary.health,
+            health_issue: summary.health_issue,
+            source_fingerprint: summary.source_fingerprint,
+            storage_identity: summary.storage_identity,
             runtime_workspace_roots: meta.runtime_workspace_roots,
             active_permission_profile: meta.active_permission_profile,
             additional_working_directories: meta.additional_working_directories,
@@ -1057,20 +1154,60 @@ impl ThreadStore for JsonlThreadStore {
         sort_key: ThreadSortKey,
         sort_direction: SortDirection,
     ) -> io::Result<StoredThreadSearchPage> {
-        let mut hits = self
-            .search_sessions(query, include_archived)?
-            .into_iter()
-            .map(|hit| {
-                let archived = hit.archived;
-                let snippet = hit.line.clone();
-                summarize_session_with_archive_flag(&hit.path, archived).map(|summary| {
-                    StoredThreadSearchHit {
+        // The catalog is the source of truth for health. Search backends may
+        // skip a corrupt file before they can construct a text hit, so collect
+        // diagnostics independently from matching snippets.
+        let catalog = self.list_sessions_with_archived(usize::MAX, include_archived)?;
+        let mut diagnostic_identities = HashSet::new();
+        let mut diagnostics = catalog
+            .iter()
+            .filter(|summary| summary.health != StoredSessionHealth::Healthy)
+            .filter_map(|summary| {
+                diagnostic_identities
+                    .insert(summary.storage_identity.clone())
+                    .then(|| StoredThreadSearchDiagnostic {
+                        storage_identity: summary.storage_identity.clone(),
+                        health: summary.health,
+                        issue: summary.health_issue.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut hits = Vec::new();
+        // A search worker failure must not make one bad transcript erase
+        // healthy results or the catalog diagnostics already collected above.
+        let raw_hits = self
+            .search_sessions(query, include_archived)
+            .unwrap_or_default();
+        for hit in raw_hits {
+            let archived = hit.archived;
+            let snippet = hit.line.clone();
+            match summarize_session_with_archive_flag(&hit.path, archived) {
+                Ok(summary) => {
+                    if summary.health != StoredSessionHealth::Healthy
+                        && diagnostic_identities.insert(summary.storage_identity.clone())
+                    {
+                        diagnostics.push(StoredThreadSearchDiagnostic {
+                            storage_identity: summary.storage_identity.clone(),
+                            health: summary.health,
+                            issue: summary.health_issue.clone(),
+                        });
+                    }
+                    hits.push(StoredThreadSearchHit {
                         thread: StoredThreadSummary::from(summary),
                         snippet,
+                    });
+                }
+                Err(_) => {
+                    if diagnostic_identities.insert(hit.session_id.clone()) {
+                        diagnostics.push(StoredThreadSearchDiagnostic {
+                            storage_identity: hit.session_id.clone(),
+                            health: StoredSessionHealth::Quarantined,
+                            issue: None,
+                        });
                     }
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+                }
+            }
+        }
         sort_thread_search_hits(&mut hits, sort_key);
         if sort_direction == SortDirection::Asc {
             hits.reverse();
@@ -1080,6 +1217,7 @@ impl ThreadStore for JsonlThreadStore {
             data,
             next_cursor,
             backwards_cursor,
+            diagnostics,
         })
     }
 
@@ -1392,5 +1530,103 @@ mod tests {
         });
 
         assert!(collector.matches.is_empty());
+    }
+
+    #[test]
+    fn thread_search_returns_healthy_hits_and_quarantine_diagnostics_together() {
+        let home = tempfile::tempdir().expect("temporary Orca home");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let store = JsonlThreadStore::new();
+            let mut healthy = store
+                .create_live_thread(home, "mock", None, "healthy search transcript")
+                .expect("create healthy transcript");
+            let healthy_id = healthy.thread_id().to_string();
+            healthy
+                .writer_mut()
+                .enter_turn(orca_core::thread_identity::TurnId::new());
+            healthy
+                .writer_mut()
+                .append_message(&orca_core::conversation::Message::user(
+                    "needle in healthy transcript".to_string(),
+                ))
+                .expect("write searchable message");
+            healthy
+                .complete("success")
+                .expect("complete healthy transcript");
+
+            let corrupt_path = sessions_dir()
+                .join("2026")
+                .join("01")
+                .join("01")
+                .join("corrupt.jsonl");
+            fs::create_dir_all(corrupt_path.parent().expect("corrupt parent"))
+                .expect("create corrupt parent");
+            fs::write(
+                &corrupt_path,
+                b"{\"type\":\"session.meta\",\"title\":\"needle\",bad}\n",
+            )
+            .expect("write corrupt transcript");
+
+            let page = store
+                .search_threads(
+                    "needle",
+                    None,
+                    20,
+                    false,
+                    ThreadSortKey::UpdatedAt,
+                    SortDirection::Desc,
+                )
+                .expect("search must isolate corrupt session");
+            assert!(
+                page.data
+                    .iter()
+                    .any(|hit| hit.thread.thread_id == healthy_id)
+            );
+            assert!(page.diagnostics.iter().any(|diagnostic| {
+                diagnostic.health == StoredSessionHealth::Quarantined
+                    && diagnostic.storage_identity.starts_with("storage-")
+            }));
+        });
+    }
+
+    #[test]
+    fn storage_identity_fallback_keeps_quarantined_sessions_manageable_without_index() {
+        let home = tempfile::tempdir().expect("temporary Orca home");
+        crate::history::with_test_orca_home(home.path(), |_| {
+            let corrupt_path = sessions_dir()
+                .join("2026")
+                .join("01")
+                .join("01")
+                .join("corrupt.jsonl");
+            fs::create_dir_all(corrupt_path.parent().expect("corrupt parent"))
+                .expect("create corrupt parent");
+            fs::write(&corrupt_path, b"{\"type\":\"session.meta\",bad}\n")
+                .expect("write corrupt transcript");
+
+            let storage_identity = storage_identity_for_path(&corrupt_path);
+            assert_eq!(
+                find_session_path(&storage_identity, false).expect("resolve storage selector"),
+                Some(corrupt_path.clone())
+            );
+            assert!(
+                load_session(&storage_identity).is_err(),
+                "resume/fork's shared transcript loader must reject quarantine"
+            );
+            assert!(
+                rename_session(&storage_identity, "should not rename").is_err(),
+                "metadata rewrites must reject quarantine"
+            );
+            assert_eq!(
+                fs::read(&corrupt_path).expect("read untouched source"),
+                b"{\"type\":\"session.meta\",bad}\n"
+            );
+
+            let archived = archive_session(&storage_identity).expect("archive corrupt source");
+            let archived_identity = storage_identity_for_path(&archived);
+            assert_eq!(
+                delete_session(&archived_identity).expect("delete corrupt source"),
+                archived
+            );
+        });
     }
 }

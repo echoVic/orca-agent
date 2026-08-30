@@ -14,8 +14,9 @@ use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
 pub use crate::thread_store::{
     JsonlThreadStore, LiveThread, SearchHit, SessionMeta, SessionStore, SessionSummary,
-    SessionSummaryPage, SessionTranscript, SessionWriter, SortDirection, StoredThreadItem,
-    StoredThreadItemPage, StoredThreadProjection, StoredThreadSearchHit, StoredThreadSearchPage,
+    SessionSummaryPage, SessionTranscript, SessionWriter, SortDirection, StoredSessionHealth,
+    StoredSessionHealthIssue, StoredThreadItem, StoredThreadItemPage, StoredThreadProjection,
+    StoredThreadSearchDiagnostic, StoredThreadSearchHit, StoredThreadSearchPage,
     StoredThreadSummary, StoredThreadSummaryPage, StoredThreadTurn, StoredThreadTurnPage,
     ThreadListFilters, ThreadMetadataPatch, ThreadRelationFilter, ThreadSortKey, ThreadStore,
     TurnItemsView, archive_session, compress_session, delete_session, list_session_page,

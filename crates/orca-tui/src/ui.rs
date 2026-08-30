@@ -16,11 +16,11 @@ use orca_core::task_types::{
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_file_search::SearchPhase;
-use orca_runtime::history::SessionSummary;
+use orca_runtime::history::{SessionSummary, StoredSessionHealth};
 
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
-use crate::session_picker_actions::available_session_actions;
+use crate::session_picker_actions::available_session_actions_with_health;
 use crate::shortcuts::{self, ShortcutScope};
 use crate::syntax_highlight::highlight_code;
 use crate::theme::Theme;
@@ -736,6 +736,12 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
             ),
             Style::default().fg(theme.muted),
         ));
+        if session.health != StoredSessionHealth::Healthy {
+            spans.push(Span::styled(
+                format!("  [{:?}]", session.health),
+                Style::default().fg(theme.error),
+            ));
+        }
         lines.push(Line::from(spans));
 
         if let Some(metadata) = session_permission_metadata_label(session) {
@@ -768,9 +774,21 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
                 "Session actions",
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             )));
-            for (index, action) in available_session_actions(state.current_session_id(), session_id)
-                .into_iter()
-                .enumerate()
+            let session = state.session_picker_sessions.iter().find(|session| {
+                session.session_id == *session_id || session.storage_identity == *session_id
+            });
+            let health = session
+                .map(|session| session.health)
+                .unwrap_or(StoredSessionHealth::Healthy);
+            for (index, action) in available_session_actions_with_health(
+                state.current_session_id(),
+                session
+                    .map(|session| session.session_id.as_str())
+                    .unwrap_or(session_id),
+                health,
+            )
+            .into_iter()
+            .enumerate()
             {
                 let style = if index == *selected {
                     Style::default()
@@ -6165,6 +6183,10 @@ mod tests {
             permission_rule_count: 0,
             additional_working_directories: Vec::new(),
             network_domain_permissions: Default::default(),
+            health: orca_runtime::history::StoredSessionHealth::Healthy,
+            health_issue: None,
+            source_fingerprint: None,
+            storage_identity: id.to_string(),
         }
     }
 
