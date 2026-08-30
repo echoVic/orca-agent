@@ -186,17 +186,15 @@ impl DetachedPermissionHandler {
             .map_err(io::Error::other)?;
         let deadline = Instant::now() + self.wait_timeout;
         let terminal_error = |kind: io::ErrorKind, message: &str| {
-            self.persist_terminal_deny(&key)
-                .err()
-                .map_or_else(
-                    || io::Error::new(kind, message),
-                    |error| {
-                        io::Error::new(
-                            kind,
-                            format!("{message}; failed to persist terminal denial: {error}"),
-                        )
-                    },
-                )
+            self.persist_terminal_deny(&key).err().map_or_else(
+                || io::Error::new(kind, message),
+                |error| {
+                    io::Error::new(
+                        kind,
+                        format!("{message}; failed to persist terminal denial: {error}"),
+                    )
+                },
+            )
         };
         loop {
             if self.cancel.is_cancelled() {
