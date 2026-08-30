@@ -41,8 +41,9 @@ use crate::lifecycle::{
 };
 use crate::model_response::RuntimeModelResponse;
 use crate::runtime_surface::{
-    DisplayText, Sha256Digest, SurfaceTask, SurfaceTaskId, SurfaceTaskStatus, SurfaceTaskType,
-    TaskRevision, UnixMillis, UsageTotals as SurfaceUsageTotals,
+    DisplayText, Sha256Digest, SurfaceOperationFence, SurfaceTask, SurfaceTaskId,
+    SurfaceTaskStatus, SurfaceTaskType, TaskRevision, UnixMillis,
+    UsageTotals as SurfaceUsageTotals,
 };
 use crate::subagent_event_relay::{
     RelayError, RelayLease, RelayReadTarget, RelayRecord, SubagentEventRelay,
@@ -153,6 +154,11 @@ pub(crate) struct DetachedSubagentBinding {
     pub(crate) parent_task_id: Option<String>,
     pub(crate) task_revision: TaskRevision,
     pub(crate) attempt_id: AgentAttemptId,
+    /// Durable identity of the operation that admitted this detached child.
+    /// It is context, not a bearer capability; the actor still validates the
+    /// current thread owner and operation history before using it.
+    #[serde(default)]
+    pub(crate) parent_fence: Option<SurfaceOperationFence>,
     /// Random actor-issued capability digest.  It is never derived solely
     /// from compatibility/configuration data.
     pub(crate) authority_digest: Sha256Digest,
@@ -925,6 +931,7 @@ impl TaskRegistry {
         subagent_id: &str,
         attempt_id: AgentAttemptId,
         task_revision: TaskRevision,
+        parent_fence: Option<SurfaceOperationFence>,
     ) -> Result<DetachedSubagentBinding, String> {
         if let Some(error) = self.persistent_open_error.as_deref() {
             return Err(format!("persistent task registry is unavailable: {error}"));
@@ -972,6 +979,7 @@ impl TaskRegistry {
                 && existing.parent_task_id == task.parent_task_id
                 && existing.task_revision == task_revision
                 && existing.attempt_id == attempt_id
+                && existing.parent_fence == parent_fence
             {
                 self.detached_bindings
                     .lock()
@@ -997,6 +1005,7 @@ impl TaskRegistry {
             parent_task_id: task.parent_task_id,
             task_revision,
             attempt_id,
+            parent_fence,
             authority_digest: Sha256Digest::digest(authority_material),
         };
         if let Some(persistence) = self.persistence.as_ref() {

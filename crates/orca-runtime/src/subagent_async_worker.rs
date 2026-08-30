@@ -51,7 +51,8 @@ use crate::runtime_subagent_call::{
     serialized_subagent_type, validate_resume_overrides, validate_subagent_output_schema,
 };
 use crate::runtime_surface::{
-    DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId, TaskRevision,
+    DisplayText, SurfaceOperationFence, SurfaceSubagentId, SurfaceSubagentTerminalStatus,
+    SurfaceTaskId, TaskRevision,
 };
 use crate::subagent::{self, SubagentIsolation};
 use crate::subagent_event_relay::RelayRecord;
@@ -103,6 +104,9 @@ pub(crate) struct AsyncSubagentLaunchContext<'a> {
     pub subagent_depth: u32,
     pub task_registry: &'a TaskRegistry,
     pub root_task_id: Option<&'a str>,
+    /// Parent operation identity retained by detached activity after the
+    /// admitting generation leaves the resident actor.
+    pub parent_fence: Option<SurfaceOperationFence>,
 }
 
 pub(crate) struct AsyncSubagentLaunchOutput {
@@ -632,6 +636,7 @@ pub(crate) fn launch_async_subagent(
         subagent_depth,
         task_registry,
         root_task_id,
+        parent_fence,
     } = context;
     let mut request = subagent::with_delegation_snapshot(
         request,
@@ -829,6 +834,7 @@ pub(crate) fn launch_async_subagent(
         &agent_id,
         prepared.attempt_id.clone(),
         TaskRevision::try_new(1).expect("one is a valid task revision"),
+        parent_fence,
     ) {
         Ok(binding) => binding,
         Err(error) => {
@@ -1444,6 +1450,7 @@ mod tests {
             subagent_depth: 0,
             task_registry: &registry,
             root_task_id: None,
+            parent_fence: None,
         });
 
         assert_eq!(output.result.status, ToolStatus::Failed);

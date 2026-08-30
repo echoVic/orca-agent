@@ -10,8 +10,8 @@ use crate::child_agent_types::SubagentActivityEvent;
 use crate::model_response::RuntimeModelResponse;
 
 use super::{
-    DisplayText, NonEmptyText, SurfaceTaskFence, SurfaceTaskId, SurfaceToolCallId,
-    SurfaceWorkflowFence, SurfaceWorkflowRunId, UnixMillis,
+    DisplayText, NonEmptyText, SurfaceOperationFence, SurfaceTaskFence, SurfaceTaskId,
+    SurfaceToolCallId, SurfaceWorkflowFence, SurfaceWorkflowRunId, UnixMillis,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +76,13 @@ pub trait RuntimeWorkflowLifecycleIngress: Send + Sync + std::fmt::Debug {
 pub trait RuntimeSubagentActivityIngress: Send + Sync + std::fmt::Debug {
     #[allow(private_interfaces)]
     fn owner(&self) -> crate::child_agent_types::SubagentActivityOwner;
+    /// Returns the parent operation fence that admitted this child attempt.
+    /// Detached workers persist this identity with their owner binding so a
+    /// restarted actor can project child activity under the original parent
+    /// operation without reusing a stale generation capability.
+    fn parent_fence(&self) -> Option<SurfaceOperationFence> {
+        None
+    }
     #[allow(private_interfaces)]
     fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()>;
 }

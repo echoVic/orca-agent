@@ -1967,6 +1967,10 @@ impl surface::RuntimeSubagentActivityIngress for RuntimeSurfaceSubagentActivityI
         }
     }
 
+    fn parent_fence(&self) -> Option<surface::SurfaceOperationFence> {
+        Some(self.fence.clone())
+    }
+
     fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
         if !event.verify_digest() {
             return Err(io::Error::new(

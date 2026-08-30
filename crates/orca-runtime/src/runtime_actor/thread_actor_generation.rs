@@ -891,7 +891,14 @@ impl ThreadActor {
                     created_at: event.occurred_at,
                     started_at: Some(event.occurred_at),
                     completed_at: None,
-                    parent_operation: fence.map(|fence| fence.operation_id.clone()),
+                    parent_operation: fence.map(|fence| fence.operation_id.clone()).or_else(|| {
+                        detached_binding.as_ref().and_then(|binding| {
+                            binding
+                                .parent_fence
+                                .as_ref()
+                                .map(|fence| fence.operation_id.clone())
+                        })
+                    }),
                     parent_task_id: task_registry
                         .get(event.task_id.as_str())
                         .and_then(|record| record.parent_task_id)
