@@ -11,9 +11,9 @@ use super::identity::{
     SurfaceGenerationId, SurfaceGoalId, SurfaceGoalIntentId, SurfaceGoalOuterTurnId,
     SurfaceGoalRunId, SurfaceInteractionId, SurfaceItemId, SurfaceOperationFence,
     SurfaceOperationId, SurfaceRequestId, SurfaceScope, SurfaceSettlementId, SurfaceSubagentId,
-    SurfaceTaskFence, SurfaceTaskId, SurfaceToolCallId, SurfaceTurnId, SurfaceWorkflowFence,
-    SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, UnixMillis, UuidV7, WorkflowRevision,
-    canonical_background_fence_v1, canonical_surface_scope_v1,
+    SurfaceTaskFence, SurfaceTaskId, SurfaceTaskOwnerRef, SurfaceToolCallId, SurfaceTurnId,
+    SurfaceWorkflowFence, SurfaceWorkflowRunId, TaskRevision, ThreadOwnerEpoch, UnixMillis, UuidV7,
+    WorkflowRevision, canonical_background_fence_v1, canonical_surface_scope_v1,
 };
 use super::interaction::{
     AuthorityFingerprint, CanonicalInteractionPatchV1,
@@ -21,7 +21,8 @@ use super::interaction::{
     InteractionExpiryAuthorityFailure, InteractionPatch, InteractionUnavailableDisposition,
     SurfaceInteractionKind, SurfaceInteractionLifecycle, SurfaceInteractionRequest,
     SurfaceInteractionResolutionReceipt, SurfaceInteractionRoute, SurfaceInteractionSafeProjection,
-    SurfaceInteractionView, SurfaceToolAction, SurfaceToolRequest, canonical_interaction_patch_v1,
+    SurfaceInteractionView, SurfacePermissionContext, SurfacePermissionOwnerRef, SurfaceToolAction,
+    SurfaceToolRequest, canonical_interaction_patch_v1,
 };
 use super::operation::{
     AdmissionRejectionReason, AdmittedInput, CancelReason, FailureClass, FinalizationDegradedCause,
@@ -50,7 +51,7 @@ use super::projection::{
     SurfaceGoalState, SurfaceGoalStoreReceipt, SurfaceHealthIssue, SurfaceHealthIssueId,
     SurfaceItem, SurfaceItemOrigin, SurfacePinnedContextEntry, SurfacePinnedContextKind,
     SurfacePlanSnapshot, SurfaceRemoteTerminalLease, SurfaceRemoteTerminalLeaseState,
-    SurfaceSubagentOwner, SurfaceSubagentSource, SurfaceSubagentStatus,
+    SurfaceSubagent, SurfaceSubagentOwner, SurfaceSubagentSource, SurfaceSubagentStatus,
     SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus, SurfaceTaskType,
     SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState, SurfaceUsageSnapshot,
     SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow, SurfaceWorkflowAgent,
@@ -1135,7 +1136,372 @@ fn validate_cursor_and_commit(
     Ok(())
 }
 
-fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildPermissionOwnerScope {
+    Generation,
+    Detached,
+}
+
+/// Return the interaction view addressed by a non-request patch.  A request
+/// and its immediate capability-unavailable cancellation may be committed in
+/// one batch, so the lookup also considers an earlier Requested event in that
+/// same batch.  The caller still validates the full owner tuple below.
+fn interaction_view_for_patch<'a>(
+    snapshot: &'a SurfaceSnapshot,
+    batch: &'a SurfaceCommitBatch,
+    patch: &InteractionPatch,
+) -> Option<&'a SurfaceInteractionView> {
+    let interaction_id = match patch {
+        InteractionPatch::Requested { .. } => return None,
+        InteractionPatch::RouteChanged { interaction_id, .. }
+        | InteractionPatch::Resolved { interaction_id, .. }
+        | InteractionPatch::ContinuationDispatchStarted { interaction_id, .. }
+        | InteractionPatch::ContinuationDispatchConsumed { interaction_id, .. }
+        | InteractionPatch::Cancelled { interaction_id, .. }
+        | InteractionPatch::Expired { interaction_id, .. }
+        | InteractionPatch::Transferred { interaction_id, .. } => interaction_id,
+    };
+    snapshot
+        .interactions
+        .iter()
+        .find(|interaction| interaction.interaction_id == *interaction_id)
+        .or_else(|| {
+            batch.events.as_slice().iter().find_map(|envelope| {
+                let SurfaceEvent::Interaction(InteractionPatch::Requested { interaction }) =
+                    &envelope.event
+                else {
+                    return None;
+                };
+                (interaction.interaction_id == *interaction_id).then_some(interaction)
+            })
+        })
+}
+
+fn child_permission_request(
+    interaction: &SurfaceInteractionView,
+) -> Option<(
+    &SurfacePermissionContext,
+    &SurfacePermissionOwnerRef,
+    &SurfaceToolCallId,
+    &AuthorityFingerprint,
+)> {
+    let SurfaceInteractionRequest::PermissionRequest {
+        tool_call_id,
+        context,
+        authority,
+        ..
+    } = &interaction.request
+    else {
+        return None;
+    };
+    let SurfacePermissionOwnerRef::Child { .. } = &context.owner else {
+        return None;
+    };
+    Some((context, &context.owner, tool_call_id, authority))
+}
+
+/// Rebuild the deterministic, non-provider tool identity used when the actor
+/// fingerprints a child capability request.  Child tools intentionally do not
+/// enter `snapshot.tools`, but the authority still commits to the requested
+/// capability shape so a caller cannot copy a valid generation fingerprint
+/// onto a different child request.
+fn child_permission_tool_authority_matches(
+    context: &SurfacePermissionContext,
+    reason: Option<&DisplayText>,
+    permissions: &super::interaction::SurfacePermissionProfile,
+    authority: &AuthorityFingerprint,
+) -> bool {
+    let SurfacePermissionOwnerRef::Child {
+        turn_id,
+        tool_call_id,
+        activity_id,
+        ..
+    } = &context.owner
+    else {
+        return false;
+    };
+    let action = if permissions.network.is_some() {
+        SurfaceToolAction::Network
+    } else if permissions.file_system.as_ref().is_some_and(|profile| {
+        profile
+            .write
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+    }) {
+        SurfaceToolAction::Write
+    } else if permissions
+        .file_system
+        .as_ref()
+        .is_some_and(|profile| profile.read.as_ref().is_some_and(|paths| !paths.is_empty()))
+    {
+        SurfaceToolAction::Read
+    } else {
+        SurfaceToolAction::Shell
+    };
+    let raw_arguments = DisplayText::new("{}");
+    let tool = SurfaceToolRequest {
+        tool_call_id: tool_call_id.clone(),
+        source_response_id: None,
+        turn_id: turn_id.clone(),
+        name: NonEmptyText::try_new("child-permission")
+            .expect("child permission display name is non-empty"),
+        action,
+        target: reason.cloned(),
+        raw_arguments: raw_arguments.clone(),
+        arguments_digest: sha256(raw_arguments.as_str().as_bytes()),
+    };
+    context.validates_tool(&tool)
+        && activity_id.as_str() == tool_call_id.as_str()
+        && interaction_tool_authority_matches(&tool, authority)
+}
+
+/// Validate a child PermissionRequest against the durable task/subagent
+/// projection and return which scope is allowed to publish its interaction.
+///
+/// `task_revision` in the public child owner is deliberately an owner floor,
+/// not a CAS value: the actor may advance the task revision while the child
+/// request is crossing the relay.  Agent revision, turn, activity, and tool
+/// identity remain exact, and a detached owner is additionally fenced to its
+/// durable attempt.  `allow_running_without_pending` is reserved for the
+/// immediate Requested+Cancelled capability-unavailable batch; an already
+/// persisted interaction must have the exact ApprovalRequired task marker.
+/// No provider `snapshot.tools` entry is consulted here; child tools are
+/// emitted by the child activity stream.
+fn child_permission_owner_scope_matches(
+    snapshot: &SurfaceSnapshot,
+    interaction: &SurfaceInteractionView,
+    allow_pending_task: bool,
+    allow_running_without_pending: bool,
+) -> Option<ChildPermissionOwnerScope> {
+    let (context, owner, tool_call_id, authority) = child_permission_request(interaction)?;
+    let SurfaceInteractionRequest::PermissionRequest {
+        reason,
+        permissions,
+        ..
+    } = &interaction.request
+    else {
+        return None;
+    };
+    let SurfacePermissionOwnerRef::Child {
+        task_id,
+        task_revision,
+        agent_id,
+        agent_revision,
+        activity_id,
+        turn_id,
+        tool_call_id: owner_tool_call_id,
+    } = owner
+    else {
+        return None;
+    };
+    if context.origin != super::interaction::SurfacePermissionOrigin::ChildAgent
+        || owner_tool_call_id != tool_call_id
+        || activity_id.as_str() != tool_call_id.as_str()
+        || !child_permission_tool_authority_matches(
+            context,
+            reason.as_ref(),
+            permissions,
+            authority,
+        )
+    {
+        return None;
+    }
+    let task = snapshot
+        .tasks
+        .iter()
+        .find(|task| task.task_id == *task_id)?;
+    let subagent = snapshot
+        .subagents
+        .iter()
+        .find(|subagent| subagent.subagent_id == *agent_id)?;
+    if task.task_type != SurfaceTaskType::Subagent
+        || task.subagent_id.as_ref() != Some(agent_id)
+        || task_revision > &task.revision
+        || subagent.task_id != *task_id
+        || subagent.revision != *agent_revision
+        || subagent.source.source_sequence != agent_revision.get()
+        || subagent.status != SurfaceSubagentStatus::Running
+        || subagent.source.turn_id != *turn_id
+    {
+        return None;
+    }
+    let task_state_matches = if allow_pending_task {
+        (task.status == SurfaceTaskStatus::ApprovalRequired
+            && task.pending_interaction_id.as_ref() == Some(&interaction.interaction_id))
+            || (allow_running_without_pending
+                && task.status == SurfaceTaskStatus::Running
+                && task.pending_interaction_id.is_none())
+    } else {
+        task.status == SurfaceTaskStatus::Running && task.pending_interaction_id.is_none()
+    };
+    if !task_state_matches
+        || !interaction_authority_matches(snapshot, &interaction.fence, authority)
+    {
+        return None;
+    }
+    match &subagent.owner {
+        SurfaceSubagentOwner::Generation { fence } => {
+            if fence != &interaction.fence
+                || task.parent_operation.as_ref() != Some(&interaction.fence.operation_id)
+            {
+                return None;
+            }
+            Some(ChildPermissionOwnerScope::Generation)
+        }
+        SurfaceSubagentOwner::DetachedTask { owner } => {
+            if owner.task_id != *task_id
+                || owner.task_revision > *task_revision
+                || subagent.source.attempt_id != owner.attempt_id
+                || task.parent_operation.as_ref() != Some(&interaction.fence.operation_id)
+            {
+                return None;
+            }
+            Some(ChildPermissionOwnerScope::Detached)
+        }
+    }
+}
+
+fn interaction_is_child_permission(interaction: &SurfaceInteractionView) -> bool {
+    matches!(
+        &interaction.request,
+        SurfaceInteractionRequest::PermissionRequest { context, .. }
+            if context.origin == super::interaction::SurfacePermissionOrigin::ChildAgent
+                || matches!(&context.owner, SurfacePermissionOwnerRef::Child { .. })
+    )
+}
+
+fn interaction_generation_scope_matches(
+    snapshot: &SurfaceSnapshot,
+    scope: &SurfaceScope,
+    fence: &SurfaceOperationFence,
+) -> bool {
+    matches!(scope, SurfaceScope::Generation { .. })
+        && interaction_scope_owns_generation(snapshot, scope, fence)
+}
+
+fn interaction_scope_owns_generation(
+    snapshot: &SurfaceSnapshot,
+    scope: &SurfaceScope,
+    fence: &SurfaceOperationFence,
+) -> bool {
+    if snapshot_generation(snapshot, fence).is_none() {
+        return false;
+    }
+    match scope {
+        SurfaceScope::Generation { fence: scoped } => {
+            scoped == fence
+                && !snapshot
+                    .background_operations
+                    .iter()
+                    .any(|operation| operation.operation_id == fence.operation_id)
+        }
+        SurfaceScope::Background { fence: scoped } => {
+            scoped.operation_fence == *fence
+                && snapshot
+                    .background_operations
+                    .iter()
+                    .any(|operation| operation.fence == *scoped)
+        }
+        _ => false,
+    }
+}
+
+fn interaction_scope_matches_event(
+    snapshot: &SurfaceSnapshot,
+    batch: &SurfaceCommitBatch,
+    scope: &SurfaceScope,
+    patch: &InteractionPatch,
+) -> bool {
+    match patch {
+        InteractionPatch::Requested { interaction } => {
+            if interaction_is_child_permission(interaction) {
+                return match child_permission_owner_scope_matches(
+                    snapshot,
+                    interaction,
+                    false,
+                    false,
+                ) {
+                    Some(ChildPermissionOwnerScope::Generation) => {
+                        interaction_generation_scope_matches(snapshot, scope, &interaction.fence)
+                    }
+                    Some(ChildPermissionOwnerScope::Detached) => {
+                        matches!(scope, SurfaceScope::Thread)
+                    }
+                    None => false,
+                };
+            }
+            interaction_scope_owns_generation(snapshot, scope, &interaction.fence)
+        }
+        InteractionPatch::Transferred {
+            interaction_id,
+            background_fence,
+            ..
+        } => {
+            let child = snapshot
+                .interactions
+                .iter()
+                .find(|interaction| interaction.interaction_id == *interaction_id)
+                .is_some_and(interaction_is_child_permission);
+            !child
+                && matches!(
+                    scope,
+                    SurfaceScope::Background { fence } if fence == background_fence
+                )
+        }
+        InteractionPatch::ContinuationDispatchStarted { .. }
+        | InteractionPatch::ContinuationDispatchConsumed { .. } => {
+            matches!(scope, SurfaceScope::Thread)
+        }
+        _ => {
+            let Some(interaction) = interaction_view_for_patch(snapshot, batch, patch) else {
+                // Preserve the reducer's historical error classification for
+                // a missing interaction: scope validation should only narrow
+                // child-owned events, while `apply_interaction_patch` still
+                // reports the missing identity itself.
+                return matches!(
+                    scope,
+                    SurfaceScope::Generation { .. } | SurfaceScope::Background { .. }
+                );
+            };
+            if interaction_is_child_permission(interaction) {
+                let same_batch_request = matches!(patch, InteractionPatch::Cancelled { .. })
+                    && batch.events.as_slice().iter().any(|envelope| {
+                        matches!(
+                            &envelope.event,
+                            SurfaceEvent::Interaction(InteractionPatch::Requested {
+                                interaction: requested,
+                            }) if requested.interaction_id == interaction.interaction_id
+                        )
+                    });
+                return match child_permission_owner_scope_matches(
+                    snapshot,
+                    interaction,
+                    true,
+                    same_batch_request,
+                ) {
+                    Some(ChildPermissionOwnerScope::Generation) => {
+                        interaction_generation_scope_matches(snapshot, scope, &interaction.fence)
+                    }
+                    Some(ChildPermissionOwnerScope::Detached) => {
+                        matches!(scope, SurfaceScope::Thread)
+                    }
+                    None => false,
+                };
+            }
+            matches!(
+                scope,
+                SurfaceScope::Generation { .. } | SurfaceScope::Background { .. }
+            )
+        }
+    }
+}
+
+fn scope_matches_event(
+    snapshot: &SurfaceSnapshot,
+    batch: &SurfaceCommitBatch,
+    scope: &SurfaceScope,
+    event: &SurfaceEvent,
+) -> bool {
     match event {
         SurfaceEvent::Plan(_)
         | SurfaceEvent::Usage(_)
@@ -1275,29 +1641,9 @@ fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
             scope,
             SurfaceScope::Generation { .. } | SurfaceScope::Background { .. }
         ),
-        SurfaceEvent::Interaction(InteractionPatch::Requested { interaction }) => {
-            matches!(
-                scope,
-                SurfaceScope::Generation { fence } if fence == &interaction.fence
-            ) || matches!(
-                scope,
-                SurfaceScope::Background { fence } if fence.operation_fence == interaction.fence
-            )
+        SurfaceEvent::Interaction(patch) => {
+            interaction_scope_matches_event(snapshot, batch, scope, patch)
         }
-        SurfaceEvent::Interaction(InteractionPatch::Transferred {
-            background_fence, ..
-        }) => matches!(
-            scope,
-            SurfaceScope::Background { fence } if fence == background_fence
-        ),
-        SurfaceEvent::Interaction(
-            InteractionPatch::ContinuationDispatchStarted { .. }
-            | InteractionPatch::ContinuationDispatchConsumed { .. },
-        ) => matches!(scope, SurfaceScope::Thread),
-        SurfaceEvent::Interaction(_) => matches!(
-            scope,
-            SurfaceScope::Generation { .. } | SurfaceScope::Background { .. }
-        ),
         SurfaceEvent::Workflow(_) => matches!(scope, SurfaceScope::Thread),
         SurfaceEvent::Subagent(SubagentPatch::Started { subagent, .. }) => {
             match (scope, &subagent.as_subagent().owner) {
@@ -1382,7 +1728,7 @@ fn validate_batch_structure(
                 ),
             });
         }
-        if !scope_matches_event(&envelope.scope, &envelope.event) {
+        if !scope_matches_event(state.snapshot(), batch, &envelope.scope, &envelope.event) {
             return Err(SurfaceReduceResult::Rejected {
                 error: event_error(
                     envelope,
@@ -1562,7 +1908,7 @@ fn apply_event(
         }
         SurfaceEvent::Task(patch) => apply_task_patch(&mut state.snapshot, envelope, patch),
         SurfaceEvent::Interaction(patch) => {
-            apply_interaction_patch(&mut state.snapshot, envelope, patch)
+            apply_interaction_patch(&mut state.snapshot, envelope, batch, patch)
         }
         SurfaceEvent::Workflow(patch) => apply_workflow_patch(&mut state.snapshot, envelope, patch),
         SurfaceEvent::Subagent(patch) => apply_subagent_patch(&mut state.snapshot, envelope, patch),
@@ -4805,18 +5151,32 @@ fn interaction_request_matches_snapshot(
         }
         SurfaceInteractionRequest::PermissionRequest {
             tool_call_id,
+            context: _,
             authority,
             ..
-        } => snapshot
-            .tools
-            .iter()
-            .find(|tool| tool.request.tool_call_id == *tool_call_id)
-            .is_some_and(|tool| {
-                generation_fence_for_turn(snapshot, &tool.request.turn_id).as_ref()
-                    == Some(&interaction.fence)
-                    && interaction_authority_matches(snapshot, &interaction.fence, authority)
-                    && interaction_tool_authority_matches(&tool.request, authority)
-            }),
+        } => {
+            if interaction_is_child_permission(interaction) {
+                // Child tool calls are sourced from the child activity stream,
+                // so requiring a foreground provider tool here would reject a
+                // valid child request (and invite adapters to fabricate one).
+                child_permission_owner_scope_matches(snapshot, interaction, false, false).is_some()
+            } else {
+                snapshot
+                    .tools
+                    .iter()
+                    .find(|tool| tool.request.tool_call_id == *tool_call_id)
+                    .is_some_and(|tool| {
+                        generation_fence_for_turn(snapshot, &tool.request.turn_id).as_ref()
+                            == Some(&interaction.fence)
+                            && interaction_authority_matches(
+                                snapshot,
+                                &interaction.fence,
+                                authority,
+                            )
+                            && interaction_tool_authority_matches(&tool.request, authority)
+                    })
+            }
+        }
         SurfaceInteractionRequest::BackgroundApproval {
             task,
             tool,
@@ -4925,10 +5285,17 @@ fn interaction_cancel_reason_matches_disposition(
 fn apply_interaction_patch(
     snapshot: &mut SurfaceSnapshot,
     envelope: &SurfaceEventEnvelope,
+    batch: &SurfaceCommitBatch,
     patch: &InteractionPatch,
 ) -> Result<(), SurfaceReducerError> {
     if let InteractionPatch::Requested { interaction } = patch {
-        require_event_scope_owns_generation(snapshot, envelope, &interaction.fence)?;
+        if !interaction_scope_matches_event(snapshot, batch, &envelope.scope, patch) {
+            return Err(event_error(
+                envelope,
+                SurfaceReducerErrorCode::ScopeMismatch,
+                "interaction request owner scope is stale or unauthorized",
+            ));
+        }
         if interaction.revision.get() != 1
             || !matches!(
                 interaction.lifecycle,
@@ -5011,12 +5378,34 @@ fn apply_interaction_patch(
         InteractionPatch::Transferred {
             background_fence, ..
         } => {
-            background_fence.operation_fence == current.fence
+            !interaction_is_child_permission(current)
+                && background_fence.operation_fence == current.fence
                 && event_scope_owns_generation(snapshot, envelope, &current.fence)
         }
         InteractionPatch::ContinuationDispatchStarted { .. }
         | InteractionPatch::ContinuationDispatchConsumed { .. } => {
             matches!(envelope.scope, SurfaceScope::Thread)
+        }
+        _ if interaction_is_child_permission(current) => {
+            let same_batch_request = matches!(patch, InteractionPatch::Cancelled { .. })
+                && batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        SurfaceEvent::Interaction(InteractionPatch::Requested {
+                            interaction,
+                        }) if interaction.interaction_id == *interaction_id
+                    )
+                });
+            match child_permission_owner_scope_matches(snapshot, current, true, same_batch_request)
+            {
+                Some(ChildPermissionOwnerScope::Detached) => {
+                    matches!(envelope.scope, SurfaceScope::Thread)
+                }
+                Some(ChildPermissionOwnerScope::Generation) => {
+                    interaction_generation_scope_matches(snapshot, &envelope.scope, &current.fence)
+                }
+                None => false,
+            }
         }
         _ => match &current.lifecycle {
             SurfaceInteractionLifecycle::Transferred { background_fence } => matches!(
@@ -9048,6 +9437,408 @@ pub(crate) mod tests {
             finalization: None,
             terminal: None,
         }
+    }
+
+    fn child_permission_fixture(
+        detached: bool,
+    ) -> (
+        SurfaceSnapshot,
+        SurfaceInteractionView,
+        SurfaceOperationFence,
+    ) {
+        let mut snapshot = reducer_snapshot();
+        let mut operation = started_operation();
+        let fence = operation.generations[0].fence.clone();
+        let cwd = snapshot.settings.effective.cwd.clone();
+        let workspace_roots = snapshot.thread.workspace_roots.clone();
+        let replayability = Replayability::Replayable {
+            capsule_digest: digest(200),
+            request: None,
+            request_digest: Some(digest(201)),
+            cwd: cwd.clone(),
+            workspace_roots: workspace_roots.clone(),
+            settings_revision: SettingsRevision::try_new(1).unwrap(),
+            policy_epoch: operation.intent.policy_epoch,
+            tool_schema_digest: digest(202),
+        };
+        operation.intent.initial_replayability = replayability.clone();
+        operation.generations[0].replayability = replayability;
+        let capability_digest = operation.generations[0].capability_fingerprint.clone();
+        let child_turn = SurfaceTurnId::new();
+        let task_id = SurfaceTaskId::try_new(if detached {
+            "detached-child-task"
+        } else {
+            "generation-child-task"
+        })
+        .unwrap();
+        let agent_id = SurfaceSubagentId::try_new(if detached {
+            "detached-child-agent"
+        } else {
+            "generation-child-agent"
+        })
+        .unwrap();
+        let task_revision = TaskRevision::try_new(1).unwrap();
+        let agent_revision = super::super::SubagentRevision::try_new(1).unwrap();
+        let attempt_id = crate::runtime_surface::SurfaceTaskAttemptId::try_new(if detached {
+            "detached-attempt"
+        } else {
+            "generation-attempt"
+        })
+        .unwrap();
+        let task_owner = SurfaceTaskOwnerRef::new(
+            task_id.clone(),
+            task_revision,
+            attempt_id.clone(),
+            digest(205),
+        );
+        let task = SurfaceTask {
+            task_id: task_id.clone(),
+            revision: task_revision,
+            task_type: SurfaceTaskType::Subagent,
+            status: SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: DisplayText::new("child task"),
+            created_at: UnixMillis::new(1),
+            started_at: Some(UnixMillis::new(1)),
+            completed_at: None,
+            // Detached permissions still need the historical parent
+            // operation as their authority anchor; the interaction itself is
+            // transported at Thread scope after that operation may finish.
+            parent_operation: Some(fence.operation_id.clone()),
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: Some(agent_id.clone()),
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        };
+        let owner = if detached {
+            SurfaceSubagentOwner::DetachedTask { owner: task_owner }
+        } else {
+            SurfaceSubagentOwner::Generation {
+                fence: fence.clone(),
+            }
+        };
+        let subagent = SurfaceSubagent {
+            subagent_id: agent_id.clone(),
+            task_id: task_id.clone(),
+            revision: agent_revision,
+            description: DisplayText::new("child agent"),
+            status: SurfaceSubagentStatus::Running,
+            activity: Some(DisplayText::new("bash")),
+            turn: Some(1),
+            usage: None,
+            output: None,
+            error: None,
+            owner,
+            source: SurfaceSubagentSource::new(
+                attempt_id,
+                child_turn.clone(),
+                1,
+                SurfaceCommitId::try_from_bytes(uuid_v7_bytes(206)).unwrap(),
+                digest(207),
+            ),
+        };
+        let tool_call_id = SurfaceToolCallId::try_new(if detached {
+            "detached-child-tool"
+        } else {
+            "generation-child-tool"
+        })
+        .unwrap();
+        let child_tool_raw_arguments = DisplayText::new("{}");
+        let child_tool = SurfaceToolRequest {
+            tool_call_id: tool_call_id.clone(),
+            source_response_id: None,
+            turn_id: child_turn.clone(),
+            name: NonEmptyText::try_new("child-permission").unwrap(),
+            action: SurfaceToolAction::Shell,
+            target: Some(DisplayText::new("child capability")),
+            raw_arguments: child_tool_raw_arguments.clone(),
+            arguments_digest: sha256(child_tool_raw_arguments.as_str().as_bytes()),
+        };
+        let permissions = super::super::SurfacePermissionProfile::empty();
+        let reason = Some(DisplayText::new("child capability"));
+        let authority = AuthorityFingerprint::new(
+            fence.operation_id.clone(),
+            digest(201),
+            digest(202),
+            cwd,
+            sha256(&serde_json::to_vec(&workspace_roots).unwrap()),
+            operation.intent.policy_epoch,
+            sha256(&serde_json::to_vec(&child_tool).unwrap()),
+            child_tool.arguments_digest.clone(),
+            capability_digest,
+        );
+        let interaction = SurfaceInteractionView {
+            interaction_id: SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(if detached {
+                208
+            } else {
+                209
+            }))
+            .unwrap(),
+            revision: InteractionRevision::try_new(1).unwrap(),
+            fence: fence.clone(),
+            kind: SurfaceInteractionKind::PermissionRequest,
+            request: SurfaceInteractionRequest::PermissionRequest {
+                tool_call_id: tool_call_id.clone(),
+                context: SurfacePermissionContext {
+                    owner: SurfacePermissionOwnerRef::Child {
+                        task_id,
+                        task_revision,
+                        agent_id,
+                        agent_revision,
+                        activity_id: super::super::SurfaceActivityId::try_new(
+                            tool_call_id.as_str(),
+                        )
+                        .unwrap(),
+                        turn_id: child_turn,
+                        tool_call_id,
+                    },
+                    origin: super::super::SurfacePermissionOrigin::ChildAgent,
+                },
+                reason,
+                permissions,
+                authority,
+            },
+            route: SurfaceInteractionRoute::Unassigned {
+                epoch: ResponseRouteEpoch::try_new(1).unwrap(),
+            },
+            lifecycle: SurfaceInteractionLifecycle::Requested,
+            recovery_disposition: InteractionUnavailableDisposition::FailOperation,
+        };
+        snapshot.foreground_operation = Some(operation);
+        snapshot.tasks.push(task);
+        snapshot.subagents.push(subagent);
+        (snapshot, interaction, fence)
+    }
+
+    #[test]
+    fn child_permission_request_is_bound_to_child_projection_not_provider_tools() {
+        let (snapshot, interaction, fence) = child_permission_fixture(false);
+        assert!(snapshot.tools.is_empty());
+        assert!(interaction_request_matches_snapshot(
+            &snapshot,
+            &interaction
+        ));
+
+        let state = SurfaceReducerState::new(snapshot);
+        let batch = reducer_batch(
+            &state,
+            210,
+            SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            SurfaceEvent::Interaction(InteractionPatch::Requested {
+                interaction: interaction.clone(),
+            }),
+        );
+        let reduced = reduce_batch(SurfaceReduceMode::Live, &state, &batch);
+        assert!(matches!(reduced, SurfaceReduceResult::Applied { .. }));
+
+        let mut forged = interaction.clone();
+        let SurfaceInteractionRequest::PermissionRequest { context, .. } = &mut forged.request
+        else {
+            unreachable!("fixture is a permission request");
+        };
+        let SurfacePermissionOwnerRef::Child { activity_id, .. } = &mut context.owner else {
+            unreachable!("fixture is a child request");
+        };
+        *activity_id = super::super::SurfaceActivityId::try_new("different-activity").unwrap();
+        assert!(!interaction_request_matches_snapshot(
+            state.snapshot(),
+            &forged
+        ));
+
+        let mut forged_authority = interaction.clone();
+        let SurfaceInteractionRequest::PermissionRequest { authority, .. } =
+            &mut forged_authority.request
+        else {
+            unreachable!("fixture is a permission request");
+        };
+        *authority = AuthorityFingerprint::new(
+            authority.operation_id().clone(),
+            authority.request_digest().clone(),
+            authority.tool_digest().clone(),
+            authority.cwd().clone(),
+            authority.workspace_roots_digest().clone(),
+            authority.policy_epoch(),
+            digest(218),
+            authority.artifact_generation().clone(),
+            authority.capability_digest().clone(),
+        );
+        assert!(!interaction_request_matches_snapshot(
+            state.snapshot(),
+            &forged_authority
+        ));
+    }
+
+    #[test]
+    fn detached_child_permission_lifecycle_is_thread_scoped_and_attempt_fenced() {
+        let (mut snapshot, interaction, fence) = child_permission_fixture(true);
+        let state = SurfaceReducerState::new(snapshot.clone());
+        let request_batch = reducer_batch(
+            &state,
+            211,
+            SurfaceScope::Thread,
+            SurfaceEvent::Interaction(InteractionPatch::Requested {
+                interaction: interaction.clone(),
+            }),
+        );
+        assert!(scope_matches_event(
+            &snapshot,
+            &request_batch,
+            &SurfaceScope::Thread,
+            &request_batch.events.as_slice()[0].event,
+        ));
+        assert!(!scope_matches_event(
+            &snapshot,
+            &request_batch,
+            &SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            &request_batch.events.as_slice()[0].event,
+        ));
+        assert!(matches!(
+            reduce_batch(SurfaceReduceMode::Live, &state, &request_batch),
+            SurfaceReduceResult::Applied { .. }
+        ));
+
+        snapshot.interactions.push(interaction.clone());
+        let task = snapshot.tasks.first_mut().expect("fixture task");
+        task.revision = TaskRevision::try_new(2).unwrap();
+        task.status = SurfaceTaskStatus::ApprovalRequired;
+        task.pending_interaction_id = Some(interaction.interaction_id.clone());
+        let pending = SurfaceReducerState::new(snapshot.clone());
+        let resolved = InteractionPatch::Resolved {
+            interaction_id: interaction.interaction_id.clone(),
+            expected_revision: InteractionRevision::try_new(1).unwrap(),
+            next_revision: InteractionRevision::try_new(2).unwrap(),
+            receipt: SurfaceInteractionResolutionReceipt {
+                response_id: super::super::SurfaceResponseId::try_from_bytes(uuid_v7_bytes(212))
+                    .unwrap(),
+                receipt_id: super::super::SurfaceResponseReceiptId::try_from_bytes(uuid_v7_bytes(
+                    213,
+                ))
+                .unwrap(),
+                kind: SurfaceInteractionKind::PermissionRequest,
+                safe_projection: SurfaceInteractionSafeProjection::PermissionRequest {
+                    decision: super::super::SurfaceAllowDeny::Deny,
+                    scope: super::super::PermissionGrantScope::Turn,
+                    permissions: super::super::SurfacePermissionProfile {
+                        file_system: None,
+                        network: None,
+                    },
+                    strict_auto_review: false,
+                },
+            },
+            continuation: None,
+        };
+        let resolution_batch = reducer_batch(
+            &pending,
+            214,
+            SurfaceScope::Thread,
+            SurfaceEvent::Interaction(resolved),
+        );
+        assert!(scope_matches_event(
+            &snapshot,
+            &resolution_batch,
+            &SurfaceScope::Thread,
+            &resolution_batch.events.as_slice()[0].event,
+        ));
+        assert!(!scope_matches_event(
+            &snapshot,
+            &resolution_batch,
+            &SurfaceScope::Generation { fence },
+            &resolution_batch.events.as_slice()[0].event,
+        ));
+
+        let cancelled = InteractionPatch::Cancelled {
+            interaction_id: interaction.interaction_id,
+            expected_revision: InteractionRevision::try_new(1).unwrap(),
+            next_revision: InteractionRevision::try_new(2).unwrap(),
+            reason: InteractionCancelReason::HostShutdown,
+        };
+        let cancelled_batch = reducer_batch(
+            &pending,
+            215,
+            SurfaceScope::Thread,
+            SurfaceEvent::Interaction(cancelled),
+        );
+        assert!(scope_matches_event(
+            &snapshot,
+            &cancelled_batch,
+            &SurfaceScope::Thread,
+            &cancelled_batch.events.as_slice()[0].event,
+        ));
+
+        let subagent = snapshot.subagents.first_mut().expect("fixture subagent");
+        subagent.source.attempt_id =
+            crate::runtime_surface::SurfaceTaskAttemptId::try_new("superseded-attempt").unwrap();
+        assert!(!scope_matches_event(
+            &snapshot,
+            &cancelled_batch,
+            &SurfaceScope::Thread,
+            &cancelled_batch.events.as_slice()[0].event,
+        ));
+    }
+
+    #[test]
+    fn thread_scope_does_not_authorize_foreground_or_generation_permission_requests() {
+        let (snapshot, generation_interaction, fence) = child_permission_fixture(false);
+        let state = SurfaceReducerState::new(snapshot.clone());
+        let batch = reducer_batch(
+            &state,
+            216,
+            SurfaceScope::Thread,
+            SurfaceEvent::Interaction(InteractionPatch::Requested {
+                interaction: generation_interaction.clone(),
+            }),
+        );
+        assert!(!scope_matches_event(
+            &snapshot,
+            &batch,
+            &SurfaceScope::Thread,
+            &batch.events.as_slice()[0].event,
+        ));
+
+        let mut foreground = generation_interaction;
+        let SurfaceInteractionRequest::PermissionRequest { context, .. } = &mut foreground.request
+        else {
+            unreachable!("fixture is a permission request");
+        };
+        context.owner = SurfacePermissionOwnerRef::Foreground {
+            turn_id: SurfaceTurnId::new(),
+            tool_call_id: SurfaceToolCallId::try_new("foreground-tool").unwrap(),
+        };
+        let foreground_batch = reducer_batch(
+            &state,
+            217,
+            SurfaceScope::Thread,
+            SurfaceEvent::Interaction(InteractionPatch::Requested {
+                interaction: foreground.clone(),
+            }),
+        );
+        assert!(!scope_matches_event(
+            &snapshot,
+            &foreground_batch,
+            &SurfaceScope::Thread,
+            &foreground_batch.events.as_slice()[0].event,
+        ));
+        assert!(!interaction_request_matches_snapshot(
+            &snapshot,
+            &foreground
+        ));
+        assert!(interaction_generation_scope_matches(
+            &snapshot,
+            &SurfaceScope::Generation {
+                fence: fence.clone()
+            },
+            &fence
+        ));
     }
 
     fn resolved_continuation_interaction(
