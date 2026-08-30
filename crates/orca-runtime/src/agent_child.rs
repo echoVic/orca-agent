@@ -22,7 +22,8 @@ pub use crate::child_agent_response_folding::{
     fold_child_agent_tool_result,
 };
 pub use crate::child_agent_types::{
-    ChildAgentActivity, ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult,
+    ChildAgentActivity, ChildAgentActivityObserver, ChildAgentActivityPublisher, ChildAgentRequest,
+    ChildAgentResult,
 };
 pub(crate) use crate::child_agent_types::{
     ChildAgentExecutor, ChildAgentRuntime, ChildAgentRuntimeContext,

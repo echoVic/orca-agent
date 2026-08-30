@@ -4593,6 +4593,7 @@ mod closed_command_domain_tests {
             started_at: Some(UnixMillis::new(2)),
             completed_at: None,
             parent_operation: Some(operation_id(seed)),
+            parent_task_id: None,
             background_fence: None,
             workflow_run_id: None,
             subagent_id: None,

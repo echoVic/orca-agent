@@ -851,6 +851,7 @@ struct StoredTaskV1 {
     started_at: Option<UnixMillis>,
     completed_at: Option<UnixMillis>,
     parent_operation: Option<SurfaceOperationId>,
+    parent_task_id: Option<SurfaceTaskId>,
     background_fence: Option<StoredBackgroundFenceV1>,
     workflow_run_id: Option<SurfaceWorkflowRunId>,
     subagent_id: Option<SurfaceSubagentId>,
@@ -877,6 +878,7 @@ impl StoredTaskV1 {
             started_at: task.started_at,
             completed_at: task.completed_at,
             parent_operation: task.parent_operation.clone(),
+            parent_task_id: task.parent_task_id.clone(),
             background_fence: task
                 .background_fence
                 .as_ref()
@@ -905,6 +907,7 @@ impl StoredTaskV1 {
             started_at: self.started_at,
             completed_at: self.completed_at,
             parent_operation: self.parent_operation,
+            parent_task_id: self.parent_task_id,
             background_fence: self
                 .background_fence
                 .map(StoredBackgroundFenceV1::into_live),

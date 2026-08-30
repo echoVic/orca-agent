@@ -6,8 +6,9 @@ use std::thread;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{DelegationSnapshot, RunConfig};
-use orca_core::event_schema::{EventFactory, RunStatus};
-use orca_core::event_sink::EventSink;
+use orca_core::cost_types::UsageTotals;
+use orca_core::event_schema::{EventEnvelope, EventFactory, EventType, RunStatus};
+use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
@@ -25,7 +26,10 @@ use crate::agent_continuation::{
     compute_continuation_compatibility_hash,
 };
 use crate::child_agent_types::{
+    ChildAgentActivityEmitter, ChildAgentActivityPublisher, ChildAgentActivitySink,
     ChildAgentCheckpointObserver, ChildAgentCompatibilityIdentity, ChildAgentContinuationStart,
+    SubagentActivityEvent, SubagentActivityIdentity, SubagentActivityOwner,
+    SubagentActivityPayload, child_event_output,
 };
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
@@ -34,6 +38,9 @@ use crate::lifecycle::{
     RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskLifecycle, RuntimeTaskStatus,
 };
 use crate::memory::MemoryBlock;
+use crate::runtime_surface::{
+    DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId, TaskRevision,
+};
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::subagent::{SubagentIsolation, SubagentRequest};
@@ -55,6 +62,112 @@ pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) child_executor: ChildAgentExecutor<io::Sink>,
     pub(crate) task_registry: TaskRegistry,
     pub(crate) root_task_id: Option<String>,
+}
+
+/// The temporary runtime-side activity bridge. The surface actor will replace
+/// this mirror with its ingress, but the child never silently drops an event:
+/// an update failure is returned to the execution path before a tool launches.
+pub(crate) struct TaskRegistryActivitySink {
+    pub(crate) task_registry: TaskRegistry,
+    pub(crate) task_id: String,
+}
+
+impl ChildAgentActivitySink for TaskRegistryActivitySink {
+    fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        if !event.verify_digest() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child activity digest verification failed",
+            ));
+        }
+        let (activity, turn, usage) = match event.payload {
+            SubagentActivityPayload::Started { description } => {
+                (format!("started: {}", description.as_str()), None, None)
+            }
+            SubagentActivityPayload::PhaseChanged { phase, turn } => {
+                (format!("phase: {phase:?}"), turn, None)
+            }
+            SubagentActivityPayload::ToolStarted { name, target, .. } => (
+                target
+                    .as_ref()
+                    .map(|target| format!("{name}: {}", target.as_str()))
+                    .unwrap_or(name),
+                None,
+                None,
+            ),
+            SubagentActivityPayload::ToolCompleted { status, .. } => {
+                (format!("tool completed: {status:?}"), None, None)
+            }
+            SubagentActivityPayload::Usage { totals } => {
+                ("usage updated".to_string(), None, Some(totals))
+            }
+            SubagentActivityPayload::CheckpointPublished {
+                checkpoint_revision,
+            } => (format!("checkpoint {checkpoint_revision}"), None, None),
+            SubagentActivityPayload::Completed { status, .. } => {
+                (format!("completed: {status:?}"), None, None)
+            }
+        };
+        self.task_registry
+            .update_subagent_activity(&self.task_id, activity, turn, usage)
+            .map_err(io::Error::other)
+    }
+}
+
+pub(crate) struct ChildEventActivityObserver {
+    pub(crate) emitter: Arc<ChildAgentActivityEmitter>,
+}
+
+impl EventObserver for ChildEventActivityObserver {
+    fn observe(&self, event: &EventEnvelope) -> io::Result<()> {
+        let activity = match event.event_type {
+            EventType::TurnStarted => Some(crate::agent_child::ChildAgentActivity::TurnStarted {
+                turn: event.payload["turn"].as_u64().unwrap_or_default() as u32,
+            }),
+            EventType::AssistantReasoningDelta | EventType::AssistantMessageDelta => {
+                Some(crate::agent_child::ChildAgentActivity::Streaming)
+            }
+            EventType::ToolCallRequested => {
+                Some(crate::agent_child::ChildAgentActivity::ToolStarted {
+                    call_id: event.payload["id"]
+                        .as_str()
+                        .unwrap_or("unknown-tool-call")
+                        .to_string(),
+                    name: event.payload["name"].as_str().unwrap_or("tool").to_string(),
+                    target: event.payload["target"].as_str().map(str::to_string),
+                })
+            }
+            EventType::ToolCallCompleted => {
+                Some(crate::agent_child::ChildAgentActivity::ToolCompleted {
+                    call_id: event.payload["id"]
+                        .as_str()
+                        .unwrap_or("unknown-tool-call")
+                        .to_string(),
+                    name: event.payload["name"].as_str().unwrap_or("tool").to_string(),
+                    status: match event.payload["status"].as_str() {
+                        Some("completed") => RunStatus::Success,
+                        Some("cancelled") => RunStatus::Cancelled,
+                        _ => RunStatus::Failed,
+                    },
+                })
+            }
+            EventType::UsageUpdated => {
+                Some(crate::agent_child::ChildAgentActivity::Usage(UsageTotals {
+                    input_tokens: event.payload["input_tokens"].as_u64().unwrap_or_default(),
+                    output_tokens: event.payload["output_tokens"].as_u64().unwrap_or_default(),
+                    cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
+                    estimated_cost_usd: event.payload["estimated_cost_usd"]
+                        .as_f64()
+                        .unwrap_or_default(),
+                }))
+            }
+            _ => None,
+        };
+        if let Some(activity) = activity {
+            self.emitter.publish_activity(activity)?;
+        }
+        Ok(())
+    }
 }
 
 impl RuntimeSubagentInvocation {
@@ -668,14 +781,59 @@ fn execute_acquired_sync_subagent(
         subagent_type,
         model: effective_model,
         depth: child_depth,
-        emit_deltas: false,
+        emit_deltas: true,
         allowed_tools: None,
         tool_policy_label: None,
         workflow_ipc,
         continuation: continuation_start,
     };
+    let surface_task_id = SurfaceTaskId::try_new(registry_task_id.clone())
+        .expect("task registry created a non-empty task id");
+    let activity_sink: Arc<dyn ChildAgentActivitySink> = Arc::new(TaskRegistryActivitySink {
+        task_registry: task_registry.clone(),
+        task_id: registry_task_id.clone(),
+    });
+    let activity = Arc::new(ChildAgentActivityEmitter::new(
+        SubagentActivityIdentity {
+            task_id: surface_task_id.clone(),
+            subagent_id: SurfaceSubagentId::try_new(tool_request.id.clone())
+                .expect("tool requests have a non-empty id"),
+            attempt_id: prepared.attempt_id.clone(),
+            owner: SubagentActivityOwner::DetachedTask {
+                task_id: surface_task_id,
+                task_revision: TaskRevision::try_new(1).expect("one is a valid task revision"),
+                authority_digest: prepared.compatibility.compatibility_hash,
+            },
+        },
+        activity_sink,
+    ));
+    if let Err(error) = activity.publish_payload(SubagentActivityPayload::Started {
+        description: DisplayText::new(&description),
+    }) {
+        let output = continuation_started_failure(
+            tool_request,
+            description,
+            lifecycle,
+            started_task,
+            &child_config,
+            format!("child activity start could not be durably published: {error}"),
+            worktree_execution.finish(),
+        );
+        return finalize_started_sync_subagent(
+            output,
+            &coordinator,
+            &lease,
+            &task_registry,
+            &registry_task_id,
+            false,
+        );
+    }
     let mut child_events = EventFactory::new(format!("subagent-{}", tool_request.id));
-    let mut child_sink = EventSink::new(io::sink(), output_format);
+    let mut child_sink = EventSink::new(child_event_output(), output_format).with_observer(
+        Arc::new(ChildEventActivityObserver {
+            emitter: Arc::clone(&activity),
+        }),
+    );
     let child = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
             cwd: &child_cwd,
@@ -695,7 +853,7 @@ fn execute_acquired_sync_subagent(
         run_child_agent(&child_config, &child_request, &mut runtime)
     }));
     let worktree = worktree_execution.finish();
-    let (output, panicked) = match child {
+    let (mut output, panicked) = match child {
         Ok((child, cost_tracker)) => (
             finish_child_output(
                 tool_request,
@@ -740,6 +898,26 @@ fn execute_acquired_sync_subagent(
             )
         }
     };
+    let terminal_status = match output.status {
+        RunStatus::Success => SurfaceSubagentTerminalStatus::Completed,
+        RunStatus::Cancelled => SurfaceSubagentTerminalStatus::Cancelled,
+        RunStatus::Failed | RunStatus::ApprovalRequired | RunStatus::VerificationFailed => {
+            SurfaceSubagentTerminalStatus::Failed
+        }
+    };
+    if let Err(error) = activity.publish_payload(SubagentActivityPayload::Completed {
+        status: terminal_status,
+        output: output.event_output.as_deref().map(DisplayText::new),
+        error: output.event_error.as_deref().map(DisplayText::new),
+        usage: Some(output.cost_tracker.totals()),
+    }) {
+        let message = format!("child activity terminal could not be durably published: {error}");
+        output.event_error = Some(match output.event_error.take() {
+            Some(existing) => format!("{existing}\n\n{message}"),
+            None => message,
+        });
+        output.status = RunStatus::Failed;
+    }
     finalize_started_sync_subagent_with_revision(
         output,
         &coordinator,

@@ -24,7 +24,7 @@ use crate::child_agent_response_folding::{
     fold_child_agent_tool_result_and_close_siblings,
 };
 use crate::child_agent_types::{
-    ChildAgentActivity, ChildAgentActivityObserver, ChildAgentCheckpointObservation,
+    ChildAgentActivity, ChildAgentActivityPublisher, ChildAgentCheckpointObservation,
     ChildAgentCheckpointSink, ChildAgentRequest, ChildAgentResult,
 };
 use crate::cost::CostTracker;
@@ -207,7 +207,7 @@ where
         ) {
             ChildAgentProviderTurn::Response(response) => response,
             ChildAgentProviderTurn::Fail { result, usage } => {
-                record_child_provider_usage(usage, context.child_cost_tracker, None);
+                record_child_provider_usage(usage, context.child_cost_tracker, None)?;
                 if let Err(stop) = sync_child_cost_to_lease(
                     lease,
                     context.child_cost_tracker,
@@ -363,7 +363,7 @@ where
 pub fn run_child_agent_loop_with_tool_executor_observed<F>(
     config: &RunConfig,
     context: ChildAgentLoopContext<'_>,
-    observer: Option<&ChildAgentActivityObserver<'_>>,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
     execute_tool: F,
 ) -> io::Result<ChildAgentResult>
 where
@@ -381,7 +381,7 @@ where
 pub(crate) fn run_child_agent_loop_with_tool_executor_observed_checkpointed<F>(
     config: &RunConfig,
     context: ChildAgentLoopContext<'_>,
-    observer: Option<&ChildAgentActivityObserver<'_>>,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
     checkpoint_observer: Option<&dyn ChildAgentCheckpointSink>,
     mut execute_tool: F,
 ) -> io::Result<ChildAgentResult>
@@ -409,7 +409,8 @@ where
         match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {
                 if let Some(observer) = observer {
-                    observer.emit(ChildAgentActivity::TurnStarted { turn: setup.turn });
+                    observer
+                        .publish_activity(ChildAgentActivity::TurnStarted { turn: setup.turn })?;
                 }
             }
             ChildAgentTurnBudget::Stop(result) => {
@@ -434,7 +435,7 @@ where
         ) {
             ChildAgentProviderTurn::Response(response) => response,
             ChildAgentProviderTurn::Fail { result, usage } => {
-                record_child_provider_usage(usage, context.child_cost_tracker, observer);
+                record_child_provider_usage(usage, context.child_cost_tracker, observer)?;
                 if let Err(stop) = sync_child_cost_to_lease(
                     lease,
                     context.child_cost_tracker,
@@ -509,9 +510,9 @@ where
         .err();
         if had_usage {
             if let Some(observer) = observer {
-                observer.emit(ChildAgentActivity::Usage(
+                observer.publish_activity(ChildAgentActivity::Usage(
                     context.child_cost_tracker.totals(),
-                ));
+                ))?;
             }
         }
         if let Some(stop) = lease_stop {
@@ -558,18 +559,20 @@ where
                     .map_err(child_checkpoint_error)?;
             }
             if let Some(observer) = observer {
-                observer.emit(ChildAgentActivity::ToolStarted {
+                observer.publish_activity(ChildAgentActivity::ToolStarted {
+                    call_id: tool_request.id.clone(),
                     name: tool_request.name.as_str().to_string(),
                     target: tool_request.target.clone(),
-                });
+                })?;
             }
             let tool_execution = execute_tool(&tool_context, &child_cancel, tool_request);
             let had_child_cost = tool_execution.child_cost.is_some();
             if let Some(observer) = observer {
-                observer.emit(ChildAgentActivity::ToolCompleted {
+                observer.publish_activity(ChildAgentActivity::ToolCompleted {
+                    call_id: tool_request.id.clone(),
                     name: tool_request.name.as_str().to_string(),
                     status: run_status_from_tool_status(tool_execution.result.status),
-                });
+                })?;
             }
             let tool_fold = fold_child_agent_tool_result_and_close_siblings(
                 &mut setup,
@@ -594,9 +597,9 @@ where
             }
             if had_child_cost {
                 if let Some(observer) = observer {
-                    observer.emit(ChildAgentActivity::Usage(
+                    observer.publish_activity(ChildAgentActivity::Usage(
                         context.child_cost_tracker.totals(),
-                    ));
+                    ))?;
                 }
             }
             if let Some(result) =
@@ -627,14 +630,14 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
     hooks: &HookRunner,
     response: &ProviderResponse,
     child_cost_tracker: &mut CostTracker,
-    observer: Option<&ChildAgentActivityObserver<'_>>,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
 ) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
     let has_provider_error = response
         .steps
         .iter()
         .any(|step| matches!(step, ProviderStep::Error(_)));
     if has_provider_error {
-        record_child_provider_usage(response.usage, child_cost_tracker, observer);
+        record_child_provider_usage(response.usage, child_cost_tracker, observer)?;
     }
 
     handle_child_agent_provider_error(config, setup, cwd, hooks, response)
@@ -643,15 +646,16 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
 fn record_child_provider_usage(
     usage: Option<orca_core::provider_types::Usage>,
     child_cost_tracker: &mut CostTracker,
-    observer: Option<&ChildAgentActivityObserver<'_>>,
-) {
+    observer: Option<&dyn ChildAgentActivityPublisher>,
+) -> io::Result<()> {
     let Some(usage) = usage.filter(|usage| !usage.is_empty()) else {
-        return;
+        return Ok(());
     };
     child_cost_tracker.add_usage(usage);
     if let Some(observer) = observer {
-        observer.emit(ChildAgentActivity::Usage(child_cost_tracker.totals()));
+        observer.publish_activity(ChildAgentActivity::Usage(child_cost_tracker.totals()))?;
     }
+    Ok(())
 }
 
 pub(crate) fn child_agent_budget_exhausted_result(
@@ -736,7 +740,7 @@ pub fn run_child_agent_with_tool_executor_observed<F>(
     instructions: &ProjectInstructions,
     memory: &MemoryBlock,
     hooks: &HookRunner,
-    observer: Option<&ChildAgentActivityObserver<'_>>,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
     mut execute_tool: F,
 ) -> (ChildAgentResult, CostTracker)
 where

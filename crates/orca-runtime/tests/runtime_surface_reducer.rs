@@ -2418,6 +2418,7 @@ fn task(status: SurfaceTaskStatus, revision: u64) -> SurfaceTask {
         started_at: Some(UnixMillis::new(2)),
         completed_at: None,
         parent_operation: None,
+        parent_task_id: None,
         background_fence: None,
         workflow_run_id: None,
         subagent_id: None,
@@ -2428,6 +2429,48 @@ fn task(status: SurfaceTaskStatus, revision: u64) -> SurfaceTask {
         retry_count: 0,
         output_truncated: false,
     }
+}
+
+#[test]
+fn task_parent_must_exist_and_cannot_reference_itself() {
+    let initial = state();
+    let mut missing_parent = task(SurfaceTaskStatus::Running, 1);
+    missing_parent.task_id = SurfaceTaskId::try_new("child-task").unwrap();
+    missing_parent.parent_task_id = Some(SurfaceTaskId::try_new("missing-task").unwrap());
+    let missing = batch(
+        &initial,
+        5_901,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::Upserted {
+                expected_revision: None,
+                task: missing_parent,
+            }),
+        )],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &initial, &missing),
+        SurfaceReducerErrorCode::MissingIdentity,
+    );
+
+    let mut self_parent = task(SurfaceTaskStatus::Running, 1);
+    self_parent.task_id = SurfaceTaskId::try_new("self-task").unwrap();
+    self_parent.parent_task_id = Some(self_parent.task_id.clone());
+    let self_cycle = batch(
+        &initial,
+        5_902,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::Upserted {
+                expected_revision: None,
+                task: self_parent,
+            }),
+        )],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &initial, &self_cycle),
+        SurfaceReducerErrorCode::IllegalTransition,
+    );
 }
 
 fn operation_fence() -> SurfaceOperationFence {
@@ -2837,6 +2880,7 @@ fn workflow_agent_attempt_transitions_are_generated_from_manifest() {
 fn subagent(status: SurfaceSubagentStatus, revision: u64) -> SurfaceSubagent {
     SurfaceSubagent {
         subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
+        task_id: SurfaceTaskId::try_new("manifest-task").unwrap(),
         revision: SubagentRevision::try_new(revision).unwrap(),
         description: DisplayText::new("manifest subagent"),
         status,

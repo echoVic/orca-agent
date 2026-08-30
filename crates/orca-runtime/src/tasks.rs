@@ -344,6 +344,7 @@ impl LegacyTerminalTaskReconciliationReceipt {
                     started_at: record.started_at_ms.map(UnixMillis::new),
                     completed_at: record.completed_at_ms.map(UnixMillis::new),
                     parent_operation: None,
+                    parent_task_id: None,
                     background_fence: None,
                     workflow_run_id: None,
                     subagent_id: None,

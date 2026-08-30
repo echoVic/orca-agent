@@ -3121,6 +3121,7 @@ fn recover_retries_prepared_main_session_transfer_as_one_owner_batch() {
             started_at: Some(UnixMillis::new(1)),
             completed_at: None,
             parent_operation: Some(operation_id.clone()),
+            parent_task_id: None,
             background_fence: Some(background_fence.clone()),
             workflow_run_id: None,
             subagent_id: None,

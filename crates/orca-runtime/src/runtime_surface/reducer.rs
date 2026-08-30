@@ -357,6 +357,7 @@ struct CanonicalTaskV1<'a> {
     started_at: &'a Option<UnixMillis>,
     completed_at: &'a Option<UnixMillis>,
     parent_operation: &'a Option<SurfaceOperationId>,
+    parent_task_id: &'a Option<SurfaceTaskId>,
     background_fence: Option<CanonicalBackgroundFenceV1<'a>>,
     workflow_run_id: &'a Option<SurfaceWorkflowRunId>,
     subagent_id: &'a Option<SurfaceSubagentId>,
@@ -378,6 +379,7 @@ fn canonical_task_v1(task: &SurfaceTask) -> CanonicalTaskV1<'_> {
         started_at: &task.started_at,
         completed_at: &task.completed_at,
         parent_operation: &task.parent_operation,
+        parent_task_id: &task.parent_task_id,
         background_fence: task
             .background_fence
             .as_ref()
@@ -8196,10 +8198,59 @@ fn historical_terminal_task_creation_allowed(task: &SurfaceTask) -> bool {
         && task.completed_at.is_some()
         && !task.backgrounded
         && task.parent_operation.is_none()
+        && task.parent_task_id.is_none()
         && task.background_fence.is_none()
         && task.workflow_run_id.is_none()
         && task.subagent_id.is_none()
         && task.pending_interaction_id.is_none()
+}
+
+fn validate_task_parent_graph(
+    tasks: &[SurfaceTask],
+    envelope: &SurfaceEventEnvelope,
+) -> Result<(), SurfaceReducerError> {
+    for task in tasks {
+        let mut current = task;
+        let mut seen = HashSet::new();
+        let mut depth = 0_u8;
+        loop {
+            if !seen.insert(current.task_id.clone()) {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "task parent graph contains a cycle",
+                ));
+            }
+            let Some(parent_task_id) = current.parent_task_id.as_ref() else {
+                break;
+            };
+            depth = depth.checked_add(1).ok_or_else(|| {
+                event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "task parent depth overflow",
+                )
+            })?;
+            if depth > 32 {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "task parent depth exceeds 32",
+                ));
+            }
+            current = tasks
+                .iter()
+                .find(|candidate| candidate.task_id == *parent_task_id)
+                .ok_or_else(|| {
+                    event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::MissingIdentity,
+                        "task parent does not exist",
+                    )
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_task_patch(
@@ -8230,6 +8281,9 @@ fn apply_task_patch(
                     "task already exists",
                 ));
             }
+            let mut candidate_tasks = snapshot.tasks.clone();
+            candidate_tasks.push(task.clone());
+            validate_task_parent_graph(&candidate_tasks, envelope)?;
             if task.revision.get() != 1
                 || !matches!(
                     task.status,
@@ -8387,6 +8441,7 @@ fn apply_task_patch(
                     ));
                 }
             }
+            validate_task_parent_graph(tasks, envelope)?;
             snapshot.tasks = tasks.clone();
             Ok(())
         }

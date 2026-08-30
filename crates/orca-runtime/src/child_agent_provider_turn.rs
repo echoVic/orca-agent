@@ -12,7 +12,8 @@ use orca_provider::ProviderConfig;
 
 use crate::child_agent_loop_setup::ChildAgentLoopSetup;
 use crate::child_agent_types::{
-    ChildAgentActivity, ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult,
+    ChildAgentActivity, ChildAgentActivityPublisher, ChildAgentRequest, ChildAgentResult,
+    child_event_output,
 };
 use crate::compaction::{
     RuntimeCompactionPolicy, RuntimeCompactionRetryDecision, RuntimeCompactionStep,
@@ -129,7 +130,7 @@ pub fn run_child_agent_provider_turn_observed(
     hooks: &HookRunner,
     provider_config: &ProviderConfig,
     cancel: &CancelToken,
-    observer: Option<&ChildAgentActivityObserver<'_>>,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
 ) -> ChildAgentProviderTurn {
     let pre_model_outcome = match hooks.run(
         orca_core::hook_types::HookEvent::PreModelCall,
@@ -159,6 +160,7 @@ pub fn run_child_agent_provider_turn_observed(
     let model_conversation =
         conversation_with_hook_context(&setup.conversation, &pre_model_outcome);
 
+    let mut activity_error = None;
     let response = orca_provider::call_streaming(
         config.provider,
         &model_conversation,
@@ -166,10 +168,24 @@ pub fn run_child_agent_provider_turn_observed(
         cancel,
         &mut |_| {
             if let Some(observer) = observer {
-                observer.emit(ChildAgentActivity::Streaming);
+                if let Err(error) = observer.publish_activity(ChildAgentActivity::Streaming) {
+                    activity_error = Some(error.to_string());
+                }
             }
         },
     );
+
+    if let Some(error) = activity_error {
+        return ChildAgentProviderTurn::Fail {
+            result: ChildAgentResult {
+                status: RunStatus::Failed,
+                final_message: None,
+                error: Some(format!("child activity sink failed: {error}")),
+                budget_usage: None,
+            },
+            usage: response.usage,
+        };
+    }
 
     if let Err(error) = hooks.run(
         orca_core::hook_types::HookEvent::PostModelCall,
@@ -204,7 +220,7 @@ pub fn compact_child_agent_conversation_if_needed(
     hooks: &HookRunner,
 ) -> io::Result<bool> {
     let mut events = EventFactory::new("child-agent-compaction".to_string());
-    let mut sink = EventSink::new(io::sink(), config.output_format);
+    let mut sink = EventSink::new(child_event_output(), config.output_format);
     let subagent_type = SubagentType::General;
     let mut compaction = RuntimeCompactionStep::new(
         config.provider,
@@ -240,7 +256,7 @@ pub fn handle_child_agent_provider_error(
     ) {
         RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
             let mut events = EventFactory::new("child-agent-compaction".to_string());
-            let mut sink = EventSink::new(io::sink(), config.output_format);
+            let mut sink = EventSink::new(child_event_output(), config.output_format);
             let subagent_type = SubagentType::General;
             let mut compaction = RuntimeCompactionStep::new(
                 config.provider,

@@ -2315,6 +2315,7 @@ impl ThreadActor {
             started_at: Some(surface::UnixMillis::new(prepared.created_at_ms)),
             completed_at: None,
             parent_operation: Some(operation_id.clone()),
+            parent_task_id: None,
             background_fence: Some(background_fence.clone()),
             workflow_run_id: Some(workflow_run_id.clone()),
             subagent_id: None,

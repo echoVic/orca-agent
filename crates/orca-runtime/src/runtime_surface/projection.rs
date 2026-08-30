@@ -942,6 +942,27 @@ pub enum SurfaceTaskStatus {
     Cancelled,
 }
 
+/// User-visible phase of a delegated child. This intentionally describes
+/// execution state rather than provider reasoning or hidden model output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SurfaceSubagentPhase {
+    Starting,
+    Thinking,
+    Tool,
+    Checkpointing,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SurfaceToolTerminalStatus {
+    Success,
+    Failed,
+    Cancelled,
+    Indeterminate,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct SurfaceTask {
     pub task_id: SurfaceTaskId,
@@ -954,6 +975,10 @@ pub struct SurfaceTask {
     pub started_at: Option<UnixMillis>,
     pub completed_at: Option<UnixMillis>,
     pub parent_operation: Option<SurfaceOperationId>,
+    /// Durable parent task identity used by projections to build the child
+    /// tree. Private operation/background fences remain separate and are never
+    /// serialized into the task snapshot.
+    pub parent_task_id: Option<SurfaceTaskId>,
     pub background_fence: Option<SurfaceBackgroundFence>,
     pub workflow_run_id: Option<SurfaceWorkflowRunId>,
     pub subagent_id: Option<SurfaceSubagentId>,
@@ -1168,6 +1193,9 @@ pub enum SurfaceSubagentStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceSubagent {
     pub subagent_id: SurfaceSubagentId,
+    /// The task that owns this subagent projection. Keeping the relationship
+    /// explicit avoids making the TUI infer ownership from display labels.
+    pub task_id: SurfaceTaskId,
     pub revision: SubagentRevision,
     pub description: DisplayText,
     pub status: SurfaceSubagentStatus,

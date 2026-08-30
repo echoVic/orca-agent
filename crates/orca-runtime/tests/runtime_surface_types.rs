@@ -897,6 +897,7 @@ fn subagent_and_goal_projection_refinements_are_exact() {
 
     let running = SurfaceSubagent {
         subagent_id: SurfaceSubagentId::try_new("subagent-1").unwrap(),
+        task_id: SurfaceTaskId::try_new("task-1").unwrap(),
         revision: SubagentRevision::try_new(1).unwrap(),
         description: DisplayText::new("focused projection"),
         status: SurfaceSubagentStatus::Running,

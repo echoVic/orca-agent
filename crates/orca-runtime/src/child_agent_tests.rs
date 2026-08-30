@@ -934,6 +934,49 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
 }
 
 #[test]
+fn activity_sink_failure_before_tool_started_prevents_tool_execution() {
+    let request = ChildAgentRequest::new(
+        "bash echo child".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let runtime_config = config(None);
+    let mut tracker = CostTracker::new(None);
+    let tool_executed = RefCell::new(false);
+    let observer = ChildAgentActivityObserver::new_fallible(|activity| {
+        if matches!(activity, ChildAgentActivity::ToolStarted { .. }) {
+            return Err(io::Error::other("injected activity admission failure"));
+        }
+        Ok(())
+    });
+
+    let result = run_child_agent_loop_with_tool_executor_observed(
+        &runtime_config,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+            lease: None,
+        },
+        Some(&observer),
+        |_setup, _cancel, _tool_request| {
+            *tool_executed.borrow_mut() = true;
+            panic!("tool execution must be fenced by ToolStarted activity admission")
+        },
+    );
+
+    assert!(result.is_err());
+    assert!(!*tool_executed.borrow());
+}
+
+#[test]
 fn observed_child_agent_stops_at_local_budget_after_emitting_exact_usage() {
     let request = ChildAgentRequest::new(
         "mock_usage".to_string(),

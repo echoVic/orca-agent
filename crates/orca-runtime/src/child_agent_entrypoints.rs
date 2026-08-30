@@ -12,7 +12,7 @@ use crate::child_agent_loop_runner::{
 };
 use crate::child_agent_response_folding::{ChildAgentToolContext, ChildAgentToolExecution};
 use crate::child_agent_types::{
-    ChildAgentActivityObserver, ChildAgentRequest, ChildAgentResult, ChildAgentRuntime,
+    ChildAgentActivityPublisher, ChildAgentRequest, ChildAgentResult, ChildAgentRuntime,
 };
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
@@ -104,7 +104,7 @@ where
 pub fn run_child_agent_prompt_with_tool_executor_observed<F>(
     config: &RunConfig,
     context: ChildAgentPromptContext<'_>,
-    observer: Option<&ChildAgentActivityObserver<'_>>,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
     execute_tool: F,
 ) -> (ChildAgentResult, CostTracker)
 where

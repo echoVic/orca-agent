@@ -1098,6 +1098,7 @@ impl ThreadActor {
             started_at: Some(started.created_at),
             completed_at: None,
             parent_operation: Some(fence.operation_id.clone()),
+            parent_task_id: None,
             background_fence: None,
             workflow_run_id: Some(started.workflow_run_id.clone()),
             subagent_id: None,

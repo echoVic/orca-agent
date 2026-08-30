@@ -2322,6 +2322,7 @@ mod tests {
             started_at: Some(UnixMillis::new(1_000)),
             completed_at: None,
             parent_operation: None,
+            parent_task_id: None,
             background_fence: None,
             workflow_run_id: None,
             subagent_id: None,
