@@ -1890,6 +1890,8 @@ impl WorkflowRunner {
                 task_registry: Some(&self.tasks),
                 root_task_id: Some(&child_task_id),
                 checkpoint_observer: Some(&checkpoint_observer),
+                permission_handler: None,
+                turn_id: None,
                 executor: self.child_executor,
             });
             run_child_agent(&workflow_child_config, &child_request, &mut runtime)

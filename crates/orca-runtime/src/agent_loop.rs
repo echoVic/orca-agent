@@ -23,6 +23,7 @@ use orca_core::budget::OperationTerminal;
 use orca_core::config::{OutputFormat, RunConfig};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
+use orca_core::thread_identity::TurnId;
 
 #[cfg(test)]
 use crate::lifecycle::{
@@ -211,6 +212,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
             request.emit_deltas,
             &request.subagent_type,
         )
+        .with_turn_id(runtime.turn_id.clone().unwrap_or_else(TurnId::new))
         .with_root_task_id(runtime.root_task_id)
         .with_services(
             runtime.instructions,
@@ -219,6 +221,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
             runtime.hooks,
         )
         .with_runtime(child_cost_tracker, runtime.cancel, task_registry)
+        .with_permission_handler(runtime.permission_handler.as_deref())
         .with_execution(
             &mut background_workflows,
             request.workflow_ipc.as_ref(),

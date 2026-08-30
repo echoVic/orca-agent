@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
@@ -167,6 +168,8 @@ pub(crate) struct RuntimeNormalToolTurnRuntime<'a> {
 pub(crate) struct RuntimeNormalToolTurnInteractions<'a> {
     pub(crate) approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) permission_handler_owned:
+        Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
@@ -329,6 +332,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let workflow_ipc = capabilities.workflow_ipc;
     let approval_handler = capabilities.approval_handler;
     let permission_handler = capabilities.permission_handler;
+    let permission_handler_owned = step_snapshot.turn_context.permission_handler_owned();
     let user_input_handler = capabilities.user_input_handler;
     let mcp_elicitation_handler = capabilities.mcp_elicitation_handler;
     while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
@@ -589,6 +593,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     task_registry,
                     root_task_id,
                     workflow_ipc,
+                    permission_handler: permission_handler_owned.clone(),
                     activity_ingress: workflow_lifecycle_ingress
                         .and_then(|ingress| ingress.subagent_activity_ingress()),
                 },
@@ -852,6 +857,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             interactions: RuntimeNormalToolTurnInteractions {
                 approval_handler,
                 permission_handler,
+                permission_handler_owned: permission_handler_owned.clone(),
                 user_input_handler,
                 mcp_elicitation_handler,
                 provider_response_ingress,
@@ -1183,6 +1189,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     let RuntimeNormalToolTurnInteractions {
         approval_handler,
         permission_handler,
+        permission_handler_owned,
         user_input_handler,
         mcp_elicitation_handler,
         provider_response_ingress,
@@ -1232,6 +1239,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         .with_permission_overlay(sampling_state.permission_overlay_mut())
         .with_approval_handler(approval_handler)
         .with_permission_handler(permission_handler)
+        .with_owned_permission_handler(permission_handler_owned)
         .with_user_input_handler(user_input_handler)
         .with_mcp_elicitation_handler(mcp_elicitation_handler)
         .with_provider_response_ingress(provider_response_ingress);
@@ -2105,6 +2113,7 @@ mod tests {
             interactions: RuntimeNormalToolTurnInteractions {
                 approval_handler: None,
                 permission_handler: None,
+                permission_handler_owned: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
                 provider_response_ingress: None,
@@ -2204,6 +2213,7 @@ mod tests {
             interactions: RuntimeNormalToolTurnInteractions {
                 approval_handler: None,
                 permission_handler: None,
+                permission_handler_owned: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
                 provider_response_ingress: None,
@@ -3597,6 +3607,7 @@ mod tests {
             interactions: RuntimeNormalToolTurnInteractions {
                 approval_handler: None,
                 permission_handler: None,
+                permission_handler_owned: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
                 provider_response_ingress: None,

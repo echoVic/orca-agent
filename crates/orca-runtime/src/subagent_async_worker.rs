@@ -430,6 +430,8 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             task_registry: Some(&task_registry),
             root_task_id: Some(&agent_id),
             checkpoint_observer: Some(&checkpoint_observer),
+            permission_handler: None,
+            turn_id: None,
             executor: child_executor,
         });
         crate::agent_child::run_child_agent(&config, &child_request, &mut child_runtime)

@@ -15,7 +15,9 @@ use crate::agent_child::ChildAgentExecutor;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunError, HookRunner};
 use crate::instructions::ProjectInstructions;
-use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
+use crate::lifecycle::{
+    RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus,
+};
 use crate::memory::MemoryBlock;
 use crate::runtime_subagent_call::{RuntimeSubagentCallOutput, RuntimeSubagentInvocation};
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
@@ -80,6 +82,7 @@ pub(crate) struct RuntimeSubagentBatchToolTurnRuntime<'a> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) activity_ingress:
         Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
+    pub(crate) permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
 }
 
 struct SubagentBatchExecution {
@@ -209,6 +212,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         root_task_id,
         workflow_ipc,
         activity_ingress,
+        permission_handler,
     } = runtime;
     let execution = execute_subagent_batch(
         config,
@@ -228,6 +232,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         root_task_id,
         workflow_ipc,
         child_executor,
+        permission_handler,
         activity_ingress,
         &child_budgets,
     );
@@ -288,6 +293,7 @@ fn execute_subagent_batch(
     root_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
+    permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
     child_budgets: &[Option<orca_core::budget::BudgetSpec>],
 ) -> SubagentBatchExecution {
@@ -432,6 +438,7 @@ fn execute_subagent_batch(
             subagent_depth + 1,
             child_executor,
             activity_ingress.clone(),
+            permission_handler.clone(),
             task_registry,
             root_task_id,
         );
@@ -543,6 +550,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         workflow_ipc,
         child_executor,
         None,
+        None,
         event_error,
         child_budget,
     )
@@ -567,6 +575,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
     root_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
+    permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
     event_error: &mut Option<io::Error>,
     child_budget: Option<&orca_core::budget::BudgetSpec>,
@@ -643,6 +652,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         subagent_depth + 1,
         child_executor,
         activity_ingress,
+        permission_handler,
         task_registry,
         root_task_id,
     );
@@ -754,6 +764,7 @@ fn emit_rejected_subagent_lifecycle(
 mod tests {
     use std::io;
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
@@ -774,6 +785,14 @@ mod tests {
     use orca_core::tool_types;
     use orca_mcp::McpRegistry;
 
+    use crate::protocol::{
+        PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile,
+    };
+    use crate::runtime_permission::{
+        RuntimePermissionContext, RuntimePermissionRequest, RuntimePermissionRequestHandler,
+        RuntimePermissionResponse,
+    };
+    use crate::surface::SurfacePermissionOrigin;
     use crate::tool_turn::ToolTurnOutcome;
 
     fn platform_hook_script(unix: &str, windows: &str) -> String {
@@ -1109,6 +1128,7 @@ mod tests {
                     root_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
+                    permission_handler: None,
                 },
                 child_executor: fake_child_executor::<std::io::Sink>,
             });
@@ -1136,6 +1156,50 @@ mod tests {
         Ok(ChildAgentResult {
             status: RunStatus::Success,
             final_message: Some("injected child result".to_string()),
+            error: None,
+            budget_usage: None,
+        })
+    }
+
+    struct CapturingPermissionHandler {
+        requests: Arc<Mutex<Vec<RuntimePermissionRequest>>>,
+    }
+
+    impl RuntimePermissionRequestHandler for CapturingPermissionHandler {
+        fn request_permissions(
+            &self,
+            request: &RuntimePermissionRequest,
+        ) -> io::Result<RuntimePermissionResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(RuntimePermissionResponse {
+                decision: PermissionResponseDecision::Allow,
+                scope: PermissionGrantScope::Turn,
+                permissions: request.permissions.clone(),
+                strict_auto_review: false,
+            })
+        }
+    }
+
+    fn child_executor_observes_permission_handler<W: io::Write>(
+        _config: &RunConfig,
+        request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        let handler = runtime
+            .permission_handler
+            .as_ref()
+            .ok_or_else(|| io::Error::other("sync child permission handler missing"))?;
+        let permission_request = RuntimePermissionRequest {
+            id: request.prompt.clone(),
+            reason: None,
+            permissions: RequestPermissionProfile::default(),
+            context: RuntimePermissionContext::foreground(SurfacePermissionOrigin::CommandExec),
+        };
+        handler.request_permissions(&permission_request)?;
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("permission handler observed".to_string()),
             error: None,
             budget_usage: None,
         })
@@ -1282,6 +1346,7 @@ mod tests {
                     root_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
+                    permission_handler: None,
                 },
                 child_executor: cancelling_child_executor::<std::io::Sink>,
             });
@@ -1356,6 +1421,7 @@ mod tests {
                     root_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
+                    permission_handler: None,
                 },
                 child_executor: delayed_child_executor::<std::io::Sink>,
             });
@@ -1432,6 +1498,7 @@ mod tests {
                     root_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
+                    permission_handler: None,
                 },
                 child_executor: panic_child_executor::<std::io::Sink>,
             });
@@ -1696,6 +1763,7 @@ mod tests {
                     root_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
+                    permission_handler: None,
                 },
                 child_executor: cancelled_child_executor::<std::io::Sink>,
             });
@@ -1777,6 +1845,70 @@ mod tests {
                 .unwrap_or_default()
                 .contains("injected child result")
         );
+    }
+
+    #[test]
+    fn sync_subagent_child_executor_receives_scoped_permission_handler() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("subagent-permission-bridge".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "inspect bridge",
+                    "prompt": "child-permission-request"
+                })
+                .to_string(),
+            ),
+            ..subagent_request("permission-bridge")
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-permission-bridge".to_string());
+        let mut event_error = None;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let permission_handler: Arc<dyn RuntimePermissionRequestHandler + Send + Sync> =
+            Arc::new(CapturingPermissionHandler {
+                requests: Arc::clone(&captured),
+            });
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            true,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            child_executor_observes_permission_handler::<io::Sink>,
+            Some(permission_handler),
+            None,
+            &mut event_error,
+            None,
+        )
+        .expect("subagent permission bridge");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            requests[0].context,
+            RuntimePermissionContext::Child { .. }
+        ));
     }
 
     #[test]
@@ -2077,6 +2209,7 @@ mod tests {
                     root_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
+                    permission_handler: None,
                 },
                 child_executor: receipt_child_executor::<std::io::Sink>,
             });

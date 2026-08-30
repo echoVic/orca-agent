@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::io;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use crate::agent_child::*;
 use crate::cost::CostTracker;
@@ -22,6 +23,7 @@ use orca_core::provider_types::{
 };
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::subagent_types::SubagentType;
+use orca_core::thread_identity::TurnId;
 use orca_core::tool_types::{ToolInvocationStarted, ToolName, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
 
@@ -92,8 +94,57 @@ fn runtime<'a>(
         task_registry: None,
         root_task_id: None,
         checkpoint_observer: None,
+        permission_handler: None,
+        turn_id: None,
         executor,
     })
+}
+
+fn noop_child_executor<W: io::Write>(
+    _: &RunConfig,
+    _: &ChildAgentRequest,
+    _: &mut ChildAgentRuntime<'_, W>,
+    _: &mut CostTracker,
+) -> io::Result<ChildAgentResult> {
+    Ok(ChildAgentResult {
+        status: RunStatus::Success,
+        final_message: None,
+        error: None,
+        budget_usage: None,
+    })
+}
+
+#[test]
+fn child_runtime_retains_owned_permission_handler() {
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let mcp_registry = McpRegistry::default();
+    let hooks = HookRunner::new(Vec::new());
+    let cancel = CancelToken::new();
+    let mut events = EventFactory::new("permission-handler-retained".to_string());
+    let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+    let handler: Arc<dyn crate::runtime_permission::RuntimePermissionRequestHandler + Send + Sync> =
+        Arc::new(crate::runtime_permission::AllowRequestedPermissions);
+    let runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
+        cwd: std::path::Path::new("."),
+        events: &mut events,
+        sink: &mut sink,
+        instructions: &instructions,
+        memory: &memory,
+        mcp_registry: &mcp_registry,
+        hooks: &hooks,
+        cancel: &cancel,
+        lifecycle: None,
+        task_registry: None,
+        root_task_id: None,
+        checkpoint_observer: None,
+        permission_handler: Some(handler),
+        turn_id: Some(TurnId::new()),
+        executor: noop_child_executor::<Cursor<Vec<u8>>>,
+    });
+
+    assert!(runtime.permission_handler.is_some());
+    assert!(runtime.turn_id.is_some());
 }
 
 fn child_loop_setup(runtime_config: &RunConfig) -> ChildAgentLoopSetup {

@@ -201,6 +201,7 @@ impl<'a> RuntimeTurnRequestContext<'a> {
             workflow_lifecycle_ingress: self.turn_context.workflow_lifecycle_ingress,
             wait_for_background_workflows: self.turn_context.wait_for_background_workflows,
             defer_cancel_terminal: self.turn_context.defer_cancel_terminal,
+            permission_handler_owned: self.turn_context.permission_handler_owned.clone(),
         };
         Self { turn_context }
     }

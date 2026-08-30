@@ -215,7 +215,7 @@ pub(crate) struct AgentLoopContext<'a> {
     pub(crate) turn_execution: Option<RuntimeTurnExecution<'a>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) turn_id: TurnId,
     pub(crate) cwd: &'a Path,
@@ -231,6 +231,10 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
     pub(crate) wait_for_background_workflows: bool,
     pub(crate) defer_cancel_terminal: bool,
+    /// The handler is owned by the turn so a synchronous child invocation can
+    /// move an `Arc` across its worker boundary without borrowing the parent.
+    pub(crate) permission_handler_owned:
+        Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1064,6 +1068,14 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_owned_permission_handler(
+        mut self,
+        handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    ) -> Self {
+        self.turn_context = self.turn_context.with_owned_permission_handler(handler);
+        self
+    }
+
     pub(crate) fn with_provider_response_ingress(
         mut self,
         ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
@@ -1209,12 +1221,27 @@ impl<'a> RuntimeTurnContext<'a> {
             workflow_lifecycle_ingress: None,
             wait_for_background_workflows: true,
             defer_cancel_terminal: false,
+            permission_handler_owned: None,
         }
     }
 
     pub(crate) fn with_turn_id(mut self, turn_id: TurnId) -> Self {
         self.turn_id = turn_id;
         self
+    }
+
+    pub(crate) fn with_owned_permission_handler(
+        mut self,
+        handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    ) -> Self {
+        self.permission_handler_owned = handler;
+        self
+    }
+
+    pub(crate) fn permission_handler_owned(
+        &self,
+    ) -> Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>> {
+        self.permission_handler_owned.clone()
     }
 
     pub(crate) fn with_root_task_id(mut self, root_task_id: Option<&'a str>) -> Self {

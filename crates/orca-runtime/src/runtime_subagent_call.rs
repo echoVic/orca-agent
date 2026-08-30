@@ -10,6 +10,7 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventFactory, EventType, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::subagent_types::SubagentType;
+use orca_core::thread_identity::TurnId;
 use orca_core::tool_types::{ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use serde_json::Value;
@@ -31,6 +32,7 @@ use crate::child_agent_types::{
     SubagentActivityEvent, SubagentActivityIdentity, SubagentActivityOwner,
     SubagentActivityPayload, child_event_output,
 };
+use crate::child_permission::{ChildPermissionHandler, ChildPermissionIdentity};
 use crate::cost::CostTracker;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
@@ -38,6 +40,7 @@ use crate::lifecycle::{
     RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskLifecycle, RuntimeTaskStatus,
 };
 use crate::memory::MemoryBlock;
+use crate::runtime_permission::RuntimePermissionRequestHandler;
 use crate::runtime_surface::RuntimeSubagentActivityIngress;
 use crate::runtime_surface::{
     DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId, TaskRevision,
@@ -62,6 +65,9 @@ pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) child_depth: u32,
     pub(crate) child_executor: ChildAgentExecutor<io::Sink>,
     pub(crate) activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
+    /// Owned parent handler; the child wraps it with its own typed identity
+    /// before any tool can request an escalation.
+    pub(crate) permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     pub(crate) task_registry: TaskRegistry,
     pub(crate) root_task_id: Option<String>,
 }
@@ -205,6 +211,7 @@ impl RuntimeSubagentInvocation {
         child_depth: u32,
         child_executor: ChildAgentExecutor<io::Sink>,
         activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
+        permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
         task_registry: &TaskRegistry,
         root_task_id: Option<&str>,
     ) -> Self {
@@ -221,6 +228,7 @@ impl RuntimeSubagentInvocation {
             child_depth,
             child_executor,
             activity_ingress,
+            permission_handler,
             task_registry: task_registry.clone(),
             root_task_id: root_task_id.map(str::to_string),
         }
@@ -422,6 +430,7 @@ fn run_subagent_worker(
         child_depth,
         child_executor,
         activity_ingress,
+        permission_handler,
         task_registry,
         root_task_id,
     } = invocation;
@@ -678,6 +687,7 @@ fn run_subagent_worker(
             child_depth,
             child_executor,
             activity_ingress,
+            permission_handler,
             task_registry.clone(),
             root_task_id,
             lifecycle,
@@ -740,6 +750,7 @@ fn execute_acquired_sync_subagent(
     child_depth: u32,
     child_executor: ChildAgentExecutor<io::Sink>,
     activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
+    permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     task_registry: TaskRegistry,
     root_task_id: Option<String>,
     mut lifecycle: RuntimeSessionLifecycle,
@@ -812,8 +823,50 @@ fn execute_acquired_sync_subagent(
         workflow_ipc,
         continuation: continuation_start,
     };
-    let surface_task_id = SurfaceTaskId::try_new(registry_task_id.clone())
-        .expect("task registry created a non-empty task id");
+    let surface_task_id = match SurfaceTaskId::try_new(registry_task_id.clone()) {
+        Ok(task_id) => task_id,
+        Err(error) => {
+            let output = continuation_started_failure(
+                tool_request,
+                description,
+                lifecycle,
+                started_task,
+                &child_config,
+                format!("child permission identity unavailable: invalid task id ({error})"),
+                worktree_execution.finish(),
+            );
+            return finalize_started_sync_subagent(
+                output,
+                &coordinator,
+                &lease,
+                &task_registry,
+                &registry_task_id,
+                false,
+            );
+        }
+    };
+    let surface_subagent_id = match SurfaceSubagentId::try_new(tool_request.id.clone()) {
+        Ok(subagent_id) => subagent_id,
+        Err(error) => {
+            let output = continuation_started_failure(
+                tool_request,
+                description,
+                lifecycle,
+                started_task,
+                &child_config,
+                format!("child permission identity unavailable: invalid subagent id ({error})"),
+                worktree_execution.finish(),
+            );
+            return finalize_started_sync_subagent(
+                output,
+                &coordinator,
+                &lease,
+                &task_registry,
+                &registry_task_id,
+                false,
+            );
+        }
+    };
     let activity_owner = activity_ingress.as_ref().map_or_else(
         || SubagentActivityOwner::DetachedTask {
             task_id: surface_task_id.clone(),
@@ -832,8 +885,7 @@ fn execute_acquired_sync_subagent(
     let activity = Arc::new(ChildAgentActivityEmitter::new(
         SubagentActivityIdentity {
             task_id: surface_task_id.clone(),
-            subagent_id: SurfaceSubagentId::try_new(tool_request.id.clone())
-                .expect("tool requests have a non-empty id"),
+            subagent_id: surface_subagent_id.clone(),
             attempt_id: prepared.attempt_id.clone(),
             owner: activity_owner,
         },
@@ -860,6 +912,18 @@ fn execute_acquired_sync_subagent(
             false,
         );
     }
+    let child_turn_id = TurnId::new();
+    let child_permission_handler = permission_handler.map(|parent| {
+        Arc::new(ChildPermissionHandler::new(
+            parent,
+            ChildPermissionIdentity::new(
+                surface_task_id.clone(),
+                surface_subagent_id,
+                child_turn_id.clone(),
+                activity.revision_source(),
+            ),
+        )) as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>
+    });
     let mut child_events = EventFactory::new(format!("subagent-{}", tool_request.id));
     let mut child_sink = EventSink::new(child_event_output(), output_format).with_observer(
         Arc::new(ChildEventActivityObserver {
@@ -880,6 +944,8 @@ fn execute_acquired_sync_subagent(
             task_registry: Some(&task_registry),
             root_task_id: root_task_id.as_deref(),
             checkpoint_observer: Some(&checkpoint_observer),
+            permission_handler: child_permission_handler,
+            turn_id: Some(child_turn_id),
             executor: child_executor,
         });
         run_child_agent(&child_config, &child_request, &mut runtime)

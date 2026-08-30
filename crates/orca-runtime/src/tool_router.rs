@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::{HistoryMode, RunConfig};
@@ -55,6 +56,8 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
     pub(crate) permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    pub(crate) permission_handler_owned:
+        Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     pub(crate) user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     pub(crate) extension_stores: Option<RuntimeExtensionStores<'a>>,
@@ -151,6 +154,7 @@ impl<'a> RuntimeToolRouter<'a> {
             workflow_ipc,
             permission_overlay,
             permission_handler,
+            permission_handler_owned,
             user_input_handler,
             mcp_elicitation_handler,
             extension_stores,
@@ -248,6 +252,7 @@ impl<'a> RuntimeToolRouter<'a> {
                     root_task_id,
                     workflow_ipc,
                     subagent_child_executor,
+                    permission_handler_owned,
                     workflow_lifecycle_ingress
                         .and_then(|ingress| ingress.subagent_activity_ingress()),
                     event_error,

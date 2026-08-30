@@ -753,6 +753,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
         } else {
             loop_context
         }
+        .with_owned_permission_handler(request.permission_handler_arc())
         .with_provider_suspension_control(request.provider_suspension_control())
         .with_provider_response_ingress(request.provider_response_ingress())
         .with_workflow_lifecycle_ingress(request.workflow_lifecycle_ingress())
@@ -1228,6 +1229,12 @@ impl ThreadTurnRequest {
         &self,
     ) -> Option<&(dyn RuntimePermissionRequestHandler + Send + Sync)> {
         self.permission_handler.as_deref()
+    }
+
+    pub(crate) fn permission_handler_arc(
+        &self,
+    ) -> Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>> {
+        self.permission_handler.clone()
     }
 
     pub fn approval_handler(&self) -> Option<&(dyn RuntimeApprovalHandler + Send + Sync)> {
@@ -3373,6 +3380,7 @@ mod tests {
                 workflow_ipc: None,
                 permission_overlay: &mut permission_overlay,
                 permission_handler: None,
+                permission_handler_owned: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
                 extension_stores: None,
@@ -3445,6 +3453,7 @@ mod tests {
                     workflow_ipc: None,
                     permission_overlay: &mut permission_overlay,
                     permission_handler: Some(&permission_handler),
+                    permission_handler_owned: None,
                     user_input_handler: None,
                     mcp_elicitation_handler: None,
                     extension_stores: None,

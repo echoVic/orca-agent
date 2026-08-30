@@ -1,7 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orca_core::budget::BudgetUsage;
@@ -23,6 +26,7 @@ use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::RuntimeSessionLifecycle;
 use crate::memory::MemoryBlock;
+use crate::runtime_permission::RuntimePermissionRequestHandler;
 use crate::runtime_surface::{
     DisplayText, Sha256Digest, SurfaceCommitId, SurfaceOperationId, SurfaceSubagentId,
     SurfaceSubagentPhase, SurfaceSubagentTerminalStatus, SurfaceTaskId, SurfaceToolCallId,
@@ -30,6 +34,7 @@ use crate::runtime_surface::{
 };
 use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
+use orca_core::thread_identity::TurnId;
 
 /// Computed child-runtime identity used to fail closed when a checkpoint was
 /// created under a different model, policy, tool catalog, or workspace.
@@ -269,6 +274,13 @@ pub(crate) struct ChildAgentRuntime<'a, W: io::Write> {
     pub task_registry: Option<&'a TaskRegistry>,
     pub root_task_id: Option<&'a str>,
     pub checkpoint_observer: Option<&'a dyn ChildAgentCheckpointSink>,
+    /// Owned because child execution may cross a worker boundary. The value
+    /// is already scoped to this child attempt by the synchronous invoker.
+    pub permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    /// The child loop turn id used when constructing the typed permission
+    /// owner. `None` is reserved for legacy/background paths that cannot
+    /// safely prompt and therefore fail closed.
+    pub turn_id: Option<TurnId>,
     executor: ChildAgentExecutor<W>,
 }
 
@@ -285,6 +297,8 @@ pub(crate) struct ChildAgentRuntimeContext<'a, W: io::Write> {
     pub task_registry: Option<&'a TaskRegistry>,
     pub root_task_id: Option<&'a str>,
     pub checkpoint_observer: Option<&'a dyn ChildAgentCheckpointSink>,
+    pub permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    pub turn_id: Option<TurnId>,
     pub executor: ChildAgentExecutor<W>,
 }
 
@@ -303,6 +317,8 @@ impl<'a, W: io::Write> ChildAgentRuntime<'a, W> {
             task_registry: context.task_registry,
             root_task_id: context.root_task_id,
             checkpoint_observer: context.checkpoint_observer,
+            permission_handler: context.permission_handler,
+            turn_id: context.turn_id,
             executor: context.executor,
         }
     }
@@ -520,12 +536,21 @@ pub(crate) struct ChildAgentActivityEmitter {
     sink: Arc<dyn ChildAgentActivitySink>,
     pending: Mutex<PendingSubagentActivity>,
     last_streaming: Mutex<Option<Instant>>,
+    published_revision: Arc<AtomicU64>,
 }
 
 impl ChildAgentActivityEmitter {
     pub(crate) fn new(
         identity: SubagentActivityIdentity,
         sink: Arc<dyn ChildAgentActivitySink>,
+    ) -> Self {
+        Self::new_with_revision_source(identity, sink, Arc::new(AtomicU64::new(0)))
+    }
+
+    pub(crate) fn new_with_revision_source(
+        identity: SubagentActivityIdentity,
+        sink: Arc<dyn ChildAgentActivitySink>,
+        published_revision: Arc<AtomicU64>,
     ) -> Self {
         Self {
             identity,
@@ -535,7 +560,12 @@ impl ChildAgentActivityEmitter {
                 pending: None,
             }),
             last_streaming: Mutex::new(None),
+            published_revision,
         }
+    }
+
+    pub(crate) fn revision_source(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.published_revision)
     }
 
     pub(crate) fn publish_payload(&self, payload: SubagentActivityPayload) -> io::Result<()> {
@@ -555,6 +585,8 @@ impl ChildAgentActivityEmitter {
             )
         });
         self.sink.publish(event.clone())?;
+        self.published_revision
+            .store(next_sequence, Ordering::Release);
         pending.next_sequence = pending
             .next_sequence
             .checked_add(1)

@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use orca_approval::ApprovalPolicy;
@@ -94,6 +95,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     permission_overlay: Option<&'a mut TurnPermissionOverlay>,
     approval_handler: Option<&'a (dyn RuntimeApprovalHandler + Send + Sync)>,
     permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
+    permission_handler_owned: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<&'a dyn RuntimeUserInputHandler>,
     mcp_elicitation_handler: Option<&'a (dyn McpElicitationHandler + Send + Sync)>,
     provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
@@ -313,6 +315,7 @@ impl<'a> ToolExecutionContext<'a> {
             permission_overlay: None,
             approval_handler: None,
             permission_handler: None,
+            permission_handler_owned: None,
             user_input_handler: None,
             mcp_elicitation_handler: None,
             provider_response_ingress: None,
@@ -372,6 +375,14 @@ impl<'a> ToolExecutionContext<'a> {
         permission_handler: Option<&'a (dyn RuntimePermissionRequestHandler + Send + Sync)>,
     ) -> Self {
         self.permission_handler = permission_handler;
+        self
+    }
+
+    pub(crate) fn with_owned_permission_handler(
+        mut self,
+        permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    ) -> Self {
+        self.permission_handler_owned = permission_handler;
         self
     }
 
@@ -991,6 +1002,7 @@ impl ToolExecutionActor {
             permission_overlay,
             approval_handler,
             permission_handler,
+            permission_handler_owned,
             user_input_handler,
             mcp_elicitation_handler,
             provider_response_ingress,
@@ -1223,6 +1235,7 @@ impl ToolExecutionActor {
                 workflow_ipc,
                 permission_overlay,
                 permission_handler,
+                permission_handler_owned,
                 user_input_handler,
                 mcp_elicitation_handler,
                 extension_stores,
