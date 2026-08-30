@@ -255,6 +255,7 @@
       "ResolveBackgroundApproval",
       "StopTask",
       "ForegroundTask",
+      "ReadTaskTranscript",
       "RespondToInteraction",
       "Backtrack",
       "BackgroundCurrentTurn",
@@ -4653,6 +4654,30 @@
       "remove_direct_task_registry_foregrounding"
     ],
     [
+      "ReadTaskTranscript",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:414",
+        "crates/orca-tui/src/workflow_panel_actions.rs:35",
+        "crates/orca-tui/src/hosted_controller.rs:535"
+      ],
+      "task_read",
+      "UserAction::ReadTaskTranscript{task_id,expected_revision}",
+      "read_task_transcript(task_id, expected_revision)",
+      "RuntimeSurfaceHandle::read_task_transcript(task_id, expected_revision)",
+      [
+        "ReadSnapshot"
+      ],
+      [
+        "SurfaceTaskFence",
+        "TaskRevision",
+        "ThreadOwnerEpoch"
+      ],
+      "QueryReply<TaskTranscriptSnapshot>",
+      "task transcript view consumes a typed snapshot or unavailable/stale/binding error",
+      "remove_direct_transcript_path_access"
+    ],
+    [
       "RespondToInteraction",
       "current",
       [
@@ -7467,7 +7492,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 39 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 40 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",

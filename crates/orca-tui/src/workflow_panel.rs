@@ -158,12 +158,15 @@ impl WorkflowPanelState {
                 }
                 TaskTreeKeyResult::Handled
             }
-            KeyCode::Enter if task.task_type == TaskType::Subagent => {
-                TaskTreeKeyResult::OpenTranscript(TaskTranscriptRequest {
-                    task_id: task.id.clone(),
-                    expected_revision: task.publication_revision,
+            KeyCode::Enter if task.task_type == TaskType::Subagent => task
+                .publication_revision
+                .map(|expected_revision| {
+                    TaskTreeKeyResult::OpenTranscript(TaskTranscriptRequest {
+                        task_id: task.id.clone(),
+                        expected_revision,
+                    })
                 })
-            }
+                .unwrap_or(TaskTreeKeyResult::Handled),
             _ => TaskTreeKeyResult::Unhandled,
         }
     }
@@ -691,8 +694,21 @@ mod tests {
             panel.handle_tree_key(crossterm::event::KeyCode::Enter),
             TaskTreeKeyResult::OpenTranscript(TaskTranscriptRequest {
                 task_id: "child".to_string(),
-                expected_revision: Some(7),
+                expected_revision: 7,
             })
+        );
+    }
+
+    #[test]
+    fn child_without_a_publication_revision_does_not_issue_an_unfenced_request() {
+        let mut panel = WorkflowPanelState::default();
+        let mut child = workflow_task_with_parent("child", None);
+        child.task_type = TaskType::Subagent;
+        panel.replace_task_tree_for_test(vec![child]);
+
+        assert_eq!(
+            panel.handle_tree_key(crossterm::event::KeyCode::Enter),
+            TaskTreeKeyResult::Handled
         );
     }
 

@@ -1890,7 +1890,7 @@ fn workflows_panel_enter_requests_child_transcript_by_task_and_revision() {
         rx.try_recv(),
         Ok(UserAction::ReadTaskTranscript(TaskTranscriptRequest {
             task_id,
-            expected_revision: Some(42),
+            expected_revision: 42,
         })) if task_id == "task-child"
     ));
 }

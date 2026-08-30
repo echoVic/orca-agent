@@ -325,7 +325,7 @@ pub struct TuiTaskLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTranscriptRequest {
     pub task_id: String,
-    pub expected_revision: Option<u64>,
+    pub expected_revision: u64,
 }
 
 #[derive(Debug, Clone)]

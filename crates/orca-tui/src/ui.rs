@@ -1348,7 +1348,7 @@ fn workflow_panel_action_hint<'a>(
             " · Enter approve",
             Style::default().fg(theme.muted),
         ));
-    } else if selected_task.is_some_and(|task| task.task_type == TaskType::Subagent) {
+    } else if selected_task.is_some_and(is_transcript_readable_task) {
         spans.push(Span::styled(
             " · Enter transcript",
             Style::default().fg(theme.muted),
@@ -1372,6 +1372,10 @@ fn workflow_panel_action_hint<'a>(
 
 fn is_approval_actionable_task(task: &BackgroundTaskSummary) -> bool {
     task.status == TaskStatus::ApprovalRequired && task.pending_tool_call.is_some()
+}
+
+fn is_transcript_readable_task(task: &BackgroundTaskSummary) -> bool {
+    task.task_type == TaskType::Subagent && task.publication_revision.is_some()
 }
 
 fn is_stoppable_task(task: &BackgroundTaskSummary) -> bool {
@@ -8404,6 +8408,30 @@ mod tests {
         assert!(rendered.contains("↑↓ select"));
         assert!(!rendered.contains("s stop"));
         assert!(rendered.contains("Esc close"));
+    }
+
+    #[test]
+    fn workflows_panel_shows_transcript_hint_only_for_a_revisioned_child() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let mut child = workflow_task_for_agent_dashboard(
+            "child",
+            "child-agent",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        child.task_type = TaskType::Subagent;
+
+        assert!(
+            !workflow_panel_action_hint(Some(&child), &theme)
+                .to_string()
+                .contains("Enter transcript")
+        );
+
+        child.publication_revision = Some(7);
+        assert!(
+            workflow_panel_action_hint(Some(&child), &theme)
+                .to_string()
+                .contains("Enter transcript")
+        );
     }
 
     #[test]
