@@ -155,6 +155,10 @@ pub struct TaskRegistry {
     /// material is process-local and is never persisted or passed to workers;
     /// a process restart therefore fails closed (it can still issue Deny).
     detached_permission_signers: Arc<Mutex<HashMap<String, Arc<Ed25519KeyPair>>>>,
+    /// Serialize binding registration within one registry. This keeps the
+    /// durable binding write and process-local signer installation atomic from
+    /// sibling callers; cross-process instances still use the session lock.
+    detached_binding_registration: Arc<Mutex<()>>,
     persistence: Option<Arc<TaskPersistence>>,
     persistent_open_error: Option<Arc<str>>,
     recover_persisted_active_tasks: bool,
@@ -1229,6 +1233,7 @@ impl TaskRegistry {
             detached_bindings: Arc::new(Mutex::new(HashMap::new())),
             detached_permission_requests: Arc::new(Mutex::new(HashMap::new())),
             detached_permission_signers: Arc::new(Mutex::new(HashMap::new())),
+            detached_binding_registration: Arc::new(Mutex::new(())),
             persistence: None,
             persistent_open_error: None,
             recover_persisted_active_tasks: false,
@@ -1344,6 +1349,7 @@ impl TaskRegistry {
             detached_bindings: Arc::new(Mutex::new(detached_bindings)),
             detached_permission_requests: Arc::new(Mutex::new(detached_permission_requests)),
             detached_permission_signers: Arc::new(Mutex::new(HashMap::new())),
+            detached_binding_registration: Arc::new(Mutex::new(())),
             persistence: Some(persistence),
             persistent_open_error: None,
             recover_persisted_active_tasks: recover_interrupted,
@@ -1450,6 +1456,10 @@ impl TaskRegistry {
         if let Some(error) = self.persistent_open_error.as_deref() {
             return Err(format!("persistent task registry is unavailable: {error}"));
         }
+        let _registration_guard = self
+            .detached_binding_registration
+            .lock()
+            .map_err(|_| "detached binding registration lock poisoned".to_string())?;
         if parent_fence.is_none() {
             return Err(
                 "detached subagent binding requires an actor-owned parent operation fence"
