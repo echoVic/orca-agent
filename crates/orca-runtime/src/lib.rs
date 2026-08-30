@@ -318,6 +318,7 @@ pub mod surface {
         WorkflowControlAction, WorkflowControlOutput, WorkflowPatch, WorkflowRevision,
         ZeroizingProcessLocalSecret, canonical_batch_digest, canonical_batch_encoded_bytes,
         canonical_event_digest, canonical_replayability_digest,
+        TaskTranscriptItem, TaskTranscriptSnapshot, TaskTranscriptToolStatus,
         decide_post_materialization_recovery, preflight_batch, reconcile_finalize_intent,
         reduce_batch, select_shutdown_cause,
     };

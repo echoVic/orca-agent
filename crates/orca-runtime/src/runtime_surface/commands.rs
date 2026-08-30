@@ -51,6 +51,7 @@ use super::projection::{
     ToolPatch, ToolTerminalSource, WorkflowPatch,
 };
 use super::reducer::canonical_replayability_digest;
+use orca_core::budget::BudgetUsage;
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -596,6 +597,14 @@ pub(crate) trait RuntimeSurfaceCommandDispatcher: Send + Sync {
         action: TaskControlAction,
     ) -> Result<MutationReply<TaskControlOutput>, SurfaceClientCommandError>;
 
+    fn read_task_transcript(
+        &self,
+        client: RuntimeSurfaceClientHandle,
+        request_id: SurfaceRequestId,
+        task_id: SurfaceTaskId,
+        expected_revision: TaskRevision,
+    ) -> Result<SurfaceReadResult<TaskTranscriptSnapshot>, SurfaceClientCommandError>;
+
     fn respond_interaction_by_id(
         &self,
         client: RuntimeSurfaceClientHandle,
@@ -1050,6 +1059,22 @@ impl RuntimeSurfaceClientHandle {
             .as_ref()
             .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
             .task_control(self.clone(), request_id, action)
+    }
+
+    /// Reads a child transcript through the actor-owned typed surface.
+    ///
+    /// The request is fenced by the task publication revision; callers must
+    /// treat a stale result as a signal to refresh the projected task list.
+    pub fn read_task_transcript(
+        &self,
+        request_id: SurfaceRequestId,
+        task_id: SurfaceTaskId,
+        expected_revision: TaskRevision,
+    ) -> Result<SurfaceReadResult<TaskTranscriptSnapshot>, SurfaceClientCommandError> {
+        self.dispatcher
+            .as_ref()
+            .ok_or(SurfaceClientCommandError::RuntimeUnavailable)?
+            .read_task_transcript(self.clone(), request_id, task_id, expected_revision)
     }
 
     pub fn respond_interaction(
@@ -2958,6 +2983,62 @@ pub struct PinnedContextMutationOutput {
     pub cursor: SurfaceCursor,
 }
 
+/// Bounded, user-visible content from the latest durable child checkpoint.
+///
+/// This is deliberately a separate projection from [`SurfaceHistoryMessage`].
+/// The latter is a compatibility view and can contain provider reasoning,
+/// raw tool arguments, and filesystem metadata.  A task transcript query must
+/// never make those private fields available to a surface client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskTranscriptSnapshot {
+    /// The task whose checkpoint was read.
+    pub task_id: SurfaceTaskId,
+    /// Publication revision used to fence the task lookup.
+    pub task_revision: TaskRevision,
+    /// CAS revision of the continuation record that supplied this checkpoint.
+    pub checkpoint_revision: u64,
+    /// Number of completed child turns represented by the checkpoint.
+    pub turn: u32,
+    /// Cumulative child budget usage at the checkpoint.
+    pub usage: BudgetUsage,
+    /// Whether the continuation has reached a durable terminal state.
+    pub complete: bool,
+    /// User-visible conversation and tool boundary items.
+    pub items: Vec<TaskTranscriptItem>,
+}
+
+/// Safe transcript item projection.  Hidden reasoning, raw tool arguments,
+/// image payloads, continuation paths, and working-directory metadata are
+/// intentionally absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskTranscriptItem {
+    User {
+        content: DisplayText,
+    },
+    Assistant {
+        content: DisplayText,
+    },
+    ToolCall {
+        id: SurfaceHistoryId,
+        name: NonEmptyText,
+    },
+    ToolResult {
+        id: SurfaceHistoryId,
+        content: DisplayText,
+        status: TaskTranscriptToolStatus,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskTranscriptToolStatus {
+    Completed,
+    Failed,
+    Denied,
+    NotImplemented,
+    Cancelled,
+    Indeterminate,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub enum SurfaceReadRevision {
     Host {
@@ -2983,6 +3064,10 @@ pub enum SurfaceReadRevision {
     Session {
         token: SessionReadToken,
     },
+    Task {
+        task_id: SurfaceTaskId,
+        revision: TaskRevision,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2992,6 +3077,7 @@ pub enum SurfaceReadErrorCode {
     CapabilityDenied,
     NotFound,
     StaleRevision,
+    BindingMismatch,
     ThreadOwnedElsewhere,
     ThreadClosed,
     StoreUnavailable,
@@ -5830,5 +5916,18 @@ mod closed_command_domain_tests {
             close_output,
             shutdown_output,
         );
+    }
+
+    #[test]
+    fn task_transcript_query_is_exposed_as_a_typed_surface_read() {
+        let _query: fn(
+            &RuntimeSurfaceClientHandle,
+            SurfaceRequestId,
+            SurfaceTaskId,
+            TaskRevision,
+        ) -> Result<
+            SurfaceReadResult<TaskTranscriptSnapshot>,
+            SurfaceClientCommandError,
+        > = RuntimeSurfaceClientHandle::read_task_transcript;
     }
 }

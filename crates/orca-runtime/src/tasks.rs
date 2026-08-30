@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::process::Command;
 
+use orca_core::budget::BudgetUsage;
 use orca_core::cancel::CancelToken;
 use orca_core::conversation::RawToolCall;
 use orca_core::cost_types::UsageTotals;
@@ -31,8 +32,9 @@ use orca_platform::process::ProcessJob;
 use serde::{Deserialize, Serialize};
 
 use crate::agent_continuation::{
-    AgentAttemptId, AgentCheckpointId, AgentContinuationId, AgentContinuationStore,
-    ContinuationProjection, ContinuationRevision,
+    AgentAttemptId, AgentCheckpointId, AgentContinuationError, AgentContinuationId,
+    AgentContinuationStore, AgentTerminal, ChildTranscriptItem, ContinuationProjection,
+    ContinuationRevision, ContinuationStatus, project_checkpoint_transcript,
 };
 use crate::lifecycle::{
     RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord, RuntimeUsageTotals,
@@ -476,6 +478,29 @@ pub(crate) struct TaskContinuationProjection {
     pub(crate) revision: ContinuationRevision,
     pub(crate) resumable: bool,
     pub(crate) indeterminate: bool,
+}
+
+/// Internal result of a runtime-owned child transcript lookup.  It contains
+/// only the task identity and safe checkpoint projection; no continuation
+/// paths or workspace bindings are carried across the actor boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TaskTranscriptRecord {
+    pub(crate) task_id: String,
+    pub(crate) parent_task_id: Option<String>,
+    pub(crate) publication_revision: u64,
+    pub(crate) checkpoint_revision: u64,
+    pub(crate) turn: u32,
+    pub(crate) usage: BudgetUsage,
+    pub(crate) complete: bool,
+    pub(crate) items: Vec<ChildTranscriptItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskTranscriptReadError {
+    NotFound,
+    BindingMismatch,
+    Unavailable,
+    Corrupt,
 }
 
 impl From<&ContinuationProjection> for TaskContinuationProjection {
@@ -1121,6 +1146,86 @@ impl TaskRegistry {
             self.get(id)
         };
         Ok(record.and_then(|record| record.continuation_projection()))
+    }
+
+    /// Reads the latest digest-verified child checkpoint for one task.
+    ///
+    /// This is intentionally a narrow runtime-internal API.  Callers receive
+    /// only bounded user-visible items and immutable identity evidence; the
+    /// continuation store's paths, compatibility bindings, and raw model
+    /// payload never leave this module.
+    pub(crate) fn read_task_transcript(
+        &self,
+        id: &str,
+    ) -> Result<TaskTranscriptRecord, TaskTranscriptReadError> {
+        let record = if self.persistence.is_some() {
+            self.refresh_task_from_persistence(id)
+                .map_err(|_| TaskTranscriptReadError::Unavailable)?
+        } else {
+            self.get(id)
+        };
+        let Some(record) = record else {
+            return Err(TaskTranscriptReadError::NotFound);
+        };
+        if record.task_type != TaskType::Subagent {
+            return Err(TaskTranscriptReadError::BindingMismatch);
+        }
+        let Some(task_projection) = record.continuation_projection() else {
+            return Err(TaskTranscriptReadError::Unavailable);
+        };
+        if task_projection.indeterminate || record.continuation_indeterminate {
+            return Err(TaskTranscriptReadError::Unavailable);
+        }
+
+        let store = self
+            .continuation_store()
+            .map_err(|_| TaskTranscriptReadError::Unavailable)?;
+        let continuation = store
+            .load_record(&task_projection.continuation_id)
+            .map_err(map_task_transcript_continuation_error)?
+            .ok_or(TaskTranscriptReadError::NotFound)?;
+
+        // Every identity component is checked before exposing any checkpoint
+        // bytes.  This prevents a stale task mirror or a cross-session
+        // continuation from being rendered as if it belonged to this task.
+        if continuation.parent_session_id != self.session_id
+            || continuation.latest_task_id != record.id
+            || continuation.parent_task_id != record.parent_task_id
+            || continuation.current_attempt.attempt_id != task_projection.attempt_id
+            || continuation.revision != task_projection.revision
+            || continuation
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.checkpoint_id.clone())
+                != task_projection.checkpoint_id
+        {
+            return Err(TaskTranscriptReadError::BindingMismatch);
+        }
+        if matches!(continuation.status, ContinuationStatus::Indeterminate)
+            || matches!(
+                continuation.terminal,
+                Some(AgentTerminal::Indeterminate { .. })
+            )
+        {
+            return Err(TaskTranscriptReadError::Unavailable);
+        }
+        let checkpoint = continuation
+            .checkpoint
+            .as_ref()
+            .ok_or(TaskTranscriptReadError::Unavailable)?;
+        let items = project_checkpoint_transcript(checkpoint)
+            .map_err(map_task_transcript_continuation_error)?;
+
+        Ok(TaskTranscriptRecord {
+            task_id: record.id,
+            parent_task_id: record.parent_task_id,
+            publication_revision: record.publication_revision,
+            checkpoint_revision: continuation.revision.get(),
+            turn: checkpoint.turn,
+            usage: checkpoint.usage,
+            complete: continuation.terminal.is_some(),
+            items,
+        })
     }
 
     pub(crate) fn with_terminal_main_session_reconciliation<R>(
@@ -3057,6 +3162,36 @@ impl TaskRegistry {
     {
         let mut tasks = self.inner.lock().map_err(|_| ())?;
         Ok(f(&mut tasks))
+    }
+}
+
+fn map_task_transcript_continuation_error(
+    error: AgentContinuationError,
+) -> TaskTranscriptReadError {
+    match error {
+        AgentContinuationError::NotFound => TaskTranscriptReadError::NotFound,
+        AgentContinuationError::ParentMismatch { .. }
+        | AgentContinuationError::TaskBindingMismatch { .. }
+        | AgentContinuationError::ContinuationMismatch { .. }
+        | AgentContinuationError::AttemptMismatch { .. }
+        | AgentContinuationError::CompatibilityMismatch => TaskTranscriptReadError::BindingMismatch,
+        AgentContinuationError::CheckpointMissing
+        | AgentContinuationError::Indeterminate
+        | AgentContinuationError::NotResumable { .. }
+        | AgentContinuationError::LeaseExpired
+        | AgentContinuationError::LeaseHeld { .. } => TaskTranscriptReadError::Unavailable,
+        AgentContinuationError::UnsupportedSchemaVersion { .. }
+        | AgentContinuationError::CorruptRecord { .. }
+        | AgentContinuationError::DigestMismatch => TaskTranscriptReadError::Corrupt,
+        AgentContinuationError::Persistence { .. }
+        | AgentContinuationError::AlreadyExists { .. }
+        | AgentContinuationError::InvalidUuid { .. }
+        | AgentContinuationError::WrongUuidVersion { .. }
+        | AgentContinuationError::InvalidTransition { .. }
+        | AgentContinuationError::InvalidAttemptTransition { .. }
+        | AgentContinuationError::RevisionConflict { .. }
+        | AgentContinuationError::RevisionExhausted
+        | AgentContinuationError::LeaseEpochMismatch { .. } => TaskTranscriptReadError::Unavailable,
     }
 }
 

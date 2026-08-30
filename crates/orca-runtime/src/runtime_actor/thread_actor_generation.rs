@@ -46,6 +46,101 @@ fn subagent_activity_projection(
     }
 }
 
+fn task_transcript_not_found(
+    request_id: surface::SurfaceRequestId,
+) -> surface::SurfaceReadResult<surface::TaskTranscriptSnapshot> {
+    surface::SurfaceReadResult::NotFound {
+        request_id,
+        error: surface::SurfaceReadError {
+            class: surface::SurfaceReadErrorClass::NotFound,
+            code: surface::SurfaceReadErrorCode::NotFound,
+            message: surface::DisplayText::new("task transcript was not found"),
+            current_revision: None,
+        },
+    }
+}
+
+fn task_transcript_binding_error(
+    request_id: surface::SurfaceRequestId,
+    current_revision: Option<surface::SurfaceReadRevision>,
+) -> surface::SurfaceReadResult<surface::TaskTranscriptSnapshot> {
+    surface::SurfaceReadResult::Invalid {
+        request_id,
+        error: surface::SurfaceReadError {
+            class: surface::SurfaceReadErrorClass::Invalid,
+            code: surface::SurfaceReadErrorCode::BindingMismatch,
+            message: surface::DisplayText::new("task transcript binding is invalid"),
+            current_revision,
+        },
+    }
+}
+
+fn task_transcript_unavailable(
+    request_id: surface::SurfaceRequestId,
+) -> surface::SurfaceReadResult<surface::TaskTranscriptSnapshot> {
+    surface::SurfaceReadResult::Unavailable {
+        request_id,
+        error: surface::SurfaceReadError {
+            class: surface::SurfaceReadErrorClass::Unavailable,
+            code: surface::SurfaceReadErrorCode::StoreUnavailable,
+            message: surface::DisplayText::new("task transcript has no safe durable checkpoint"),
+            current_revision: None,
+        },
+    }
+}
+
+fn surface_task_transcript_item(
+    item: crate::agent_continuation::ChildTranscriptItem,
+) -> Result<surface::TaskTranscriptItem, ()> {
+    let item = match item {
+        crate::agent_continuation::ChildTranscriptItem::User { content } => {
+            surface::TaskTranscriptItem::User {
+                content: surface_persisted_display_text(&content),
+            }
+        }
+        crate::agent_continuation::ChildTranscriptItem::Assistant { content } => {
+            surface::TaskTranscriptItem::Assistant {
+                content: surface_persisted_display_text(&content),
+            }
+        }
+        crate::agent_continuation::ChildTranscriptItem::ToolCall { id, name } => {
+            surface::TaskTranscriptItem::ToolCall {
+                id: surface::SurfaceHistoryId::try_new(id).map_err(|_| ())?,
+                name: surface::NonEmptyText::try_new(name).map_err(|_| ())?,
+            }
+        }
+        crate::agent_continuation::ChildTranscriptItem::ToolResult {
+            id,
+            content,
+            status,
+        } => surface::TaskTranscriptItem::ToolResult {
+            id: surface::SurfaceHistoryId::try_new(id).map_err(|_| ())?,
+            content: surface_persisted_display_text(&content),
+            status: match status {
+                orca_core::tool_types::ToolStatus::Completed => {
+                    surface::TaskTranscriptToolStatus::Completed
+                }
+                orca_core::tool_types::ToolStatus::Failed => {
+                    surface::TaskTranscriptToolStatus::Failed
+                }
+                orca_core::tool_types::ToolStatus::Denied => {
+                    surface::TaskTranscriptToolStatus::Denied
+                }
+                orca_core::tool_types::ToolStatus::NotImplemented => {
+                    surface::TaskTranscriptToolStatus::NotImplemented
+                }
+                orca_core::tool_types::ToolStatus::Cancelled => {
+                    surface::TaskTranscriptToolStatus::Cancelled
+                }
+                orca_core::tool_types::ToolStatus::Indeterminate => {
+                    surface::TaskTranscriptToolStatus::Indeterminate
+                }
+            },
+        },
+    };
+    Ok(item)
+}
+
 impl ThreadActor {
     pub(super) fn admits_surface_client(
         &self,
@@ -56,6 +151,107 @@ impl ThreadActor {
             let admitted = resident.hub.admits_client(client);
             let capability_granted = client.grant().capabilities.as_set().contains(&capability);
             admitted && capability_granted
+        })
+    }
+
+    pub(super) fn read_surface_task_transcript(
+        &self,
+        request_id: surface::SurfaceRequestId,
+        task_id: surface::SurfaceTaskId,
+        expected_revision: surface::TaskRevision,
+    ) -> Result<
+        surface::SurfaceReadResult<surface::TaskTranscriptSnapshot>,
+        surface::SurfaceClientCommandError,
+    > {
+        let Some(resident) = self.resident_surface.0.as_ref() else {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        };
+        let snapshot = resident.coordinator.state().snapshot();
+        let current_task = snapshot.tasks.iter().find(|task| task.task_id == task_id);
+        let Some(current_task) = current_task else {
+            return Ok(task_transcript_not_found(request_id));
+        };
+        let current_revision = surface::SurfaceReadRevision::Task {
+            task_id: current_task.task_id.clone(),
+            revision: current_task.revision,
+        };
+        if current_task.revision != expected_revision {
+            return Ok(surface::SurfaceReadResult::Stale {
+                request_id,
+                error: surface::SurfaceReadError {
+                    class: surface::SurfaceReadErrorClass::Stale,
+                    code: surface::SurfaceReadErrorCode::StaleRevision,
+                    message: surface::DisplayText::new("task transcript revision is stale"),
+                    current_revision: Some(current_revision),
+                },
+            });
+        }
+        if current_task.task_type != surface::SurfaceTaskType::Subagent {
+            return Ok(task_transcript_binding_error(
+                request_id,
+                Some(current_revision),
+            ));
+        }
+
+        let Some(state) = self.state.as_ref() else {
+            return Ok(task_transcript_unavailable(request_id));
+        };
+        let record = match state
+            .thread
+            .session()
+            .task_registry()
+            .read_task_transcript(task_id.as_str())
+        {
+            Ok(record) => record,
+            Err(crate::tasks::TaskTranscriptReadError::NotFound) => {
+                return Ok(task_transcript_not_found(request_id));
+            }
+            Err(crate::tasks::TaskTranscriptReadError::BindingMismatch) => {
+                return Ok(task_transcript_binding_error(
+                    request_id,
+                    Some(current_revision),
+                ));
+            }
+            Err(
+                crate::tasks::TaskTranscriptReadError::Unavailable
+                | crate::tasks::TaskTranscriptReadError::Corrupt,
+            ) => return Ok(task_transcript_unavailable(request_id)),
+        };
+        if record.task_id != task_id.as_str()
+            || record.publication_revision != expected_revision.get()
+            || record.parent_task_id.as_deref()
+                != current_task
+                    .parent_task_id
+                    .as_ref()
+                    .map(|parent| parent.as_str())
+        {
+            return Ok(task_transcript_binding_error(
+                request_id,
+                Some(current_revision),
+            ));
+        }
+        let items = match record
+            .items
+            .into_iter()
+            .map(surface_task_transcript_item)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(items) => items,
+            Err(()) => return Ok(task_transcript_unavailable(request_id)),
+        };
+
+        Ok(surface::SurfaceReadResult::Found {
+            request_id,
+            revision: current_revision,
+            value: surface::TaskTranscriptSnapshot {
+                task_id,
+                task_revision: expected_revision,
+                checkpoint_revision: record.checkpoint_revision,
+                turn: record.turn,
+                usage: record.usage,
+                complete: record.complete,
+                items,
+            },
         })
     }
 

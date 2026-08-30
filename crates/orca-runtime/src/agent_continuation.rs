@@ -656,6 +656,139 @@ impl StoredChildMessage {
     }
 }
 
+/// User-visible projection of a durable child checkpoint.  This intentionally
+/// lives next to the persisted message representation so raw reasoning,
+/// arguments, images, and internal context cannot accidentally cross the
+/// runtime-surface boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ChildTranscriptItem {
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+    },
+    ToolResult {
+        id: String,
+        content: String,
+        status: ToolStatus,
+    },
+}
+
+const TRANSCRIPT_ITEM_TEXT_LIMIT: usize = 64 * 1024;
+const TRANSCRIPT_ITEM_COUNT_LIMIT: usize = 16 * 1024;
+
+/// Projects one digest-verified checkpoint into bounded, display-safe items.
+///
+/// The function performs its own boundary validation instead of trusting the
+/// serialized checkpoint fields.  A checkpoint containing an open call,
+/// missing/indeterminate terminal, or malformed tool identity is therefore
+/// unavailable to surface clients even if it was written by an older runtime.
+pub(crate) fn project_checkpoint_transcript(
+    checkpoint: &AgentCheckpoint,
+) -> Result<Vec<ChildTranscriptItem>, AgentContinuationError> {
+    checkpoint.verify_digest()?;
+    if checkpoint.conversation.schema_version != CHILD_CONVERSATION_SNAPSHOT_SCHEMA_VERSION {
+        return Err(AgentContinuationError::UnsupportedSchemaVersion {
+            found: checkpoint.conversation.schema_version,
+        });
+    }
+    ensure_checkpoint_boundary_safe(checkpoint)?;
+
+    let mut open_tool_calls = HashSet::new();
+    let mut items = Vec::new();
+    for message in &checkpoint.conversation.messages {
+        if items.len() >= TRANSCRIPT_ITEM_COUNT_LIMIT {
+            return Err(corrupt_record("child transcript item limit exceeded"));
+        }
+        match message {
+            StoredChildMessage::User { content, .. } => {
+                items.push(ChildTranscriptItem::User {
+                    content: bound_transcript_text(content),
+                });
+            }
+            StoredChildMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                if let Some(content) = content {
+                    items.push(ChildTranscriptItem::Assistant {
+                        content: bound_transcript_text(content),
+                    });
+                }
+                for tool_call in tool_calls {
+                    if items.len() >= TRANSCRIPT_ITEM_COUNT_LIMIT {
+                        return Err(corrupt_record("child transcript item limit exceeded"));
+                    }
+                    if tool_call.id.trim().is_empty() || tool_call.function_name.trim().is_empty() {
+                        return Err(corrupt_record(
+                            "child transcript has an empty tool identity",
+                        ));
+                    }
+                    if !open_tool_calls.insert(tool_call.id.clone()) {
+                        return Err(corrupt_record("child transcript repeats an open tool call"));
+                    }
+                    items.push(ChildTranscriptItem::ToolCall {
+                        id: tool_call.id.clone(),
+                        name: bound_transcript_text(&tool_call.function_name),
+                    });
+                }
+            }
+            StoredChildMessage::Tool {
+                tool_call_id,
+                content,
+                terminal,
+                ..
+            } => {
+                if tool_call_id.trim().is_empty() || !open_tool_calls.remove(tool_call_id) {
+                    return Err(corrupt_record(
+                        "child transcript has a tool result without its call",
+                    ));
+                }
+                let Some(terminal) = terminal else {
+                    return Err(AgentContinuationError::Indeterminate);
+                };
+                if terminal.source != ToolTerminalSource::Observed
+                    || terminal.status == ToolStatus::Indeterminate
+                    || terminal.kind == ToolResultKind::Indeterminate
+                {
+                    return Err(AgentContinuationError::Indeterminate);
+                }
+                items.push(ChildTranscriptItem::ToolResult {
+                    id: tool_call_id.clone(),
+                    content: bound_transcript_text(content),
+                    status: terminal.status,
+                });
+            }
+        }
+    }
+    if !open_tool_calls.is_empty() {
+        return Err(AgentContinuationError::Indeterminate);
+    }
+    Ok(items)
+}
+
+fn bound_transcript_text(value: &str) -> String {
+    if value.len() <= TRANSCRIPT_ITEM_TEXT_LIMIT {
+        return value.to_string();
+    }
+    const MARKER: &str = "\n[transcript output truncated]\n";
+    let prefix_limit = TRANSCRIPT_ITEM_TEXT_LIMIT.saturating_sub(MARKER.len());
+    let mut end = prefix_limit.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(TRANSCRIPT_ITEM_TEXT_LIMIT);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(MARKER);
+    bounded
+}
+
 /// Serde wire for the child conversation summary state.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct StoredChildSummaryState {

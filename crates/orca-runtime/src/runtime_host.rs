@@ -4643,6 +4643,18 @@ enum ThreadCommand {
             >,
         >,
     },
+    SurfaceReadTaskTranscript {
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        task_id: surface::SurfaceTaskId,
+        expected_revision: surface::TaskRevision,
+        reply: SyncSender<
+            Result<
+                surface::SurfaceReadResult<surface::TaskTranscriptSnapshot>,
+                surface::SurfaceClientCommandError,
+            >,
+        >,
+    },
     SurfaceCommitProviderResponse {
         fence: surface::SurfaceOperationFence,
         response: crate::model_response::RuntimeModelResponse,
@@ -6244,6 +6256,25 @@ impl surface::RuntimeSurfaceCommandDispatcher for ThreadSurfaceDispatcher {
             client,
             request_id,
             action,
+            reply,
+        })
+    }
+
+    fn read_task_transcript(
+        &self,
+        client: surface::RuntimeSurfaceClientHandle,
+        request_id: surface::SurfaceRequestId,
+        task_id: surface::SurfaceTaskId,
+        expected_revision: surface::TaskRevision,
+    ) -> Result<
+        surface::SurfaceReadResult<surface::TaskTranscriptSnapshot>,
+        surface::SurfaceClientCommandError,
+    > {
+        self.dispatch(|reply| ThreadCommand::SurfaceReadTaskTranscript {
+            client,
+            request_id,
+            task_id,
+            expected_revision,
             reply,
         })
     }
@@ -17217,6 +17248,9 @@ impl ThreadActor {
                 ThreadCommand::SurfaceTaskControl { reply, .. } => {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                 }
+                ThreadCommand::SurfaceReadTaskTranscript { reply, .. } => {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                }
                 ThreadCommand::SurfaceCommitProviderResponse { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -17438,7 +17472,9 @@ impl ThreadActor {
     fn handle_idle_command(&mut self, command: ThreadCommand) {
         let permitted_during_goal_blocking = matches!(
             &command,
-            ThreadCommand::ReadState { .. } | ThreadCommand::ReadSnapshot { .. }
+            ThreadCommand::ReadState { .. }
+                | ThreadCommand::ReadSnapshot { .. }
+                | ThreadCommand::SurfaceReadTaskTranscript { .. }
         );
         #[cfg(test)]
         let permitted_during_goal_blocking = permitted_during_goal_blocking
@@ -17454,6 +17490,7 @@ impl ThreadActor {
                 | ThreadCommand::SurfaceManualCompact { .. }
                 | ThreadCommand::ReadState { .. }
                 | ThreadCommand::ReadSnapshot { .. }
+                | ThreadCommand::SurfaceReadTaskTranscript { .. }
         );
         #[cfg(test)]
         let permitted_during_manual_retry = permitted_during_manual_retry
@@ -18018,6 +18055,22 @@ impl ThreadActor {
                 };
                 let _ = reply.send(result);
             }
+            ThreadCommand::SurfaceReadTaskTranscript {
+                client,
+                request_id,
+                task_id,
+                expected_revision,
+                reply,
+            } => {
+                let result = if self
+                    .admits_surface_client(&client, surface::SurfaceCapability::ReadSnapshot)
+                {
+                    self.read_surface_task_transcript(request_id, task_id, expected_revision)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
             #[cfg(test)]
             ThreadCommand::SurfaceSuspendOperationForTest { reply, .. } => {
                 let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
@@ -18363,6 +18416,7 @@ impl ThreadActor {
                 | ThreadCommand::SurfaceControlJsonlTurn { .. }
                 | ThreadCommand::SurfaceManualCompact { .. }
                 | ThreadCommand::ReadState { .. }
+                | ThreadCommand::SurfaceReadTaskTranscript { .. }
         );
         #[cfg(test)]
         let permitted_during_manual_precommit = permitted_during_manual_precommit
@@ -18697,6 +18751,22 @@ impl ThreadActor {
                     .admits_surface_client(&client, surface::SurfaceCapability::ManageTask)
                 {
                     self.control_surface_task(&client, request_id, action)
+                } else {
+                    Err(surface::SurfaceClientCommandError::Unauthorized)
+                };
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceReadTaskTranscript {
+                client,
+                request_id,
+                task_id,
+                expected_revision,
+                reply,
+            } => {
+                let result = if self
+                    .admits_surface_client(&client, surface::SurfaceCapability::ReadSnapshot)
+                {
+                    self.read_surface_task_transcript(request_id, task_id, expected_revision)
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };

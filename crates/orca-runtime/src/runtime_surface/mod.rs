@@ -87,6 +87,7 @@ pub use commands::{
     SurfaceSessionSummary, SurfaceSessionSummaryPage, SurfaceSnapshot, SurfaceSubscriptionHandle,
     SurfaceSubscriptionItem, SurfaceSubscriptionSealReason, SurfaceThreadCreateSpec,
     SurfaceThreadPage, SurfaceThreadPageCursor, TaskControlAction, TaskControlOutput,
+    TaskTranscriptItem, TaskTranscriptSnapshot, TaskTranscriptToolStatus,
     TerminalProjectionDeferredState, ThreadCursorAckRequirement, ThreadItemTurnFilter,
     ThreadPageCursor, ThreadPageQuery, ThreadSettingsReceipt, TransferBackgroundOutput,
     TurnItemsView, UnavailableMutationError, UncommittedMutation, WaitOperationTerminalRequest,
