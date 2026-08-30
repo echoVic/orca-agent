@@ -53,8 +53,8 @@ pub use crate::runtime_lifecycle::{
 };
 pub(crate) use crate::runtime_permission::AllowRequestedPermissions;
 pub use crate::runtime_permission::{
-    RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
-    TurnPermissionOverlay,
+    RuntimePermissionContext, RuntimePermissionRequest, RuntimePermissionRequestHandler,
+    RuntimePermissionResponse, TurnPermissionOverlay,
 };
 pub use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
 pub use crate::runtime_tool_actor::RuntimeToolActorContext;

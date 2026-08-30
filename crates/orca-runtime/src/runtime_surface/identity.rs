@@ -832,6 +832,7 @@ macro_rules! text_id {
 text_id!(
     SurfaceToolCallId,
     SurfaceTaskId,
+    SurfaceActivityId,
     SurfaceWorkflowRunId,
     SurfaceWorkflowResultId,
     SurfaceSubagentId,

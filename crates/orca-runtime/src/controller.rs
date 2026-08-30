@@ -1845,6 +1845,10 @@ mod tests {
                                 }),
                                 network: None,
                             },
+                            context:
+                                crate::runtime_permission::RuntimePermissionContext::foreground(
+                                    crate::surface::SurfacePermissionOrigin::Unknown,
+                                ),
                         })
                         .expect("grant first normal call");
                     tool_types::ToolResult::completed(

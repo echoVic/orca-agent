@@ -408,6 +408,13 @@ enum CanonicalTaskPatchV1<'a> {
         result: &'a Option<DisplayText>,
         error: &'a Option<DisplayText>,
     },
+    InteractionChanged {
+        task_id: &'a SurfaceTaskId,
+        expected_revision: TaskRevision,
+        next_revision: TaskRevision,
+        status: SurfaceTaskStatus,
+        pending_interaction_id: &'a Option<SurfaceInteractionId>,
+    },
     OwnershipChanged {
         task_id: &'a SurfaceTaskId,
         expected_revision: TaskRevision,
@@ -446,6 +453,19 @@ fn canonical_task_patch_v1(patch: &TaskPatch) -> CanonicalTaskPatchV1<'_> {
             completed_at,
             result,
             error,
+        },
+        TaskPatch::InteractionChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            status,
+            pending_interaction_id,
+        } => CanonicalTaskPatchV1::InteractionChanged {
+            task_id,
+            expected_revision: *expected_revision,
+            next_revision: *next_revision,
+            status: *status,
+            pending_interaction_id,
         },
         TaskPatch::OwnershipChanged {
             task_id,
@@ -8384,6 +8404,58 @@ fn apply_task_patch(
             task.completed_at = *completed_at;
             task.result = result.clone();
             task.error = error.clone();
+            Ok(())
+        }
+        TaskPatch::InteractionChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            status,
+            pending_interaction_id,
+        } => {
+            let Some(task) = snapshot
+                .tasks
+                .iter_mut()
+                .find(|task| task.task_id == *task_id)
+            else {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::MissingIdentity,
+                    "task does not exist",
+                ));
+            };
+            if task.revision != *expected_revision
+                || !task_revision_is_contiguous(*expected_revision, *next_revision)
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::StaleRevision,
+                    "task interaction revision is stale or noncontiguous",
+                ));
+            }
+            if !task_status_transition_allowed(task.status, *status) {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "task interaction status transition is not allowed",
+                ));
+            }
+            let valid_request = task.pending_interaction_id.is_none()
+                && pending_interaction_id.is_some()
+                && *status == SurfaceTaskStatus::ApprovalRequired;
+            let valid_resolution = task.pending_interaction_id.is_some()
+                && pending_interaction_id.is_none()
+                && *status == SurfaceTaskStatus::Running;
+            if !valid_request && !valid_resolution {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "task interaction transition is not a request or resolution",
+                ));
+            }
+            task.revision = *next_revision;
+            task.status = *status;
+            task.pending_interaction_id = pending_interaction_id.clone();
             Ok(())
         }
         TaskPatch::OwnershipChanged {

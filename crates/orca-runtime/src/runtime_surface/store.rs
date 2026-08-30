@@ -26,7 +26,8 @@ use super::interaction::{
     InteractionExpiryDeadline, InteractionPatch, InteractionUnavailableDisposition,
     SurfaceInteractionKind, SurfaceInteractionLifecycle, SurfaceInteractionRequest,
     SurfaceInteractionResolutionReceipt, SurfaceInteractionRoute, SurfaceInteractionView,
-    SurfaceMcpElicitationRequest, SurfacePermissionProfile, SurfaceToolRequest,
+    SurfaceMcpElicitationRequest, SurfacePermissionContext, SurfacePermissionProfile,
+    SurfaceToolRequest,
 };
 #[cfg(test)]
 use super::operation::GenerationExecutionFailureClass;
@@ -960,6 +961,13 @@ enum StoredTaskPatchV1 {
         result: Option<DisplayText>,
         error: Option<DisplayText>,
     },
+    InteractionChanged {
+        task_id: SurfaceTaskId,
+        expected_revision: TaskRevision,
+        next_revision: TaskRevision,
+        status: SurfaceTaskStatus,
+        pending_interaction_id: Option<SurfaceInteractionId>,
+    },
     OwnershipChanged {
         task_id: SurfaceTaskId,
         expected_revision: TaskRevision,
@@ -999,6 +1007,19 @@ impl StoredTaskPatchV1 {
                 completed_at: *completed_at,
                 result: result.clone(),
                 error: error.clone(),
+            },
+            TaskPatch::InteractionChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                status,
+                pending_interaction_id,
+            } => Self::InteractionChanged {
+                task_id: task_id.clone(),
+                expected_revision: *expected_revision,
+                next_revision: *next_revision,
+                status: *status,
+                pending_interaction_id: pending_interaction_id.clone(),
             },
             TaskPatch::OwnershipChanged {
                 task_id,
@@ -1054,6 +1075,19 @@ impl StoredTaskPatchV1 {
                 completed_at,
                 result,
                 error,
+            },
+            Self::InteractionChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                status,
+                pending_interaction_id,
+            } => TaskPatch::InteractionChanged {
+                task_id,
+                expected_revision,
+                next_revision,
+                status,
+                pending_interaction_id,
             },
             Self::OwnershipChanged {
                 task_id,
@@ -1163,6 +1197,7 @@ enum StoredInteractionRequestV1 {
     },
     PermissionRequest {
         tool_call_id: SurfaceToolCallId,
+        context: SurfacePermissionContext,
         reason: Option<DisplayText>,
         permissions: SurfacePermissionProfile,
         authority: StoredAuthorityFingerprintV1,
@@ -1200,11 +1235,13 @@ impl StoredInteractionRequestV1 {
             },
             SurfaceInteractionRequest::PermissionRequest {
                 tool_call_id,
+                context,
                 reason,
                 permissions,
                 authority,
             } => Self::PermissionRequest {
                 tool_call_id: tool_call_id.clone(),
+                context: context.clone(),
                 reason: reason.clone(),
                 permissions: permissions.clone(),
                 authority: StoredAuthorityFingerprintV1::from_live(authority),
@@ -1254,11 +1291,13 @@ impl StoredInteractionRequestV1 {
             },
             Self::PermissionRequest {
                 tool_call_id,
+                context,
                 reason,
                 permissions,
                 authority,
             } => SurfaceInteractionRequest::PermissionRequest {
                 tool_call_id,
+                context,
                 reason,
                 permissions,
                 authority: authority.into_live(),

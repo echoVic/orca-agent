@@ -695,6 +695,14 @@ enum BatchCommitAuthority<'permit> {
         actor: &'permit SurfacePublisherPermit,
         generation: &'permit SurfacePublisherPermit,
     },
+    ActorGenerationPermissionResolution {
+        actor: &'permit SurfacePublisherPermit,
+        generation: &'permit SurfacePublisherPermit,
+    },
+    ActorGenerationPermissionRequest {
+        actor: &'permit SurfacePublisherPermit,
+        generation: &'permit SurfacePublisherPermit,
+    },
     ActorFinalizerTaskTerminal {
         actor: &'permit SurfacePublisherPermit,
         finalizer: &'permit SurfacePublisherPermit,
@@ -775,6 +783,14 @@ enum RecoveredBatchAuthority {
         generation: SurfacePublisherPermit,
     },
     ActorGenerationInterrupt {
+        actor: SurfacePublisherPermit,
+        generation: SurfacePublisherPermit,
+    },
+    ActorGenerationPermissionResolution {
+        actor: SurfacePublisherPermit,
+        generation: SurfacePublisherPermit,
+    },
+    ActorGenerationPermissionRequest {
         actor: SurfacePublisherPermit,
         generation: SurfacePublisherPermit,
     },
@@ -1114,6 +1130,29 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
                         None,
                     )?;
                 }
+                RecoveredBatchAuthority::ActorGenerationPermissionResolution {
+                    actor,
+                    generation,
+                } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ActorGenerationPermissionResolution {
+                            actor: &actor,
+                            generation: &generation,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
+                RecoveredBatchAuthority::ActorGenerationPermissionRequest { actor, generation } => {
+                    coordinator.commit_batch_with_authority(
+                        BatchCommitAuthority::ActorGenerationPermissionRequest {
+                            actor: &actor,
+                            generation: &generation,
+                        },
+                        &batch,
+                        None,
+                    )?;
+                }
                 RecoveredBatchAuthority::ActorFinalizerTaskTerminal { actor, finalizer } => {
                     coordinator.commit_batch_with_authority(
                         BatchCommitAuthority::ActorFinalizerTaskTerminal {
@@ -1331,6 +1370,25 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     &batch,
                     None,
                 )?,
+            RecoveredBatchAuthority::ActorGenerationPermissionResolution { actor, generation } => {
+                self.commit_batch_with_authority(
+                    BatchCommitAuthority::ActorGenerationPermissionResolution {
+                        actor: &actor,
+                        generation: &generation,
+                    },
+                    &batch,
+                    None,
+                )?
+            }
+            RecoveredBatchAuthority::ActorGenerationPermissionRequest { actor, generation } => self
+                .commit_batch_with_authority(
+                    BatchCommitAuthority::ActorGenerationPermissionRequest {
+                        actor: &actor,
+                        generation: &generation,
+                    },
+                    &batch,
+                    None,
+                )?,
             RecoveredBatchAuthority::ActorFinalizerTaskTerminal { actor, finalizer } => self
                 .commit_batch_with_authority(
                     BatchCommitAuthority::ActorFinalizerTaskTerminal {
@@ -1488,6 +1546,50 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             fence,
         });
         self.commit_batch(&permit, batch)
+    }
+
+    /// Commits the only supported cross-scope permission transition: a
+    /// session-scoped permission resolution paired with the settings delta
+    /// that realizes that grant. The specialized authority rejects every
+    /// other Thread + Generation batch shape.
+    pub(crate) fn commit_actor_generation_permission_resolution_batch(
+        &mut self,
+        fence: super::SurfaceOperationFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let generation = self.register_permit(SurfacePublisherPermit::Generation {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ActorGenerationPermissionResolution {
+                actor: &actor,
+                generation: &generation,
+            },
+            batch,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_actor_generation_permission_request_batch(
+        &mut self,
+        fence: super::SurfaceOperationFence,
+        batch: &SurfaceCommitBatch,
+    ) -> Result<SurfaceCommitApplied, SurfaceCommitError> {
+        let actor = self.actor_control_permit.clone();
+        let generation = self.register_permit(SurfacePublisherPermit::Generation {
+            permit_id: next_permit_id(),
+            fence,
+        });
+        self.commit_batch_with_authority(
+            BatchCommitAuthority::ActorGenerationPermissionRequest {
+                actor: &actor,
+                generation: &generation,
+            },
+            batch,
+            None,
+        )
     }
 
     /// Function intent contract:
@@ -3947,6 +4049,160 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 return Ok(RecoveredBatchAuthority::ActorGoal { actor, goal });
             }
         }
+        if let [interaction, task] = events
+            && let SurfaceScope::Generation {
+                fence: historical_fence,
+            } = &interaction.scope
+            && matches!(
+                (&interaction.event, &task.scope, &task.event),
+                (
+                    super::SurfaceEvent::Interaction(super::InteractionPatch::Requested { .. }),
+                    SurfaceScope::Thread,
+                    super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged { .. }),
+                )
+            )
+        {
+            let generation = SurfacePublisherPermit::Generation {
+                permit_id: next_permit_id(),
+                fence: historical_fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(generation.clone());
+            if actor_generation_permission_request_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &generation,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(RecoveredBatchAuthority::ActorGenerationPermissionRequest {
+                    actor,
+                    generation: self.register_permit(generation),
+                });
+            }
+        }
+        // A child Turn-scoped permission resolution clears the task's
+        // pending interaction in the same generation batch. Recover it with
+        // the owner-aware authority instead of treating the task patch as a
+        // generic generation continuation.
+        if let [resolution, task] = events
+            && let SurfaceScope::Generation {
+                fence: historical_fence,
+            } = &resolution.scope
+            && matches!(
+                (&resolution.event, &task.scope, &task.event),
+                (
+                    super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved { .. }),
+                    SurfaceScope::Thread,
+                    super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged { .. }),
+                )
+            )
+        {
+            let generation = SurfacePublisherPermit::Generation {
+                permit_id: next_permit_id(),
+                fence: historical_fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(generation.clone());
+            if actor_generation_permission_resolution_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &generation,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(
+                    RecoveredBatchAuthority::ActorGenerationPermissionResolution {
+                        actor,
+                        generation: self.register_permit(generation),
+                    },
+                );
+            }
+        }
+        // Session-scoped child resolutions contain a settings commit before
+        // the interaction/task transition. Keep all three events under one
+        // recovered authority so a replay cannot apply only the settings or
+        // only the task clear.
+        if let [settings, resolution, task] = events
+            && let SurfaceScope::Generation {
+                fence: historical_fence,
+            } = &resolution.scope
+            && matches!(
+                (
+                    &settings.scope,
+                    &settings.event,
+                    &resolution.event,
+                    &task.scope,
+                    &task.event
+                ),
+                (
+                    SurfaceScope::Thread,
+                    super::SurfaceEvent::Settings(super::SettingsPatch::Committed { .. }),
+                    super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved { .. }),
+                    SurfaceScope::Thread,
+                    super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged { .. }),
+                )
+            )
+        {
+            let generation = SurfacePublisherPermit::Generation {
+                permit_id: next_permit_id(),
+                fence: historical_fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(generation.clone());
+            if actor_generation_permission_resolution_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &generation,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(
+                    RecoveredBatchAuthority::ActorGenerationPermissionResolution {
+                        actor,
+                        generation: self.register_permit(generation),
+                    },
+                );
+            }
+        }
+        if let [settings, resolution] = events
+            && let SurfaceScope::Generation {
+                fence: historical_fence,
+            } = &resolution.scope
+            && matches!(
+                (&settings.scope, &settings.event, &resolution.event),
+                (
+                    SurfaceScope::Thread,
+                    super::SurfaceEvent::Settings(super::SettingsPatch::Committed { .. }),
+                    super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved { .. }),
+                )
+            )
+        {
+            let generation = SurfacePublisherPermit::Generation {
+                permit_id: next_permit_id(),
+                fence: historical_fence.clone(),
+            };
+            let mut issued = self.issued_permits.clone();
+            issued.push(generation.clone());
+            if actor_generation_permission_resolution_authorized(
+                &self.state,
+                &issued,
+                &actor,
+                &generation,
+                batch,
+                self.owner_epoch,
+            ) {
+                return Ok(
+                    RecoveredBatchAuthority::ActorGenerationPermissionResolution {
+                        actor,
+                        generation: self.register_permit(generation),
+                    },
+                );
+            }
+        }
         if let Some(SurfaceScope::Generation {
             fence: historical_fence,
         }) = events.get(1).map(|event| &event.scope)
@@ -4936,6 +5192,26 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             }
             BatchCommitAuthority::ActorGenerationInterrupt { actor, generation } => {
                 actor_generation_interrupt_authorized(
+                    &self.issued_permits,
+                    actor,
+                    generation,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
+            BatchCommitAuthority::ActorGenerationPermissionResolution { actor, generation } => {
+                actor_generation_permission_resolution_authorized(
+                    &self.state,
+                    &self.issued_permits,
+                    actor,
+                    generation,
+                    batch,
+                    self.owner_epoch,
+                )
+            }
+            BatchCommitAuthority::ActorGenerationPermissionRequest { actor, generation } => {
+                actor_generation_permission_request_authorized(
+                    &self.state,
                     &self.issued_permits,
                     actor,
                     generation,
@@ -6287,6 +6563,546 @@ fn actor_goal_edit_run_authorized(
                 && goal_run_id == &run.goal_run_id
                 && initial_objective_revision == &second_envelope.receipt.objective_revision
         )
+}
+
+fn actor_generation_permission_request_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    generation_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(generation_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_owner_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Generation { fence, .. },
+    ) = (actor_permit, generation_permit)
+    else {
+        return false;
+    };
+    if *actor_owner_epoch != owner_epoch
+        || thread_id != &fence.thread_id
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+    let [interaction_event, task_event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Generation {
+            fence: interaction_fence,
+        },
+        super::SurfaceEvent::Interaction(super::InteractionPatch::Requested { interaction }),
+    ) = (&interaction_event.scope, &interaction_event.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            status: super::SurfaceTaskStatus::ApprovalRequired,
+            pending_interaction_id: Some(pending_id),
+        }),
+    ) = (&task_event.scope, &task_event.event)
+    else {
+        return false;
+    };
+    if interaction_fence != fence
+        || pending_id != &interaction.interaction_id
+        || interaction.kind != super::SurfaceInteractionKind::PermissionRequest
+        || interaction.revision.get() != 1
+        || expected_revision.get().checked_add(1) != Some(next_revision.get())
+    {
+        return false;
+    }
+    let super::SurfaceInteractionRequest::PermissionRequest {
+        tool_call_id,
+        context,
+        ..
+    } = &interaction.request
+    else {
+        return false;
+    };
+    let super::SurfacePermissionOwnerRef::Child {
+        task_id: context_task_id,
+        task_revision: context_task_revision,
+        agent_id,
+        agent_revision,
+        activity_id,
+        turn_id,
+        tool_call_id: context_tool_call_id,
+    } = &context.owner
+    else {
+        return false;
+    };
+    if context.origin != super::SurfacePermissionOrigin::ChildAgent {
+        return false;
+    }
+    let Some(committed_turn) = find_tool_turn(state, tool_call_id) else {
+        return false;
+    };
+    if context_task_id != task_id
+        || context_task_revision != expected_revision
+        || context_tool_call_id != tool_call_id
+        || activity_id.as_str() != tool_call_id.as_str()
+        || turn_id != &committed_turn
+    {
+        return false;
+    }
+    let Some(task) = state
+        .snapshot()
+        .tasks
+        .iter()
+        .find(|task| task.task_id == *task_id)
+    else {
+        return false;
+    };
+    let Some(subagent) = state
+        .snapshot()
+        .subagents
+        .iter()
+        .find(|subagent| subagent.subagent_id == *agent_id)
+    else {
+        return false;
+    };
+    task.revision == *expected_revision
+        && task.status == super::SurfaceTaskStatus::Running
+        && task.pending_interaction_id.is_none()
+        && task.parent_operation.as_ref() == Some(&fence.operation_id)
+        && task.subagent_id.as_ref() == Some(agent_id)
+        && subagent.revision == *agent_revision
+        && subagent.parent == *fence
+}
+
+fn find_tool_turn(
+    state: &SurfaceReducerState,
+    tool_call_id: &super::SurfaceToolCallId,
+) -> Option<super::SurfaceTurnId> {
+    state
+        .snapshot()
+        .tools
+        .iter()
+        .find(|tool| tool.request.tool_call_id == *tool_call_id)
+        .map(|tool| tool.request.turn_id.clone())
+}
+
+fn actor_generation_permission_resolution_authorized(
+    state: &SurfaceReducerState,
+    issued_permits: &[SurfacePublisherPermit],
+    actor_permit: &SurfacePublisherPermit,
+    generation_permit: &SurfacePublisherPermit,
+    batch: &SurfaceCommitBatch,
+    owner_epoch: ThreadOwnerEpoch,
+) -> bool {
+    if !issued_permits.contains(actor_permit) || !issued_permits.contains(generation_permit) {
+        return false;
+    }
+    let (
+        SurfacePublisherPermit::ActorControl {
+            thread_id,
+            owner_epoch: actor_owner_epoch,
+            ..
+        },
+        SurfacePublisherPermit::Generation { fence, .. },
+    ) = (actor_permit, generation_permit)
+    else {
+        return false;
+    };
+    if *actor_owner_epoch != owner_epoch
+        || thread_id != &fence.thread_id
+        || thread_id != &batch.cursor_before.thread_id
+        || thread_id != &batch.cursor_after.thread_id
+    {
+        return false;
+    }
+
+    // Child permission resolutions also clear the task's pending interaction
+    // in the same atomic generation batch. Handle the Turn-scoped shape here;
+    // the Session shape is the same transition with a leading settings event.
+    if let [resolution_event, task_event] = batch.events.as_slice()
+        && matches!(
+            (&resolution_event.event, &task_event.event),
+            (
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved { .. }),
+                super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged { .. }),
+            )
+        )
+    {
+        return actor_generation_permission_task_resolution_authorized(
+            state,
+            fence,
+            resolution_event,
+            task_event,
+            false,
+        );
+    }
+    if let [settings_event, resolution_event, task_event] = batch.events.as_slice()
+        && matches!(
+            (
+                &settings_event.event,
+                &resolution_event.event,
+                &task_event.event
+            ),
+            (
+                super::SurfaceEvent::Settings(super::SettingsPatch::Committed { .. }),
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved { .. }),
+                super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged { .. }),
+            )
+        )
+    {
+        let (
+            SurfaceScope::Thread,
+            super::SurfaceEvent::Settings(super::SettingsPatch::Committed {
+                previous_revision,
+                snapshot: next_settings,
+            }),
+        ) = (&settings_event.scope, &settings_event.event)
+        else {
+            return false;
+        };
+        let snapshot = state.snapshot();
+        let current_settings = &snapshot.settings;
+        let super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved {
+            interaction_id,
+            receipt,
+            ..
+        }) = &resolution_event.event
+        else {
+            return false;
+        };
+        let Some(interaction) = snapshot
+            .interactions
+            .iter()
+            .find(|candidate| candidate.interaction_id == *interaction_id)
+        else {
+            return false;
+        };
+        let super::SurfaceInteractionRequest::PermissionRequest { permissions, .. } =
+            &interaction.request
+        else {
+            return false;
+        };
+        if current_settings.thread_revision != *previous_revision
+            || previous_revision.get().checked_add(1) != Some(next_settings.thread_revision.get())
+            || next_settings.host_revision != current_settings.host_revision
+            || next_settings.frozen_generation_revision
+                != current_settings.frozen_generation_revision
+            || next_settings.pending.is_some()
+            || current_settings.pending.is_some()
+            || current_settings.effective.policy_epoch.get().checked_add(1)
+                != Some(next_settings.effective.policy_epoch.get())
+            || !matches!(
+                receipt,
+                super::SurfaceInteractionResolutionReceipt {
+                    kind: super::SurfaceInteractionKind::PermissionRequest,
+                    safe_projection: super::SurfaceInteractionSafeProjection::PermissionRequest {
+                        decision: super::SurfaceAllowDeny::Allow,
+                        scope: super::PermissionGrantScope::Session,
+                        ..
+                    },
+                    ..
+                }
+            )
+            || !session_permission_settings_delta_authorized(
+                &current_settings.effective,
+                &next_settings.effective,
+                permissions,
+            )
+        {
+            return false;
+        }
+        return actor_generation_permission_task_resolution_authorized(
+            state,
+            fence,
+            resolution_event,
+            task_event,
+            true,
+        );
+    }
+
+    let [settings_event, resolution_event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        (
+            SurfaceScope::Thread,
+            super::SurfaceEvent::Settings(super::SettingsPatch::Committed {
+                previous_revision,
+                snapshot: next_settings,
+            }),
+        ),
+        (
+            SurfaceScope::Generation {
+                fence: resolution_fence,
+            },
+            super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                receipt,
+                ..
+            }),
+        ),
+    ) = (
+        (&settings_event.scope, &settings_event.event),
+        (&resolution_event.scope, &resolution_event.event),
+    )
+    else {
+        return false;
+    };
+    if resolution_fence != fence {
+        return false;
+    }
+
+    let snapshot = state.snapshot();
+    let current_settings = &snapshot.settings;
+    if current_settings.thread_revision != *previous_revision
+        || previous_revision.get().checked_add(1) != Some(next_settings.thread_revision.get())
+        || next_settings.host_revision != current_settings.host_revision
+        || next_settings.frozen_generation_revision != current_settings.frozen_generation_revision
+        || next_settings.pending.is_some()
+        || current_settings.pending.is_some()
+        || current_settings.effective.policy_epoch.get().checked_add(1)
+            != Some(next_settings.effective.policy_epoch.get())
+    {
+        return false;
+    }
+
+    let Some(interaction) = snapshot
+        .interactions
+        .iter()
+        .find(|candidate| candidate.interaction_id == *interaction_id)
+    else {
+        return false;
+    };
+    let super::SurfaceInteractionRequest::PermissionRequest { permissions, .. } =
+        &interaction.request
+    else {
+        return false;
+    };
+    if interaction.fence != *fence
+        || interaction.kind != super::SurfaceInteractionKind::PermissionRequest
+        || interaction.revision != *expected_revision
+        || expected_revision.get().checked_add(1) != Some(next_revision.get())
+        || !matches!(
+            interaction.lifecycle,
+            super::SurfaceInteractionLifecycle::Requested
+        )
+        || !matches!(
+            receipt,
+            super::SurfaceInteractionResolutionReceipt {
+                kind: super::SurfaceInteractionKind::PermissionRequest,
+                safe_projection: super::SurfaceInteractionSafeProjection::PermissionRequest {
+                    decision: super::SurfaceAllowDeny::Allow,
+                    scope: super::PermissionGrantScope::Session,
+                    ..
+                },
+                ..
+            }
+        )
+    {
+        return false;
+    }
+
+    session_permission_settings_delta_authorized(
+        &current_settings.effective,
+        &next_settings.effective,
+        permissions,
+    )
+}
+
+fn actor_generation_permission_task_resolution_authorized(
+    state: &SurfaceReducerState,
+    fence: &super::SurfaceOperationFence,
+    resolution_event: &super::SurfaceEventEnvelope,
+    task_event: &super::SurfaceEventEnvelope,
+    require_session: bool,
+) -> bool {
+    let (
+        SurfaceScope::Generation {
+            fence: resolution_fence,
+        },
+        super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            receipt,
+            ..
+        }),
+    ) = (&resolution_event.scope, &resolution_event.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged {
+            task_id,
+            expected_revision: task_expected_revision,
+            next_revision: task_next_revision,
+            status: super::SurfaceTaskStatus::Running,
+            pending_interaction_id: None,
+        }),
+    ) = (&task_event.scope, &task_event.event)
+    else {
+        return false;
+    };
+    if resolution_fence != fence
+        || expected_revision.get().checked_add(1) != Some(next_revision.get())
+        || task_expected_revision.get().checked_add(1) != Some(task_next_revision.get())
+    {
+        return false;
+    }
+    let super::SurfaceInteractionSafeProjection::PermissionRequest {
+        decision, scope, ..
+    } = &receipt.safe_projection
+    else {
+        return false;
+    };
+    if (require_session && *decision != super::SurfaceAllowDeny::Allow)
+        || (!require_session && *scope == super::PermissionGrantScope::Session)
+        || (require_session && *scope != super::PermissionGrantScope::Session)
+    {
+        return false;
+    }
+    let snapshot = state.snapshot();
+    let Some(interaction) = snapshot
+        .interactions
+        .iter()
+        .find(|candidate| candidate.interaction_id == *interaction_id)
+    else {
+        return false;
+    };
+    if interaction.fence != *fence
+        || interaction.kind != super::SurfaceInteractionKind::PermissionRequest
+        || interaction.revision != *expected_revision
+        || !matches!(
+            interaction.lifecycle,
+            super::SurfaceInteractionLifecycle::Requested
+        )
+    {
+        return false;
+    }
+    let super::SurfaceInteractionRequest::PermissionRequest {
+        tool_call_id,
+        context,
+        ..
+    } = &interaction.request
+    else {
+        return false;
+    };
+    let super::SurfacePermissionOwnerRef::Child {
+        task_id: context_task_id,
+        task_revision: context_task_revision,
+        agent_id,
+        agent_revision,
+        activity_id,
+        turn_id,
+        tool_call_id: context_tool_call_id,
+    } = &context.owner
+    else {
+        return false;
+    };
+    if context.origin != super::SurfacePermissionOrigin::ChildAgent {
+        return false;
+    }
+    let Some(committed_turn) = find_tool_turn(state, tool_call_id) else {
+        return false;
+    };
+    let Some(task) = snapshot.tasks.iter().find(|task| task.task_id == *task_id) else {
+        return false;
+    };
+    let Some(subagent) = snapshot
+        .subagents
+        .iter()
+        .find(|subagent| subagent.subagent_id == *agent_id)
+    else {
+        return false;
+    };
+    context_task_id == task_id
+        && context_tool_call_id == tool_call_id
+        && activity_id.as_str() == tool_call_id.as_str()
+        && turn_id == &committed_turn
+        && context_task_revision.get().checked_add(1) == Some(task_expected_revision.get())
+        && task.revision == *task_expected_revision
+        && task.pending_interaction_id.as_ref() == Some(interaction_id)
+        && task.status == super::SurfaceTaskStatus::ApprovalRequired
+        && task.parent_operation.as_ref() == Some(&fence.operation_id)
+        && task.subagent_id.as_ref() == Some(agent_id)
+        && subagent.revision == *agent_revision
+        && subagent.parent == *fence
+}
+
+fn session_permission_settings_delta_authorized(
+    current: &super::SurfaceRuntimeSettings,
+    next: &super::SurfaceRuntimeSettings,
+    requested: &super::SurfacePermissionProfile,
+) -> bool {
+    if requested
+        .network
+        .as_ref()
+        .is_some_and(|network| network.enabled.is_some() || !network.domains.is_empty())
+    {
+        return false;
+    }
+    if current.model != next.model
+        || current.reasoning_effort != next.reasoning_effort
+        || current.approval_mode != next.approval_mode
+        || current.cwd != next.cwd
+        || current.workspace_roots != next.workspace_roots
+        || current.active_permission_profile != next.active_permission_profile
+        || current.permission_rules != next.permission_rules
+    {
+        return false;
+    }
+
+    let mut expected_directories = current.additional_working_directories.clone();
+    if let Some(file_system) = requested.file_system.as_ref() {
+        if file_system
+            .read
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+        {
+            return false;
+        }
+        for path in file_system.write.iter().flatten() {
+            let Ok(path) = super::CanonicalPath::try_new(std::path::PathBuf::from(path.0.as_str()))
+            else {
+                return false;
+            };
+            if orca_tools::sandbox::is_protected_metadata_root(path.as_path()) {
+                return false;
+            }
+            if !expected_directories
+                .iter()
+                .any(|directory| directory.path == path)
+            {
+                expected_directories.push(super::SurfaceAdditionalWorkingDirectory {
+                    path,
+                    source: super::NonEmptyText::try_new("session")
+                        .expect("session permission source is non-empty"),
+                });
+            }
+        }
+    }
+
+    let expected_network = current.network_permissions.clone();
+
+    (expected_directories != current.additional_working_directories
+        || expected_network != current.network_permissions)
+        && next.additional_working_directories == expected_directories
+        && next.network_permissions == expected_network
 }
 
 fn actor_generation_terminalization_authorized(
@@ -12257,6 +13073,285 @@ mod tests {
             &actor,
             &other_generation,
             &batch,
+            ThreadOwnerEpoch::new(1),
+        ));
+    }
+
+    #[test]
+    fn child_permission_authority_binds_activity_and_request_decision_epochs() {
+        let mut snapshot = reducer_snapshot();
+        let operation = started_operation();
+        let fence = operation.generations[0].fence.clone();
+        let turn_id = operation.generations[0].logical_turn_id.clone();
+        snapshot.foreground_operation = Some(operation);
+
+        let tool_call_id = super::super::SurfaceToolCallId::try_new("child-tool-1").unwrap();
+        let task_id = super::super::SurfaceTaskId::try_new("child-task-1").unwrap();
+        let agent_id = super::super::SurfaceSubagentId::try_new("child-agent-1").unwrap();
+        snapshot.tools.push(super::super::SurfaceToolView {
+            request: super::super::SurfaceToolRequest {
+                tool_call_id: tool_call_id.clone(),
+                source_response_id: None,
+                turn_id: turn_id.clone(),
+                name: super::super::NonEmptyText::try_new("bash").unwrap(),
+                action: super::super::SurfaceToolAction::Shell,
+                target: None,
+                raw_arguments: super::super::DisplayText::new("{}"),
+                arguments_digest: digest(120),
+            },
+            state: super::super::SurfaceToolViewState::Requested,
+            invocation_started: None,
+            arguments_bytes: super::super::ByteCount::new(2),
+            output_bytes: super::super::ByteCount::new(0),
+            streamed_output: super::super::DisplayText::new(""),
+            streamed_output_truncated: false,
+            result: None,
+            capability_calls: Vec::new(),
+            terminal_leases: Vec::new(),
+        });
+        snapshot.tasks.push(super::super::SurfaceTask {
+            task_id: task_id.clone(),
+            revision: super::super::TaskRevision::try_new(1).unwrap(),
+            task_type: super::super::SurfaceTaskType::Subagent,
+            status: super::super::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: super::super::DisplayText::new("child task"),
+            created_at: super::super::UnixMillis::new(1),
+            started_at: Some(super::super::UnixMillis::new(1)),
+            completed_at: None,
+            parent_operation: Some(fence.operation_id.clone()),
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: Some(agent_id.clone()),
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        });
+        snapshot.subagents.push(super::super::SurfaceSubagent {
+            subagent_id: agent_id.clone(),
+            revision: super::super::SubagentRevision::try_new(1).unwrap(),
+            description: super::super::DisplayText::new("child agent"),
+            status: super::super::SurfaceSubagentStatus::Running,
+            activity: Some(super::super::DisplayText::new("bash")),
+            turn: Some(1),
+            usage: None,
+            output: None,
+            error: None,
+            parent: fence.clone(),
+        });
+        let state = SurfaceReducerState::new(snapshot);
+        let interaction_id =
+            super::super::SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(121)).unwrap();
+        let context = super::super::SurfacePermissionContext {
+            owner: super::super::SurfacePermissionOwnerRef::Child {
+                task_id: task_id.clone(),
+                task_revision: super::super::TaskRevision::try_new(1).unwrap(),
+                agent_id: agent_id.clone(),
+                agent_revision: super::super::SubagentRevision::try_new(1).unwrap(),
+                activity_id: super::super::SurfaceActivityId::try_new(tool_call_id.as_str())
+                    .unwrap(),
+                turn_id,
+                tool_call_id: tool_call_id.clone(),
+            },
+            origin: super::super::SurfacePermissionOrigin::ChildAgent,
+        };
+        let interaction = super::super::SurfaceInteractionView {
+            interaction_id: interaction_id.clone(),
+            revision: super::super::InteractionRevision::try_new(1).unwrap(),
+            fence: fence.clone(),
+            kind: super::super::SurfaceInteractionKind::PermissionRequest,
+            request: super::super::SurfaceInteractionRequest::PermissionRequest {
+                tool_call_id: tool_call_id.clone(),
+                context,
+                reason: None,
+                permissions: super::super::SurfacePermissionProfile::empty(),
+                authority: super::super::AuthorityFingerprint::new(
+                    fence.operation_id.clone(),
+                    digest(122),
+                    digest(123),
+                    state.snapshot().settings.effective.cwd.clone(),
+                    digest(124),
+                    state.snapshot().settings.effective.policy_epoch,
+                    digest(125),
+                    digest(126),
+                    digest(127),
+                ),
+            },
+            route: super::super::SurfaceInteractionRoute::Unassigned {
+                epoch: super::super::ResponseRouteEpoch::try_new(1).unwrap(),
+            },
+            lifecycle: super::super::SurfaceInteractionLifecycle::Requested,
+            recovery_disposition: super::super::InteractionUnavailableDisposition::FailOperation,
+        };
+        let request_batch = test_batch_with_events(
+            &state,
+            vec![
+                (
+                    SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    super::super::SurfaceEvent::Interaction(
+                        super::super::InteractionPatch::Requested {
+                            interaction: interaction.clone(),
+                        },
+                    ),
+                ),
+                (
+                    SurfaceScope::Thread,
+                    super::super::SurfaceEvent::Task(super::super::TaskPatch::InteractionChanged {
+                        task_id: task_id.clone(),
+                        expected_revision: super::super::TaskRevision::try_new(1).unwrap(),
+                        next_revision: super::super::TaskRevision::try_new(2).unwrap(),
+                        status: super::super::SurfaceTaskStatus::ApprovalRequired,
+                        pending_interaction_id: Some(interaction_id.clone()),
+                    }),
+                ),
+            ],
+        );
+        let actor = SurfacePublisherPermit::ActorControl {
+            permit_id: super::super::SurfacePublisherPermitId::new([21; 32]),
+            thread_id: thread_id(),
+            owner_epoch: ThreadOwnerEpoch::new(1),
+        };
+        let generation = SurfacePublisherPermit::Generation {
+            permit_id: super::super::SurfacePublisherPermitId::new([22; 32]),
+            fence: fence.clone(),
+        };
+        let permits = [actor.clone(), generation.clone()];
+        assert!(actor_generation_permission_request_authorized(
+            &state,
+            &permits,
+            &actor,
+            &generation,
+            &request_batch,
+            ThreadOwnerEpoch::new(1),
+        ));
+
+        let mut stale_activity = request_batch.clone();
+        let mut stale_events = stale_activity.events.as_slice().to_vec();
+        let super::super::SurfaceEvent::Interaction(super::super::InteractionPatch::Requested {
+            interaction: stale_interaction,
+        }) = &mut stale_events[0].event
+        else {
+            unreachable!();
+        };
+        let super::super::SurfaceInteractionRequest::PermissionRequest { context, .. } =
+            &mut stale_interaction.request
+        else {
+            unreachable!();
+        };
+        let super::super::SurfacePermissionOwnerRef::Child { activity_id, .. } = &mut context.owner
+        else {
+            unreachable!();
+        };
+        *activity_id = super::super::SurfaceActivityId::try_new("stale-activity").unwrap();
+        stale_activity.events = super::super::NonEmptyVec::try_new(stale_events).unwrap();
+        stale_activity.batch_digest = super::super::canonical_batch_digest(&stale_activity);
+        assert!(!actor_generation_permission_request_authorized(
+            &state,
+            &permits,
+            &actor,
+            &generation,
+            &stale_activity,
+            ThreadOwnerEpoch::new(1),
+        ));
+
+        let mut after_snapshot = state.snapshot().clone();
+        after_snapshot.interactions.push(
+            request_batch
+                .events
+                .as_slice()
+                .first()
+                .and_then(|event| match &event.event {
+                    super::super::SurfaceEvent::Interaction(
+                        super::super::InteractionPatch::Requested { interaction },
+                    ) => Some(interaction.clone()),
+                    _ => None,
+                })
+                .expect("request batch contains interaction"),
+        );
+        after_snapshot.tasks[0].revision = super::super::TaskRevision::try_new(2).unwrap();
+        after_snapshot.tasks[0].pending_interaction_id = Some(interaction_id.clone());
+        after_snapshot.tasks[0].status = super::super::SurfaceTaskStatus::ApprovalRequired;
+        let after_request = SurfaceReducerState::new(after_snapshot);
+        let resolution_batch = test_batch_with_events(
+            &after_request,
+            vec![
+                (
+                    SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    },
+                    super::super::SurfaceEvent::Interaction(
+                        super::super::InteractionPatch::Resolved {
+                            interaction_id: interaction_id.clone(),
+                            expected_revision: super::super::InteractionRevision::try_new(1)
+                                .unwrap(),
+                            next_revision: super::super::InteractionRevision::try_new(2).unwrap(),
+                            receipt: super::super::SurfaceInteractionResolutionReceipt {
+                                response_id: super::super::SurfaceResponseId::try_from_bytes(
+                                    uuid_v7_bytes(128),
+                                )
+                                .unwrap(),
+                                receipt_id: super::super::SurfaceResponseReceiptId::try_from_bytes(
+                                    uuid_v7_bytes(129),
+                                )
+                                .unwrap(),
+                                kind: super::super::SurfaceInteractionKind::PermissionRequest,
+                                safe_projection:
+                                    super::super::SurfaceInteractionSafeProjection::PermissionRequest {
+                                        decision: super::super::SurfaceAllowDeny::Allow,
+                                        scope: super::super::PermissionGrantScope::Turn,
+                                        strict_auto_review: false,
+                                    },
+                            },
+                            continuation: None,
+                        },
+                    ),
+                ),
+                (
+                    SurfaceScope::Thread,
+                    super::super::SurfaceEvent::Task(
+                        super::super::TaskPatch::InteractionChanged {
+                            task_id,
+                            expected_revision: super::super::TaskRevision::try_new(2).unwrap(),
+                            next_revision: super::super::TaskRevision::try_new(3).unwrap(),
+                            status: super::super::SurfaceTaskStatus::Running,
+                            pending_interaction_id: None,
+                        },
+                    ),
+                ),
+            ],
+        );
+        assert!(actor_generation_permission_resolution_authorized(
+            &after_request,
+            &permits,
+            &actor,
+            &generation,
+            &resolution_batch,
+            ThreadOwnerEpoch::new(1),
+        ));
+
+        let mut stale = resolution_batch.clone();
+        let mut stale_events = stale.events.as_slice().to_vec();
+        let super::super::SurfaceEvent::Task(super::super::TaskPatch::InteractionChanged {
+            expected_revision,
+            ..
+        }) = &mut stale_events[1].event
+        else {
+            unreachable!();
+        };
+        *expected_revision = super::super::TaskRevision::try_new(1).unwrap();
+        stale.events = super::super::NonEmptyVec::try_new(stale_events).unwrap();
+        stale.batch_digest = super::super::canonical_batch_digest(&stale);
+        assert!(!actor_generation_permission_resolution_authorized(
+            &after_request,
+            &permits,
+            &actor,
+            &generation,
+            &stale,
             ThreadOwnerEpoch::new(1),
         ));
     }

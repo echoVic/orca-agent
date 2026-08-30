@@ -2,6 +2,194 @@
 use super::*;
 
 impl ThreadActor {
+    fn surface_permission_context_for_tool(
+        snapshot: &surface::SurfaceSnapshot,
+        fence: &surface::SurfaceOperationFence,
+        tool: &surface::SurfaceToolRequest,
+        supplied: &crate::runtime_permission::RuntimePermissionContext,
+    ) -> io::Result<surface::SurfacePermissionContext> {
+        use crate::runtime_permission::RuntimePermissionContext;
+
+        match supplied {
+            RuntimePermissionContext::Foreground { origin } => {
+                if *origin == surface::SurfacePermissionOrigin::ChildAgent {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "child-agent origin requires a complete child permission owner",
+                    ));
+                }
+                Ok(surface::SurfacePermissionContext::foreground_for_tool(
+                    tool, *origin,
+                ))
+            }
+            RuntimePermissionContext::Child {
+                task_id,
+                task_revision,
+                agent_id,
+                agent_revision,
+                activity_id,
+                turn_id,
+                tool_call_id,
+                origin,
+            } => {
+                if *origin != surface::SurfacePermissionOrigin::ChildAgent {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "child permission owner must use the child-agent origin",
+                    ));
+                }
+                if turn_id != &tool.turn_id || tool_call_id != &tool.tool_call_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "child permission context does not own the committed tool identity",
+                    ));
+                }
+                // Activity ids are produced at a tool activity boundary. Until the
+                // child relay supplies an independent activity ledger, require the
+                // activity to be exactly the immutable provider tool-call id.
+                if activity_id.as_str() != tool.tool_call_id.as_str() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "child permission activity is stale or does not match the tool call",
+                    ));
+                }
+                let task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == *task_id)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "child permission task is not committed",
+                        )
+                    })?;
+                let subagent = snapshot
+                    .subagents
+                    .iter()
+                    .find(|subagent| subagent.subagent_id == *agent_id)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "child permission subagent is not committed",
+                        )
+                    })?;
+                if task.revision != *task_revision
+                    || subagent.revision != *agent_revision
+                    || task.parent_operation.as_ref() != Some(&fence.operation_id)
+                    || task.subagent_id.as_ref() != Some(agent_id)
+                    || subagent.parent != *fence
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "child permission owner epoch or generation is stale",
+                    ));
+                }
+                Ok(surface::SurfacePermissionContext {
+                    owner: surface::SurfacePermissionOwnerRef::Child {
+                        task_id: task_id.clone(),
+                        task_revision: *task_revision,
+                        agent_id: agent_id.clone(),
+                        agent_revision: *agent_revision,
+                        activity_id: activity_id.clone(),
+                        turn_id: turn_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                    },
+                    origin: *origin,
+                })
+            }
+        }
+    }
+
+    /// Build the one persistent settings snapshot that represents a session
+    /// permission grant. This accepts only capabilities the runtime can carry
+    /// across turns without widening a read-only or protected-metadata grant.
+    fn surface_session_permission_settings(
+        &self,
+        permissions: &surface::SurfacePermissionProfile,
+    ) -> Result<Option<(surface::SurfaceSettingsSnapshot, RunConfig)>, &'static str> {
+        let current = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .settings
+            .clone();
+        let mut next = current.clone();
+        let mut directories = next.effective.additional_working_directories.clone();
+
+        if let Some(file_system) = permissions.file_system.as_ref() {
+            if file_system
+                .read
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty())
+            {
+                return Err("session scope cannot persist read-only filesystem grants");
+            }
+            for path in file_system.write.iter().flatten() {
+                let path = surface::CanonicalPath::try_new(PathBuf::from(path.0.as_str()))
+                    .map_err(|_| "session scope requires canonical absolute filesystem paths")?;
+                if orca_tools::sandbox::is_protected_metadata_root(path.as_path()) {
+                    return Err("protected metadata paths are limited to the current turn");
+                }
+                if !directories.iter().any(|directory| directory.path == path) {
+                    directories.push(surface::SurfaceAdditionalWorkingDirectory {
+                        path,
+                        source: surface::NonEmptyText::try_new("session")
+                            .expect("session permission source is non-empty"),
+                    });
+                }
+            }
+        }
+
+        if permissions
+            .network
+            .as_ref()
+            .is_some_and(|network| network.enabled.is_some() || !network.domains.is_empty())
+        {
+            return Err("session scope cannot persist network grants without a runtime policy");
+        }
+        let network = next.effective.network_permissions.clone();
+
+        if directories == current.effective.additional_working_directories
+            && network == current.effective.network_permissions
+        {
+            return Ok(None);
+        }
+
+        next.effective.additional_working_directories = directories;
+        next.effective.network_permissions = network;
+        next.thread_revision = surface::SettingsRevision::try_new(
+            current
+                .thread_revision
+                .get()
+                .checked_add(1)
+                .ok_or("session permission settings revision overflow")?,
+        )
+        .map_err(|_| "session permission settings revision is invalid")?;
+        next.effective.policy_epoch = surface::PolicyEpoch::try_new(
+            current
+                .effective
+                .policy_epoch
+                .get()
+                .checked_add(1)
+                .ok_or("session permission policy epoch overflow")?,
+        )
+        .map_err(|_| "session permission policy epoch is invalid")?;
+        next.pending = None;
+
+        let mut next_config = self.config.clone();
+        next_config.additional_working_directories = next
+            .effective
+            .additional_working_directories
+            .iter()
+            .map(|directory| orca_core::config::AdditionalWorkingDirectory {
+                path: directory.path.as_path().to_path_buf(),
+                source: directory.source.as_str().to_string(),
+            })
+            .collect();
+        Ok(Some((next, next_config)))
+    }
+
     pub(super) fn surface_authority_for_tool(
         snapshot: &surface::SurfaceSnapshot,
         fence: &surface::SurfaceOperationFence,
@@ -107,7 +295,7 @@ impl ThreadActor {
             record,
             route,
             revision,
-            events,
+            mut events,
             unavailable,
         } = prepare_interaction_request(
             fence.clone(),
@@ -117,13 +305,66 @@ impl ThreadActor {
             recovery_disposition,
             attachment_id,
         );
+        let child_permission_task = match &record.request {
+            surface::SurfaceInteractionRequest::PermissionRequest { context, .. }
+                if !unavailable =>
+            {
+                context.child_owner_task()
+            }
+            _ => None,
+        };
+        if let Some((task_id, expected_revision)) = child_permission_task {
+            let task = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .tasks
+                .iter()
+                .find(|task| task.task_id == *task_id)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "permission task missing")
+                })?;
+            let next_revision = surface::TaskRevision::try_new(
+                expected_revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("permission task revision exhausted"))?,
+            )
+            .map_err(|_| io::Error::other("permission task revision is invalid"))?;
+            if task.revision != expected_revision
+                || task.status != surface::SurfaceTaskStatus::Running
+                || task.pending_interaction_id.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "permission task request epoch is stale",
+                ));
+            }
+            events.push((
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Task(surface::TaskPatch::InteractionChanged {
+                    task_id: task_id.clone(),
+                    expected_revision,
+                    next_revision,
+                    status: surface::SurfaceTaskStatus::ApprovalRequired,
+                    pending_interaction_id: Some(interaction_id.clone()),
+                }),
+            ));
+        }
         let batch = self.surface_event_batch_with_commit_id(events, None);
-        self.resident_surface
-            .coordinator
-            .commit_generation_batch(fence, &batch)
-            .map_err(|error| {
-                io::Error::other(format!("failed to commit effect interaction: {error:?}"))
-            })?;
+        let committed = if child_permission_task.is_some() {
+            self.resident_surface
+                .coordinator
+                .commit_actor_generation_permission_request_batch(fence, &batch)
+        } else {
+            self.resident_surface
+                .coordinator
+                .commit_generation_batch(fence, &batch)
+        };
+        committed.map_err(|error| {
+            io::Error::other(format!("failed to commit effect interaction: {error:?}"))
+        })?;
         if unavailable {
             active.surface_execution_failure =
                 Some(surface::GenerationExecutionFailureClass::ClientCapabilityUnavailable);
@@ -268,9 +509,16 @@ impl ThreadActor {
                 ));
             }
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool_request)?;
+            let context = Self::surface_permission_context_for_tool(
+                &snapshot,
+                &fence,
+                &tool_request,
+                &request.context,
+            )?;
             let permissions = surface_permission_profile_from_runtime(request.permissions.clone())?;
             let interaction_request = surface::SurfaceInteractionRequest::PermissionRequest {
                 tool_call_id: tool_request.tool_call_id.clone(),
+                context,
                 reason: request.reason.clone().map(surface::DisplayText::new),
                 permissions: permissions.clone(),
                 authority: authority.clone(),
@@ -1061,7 +1309,9 @@ impl ThreadActor {
             .resident_surface
             .interactions
             .get(&interaction_id)
+            .cloned()
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let interaction = &interaction;
         {
             if interaction.revision != exact.expected_revision {
                 return Ok(Self::stale_interaction_response(
@@ -1147,7 +1397,18 @@ impl ThreadActor {
                 "interaction response authority does not match the persisted request",
             ));
         }
-        if let (
+        if let surface::SurfaceClientInteractionAnswer::PermissionRequest { decision } =
+            response.answer()
+            && decision.validate_scope().is_err()
+        {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::InvalidInput,
+                "denied permission responses must be turn-scoped",
+            ));
+        }
+        let session_permissions = if let (
             surface::SurfaceInteractionRequest::PermissionRequest {
                 permissions: requested,
                 ..
@@ -1160,25 +1421,6 @@ impl ThreadActor {
             },
         ) = (&interaction.record.request, response.answer())
         {
-            if *scope == surface::PermissionGrantScope::Session
-                && !surface_session_permission_grant_is_applied(
-                    &self
-                        .resident_surface
-                        .coordinator
-                        .state()
-                        .snapshot()
-                        .settings
-                        .effective,
-                    permissions,
-                )
-            {
-                return Ok(Self::uncommitted_interaction_response(
-                    request_id,
-                    interaction,
-                    surface::SurfaceMutationErrorCode::InvalidInput,
-                    "session permission grants require runtime settings ownership",
-                ));
-            }
             if !surface_permission_profile_is_subset(permissions, requested) {
                 return Ok(Self::uncommitted_interaction_response(
                     request_id,
@@ -1187,7 +1429,24 @@ impl ThreadActor {
                     "permission response exceeds the persisted requested profile",
                 ));
             }
-        }
+            (*scope == surface::PermissionGrantScope::Session).then(|| permissions.clone())
+        } else {
+            None
+        };
+        let session_permission_settings = match session_permissions.as_ref() {
+            Some(permissions) => match self.surface_session_permission_settings(permissions) {
+                Ok(settings) => settings,
+                Err(message) => {
+                    return Ok(Self::uncommitted_interaction_response(
+                        request_id,
+                        interaction,
+                        surface::SurfaceMutationErrorCode::InvalidInput,
+                        message,
+                    ));
+                }
+            },
+            None => None,
+        };
         if !self
             .resident_surface
             .hub
@@ -1236,8 +1495,13 @@ impl ThreadActor {
             });
         }
         let expected_revision = interaction.revision;
-        let next_revision = surface::InteractionRevision::try_new(expected_revision.get() + 1)
-            .expect("interaction revision did not exhaust");
+        let next_revision = surface::InteractionRevision::try_new(
+            expected_revision
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        )
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let fence = interaction.record.fence.clone();
         let background_fence = (interaction.record.kind
             == surface::SurfaceInteractionKind::BackgroundApproval)
@@ -1309,6 +1573,35 @@ impl ThreadActor {
                     (receipt, response.answer().clone(), true)
                 }
             };
+        let winner_has_session_scope = matches!(
+            &winner_answer,
+            surface::SurfaceClientInteractionAnswer::PermissionRequest {
+                decision: surface::SurfacePermissionClientDecision::Allow {
+                    scope: surface::PermissionGrantScope::Session,
+                    ..
+                },
+            }
+        );
+        // Child interactions always carry a task transition that clears the
+        // pending approval in the same generation batch. Route those
+        // resolutions through the owner-aware authority even for Turn-scoped
+        // decisions (which do not have a Session settings patch).
+        let child_permission_resolution = self
+            .resident_surface
+            .interactions
+            .get(&interaction_id)
+            .is_some_and(|interaction| {
+                matches!(
+                    &interaction.record.request,
+                    surface::SurfaceInteractionRequest::PermissionRequest {
+                        context: surface::SurfacePermissionContext {
+                            owner: surface::SurfacePermissionOwnerRef::Child { .. },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            });
         let batch = if let Some(batch) = self
             .resident_surface
             .interactions
@@ -1335,19 +1628,71 @@ impl ThreadActor {
                 .transpose()
                 .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
                 .flatten();
-            let batch = self.surface_event_batch_with_commit_id(
-                vec![(
-                    scope,
-                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
-                        interaction_id: interaction_id.clone(),
-                        expected_revision,
-                        next_revision,
-                        receipt: receipt.clone(),
-                        continuation,
+            let mut events = Vec::new();
+            if let Some((settings, _)) = session_permission_settings.as_ref() {
+                let previous_revision = self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .settings
+                    .thread_revision;
+                events.push((
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Settings(surface::SettingsPatch::Committed {
+                        previous_revision,
+                        snapshot: settings.clone(),
                     }),
-                )],
-                None,
-            );
+                ));
+            }
+            events.push((
+                scope,
+                surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
+                    interaction_id: interaction_id.clone(),
+                    expected_revision,
+                    next_revision,
+                    receipt: receipt.clone(),
+                    continuation,
+                }),
+            ));
+            if let surface::SurfaceInteractionRequest::PermissionRequest { context, .. } =
+                &interaction.record.request
+                && let surface::SurfacePermissionOwnerRef::Child { task_id, .. } = &context.owner
+            {
+                let current_task = self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == *task_id)
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                if current_task.pending_interaction_id.as_ref() != Some(&interaction_id)
+                    || current_task.status != surface::SurfaceTaskStatus::ApprovalRequired
+                {
+                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                }
+                let next_task_revision = surface::TaskRevision::try_new(
+                    current_task
+                        .revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                )
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+                events.push((
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::InteractionChanged {
+                        task_id: task_id.clone(),
+                        expected_revision: current_task.revision,
+                        next_revision: next_task_revision,
+                        status: surface::SurfaceTaskStatus::Running,
+                        pending_interaction_id: None,
+                    }),
+                ));
+            }
+            let batch = self.surface_event_batch_with_commit_id(events, None);
             self.resident_surface
                 .interactions
                 .get_mut(&interaction_id)
@@ -1366,11 +1711,27 @@ impl ThreadActor {
                         &safe_projection,
                         &batch,
                     )
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+            None if child_permission_resolution
+                || (winner_has_session_scope && session_permission_settings.is_some()) =>
+            {
+                self.resident_surface
+                    .coordinator
+                    .commit_actor_generation_permission_resolution_batch(fence.clone(), &batch)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        eprintln!("orca: session permission atomic commit failed: {error:?}");
+                        ()
+                    })
             }
             None => self
                 .resident_surface
                 .coordinator
-                .commit_generation_batch(fence, &batch),
+                .commit_generation_batch(fence, &batch)
+                .map(|_| ())
+                .map_err(|_| ()),
         };
         if let Err(error) = resolution {
             eprintln!("orca: typed interaction resolution commit failed: {error:?}");
@@ -1382,6 +1743,22 @@ impl ThreadActor {
                 .retry_at =
                 Some(tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        if winner_has_session_scope {
+            if let Some((_, config)) = session_permission_settings.as_ref() {
+                self.config = config.clone();
+            } else {
+                let settings = self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .settings
+                    .effective
+                    .clone();
+                hydrate_run_config_from_surface_settings(&mut self.config, &settings)
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            }
         }
         self.apply_surface_interaction_resolution(&interaction_id, &winner_answer);
         let output = surface::RespondInteractionOutput {
@@ -1422,7 +1799,19 @@ impl ThreadActor {
             let batch = private
                 .pending_batch
                 .expect("committed interaction retains its exact public batch");
-            let envelope = &batch.events.as_slice()[0];
+            let envelope = batch
+                .events
+                .as_slice()
+                .iter()
+                .find(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Resolved { interaction_id: resolved, .. }
+                        ) if *resolved == *interaction_id
+                    )
+                })
+                .expect("committed interaction batch contains its resolution event");
             interaction.revision =
                 surface::InteractionRevision::try_new(interaction.revision.get().saturating_add(1))
                     .expect("interaction revision did not exhaust");
@@ -1497,12 +1886,12 @@ impl ThreadActor {
                             strict_auto_review,
                         ),
                         surface::SurfacePermissionClientDecision::Deny {
-                            scope,
                             permissions,
                             strict_auto_review,
+                            ..
                         } => (
                             crate::protocol::PermissionResponseDecision::Deny,
-                            scope,
+                            &surface::PermissionGrantScope::Turn,
                             permissions,
                             strict_auto_review,
                         ),
@@ -1667,12 +2056,12 @@ impl ThreadActor {
                         *strict_auto_review,
                     ),
                     surface::SurfacePermissionClientDecision::Deny {
-                        scope,
                         permissions,
                         strict_auto_review,
+                        ..
                     } => (
                         crate::protocol::PermissionResponseDecision::Deny,
-                        *scope,
+                        surface::PermissionGrantScope::Turn,
                         permissions,
                         *strict_auto_review,
                     ),

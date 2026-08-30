@@ -218,7 +218,8 @@ pub mod surface {
         SortDirection, StaleLiveCapsuleDescriptor, StaleMutationError, StartCommitDegradedState,
         SteerOutput, StoreProviderCredential, StoreProviderCredentialError,
         StoreProviderCredentialResult, SubagentPatch, SubagentRevision,
-        SurfaceActivePermissionProfile, SurfaceAdditionalWorkingDirectory, SurfaceAdmissionLeaseId,
+        SurfaceActivePermissionProfile, SurfaceActivityId, SurfaceAdditionalWorkingDirectory,
+        SurfaceAdmissionLeaseId,
         SurfaceAgentLoopTurn, SurfaceAllowDeny, SurfaceApprovalMode, SurfaceAssistantMessageItem,
         SurfaceAssistantPlanItem, SurfaceAssistantReasoningItem, SurfaceAssistantStream,
         SurfaceAssistantStreamState, SurfaceAttachAuthority, SurfaceAttachmentCapabilities,
@@ -269,8 +270,9 @@ pub mod surface {
         SurfaceMutationRevision, SurfaceNetworkDomainAccess, SurfaceNetworkDomainPermission,
         SurfaceNetworkPermissions, SurfaceOperationCompletionProof, SurfaceOperationFence,
         SurfaceOperationId, SurfacePageLimit,
-        SurfacePermissionClientDecision, SurfacePermissionDecision, SurfacePermissionDomainPattern,
-        SurfacePermissionNetworkProfile, SurfacePermissionPathLabel, SurfacePermissionProfile,
+        SurfacePermissionClientDecision, SurfacePermissionContext, SurfacePermissionDecision,
+        SurfacePermissionDomainPattern, SurfacePermissionNetworkProfile, SurfacePermissionOrigin,
+        SurfacePermissionOwnerRef, SurfacePermissionPathLabel, SurfacePermissionProfile,
         SurfacePermissionRule, SurfacePermissionRuleSelector, SurfacePermissionRuleSet,
         SurfacePermissionUpdate, SurfacePinnedContextEntry, SurfacePinnedContextKind,
         SurfacePinnedContextSnapshot, SurfacePlanItem, SurfacePlanPriority, SurfacePlanSnapshot,
@@ -643,6 +645,9 @@ mod tests {
                             domains,
                         }),
                     },
+                    context: crate::runtime_permission::RuntimePermissionContext::foreground(
+                        crate::surface::SurfacePermissionOrigin::Unknown,
+                    ),
                 },
             )
             .expect("permission reducer should delegate to handler");

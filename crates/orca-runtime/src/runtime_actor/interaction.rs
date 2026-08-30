@@ -15,6 +15,7 @@ pub(crate) struct PreparedInteractionRequest {
     pub(crate) unavailable: bool,
 }
 
+#[derive(Clone)]
 pub(crate) enum ResidentInteractionWaiter {
     ToolApproval {
         approval_id: String,
@@ -25,6 +26,7 @@ pub(crate) enum ResidentInteractionWaiter {
     McpElicitation(SyncSender<Result<orca_mcp::McpElicitationResponse, String>>),
 }
 
+#[derive(Clone)]
 pub(crate) struct ResidentSurfaceInteraction {
     pub(crate) record: surface::BrokerInteractionRequestRecord,
     pub(crate) route: surface::BrokerInteractionResponseRoute,
@@ -47,6 +49,7 @@ pub(crate) struct PendingBackgroundInteractionRoute {
     pub(crate) retry_at: tokio::time::Instant,
 }
 
+#[derive(Clone)]
 pub(crate) struct ResidentPrivateInteractionResponse {
     pub(crate) record: surface::BrokerInteractionResponseRecord,
     pub(crate) answer: surface::SurfaceClientInteractionAnswer,

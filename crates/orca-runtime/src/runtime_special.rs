@@ -264,6 +264,9 @@ impl RuntimeToolActorContext {
             id: request.id.clone(),
             reason: args.reason,
             permissions: args.permissions,
+            context: crate::runtime_permission::RuntimePermissionContext::foreground(
+                crate::surface::SurfacePermissionOrigin::SpecialTool,
+            ),
         };
         let reducer = RuntimeTurnReducer::from_extension_stores(RuntimeExtensionStores::new(
             &self.thread_extensions,

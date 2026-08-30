@@ -1203,6 +1203,15 @@ pub enum TaskPatch {
         result: Option<DisplayText>,
         error: Option<DisplayText>,
     },
+    /// Atomically associates a task with a pending interaction (or clears the
+    /// association after resolution).
+    InteractionChanged {
+        task_id: SurfaceTaskId,
+        expected_revision: TaskRevision,
+        next_revision: TaskRevision,
+        status: SurfaceTaskStatus,
+        pending_interaction_id: Option<SurfaceInteractionId>,
+    },
     OwnershipChanged {
         task_id: SurfaceTaskId,
         expected_revision: TaskRevision,

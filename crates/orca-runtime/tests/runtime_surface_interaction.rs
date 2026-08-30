@@ -27,13 +27,15 @@ use orca_runtime::lifecycle::RuntimeUserInputRequest;
 use orca_runtime::model_response::RuntimeModelResponse;
 use orca_runtime::protocol::{
     PermissionGrantScope as RuntimePermissionGrantScope, PermissionResponseDecision,
-    RequestFileSystemPermissions, RequestPermissionProfile,
+    RequestFileSystemPermissions, RequestNetworkPermissions, RequestPermissionProfile,
 };
 use orca_runtime::runtime_host::{
     GenerationContext, HostedTurnRequest, RuntimeHost, ThreadOperationExecutor,
     ThreadOperationOutcome,
 };
-use orca_runtime::runtime_permission::{RuntimePermissionRequest, RuntimePermissionResponse};
+use orca_runtime::runtime_permission::{
+    RuntimePermissionContext, RuntimePermissionRequest, RuntimePermissionResponse,
+};
 use orca_runtime::surface::*;
 use orca_runtime::thread::RuntimeThread;
 
@@ -107,6 +109,10 @@ struct BlockingAssistantStreamExecutor;
 struct PermissionExecutor {
     response_tx: mpsc::SyncSender<RuntimePermissionResponse>,
     tool: ToolRequest,
+}
+
+struct NetworkPermissionExecutor {
+    response_tx: mpsc::SyncSender<Result<RuntimePermissionResponse, io::ErrorKind>>,
 }
 
 struct BlockingResolvedToolApprovalExecutor {
@@ -547,8 +553,54 @@ impl ThreadOperationExecutor for PermissionExecutor {
                     }),
                     network: None,
                 },
+                context: RuntimePermissionContext::foreground(SurfacePermissionOrigin::Unknown),
             })?;
         self.response_tx.send(response).unwrap();
+        thread.lifecycle_mut().finish_task(RunStatus::Success);
+        Ok(RunStatus::Success.into())
+    }
+}
+
+impl ThreadOperationExecutor for NetworkPermissionExecutor {
+    fn run_turn(
+        &self,
+        thread: &mut RuntimeThread,
+        request: &HostedTurnRequest,
+        generation: &GenerationContext,
+        _events: &mut EventFactory,
+        _writer: &mut (dyn Write + Send),
+        _cancel: &CancelToken,
+    ) -> io::Result<ThreadOperationOutcome> {
+        let turn_request = request.thread_turn_request(generation);
+        let tool = permission_tool_request();
+        turn_request
+            .provider_response_ingress()
+            .expect("typed generation installs provider response ingress")
+            .commit_response(&provider_response_for_tool(
+                &tool,
+                request.turn_id().clone(),
+            ))?;
+        let response = turn_request
+            .permission_handler()
+            .expect("typed generation installs runtime-owned permission broker")
+            .request_permissions(&RuntimePermissionRequest {
+                id: tool.id.clone(),
+                reason: Some("access example.com".to_string()),
+                permissions: RequestPermissionProfile {
+                    file_system: None,
+                    network: Some(RequestNetworkPermissions {
+                        enabled: None,
+                        domains: HashMap::from([(
+                            "example.com".to_string(),
+                            orca_core::config::PermissionProfileNetworkAccess::Allow,
+                        )]),
+                    }),
+                },
+                context: RuntimePermissionContext::foreground(SurfacePermissionOrigin::Unknown),
+            });
+        self.response_tx
+            .send(response.map_err(|error| error.kind()))
+            .unwrap();
         thread.lifecycle_mut().finish_task(RunStatus::Success);
         Ok(RunStatus::Success.into())
     }
@@ -626,6 +678,7 @@ impl ThreadOperationExecutor for BlockingResolvedPermissionExecutor {
                     }),
                     network: None,
                 },
+                context: RuntimePermissionContext::foreground(SurfacePermissionOrigin::Unknown),
             })?;
         self.response_tx.send(response).unwrap();
         std::thread::park();
@@ -1646,7 +1699,21 @@ fn native_permission_allow_cannot_widen_requested_profile() {
         "permission-1",
     );
     let requested = match &interaction.request {
-        SurfaceInteractionRequest::PermissionRequest { permissions, .. } => permissions.clone(),
+        SurfaceInteractionRequest::PermissionRequest {
+            tool_call_id,
+            context,
+            permissions,
+            ..
+        } => {
+            assert!(matches!(
+                &context.owner,
+                SurfacePermissionOwnerRef::Foreground {
+                    turn_id: _,
+                    tool_call_id: owner_tool_call_id,
+                } if owner_tool_call_id == tool_call_id
+            ));
+            permissions.clone()
+        }
         _ => panic!("expected permission request"),
     };
     assert!(response_rx.try_recv().is_err());
@@ -1683,7 +1750,105 @@ fn native_permission_allow_cannot_widen_requested_profile() {
     ));
     assert!(response_rx.try_recv().is_err());
 
-    let session_rejected = attachment
+    let session_granted = committed_value(
+        attachment
+            .client
+            .respond_interaction_by_id(
+                request_id(),
+                interaction.interaction_id.clone(),
+                SurfaceClientInteractionAnswer::PermissionRequest {
+                    decision: SurfacePermissionClientDecision::Allow {
+                        scope: PermissionGrantScope::Session,
+                        permissions: requested.clone(),
+                        strict_auto_review: false,
+                    },
+                },
+            )
+            .unwrap(),
+    );
+    assert!(matches!(
+        session_granted,
+        RespondInteractionOutput {
+            disposition: RespondInteractionDisposition::Resolved { .. },
+            ..
+        }
+    ));
+    let response = response_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    assert_eq!(response.decision, PermissionResponseDecision::Allow);
+    assert_eq!(response.scope, RuntimePermissionGrantScope::Session);
+    assert_eq!(
+        response
+            .permissions
+            .file_system
+            .and_then(|profile| profile.write)
+            .unwrap(),
+        vec![PathBuf::from("/workspace/output")]
+    );
+    let snapshot = fresh_interaction_attachment(&surface).baseline.snapshot;
+    assert!(
+        snapshot
+            .settings
+            .effective
+            .additional_working_directories
+            .iter()
+            .any(|directory| directory.path.as_path() == PathBuf::from("/workspace/output"))
+    );
+    let terminal = attachment
+        .client
+        .wait_operation_terminal(request_id(), operation_id)
+        .unwrap();
+    assert!(matches!(
+        terminal,
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn session_network_permission_is_rejected_without_a_persistent_runtime_policy() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    let host =
+        RuntimeHost::start_with_executor(Arc::new(NetworkPermissionExecutor { response_tx }))
+            .expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "runtime-owned network permission request",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .expect("claim subscription once");
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, "grant network permission"),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+
+    let interaction = collect_effect_interaction(
+        &mut subscription,
+        SurfaceInteractionKind::PermissionRequest,
+        "permission-1",
+    );
+    let requested = match &interaction.request {
+        SurfaceInteractionRequest::PermissionRequest { permissions, .. } => permissions.clone(),
+        _ => panic!("expected permission request"),
+    };
+    let rejected = attachment
         .client
         .respond_interaction_by_id(
             request_id(),
@@ -1698,7 +1863,7 @@ fn native_permission_allow_cannot_widen_requested_profile() {
         )
         .unwrap();
     assert!(matches!(
-        session_rejected,
+        rejected,
         MutationReply::Uncommitted {
             mutation: UncommittedMutation::Invalid { ref error, .. },
         } if error.error().code == SurfaceMutationErrorCode::InvalidInput
@@ -1721,23 +1886,13 @@ fn native_permission_allow_cannot_widen_requested_profile() {
             )
             .unwrap(),
     );
-    let response = response_rx.recv_timeout(TEST_TIMEOUT).unwrap();
-    assert_eq!(response.decision, PermissionResponseDecision::Allow);
+    let response = response_rx.recv_timeout(TEST_TIMEOUT).unwrap().unwrap();
     assert_eq!(response.scope, RuntimePermissionGrantScope::Turn);
-    assert_eq!(
-        response
-            .permissions
-            .file_system
-            .and_then(|profile| profile.write)
-            .unwrap(),
-        vec![PathBuf::from("/workspace/output")]
-    );
-    let terminal = attachment
-        .client
-        .wait_operation_terminal(request_id(), operation_id)
-        .unwrap();
     assert!(matches!(
-        terminal,
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
         WaitOperationTerminalResult::Terminal { .. }
     ));
     host.shutdown().unwrap();

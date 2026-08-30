@@ -1878,6 +1878,7 @@ fn build_interaction_request(
         ),
         SurfaceInteractionRequest::PermissionRequest {
             tool_call_id,
+            context,
             reason,
             permissions,
             ..
@@ -1887,9 +1888,10 @@ fn build_interaction_request(
                 .as_ref()
                 .map(|reason| reason.as_str().to_string())
                 .unwrap_or_else(|| "Permission request".to_string()),
-            Some(serde_json::to_value(permissions).map_err(|error| {
-                format!("ACP permission request could not encode permissions: {error}")
-            })?),
+            Some(serde_json::json!({
+                "permissions": permissions,
+                "context": context,
+            })),
             standard_permission_request_options(),
             AcpInteractionTarget::PermissionRequest {
                 permissions: permissions.clone(),
@@ -2012,11 +2014,6 @@ fn standard_permission_request_options() -> Vec<PermissionOption> {
             "Deny for this turn",
             PermissionOptionKind::RejectOnce,
         ),
-        PermissionOption::new(
-            "reject_always",
-            "Deny for this session",
-            PermissionOptionKind::RejectAlways,
-        ),
     ]
 }
 
@@ -2053,9 +2050,6 @@ fn interaction_answer(
                     (true, crate::surface::PermissionGrantScope::Session, true)
                 }
                 Some("reject_once") => (false, crate::surface::PermissionGrantScope::Turn, false),
-                Some("reject_always") => {
-                    (false, crate::surface::PermissionGrantScope::Session, false)
-                }
                 None | Some(_) => (false, crate::surface::PermissionGrantScope::Turn, false),
             };
             let decision = if allow {
@@ -3340,7 +3334,7 @@ mod tests {
             (
                 "reject_always",
                 SurfacePermissionClientDecision::Deny {
-                    scope: crate::surface::PermissionGrantScope::Session,
+                    scope: crate::surface::PermissionGrantScope::Turn,
                     permissions: permissions.clone(),
                     strict_auto_review: false,
                 },

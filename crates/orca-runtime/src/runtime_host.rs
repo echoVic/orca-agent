@@ -13086,59 +13086,26 @@ fn surface_permission_profile_is_subset(
     file_system_subset && network_subset
 }
 
-fn surface_session_permission_grant_is_applied(
-    settings: &surface::SurfaceRuntimeSettings,
-    permissions: &surface::SurfacePermissionProfile,
-) -> bool {
-    let paths_applied = permissions.file_system.as_ref().is_none_or(|file_system| {
-        file_system
-            .read
-            .iter()
-            .flatten()
-            .chain(file_system.write.iter().flatten())
-            .all(|path| {
-                surface::CanonicalPath::try_new(std::path::PathBuf::from(path.0.as_str()))
-                    .ok()
-                    .is_some_and(|path| {
-                        settings
-                            .additional_working_directories
-                            .iter()
-                            .any(|directory| directory.path == path)
-                    })
-            })
-    });
-    let network_applied = permissions.network.as_ref().is_none_or(|requested| {
-        let enabled = requested
-            .enabled
-            .is_none_or(|enabled| settings.network_permissions.enabled == Some(enabled));
-        enabled
-            && requested.domains.iter().all(|(domain, access)| {
-                settings
-                    .network_permissions
-                    .domains
-                    .iter()
-                    .any(|permission| {
-                        permission.domain.as_str() == domain.0.as_str()
-                            && permission.access
-                                == match access {
-                                    surface::SurfaceAllowDeny::Allow => {
-                                        surface::SurfaceNetworkDomainAccess::Allow
-                                    }
-                                    surface::SurfaceAllowDeny::Deny => {
-                                        surface::SurfaceNetworkDomainAccess::Deny
-                                    }
-                                }
-                    })
-            })
-    });
-    paths_applied && network_applied
-}
-
 fn surface_session_permission_settings_delta_authorized(
     current: &surface::SurfaceRuntimeSettings,
     next: &surface::SurfaceRuntimeSettings,
     requested: &surface::SurfacePermissionProfile,
 ) -> bool {
+    if requested
+        .network
+        .as_ref()
+        .is_some_and(|network| network.enabled.is_some() || !network.domains.is_empty())
+    {
+        return false;
+    }
+    if requested.file_system.as_ref().is_some_and(|file_system| {
+        file_system
+            .read
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+    }) {
+        return false;
+    }
     if current.model != next.model
         || current.reasoning_effort != next.reasoning_effort
         || current.approval_mode != next.approval_mode
@@ -13159,17 +13126,18 @@ fn surface_session_permission_settings_delta_authorized(
     let requested_paths = requested
         .file_system
         .iter()
-        .flat_map(|file_system| {
-            file_system
-                .read
-                .iter()
-                .flatten()
-                .chain(file_system.write.iter().flatten())
-        })
-        .filter_map(|path| {
-            surface::CanonicalPath::try_new(std::path::PathBuf::from(path.0.as_str())).ok()
-        })
-        .collect::<BTreeSet<_>>();
+        .flat_map(|file_system| file_system.write.iter().flatten())
+        .map(|path| surface::CanonicalPath::try_new(std::path::PathBuf::from(path.0.as_str())))
+        .collect::<Result<BTreeSet<_>, _>>();
+    let Ok(requested_paths) = requested_paths else {
+        return false;
+    };
+    if requested_paths
+        .iter()
+        .any(|path| orca_tools::sandbox::is_protected_metadata_root(path.as_path()))
+    {
+        return false;
+    }
     if next
         .additional_working_directories
         .iter()
@@ -13372,10 +13340,12 @@ fn interaction_safe_projection(
                     *strict_auto_review,
                 ),
                 surface::SurfacePermissionClientDecision::Deny {
-                    scope,
-                    strict_auto_review,
-                    ..
-                } => (surface::SurfaceAllowDeny::Deny, *scope, *strict_auto_review),
+                    strict_auto_review, ..
+                } => (
+                    surface::SurfaceAllowDeny::Deny,
+                    surface::PermissionGrantScope::Turn,
+                    *strict_auto_review,
+                ),
             };
             surface::SurfaceInteractionSafeProjection::PermissionRequest {
                 decision,
@@ -22265,6 +22235,10 @@ mod tests {
                 (
                     surface::SurfaceInteractionRequest::PermissionRequest {
                         tool_call_id: tool.tool_call_id.clone(),
+                        context: surface::SurfacePermissionContext::foreground_for_tool(
+                            &tool,
+                            surface::SurfacePermissionOrigin::Unknown,
+                        ),
                         reason: Some(surface::DisplayText::new("sandbox retry")),
                         permissions: permissions.clone(),
                         authority: authority.clone(),

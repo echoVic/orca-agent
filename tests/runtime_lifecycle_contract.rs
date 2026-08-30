@@ -31,6 +31,7 @@ use orca_runtime::protocol::{
     PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
     RequestNetworkPermissions, RequestPermissionProfile,
 };
+use orca_runtime::runtime_permission::RuntimePermissionContext;
 use orca_runtime::tasks::TaskRegistry;
 use serde_json::Value;
 use tempfile::tempdir;
@@ -988,6 +989,9 @@ fn turn_permission_overlay_requests_and_merges_network_grants() {
                         )]),
                     }),
                 },
+                context: RuntimePermissionContext::foreground(
+                    orca_runtime::surface::SurfacePermissionOrigin::Unknown,
+                ),
             },
         )
         .expect("permission request");
@@ -1049,6 +1053,9 @@ fn turn_permission_overlay_requests_and_merges_file_system_write_grants() {
                     }),
                     network: None,
                 },
+                context: RuntimePermissionContext::foreground(
+                    orca_runtime::surface::SurfacePermissionOrigin::Unknown,
+                ),
             },
         )
         .expect("permission request");
@@ -1094,6 +1101,9 @@ fn turn_permission_overlay_does_not_merge_denied_responses() {
                         )]),
                     }),
                 },
+                context: RuntimePermissionContext::foreground(
+                    orca_runtime::surface::SurfacePermissionOrigin::Unknown,
+                ),
             },
         )
         .expect("permission request");

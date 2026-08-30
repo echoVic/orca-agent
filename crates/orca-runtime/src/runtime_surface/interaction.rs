@@ -2,12 +2,12 @@ use super::identity::{
     CanonicalBackgroundFenceV1, CanonicalPath, CanonicalTaskFenceV1, Denied, DisplayText,
     FiniteF64, HostIncarnation, HostMonotonicClockId, InteractionRevision, MonotonicInstant,
     NonEmptySet, NonEmptyText, NonEmptyVec, OpaqueToken, PolicyEpoch, ResponseRouteEpoch,
-    Sha256Digest, SurfaceAttachmentId, SurfaceBackgroundFence, SurfaceConnectionId,
-    SurfaceIncarnation, SurfaceInteractionId, SurfaceOperationFence, SurfaceOperationId,
-    SurfaceRequestId, SurfaceResponseGrantToken, SurfaceResponseId, SurfaceResponseReceiptId,
-    SurfaceResponseToken, SurfaceSettlementId, SurfaceTaskFence, SurfaceThreadId,
-    SurfaceToolCallId, SurfaceTurnId, SurfaceValueError, UnixMillis, UuidV7,
-    canonical_background_fence_v1, canonical_task_fence_v1,
+    Sha256Digest, SurfaceActivityId, SurfaceAttachmentId, SurfaceBackgroundFence,
+    SurfaceConnectionId, SurfaceIncarnation, SurfaceInteractionId, SurfaceOperationFence,
+    SurfaceOperationId, SurfaceRequestId, SurfaceResponseGrantToken, SurfaceResponseId,
+    SurfaceResponseReceiptId, SurfaceResponseToken, SurfaceSettlementId, SurfaceSubagentId,
+    SurfaceTaskFence, SurfaceTaskId, SurfaceThreadId, SurfaceToolCallId, SurfaceTurnId,
+    SurfaceValueError, UnixMillis, UuidV7, canonical_background_fence_v1, canonical_task_fence_v1,
 };
 use super::operation::CancelReason;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -329,6 +329,89 @@ pub struct SurfacePermissionProfile {
     pub network: Option<SurfacePermissionNetworkProfile>,
 }
 
+/// Public, non-authorizing identity for the runtime owner of a permission
+/// request. This deliberately contains no operation fence, response token, or
+/// grant token; those values remain private to the runtime actor.
+///
+/// A child owner is intentionally a different shape from a foreground owner:
+/// a child permission cannot be represented without its task, agent, and
+/// activity identity. This prevents adapters from silently rendering a child
+/// request as an anonymous foreground prompt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SurfacePermissionOwnerRef {
+    Foreground {
+        turn_id: SurfaceTurnId,
+        tool_call_id: SurfaceToolCallId,
+    },
+    Child {
+        task_id: SurfaceTaskId,
+        task_revision: super::TaskRevision,
+        agent_id: SurfaceSubagentId,
+        agent_revision: super::SubagentRevision,
+        activity_id: SurfaceActivityId,
+        turn_id: SurfaceTurnId,
+        tool_call_id: SurfaceToolCallId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SurfacePermissionOrigin {
+    Bash,
+    CommandExec,
+    SpecialTool,
+    ChildAgent,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SurfacePermissionContext {
+    pub owner: SurfacePermissionOwnerRef,
+    pub origin: SurfacePermissionOrigin,
+}
+
+impl SurfacePermissionContext {
+    pub fn foreground_for_tool(tool: &SurfaceToolRequest, origin: SurfacePermissionOrigin) -> Self {
+        Self {
+            owner: SurfacePermissionOwnerRef::Foreground {
+                turn_id: tool.turn_id.clone(),
+                tool_call_id: tool.tool_call_id.clone(),
+            },
+            origin,
+        }
+    }
+
+    pub fn validates_tool(&self, tool: &SurfaceToolRequest) -> bool {
+        match &self.owner {
+            SurfacePermissionOwnerRef::Foreground {
+                turn_id,
+                tool_call_id,
+                ..
+            } => turn_id == &tool.turn_id && tool_call_id == &tool.tool_call_id,
+            SurfacePermissionOwnerRef::Child {
+                turn_id,
+                tool_call_id,
+                activity_id,
+                ..
+            } => {
+                turn_id == &tool.turn_id
+                    && tool_call_id == &tool.tool_call_id
+                    && activity_id.as_str() == tool.tool_call_id.as_str()
+            }
+        }
+    }
+
+    pub fn child_owner_task(&self) -> Option<(&SurfaceTaskId, super::TaskRevision)> {
+        match &self.owner {
+            SurfacePermissionOwnerRef::Foreground { .. } => None,
+            SurfacePermissionOwnerRef::Child {
+                task_id,
+                task_revision,
+                ..
+            } => Some((task_id, *task_revision)),
+        }
+    }
+}
+
 impl SurfacePermissionProfile {
     pub const fn empty() -> Self {
         Self {
@@ -487,6 +570,7 @@ pub enum SurfaceInteractionRequest {
     },
     PermissionRequest {
         tool_call_id: SurfaceToolCallId,
+        context: SurfacePermissionContext,
         reason: Option<DisplayText>,
         permissions: SurfacePermissionProfile,
         authority: AuthorityFingerprint,
@@ -859,6 +943,7 @@ pub(crate) enum DurableInteractionContinuationRequest {
     },
     PermissionRequest {
         tool_call_id: SurfaceToolCallId,
+        context: SurfacePermissionContext,
         reason: Option<DisplayText>,
         permissions: SurfacePermissionProfile,
         authority: AuthorityFingerprint,
@@ -1464,11 +1549,13 @@ impl DurableInteractionContinuationRequest {
             },
             Self::PermissionRequest {
                 tool_call_id,
+                context,
                 reason,
                 permissions,
                 authority,
             } => SurfaceInteractionRequest::PermissionRequest {
                 tool_call_id: tool_call_id.clone(),
+                context: context.clone(),
                 reason: reason.clone(),
                 permissions: permissions.clone(),
                 authority: authority.clone(),
@@ -1513,11 +1600,13 @@ impl TryFrom<SurfaceInteractionRequest> for DurableInteractionContinuationReques
             }),
             SurfaceInteractionRequest::PermissionRequest {
                 tool_call_id,
+                context,
                 reason,
                 permissions,
                 authority,
             } => Ok(Self::PermissionRequest {
                 tool_call_id,
+                context,
                 reason,
                 permissions,
                 authority,
@@ -1561,6 +1650,31 @@ pub enum SurfacePermissionClientDecision {
         permissions: SurfacePermissionProfile,
         strict_auto_review: bool,
     },
+}
+
+impl SurfacePermissionClientDecision {
+    /// Denials never grant a session-wide capability. A client may send an
+    /// old/stale session value, but the runtime rejects it instead of letting
+    /// an adapter reinterpret it as authorization.
+    pub fn validate_scope(&self) -> Result<(), SurfaceValueError> {
+        if matches!(
+            self,
+            Self::Deny {
+                scope: PermissionGrantScope::Session,
+                ..
+            }
+        ) {
+            return Err(SurfaceValueError::NonCanonical);
+        }
+        Ok(())
+    }
+
+    pub const fn effective_scope(&self) -> PermissionGrantScope {
+        match self {
+            Self::Allow { scope, .. } => *scope,
+            Self::Deny { .. } => PermissionGrantScope::Turn,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2162,6 +2276,7 @@ enum CanonicalInteractionRequestV1<'a> {
     },
     PermissionRequest {
         tool_call_id: &'a SurfaceToolCallId,
+        context: &'a SurfacePermissionContext,
         reason: &'a Option<DisplayText>,
         permissions: &'a SurfacePermissionProfile,
         authority: CanonicalAuthorityFingerprintV1<'a>,
@@ -2200,11 +2315,13 @@ fn canonical_interaction_request_v1(
         },
         SurfaceInteractionRequest::PermissionRequest {
             tool_call_id,
+            context,
             reason,
             permissions,
             authority,
         } => CanonicalInteractionRequestV1::PermissionRequest {
             tool_call_id,
+            context,
             reason,
             permissions,
             authority: canonical_authority_fingerprint_v1(authority),
@@ -2469,7 +2586,8 @@ pub(super) fn canonical_interaction_patch_v1(
 mod tests {
     use super::*;
     use crate::runtime_surface::identity::{
-        SurfaceBackgroundOwnerToken, SurfaceGenerationId, ThreadOwnerEpoch,
+        SubagentRevision, SurfaceBackgroundOwnerToken, SurfaceGenerationId, TaskRevision,
+        ThreadOwnerEpoch,
     };
 
     fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
@@ -2634,5 +2752,87 @@ mod tests {
                 epoch: ResponseRouteEpoch::try_new(1).unwrap(),
             },
         };
+    }
+
+    #[test]
+    fn permission_context_is_public_identity_only() {
+        let tool_call_id = SurfaceToolCallId::try_new("tool-1").unwrap();
+        let context = SurfacePermissionContext {
+            owner: SurfacePermissionOwnerRef::Child {
+                task_id: SurfaceTaskId::try_new("task-1").unwrap(),
+                task_revision: TaskRevision::try_new(2).unwrap(),
+                agent_id: SurfaceSubagentId::try_new("agent-1").unwrap(),
+                agent_revision: SubagentRevision::try_new(3).unwrap(),
+                activity_id: SurfaceActivityId::try_new("tool-1").unwrap(),
+                turn_id: orca_core::thread_identity::TurnId::new(),
+                tool_call_id,
+            },
+            origin: SurfacePermissionOrigin::ChildAgent,
+        };
+        let encoded = serde_json::to_value(&context).unwrap();
+        assert_eq!(encoded["owner"]["Child"]["task_id"], "task-1");
+        assert_eq!(encoded["owner"]["Child"]["agent_id"], "agent-1");
+        assert_eq!(encoded["owner"]["Child"]["activity_id"], "tool-1");
+        assert!(encoded.get("fence").is_none());
+        assert!(encoded.get("grant_token").is_none());
+        assert!(encoded.get("operation_fence").is_none());
+    }
+
+    #[test]
+    fn denied_permission_scope_is_always_turn_scoped() {
+        let decision = SurfacePermissionClientDecision::Deny {
+            scope: PermissionGrantScope::Session,
+            permissions: SurfacePermissionProfile::empty(),
+            strict_auto_review: false,
+        };
+        assert!(decision.validate_scope().is_err());
+        assert_eq!(decision.effective_scope(), PermissionGrantScope::Turn);
+    }
+
+    #[test]
+    fn child_permission_owner_cannot_omit_activity_identity() {
+        let value = serde_json::json!({
+            "owner": {
+                "Child": {
+                    "task_id": "task-1",
+                    "task_revision": 1,
+                    "agent_id": "agent-1",
+                    "agent_revision": 1,
+                    "turn_id": orca_core::thread_identity::TurnId::new(),
+                    "tool_call_id": "tool-1"
+                }
+            },
+            "origin": "ChildAgent"
+        });
+        assert!(serde_json::from_value::<SurfacePermissionContext>(value).is_err());
+    }
+
+    #[test]
+    fn child_permission_owner_rejects_stale_activity() {
+        let turn_id = orca_core::thread_identity::TurnId::new();
+        let tool_call_id = SurfaceToolCallId::try_new("tool-1").unwrap();
+        let context = SurfacePermissionContext {
+            owner: SurfacePermissionOwnerRef::Child {
+                task_id: SurfaceTaskId::try_new("task-1").unwrap(),
+                task_revision: TaskRevision::try_new(1).unwrap(),
+                agent_id: SurfaceSubagentId::try_new("agent-1").unwrap(),
+                agent_revision: SubagentRevision::try_new(1).unwrap(),
+                activity_id: SurfaceActivityId::try_new("stale-activity").unwrap(),
+                turn_id: turn_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+            },
+            origin: SurfacePermissionOrigin::ChildAgent,
+        };
+        let tool = SurfaceToolRequest {
+            tool_call_id,
+            source_response_id: None,
+            turn_id,
+            name: NonEmptyText::try_new("bash").unwrap(),
+            action: SurfaceToolAction::Shell,
+            target: None,
+            raw_arguments: DisplayText::new("{}"),
+            arguments_digest: Sha256Digest::new([0; 32]),
+        };
+        assert!(!context.validates_tool(&tool));
     }
 }

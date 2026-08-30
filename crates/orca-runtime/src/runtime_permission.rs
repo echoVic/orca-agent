@@ -11,6 +11,54 @@ use crate::protocol::{
     RequestPermissionProfile,
 };
 
+/// Caller-proven provenance for a permission prompt. The actor binds a
+/// foreground request to the committed tool identity. Child requests must
+/// carry the complete activity owner, so they cannot be recovered from an
+/// incidental snapshot match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimePermissionContext {
+    Foreground {
+        origin: crate::surface::SurfacePermissionOrigin,
+    },
+    Child {
+        task_id: crate::surface::SurfaceTaskId,
+        task_revision: crate::surface::TaskRevision,
+        agent_id: crate::surface::SurfaceSubagentId,
+        agent_revision: crate::surface::SubagentRevision,
+        activity_id: crate::surface::SurfaceActivityId,
+        turn_id: crate::surface::SurfaceTurnId,
+        tool_call_id: crate::surface::SurfaceToolCallId,
+        origin: crate::surface::SurfacePermissionOrigin,
+    },
+}
+
+impl RuntimePermissionContext {
+    pub const fn foreground(origin: crate::surface::SurfacePermissionOrigin) -> Self {
+        Self::Foreground { origin }
+    }
+
+    pub fn child(
+        task_id: crate::surface::SurfaceTaskId,
+        task_revision: crate::surface::TaskRevision,
+        agent_id: crate::surface::SurfaceSubagentId,
+        agent_revision: crate::surface::SubagentRevision,
+        activity_id: crate::surface::SurfaceActivityId,
+        turn_id: crate::surface::SurfaceTurnId,
+        tool_call_id: crate::surface::SurfaceToolCallId,
+    ) -> Self {
+        Self::Child {
+            task_id,
+            task_revision,
+            agent_id,
+            agent_revision,
+            activity_id,
+            turn_id,
+            tool_call_id,
+            origin: crate::surface::SurfacePermissionOrigin::ChildAgent,
+        }
+    }
+}
+
 pub(crate) const SESSION_METADATA_DIRECTORY_SOURCE: &str = "session-metadata";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +66,9 @@ pub struct RuntimePermissionRequest {
     pub id: String,
     pub reason: Option<String>,
     pub permissions: RequestPermissionProfile,
+    /// Caller-proven owner identity. The runtime actor verifies it against the
+    /// committed tool and active operation before publishing it.
+    pub context: RuntimePermissionContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +214,12 @@ impl RuntimePermissionPolicy {
                         domains,
                     }),
                 },
+                context: RuntimePermissionContext::foreground(match origin {
+                    RuntimePermissionOrigin::Bash => crate::surface::SurfacePermissionOrigin::Bash,
+                    RuntimePermissionOrigin::CommandExec => {
+                        crate::surface::SurfacePermissionOrigin::CommandExec
+                    }
+                }),
             },
         })
     }

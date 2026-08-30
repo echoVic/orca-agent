@@ -769,7 +769,13 @@ patch_name_matcher!(
 patch_name_matcher!(
     task_patch_name,
     TaskPatch,
-    [Upserted, StatusChanged, OwnershipChanged, Reconciled]
+    [
+        Upserted,
+        StatusChanged,
+        InteractionChanged,
+        OwnershipChanged,
+        Reconciled
+    ]
 );
 patch_name_matcher!(
     workflow_patch_name,
@@ -1028,6 +1034,7 @@ fn every_manifest_patch_inventory_has_an_exhaustive_rust_match() {
             &[
                 "Upserted",
                 "StatusChanged",
+                "InteractionChanged",
                 "OwnershipChanged",
                 "Reconciled",
             ],

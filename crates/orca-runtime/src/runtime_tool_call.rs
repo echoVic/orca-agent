@@ -1073,6 +1073,9 @@ mod tests {
                     }),
                     network: None,
                 },
+                context: crate::runtime_permission::RuntimePermissionContext::foreground(
+                    crate::surface::SurfacePermissionOrigin::CommandExec,
+                ),
             };
             context
                 .request_permissions(request)

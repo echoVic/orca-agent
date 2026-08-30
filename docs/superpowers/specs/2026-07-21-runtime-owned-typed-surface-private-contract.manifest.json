@@ -82,6 +82,7 @@
     "task_patch_variants": [
       "Upserted",
       "StatusChanged",
+      "InteractionChanged",
       "OwnershipChanged",
       "Reconciled"
     ],

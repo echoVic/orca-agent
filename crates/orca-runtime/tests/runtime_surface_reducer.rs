@@ -2459,7 +2459,7 @@ fn task_parent_must_exist_and_cannot_reference_itself() {
     let self_cycle = batch(
         &initial,
         5_902,
-        vec![(
+        vec![ (
             SurfaceScope::Thread,
             SurfaceEvent::Task(TaskPatch::Upserted {
                 expected_revision: None,
@@ -2471,6 +2471,100 @@ fn task_parent_must_exist_and_cannot_reference_itself() {
         reduce_batch(SurfaceReduceMode::Live, &initial, &self_cycle),
         SurfaceReducerErrorCode::IllegalTransition,
     );
+}
+
+#[test]
+fn task_permission_interaction_epochs_are_atomic() {
+    let interaction_id = SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(61_001)).unwrap();
+    let mut initial_snapshot = snapshot();
+    initial_snapshot
+        .tasks
+        .push(task(SurfaceTaskStatus::Running, 1));
+    let initial = SurfaceReducerState::new(initial_snapshot);
+
+    let request = batch(
+        &initial,
+        61_002,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::InteractionChanged {
+                task_id: SurfaceTaskId::try_new("manifest-task").unwrap(),
+                expected_revision: TaskRevision::try_new(1).unwrap(),
+                next_revision: TaskRevision::try_new(2).unwrap(),
+                status: SurfaceTaskStatus::ApprovalRequired,
+                pending_interaction_id: Some(interaction_id.clone()),
+            }),
+        )],
+    );
+    let after_request = applied(reduce_batch(SurfaceReduceMode::Live, &initial, &request));
+    let requested_task = &after_request.snapshot().tasks[0];
+    assert_eq!(requested_task.revision.get(), 2);
+    assert_eq!(
+        requested_task.pending_interaction_id.as_ref(),
+        Some(&interaction_id)
+    );
+    assert_eq!(requested_task.status, SurfaceTaskStatus::ApprovalRequired);
+
+    let stale_resolution = batch(
+        &after_request,
+        61_003,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Task(TaskPatch::InteractionChanged {
+                task_id: SurfaceTaskId::try_new("manifest-task").unwrap(),
+                expected_revision: TaskRevision::try_new(1).unwrap(),
+                next_revision: TaskRevision::try_new(2).unwrap(),
+                status: SurfaceTaskStatus::Running,
+                pending_interaction_id: None,
+            }),
+        )],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &after_request, &stale_resolution),
+        SurfaceReducerErrorCode::StaleRevision,
+    );
+    assert_eq!(after_request.snapshot().tasks[0].revision.get(), 2);
+    assert_eq!(
+        after_request.snapshot().tasks[0]
+            .pending_interaction_id
+            .as_ref(),
+        Some(&interaction_id)
+    );
+
+    // A batch containing a valid request followed by a stale duplicate is
+    // rejected as a whole; the caller's state remains at the pre-batch epoch.
+    let duplicate_request = batch(
+        &initial,
+        61_004,
+        vec![
+            (
+                SurfaceScope::Thread,
+                SurfaceEvent::Task(TaskPatch::InteractionChanged {
+                    task_id: SurfaceTaskId::try_new("manifest-task").unwrap(),
+                    expected_revision: TaskRevision::try_new(1).unwrap(),
+                    next_revision: TaskRevision::try_new(2).unwrap(),
+                    status: SurfaceTaskStatus::ApprovalRequired,
+                    pending_interaction_id: Some(interaction_id.clone()),
+                }),
+            ),
+            (
+                SurfaceScope::Thread,
+                SurfaceEvent::Task(TaskPatch::InteractionChanged {
+                    task_id: SurfaceTaskId::try_new("manifest-task").unwrap(),
+                    expected_revision: TaskRevision::try_new(1).unwrap(),
+                    next_revision: TaskRevision::try_new(2).unwrap(),
+                    status: SurfaceTaskStatus::ApprovalRequired,
+                    pending_interaction_id: Some(interaction_id),
+                }),
+            ),
+        ],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &initial, &duplicate_request),
+        SurfaceReducerErrorCode::StaleRevision,
+    );
+    assert!(initial.snapshot().tasks[0].pending_interaction_id.is_none());
+    assert_eq!(initial.snapshot().tasks[0].revision.get(), 1);
 }
 
 fn operation_fence() -> SurfaceOperationFence {

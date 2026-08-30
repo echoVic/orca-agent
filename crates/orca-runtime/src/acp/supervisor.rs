@@ -3284,6 +3284,9 @@ mod tests {
                                         }),
                                         network: None,
                                     },
+                                    context: crate::runtime_permission::RuntimePermissionContext::foreground(
+                                        crate::surface::SurfacePermissionOrigin::Unknown,
+                                    ),
                                 })?;
                             StandardInteractionOutcome::PermissionRequest(permission.decision)
                         }

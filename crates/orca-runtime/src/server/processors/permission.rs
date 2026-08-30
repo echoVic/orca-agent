@@ -48,6 +48,13 @@ fn run_permission_respond<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
+    // A denial is never a durable grant. Normalize before using the response
+    // in replay identity or forwarding it to the runtime authority.
+    let scope = if decision == protocol::PermissionResponseDecision::Deny {
+        protocol::PermissionGrantScope::Turn
+    } else {
+        scope
+    };
     let response_digest = jsonl_response_digest(&json!({
         "decision": decision,
         "scope": scope,
@@ -123,23 +130,6 @@ fn run_permission_respond<W: Write>(
             permissions,
         )?;
         let allow = decision == protocol::PermissionResponseDecision::Allow;
-        if allow
-            && scope == protocol::PermissionGrantScope::Session
-            && let Err(error) = state.threads.persist_session_permission_grant(
-                &thread_id,
-                &client,
-                &runtime_workspace_roots,
-                &permissions,
-            )
-        {
-            return protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::error(format!(
-                    "session permission settings did not commit: {error}"
-                )),
-            );
-        }
         let answer = match &target {
             crate::surface::SurfaceInteractionKind::ToolApproval => {
                 crate::surface::SurfaceClientInteractionAnswer::ToolApproval {
