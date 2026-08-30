@@ -628,6 +628,14 @@ fn run_workflow_worker(args: WorkflowWorkerRequest) -> i32 {
         return 1;
     }
 
+    // The launcher reads exactly one JSON line from this worker. Close that
+    // handshake pipe before entering the long-running workflow so callers do
+    // not wait for the worker's eventual terminal state.
+    if let Err(error) = orca_platform::process::detach_current_process_stdout() {
+        eprintln!("orca: failed to detach workflow worker stdout: {error}");
+        return 1;
+    }
+
     match launch.join() {
         Ok(Ok(_)) => 0,
         Ok(Err(_)) => 1,
@@ -742,7 +750,7 @@ fn spawn_workflow_worker(
         orca_core::capability::EnforcementState::Advisory,
         "workflow-worker-user-trusted",
     );
-    let launched = match broker.launch_user_trusted(
+    let launched = match broker.launch_user_trusted_detached(
         command,
         format!("workflow-worker:{session_id}"),
         cwd_for_broker,

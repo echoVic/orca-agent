@@ -25,6 +25,10 @@ pub(super) struct CommandExecProcess {
     pub(super) command_event_id: Value,
     pub(super) command: Vec<String>,
     pub(super) cwd: PathBuf,
+    /// User-facing lexical cwd. `cwd` remains canonical and is used for
+    /// enforcement/diagnostics; this value avoids leaking Windows verbatim
+    /// path syntax through the protocol.
+    pub(super) display_cwd: PathBuf,
     pub(super) stream_output: bool,
     pub(super) output_bytes_cap: Option<usize>,
     pub(super) output_offset: usize,
@@ -213,7 +217,7 @@ impl CommandExecManager {
                         process_id,
                         shell_id: process.shell_id.clone(),
                         command: process.command.clone(),
-                        cwd: process.cwd.clone(),
+                        cwd: process.display_cwd.clone(),
                         status: if process.shell_id.is_some() {
                             "running"
                         } else {
@@ -841,6 +845,7 @@ mod tests {
                     command_event_id: Value::from("cmd-rebase"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
+                    display_cwd: cwd.path().to_path_buf(),
                     stream_output: true,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -925,6 +930,7 @@ mod tests {
                     command_event_id: Value::from("cmd-cap"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
+                    display_cwd: cwd.path().to_path_buf(),
                     stream_output: true,
                     output_bytes_cap: Some(3),
                     output_offset: 0,
@@ -1017,6 +1023,7 @@ mod tests {
                     command_event_id: Value::from("cmd-omitted"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
+                    display_cwd: cwd.path().to_path_buf(),
                     stream_output: true,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -1085,6 +1092,7 @@ mod tests {
                     command_event_id: Value::from("cmd-stderr-omitted"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
+                    display_cwd: cwd.path().to_path_buf(),
                     stream_output: true,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -1157,6 +1165,7 @@ mod tests {
                     command_event_id: Value::from("cmd-omitted-cap"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
+                    display_cwd: cwd.path().to_path_buf(),
                     stream_output: true,
                     output_bytes_cap: Some(3),
                     output_offset: 0,
@@ -1234,6 +1243,7 @@ mod tests {
                     command_event_id: Value::from("cmd-denied"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
+                    display_cwd: cwd.path().to_path_buf(),
                     stream_output: false,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -1297,6 +1307,7 @@ mod tests {
                     command_event_id: Value::from("cmd-list-owned"),
                     command: platform_command_argv(),
                     cwd: cwd.path().to_path_buf(),
+                    display_cwd: cwd.path().to_path_buf(),
                     stream_output: false,
                     output_bytes_cap: None,
                     output_offset: 0,

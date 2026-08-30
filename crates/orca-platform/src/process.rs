@@ -48,6 +48,14 @@ impl ProcessJob {
         Ok((child, Self { platform }))
     }
 
+    /// Spawns a child in a Windows Job Object whose lifetime is managed by the
+    /// child owner rather than by this handle. This is reserved for explicitly
+    /// detached user-trusted workers that must outlive their launcher process.
+    pub fn spawn_detached(command: &mut Command) -> io::Result<(Child, Self)> {
+        let (child, platform) = platform::ProcessJob::spawn_detached(command)?;
+        Ok((child, Self { platform }))
+    }
+
     /// Spawns into an existing named Windows Job when the current process is
     /// already a member; otherwise creates and assigns the named boundary.
     /// This is used by the Windows runner so descendants inherit the runtime's
@@ -100,6 +108,15 @@ pub fn clear_current_process_std_handle_inheritance() -> io::Result<()> {
     platform::clear_current_process_std_handle_inheritance()
 }
 
+/// Detaches the current process stdout from a one-shot launcher handshake.
+///
+/// Long-lived workers use stdout only to publish their initial launch receipt.
+/// Rebinding the descriptor after that receipt lets the launcher observe EOF
+/// without waiting for the worker's full execution lifetime.
+pub fn detach_current_process_stdout() -> io::Result<()> {
+    platform::detach_current_process_stdout()
+}
+
 /// Reads a captured child pipe without making cancellation depend on a
 /// blocking operating-system read returning first.
 #[cfg(not(windows))]
@@ -137,6 +154,21 @@ mod platform {
         Ok(())
     }
 
+    pub(super) fn detach_current_process_stdout() -> io::Result<()> {
+        use std::fs::OpenOptions;
+        use std::os::fd::AsRawFd;
+
+        let null = OpenOptions::new().write(true).open("/dev/null")?;
+        // SAFETY: stdout is a process-local descriptor and dup2 atomically
+        // replaces it, closing the inherited launcher pipe at fd 1.
+        let result = unsafe { libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn read_child_pipe_interruptibly<R: Read>(
         reader: &mut R,
         stop: &AtomicBool,
@@ -162,6 +194,10 @@ mod platform {
             _name: Option<&str>,
         ) -> io::Result<(Child, Self)> {
             Ok((command.spawn()?, Self))
+        }
+
+        pub(super) fn spawn_detached(command: &mut Command) -> io::Result<(Child, Self)> {
+            Self::spawn(command, None)
         }
 
         pub(super) fn attach(_pid: u32) -> io::Result<Self> {
@@ -265,6 +301,44 @@ mod platform {
         Ok(())
     }
 
+    pub(super) fn detach_current_process_stdout() -> io::Result<()> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE,
+            OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, SetStdHandle};
+
+        let null_name = [b'N' as u16, b'U' as u16, b'L' as u16, 0];
+        let null_handle = unsafe {
+            CreateFileW(
+                null_name.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if null_handle.is_null() || null_handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        let previous = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, null_handle) } == 0 {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(null_handle) };
+            return Err(error);
+        }
+        if !previous.is_null() && previous != INVALID_HANDLE_VALUE && previous != null_handle {
+            unsafe { CloseHandle(previous) };
+        }
+        // The new standard handle remains open until process exit and is
+        // intentionally not wrapped in a Rust-owned file object.
+        Ok(())
+    }
+
     pub(super) fn read_child_pipe_interruptibly<R: io::Read + AsRawHandle>(
         reader: &mut R,
         stop: &AtomicBool,
@@ -319,7 +393,19 @@ mod platform {
             command: &mut Command,
             name: Option<&str>,
         ) -> io::Result<(Child, Self)> {
-            let job = Self::create(name)?;
+            Self::spawn_with_lifetime(command, name, true)
+        }
+
+        pub(super) fn spawn_detached(command: &mut Command) -> io::Result<(Child, Self)> {
+            Self::spawn_with_lifetime(command, None, false)
+        }
+
+        fn spawn_with_lifetime(
+            command: &mut Command,
+            name: Option<&str>,
+            kill_on_close: bool,
+        ) -> io::Result<(Child, Self)> {
+            let job = Self::create_with_lifetime(name, kill_on_close)?;
             command.creation_flags(CREATE_SUSPENDED);
             let mut child = command.spawn()?;
             let process = child.as_raw_handle().cast();
@@ -384,6 +470,10 @@ mod platform {
         }
 
         pub(super) fn create(name: Option<&str>) -> io::Result<Self> {
+            Self::create_with_lifetime(name, true)
+        }
+
+        fn create_with_lifetime(name: Option<&str>, kill_on_close: bool) -> io::Result<Self> {
             if let Some(name) = name {
                 validate_name(name)?;
             }
@@ -399,19 +489,21 @@ mod platform {
             if handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured = unsafe {
-                SetInformationJobObject(
-                    handle,
-                    JobObjectExtendedLimitInformation,
-                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            };
-            if configured == 0 {
-                unsafe { CloseHandle(handle) };
-                return Err(io::Error::last_os_error());
+            if kill_on_close {
+                let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let configured = unsafe {
+                    SetInformationJobObject(
+                        handle,
+                        JobObjectExtendedLimitInformation,
+                        (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                        size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    )
+                };
+                if configured == 0 {
+                    unsafe { CloseHandle(handle) };
+                    return Err(io::Error::last_os_error());
+                }
             }
             Ok(Self { handle })
         }

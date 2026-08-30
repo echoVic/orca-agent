@@ -2126,8 +2126,10 @@ mod tests {
 
     #[test]
     fn read_only_profile_can_carry_only_explicit_write_roots() {
-        let cwd = PathBuf::from("/workspace");
-        let approved = PathBuf::from("/approved-output");
+        let cwd = std::env::current_dir()
+            .expect("current directory")
+            .join("orca-shell-test-workspace");
+        let approved = cwd.join("approved-output");
         let command = ShellSessionCommand {
             command: "true".to_string(),
             argv: None,

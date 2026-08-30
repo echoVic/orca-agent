@@ -30,6 +30,13 @@ filesystem roots and target sets, so a forged or stale materialized capability
 cannot widen the parent after resolution. MCP stdio integrations declare
 capabilities in user-owned configuration and default to read-only.
 
+Permission glob evaluation is deliberately strict: when several rules for the
+same tool/target match, the most restrictive decision wins (`deny` over
+`prompt` over `allow`), independent of declaration order. On Windows the
+pattern and target are ASCII-folded before matching to follow the host
+filesystem and command-name case rules; this does not change path containment,
+which remains canonical and case-aware at the OS boundary.
+
 ## Process ownership
 
 `ExecutionBroker` is the process-launch choke point used by runtime shells,
@@ -48,6 +55,13 @@ process class, final boolean capabilities, cwd, roots, network targets, backend
 name, and enforcement state.
 The JSONL permission event includes the command, cwd, and the same capability
 context so a client can make a decision from the actual launch boundary.
+
+Long-lived workflow CLI workers use a separate lifecycle contract: the worker
+is launched through the broker's explicit detached user-trusted path, emits one
+JSON launch receipt, then detaches stdout before running the workflow. The
+launcher therefore observes handshake EOF immediately; durable workflow state,
+not an inherited pipe or launcher process lifetime, owns pause, stop, resume,
+and terminal-state recovery.
 
 ## Paths and denial evidence
 

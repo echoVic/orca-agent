@@ -35,6 +35,10 @@ use orca_runtime::tasks::TaskRegistry;
 use serde_json::Value;
 use tempfile::tempdir;
 
+fn hook_test_cwd() -> String {
+    std::env::temp_dir().display().to_string()
+}
+
 #[path = "support/sandbox_test_parent.rs"]
 mod sandbox_test_support;
 
@@ -352,7 +356,7 @@ fn task_actor_runs_pre_model_hook_and_returns_injected_context() {
     }]);
 
     let outcome = actor
-        .run_pre_model_hook(&hooks, "/tmp")
+        .run_pre_model_hook(&hooks, &hook_test_cwd())
         .expect("pre model hook");
 
     assert_eq!(outcome.injected_context, vec!["actor hook context"]);
@@ -372,7 +376,7 @@ fn task_actor_formats_post_model_hook_failure_as_warning() {
     let warning = actor
         .run_post_model_hook(
             &hooks,
-            "/tmp",
+            &hook_test_cwd(),
             Some(&Usage {
                 input_tokens: 1,
                 output_tokens: 2,
@@ -483,7 +487,7 @@ fn task_actor_runs_pre_tool_hook_and_formats_blocked_result() {
     }]);
 
     let blocked = actor
-        .run_pre_tool_hook(&hooks, "/tmp", &request)
+        .run_pre_tool_hook(&hooks, &hook_test_cwd(), &request)
         .expect_err("blocked result");
 
     assert_eq!(blocked.status, orca_core::tool_types::ToolStatus::Failed);
@@ -513,7 +517,7 @@ fn task_actor_formats_post_tool_hook_failure_as_warning() {
     }]);
 
     let warning = actor
-        .run_post_tool_hook(&hooks, "/tmp", &request, &result)
+        .run_post_tool_hook(&hooks, &hook_test_cwd(), &request, &result)
         .expect("post tool warning");
 
     assert!(warning.contains("post_tool_use hook failed"));
@@ -1467,7 +1471,7 @@ fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution()
     ));
 
     let pre_tool_outcome = context
-        .run_pre_tool_hook(&hooks, "/tmp", &request)
+        .run_pre_tool_hook(&hooks, &hook_test_cwd(), &request)
         .expect("pre tool hook");
     assert!(pre_tool_outcome.modified_target.is_none());
     assert!(pre_tool_outcome.injected_context.is_empty());
@@ -1498,7 +1502,12 @@ fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution()
 
     assert!(
         context
-            .run_post_tool_hook(&HookRunner::new(Vec::new()), "/tmp", &request, &result)
+            .run_post_tool_hook(
+                &HookRunner::new(Vec::new()),
+                &hook_test_cwd(),
+                &request,
+                &result
+            )
             .is_none()
     );
 
@@ -2184,18 +2193,10 @@ fn tool_request(name: ToolName) -> ToolRequest {
 fn sandbox_seatbelt_available() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let available = std::process::Command::new("/usr/bin/sandbox-exec")
-            .arg("-p")
-            .arg("(version 1) (allow default)")
-            .arg("true")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        assert!(
-            available,
-            "macOS Seatbelt is required for sandbox contract tests"
-        );
-        available
+        matches!(
+            orca_tools::sandbox::enforcement_state(),
+            orca_core::capability::EnforcementState::Enforced
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -18,7 +18,7 @@ mod tests {
                 "broker-1",
                 CapabilityProcessClass::SandboxedTool,
                 CapabilitySet::read_only(),
-                "/workspace",
+                std::env::current_dir().expect("current directory"),
             ),
             CapabilitySet::read_only(),
             orca_core::approval_types::ApprovalMode::Plan,

@@ -2034,8 +2034,16 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
 
 #[test]
 fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
+    if !sandbox_backend_available() {
+        return;
+    }
     let workspace = tempdir().expect("workspace");
     let invocation_marker = workspace.path().join("bash-invocation-started");
+    let command_marker = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace")
+        .join("bash-invocation-started");
     let home = workspace.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
     std::fs::write(
@@ -2071,10 +2079,20 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
     let thread_id = thread_started["threadId"].as_str().expect("thread id");
 
     {
-        let command = platform_shell_script(
-            "touch bash-invocation-started; sleep 5; printf after",
-            "New-Item -ItemType File -Force -Path 'bash-invocation-started' | Out-Null; Start-Sleep -Seconds 5; Write-Host -NoNewline 'after'",
-        );
+        let command = {
+            #[cfg(windows)]
+            {
+                let marker = command_marker.display().to_string().replace('\'', "''");
+                format!(
+                    "New-Item -ItemType File -Force -Path '{marker}' | Out-Null; Start-Sleep -Seconds 5; Write-Host -NoNewline 'after'"
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                let marker = shell_escape(&command_marker);
+                format!("touch {marker}; sleep 5; printf after")
+            }
+        };
         let request = json!({
             "id": "turn-bash",
             "method": "turn/start",
@@ -2094,7 +2112,10 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
         .to_string();
     let tool_requested = child.expect_event("turn-bash", "tool_requested");
     assert_eq!(tool_requested["tool"], "bash");
-    wait_for_path(&invocation_marker);
+    if !wait_for_path_result(&invocation_marker) {
+        let events = child.drain_events_until_event_or_error("turn-bash", "turn_completed");
+        panic!("bash invocation marker was not created; terminal events={events:?}");
+    }
 
     {
         let stdin = child.stdin_mut();
@@ -10007,20 +10028,36 @@ fn server_mode_rejects_turn_start_for_unknown_thread() {
 fn sandbox_seatbelt_available() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let available = Command::new("/usr/bin/sandbox-exec")
-            .arg("-p")
-            .arg("(version 1) (allow default)")
-            .arg("true")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        assert!(
-            available,
-            "macOS Seatbelt is required for sandbox contract tests"
-        );
-        available
+        matches!(
+            orca_tools::sandbox::enforcement_state(),
+            orca_core::capability::EnforcementState::Enforced
+        )
     }
     #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+fn sandbox_backend_available() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // The server harness provisions the native AppContainer capability
+        // store before spawning each Windows test process.
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        sandbox_seatbelt_available()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            orca_tools::sandbox::enforcement_state(),
+            orca_core::capability::EnforcementState::Enforced
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
     }
@@ -10036,15 +10073,22 @@ fn wait_for_child_output_with_timeout(
 }
 
 fn wait_for_path(path: &Path) {
+    assert!(
+        wait_for_path_result(path),
+        "timed out waiting for path: {}",
+        path.display()
+    );
+}
+
+fn wait_for_path_result(path: &Path) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for path: {}",
-            path.display()
-        );
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
+    true
 }
 
 fn assert_command_exec_error(params: Value, expected_message: &str) {

@@ -478,6 +478,7 @@ impl CapabilityReceipt {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     use super::{
         CapabilityCeiling, CapabilityProcessClass, CapabilityReceipt, CapabilityRequest,
@@ -485,6 +486,12 @@ mod tests {
         SandboxDenialSource,
     };
     use crate::approval_types::ApprovalMode;
+
+    fn test_workspace() -> PathBuf {
+        std::env::current_dir()
+            .expect("current directory")
+            .join("orca-capability-test-workspace")
+    }
 
     #[test]
     fn plan_is_a_hard_read_only_ceiling() {
@@ -516,7 +523,7 @@ mod tests {
             "req-1",
             CapabilityProcessClass::SandboxedTool,
             EnforcementState::Enforced,
-            "/workspace",
+            test_workspace(),
             "landlock+seccomp",
         );
         let encoded = serde_json::to_string(&receipt).expect("serialize receipt");
@@ -532,7 +539,7 @@ mod tests {
             "req-denied",
             SandboxDenialSource::Kernel,
             "landlock",
-            Some("/workspace/.git/index.lock".into()),
+            Some(test_workspace().join(".git/index.lock")),
             "write",
         );
         let encoded = serde_json::to_string(&receipt).expect("serialize denial receipt");
@@ -549,7 +556,7 @@ mod tests {
             "req-2",
             CapabilityProcessClass::SandboxedTool,
             CapabilitySet::all(),
-            "/workspace",
+            test_workspace(),
         );
         let effective = EffectiveCapability::resolve(
             request,
@@ -568,7 +575,7 @@ mod tests {
             "req-3",
             CapabilityProcessClass::SandboxedTool,
             CapabilitySet::workspace_write(),
-            "/workspace",
+            test_workspace(),
         );
 
         assert!(
@@ -583,14 +590,20 @@ mod tests {
             "req-roots",
             CapabilityProcessClass::SandboxedTool,
             CapabilitySet::workspace_write(),
-            "/workspace",
+            test_workspace(),
         );
-        request.read_roots = vec!["/workspace/src".into(), "/outside".into()];
-        request.write_roots = vec!["/workspace".into()];
+        let workspace = test_workspace();
+        let source = workspace.join("src");
+        let outside = workspace
+            .parent()
+            .expect("workspace parent")
+            .join("orca-capability-test-outside");
+        request.read_roots = vec![source.clone(), outside];
+        request.write_roots = vec![workspace.clone()];
         let ceiling = super::CapabilityCeiling {
             capabilities: CapabilitySet::workspace_write(),
-            read_roots: Some(vec!["/workspace".into()]),
-            write_roots: Some(vec!["/workspace/src".into()]),
+            read_roots: Some(vec![workspace]),
+            write_roots: Some(vec![source.clone()]),
             metadata_roots: None,
             denied_roots: Vec::new(),
             network_targets: None,
@@ -599,14 +612,8 @@ mod tests {
         let effective = EffectiveCapability::resolve(request, ceiling, ApprovalMode::AutoEdit)
             .expect("resolve roots");
 
-        assert_eq!(
-            effective.read_roots,
-            vec![std::path::PathBuf::from("/workspace/src")]
-        );
-        assert_eq!(
-            effective.write_roots,
-            vec![std::path::PathBuf::from("/workspace/src")]
-        );
+        assert_eq!(effective.read_roots, vec![source.clone()]);
+        assert_eq!(effective.write_roots, vec![source]);
     }
 
     #[test]
@@ -615,10 +622,12 @@ mod tests {
             "req-final-subset",
             CapabilityProcessClass::SandboxedTool,
             CapabilitySet::workspace_write(),
-            "/workspace",
+            test_workspace(),
         );
-        request.read_roots = vec!["/workspace/src".into()];
-        request.write_roots = vec!["/workspace/src".into()];
+        let workspace = test_workspace();
+        let source = workspace.join("src");
+        request.read_roots = vec![source.clone()];
+        request.write_roots = vec![source.clone()];
         request
             .network_targets
             .insert("api.example.com".to_string());
@@ -626,8 +635,8 @@ mod tests {
             request,
             CapabilityCeiling {
                 capabilities: CapabilitySet::workspace_write(),
-                read_roots: Some(vec!["/workspace".into()]),
-                write_roots: Some(vec!["/workspace".into()]),
+                read_roots: Some(vec![workspace.clone()]),
+                write_roots: Some(vec![workspace.clone()]),
                 metadata_roots: None,
                 denied_roots: Vec::new(),
                 network_targets: Some(["api.example.com".to_string()].into_iter().collect()),
@@ -638,8 +647,8 @@ mod tests {
 
         let mut narrowed = CapabilityCeiling {
             capabilities: CapabilitySet::workspace_write(),
-            read_roots: Some(vec!["/workspace/src".into()]),
-            write_roots: Some(vec!["/workspace/src".into()]),
+            read_roots: Some(vec![source]),
+            write_roots: Some(vec![workspace.join("src")]),
             metadata_roots: None,
             denied_roots: Vec::new(),
             network_targets: Some(BTreeSet::new()),
@@ -655,7 +664,7 @@ mod tests {
             "req-network",
             CapabilityProcessClass::UserTrustedIntegration,
             CapabilitySet::all(),
-            "/workspace",
+            test_workspace(),
         );
         request.network_targets = ["api.example.com", "evil.example.com"]
             .into_iter()
@@ -700,7 +709,7 @@ mod tests {
             "req-parent",
             CapabilityProcessClass::SandboxedTool,
             CapabilitySet::read_only(),
-            "/workspace/../outside",
+            format!("{}/../outside", test_workspace().display()),
         );
 
         assert_eq!(
@@ -715,7 +724,7 @@ mod tests {
             "req-trusted-spoof",
             CapabilityProcessClass::UserTrustedIntegration,
             CapabilitySet::read_only(),
-            "/workspace",
+            test_workspace(),
         );
 
         assert_eq!(
@@ -730,7 +739,7 @@ mod tests {
             "req-not-trusted",
             CapabilityProcessClass::SandboxedTool,
             CapabilitySet::read_only(),
-            "/workspace",
+            test_workspace(),
         );
 
         assert_eq!(

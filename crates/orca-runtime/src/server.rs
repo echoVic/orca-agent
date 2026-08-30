@@ -1396,6 +1396,7 @@ fn run_command_exec<W: Write>(
                 command_event_id: id.clone(),
                 command: command.to_vec(),
                 cwd: cwd.clone(),
+                display_cwd: requested_cwd.clone(),
                 stream_output: terminal.is_pty() || options.stream_stdout_stderr,
                 output_bytes_cap: options
                     .output_bytes_cap
@@ -3253,6 +3254,7 @@ mod tests {
                     command_event_id: Value::from("cmd-shell-list"),
                     command: test_command_argv("true"),
                     cwd: cwd.path().to_path_buf(),
+                    display_cwd: cwd.path().to_path_buf(),
                     stream_output: false,
                     output_bytes_cap: None,
                     output_offset: 0,
@@ -5411,6 +5413,7 @@ enabled = true
             command_event_id: Value::from("cmd"),
             command: test_command_argv("true"),
             cwd: std::env::temp_dir(),
+            display_cwd: std::env::temp_dir(),
             stream_output: false,
             output_bytes_cap: None,
             output_offset: 0,

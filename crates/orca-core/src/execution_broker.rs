@@ -68,7 +68,7 @@ impl ExecutionBroker {
         command: Command,
         capability: EffectiveCapability,
     ) -> Result<BrokerLaunch, LaunchError> {
-        self.launch_inner(command, capability, None, false)
+        self.launch_inner(command, capability, None, false, false)
     }
 
     pub fn launch_named(
@@ -77,7 +77,7 @@ impl ExecutionBroker {
         capability: EffectiveCapability,
         job_name: &str,
     ) -> Result<BrokerLaunch, LaunchError> {
-        self.launch_inner(command, capability, Some(job_name), false)
+        self.launch_inner(command, capability, Some(job_name), false, false)
     }
 
     /// Authorize a platform-native launcher that cannot return a standard
@@ -117,6 +117,7 @@ impl ExecutionBroker {
         capability: EffectiveCapability,
         job_name: Option<&str>,
         allow_user_trusted: bool,
+        detached: bool,
     ) -> Result<BrokerLaunch, LaunchError> {
         self.validate_capability(&capability, allow_user_trusted)?;
 
@@ -126,9 +127,16 @@ impl ExecutionBroker {
         crate::workspace_identity::attach_stable_cwd(&mut command, &capability.cwd)
             .map_err(LaunchError::Cwd)?;
 
-        let (child, process_job) = match job_name {
-            Some(job_name) => ProcessJob::spawn_named(&mut command, job_name),
-            None => ProcessJob::spawn(&mut command),
+        let (child, process_job) = match (job_name, detached) {
+            (Some(_), true) => {
+                return Err(LaunchError::Spawn(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "detached launches cannot use a named process job",
+                )));
+            }
+            (Some(job_name), false) => ProcessJob::spawn_named(&mut command, job_name),
+            (None, true) => ProcessJob::spawn_detached(&mut command),
+            (None, false) => ProcessJob::spawn(&mut command),
         }
         .map_err(LaunchError::Spawn)?;
         let receipt = capability.receipt(self.enforcement, self.backend.clone());
@@ -185,7 +193,20 @@ impl ExecutionBroker {
         cwd: impl Into<PathBuf>,
         capabilities: crate::capability::CapabilitySet,
     ) -> Result<BrokerLaunch, LaunchError> {
-        self.launch_user_trusted_inner(command, request_id, cwd, capabilities, None)
+        self.launch_user_trusted_inner(command, request_id, cwd, capabilities, None, false)
+    }
+
+    /// Launch an explicitly user-owned worker that must outlive this process.
+    /// The detached process job has no kill-on-close policy; durable worker
+    /// state and explicit stop/reap operations remain responsible for cleanup.
+    pub fn launch_user_trusted_detached(
+        &self,
+        command: Command,
+        request_id: impl Into<String>,
+        cwd: impl Into<PathBuf>,
+        capabilities: crate::capability::CapabilitySet,
+    ) -> Result<BrokerLaunch, LaunchError> {
+        self.launch_user_trusted_inner(command, request_id, cwd, capabilities, None, true)
     }
 
     pub fn launch_user_trusted_named(
@@ -196,7 +217,14 @@ impl ExecutionBroker {
         capabilities: crate::capability::CapabilitySet,
         job_name: &str,
     ) -> Result<BrokerLaunch, LaunchError> {
-        self.launch_user_trusted_inner(command, request_id, cwd, capabilities, Some(job_name))
+        self.launch_user_trusted_inner(
+            command,
+            request_id,
+            cwd,
+            capabilities,
+            Some(job_name),
+            false,
+        )
     }
 
     fn launch_user_trusted_inner(
@@ -206,6 +234,7 @@ impl ExecutionBroker {
         cwd: impl Into<PathBuf>,
         capabilities: crate::capability::CapabilitySet,
         job_name: Option<&str>,
+        detached: bool,
     ) -> Result<BrokerLaunch, LaunchError> {
         // User-owned integrations may originate from hook/configuration
         // contexts that still carry a relative cwd. Resolve it once at the
@@ -224,7 +253,7 @@ impl ExecutionBroker {
             crate::approval_types::ApprovalMode::FullAuto,
         )
         .map_err(|_| LaunchError::EnforcementAdvisory)?;
-        self.launch_inner(command, effective, job_name, true)
+        self.launch_inner(command, effective, job_name, true, detached)
     }
 }
 
