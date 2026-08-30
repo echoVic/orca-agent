@@ -22059,8 +22059,8 @@ mod tests {
     fn subagent_activity_dedupe_cache_evicts_oldest_entry() {
         let mut cache = VecDeque::new();
         for index in 0..=SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
-            let id = surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
-                .unwrap();
+            let id =
+                surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
             let digest = surface::Sha256Digest::new([index as u8; 32]);
             if cache.len() >= SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
                 cache.pop_front();

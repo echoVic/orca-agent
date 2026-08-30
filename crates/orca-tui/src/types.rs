@@ -17,8 +17,8 @@ use orca_core::proposed_plan::ProposedPlanStreamParser;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_file_search::{SearchPhase, SearchProgress};
 use orca_runtime::history::SessionSummary;
-use orca_runtime::onboarding::FirstRunState;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
+use orca_runtime::onboarding::FirstRunState;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 #[cfg(test)]
 use orca_runtime::surface::SurfaceOperationId;

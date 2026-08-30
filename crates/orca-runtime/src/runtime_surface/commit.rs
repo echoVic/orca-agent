@@ -2114,7 +2114,10 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
 
     /// Look up a previously committed batch by id for idempotent command
     /// retries after the caller lost the original reply.
-    pub fn lookup_commit(&self, commit_id: &super::SurfaceCommitId) -> Option<super::SurfaceBatchReceipt> {
+    pub fn lookup_commit(
+        &self,
+        commit_id: &super::SurfaceCommitId,
+    ) -> Option<super::SurfaceBatchReceipt> {
         self.ledger.lookup_commit(commit_id)
     }
 
@@ -13120,6 +13123,7 @@ mod tests {
             started_at: Some(super::super::UnixMillis::new(1)),
             completed_at: None,
             parent_operation: Some(fence.operation_id.clone()),
+            parent_task_id: None,
             background_fence: None,
             workflow_run_id: None,
             subagent_id: Some(agent_id.clone()),
@@ -13132,6 +13136,7 @@ mod tests {
         });
         snapshot.subagents.push(super::super::SurfaceSubagent {
             subagent_id: agent_id.clone(),
+            task_id: task_id.clone(),
             revision: super::super::SubagentRevision::try_new(1).unwrap(),
             description: super::super::DisplayText::new("child agent"),
             status: super::super::SurfaceSubagentStatus::Running,

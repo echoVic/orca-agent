@@ -4362,7 +4362,8 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                                 .checks
                                 .iter()
                                 .filter(|check| {
-                                    check.status == orca_runtime::diagnostics::DiagnosticStatus::Pass
+                                    check.status
+                                        == orca_runtime::diagnostics::DiagnosticStatus::Pass
                                 })
                                 .count(),
                             first_run
@@ -4370,7 +4371,8 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                                 .checks
                                 .iter()
                                 .filter(|check| {
-                                    check.status == orca_runtime::diagnostics::DiagnosticStatus::Warn
+                                    check.status
+                                        == orca_runtime::diagnostics::DiagnosticStatus::Warn
                                 })
                                 .count(),
                             first_run
@@ -4378,7 +4380,8 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                                 .checks
                                 .iter()
                                 .filter(|check| {
-                                    check.status == orca_runtime::diagnostics::DiagnosticStatus::Fail
+                                    check.status
+                                        == orca_runtime::diagnostics::DiagnosticStatus::Fail
                                 })
                                 .count(),
                         ),

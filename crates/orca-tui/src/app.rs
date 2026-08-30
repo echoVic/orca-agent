@@ -168,10 +168,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let first_run_result = onboarding::inspect_first_run(&config);
     let first_run = first_run_result.as_ref().ok().cloned();
     let first_run_error = first_run_result.err().map(|error| error.to_string());
-    let needs_disclosure = first_run_error.is_some()
-        || first_run
-            .as_ref()
-            .is_none_or(|state| !state.acknowledged);
+    let needs_disclosure =
+        first_run_error.is_some() || first_run.as_ref().is_none_or(|state| !state.acknowledged);
     let needs_setup = config.api_key.is_none() || needs_disclosure;
     let should_show_picker = config.show_session_picker
         && !needs_setup

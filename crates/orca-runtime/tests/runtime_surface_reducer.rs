@@ -2459,7 +2459,7 @@ fn task_parent_must_exist_and_cannot_reference_itself() {
     let self_cycle = batch(
         &initial,
         5_902,
-        vec![ (
+        vec![(
             SurfaceScope::Thread,
             SurfaceEvent::Task(TaskPatch::Upserted {
                 expected_revision: None,
