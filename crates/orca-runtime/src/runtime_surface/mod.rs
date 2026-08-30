@@ -265,6 +265,9 @@ pub use reducer::{
     canonical_batch_encoded_bytes, canonical_event_digest, canonical_replayability_digest,
     preflight_batch, reduce_batch,
 };
+pub(crate) use reducer::{
+    detached_child_permission_interaction_matches, generation_child_permission_interaction_matches,
+};
 
 pub use store::{
     CommitProbe, DurableBatchReceipt, DurableFinalizeIntent, EphemeralBatchReceipt,

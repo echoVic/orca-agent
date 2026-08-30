@@ -185,48 +185,31 @@ impl DetachedPermissionHandler {
             .enqueue_detached_permission_request(&self.binding, scoped.clone())
             .map_err(io::Error::other)?;
         let deadline = Instant::now() + self.wait_timeout;
+        let terminal_error = |kind: io::ErrorKind, message: &str| {
+            self.persist_terminal_deny(&key)
+                .err()
+                .map_or_else(
+                    || io::Error::new(kind, message),
+                    |error| {
+                        io::Error::new(
+                            kind,
+                            format!("{message}; failed to persist terminal denial: {error}"),
+                        )
+                    },
+                )
+        };
         loop {
             if self.cancel.is_cancelled() {
-                return Err(self
-                    .persist_terminal_deny(&key)
-                    .err()
-                    .map_or_else(
-                        || {
-                            io::Error::new(
-                                io::ErrorKind::Interrupted,
-                                "detached permission request was cancelled",
-                            )
-                        },
-                        |error| {
-                            io::Error::new(
-                                io::ErrorKind::Interrupted,
-                                format!(
-                                    "detached permission request was cancelled; failed to persist terminal denial: {error}"
-                                ),
-                            )
-                        },
-                    ));
+                return Err(terminal_error(
+                    io::ErrorKind::Interrupted,
+                    "detached permission request was cancelled",
+                ));
             }
             if Instant::now() >= deadline {
-                return Err(self
-                    .persist_terminal_deny(&key)
-                    .err()
-                    .map_or_else(
-                        || {
-                            io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "detached permission request timed out waiting for the runtime actor",
-                            )
-                        },
-                        |error| {
-                            io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                format!(
-                                    "detached permission request timed out waiting for the runtime actor; failed to persist terminal denial: {error}"
-                                ),
-                            )
-                        },
-                    ));
+                return Err(terminal_error(
+                    io::ErrorKind::TimedOut,
+                    "detached permission request timed out waiting for the runtime actor",
+                ));
             }
             let Some(record) = self
                 .registry
@@ -281,6 +264,22 @@ impl DetachedPermissionHandler {
                 ));
             }
             if let Some(response) = record.response.clone() {
+                // Cancellation/timeout may race with the mailbox read.  Treat
+                // either condition as the linearization point before
+                // consuming an actor response; otherwise a late Allow could
+                // escape after the child has already been cancelled.
+                if self.cancel.is_cancelled() {
+                    return Err(terminal_error(
+                        io::ErrorKind::Interrupted,
+                        "detached permission request was cancelled",
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err(terminal_error(
+                        io::ErrorKind::TimedOut,
+                        "detached permission request timed out waiting for the runtime actor",
+                    ));
+                }
                 if record.permission_response_public_key
                     != self.binding.permission_response_public_key
                     || !record.verify_response_signature_with_key(
@@ -305,6 +304,12 @@ impl DetachedPermissionHandler {
                         &response_digest,
                     )
                     .map_err(io::Error::other)?;
+                if self.cancel.is_cancelled() {
+                    return Err(terminal_error(
+                        io::ErrorKind::Interrupted,
+                        "detached permission request was cancelled",
+                    ));
+                }
                 return Ok(response);
             }
             thread::sleep(Duration::from_millis(50));
@@ -587,13 +592,25 @@ mod tests {
                 },
             })
             .expect("prepared continuation");
+        let parent_fence = crate::runtime_surface::SurfaceOperationFence {
+            thread_id: crate::runtime_surface::SurfaceThreadId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            thread_owner_epoch: crate::runtime_surface::ThreadOwnerEpoch::new(1),
+            operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            generation_id: crate::runtime_surface::SurfaceGenerationId::new(1),
+        };
         let binding = registry
             .register_detached_subagent_binding(
                 &task.id,
                 &task.id,
                 prepared.attempt_id,
                 TaskRevision::try_new(1).unwrap(),
-                None,
+                Some(parent_fence),
             )
             .expect("detached binding");
         let identity = ChildPermissionIdentity::new(

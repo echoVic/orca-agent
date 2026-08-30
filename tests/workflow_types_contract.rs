@@ -92,6 +92,7 @@ fn workflow_tool_name_round_trips() {
 fn background_task_summary_matches_sdk_names() {
     let summary = BackgroundTaskSummary {
         id: "task-1".to_string(),
+        parent_task_id: None,
         task_type: TaskType::Workflow,
         status: TaskStatus::Running,
         is_backgrounded: false,

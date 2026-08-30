@@ -446,6 +446,10 @@ struct SubagentWorkerArgs {
     #[arg(long)]
     request_json: String,
 
+    /// Actor-issued public key used to authenticate detached permission responses.
+    #[arg(long, hide = true)]
+    permission_response_public_key: String,
+
     /// Parent git repository root for isolated worktree cleanup.
     #[arg(long)]
     worktree_repo_root: Option<PathBuf>,
@@ -581,6 +585,7 @@ impl From<SubagentWorkerArgs> for orca_runtime::command::launch::SubagentWorkerL
             agent_id: args.agent_id,
             subagent_depth: args.subagent_depth,
             request_json: args.request_json,
+            permission_response_public_key: args.permission_response_public_key,
             worktree_repo_root: args.worktree_repo_root,
             worktree_path: args.worktree_path,
         }

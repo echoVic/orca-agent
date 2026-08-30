@@ -1476,6 +1476,12 @@ pub(crate) fn workflow_task_summaries(
         .tasks
         .iter()
         .map(|task| {
+            let subagent = task.subagent_id.as_ref().and_then(|subagent_id| {
+                snapshot
+                    .subagents
+                    .iter()
+                    .find(|subagent| &subagent.subagent_id == subagent_id)
+            });
             let workflow = task.workflow_run_id.as_ref().and_then(|run_id| {
                 snapshot
                     .workflows
@@ -1567,8 +1573,10 @@ pub(crate) fn workflow_task_summaries(
                     })
                     .unwrap_or_default(),
                 usage: task.usage.as_ref().map(core_usage_totals),
-                subagent_current_activity: None,
-                subagent_turn: None,
+                subagent_current_activity: subagent
+                    .and_then(|subagent| subagent.activity.as_ref())
+                    .map(|activity| activity.as_str().to_string()),
+                subagent_turn: subagent.and_then(|subagent| subagent.turn),
                 last_activity_at_ms: task.completed_at.or(task.started_at).map(UnixMillis::get),
                 continuation: None,
                 result: task.result.as_ref().map(|value| value.as_str().to_string()),

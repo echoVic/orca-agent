@@ -1,7 +1,766 @@
 // Mechanical ThreadActor method boundary; state ownership lives in runtime_actor controllers.
 use super::*;
 
+const DETACHED_PERMISSION_DRAIN_LIMIT: usize = 32;
+
+enum DetachedPermissionAdmissionError {
+    Deferred(String),
+    Denied(String),
+}
+
 impl ThreadActor {
+    /// Consume durable permission requests emitted by detached child workers.
+    ///
+    /// The mailbox is intentionally drained by the actor (rather than by a
+    /// UI adapter): this keeps owner/fence validation and the interaction
+    /// commit in one serialization domain. A request is only removed by the
+    /// child after the actor has persisted a response, so retries here are
+    /// naturally idempotent.
+    pub(super) fn drain_detached_permission_requests(&mut self, active: Option<&ActiveOperation>) {
+        // A sessionless actor can receive the periodic tick before a typed
+        // surface is admitted.  There is no resident waiter to retry in that
+        // state, and touching the fail-fast surface slot would panic.
+        if self.resident_surface.0.is_none() {
+            return;
+        }
+        // A surface resolution is committed before the detached mailbox is
+        // updated. Retry any response whose first persistence attempt failed
+        // before admitting new requests; the resident waiter is deliberately
+        // retained until this succeeds.
+        self.retry_detached_permission_resolutions();
+        let registry = active
+            .map(|active| active.task_registry.clone())
+            .or_else(|| {
+                self.state
+                    .as_ref()
+                    .map(|state| state.thread.session().task_registry().clone())
+            });
+        let Some(registry) = registry else {
+            return;
+        };
+        if let Err(error) = registry.prune_detached_permission_requests() {
+            eprintln!("orca: detached permission mailbox compaction failed: {error}");
+        }
+        let requests = match registry.detached_permission_requests() {
+            Ok(requests) => requests,
+            Err(error) => {
+                eprintln!("orca: detached permission mailbox scan failed: {error}");
+                return;
+            }
+        };
+        for request in requests
+            .into_iter()
+            .filter(DetachedPermissionRequest::is_pending)
+            .take(DETACHED_PERMISSION_DRAIN_LIMIT)
+        {
+            match self.admit_detached_permission_request(&registry, &request) {
+                Ok(()) => {}
+                Err(DetachedPermissionAdmissionError::Deferred(_reason)) => {
+                    // A child can publish its mailbox entry just before its
+                    // Started/activity frame reaches the surface. Keep the
+                    // entry pending and let the next actor tick retry it.
+                }
+                Err(DetachedPermissionAdmissionError::Denied(reason)) => {
+                    // Invalid owner material is terminal for this request.
+                    // Persisting a deny wakes the child and prevents an
+                    // unbounded mailbox entry from blocking thread close.
+                    eprintln!(
+                        "orca: denying detached permission request {}: {reason}",
+                        request.key
+                    );
+                    if let Err(error) = resolve_detached_permission_deny(
+                        &registry,
+                        &request.key,
+                        &request.request_digest,
+                        &reason,
+                    ) {
+                        eprintln!(
+                            "orca: detached permission denial remains pending for {}: {error}",
+                            request.key
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Finish mailbox settlement for a detached interaction whose public
+    /// surface resolution already committed. The durable receipt contains the
+    /// exact permission profile, so this remains recoverable without retaining
+    /// the client's private response or issuing a second prompt.
+    fn retry_detached_permission_resolutions(&mut self) {
+        let candidates = self
+            .resident_surface
+            .interactions
+            .iter()
+            .filter_map(|(interaction_id, interaction)| {
+                let ResidentInteractionWaiter::DetachedPermission {
+                    registry,
+                    key,
+                    request_digest,
+                } = interaction.waiter.as_ref()?
+                else {
+                    return None;
+                };
+                let receipt = interaction.winning_receipt.as_ref()?;
+                let response = detached_permission_response_from_receipt(receipt)?;
+                Some((
+                    interaction_id.clone(),
+                    registry.clone(),
+                    key.clone(),
+                    request_digest.clone(),
+                    response,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (interaction_id, registry, key, request_digest, response) in candidates {
+            let expected_response = response.clone();
+            match registry.resolve_detached_permission_request(&key, &request_digest, response) {
+                Ok(()) => {
+                    if let Some(interaction) =
+                        self.resident_surface.interactions.get_mut(&interaction_id)
+                        && matches!(
+                            interaction.waiter.as_ref(),
+                            Some(ResidentInteractionWaiter::DetachedPermission {
+                                key: current_key,
+                                request_digest: current_digest,
+                                ..
+                            }) if current_key == &key && current_digest == &request_digest
+                        )
+                    {
+                        interaction.waiter = None;
+                        interaction.private_response = None;
+                    }
+                }
+                Err(error) => {
+                    // The child may have acknowledged the response, or a
+                    // fail-closed cancellation may have won the race, between
+                    // our scan and this retry. A missing record is already
+                    // acknowledged; an existing record only settles this
+                    // waiter when it contains the exact response we tried to
+                    // persist. A different response is a conflict and must
+                    // remain visible for diagnosis/recovery.
+                    let terminal = match registry.detached_permission_request(&key) {
+                        Ok(None) => true,
+                        Ok(Some(record)) => record.response.as_ref() == Some(&expected_response),
+                        Err(_) => false,
+                    };
+                    if terminal {
+                        if let Some(interaction) =
+                            self.resident_surface.interactions.get_mut(&interaction_id)
+                            && matches!(
+                                interaction.waiter.as_ref(),
+                                Some(ResidentInteractionWaiter::DetachedPermission {
+                                    key: current_key,
+                                    request_digest: current_digest,
+                                    ..
+                                }) if current_key == &key && current_digest == &request_digest
+                            )
+                        {
+                            interaction.waiter = None;
+                            interaction.private_response = None;
+                        }
+                    } else {
+                        eprintln!(
+                            "orca: detached permission response settlement deferred for {key}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn admit_detached_permission_request(
+        &mut self,
+        registry: &TaskRegistry,
+        mailbox: &DetachedPermissionRequest,
+    ) -> Result<(), DetachedPermissionAdmissionError> {
+        let crate::runtime_permission::RuntimePermissionContext::Child {
+            task_id,
+            task_revision,
+            agent_id,
+            agent_revision,
+            activity_id: _activity_id,
+            turn_id,
+            tool_call_id,
+            origin,
+        } = &mailbox.request.context
+        else {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission request is not child-owned".to_string(),
+            ));
+        };
+        let binding = match registry.detached_subagent_binding(task_id.as_str()) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "detached subagent owner binding is missing or stale".to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(DetachedPermissionAdmissionError::Deferred(format!(
+                    "owner binding lookup failed: {error}"
+                )));
+            }
+        };
+        let expected_key = format!(
+            "{}:{}:{}",
+            binding.task_id,
+            binding.attempt_id.as_str(),
+            mailbox.request.id
+        );
+        if mailbox.request.id.is_empty()
+            || mailbox.key != expected_key
+            || mailbox.request.id != tool_call_id.as_str()
+            || *origin != surface::SurfacePermissionOrigin::ChildAgent
+            || *task_revision != binding.task_revision
+            || agent_id.as_str() != binding.subagent_id
+            || mailbox.attempt_id != binding.attempt_id
+            || mailbox.authority_digest != binding.authority_digest
+            || mailbox.permission_response_public_key != binding.permission_response_public_key
+        {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission request owner tuple is invalid".to_string(),
+            ));
+        }
+        let expected_interaction_id =
+            match detached_permission_interaction_id(&binding, &mailbox.request.id) {
+                Ok(interaction_id) => interaction_id,
+                Err(error) => {
+                    return Err(DetachedPermissionAdmissionError::Denied(format!(
+                        "detached permission interaction identity is invalid: {error}"
+                    )));
+                }
+            };
+        if mailbox.interaction_id != expected_interaction_id {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission interaction identity is not actor-derived".to_string(),
+            ));
+        }
+        let Some(parent_fence) = binding.parent_fence.clone() else {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission binding has no parent operation fence".to_string(),
+            ));
+        };
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        if snapshot.thread.thread_id != parent_fence.thread_id {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission parent fence belongs to another thread".to_string(),
+            ));
+        }
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == *task_id)
+            .ok_or_else(|| {
+                DetachedPermissionAdmissionError::Deferred(
+                    "detached permission task projection has not arrived".to_string(),
+                )
+            })?;
+        let subagent = snapshot
+            .subagents
+            .iter()
+            .find(|subagent| subagent.subagent_id == *agent_id)
+            .ok_or_else(|| {
+                DetachedPermissionAdmissionError::Deferred(
+                    "detached permission subagent projection has not arrived".to_string(),
+                )
+            })?;
+        if task.task_type != surface::SurfaceTaskType::Subagent
+            || task.subagent_id.as_ref() != Some(agent_id)
+            || task.parent_task_id.as_ref().map(|parent| parent.as_str())
+                != binding.parent_task_id.as_deref()
+            || subagent.task_id != *task_id
+            || subagent.source.attempt_id.as_str() != binding.attempt_id.as_str()
+            || subagent.source.turn_id != *turn_id
+            || subagent.source.attempt_id.as_str() != mailbox.attempt_id.as_str()
+        {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission task/subagent identity is invalid".to_string(),
+            ));
+        }
+        let surface::SurfaceSubagentOwner::DetachedTask { owner } = &subagent.owner else {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission subagent is generation-owned".to_string(),
+            ));
+        };
+        if owner.task_id != *task_id
+            || owner.task_revision != binding.task_revision
+            || owner.attempt_id.as_str() != binding.attempt_id.as_str()
+            || owner.authority_digest != binding.authority_digest
+            || subagent.revision < *agent_revision
+            || agent_revision.get() == 0
+        {
+            if subagent.revision < *agent_revision {
+                return Err(DetachedPermissionAdmissionError::Deferred(
+                    "detached permission activity projection has not arrived".to_string(),
+                ));
+            }
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission subagent owner epoch is stale".to_string(),
+            ));
+        }
+        if task.revision < *task_revision {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission task revision is behind its admission floor".to_string(),
+            ));
+        }
+        let tool = Self::surface_child_permission_tool(&mailbox.request).map_err(|error| {
+            DetachedPermissionAdmissionError::Denied(format!(
+                "detached permission tool identity is invalid: {error}"
+            ))
+        })?;
+        let permissions = surface_permission_profile_from_runtime(
+            mailbox.request.permissions.clone(),
+        )
+        .map_err(|error| {
+            DetachedPermissionAdmissionError::Denied(format!(
+                "detached permission profile is invalid: {error}"
+            ))
+        })?;
+        let authority =
+            Self::surface_authority_for_tool(&snapshot, &parent_fence, &tool).map_err(|error| {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+                ) {
+                    DetachedPermissionAdmissionError::Deferred(format!(
+                        "detached permission authority is not materialized: {error}"
+                    ))
+                } else {
+                    DetachedPermissionAdmissionError::Denied(format!(
+                        "detached permission authority is invalid: {error}"
+                    ))
+                }
+            })?;
+
+        // A surface resolution is committed before the actor writes the
+        // process-independent mailbox response. If the actor crashes in that
+        // window, recover the exact persisted answer from the receipt instead
+        // of creating a second prompt or converting an allow into a deny.
+        if let Some(view) = snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == mailbox.interaction_id)
+            && let surface::SurfaceInteractionLifecycle::Resolved { receipt } = &view.lifecycle
+        {
+            if view.fence != parent_fence
+                || receipt.kind != surface::SurfaceInteractionKind::PermissionRequest
+                || !detached_surface_request_matches_mailbox(
+                    &view.request,
+                    &mailbox.request,
+                    &binding,
+                    &permissions,
+                    &authority,
+                    task.revision,
+                )
+            {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "detached permission resolution owner or request changed".to_string(),
+                ));
+            }
+            let response = detached_permission_response_from_receipt(receipt).ok_or_else(|| {
+                DetachedPermissionAdmissionError::Denied(
+                    "detached permission resolution receipt is incomplete".to_string(),
+                )
+            })?;
+            if response.permissions
+                != mailbox
+                    .request
+                    .permissions
+                    .clone()
+                    .normalize_file_system_entries()
+            {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "detached permission resolution profile does not match mailbox".to_string(),
+                ));
+            }
+            registry
+                .resolve_detached_permission_request(
+                    &mailbox.key,
+                    &mailbox.request_digest,
+                    response,
+                )
+                .map_err(|error| {
+                    DetachedPermissionAdmissionError::Deferred(format!(
+                        "detached permission recovery response persistence deferred: {error}"
+                    ))
+                })?;
+            return Ok(());
+        }
+
+        // Cancellation/expiry is also a terminal mailbox outcome. The
+        // interaction may have been removed from the resident map during the
+        // capability-loss path, so recover the durable lifecycle and persist a
+        // deny instead of admitting a fresh prompt after restart.
+        if let Some(view) = snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == mailbox.interaction_id)
+            && matches!(
+                view.lifecycle,
+                surface::SurfaceInteractionLifecycle::Cancelled { .. }
+                    | surface::SurfaceInteractionLifecycle::Expired { .. }
+            )
+        {
+            if view.fence != parent_fence
+                || view.kind != surface::SurfaceInteractionKind::PermissionRequest
+                || !detached_surface_request_matches_mailbox(
+                    &view.request,
+                    &mailbox.request,
+                    &binding,
+                    &permissions,
+                    &authority,
+                    task.revision,
+                )
+            {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "detached permission terminal interaction owner or request changed".to_string(),
+                ));
+            }
+            resolve_detached_permission_deny(
+                registry,
+                &mailbox.key,
+                &mailbox.request_digest,
+                "surface interaction was cancelled or expired",
+            )
+            .map_err(DetachedPermissionAdmissionError::Deferred)?;
+            return Ok(());
+        }
+
+        // A request that is already parked in ApprovalRequired state is the
+        // normal restart/race case. Reattach the durable mailbox waiter to
+        // that exact interaction instead of emitting a second Requested fact.
+        if task.status == surface::SurfaceTaskStatus::ApprovalRequired {
+            if subagent.status != surface::SurfaceSubagentStatus::Running {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "detached permission subagent is no longer running".to_string(),
+                ));
+            }
+            if task.pending_interaction_id.as_ref() != Some(&mailbox.interaction_id) {
+                return Err(DetachedPermissionAdmissionError::Deferred(
+                    "another child permission interaction is currently pending".to_string(),
+                ));
+            }
+            let Some(view) = snapshot
+                .interactions
+                .iter()
+                .find(|interaction| interaction.interaction_id == mailbox.interaction_id)
+            else {
+                return Err(DetachedPermissionAdmissionError::Deferred(
+                    "detached permission interaction projection has not arrived".to_string(),
+                ));
+            };
+            if !matches!(
+                view.lifecycle,
+                surface::SurfaceInteractionLifecycle::Requested
+            ) || view.fence != parent_fence
+                || !detached_surface_request_matches_mailbox(
+                    &view.request,
+                    &mailbox.request,
+                    &binding,
+                    &permissions,
+                    &authority,
+                    task.revision,
+                )
+            {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "detached permission interaction owner or request changed".to_string(),
+                ));
+            }
+            return self.ensure_detached_permission_resident(registry, mailbox, view);
+        }
+        if task.status != surface::SurfaceTaskStatus::Running {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission task is no longer running".to_string(),
+            ));
+        }
+        if task.pending_interaction_id.is_some() {
+            return Err(DetachedPermissionAdmissionError::Deferred(
+                "detached permission task already has a pending interaction".to_string(),
+            ));
+        }
+        if subagent.status != surface::SurfaceSubagentStatus::Running {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "detached permission subagent is no longer running".to_string(),
+            ));
+        }
+        let context = Self::surface_permission_context_for_tool(
+            &snapshot,
+            &parent_fence,
+            &tool,
+            &mailbox.request.context,
+        )
+        .map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+            ) {
+                DetachedPermissionAdmissionError::Deferred(error.to_string())
+            } else {
+                DetachedPermissionAdmissionError::Denied(error.to_string())
+            }
+        })?;
+        let interaction_request = surface::SurfaceInteractionRequest::PermissionRequest {
+            tool_call_id: tool.tool_call_id.clone(),
+            context,
+            reason: mailbox
+                .request
+                .reason
+                .clone()
+                .map(surface::DisplayText::new),
+            permissions,
+            authority,
+        };
+        if let Some(view) = snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == mailbox.interaction_id)
+        {
+            if !matches!(
+                view.lifecycle,
+                surface::SurfaceInteractionLifecycle::Requested
+            ) {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "detached permission interaction is already terminal".to_string(),
+                ));
+            }
+            if view.fence != parent_fence || view.request != interaction_request {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "detached permission interaction request conflicts with mailbox".to_string(),
+                ));
+            }
+            return self.ensure_detached_permission_resident(registry, mailbox, view);
+        }
+        if let Some(existing) = self
+            .resident_surface
+            .interactions
+            .get(&mailbox.interaction_id)
+        {
+            if existing.record.fence != parent_fence
+                || existing.record.request != interaction_request
+            {
+                return Err(DetachedPermissionAdmissionError::Denied(
+                    "resident detached permission interaction conflicts with mailbox".to_string(),
+                ));
+            }
+            return self.attach_detached_permission_waiter(registry, mailbox);
+        }
+        let preferred_attachment = self
+            .resident_surface
+            .interactions
+            .operation_origin_attachments
+            .get(&parent_fence.operation_id)
+            .cloned();
+        let attachment_id = self.resident_surface.hub.select_interaction_attachment_for(
+            surface::SurfaceInteractionKind::PermissionRequest,
+            preferred_attachment.as_ref(),
+        );
+        let prepared = prepare_detached_interaction_request(
+            parent_fence.clone(),
+            mailbox.interaction_id.clone(),
+            surface::SurfaceInteractionKind::PermissionRequest,
+            interaction_request,
+            surface::InteractionUnavailableDisposition::FailOperation,
+            attachment_id,
+        );
+        let next_task_revision = surface::TaskRevision::try_new(
+            task.revision.get().checked_add(1).ok_or_else(|| {
+                DetachedPermissionAdmissionError::Denied(
+                    "detached permission task revision exhausted".to_string(),
+                )
+            })?,
+        )
+        .map_err(|_| {
+            DetachedPermissionAdmissionError::Denied(
+                "detached permission task revision is invalid".to_string(),
+            )
+        })?;
+        let mut events = prepared.events;
+        events.push((
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Task(surface::TaskPatch::InteractionChanged {
+                task_id: task.task_id.clone(),
+                expected_revision: task.revision,
+                next_revision: next_task_revision,
+                status: surface::SurfaceTaskStatus::ApprovalRequired,
+                pending_interaction_id: Some(mailbox.interaction_id.clone()),
+            }),
+        ));
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.resident_surface
+            .coordinator
+            .commit_actor_generation_permission_request_batch(parent_fence, &batch)
+            .map_err(|error| {
+                DetachedPermissionAdmissionError::Deferred(format!(
+                    "detached permission request commit deferred: {error:?}"
+                ))
+            })?;
+        self.resident_surface.interactions.insert(
+            mailbox.interaction_id.clone(),
+            ResidentSurfaceInteraction {
+                record: prepared.record,
+                route: prepared.route,
+                revision: prepared.revision,
+                waiter: Some(ResidentInteractionWaiter::DetachedPermission {
+                    registry: registry.clone(),
+                    key: mailbox.key.clone(),
+                    request_digest: mailbox.request_digest.clone(),
+                }),
+                private_response: None,
+                pending_background_route: None,
+                winning_receipt: None,
+                resolution_ack: None,
+                projected_cursor: None,
+                cancelled: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn attach_detached_permission_waiter(
+        &mut self,
+        registry: &TaskRegistry,
+        mailbox: &DetachedPermissionRequest,
+    ) -> Result<(), DetachedPermissionAdmissionError> {
+        let Some(interaction) = self
+            .resident_surface
+            .interactions
+            .get_mut(&mailbox.interaction_id)
+        else {
+            return Err(DetachedPermissionAdmissionError::Deferred(
+                "resident detached permission interaction is not available yet".to_string(),
+            ));
+        };
+        if interaction.winning_receipt.is_some() || interaction.cancelled.is_some() {
+            return Err(DetachedPermissionAdmissionError::Denied(
+                "resident detached permission interaction is terminal".to_string(),
+            ));
+        }
+        match &interaction.waiter {
+            Some(ResidentInteractionWaiter::DetachedPermission {
+                key,
+                request_digest,
+                ..
+            }) if key == &mailbox.key && request_digest == &mailbox.request_digest => Ok(()),
+            Some(_) => Err(DetachedPermissionAdmissionError::Denied(
+                "resident interaction is owned by another waiter".to_string(),
+            )),
+            None => {
+                interaction.waiter = Some(ResidentInteractionWaiter::DetachedPermission {
+                    registry: registry.clone(),
+                    key: mailbox.key.clone(),
+                    request_digest: mailbox.request_digest.clone(),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn ensure_detached_permission_resident(
+        &mut self,
+        registry: &TaskRegistry,
+        mailbox: &DetachedPermissionRequest,
+        view: &surface::SurfaceInteractionView,
+    ) -> Result<(), DetachedPermissionAdmissionError> {
+        if self
+            .resident_surface
+            .interactions
+            .contains_key(&mailbox.interaction_id)
+        {
+            return self.attach_detached_permission_waiter(registry, mailbox);
+        }
+        let mut revision = view.revision;
+        let route = match &view.route {
+            surface::SurfaceInteractionRoute::Unassigned { epoch } => {
+                surface::BrokerInteractionResponseRoute::Unassigned { epoch: *epoch }
+            }
+            surface::SurfaceInteractionRoute::Exclusive { epoch, .. }
+            | surface::SurfaceInteractionRoute::SharedFirstCommitWins { epoch, .. } => {
+                let next_revision = surface::InteractionRevision::try_new(
+                    revision.get().checked_add(1).ok_or_else(|| {
+                        DetachedPermissionAdmissionError::Denied(
+                            "detached permission interaction revision exhausted".to_string(),
+                        )
+                    })?,
+                )
+                .map_err(|_| {
+                    DetachedPermissionAdmissionError::Denied(
+                        "detached permission interaction revision is invalid".to_string(),
+                    )
+                })?;
+                let next_epoch = surface::ResponseRouteEpoch::try_new(
+                    epoch.get().checked_add(1).ok_or_else(|| {
+                        DetachedPermissionAdmissionError::Denied(
+                            "detached permission response route epoch exhausted".to_string(),
+                        )
+                    })?,
+                )
+                .map_err(|_| {
+                    DetachedPermissionAdmissionError::Denied(
+                        "detached permission response route epoch is invalid".to_string(),
+                    )
+                })?;
+                let batch = self.surface_event_batch_with_commit_id(
+                    vec![(
+                        surface::SurfaceScope::Thread,
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::RouteChanged {
+                                interaction_id: mailbox.interaction_id.clone(),
+                                expected_revision: revision,
+                                next_revision,
+                                route: surface::SurfaceInteractionRoute::Unassigned {
+                                    epoch: next_epoch,
+                                },
+                            },
+                        ),
+                    )],
+                    None,
+                );
+                self.resident_surface
+                    .coordinator
+                    .commit_actor_batch(&batch)
+                    .map_err(|error| {
+                        DetachedPermissionAdmissionError::Deferred(format!(
+                            "detached permission route repark deferred: {error:?}"
+                        ))
+                    })?;
+                revision = next_revision;
+                surface::BrokerInteractionResponseRoute::Unassigned { epoch: next_epoch }
+            }
+        };
+        let record = surface::BrokerInteractionRequestRecord {
+            thread_id: view.fence.thread_id.clone(),
+            interaction_id: view.interaction_id.clone(),
+            fence: view.fence.clone(),
+            kind: view.kind,
+            request: view.request.clone(),
+            response_token: surface::SurfaceResponseToken::new(random_token_bytes()),
+            answer_policy: surface::BrokerInteractionAnswerPolicy::NativeStrict,
+            recovery_disposition: view.recovery_disposition.clone(),
+        };
+        self.resident_surface.interactions.insert(
+            mailbox.interaction_id.clone(),
+            ResidentSurfaceInteraction {
+                record,
+                route,
+                revision,
+                waiter: Some(ResidentInteractionWaiter::DetachedPermission {
+                    registry: registry.clone(),
+                    key: mailbox.key.clone(),
+                    request_digest: mailbox.request_digest.clone(),
+                }),
+                private_response: None,
+                pending_background_route: None,
+                winning_receipt: None,
+                resolution_ack: None,
+                projected_cursor: None,
+                cancelled: None,
+            },
+        );
+        Ok(())
+    }
+
     /// Build a surface tool identity for a child capability request. Child
     /// tools are not provider tools and therefore must never be recovered by
     /// looking in `snapshot.tools`; that table is reserved for model response
@@ -149,10 +908,22 @@ impl ThreadActor {
                             "child permission subagent is not committed",
                         )
                     })?;
-                if task.revision != *task_revision
+                // `task_revision` is the child owner's admission floor. The
+                // mutable task CAS revision can be higher because opening or
+                // resolving an earlier permission prompt also advances it.
+                let detached_owner = matches!(
+                    &subagent.owner,
+                    surface::SurfaceSubagentOwner::DetachedTask { .. }
+                );
+                let agent_revision_matches = if detached_owner {
+                    subagent.revision >= *agent_revision
+                } else {
+                    subagent.revision == *agent_revision
+                };
+                if task.revision < *task_revision
                     || task.status != surface::SurfaceTaskStatus::Running
                     || task.pending_interaction_id.is_some()
-                    || subagent.revision != *agent_revision
+                    || !agent_revision_matches
                     || task.subagent_id.as_ref() != Some(agent_id)
                     || subagent.task_id != *task_id
                     || subagent.source.turn_id != *turn_id
@@ -169,7 +940,8 @@ impl ThreadActor {
                     surface::SurfaceSubagentOwner::DetachedTask { owner }
                         if owner.task_id == *task_id
                             && owner.task_revision.get() <= task.revision.get()
-                            && subagent.source.attempt_id == owner.attempt_id => {}
+                            && subagent.source.attempt_id == owner.attempt_id
+                            && task.parent_operation.as_ref() == Some(&fence.operation_id) => {}
                     _ => {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -180,7 +952,10 @@ impl ThreadActor {
                 Ok(surface::SurfacePermissionContext {
                     owner: surface::SurfacePermissionOwnerRef::Child {
                         task_id: task_id.clone(),
-                        task_revision: *task_revision,
+                        // Normalize the public interaction to the actor's
+                        // current task CAS revision. The worker-provided
+                        // floor remains only an admission check above.
+                        task_revision: task.revision,
                         agent_id: agent_id.clone(),
                         agent_revision: *agent_revision,
                         activity_id: activity_id.clone(),
@@ -1182,6 +1957,72 @@ impl ThreadActor {
         ) {
             return Ok(());
         }
+        // Detached child permission prompts are thread-owned. They may have
+        // been created while no attachment was connected, so assigning one
+        // later must use the actor's Thread authority rather than a retired
+        // generation publisher permit.
+        let detached_permission = {
+            let snapshot = self.resident_surface.coordinator.state().snapshot();
+            is_detached_child_permission_interaction(snapshot, interaction)
+        };
+        if detached_permission {
+            if interaction.record.kind != surface::SurfaceInteractionKind::PermissionRequest
+                || !self
+                    .resident_surface
+                    .hub
+                    .admits_interaction_client(client, interaction.record.kind)
+            {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
+            let expected_revision = interaction.revision;
+            let next_revision = surface::InteractionRevision::try_new(
+                expected_revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let next_epoch = surface::ResponseRouteEpoch::try_new(
+                interaction_route_epoch(&interaction.route)
+                    .get()
+                    .checked_add(1)
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let public_route = surface::SurfaceInteractionRoute::Exclusive {
+                epoch: next_epoch,
+                attachment_id: client.attachment_id().clone(),
+            };
+            let private_route = surface::BrokerInteractionResponseRoute::Exclusive {
+                epoch: next_epoch,
+                attachment_id: client.attachment_id().clone(),
+                grant_token: surface::SurfaceResponseGrantToken::new(random_token_bytes()),
+            };
+            let batch = self.surface_event_batch_with_commit_id(
+                vec![(
+                    surface::SurfaceScope::Thread,
+                    surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
+                        interaction_id: interaction_id.clone(),
+                        expected_revision,
+                        next_revision,
+                        route: public_route,
+                    }),
+                )],
+                None,
+            );
+            self.resident_surface
+                .coordinator
+                .commit_actor_batch(&batch)
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let interaction = self
+                .resident_surface
+                .interactions
+                .get_mut(interaction_id)
+                .ok_or(surface::SurfaceClientCommandError::Unauthorized)?;
+            interaction.revision = next_revision;
+            interaction.route = private_route;
+            return Ok(());
+        }
         if self
             .resident_surface
             .interactions
@@ -1212,9 +2053,13 @@ impl ThreadActor {
                 return Err(surface::SurfaceClientCommandError::Unauthorized);
             }
             let expected_revision = interaction.revision;
-            let next_revision =
-                surface::InteractionRevision::try_new(expected_revision.get().saturating_add(1))
-                    .expect("interaction revision did not exhaust");
+            let next_revision = surface::InteractionRevision::try_new(
+                expected_revision
+                    .get()
+                    .checked_add(1)
+                    .expect("interaction revision did not exhaust"),
+            )
+            .expect("interaction revision did not exhaust");
             let current_epoch = interaction_route_epoch(&interaction.route);
             let next_epoch =
                 surface::ResponseRouteEpoch::try_new(current_epoch.get().saturating_add(1))
@@ -1720,6 +2565,38 @@ impl ThreadActor {
                     }
                 )
             });
+        let detached_child_permission_resolution = child_permission_resolution
+            && self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .interactions
+                .iter()
+                .find(|candidate| candidate.interaction_id == interaction_id)
+                .and_then(|interaction| match &interaction.request {
+                    surface::SurfaceInteractionRequest::PermissionRequest { context, .. } => {
+                        match &context.owner {
+                            surface::SurfacePermissionOwnerRef::Child { agent_id, .. } => self
+                                .resident_surface
+                                .coordinator
+                                .state()
+                                .snapshot()
+                                .subagents
+                                .iter()
+                                .find(|subagent| subagent.subagent_id == *agent_id)
+                                .map(|subagent| {
+                                    matches!(
+                                        &subagent.owner,
+                                        surface::SurfaceSubagentOwner::DetachedTask { .. }
+                                    )
+                                }),
+                            surface::SurfacePermissionOwnerRef::Foreground { .. } => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false);
         let batch = if let Some(batch) = self
             .resident_surface
             .interactions
@@ -1729,14 +2606,18 @@ impl ThreadActor {
         {
             batch
         } else {
-            let scope = background_fence
-                .as_ref()
-                .map(|fence| surface::SurfaceScope::Background {
-                    fence: fence.clone(),
-                })
-                .unwrap_or_else(|| surface::SurfaceScope::Generation {
-                    fence: fence.clone(),
-                });
+            let scope = if detached_child_permission_resolution {
+                surface::SurfaceScope::Thread
+            } else {
+                background_fence
+                    .as_ref()
+                    .map(|fence| surface::SurfaceScope::Background {
+                        fence: fence.clone(),
+                    })
+                    .unwrap_or_else(|| surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    })
+            };
             let continuation = self
                 .resident_surface
                 .interactions
@@ -1910,6 +2791,16 @@ impl ThreadActor {
                 .interactions
                 .get_mut(interaction_id)
                 .expect("committed interaction remains resident");
+            // Keep a detached waiter resident until the mailbox response has
+            // been durably written. Surface commits and task-registry commits
+            // use separate ledgers; consuming the waiter here would otherwise
+            // strand the child if the second write fails. The private response
+            // itself is still cleared immediately because the durable receipt
+            // below is sufficient for retry and avoids retaining client data.
+            let retain_detached_waiter = matches!(
+                interaction.waiter.as_ref(),
+                Some(ResidentInteractionWaiter::DetachedPermission { .. })
+            );
             let private = interaction
                 .private_response
                 .take()
@@ -1941,7 +2832,12 @@ impl ThreadActor {
                 commit_class: batch.commit_class.clone(),
             });
             interaction.projected_cursor = Some(batch.cursor_after);
-            (interaction.record.clone(), interaction.waiter.take())
+            let waiter = if retain_detached_waiter {
+                interaction.waiter.clone()
+            } else {
+                interaction.waiter.take()
+            };
+            (interaction.record.clone(), waiter)
         };
         if let (
             surface::SurfaceInteractionRequest::BackgroundApproval { task, tool, .. },
@@ -1963,6 +2859,7 @@ impl ThreadActor {
                     .retain_approval_resolution(operation_id, pending);
             }
         }
+        let mut detached_resolution_persisted = false;
         if let Some(waiter) = waiter {
             match (waiter, winner_answer) {
                 (
@@ -2030,6 +2927,73 @@ impl ThreadActor {
                     }));
                 }
                 (
+                    ResidentInteractionWaiter::DetachedPermission {
+                        registry,
+                        key,
+                        request_digest,
+                    },
+                    surface::SurfaceClientInteractionAnswer::PermissionRequest { decision },
+                ) => {
+                    let (decision, scope, permissions, strict_auto_review) = match decision {
+                        surface::SurfacePermissionClientDecision::Allow {
+                            scope,
+                            permissions,
+                            strict_auto_review,
+                        } => (
+                            crate::protocol::PermissionResponseDecision::Allow,
+                            scope,
+                            permissions,
+                            strict_auto_review,
+                        ),
+                        surface::SurfacePermissionClientDecision::Deny {
+                            permissions,
+                            strict_auto_review,
+                            ..
+                        } => (
+                            crate::protocol::PermissionResponseDecision::Deny,
+                            &surface::PermissionGrantScope::Turn,
+                            permissions,
+                            strict_auto_review,
+                        ),
+                    };
+                    let response = crate::runtime_permission::RuntimePermissionResponse {
+                        decision,
+                        scope: match scope {
+                            surface::PermissionGrantScope::Turn => {
+                                crate::protocol::PermissionGrantScope::Turn
+                            }
+                            surface::PermissionGrantScope::Session => {
+                                crate::protocol::PermissionGrantScope::Session
+                            }
+                        },
+                        permissions: runtime_permission_profile_from_surface(permissions),
+                        strict_auto_review: *strict_auto_review,
+                    };
+                    let expected_response = response.clone();
+                    if let Err(error) = registry.resolve_detached_permission_request(
+                        &key,
+                        &request_digest,
+                        response,
+                    ) {
+                        let terminal = match registry.detached_permission_request(&key) {
+                            Ok(None) => true,
+                            Ok(Some(record)) => {
+                                record.response.as_ref() == Some(&expected_response)
+                            }
+                            Err(_) => false,
+                        };
+                        if terminal {
+                            detached_resolution_persisted = true;
+                        } else {
+                            eprintln!(
+                                "orca: failed to persist detached permission resolution; waiter retained for retry: {error}"
+                            );
+                        }
+                    } else {
+                        detached_resolution_persisted = true;
+                    }
+                }
+                (
                     ResidentInteractionWaiter::UserInput(waiter),
                     surface::SurfaceClientInteractionAnswer::UserInput { decision },
                 ) => {
@@ -2059,6 +3023,12 @@ impl ThreadActor {
                 }
                 _ => unreachable!("waiter and answer kind were validated before commit"),
             }
+        }
+        if detached_resolution_persisted
+            && let Some(interaction) = self.resident_surface.interactions.get_mut(interaction_id)
+        {
+            interaction.waiter = None;
+            interaction.private_response = None;
         }
         self.settle_cold_recovery_tool_approval(interaction_id, winner_answer);
         self.settle_cold_recovery_permission(interaction_id, winner_answer);
@@ -4314,7 +5284,9 @@ impl ThreadActor {
             .interactions
             .values()
             .any(|interaction| {
-                &interaction.record.fence == fence && interaction.private_response.is_some()
+                &interaction.record.fence == fence
+                    && interaction.winning_receipt.is_none()
+                    && interaction.private_response.is_some()
             })
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -4375,10 +5347,28 @@ impl ThreadActor {
             let next_revision =
                 surface::InteractionRevision::try_new(expected_revision.get().saturating_add(1))
                     .expect("interaction revision did not exhaust");
-            events.push((
-                surface::SurfaceScope::Generation {
+            // Detached child permission interactions are thread-owned after
+            // the parent generation has ended. Classify from the durable
+            // projection so malformed or stale resident entries stay on the
+            // generation path and fail closed in the normal authority check.
+            let interaction_scope = snapshot
+                .interactions
+                .iter()
+                .find(|interaction| &interaction.interaction_id == interaction_id)
+                .filter(|interaction| {
+                    surface::detached_child_permission_interaction_matches(
+                        snapshot,
+                        interaction,
+                        true,
+                        false,
+                    )
+                })
+                .map(|_| surface::SurfaceScope::Thread)
+                .unwrap_or_else(|| surface::SurfaceScope::Generation {
                     fence: fence.clone(),
-                },
+                });
+            events.push((
+                interaction_scope,
                 surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
                     interaction_id: interaction_id.clone(),
                     expected_revision: *expected_revision,
@@ -4767,6 +5757,22 @@ impl ThreadActor {
                     ResidentInteractionWaiter::McpElicitation(waiter) => {
                         let _ = waiter.send(Ok(orca_mcp::McpElicitationResponse::Decline));
                     }
+                    ResidentInteractionWaiter::DetachedPermission {
+                        registry,
+                        key,
+                        request_digest,
+                    } => {
+                        if let Err(error) = resolve_detached_permission_deny(
+                            &registry,
+                            &key,
+                            &request_digest,
+                            "permission request was cancelled before resolution",
+                        ) {
+                            eprintln!(
+                                "orca: detached cancellation denial remains pending for {key}: {error}"
+                            );
+                        }
+                    }
                 }
             }
             if let Some(owner) = cold_recovery_owner
@@ -4811,6 +5817,7 @@ impl ThreadActor {
         &self,
         attachment_id: &surface::SurfaceAttachmentId,
     ) -> Result<Option<PreparedSurfaceAttachmentTransition>, ()> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
         let mut affected = self
             .resident_surface
             .interactions
@@ -4828,24 +5835,30 @@ impl ThreadActor {
                     interaction.record.fence.clone(),
                     interaction.revision,
                     interaction_route_epoch(&interaction.route),
+                    is_detached_child_permission_interaction(snapshot, interaction),
                 )
             })
             .collect::<Vec<_>>();
         affected.sort_by_key(|(interaction_id, ..)| interaction_id.clone());
-        let Some((_, _, fence, _, _)) = affected.first() else {
+        let Some((_, _, fence, _, _, detached_permission)) = affected.first() else {
             return Ok(None);
         };
         let fence = fence.clone();
+        // A detached permission route is Thread-scoped and uses actor
+        // authority. Keep it out of a mixed Generation batch with foreground
+        // interactions; the next reconciliation pass handles the other scope.
+        let detached_permission = *detached_permission;
+        affected.retain(|(_, _, _, _, _, detached)| *detached == detached_permission);
         if affected
             .iter()
-            .any(|(_, _, candidate, _, _)| candidate != &fence)
+            .any(|(_, _, candidate, _, _, _)| candidate != &fence)
         {
             return Err(());
         }
         let mut events = Vec::new();
         let mut interactions = Vec::new();
         let mut affected_route_epochs = Vec::new();
-        for (interaction_id, kind, _, expected_revision, current_epoch) in affected {
+        for (interaction_id, kind, _, expected_revision, current_epoch, detached) in affected {
             let route_revision = surface::InteractionRevision::try_new(expected_revision.get() + 1)
                 .expect("interaction revision did not exhaust");
             let next_epoch = surface::ResponseRouteEpoch::try_new(current_epoch.get() + 1)
@@ -4870,13 +5883,18 @@ impl ThreadActor {
                 None => (
                     surface::BrokerInteractionResponseRoute::Unassigned { epoch: next_epoch },
                     surface::SurfaceInteractionRoute::Unassigned { epoch: next_epoch },
-                    true,
+                    !detached,
                 ),
             };
-            events.push((
+            let event_scope = if detached {
+                surface::SurfaceScope::Thread
+            } else {
                 surface::SurfaceScope::Generation {
                     fence: fence.clone(),
-                },
+                }
+            };
+            events.push((
+                event_scope.clone(),
                 surface::SurfaceEvent::Interaction(surface::InteractionPatch::RouteChanged {
                     interaction_id: interaction_id.clone(),
                     expected_revision,
@@ -4889,9 +5907,7 @@ impl ThreadActor {
                     surface::InteractionRevision::try_new(route_revision.get() + 1)
                         .expect("interaction revision did not exhaust");
                 events.push((
-                    surface::SurfaceScope::Generation {
-                        fence: fence.clone(),
-                    },
+                    event_scope,
                     surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
                         interaction_id: interaction_id.clone(),
                         expected_revision: route_revision,
@@ -4986,6 +6002,22 @@ impl ThreadActor {
                 ResidentInteractionWaiter::McpElicitation(waiter) => {
                     let _ = waiter.send(Ok(orca_mcp::McpElicitationResponse::Decline));
                 }
+                ResidentInteractionWaiter::DetachedPermission {
+                    registry,
+                    key,
+                    request_digest,
+                } => {
+                    if let Err(error) = resolve_detached_permission_deny(
+                        &registry,
+                        &key,
+                        &request_digest,
+                        "permission capability became unavailable",
+                    ) {
+                        eprintln!(
+                            "orca: detached capability-loss denial remains pending for {key}: {error}"
+                        );
+                    }
+                }
             }
         }
         for owner in cancelled_continuation_owners {
@@ -5047,12 +6079,22 @@ impl ThreadActor {
                 Ok(Some(transition)) => transition,
                 Ok(None) | Err(()) => return,
             };
-            if self
-                .resident_surface
-                .coordinator
-                .commit_generation_batch(transition.fence.clone(), &transition.batch)
-                .is_err()
-            {
+            let thread_scoped = transition
+                .batch
+                .events
+                .as_slice()
+                .iter()
+                .all(|event| matches!(event.scope, surface::SurfaceScope::Thread));
+            let committed = if thread_scoped {
+                self.resident_surface
+                    .coordinator
+                    .commit_actor_batch(&transition.batch)
+            } else {
+                self.resident_surface
+                    .coordinator
+                    .commit_generation_batch(transition.fence.clone(), &transition.batch)
+            };
+            if committed.is_err() {
                 eprintln!("orca: typed interaction capability-loss commit failed");
                 self.resident_surface
                     .interactions
@@ -5069,5 +6111,218 @@ impl ThreadActor {
             }
             self.apply_surface_attachment_transition(active.as_deref_mut(), &transition);
         }
+    }
+}
+
+fn resolve_detached_permission_deny(
+    registry: &TaskRegistry,
+    key: &str,
+    request_digest: &surface::Sha256Digest,
+    reason: &str,
+) -> Result<(), String> {
+    let response = crate::runtime_permission::RuntimePermissionResponse {
+        decision: crate::protocol::PermissionResponseDecision::Deny,
+        scope: crate::protocol::PermissionGrantScope::Turn,
+        permissions: crate::protocol::RequestPermissionProfile::default(),
+        strict_auto_review: false,
+    };
+    registry
+        .resolve_detached_permission_request(key, request_digest, response)
+        .map_err(|error| {
+            format!("failed to persist detached permission denial ({reason}): {error}")
+        })
+}
+
+fn detached_permission_response_from_receipt(
+    receipt: &surface::SurfaceInteractionResolutionReceipt,
+) -> Option<crate::runtime_permission::RuntimePermissionResponse> {
+    let surface::SurfaceInteractionSafeProjection::PermissionRequest {
+        decision,
+        scope,
+        permissions,
+        strict_auto_review,
+    } = &receipt.safe_projection
+    else {
+        return None;
+    };
+    Some(crate::runtime_permission::RuntimePermissionResponse {
+        decision: match decision {
+            surface::SurfaceAllowDeny::Allow => crate::protocol::PermissionResponseDecision::Allow,
+            surface::SurfaceAllowDeny::Deny => crate::protocol::PermissionResponseDecision::Deny,
+        },
+        scope: match scope {
+            surface::PermissionGrantScope::Turn => crate::protocol::PermissionGrantScope::Turn,
+            surface::PermissionGrantScope::Session => {
+                crate::protocol::PermissionGrantScope::Session
+            }
+        },
+        permissions: runtime_permission_profile_from_surface(permissions),
+        strict_auto_review: *strict_auto_review,
+    })
+}
+
+fn detached_surface_request_matches_mailbox(
+    surface_request: &surface::SurfaceInteractionRequest,
+    mailbox_request: &crate::runtime_permission::RuntimePermissionRequest,
+    binding: &crate::tasks::DetachedSubagentBinding,
+    permissions: &surface::SurfacePermissionProfile,
+    authority: &surface::AuthorityFingerprint,
+    expected_task_revision: surface::TaskRevision,
+) -> bool {
+    let surface::SurfaceInteractionRequest::PermissionRequest {
+        tool_call_id,
+        context,
+        reason,
+        permissions: observed_permissions,
+        authority: observed_authority,
+    } = surface_request
+    else {
+        return false;
+    };
+    if !detached_context_matches_mailbox(context, mailbox_request, binding, expected_task_revision)
+    {
+        return false;
+    }
+    reason.as_ref().map(|value| value.as_str()) == mailbox_request.reason.as_deref()
+        && observed_permissions == permissions
+        && observed_authority == authority
+        && detached_mailbox_tool_call_matches(mailbox_request, tool_call_id)
+}
+
+fn detached_context_matches_mailbox(
+    context: &surface::SurfacePermissionContext,
+    mailbox_request: &crate::runtime_permission::RuntimePermissionRequest,
+    binding: &crate::tasks::DetachedSubagentBinding,
+    expected_task_revision: surface::TaskRevision,
+) -> bool {
+    let surface::SurfacePermissionOwnerRef::Child {
+        task_id,
+        task_revision,
+        agent_id,
+        agent_revision,
+        activity_id,
+        turn_id,
+        tool_call_id,
+    } = &context.owner
+    else {
+        return false;
+    };
+    let crate::runtime_permission::RuntimePermissionContext::Child {
+        task_id: mailbox_task_id,
+        task_revision: mailbox_task_revision,
+        agent_id: mailbox_agent_id,
+        agent_revision: mailbox_agent_revision,
+        activity_id: mailbox_activity_id,
+        turn_id: mailbox_turn_id,
+        tool_call_id: mailbox_tool_call_id,
+        origin,
+    } = &mailbox_request.context
+    else {
+        return false;
+    };
+    context.origin == surface::SurfacePermissionOrigin::ChildAgent
+        && *origin == surface::SurfacePermissionOrigin::ChildAgent
+        && task_id == mailbox_task_id
+        && *task_revision >= *mailbox_task_revision
+        && *task_revision <= expected_task_revision
+        && *mailbox_task_revision <= expected_task_revision
+        && agent_id == mailbox_agent_id
+        && agent_revision == mailbox_agent_revision
+        && activity_id == mailbox_activity_id
+        && turn_id == mailbox_turn_id
+        && tool_call_id == mailbox_tool_call_id
+        && mailbox_request.id == tool_call_id.as_str()
+        && *mailbox_task_revision == binding.task_revision
+        && binding.task_id == task_id.as_str()
+        && binding.subagent_id == agent_id.as_str()
+}
+
+fn detached_mailbox_tool_call_matches(
+    mailbox_request: &crate::runtime_permission::RuntimePermissionRequest,
+    surface_tool_call_id: &surface::SurfaceToolCallId,
+) -> bool {
+    match &mailbox_request.context {
+        crate::runtime_permission::RuntimePermissionContext::Child { tool_call_id, .. } => {
+            tool_call_id == surface_tool_call_id && mailbox_request.id == tool_call_id.as_str()
+        }
+        crate::runtime_permission::RuntimePermissionContext::Foreground { .. } => false,
+    }
+}
+
+fn is_detached_child_permission_interaction(
+    snapshot: &surface::SurfaceSnapshot,
+    interaction: &ResidentSurfaceInteraction,
+) -> bool {
+    let surface::SurfaceInteractionRequest::PermissionRequest { context, .. } =
+        &interaction.record.request
+    else {
+        return false;
+    };
+    let surface::SurfacePermissionOwnerRef::Child { agent_id, .. } = &context.owner else {
+        return false;
+    };
+    snapshot
+        .subagents
+        .iter()
+        .find(|subagent| subagent.subagent_id == *agent_id)
+        .is_some_and(|subagent| {
+            matches!(
+                &subagent.owner,
+                surface::SurfaceSubagentOwner::DetachedTask { .. }
+            )
+        })
+}
+
+#[cfg(test)]
+mod detached_permission_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn resolved_receipt_rehydrates_exact_permission_profile() {
+        let profile = surface::SurfacePermissionProfile {
+            file_system: Some(surface::SurfaceFileSystemPermissionProfile {
+                read: Some(vec![surface::SurfacePermissionPathLabel(
+                    surface::DisplayText::new("/workspace/src"),
+                )]),
+                write: None,
+            }),
+            network: Some(surface::SurfacePermissionNetworkProfile {
+                enabled: Some(false),
+                domains: vec![(
+                    surface::SurfacePermissionDomainPattern(surface::DisplayText::new(
+                        "api.example.com",
+                    )),
+                    surface::SurfaceAllowDeny::Deny,
+                )],
+            }),
+        };
+        let receipt = surface::SurfaceInteractionResolutionReceipt {
+            response_id: surface::SurfaceResponseId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            receipt_id: surface::SurfaceResponseReceiptId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            kind: surface::SurfaceInteractionKind::PermissionRequest,
+            safe_projection: surface::SurfaceInteractionSafeProjection::PermissionRequest {
+                decision: surface::SurfaceAllowDeny::Allow,
+                scope: surface::PermissionGrantScope::Turn,
+                permissions: profile.clone(),
+                strict_auto_review: true,
+            },
+        };
+        let response = detached_permission_response_from_receipt(&receipt).unwrap();
+        assert_eq!(
+            response.decision,
+            crate::protocol::PermissionResponseDecision::Allow
+        );
+        assert_eq!(response.scope, crate::protocol::PermissionGrantScope::Turn);
+        assert!(response.strict_auto_review);
+        assert_eq!(
+            response.permissions,
+            runtime_permission_profile_from_surface(&profile)
+        );
     }
 }

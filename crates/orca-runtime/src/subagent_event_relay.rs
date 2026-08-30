@@ -412,6 +412,7 @@ pub struct SubagentEventRelay {
 pub struct SubagentEventRelayReader {
     relay_path: PathBuf,
     quarantine_path: PathBuf,
+    lock_path: PathBuf,
     target: RelayReadTarget,
 }
 
@@ -884,13 +885,15 @@ impl SubagentEventRelayReader {
         ensure_existing_directory(&relay_dir, &root)?;
         let relay_path = relay_dir.join(format!("attempt-{}.relay", target.attempt_id));
         let quarantine_path = relay_dir.join(format!("attempt-{}.quarantine", target.attempt_id));
-        for path in [&relay_path, &quarantine_path] {
+        let lock_path = relay_dir.join("task.lock");
+        for path in [&relay_path, &quarantine_path, &lock_path] {
             reject_symlink(path)?;
             ensure_contained(&root, path)?;
         }
         let reader = Self {
             relay_path,
             quarantine_path,
+            lock_path,
             target,
         };
         reader.ensure_not_quarantined()?;
@@ -901,7 +904,19 @@ impl SubagentEventRelayReader {
         &self.relay_path
     }
 
+    /// Permanently fences a reader after a frame passes transport checks but
+    /// fails the typed activity schema. This prevents the actor from retrying
+    /// the same poisonous payload on every idle tick.
+    pub(crate) fn quarantine_corrupt(&self, error: &RelayError) {
+        self.quarantine(error);
+    }
+
     pub fn read_page(&self, after_sequence: u64) -> Result<RelayPage, RelayError> {
+        // Writers hold this same lock across frame append and fsync. Without
+        // taking it here, a reader can observe a valid prefix while the
+        // checksum suffix is still being written and quarantine a healthy
+        // relay permanently.
+        let _lock = acquire_no_follow_lock(&self.lock_path)?;
         self.ensure_not_quarantined()?;
         let scan = match self.scan_records() {
             Ok(scan) => scan,

@@ -5,6 +5,8 @@ use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+
 #[cfg(windows)]
 use serde::Serialize;
 #[cfg(windows)]
@@ -23,8 +25,8 @@ use orca_core::event_sink::EventSink;
 use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::BackgroundTaskSummary;
-use orca_core::tool_types;
 use orca_core::thread_identity::TurnId;
+use orca_core::tool_types;
 
 use crate::agent_child::{
     ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, ChildAgentRuntimeContext,
@@ -41,6 +43,7 @@ use crate::child_agent_types::{
     SubagentActivityIdentity, SubagentActivityOwner, SubagentActivityPayload, child_event_output,
 };
 use crate::child_agent_types::{ChildAgentCompatibilityIdentity, ChildAgentContinuationStart};
+use crate::child_permission::{ChildPermissionIdentity, DetachedPermissionHandler};
 use crate::hooks::HookRunner;
 use crate::instructions;
 use crate::lifecycle::{RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus};
@@ -89,6 +92,7 @@ pub struct AsyncSubagentWorkerInput {
     pub request: subagent::SubagentRequest,
     pub child_depth: u32,
     pub worktree: Option<AsyncSubagentWorktree>,
+    pub permission_response_public_key: [u8; 32],
 }
 
 pub(crate) struct AsyncSubagentWorkerContext {
@@ -123,6 +127,7 @@ struct AsyncSubagentWorkerSpawnContext<'a> {
     request: &'a subagent::SubagentRequest,
     child_depth: u32,
     worktree: Option<&'a AsyncSubagentWorktree>,
+    permission_response_public_key: &'a [u8; 32],
 }
 
 struct AsyncLaunchWorktree {
@@ -259,6 +264,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         request,
         child_depth,
         worktree,
+        permission_response_public_key,
     } = input;
     let owns_worktree = request.resume_from.is_none();
     let task_registry = match wait_for_async_subagent_adoption(&task_session_id, &cwd, &agent_id) {
@@ -311,6 +317,18 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 1;
         }
     };
+    if detached_binding.permission_response_public_key != permission_response_public_key {
+        let message =
+            "detached subagent response key does not match the actor-issued launch material"
+                .to_string();
+        let _ = task_registry.fail_with_usage_and_lease(
+            &task_lease,
+            &agent_id,
+            message.to_string(),
+            None,
+        );
+        return 1;
+    }
     let continuation_lease = match coordinator
         .acquire(&prepared)
         .or_else(|_| coordinator.acquire(&prepared))
@@ -404,12 +422,25 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             attempt_id: prepared.attempt_id.clone(),
             turn_id: child_turn_id.clone(),
             owner: SubagentActivityOwner::DetachedTask {
-                task_id: surface_task_id,
+                task_id: surface_task_id.clone(),
                 task_revision: detached_binding.task_revision,
                 authority_digest: detached_binding.authority_digest,
             },
         },
         activity_sink,
+    ));
+    let child_permission_handler = Arc::new(DetachedPermissionHandler::new(
+        task_registry.clone(),
+        detached_binding.clone(),
+        ChildPermissionIdentity::new_with_task_revision(
+            surface_task_id.clone(),
+            detached_binding.task_revision,
+            SurfaceSubagentId::try_new(agent_id.clone())
+                .expect("async task registry created a non-empty task id"),
+            child_turn_id.clone(),
+            activity.revision_source(),
+        ),
+        cancel.clone(),
     ));
     if let Err(error) = activity.publish_payload(SubagentActivityPayload::Started {
         description: DisplayText::new(&request.description),
@@ -453,7 +484,14 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             task_registry: Some(&task_registry),
             root_task_id: Some(&agent_id),
             checkpoint_observer: Some(&checkpoint_observer),
-            permission_handler: None,
+            permission_handler: Some(
+                child_permission_handler
+                    as Arc<
+                        dyn crate::runtime_permission::RuntimePermissionRequestHandler
+                            + Send
+                            + Sync,
+                    >,
+            ),
             turn_id: Some(child_turn_id),
             executor: child_executor,
         });
@@ -652,6 +690,16 @@ pub(crate) fn launch_async_subagent(
             task: None,
         };
     }
+    if parent_fence.is_none() {
+        return AsyncSubagentLaunchOutput {
+            result: tool_types::ToolResult::failed(
+                tool_request,
+                "async subagents require an actor-owned parent operation fence",
+                None,
+            ),
+            task: None,
+        };
+    }
     let coordinator = match ChildAgentCoordinator::new(task_registry.clone()) {
         Ok(coordinator) => coordinator,
         Err(error) => {
@@ -829,7 +877,7 @@ pub(crate) fn launch_async_subagent(
     // Persist the actor-issued detached owner before the worker is spawned.
     // The worker later reloads this binding after adoption; configuration
     // compatibility hashes are not used as authority credentials.
-    let _detached_binding = match task_registry.register_detached_subagent_binding(
+    let detached_binding = match task_registry.register_detached_subagent_binding(
         &agent_id,
         &agent_id,
         prepared.attempt_id.clone(),
@@ -887,6 +935,7 @@ pub(crate) fn launch_async_subagent(
         request: &request,
         child_depth: subagent_depth + 1,
         worktree: launch_worktree.worker.as_ref(),
+        permission_response_public_key: &detached_binding.permission_response_public_key,
     }) {
         Ok((child, process_job)) => {
             if let Err(error) =
@@ -1076,6 +1125,7 @@ fn spawn_async_subagent_worker(
         request,
         child_depth,
         worktree,
+        permission_response_public_key,
     } = context;
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
@@ -1096,6 +1146,8 @@ fn spawn_async_subagent_worker(
         child_depth.to_string(),
         "--request-json".to_string(),
         request_json,
+        "--permission-response-public-key".to_string(),
+        base64::engine::general_purpose::STANDARD.encode(permission_response_public_key),
     ];
     if let Some(model) = config.model.as_history_value() {
         worker_args.extend(["--model".to_string(), model.to_string()]);

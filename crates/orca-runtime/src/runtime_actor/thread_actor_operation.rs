@@ -163,7 +163,11 @@ impl ThreadActor {
             .interactions
             .iter()
             .filter_map(|(interaction_id, interaction)| {
-                (&interaction.record.fence == fence)
+                // Detached mailbox settlement is retried by the actor
+                // directly after the public interaction commit. Its private
+                // batch must not be submitted to the surface ledger a second
+                // time while the mailbox write is down.
+                (&interaction.record.fence == fence && interaction.winning_receipt.is_none())
                     .then_some(interaction.private_response.as_ref())
                     .flatten()
                     .and_then(|private| {
@@ -183,7 +187,9 @@ impl ThreadActor {
             .interactions
             .values()
             .any(|interaction| {
-                &interaction.record.fence == fence && interaction.private_response.is_some()
+                &interaction.record.fence == fence
+                    && interaction.winning_receipt.is_none()
+                    && interaction.private_response.is_some()
             })
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -812,15 +818,26 @@ impl ThreadActor {
                 .get(&attachment_id)
                 .expect("selected detach remains pending")
                 .clone();
-            if self
-                .resident_surface
-                .coordinator
-                .commit_generation_batch(
+            // Detached permission route transitions are Thread-scoped; all
+            // other attachment transitions retain their generation permit.
+            let thread_scoped = pending
+                .transition
+                .batch
+                .events
+                .as_slice()
+                .iter()
+                .all(|event| matches!(event.scope, surface::SurfaceScope::Thread));
+            let committed = if thread_scoped {
+                self.resident_surface
+                    .coordinator
+                    .commit_actor_batch(&pending.transition.batch)
+            } else {
+                self.resident_surface.coordinator.commit_generation_batch(
                     pending.transition.fence.clone(),
                     &pending.transition.batch,
                 )
-                .is_err()
-            {
+            };
+            if committed.is_err() {
                 if let Some(retained) = self
                     .resident_surface
                     .interactions
@@ -859,12 +876,25 @@ impl ThreadActor {
             .expect("selected capability loss remains pending")
             .transition
             .clone();
-        if self
-            .resident_surface
-            .coordinator
-            .commit_generation_batch(transition.fence.clone(), &transition.batch)
-            .is_err()
-        {
+        // Retry with the same authority class selected when the transition
+        // was prepared; a detached Thread batch cannot be replayed as a
+        // retired generation batch.
+        let thread_scoped = transition
+            .batch
+            .events
+            .as_slice()
+            .iter()
+            .all(|event| matches!(event.scope, surface::SurfaceScope::Thread));
+        let committed = if thread_scoped {
+            self.resident_surface
+                .coordinator
+                .commit_actor_batch(&transition.batch)
+        } else {
+            self.resident_surface
+                .coordinator
+                .commit_generation_batch(transition.fence.clone(), &transition.batch)
+        };
+        if committed.is_err() {
             if let Some(pending) = self
                 .resident_surface
                 .interactions
@@ -988,12 +1018,24 @@ impl ThreadActor {
                 }
             }
         };
-        if self
-            .resident_surface
-            .coordinator
-            .commit_generation_batch(pending.transition.fence.clone(), &pending.transition.batch)
-            .is_err()
-        {
+        let thread_scoped = pending
+            .transition
+            .batch
+            .events
+            .as_slice()
+            .iter()
+            .all(|event| matches!(event.scope, surface::SurfaceScope::Thread));
+        let committed = if thread_scoped {
+            self.resident_surface
+                .coordinator
+                .commit_actor_batch(&pending.transition.batch)
+        } else {
+            self.resident_surface.coordinator.commit_generation_batch(
+                pending.transition.fence.clone(),
+                &pending.transition.batch,
+            )
+        };
+        if committed.is_err() {
             let retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
             self.resident_surface
                 .interactions
@@ -7256,6 +7298,7 @@ impl ThreadActor {
                 if active.generation.cancel.is_cancelled() {
                     return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
                 }
+                let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
                 let mut interactions = self
                     .resident_surface
                     .interactions
@@ -7284,15 +7327,32 @@ impl ThreadActor {
                     ),
                 )];
                 for (interaction_id, expected_revision) in &interactions {
-                    events.push((
-                        surface::SurfaceScope::Generation {
+                    let interaction_scope = snapshot
+                        .interactions
+                        .iter()
+                        .find(|interaction| &interaction.interaction_id == interaction_id)
+                        .filter(|interaction| {
+                            surface::detached_child_permission_interaction_matches(
+                                &snapshot,
+                                interaction,
+                                true,
+                                false,
+                            )
+                        })
+                        .map(|_| surface::SurfaceScope::Thread)
+                        .unwrap_or_else(|| surface::SurfaceScope::Generation {
                             fence: fence.clone(),
-                        },
+                        });
+                    events.push((
+                        interaction_scope,
                         surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
                             interaction_id: interaction_id.clone(),
                             expected_revision: *expected_revision,
                             next_revision: surface::InteractionRevision::try_new(
-                                expected_revision.get().saturating_add(1),
+                                expected_revision
+                                    .get()
+                                    .checked_add(1)
+                                    .expect("interaction revision did not exhaust"),
                             )
                             .expect("interaction revision did not exhaust"),
                             reason: surface::InteractionCancelReason::OperationCancelled {

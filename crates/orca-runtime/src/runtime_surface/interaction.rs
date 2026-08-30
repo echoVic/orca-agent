@@ -1859,6 +1859,10 @@ pub enum SurfaceInteractionSafeProjection {
     PermissionRequest {
         decision: SurfaceAllowDeny,
         scope: PermissionGrantScope,
+        /// Exact profile selected by the client. Keeping this in the durable
+        /// receipt lets detached permission mailboxes recover the original
+        /// answer after an actor crash, without re-prompting or broadening it.
+        permissions: SurfacePermissionProfile,
         strict_auto_review: bool,
     },
     UserInput {

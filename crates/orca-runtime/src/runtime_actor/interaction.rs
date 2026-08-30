@@ -5,6 +5,7 @@ use std::sync::mpsc::SyncSender;
 use sha2::{Digest, Sha256};
 
 use crate::runtime_surface as surface;
+use crate::tasks::TaskRegistry;
 
 pub(crate) struct PreparedInteractionRequest {
     pub(crate) interaction_id: surface::SurfaceInteractionId,
@@ -22,6 +23,14 @@ pub(crate) enum ResidentInteractionWaiter {
         waiter: SyncSender<io::Result<orca_core::approval_types::ApprovalResolution>>,
     },
     Permission(SyncSender<io::Result<crate::runtime_permission::RuntimePermissionResponse>>),
+    /// A detached child has no live call stack in this actor. Its response is
+    /// therefore persisted to the task registry mailbox before the worker is
+    /// woken; the digest fences an old actor from resolving a reused key.
+    DetachedPermission {
+        registry: TaskRegistry,
+        key: String,
+        request_digest: surface::Sha256Digest,
+    },
     UserInput(SyncSender<io::Result<Option<String>>>),
     McpElicitation(SyncSender<Result<orca_mcp::McpElicitationResponse, String>>),
 }
@@ -180,6 +189,49 @@ pub(crate) fn prepare_interaction_request(
     recovery_disposition: surface::InteractionUnavailableDisposition,
     attachment_id: Option<surface::SurfaceAttachmentId>,
 ) -> PreparedInteractionRequest {
+    prepare_interaction_request_scoped(
+        fence,
+        interaction_id,
+        kind,
+        request,
+        recovery_disposition,
+        attachment_id,
+        true,
+    )
+}
+
+/// Prepare a permission request emitted by a detached child. Detached
+/// requests are thread-owned and may legitimately wait while no UI
+/// attachment is connected, so an unassigned route must not be converted into
+/// an immediate capability-unavailable cancellation.
+pub(crate) fn prepare_detached_interaction_request(
+    fence: surface::SurfaceOperationFence,
+    interaction_id: surface::SurfaceInteractionId,
+    kind: surface::SurfaceInteractionKind,
+    request: surface::SurfaceInteractionRequest,
+    recovery_disposition: surface::InteractionUnavailableDisposition,
+    attachment_id: Option<surface::SurfaceAttachmentId>,
+) -> PreparedInteractionRequest {
+    prepare_interaction_request_scoped(
+        fence,
+        interaction_id,
+        kind,
+        request,
+        recovery_disposition,
+        attachment_id,
+        false,
+    )
+}
+
+fn prepare_interaction_request_scoped(
+    fence: surface::SurfaceOperationFence,
+    interaction_id: surface::SurfaceInteractionId,
+    kind: surface::SurfaceInteractionKind,
+    request: surface::SurfaceInteractionRequest,
+    recovery_disposition: surface::InteractionUnavailableDisposition,
+    attachment_id: Option<surface::SurfaceAttachmentId>,
+    cancel_if_unavailable: bool,
+) -> PreparedInteractionRequest {
     let unavailable = attachment_id.is_none();
     let revision = surface::InteractionRevision::try_new(1).expect("one is valid");
     let route_epoch = surface::ResponseRouteEpoch::try_new(1).expect("one is valid");
@@ -218,19 +270,22 @@ pub(crate) fn prepare_interaction_request(
         lifecycle: surface::SurfaceInteractionLifecycle::Requested,
         recovery_disposition: record.recovery_disposition.clone(),
     };
-    let mut events = vec![(
+    let event_scope = if cancel_if_unavailable {
         surface::SurfaceScope::Generation {
             fence: fence.clone(),
-        },
+        }
+    } else {
+        surface::SurfaceScope::Thread
+    };
+    let mut events = vec![(
+        event_scope.clone(),
         surface::SurfaceEvent::Interaction(surface::InteractionPatch::Requested {
             interaction: view,
         }),
     )];
-    if unavailable {
+    if unavailable && cancel_if_unavailable {
         events.push((
-            surface::SurfaceScope::Generation {
-                fence: fence.clone(),
-            },
+            event_scope,
             surface::SurfaceEvent::Interaction(surface::InteractionPatch::Cancelled {
                 interaction_id: interaction_id.clone(),
                 expected_revision: revision,

@@ -86,13 +86,16 @@ use crate::runtime_actor::interaction::{
     ResidentInteractionWaiter, ResidentPrivateInteractionResponse, ResidentSurfaceInteraction,
     exact_interaction_selectors, interaction_route_admits, interaction_route_admits_exact,
     interaction_route_attachments, interaction_route_epoch, keyed_interaction_response_digest,
-    prepare_interaction_request,
+    prepare_detached_interaction_request, prepare_interaction_request,
 };
 use crate::runtime_actor::operation_recovery::{
     EphemeralReservationExpiry, OperationRecoveryController,
 };
 use crate::runtime_surface as surface;
-use crate::tasks::{DurableTypedProviderOutcome, MainSessionTerminalUpdate, TaskRegistry};
+use crate::tasks::{
+    DetachedPermissionRequest, DurableTypedProviderOutcome, MainSessionTerminalUpdate,
+    TaskRegistry, detached_permission_interaction_id,
+};
 use crate::thread::RuntimeThread;
 use crate::tool_execution::{
     RecoveredPermissionRetryAuthorization, RecoveredToolExecutionDependencies,
@@ -10024,6 +10027,19 @@ fn bootstrap_recorded_surface(
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
                 message: format!("failed to materialize typed surface owner: {error:?}"),
             })?;
+        // Keep unresolved detached permission interactions available during
+        // cold-owner recovery. Their mailbox is the child process boundary;
+        // treating them as unavailable here would discard the only durable
+        // prompt and cause a restart to issue a second request.
+        let detached_permission_requests = thread
+            .session()
+            .task_registry()
+            .detached_permission_requests()
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!(
+                    "failed to read detached permission mailbox during recovery: {error}"
+                ),
+            })?;
         let (recovered_tool_owners, recovered_tool_requests, mut cold_recovery_checkpoint_failures) =
             recover_cold_tool_approval_owners_on_start(config, &mut coordinator)?;
         cold_recovery_owners = recovered_tool_owners;
@@ -10113,6 +10129,21 @@ fn bootstrap_recorded_surface(
                 .get(&operation_id)
                 .copied();
             if checkpoint_failure.is_none() {
+                let detached_interaction_ids = detached_permission_requests
+                    .iter()
+                    .filter(|request| request.is_pending())
+                    .filter_map(|request| {
+                        coordinator
+                            .state()
+                            .snapshot()
+                            .interactions
+                            .iter()
+                            .find(|interaction| {
+                                interaction.interaction_id == request.interaction_id
+                                    && interaction.fence.operation_id == operation_id
+                            })
+                            .map(|_| request.interaction_id.clone())
+                    });
                 coordinator
                     .recover_unavailable_interactions_except(
                         &operation_id,
@@ -10133,6 +10164,7 @@ fn bootstrap_recorded_surface(
                                     .filter(|owner| owner.operation_id() == &operation_id)
                                     .map(|owner| owner.interaction_id.clone()),
                             )
+                            .chain(detached_interaction_ids)
                             .collect::<Vec<_>>(),
                     )
                     .map_err(|error| RuntimeHostError::ThreadStartFailed {
@@ -13364,27 +13396,32 @@ fn interaction_safe_projection(
             }
         }
         surface::SurfaceClientInteractionAnswer::PermissionRequest { decision } => {
-            let (decision, scope, strict_auto_review) = match decision {
+            let (decision, scope, permissions, strict_auto_review) = match decision {
                 surface::SurfacePermissionClientDecision::Allow {
                     scope,
+                    permissions,
                     strict_auto_review,
-                    ..
                 } => (
                     surface::SurfaceAllowDeny::Allow,
                     *scope,
+                    permissions.clone(),
                     *strict_auto_review,
                 ),
                 surface::SurfacePermissionClientDecision::Deny {
-                    strict_auto_review, ..
+                    permissions,
+                    strict_auto_review,
+                    ..
                 } => (
                     surface::SurfaceAllowDeny::Deny,
                     surface::PermissionGrantScope::Turn,
+                    permissions.clone(),
                     *strict_auto_review,
                 ),
             };
             surface::SurfaceInteractionSafeProjection::PermissionRequest {
                 decision,
                 scope,
+                permissions,
                 strict_auto_review,
             }
         }
@@ -16099,8 +16136,10 @@ impl ThreadActor {
         // surface cursor.  Read failures are treated as not-ready so a
         // transient persistence problem cannot silently discard activity.
         let detached_relay_pending = self.detached_relay_pending_for_close();
+        let detached_permission_pending = self.detached_permission_pending_for_close();
         completion_visible
             && !detached_relay_pending
+            && !detached_permission_pending
             && !resident.coordinator.has_incomplete_batch()
             && !self.has_pending_surface_transition_retry()
             && self.operation_recovery.terminal_blocked.is_none()
@@ -16155,6 +16194,18 @@ impl ThreadActor {
             }
         }
         false
+    }
+
+    fn detached_permission_pending_for_close(&self) -> bool {
+        let Some(state) = self.state.as_ref() else {
+            return true;
+        };
+        state
+            .thread
+            .session()
+            .task_registry()
+            .has_pending_detached_permission_requests()
+            .unwrap_or(true)
     }
 
     async fn close_ephemeral_one_shot(&mut self) -> Result<(), surface::SurfaceClientCommandError> {
@@ -16453,7 +16504,14 @@ impl ThreadActor {
                 std::collections::HashMap::new()
             }
         };
-        for binding in detached_bindings.values() {
+        for binding in detached_bindings.values().filter(|binding| {
+            binding.parent_fence.as_ref().is_some_and(|parent_fence| {
+                active
+                    .surface_operation
+                    .as_ref()
+                    .is_some_and(|fence| fence.thread_id == parent_fence.thread_id)
+            })
+        }) {
             if let Err(error) = self.drain_detached_subagent_relay(&active.task_registry, binding)
                 && !matches!(
                     error.kind(),
@@ -16521,6 +16579,17 @@ impl ThreadActor {
         let Some(state) = self.state.as_ref() else {
             return;
         };
+        let Some(current_thread_id) = self.resident_surface.0.as_ref().map(|surface| {
+            surface
+                .coordinator
+                .state()
+                .snapshot()
+                .thread
+                .thread_id
+                .clone()
+        }) else {
+            return;
+        };
         let task_registry = state.thread.session().task_registry().clone();
         let bindings = match task_registry.detached_subagent_bindings() {
             Ok(bindings) => bindings,
@@ -16529,7 +16598,12 @@ impl ThreadActor {
                 return;
             }
         };
-        for binding in bindings {
+        for binding in bindings.into_iter().filter(|binding| {
+            binding
+                .parent_fence
+                .as_ref()
+                .is_some_and(|fence| fence.thread_id == current_thread_id)
+        }) {
             if let Err(error) = self.drain_detached_subagent_relay(&task_registry, &binding) {
                 if !matches!(
                     error.kind(),
@@ -16592,6 +16666,7 @@ impl ThreadActor {
                     biased;
                     _ = tokio::time::sleep(SUBAGENT_RELAY_POLL_INTERVAL) => {
                         self.drain_subagent_relays_while_idle();
+                        self.drain_detached_permission_requests(None);
                     }
                     _ = wait_for_surface_transition_retry(surface_retry_at) => {
                         self.retry_pending_surface_transition(None);
@@ -16864,6 +16939,7 @@ impl ThreadActor {
                 }
                 _ = tokio::time::sleep(SUBAGENT_RELAY_POLL_INTERVAL) => {
                     self.drain_subagent_relays_for_active(&mut active);
+                    self.drain_detached_permission_requests(Some(&active));
                     self.active = Some(active);
                 }
                 wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {

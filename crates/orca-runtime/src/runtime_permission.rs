@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::PermissionProfileNetworkAccess;
 
@@ -15,13 +17,16 @@ use crate::protocol::{
 /// foreground request to the committed tool identity. Child requests must
 /// carry the complete activity owner, so they cannot be recovered from an
 /// incidental snapshot match.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RuntimePermissionContext {
     Foreground {
         origin: crate::surface::SurfacePermissionOrigin,
     },
     Child {
         task_id: crate::surface::SurfaceTaskId,
+        /// The task revision observed when the child attempt was admitted.
+        /// This is a lower bound for owner validation, not the mutable task
+        /// CAS revision (permission interactions advance that revision).
         task_revision: crate::surface::TaskRevision,
         agent_id: crate::surface::SurfaceSubagentId,
         agent_revision: crate::surface::SubagentRevision,
@@ -61,7 +66,7 @@ impl RuntimePermissionContext {
 
 pub(crate) const SESSION_METADATA_DIRECTORY_SOURCE: &str = "session-metadata";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimePermissionRequest {
     pub id: String,
     pub reason: Option<String>,
@@ -71,7 +76,7 @@ pub struct RuntimePermissionRequest {
     pub context: RuntimePermissionContext,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimePermissionResponse {
     pub decision: PermissionResponseDecision,
     pub scope: PermissionGrantScope,

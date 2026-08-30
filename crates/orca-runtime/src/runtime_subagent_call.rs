@@ -29,7 +29,8 @@ use crate::agent_continuation::{
 use crate::child_agent_types::{
     ChildAgentActivityEmitter, ChildAgentActivityPublisher, ChildAgentActivitySink,
     ChildAgentCheckpointObserver, ChildAgentCompatibilityIdentity, ChildAgentContinuationStart,
-    SubagentActivityEvent, SubagentActivityIdentity, SubagentActivityPayload, child_event_output,
+    SubagentActivityEvent, SubagentActivityIdentity, SubagentActivityOwner,
+    SubagentActivityPayload, child_event_output,
 };
 use crate::child_permission::{ChildPermissionHandler, ChildPermissionIdentity};
 use crate::cost::CostTracker;
@@ -42,7 +43,8 @@ use crate::memory::MemoryBlock;
 use crate::runtime_permission::RuntimePermissionRequestHandler;
 use crate::runtime_surface::RuntimeSubagentActivityIngress;
 use crate::runtime_surface::{
-    DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId,
+    DisplayText, Sha256Digest, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId,
+    TaskRevision,
 };
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
@@ -50,11 +52,6 @@ use crate::subagent::{SubagentIsolation, SubagentRequest};
 use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
-
-#[cfg(test)]
-use crate::child_agent_types::SubagentActivityOwner;
-#[cfg(test)]
-use crate::runtime_surface::TaskRevision;
 
 pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) tool_request: ToolRequest,
@@ -94,12 +91,46 @@ impl ChildAgentActivitySink for RuntimeSubagentActivitySink {
     }
 }
 
+/// The pre-surface `RuntimeHost` API still exposes parent lifecycle events but
+/// has no actor-owned surface ingress. Keep that legacy path observable through
+/// its existing parent observer without pretending that the events were
+/// durably committed to a surface. A child that has a permission handler never
+/// uses this fallback; it must have the actor boundary available.
+#[derive(Debug, Default)]
+struct LegacySubagentActivitySink;
+
+impl ChildAgentActivitySink for LegacySubagentActivitySink {
+    fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        if !event.verify_digest() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child activity digest verification failed",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct ChildEventActivityObserver {
     pub(crate) emitter: Arc<ChildAgentActivityEmitter>,
 }
 
 impl EventObserver for ChildEventActivityObserver {
     fn observe(&self, event: &EventEnvelope) -> io::Result<()> {
+        let required_text = |field: &str| {
+            event.payload[field]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "child event {:?} is missing string field '{field}'",
+                            event.event_type
+                        ),
+                    )
+                })
+        };
         let activity = match event.event_type {
             EventType::TurnStarted => Some(crate::agent_child::ChildAgentActivity::TurnStarted {
                 turn: event.payload["turn"].as_u64().unwrap_or_default() as u32,
@@ -109,21 +140,15 @@ impl EventObserver for ChildEventActivityObserver {
             }
             EventType::ToolCallRequested => {
                 Some(crate::agent_child::ChildAgentActivity::ToolStarted {
-                    call_id: event.payload["id"]
-                        .as_str()
-                        .unwrap_or("unknown-tool-call")
-                        .to_string(),
-                    name: event.payload["name"].as_str().unwrap_or("tool").to_string(),
+                    call_id: required_text("id")?,
+                    name: required_text("name")?,
                     target: event.payload["target"].as_str().map(str::to_string),
                 })
             }
             EventType::ToolCallCompleted => {
                 Some(crate::agent_child::ChildAgentActivity::ToolCompleted {
-                    call_id: event.payload["id"]
-                        .as_str()
-                        .unwrap_or("unknown-tool-call")
-                        .to_string(),
-                    name: event.payload["name"].as_str().unwrap_or("tool").to_string(),
+                    call_id: required_text("id")?,
+                    name: required_text("name")?,
                     status: match event.payload["status"].as_str() {
                         Some("completed") => RunStatus::Success,
                         Some("cancelled") => RunStatus::Cancelled,
@@ -822,32 +847,46 @@ fn execute_acquired_sync_subagent(
         }
     };
     // Synchronous children are part of the foreground surface generation.
-    // Without the actor ingress there is no authoritative delivery boundary;
-    // silently falling back to a task mirror would make the child invisible
-    // to the user and impossible to authorize, so fail before execution.
-    let Some(activity_ingress) = activity_ingress else {
-        let output = continuation_started_failure(
-            tool_request,
-            description,
-            lifecycle,
-            started_task,
-            &child_config,
-            "subagent activity ingress is unavailable; refusing to start an unobservable child"
-                .to_string(),
-            worktree_execution.finish(),
-        );
-        return finalize_started_sync_subagent(
-            output,
-            &coordinator,
-            &lease,
-            &task_registry,
-            &registry_task_id,
-            false,
-        );
-    };
-    let activity_owner = activity_ingress.owner();
-    let activity_sink: Arc<dyn ChildAgentActivitySink> =
-        Arc::new(RuntimeSubagentActivitySink { ingress: activity_ingress });
+    // A permission-capable child must have the actor ingress available. The
+    // only permitted fallback is the legacy host API, whose parent lifecycle
+    // observer remains the authoritative user-visible signal.
+    let (activity_owner, activity_sink): (SubagentActivityOwner, Arc<dyn ChildAgentActivitySink>) =
+        match activity_ingress {
+            Some(activity_ingress) => (
+                activity_ingress.owner(),
+                Arc::new(RuntimeSubagentActivitySink {
+                    ingress: activity_ingress,
+                }),
+            ),
+            None if permission_handler.is_none() => (
+                SubagentActivityOwner::DetachedTask {
+                    task_id: surface_task_id.clone(),
+                    task_revision: TaskRevision::try_new(1).expect("positive task revision"),
+                    authority_digest: Sha256Digest::new([0; 32]),
+                },
+                Arc::new(LegacySubagentActivitySink),
+            ),
+            None => {
+                let output = continuation_started_failure(
+                    tool_request,
+                    description,
+                    lifecycle,
+                    started_task,
+                    &child_config,
+                    "subagent activity ingress is unavailable; refusing to start an unobservable child"
+                        .to_string(),
+                    worktree_execution.finish(),
+                );
+                return finalize_started_sync_subagent(
+                    output,
+                    &coordinator,
+                    &lease,
+                    &task_registry,
+                    &registry_task_id,
+                    false,
+                );
+            }
+        };
     // Allocate the child logical turn before the first activity envelope. The
     // exact value is then shared by the surface source cursor, runtime turn,
     // and child permission identity for this attempt.

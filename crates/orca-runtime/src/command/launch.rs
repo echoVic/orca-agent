@@ -1,6 +1,8 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 
+use base64::Engine;
+
 use orca_core::config::file::{ConfigOverrides, parse_approval_mode_value};
 use orca_core::config::{HistoryMode, OutputFormat, ProviderKind, RunConfig};
 
@@ -63,6 +65,7 @@ pub struct SubagentWorkerLaunchRequest {
     pub request_json: String,
     pub worktree_repo_root: Option<PathBuf>,
     pub worktree_path: Option<PathBuf>,
+    pub permission_response_public_key: String,
 }
 
 pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfig, String> {
@@ -176,6 +179,19 @@ fn run_subagent_worker_with_reader(request: SubagentWorkerLaunchRequest, reader:
                 return 1;
             }
         };
+    let public_key_bytes = match base64::engine::general_purpose::STANDARD
+        .decode(request.permission_response_public_key.as_bytes())
+    {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut key = [0_u8; 32];
+            key.copy_from_slice(&bytes);
+            key
+        }
+        _ => {
+            eprintln!("orca: invalid detached permission response public key");
+            return 1;
+        }
+    };
     let worktree = match validate_worktree_pair(request.worktree_repo_root, request.worktree_path) {
         Ok(worktree) => worktree,
         Err(error) => {
@@ -216,6 +232,7 @@ fn run_subagent_worker_with_reader(request: SubagentWorkerLaunchRequest, reader:
         request: subagent_request,
         child_depth: request.subagent_depth,
         worktree,
+        permission_response_public_key: public_key_bytes,
     })
 }
 

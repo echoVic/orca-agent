@@ -585,19 +585,46 @@ impl ChildAgentActivityEmitter {
             .pending
             .lock()
             .map_err(|_| io::Error::other("child activity emitter is unavailable after a panic"))?;
+        // A failed sink keeps the exact event pending. If the caller advances
+        // to a different payload before retrying, flush the old event first;
+        // silently replacing it would create a source-sequence gap and lose
+        // the activity that the parent surface is meant to observe.
+        if let Some(event) = pending.pending.clone() {
+            if event.payload != payload {
+                self.sink.publish(event.clone())?;
+                self.published_revision
+                    .store(event.source_sequence, Ordering::Release);
+                pending.next_sequence = event
+                    .source_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("child activity source sequence overflow"))?;
+                pending.pending = None;
+            } else {
+                self.sink.publish(event)?;
+                self.published_revision
+                    .store(pending.next_sequence, Ordering::Release);
+                pending.next_sequence = pending
+                    .next_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("child activity source sequence overflow"))?;
+                pending.pending = None;
+                return Ok(());
+            }
+        }
         let next_sequence = pending.next_sequence;
-        let event = pending.pending.get_or_insert_with(|| {
-            SubagentActivityEvent::new(
-                self.identity.task_id.clone(),
-                self.identity.subagent_id.clone(),
-                self.identity.attempt_id.clone(),
-                self.identity.turn_id.clone(),
-                next_sequence,
-                self.identity.owner.clone(),
-                payload,
-            )
-        });
-        self.sink.publish(event.clone())?;
+        let event = SubagentActivityEvent::new(
+            self.identity.task_id.clone(),
+            self.identity.subagent_id.clone(),
+            self.identity.attempt_id.clone(),
+            self.identity.turn_id.clone(),
+            next_sequence,
+            self.identity.owner.clone(),
+            payload,
+        );
+        if let Err(error) = self.sink.publish(event.clone()) {
+            pending.pending = Some(event);
+            return Err(error);
+        }
         self.published_revision
             .store(next_sequence, Ordering::Release);
         pending.next_sequence = pending
@@ -800,5 +827,57 @@ mod tests {
         assert!(events[0].verify_digest());
         assert_eq!(events[2].source_sequence, 2);
         assert!(events[2].verify_digest());
+    }
+
+    #[test]
+    fn typed_emitter_does_not_drop_a_new_payload_after_failure() {
+        let sink = Arc::new(RecordingSink {
+            fail_once: AtomicBool::new(true),
+            events: Mutex::new(Vec::new()),
+        });
+        let emitter = ChildAgentActivityEmitter::new(
+            SubagentActivityIdentity {
+                task_id: SurfaceTaskId::try_new("task-2").unwrap(),
+                subagent_id: SurfaceSubagentId::try_new("subagent-2").unwrap(),
+                attempt_id: AgentAttemptId::new(),
+                turn_id: TurnId::new(),
+                owner: SubagentActivityOwner::DetachedTask {
+                    task_id: SurfaceTaskId::try_new("task-2").unwrap(),
+                    task_revision: TaskRevision::try_new(1).unwrap(),
+                    authority_digest: Sha256Digest::digest("authority-2"),
+                },
+            },
+            sink.clone(),
+        );
+        assert!(
+            emitter
+                .publish_payload(SubagentActivityPayload::Started {
+                    description: DisplayText::new("start"),
+                })
+                .is_err()
+        );
+        emitter
+            .publish_payload(SubagentActivityPayload::PhaseChanged {
+                phase: SurfaceSubagentPhase::Thinking,
+                turn: None,
+            })
+            .unwrap();
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0].payload,
+            SubagentActivityPayload::Started { .. }
+        ));
+        assert!(matches!(
+            events[1].payload,
+            SubagentActivityPayload::Started { .. }
+        ));
+        assert!(matches!(
+            events[2].payload,
+            SubagentActivityPayload::PhaseChanged { .. }
+        ));
+        assert_eq!(events[0].source_sequence, 1);
+        assert_eq!(events[1].source_sequence, 1);
+        assert_eq!(events[2].source_sequence, 2);
     }
 }

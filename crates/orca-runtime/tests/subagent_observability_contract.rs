@@ -157,41 +157,38 @@ fn synchronous_child_activity_has_one_surface_delivery_boundary() {
     // one path reaches the parent surface and one path is merely a mirror.
     // Production child execution must either receive the surface ingress or
     // fail before starting, so a missing parent cannot silently hide events.
-    let sink_selection = balanced_block(
-        SYNC_SUBAGENT,
-        "let activity_sink: Arc<dyn ChildAgentActivitySink>",
-    );
+    let sink_selection = balanced_block(SYNC_SUBAGENT, "let (activity_owner, activity_sink)");
     assert!(
         !sink_selection.contains("TaskRegistryActivitySink"),
         "sync child activity must not fall back to a registry-only mirror"
+    );
+    assert!(
+        sink_selection.contains("LegacySubagentActivitySink")
+            && sink_selection.contains("permission_handler.is_none()"),
+        "legacy activity fallback must remain restricted to children without permission capabilities"
     );
 }
 
 #[test]
 fn surface_task_projection_preserves_the_registry_parent_identity() {
-    let function = balanced_block(
-        GENERATION_ACTOR,
-        "pub(super) fn commit_surface_subagent_activity",
-    );
+    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_inner");
     assert!(
-        function.contains("parent_task_id: active.task_registry")
-            && function.contains("parent_task_id"),
+        function.contains("parent_task_id: task_registry") && function.contains("parent_task_id"),
         "the first child task projection must derive parent_task_id from the authoritative task registry"
     );
 }
 
 #[test]
 fn durable_commit_retry_checks_the_event_digest_before_acknowledging_id() {
-    let function = balanced_block(
-        GENERATION_ACTOR,
-        "pub(super) fn commit_surface_subagent_activity",
-    );
+    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_inner");
     let lookup_start = function
         .find("lookup_commit(&event.surface_commit_id)")
         .expect("subagent activity commit should consult the durable retry index");
-    let lookup_block = balanced_block(&function[lookup_start..], "if self");
+    let lookup_block = &function[lookup_start..];
     assert!(
-        lookup_block.contains("batch_digest") && lookup_block.contains("event.digest"),
+        lookup_block.contains("stored_batch_digest")
+            && lookup_block.contains("batch_digest")
+            && lookup_block.contains("event.digest"),
         "an existing commit id is not sufficient: durable retry acknowledgement must bind the stored batch digest to this event"
     );
 }

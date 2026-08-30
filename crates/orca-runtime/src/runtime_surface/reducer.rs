@@ -1318,8 +1318,13 @@ fn child_permission_owner_scope_matches(
         || task.subagent_id.as_ref() != Some(agent_id)
         || task_revision > &task.revision
         || subagent.task_id != *task_id
-        || subagent.revision != *agent_revision
-        || subagent.source.source_sequence != agent_revision.get()
+        // The activity relay and a permission mailbox are independent durable
+        // streams. The mailbox may refer to an earlier activity revision by
+        // the time the actor admits it, but it must never refer to a revision
+        // that the surface has not observed yet.
+        || subagent.revision < *agent_revision
+        || subagent.source.source_sequence < agent_revision.get()
+        || agent_revision.get() == 0
         || subagent.status != SurfaceSubagentStatus::Running
         || subagent.source.turn_id != *turn_id
     {
@@ -1359,6 +1364,49 @@ fn child_permission_owner_scope_matches(
             Some(ChildPermissionOwnerScope::Detached)
         }
     }
+}
+
+/// Commit/recovery authorization needs the same owner validation as reducer
+/// scope checking, but must not depend on a caller being able to construct a
+/// `ChildPermissionOwnerScope`. Keep this narrow predicate private to the
+/// surface crate so actor/recovery code cannot accidentally broaden Thread
+/// scope to arbitrary child interactions.
+pub(crate) fn detached_child_permission_interaction_matches(
+    snapshot: &SurfaceSnapshot,
+    interaction: &SurfaceInteractionView,
+    allow_pending_task: bool,
+    allow_running_without_pending: bool,
+) -> bool {
+    matches!(
+        child_permission_owner_scope_matches(
+            snapshot,
+            interaction,
+            allow_pending_task,
+            allow_running_without_pending,
+        ),
+        Some(ChildPermissionOwnerScope::Detached)
+    )
+}
+
+/// Counterpart to [`detached_child_permission_interaction_matches`] for the
+/// historical generation scope. Keeping both predicates beside the reducer's
+/// owner classifier prevents commit authorization from treating a malformed
+/// or detached child permission as an ordinary foreground interaction.
+pub(crate) fn generation_child_permission_interaction_matches(
+    snapshot: &SurfaceSnapshot,
+    interaction: &SurfaceInteractionView,
+    allow_pending_task: bool,
+    allow_running_without_pending: bool,
+) -> bool {
+    matches!(
+        child_permission_owner_scope_matches(
+            snapshot,
+            interaction,
+            allow_pending_task,
+            allow_running_without_pending,
+        ),
+        Some(ChildPermissionOwnerScope::Generation)
+    )
 }
 
 fn interaction_is_child_permission(interaction: &SurfaceInteractionView) -> bool {
@@ -8686,9 +8734,13 @@ fn subagent_source_is_next(previous: &SurfaceSubagentSource, next: &SurfaceSubag
         && next.source_commit_id != previous.source_commit_id
 }
 
-fn task_status_transition_allowed(from: SurfaceTaskStatus, to: SurfaceTaskStatus) -> bool {
+fn task_status_transition_allowed(
+    task_type: SurfaceTaskType,
+    from: SurfaceTaskStatus,
+    to: SurfaceTaskStatus,
+) -> bool {
     use SurfaceTaskStatus::*;
-    matches!(
+    let manifest_transition = matches!(
         (from, to),
         (
             Queued,
@@ -8701,7 +8753,9 @@ fn task_status_transition_allowed(from: SurfaceTaskStatus, to: SurfaceTaskStatus
             Running | Stopping | Stopped | Failed | Cancelled
         ) | (Paused, Running | Stopping | Stopped | Failed | Cancelled)
             | (Stopping, Stopped | Failed | Cancelled)
-    )
+    );
+    manifest_transition
+        || (task_type == SurfaceTaskType::Subagent && from == Running && to == Running)
 }
 
 fn task_revision_is_contiguous(expected: TaskRevision, next: TaskRevision) -> bool {
@@ -8850,7 +8904,7 @@ fn apply_task_patch(
                     "task revision is stale or noncontiguous",
                 ));
             }
-            if !task_status_transition_allowed(task.status, *status) {
+            if !task_status_transition_allowed(task.task_type, task.status, *status) {
                 return Err(event_error(
                     envelope,
                     SurfaceReducerErrorCode::IllegalTransition,
@@ -8891,7 +8945,7 @@ fn apply_task_patch(
                     "task interaction revision is stale or noncontiguous",
                 ));
             }
-            if !task_status_transition_allowed(task.status, *status) {
+            if !task_status_transition_allowed(task.task_type, task.status, *status) {
                 return Err(event_error(
                     envelope,
                     SurfaceReducerErrorCode::IllegalTransition,

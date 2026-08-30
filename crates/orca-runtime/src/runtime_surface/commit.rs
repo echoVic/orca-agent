@@ -2432,8 +2432,17 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                             )
                             .expect("generated UUID is v7"),
                             commit_class: batch.commit_class.clone(),
-                            scope: SurfaceScope::Generation {
-                                fence: interaction.fence,
+                            scope: if super::reducer::detached_child_permission_interaction_matches(
+                                self.state.snapshot(),
+                                &interaction,
+                                true,
+                                false,
+                            ) {
+                                SurfaceScope::Thread
+                            } else {
+                                SurfaceScope::Generation {
+                                    fence: interaction.fence.clone(),
+                                }
                             },
                             event: super::SurfaceEvent::Interaction(
                                 super::InteractionPatch::Cancelled {
@@ -3495,8 +3504,13 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         batch: &SurfaceCommitBatch,
     ) -> Result<RecoveredBatchAuthority, SurfaceCommitError> {
         let actor = self.actor_control_permit.clone();
-        if permit_authorizes(&self.issued_permits, &actor, batch, self.owner_epoch)
-            && finalizer_background_scope_matches_state(&self.state, &actor, batch)
+        if permit_authorizes(
+            &self.state,
+            &self.issued_permits,
+            &actor,
+            batch,
+            self.owner_epoch,
+        ) && finalizer_background_scope_matches_state(&self.state, &actor, batch)
             && recovery_capability_completion_matches_state(&self.state, &actor, batch)
             && recovery_manual_compaction_matches_state(&self.state, &actor, batch)
         {
@@ -4063,9 +4077,6 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             }
         }
         if let [interaction, task] = events
-            && let SurfaceScope::Generation {
-                fence: historical_fence,
-            } = &interaction.scope
             && matches!(
                 (&interaction.event, &task.scope, &task.event),
                 (
@@ -4074,10 +4085,32 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged { .. }),
                 )
             )
+            && let Some(historical_fence) = match &interaction.scope {
+                SurfaceScope::Generation { fence } => Some(fence.clone()),
+                SurfaceScope::Thread => match &interaction.event {
+                    super::SurfaceEvent::Interaction(super::InteractionPatch::Requested {
+                        interaction,
+                    }) if matches!(
+                        &interaction.request,
+                        super::SurfaceInteractionRequest::PermissionRequest {
+                            context: super::SurfacePermissionContext {
+                                owner: super::SurfacePermissionOwnerRef::Child { .. },
+                                ..
+                            },
+                            ..
+                        }
+                    ) =>
+                    {
+                        Some(interaction.fence.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
         {
             let generation = SurfacePublisherPermit::Generation {
                 permit_id: next_permit_id(),
-                fence: historical_fence.clone(),
+                fence: historical_fence,
             };
             let mut issued = self.issued_permits.clone();
             issued.push(generation.clone());
@@ -4100,9 +4133,6 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         // the owner-aware authority instead of treating the task patch as a
         // generic generation continuation.
         if let [resolution, task] = events
-            && let SurfaceScope::Generation {
-                fence: historical_fence,
-            } = &resolution.scope
             && matches!(
                 (&resolution.event, &task.scope, &task.event),
                 (
@@ -4111,10 +4141,11 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged { .. }),
                 )
             )
+            && let Some(historical_fence) = permission_interaction_fence(&self.state, resolution)
         {
             let generation = SurfacePublisherPermit::Generation {
                 permit_id: next_permit_id(),
-                fence: historical_fence.clone(),
+                fence: historical_fence,
             };
             let mut issued = self.issued_permits.clone();
             issued.push(generation.clone());
@@ -4139,9 +4170,6 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         // recovered authority so a replay cannot apply only the settings or
         // only the task clear.
         if let [settings, resolution, task] = events
-            && let SurfaceScope::Generation {
-                fence: historical_fence,
-            } = &resolution.scope
             && matches!(
                 (
                     &settings.scope,
@@ -4158,10 +4186,11 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged { .. }),
                 )
             )
+            && let Some(historical_fence) = permission_interaction_fence(&self.state, resolution)
         {
             let generation = SurfacePublisherPermit::Generation {
                 permit_id: next_permit_id(),
-                fence: historical_fence.clone(),
+                fence: historical_fence,
             };
             let mut issued = self.issued_permits.clone();
             issued.push(generation.clone());
@@ -4182,9 +4211,6 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             }
         }
         if let [settings, resolution] = events
-            && let SurfaceScope::Generation {
-                fence: historical_fence,
-            } = &resolution.scope
             && matches!(
                 (&settings.scope, &settings.event, &resolution.event),
                 (
@@ -4193,10 +4219,11 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                     super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved { .. }),
                 )
             )
+            && let Some(historical_fence) = permission_interaction_fence(&self.state, resolution)
         {
             let generation = SurfacePublisherPermit::Generation {
                 permit_id: next_permit_id(),
-                fence: historical_fence.clone(),
+                fence: historical_fence,
             };
             let mut issued = self.issued_permits.clone();
             issued.push(generation.clone());
@@ -4216,17 +4243,43 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                 );
             }
         }
-        if let Some(SurfaceScope::Generation {
-            fence: historical_fence,
-        }) = events.get(1).map(|event| &event.scope)
-        {
+        // Terminalization normally carries generation-scoped capability
+        // settlements. A batch containing only a detached child prompt can
+        // legitimately have no such event, so recover its historical fence
+        // from the durable interaction identity instead of assuming
+        // `events[1]` is Generation-scoped.
+        let terminalization_fence = events
+            .iter()
+            .find_map(|event| match &event.scope {
+                SurfaceScope::Generation { fence } => Some(fence.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                events.iter().find_map(|event| {
+                    let super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
+                        interaction_id,
+                        ..
+                    }) = &event.event
+                    else {
+                        return None;
+                    };
+                    self.state
+                        .snapshot()
+                        .interactions
+                        .iter()
+                        .find(|interaction| &interaction.interaction_id == interaction_id)
+                        .map(|interaction| interaction.fence.clone())
+                })
+            });
+        if let Some(historical_fence) = terminalization_fence {
             let generation = SurfacePublisherPermit::Generation {
                 permit_id: next_permit_id(),
-                fence: historical_fence.clone(),
+                fence: historical_fence,
             };
             let mut issued = self.issued_permits.clone();
             issued.push(generation.clone());
             if actor_generation_terminalization_authorized(
+                &self.state,
                 &issued,
                 &actor,
                 &generation,
@@ -4271,6 +4324,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             let mut issued = self.issued_permits.clone();
             issued.push(generation.clone());
             if actor_generation_interrupt_authorized(
+                &self.state,
                 &issued,
                 &actor,
                 &generation,
@@ -4362,7 +4416,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         };
         let mut issued = self.issued_permits.clone();
         issued.push(candidate.clone());
-        if !permit_authorizes(&issued, &candidate, batch, self.owner_epoch)
+        if !permit_authorizes(&self.state, &issued, &candidate, batch, self.owner_epoch)
             || !finalizer_background_scope_matches_state(&self.state, &candidate, batch)
             || !recovery_capability_completion_matches_state(&self.state, &candidate, batch)
             || !recovery_manual_compaction_matches_state(&self.state, &candidate, batch)
@@ -4832,12 +4886,33 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             commit_id: super::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7"),
         };
+        let scope = match &patch {
+            super::InteractionPatch::Cancelled { interaction_id, .. }
+                if self
+                    .state
+                    .snapshot()
+                    .interactions
+                    .iter()
+                    .find(|interaction| &interaction.interaction_id == interaction_id)
+                    .is_some_and(|interaction| {
+                        super::reducer::detached_child_permission_interaction_matches(
+                            self.state.snapshot(),
+                            interaction,
+                            true,
+                            false,
+                        )
+                    }) =>
+            {
+                SurfaceScope::Thread
+            }
+            _ => SurfaceScope::Generation { fence },
+        };
         let event = super::SurfaceEventEnvelope {
             ordinal: 0,
             event_id: super::SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7"),
             commit_class: commit_class.clone(),
-            scope: SurfaceScope::Generation { fence },
+            scope,
             event: super::SurfaceEvent::Interaction(patch),
         };
         let mut batch = SurfaceCommitBatch {
@@ -5131,8 +5206,13 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         }
         let authorized = match authority {
             BatchCommitAuthority::Single(permit) => {
-                permit_authorizes(&self.issued_permits, permit, batch, self.owner_epoch)
-                    && finalizer_background_scope_matches_state(&self.state, permit, batch)
+                permit_authorizes(
+                    &self.state,
+                    &self.issued_permits,
+                    permit,
+                    batch,
+                    self.owner_epoch,
+                ) && finalizer_background_scope_matches_state(&self.state, permit, batch)
                     && recovery_stream_dispositions_match_state(&self.state, permit, batch)
                     && recovery_capability_completion_matches_state(&self.state, permit, batch)
                     && recovery_manual_compaction_matches_state(&self.state, permit, batch)
@@ -5196,6 +5276,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             ),
             BatchCommitAuthority::ActorGenerationTerminalization { actor, generation } => {
                 actor_generation_terminalization_authorized(
+                    &self.state,
                     &self.issued_permits,
                     actor,
                     generation,
@@ -5205,6 +5286,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
             }
             BatchCommitAuthority::ActorGenerationInterrupt { actor, generation } => {
                 actor_generation_interrupt_authorized(
+                    &self.state,
                     &self.issued_permits,
                     actor,
                     generation,
@@ -6173,18 +6255,61 @@ fn historical_tool_result_commit_authorized(
 /// Thread-scoped task projection paired with one child subagent patch.  A
 /// foreground child uses a matching Generation scope; a detached child uses
 /// Thread for transport but carries an explicit durable owner identity.
-fn actor_control_subagent_activity_authorized(batch: &SurfaceCommitBatch) -> bool {
+///
+/// The actor is the only component that can issue the capability, but the
+/// capability itself is not enough: the projected task/subagent state is an
+/// independent durable fence.  Re-checking that fence here keeps a malformed
+/// or replayed batch from relying solely on validation in the runtime actor.
+fn actor_control_subagent_activity_authorized(
+    state: &SurfaceReducerState,
+    batch: &SurfaceCommitBatch,
+) -> bool {
     let [task_event, subagent_event] = batch.events.as_slice() else {
         return false;
     };
     if !matches!(&task_event.scope, SurfaceScope::Thread) {
         return false;
     }
-    let super::SurfaceEvent::Task(super::TaskPatch::Upserted { task, .. }) = &task_event.event
-    else {
-        return false;
+    let (expected_task_revision, task) = match &task_event.event {
+        super::SurfaceEvent::Task(super::TaskPatch::Upserted {
+            expected_revision,
+            task,
+        }) => (*expected_revision, task.clone()),
+        super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            status,
+            completed_at,
+            result,
+            error,
+        }) => {
+            let Some(current) = state
+                .snapshot()
+                .tasks
+                .iter()
+                .find(|candidate| candidate.task_id == *task_id)
+            else {
+                return false;
+            };
+            let mut next = current.clone();
+            next.revision = *next_revision;
+            next.status = *status;
+            next.completed_at = *completed_at;
+            next.result = result.clone();
+            next.error = error.clone();
+            (Some(*expected_revision), next)
+        }
+        _ => return false,
     };
-    let (subagent_id, owner, source, expected_generation) = match &subagent_event.event {
+    let (
+        subagent_id,
+        owner,
+        source,
+        expected_generation,
+        expected_subagent_revision,
+        next_subagent_revision,
+    ) = match &subagent_event.event {
         super::SurfaceEvent::Subagent(super::SubagentPatch::Started { subagent, .. }) => {
             let value = subagent.as_subagent();
             let expected_generation = match &subagent_event.scope {
@@ -6197,16 +6322,22 @@ fn actor_control_subagent_activity_authorized(batch: &SurfaceCommitBatch) -> boo
                 &value.owner,
                 &value.source,
                 expected_generation,
+                None,
+                Some(value.revision),
             )
         }
         super::SurfaceEvent::Subagent(super::SubagentPatch::Progress {
             subagent_id,
+            expected_revision,
+            next_revision,
             owner,
             source,
             ..
         })
         | super::SurfaceEvent::Subagent(super::SubagentPatch::Completed {
             subagent_id,
+            expected_revision,
+            next_revision,
             owner,
             source,
             ..
@@ -6216,31 +6347,247 @@ fn actor_control_subagent_activity_authorized(batch: &SurfaceCommitBatch) -> boo
                 SurfaceScope::Thread => None,
                 _ => return false,
             };
-            (subagent_id, owner, source, expected_generation)
+            (
+                subagent_id,
+                owner,
+                source,
+                expected_generation,
+                Some(*expected_revision),
+                Some(*next_revision),
+            )
         }
         _ => return false,
     };
+    let snapshot = state.snapshot();
+    let task_id = &task.task_id;
+    let existing_task = snapshot
+        .tasks
+        .iter()
+        .find(|candidate| candidate.task_id == *task_id);
+
+    // A Started patch must create both projections atomically.  If either
+    // identity is already present, accepting the batch would turn an actor
+    // control permit into a replacement authority.
+    let started = matches!(
+        &subagent_event.event,
+        super::SurfaceEvent::Subagent(super::SubagentPatch::Started { .. })
+    );
+    if started
+        && (existing_task.is_some()
+            || snapshot
+                .subagents
+                .iter()
+                .any(|candidate| candidate.subagent_id == *subagent_id))
+    {
+        return false;
+    }
+    if !started
+        && (existing_task.is_none()
+            || !snapshot
+                .subagents
+                .iter()
+                .any(|candidate| candidate.subagent_id == *subagent_id))
+    {
+        return false;
+    }
+
+    // Keep the actor permit tied to the same revision transition the reducer
+    // will apply. This is important for retries: a stale batch must not be
+    // accepted merely because its owner identity still looks valid.
+    let revision_shape_is_valid = if started {
+        expected_task_revision.is_none()
+            && task.revision.get() == 1
+            && expected_subagent_revision.is_none()
+            && next_subagent_revision.is_some_and(|revision| revision.get() == 1)
+            && source.source_sequence == 1
+    } else {
+        let Some(current_task) = existing_task else {
+            return false;
+        };
+        let Some(current_subagent) = snapshot
+            .subagents
+            .iter()
+            .find(|candidate| candidate.subagent_id == *subagent_id)
+        else {
+            return false;
+        };
+        expected_task_revision == Some(current_task.revision)
+            && task.revision.get() == current_task.revision.get().saturating_add(1)
+            && expected_subagent_revision == Some(current_subagent.revision)
+            && next_subagent_revision.is_some_and(|revision| {
+                current_subagent
+                    .revision
+                    .get()
+                    .checked_add(1)
+                    .is_some_and(|expected| revision.get() == expected)
+            })
+            && current_subagent
+                .source
+                .source_sequence
+                .checked_add(1)
+                .is_some_and(|expected| source.source_sequence == expected)
+            && source.turn_id == current_subagent.source.turn_id
+    };
+    if !revision_shape_is_valid {
+        return false;
+    }
+
     match (owner, expected_generation) {
         (super::SurfaceSubagentOwner::Generation { fence: owner }, Some(scope_fence)) => {
-            task.task_type == super::SurfaceTaskType::Subagent
+            operation_fence_is_known(snapshot, scope_fence)
+                && task.task_type == super::SurfaceTaskType::Subagent
                 && task.subagent_id.as_ref() == Some(subagent_id)
                 && task.parent_operation.as_ref() == Some(&scope_fence.operation_id)
                 && owner == scope_fence
                 && source.source_sequence > 0
+                && existing_task
+                    .map(|current| {
+                        current.task_type == super::SurfaceTaskType::Subagent
+                            && current.subagent_id.as_ref() == Some(subagent_id)
+                            && current.parent_operation == task.parent_operation
+                    })
+                    .unwrap_or(true)
+                && snapshot
+                    .subagents
+                    .iter()
+                    .find(|current| current.subagent_id == *subagent_id)
+                    .map(|current| {
+                        current.owner
+                            == super::SurfaceSubagentOwner::Generation {
+                                fence: owner.clone(),
+                            }
+                    })
+                    .unwrap_or(true)
         }
         (super::SurfaceSubagentOwner::DetachedTask { owner }, None) => {
+            let parent_operation_is_known = match task.parent_operation.as_ref() {
+                Some(operation_id) => {
+                    snapshot
+                        .foreground_operation
+                        .iter()
+                        .chain(snapshot.queued_operations.iter())
+                        .chain(snapshot.operation_history.iter())
+                        .any(|operation| &operation.operation_id == operation_id)
+                        || snapshot
+                            .background_operations
+                            .iter()
+                            .any(|operation| &operation.operation_id == operation_id)
+                }
+                // A detached task with no parent task is a valid root child
+                // and therefore has no parent operation fence.  Once a task
+                // is nested under another task, omission of the parent
+                // operation is an invalid owner projection.
+                None => task.parent_task_id.is_none(),
+            };
             task.task_type == super::SurfaceTaskType::Subagent
                 && task.task_id == owner.task_id
                 && task.subagent_id.as_ref() == Some(subagent_id)
                 && owner.task_revision.get() <= task.revision.get()
                 && source.attempt_id == owner.attempt_id
                 && source.source_sequence > 0
+                // A detached owner is still subordinate to the operation
+                // that admitted it.  Keep the operation id in the durable
+                // task row and require it to resolve to known operation
+                // history (or the current/queued operation).
+                && parent_operation_is_known
+                && existing_task
+                    .map(|current| {
+                        current.task_type == super::SurfaceTaskType::Subagent
+                            && current.subagent_id.as_ref() == Some(subagent_id)
+                            && current.parent_operation == task.parent_operation
+                    })
+                    .unwrap_or(true)
+                // For progress/completion, the projected owner is the
+                // durable authority witness.  Started has no prior row, so
+                // the actor-side binding check remains the admission fence.
+                && snapshot
+                    .subagents
+                    .iter()
+                    .find(|current| current.subagent_id == *subagent_id)
+                    .map(|current| {
+                        current.task_id == *task_id
+                            && current.owner
+                                == super::SurfaceSubagentOwner::DetachedTask {
+                                    owner: owner.clone(),
+                                }
+                            && current.source.attempt_id == owner.attempt_id
+                    })
+                    .unwrap_or(true)
         }
         _ => false,
     }
 }
 
+fn operation_fence_is_known(
+    snapshot: &super::SurfaceSnapshot,
+    fence: &super::SurfaceOperationFence,
+) -> bool {
+    snapshot
+        .foreground_operation
+        .iter()
+        .chain(snapshot.queued_operations.iter())
+        .chain(snapshot.operation_history.iter())
+        .any(|operation| {
+            operation
+                .generations
+                .iter()
+                .any(|generation| generation.fence == *fence)
+        })
+        || snapshot
+            .background_operations
+            .iter()
+            .any(|operation| operation.fence.operation_fence == *fence)
+}
+
+/// Child permission requests/resolutions/cancellations have a stronger
+/// owner contract than ordinary actor-controlled thread events.  Keep them
+/// out of the generic ActorControl branch so callers cannot publish an
+/// orphan interaction without the paired task transition and owner checks.
+fn actor_control_child_permission_lifecycle_event(
+    state: &SurfaceReducerState,
+    event: &super::SurfaceEventEnvelope,
+) -> bool {
+    match &event.event {
+        super::SurfaceEvent::Interaction(super::InteractionPatch::Requested { interaction }) => {
+            interaction_is_child_permission_for_commit(interaction)
+        }
+        super::SurfaceEvent::Interaction(
+            super::InteractionPatch::Resolved { interaction_id, .. }
+            | super::InteractionPatch::Cancelled { interaction_id, .. },
+        ) => state
+            .snapshot()
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == *interaction_id)
+            // Unknown lifecycle identities are rejected by the generic actor
+            // path as well.  Otherwise an attacker could submit an orphan
+            // Resolved/Cancelled patch and bypass the owner-aware authority
+            // simply because the state lookup returned no interaction.
+            .map_or(true, interaction_is_child_permission_for_commit),
+        _ => false,
+    }
+}
+
+fn actor_control_child_permission_task_event(
+    state: &SurfaceReducerState,
+    event: &super::SurfaceEventEnvelope,
+) -> bool {
+    let task_id = match &event.event {
+        super::SurfaceEvent::Task(
+            super::TaskPatch::InteractionChanged { task_id, .. }
+            | super::TaskPatch::StatusChanged { task_id, .. },
+        ) => task_id,
+        _ => return false,
+    };
+    state
+        .snapshot()
+        .tasks
+        .iter()
+        .any(|task| task.task_id == *task_id && task.task_type == super::SurfaceTaskType::Subagent)
+}
+
 fn permit_authorizes(
+    state: &SurfaceReducerState,
     issued_permits: &[SurfacePublisherPermit],
     permit: &SurfacePublisherPermit,
     batch: &SurfaceCommitBatch,
@@ -6279,7 +6626,9 @@ fn permit_authorizes(
                             super::SurfaceEvent::Task(super::TaskPatch::Reconciled { .. })
                         )
                         && !matches!(&event.event, super::SurfaceEvent::Subagent(_))
-                }) || actor_control_subagent_activity_authorized(batch)
+                        && !actor_control_child_permission_lifecycle_event(state, event)
+                        && !actor_control_child_permission_task_event(state, event)
+                }) || actor_control_subagent_activity_authorized(state, batch)
                     || actor_control_workflow_launch_authorized(batch)
                     || actor_control_main_session_transfer_authorized(batch)
                     || actor_control_admission_pair_authorized(batch)
@@ -6331,7 +6680,7 @@ fn permit_authorizes(
             *current_owner_epoch == owner_epoch
                 && historical_fence.thread_id == batch.cursor_before.thread_id
                 && batch.cursor_after.thread_id == historical_fence.thread_id
-                && recovery_batch_authorized(historical_fence, batch)
+                && recovery_batch_authorized(state, historical_fence, batch)
         }
     }
 }
@@ -6683,15 +7032,22 @@ fn actor_generation_permission_request_authorized(
     let [interaction_event, task_event] = batch.events.as_slice() else {
         return false;
     };
-    let (
-        SurfaceScope::Generation {
-            fence: interaction_fence,
-        },
-        super::SurfaceEvent::Interaction(super::InteractionPatch::Requested { interaction }),
-    ) = (&interaction_event.scope, &interaction_event.event)
-    else {
-        return false;
-    };
+    let (interaction_fence, detached_scope, interaction) =
+        match (&interaction_event.scope, &interaction_event.event) {
+            (
+                SurfaceScope::Generation { fence },
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Requested {
+                    interaction,
+                }),
+            ) => (fence, false, interaction),
+            (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Requested {
+                    interaction,
+                }),
+            ) => (&interaction.fence, true, interaction),
+            _ => return false,
+        };
     let (
         SurfaceScope::Thread,
         super::SurfaceEvent::Task(super::TaskPatch::InteractionChanged {
@@ -6754,10 +7110,82 @@ fn actor_generation_permission_request_authorized(
     ) else {
         return false;
     };
+    if detached_scope
+        != matches!(
+            &subagent.owner,
+            super::SurfaceSubagentOwner::DetachedTask { .. }
+        )
+    {
+        return false;
+    }
     task.revision == *expected_revision
         && task.status == super::SurfaceTaskStatus::Running
         && task.pending_interaction_id.is_none()
         && subagent.revision == *agent_revision
+}
+
+/// Extract the parent generation fence carried by an owner-aware permission
+/// interaction. Detached interactions are recorded in `Thread` scope after
+/// their parent generation has terminalized, but retain that fence inside the
+/// interaction record so crash recovery can issue the same narrow permit.
+fn permission_interaction_fence(
+    state: &SurfaceReducerState,
+    event: &super::SurfaceEventEnvelope,
+) -> Option<super::SurfaceOperationFence> {
+    match (&event.scope, &event.event) {
+        (
+            SurfaceScope::Generation { fence },
+            super::SurfaceEvent::Interaction(
+                super::InteractionPatch::Requested { .. }
+                | super::InteractionPatch::Resolved { .. },
+            ),
+        ) => Some(fence.clone()),
+        (
+            SurfaceScope::Thread,
+            super::SurfaceEvent::Interaction(super::InteractionPatch::Requested { interaction }),
+        ) if matches!(
+            &interaction.request,
+            super::SurfaceInteractionRequest::PermissionRequest {
+                context: super::SurfacePermissionContext {
+                    owner: super::SurfacePermissionOwnerRef::Child { .. },
+                    ..
+                },
+                ..
+            }
+        ) =>
+        {
+            Some(interaction.fence.clone())
+        }
+        (
+            SurfaceScope::Thread,
+            super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved {
+                interaction_id,
+                ..
+            }),
+        ) => state
+            .snapshot()
+            .interactions
+            .iter()
+            .find(|interaction| interaction.interaction_id == *interaction_id)
+            .filter(|interaction| interaction_is_child_permission_for_commit(interaction))
+            .map(|interaction| interaction.fence.clone()),
+        _ => None,
+    }
+}
+
+fn interaction_is_child_permission_for_commit(interaction: &super::SurfaceInteractionView) -> bool {
+    matches!(
+        &interaction.request,
+        super::SurfaceInteractionRequest::PermissionRequest {
+            context: super::SurfacePermissionContext {
+                owner,
+                origin,
+                ..
+            },
+            ..
+        } if *origin == super::SurfacePermissionOrigin::ChildAgent
+            || matches!(owner, super::SurfacePermissionOwnerRef::Child { .. })
+    )
 }
 
 /// Validate a child permission owner against the durable child projection.
@@ -6782,12 +7210,20 @@ fn child_permission_owner_matches<'a>(
         .subagents
         .iter()
         .find(|subagent| subagent.subagent_id == *agent_id)?;
+    let detached_owner = matches!(
+        &subagent.owner,
+        super::SurfaceSubagentOwner::DetachedTask { .. }
+    );
     if task.task_type != super::SurfaceTaskType::Subagent
         || task.task_id != *task_id
         || task.revision != task_revision
         || task.subagent_id.as_ref() != Some(agent_id)
         || subagent.task_id != *task_id
-        || subagent.revision != agent_revision
+        || if detached_owner {
+            subagent.revision.get() < agent_revision.get()
+        } else {
+            subagent.revision != agent_revision
+        }
         || subagent.source.turn_id != *turn_id
     {
         return None;
@@ -6805,13 +7241,7 @@ fn child_permission_owner_matches<'a>(
             if owner.task_id != *task_id
                 || owner.task_revision.get() > task.revision.get()
                 || subagent.source.attempt_id != owner.attempt_id
-            {
-                return None;
-            }
-            if task
-                .parent_operation
-                .as_ref()
-                .is_some_and(|operation_id| operation_id != &fence.operation_id)
+                || task.parent_operation.as_ref() != Some(&fence.operation_id)
             {
                 return None;
             }
@@ -7053,19 +7483,48 @@ fn actor_generation_permission_task_resolution_authorized(
     require_session: bool,
 ) -> bool {
     let (
-        SurfaceScope::Generation {
-            fence: resolution_fence,
-        },
-        super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved {
+        resolution_fence,
+        detached_scope,
+        interaction_id,
+        expected_revision,
+        next_revision,
+        receipt,
+    ) = match (&resolution_event.scope, &resolution_event.event) {
+        (
+            SurfaceScope::Generation { fence },
+            super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                receipt,
+                ..
+            }),
+        ) => (
+            fence,
+            false,
             interaction_id,
             expected_revision,
             next_revision,
             receipt,
-            ..
-        }),
-    ) = (&resolution_event.scope, &resolution_event.event)
-    else {
-        return false;
+        ),
+        (
+            SurfaceScope::Thread,
+            super::SurfaceEvent::Interaction(super::InteractionPatch::Resolved {
+                interaction_id,
+                expected_revision,
+                next_revision,
+                receipt,
+                ..
+            }),
+        ) => (
+            fence,
+            true,
+            interaction_id,
+            expected_revision,
+            next_revision,
+            receipt,
+        ),
+        _ => return false,
     };
     let (
         SurfaceScope::Thread,
@@ -7150,6 +7609,14 @@ fn actor_generation_permission_task_resolution_authorized(
     ) else {
         return false;
     };
+    if detached_scope
+        != matches!(
+            &subagent.owner,
+            super::SurfaceSubagentOwner::DetachedTask { .. }
+        )
+    {
+        return false;
+    }
     context_task_id == task_id
         && context_tool_call_id == tool_call_id
         && activity_id.as_str() == tool_call_id.as_str()
@@ -7222,6 +7689,7 @@ fn session_permission_settings_delta_authorized(
 }
 
 fn actor_generation_terminalization_authorized(
+    state: &SurfaceReducerState,
     issued_permits: &[SurfacePublisherPermit],
     actor_permit: &SurfacePublisherPermit,
     generation_permit: &SurfacePublisherPermit,
@@ -7282,29 +7750,52 @@ fn actor_generation_terminalization_authorized(
         let authorized = match (&event.scope, &event.event) {
             (
                 SurfaceScope::Generation { fence: scope },
-                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
-                    reason, ..
-                }),
-            ) if scope == fence => matches!(
-                (cause, reason),
-                (
-                    super::TerminalizationCause::HostShutdown,
-                    super::InteractionCancelReason::HostShutdown,
-                ) | (
-                    super::TerminalizationCause::ThreadClose,
-                    super::InteractionCancelReason::ThreadClose,
-                ) | (
-                    super::TerminalizationCause::UserCancel,
-                    super::InteractionCancelReason::OperationCancelled {
-                        reason: super::CancelReason::User,
-                    },
-                ) | (
-                    super::TerminalizationCause::GoalPause,
-                    super::InteractionCancelReason::OperationCancelled {
-                        reason: super::CancelReason::GoalPause,
-                    },
-                )
-            ),
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled { .. }),
+            ) if scope == fence => {
+                let expected_reason = match cause {
+                    super::TerminalizationCause::HostShutdown => {
+                        super::InteractionCancelReason::HostShutdown
+                    }
+                    super::TerminalizationCause::ThreadClose => {
+                        super::InteractionCancelReason::ThreadClose
+                    }
+                    super::TerminalizationCause::UserCancel => {
+                        super::InteractionCancelReason::OperationCancelled {
+                            reason: super::CancelReason::User,
+                        }
+                    }
+                    super::TerminalizationCause::GoalPause => {
+                        super::InteractionCancelReason::OperationCancelled {
+                            reason: super::CancelReason::GoalPause,
+                        }
+                    }
+                };
+                generation_child_cancellation_authorized(state, fence, event, &expected_reason)
+            }
+            (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled { .. }),
+            ) => {
+                let expected_reason = match cause {
+                    super::TerminalizationCause::HostShutdown => {
+                        super::InteractionCancelReason::HostShutdown
+                    }
+                    super::TerminalizationCause::ThreadClose => {
+                        super::InteractionCancelReason::ThreadClose
+                    }
+                    super::TerminalizationCause::UserCancel => {
+                        super::InteractionCancelReason::OperationCancelled {
+                            reason: super::CancelReason::User,
+                        }
+                    }
+                    super::TerminalizationCause::GoalPause => {
+                        super::InteractionCancelReason::OperationCancelled {
+                            reason: super::CancelReason::GoalPause,
+                        }
+                    }
+                };
+                detached_child_cancellation_authorized(state, fence, event, &expected_reason)
+            }
             (
                 SurfaceScope::Generation { fence: scope },
                 super::SurfaceEvent::Tool(super::ToolPatch::CapabilityCallChanged {
@@ -9756,6 +10247,7 @@ fn finalizer_event_authorized(
 }
 
 fn actor_generation_interrupt_authorized(
+    state: &SurfaceReducerState,
     issued_permits: &[SurfacePublisherPermit],
     actor_permit: &SurfacePublisherPermit,
     generation_permit: &SurfacePublisherPermit,
@@ -9808,21 +10300,37 @@ fn actor_generation_interrupt_authorized(
     ) {
         return false;
     }
-    cancellations.iter().all(|event| {
-        matches!(
-            (&event.scope, &event.event),
+    cancellations
+        .iter()
+        .all(|event| match (&event.scope, &event.event) {
             (
-                SurfaceScope::Generation { fence: scoped_fence },
-                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
-                    reason:
-                        super::InteractionCancelReason::OperationCancelled {
-                            reason: super::CancelReason::User,
-                        },
-                    ..
-                }),
-            ) if scoped_fence == fence
-        )
-    })
+                SurfaceScope::Generation {
+                    fence: scoped_fence,
+                },
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled { .. }),
+            ) => {
+                generation_child_cancellation_authorized(
+                    state,
+                    fence,
+                    event,
+                    &super::InteractionCancelReason::OperationCancelled {
+                        reason: super::CancelReason::User,
+                    },
+                ) && scoped_fence == fence
+            }
+            (
+                SurfaceScope::Thread,
+                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled { .. }),
+            ) => detached_child_cancellation_authorized(
+                state,
+                fence,
+                event,
+                &super::InteractionCancelReason::OperationCancelled {
+                    reason: super::CancelReason::User,
+                },
+            ),
+            _ => false,
+        })
 }
 
 fn actor_finalizer_task_terminal_authorized(
@@ -10019,7 +10527,109 @@ fn recovery_stream_dispositions_match_state(
     )
 }
 
+fn detached_child_cancellation_authorized(
+    state: &SurfaceReducerState,
+    historical_fence: &super::SurfaceOperationFence,
+    event: &super::SurfaceEventEnvelope,
+    expected_reason: &super::InteractionCancelReason,
+) -> bool {
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
+            interaction_id,
+            expected_revision,
+            next_revision,
+            reason,
+        }),
+    ) = (&event.scope, &event.event)
+    else {
+        return false;
+    };
+    if reason != expected_reason {
+        return false;
+    }
+    let Some(interaction) = state
+        .snapshot()
+        .interactions
+        .iter()
+        .find(|interaction| &interaction.interaction_id == interaction_id)
+    else {
+        return false;
+    };
+    let Some(expected_next_revision) = expected_revision
+        .get()
+        .checked_add(1)
+        .and_then(|value| super::InteractionRevision::try_new(value).ok())
+    else {
+        return false;
+    };
+    if interaction.fence != *historical_fence
+        || interaction.revision != *expected_revision
+        || interaction.lifecycle != super::SurfaceInteractionLifecycle::Requested
+        || *next_revision != expected_next_revision
+    {
+        return false;
+    }
+    // This delegates the full child owner tuple check (task, subagent,
+    // attempt, source turn/revision, authority, and ApprovalRequired marker)
+    // to the same predicate used by reducer scope validation.
+    super::reducer::detached_child_permission_interaction_matches(
+        state.snapshot(),
+        interaction,
+        true,
+        false,
+    )
+}
+
+/// Authorize a Generation-scoped interaction cancellation while preserving
+/// the owner split enforced by the reducer. Ordinary foreground interactions
+/// are still accepted here; child permission interactions must prove that
+/// their durable owner is Generation rather than DetachedTask.
+fn generation_child_cancellation_authorized(
+    state: &SurfaceReducerState,
+    historical_fence: &super::SurfaceOperationFence,
+    event: &super::SurfaceEventEnvelope,
+    expected_reason: &super::InteractionCancelReason,
+) -> bool {
+    let (
+        SurfaceScope::Generation { fence },
+        super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
+            interaction_id,
+            reason,
+            ..
+        }),
+    ) = (&event.scope, &event.event)
+    else {
+        return false;
+    };
+    if fence != historical_fence || reason != expected_reason {
+        return false;
+    }
+    let Some(interaction) = state
+        .snapshot()
+        .interactions
+        .iter()
+        .find(|interaction| &interaction.interaction_id == interaction_id)
+    else {
+        // Preserve the reducer's historical missing-identity behavior. The
+        // cancellation patch carries no request payload from which an owner
+        // type could be inferred; reducer application still reports a
+        // missing interaction identity when appropriate.
+        return true;
+    };
+    if interaction_is_child_permission_for_commit(interaction) {
+        return super::reducer::generation_child_permission_interaction_matches(
+            state.snapshot(),
+            interaction,
+            true,
+            false,
+        );
+    }
+    true
+}
+
 fn recovery_batch_authorized(
+    state: &SurfaceReducerState,
     historical_fence: &super::SurfaceOperationFence,
     batch: &SurfaceCommitBatch,
 ) -> bool {
@@ -10213,15 +10823,19 @@ fn recovery_batch_authorized(
         return true;
     }
     if let [event] = events {
-        return matches!(
-            (&event.scope, &event.event),
-            (
-                SurfaceScope::Generation { fence },
-                super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
-                    reason: super::InteractionCancelReason::CapabilityUnavailable,
-                    ..
-                }),
-            ) if fence == historical_fence
+        if detached_child_cancellation_authorized(
+            state,
+            historical_fence,
+            event,
+            &super::InteractionCancelReason::CapabilityUnavailable,
+        ) {
+            return true;
+        }
+        return generation_child_cancellation_authorized(
+            state,
+            historical_fence,
+            event,
+            &super::InteractionCancelReason::CapabilityUnavailable,
         ) || matches!(
             (&event.scope, &event.event),
             (
@@ -10335,7 +10949,7 @@ fn recovery_batch_authorized(
             ) {
                 operation_dispositions += 1;
             }
-            recovery_event_authorized(historical_fence, background_fence, event)
+            recovery_event_authorized(state, historical_fence, background_fence, event)
         }
     }) && operation_dispositions == 1
 }
@@ -10686,6 +11300,7 @@ fn recovery_generation_stop_authorized(
 }
 
 fn recovery_event_authorized(
+    state: &SurfaceReducerState,
     historical_fence: &super::SurfaceOperationFence,
     background_fence: Option<&super::SurfaceBackgroundFence>,
     event: &super::SurfaceEventEnvelope,
@@ -10736,11 +11351,26 @@ fn recovery_event_authorized(
         }
         (
             SurfaceScope::Generation { fence },
-            super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled {
-                reason: super::InteractionCancelReason::CapabilityUnavailable,
-                ..
-            }),
-        ) => background_fence.is_none() && fence == historical_fence,
+            super::SurfaceEvent::Interaction(super::InteractionPatch::Cancelled { .. }),
+        ) => {
+            background_fence.is_none()
+                && generation_child_cancellation_authorized(
+                    state,
+                    historical_fence,
+                    event,
+                    &super::InteractionCancelReason::CapabilityUnavailable,
+                )
+                && fence == historical_fence
+        }
+        (SurfaceScope::Thread, super::SurfaceEvent::Interaction(_)) => {
+            background_fence.is_none()
+                && detached_child_cancellation_authorized(
+                    state,
+                    historical_fence,
+                    event,
+                    &super::InteractionCancelReason::CapabilityUnavailable,
+                )
+        }
         (
             SurfaceScope::Background { fence },
             super::SurfaceEvent::Operation(
@@ -12088,9 +12718,12 @@ mod tests {
             retained_incarnation: snapshot.cursor.incarnation.clone(),
         };
         let state = SurfaceReducerState::new(snapshot);
-        let mut coordinator =
-            RuntimeCommitCoordinator::new_with_owner_lease(TestLedger::default(), state, &owner)
-                .unwrap();
+        let mut coordinator = RuntimeCommitCoordinator::new_with_owner_lease(
+            TestLedger::default(),
+            state.clone(),
+            &owner,
+        )
+        .unwrap();
         let diagnostic = super::super::SafeDiagnosticText::try_new(
             "cold recovery rejected durable interaction checkpoint: Unsafe",
         )
@@ -12204,9 +12837,12 @@ mod tests {
             retained_incarnation: snapshot.cursor.incarnation.clone(),
         };
         let state = SurfaceReducerState::new(snapshot);
-        let mut coordinator =
-            RuntimeCommitCoordinator::new_with_owner_lease(TestLedger::default(), state, &owner)
-                .unwrap();
+        let mut coordinator = RuntimeCommitCoordinator::new_with_owner_lease(
+            TestLedger::default(),
+            state.clone(),
+            &owner,
+        )
+        .unwrap();
 
         coordinator
             .recover_unavailable_interactions_except(
@@ -13096,6 +13732,7 @@ mod tests {
         };
 
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &batch,
@@ -13157,6 +13794,7 @@ mod tests {
             fence: fence.clone(),
         };
         assert!(actor_generation_interrupt_authorized(
+            &state,
             &[actor.clone(), generation.clone()],
             &actor,
             &generation,
@@ -13172,9 +13810,12 @@ mod tests {
             &TestClock,
         )
         .unwrap();
-        let mut coordinator =
-            RuntimeCommitCoordinator::new_with_owner_lease(TestLedger::default(), state, &owner)
-                .unwrap();
+        let mut coordinator = RuntimeCommitCoordinator::new_with_owner_lease(
+            TestLedger::default(),
+            state.clone(),
+            &owner,
+        )
+        .unwrap();
         assert!(matches!(
             coordinator.issue_exact_recovered_authority(&batch).unwrap(),
             RecoveredBatchAuthority::ActorGenerationInterrupt { .. }
@@ -13185,6 +13826,7 @@ mod tests {
             fence: test_operation_fence(114),
         };
         assert!(!actor_generation_interrupt_authorized(
+            &state,
             &[actor.clone(), other_generation.clone()],
             &actor,
             &other_generation,
@@ -13263,7 +13905,7 @@ mod tests {
             },
             source: super::super::SurfaceSubagentSource::new(
                 super::super::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
-                super::super::SurfaceTurnId::new(),
+                turn_id.clone(),
                 1,
                 super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(122)).unwrap(),
                 super::super::Sha256Digest::new([1; 32]),
@@ -13356,6 +13998,16 @@ mod tests {
             &request_batch,
             ThreadOwnerEpoch::new(1),
         ));
+        // A bare actor permit must not be able to publish a child prompt. The
+        // paired generation permit and task transition are the authority
+        // boundary for this lifecycle event.
+        assert!(!permit_authorizes(
+            &state,
+            std::slice::from_ref(&actor),
+            &actor,
+            &request_batch,
+            ThreadOwnerEpoch::new(1),
+        ));
 
         let mut stale_activity = request_batch.clone();
         let mut stale_events = stale_activity.events.as_slice().to_vec();
@@ -13431,6 +14083,10 @@ mod tests {
                                     super::super::SurfaceInteractionSafeProjection::PermissionRequest {
                                         decision: super::super::SurfaceAllowDeny::Allow,
                                         scope: super::super::PermissionGrantScope::Turn,
+                                        permissions: super::super::SurfacePermissionProfile {
+                                            file_system: None,
+                                            network: None,
+                                        },
                                         strict_auto_review: false,
                                     },
                             },
@@ -13458,6 +14114,34 @@ mod tests {
             &actor,
             &generation,
             &resolution_batch,
+            ThreadOwnerEpoch::new(1),
+        ));
+        assert!(!permit_authorizes(
+            &after_request,
+            std::slice::from_ref(&actor),
+            &actor,
+            &resolution_batch,
+            ThreadOwnerEpoch::new(1),
+        ));
+        let cancellation_batch = test_batch_with_events(
+            &after_request,
+            vec![(
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Interaction(
+                    super::super::InteractionPatch::Cancelled {
+                        interaction_id: interaction_id.clone(),
+                        expected_revision: super::super::InteractionRevision::try_new(1).unwrap(),
+                        next_revision: super::super::InteractionRevision::try_new(2).unwrap(),
+                        reason: super::super::InteractionCancelReason::CapabilityUnavailable,
+                    },
+                ),
+            )],
+        );
+        assert!(!permit_authorizes(
+            &after_request,
+            std::slice::from_ref(&actor),
+            &actor,
+            &cancellation_batch,
             ThreadOwnerEpoch::new(1),
         ));
 
@@ -13507,6 +14191,7 @@ mod tests {
             )],
         );
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &finalizing,
@@ -13527,6 +14212,7 @@ mod tests {
             )],
         );
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &generation,
@@ -13564,6 +14250,7 @@ mod tests {
             )],
         );
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &goal,
@@ -13658,6 +14345,7 @@ mod tests {
 
                 assert_eq!(
                     actor_generation_terminalization_authorized(
+                        &state,
                         &issued,
                         &actor,
                         &generation,
@@ -13706,18 +14394,21 @@ mod tests {
         };
 
         assert!(permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &batch,
             ThreadOwnerEpoch::new(1),
         ));
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&wrong_intent),
             &wrong_intent,
             &batch,
             ThreadOwnerEpoch::new(1),
         ));
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &test_batch(&state),
@@ -13771,12 +14462,14 @@ mod tests {
         };
 
         assert!(permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &batch,
             ThreadOwnerEpoch::new(1),
         ));
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&wrong_fence),
             &wrong_fence,
             &batch,
@@ -13798,6 +14491,7 @@ mod tests {
             )],
         );
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &stop_only,
@@ -13844,6 +14538,7 @@ mod tests {
             ],
         );
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &two_dispositions,
@@ -13875,6 +14570,7 @@ mod tests {
             ],
         );
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &arbitrary,
@@ -13933,12 +14629,14 @@ mod tests {
         };
 
         assert!(permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &batch,
             ThreadOwnerEpoch::new(1),
         ));
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&wrong_digest),
             &wrong_digest,
             &batch,
@@ -13992,6 +14690,7 @@ mod tests {
         batch.batch_digest = super::super::canonical_batch_digest(&batch);
 
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &batch,
@@ -14092,6 +14791,7 @@ mod tests {
         };
 
         assert!(permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &batch,
@@ -14219,6 +14919,7 @@ mod tests {
         };
 
         assert!(!permit_authorizes(
+            &state,
             std::slice::from_ref(&permit),
             &permit,
             &batch,

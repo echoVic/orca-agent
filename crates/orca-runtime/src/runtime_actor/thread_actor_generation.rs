@@ -1,5 +1,6 @@
 // Mechanical ThreadActor method boundary; state ownership lives in runtime_actor controllers.
 use super::*;
+use crate::subagent_event_relay::RelayError;
 
 fn subagent_activity_projection(
     payload: &SubagentActivityPayload,
@@ -787,6 +788,39 @@ impl ThreadActor {
         };
 
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        if let Some(binding) = detached_binding.as_ref() {
+            let Some(parent_fence) = binding.parent_fence.as_ref() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "detached subagent activity is missing its parent operation fence",
+                ));
+            };
+            if parent_fence.thread_id != snapshot.thread.thread_id
+                || !snapshot
+                    .foreground_operation
+                    .iter()
+                    .chain(snapshot.queued_operations.iter())
+                    .map(|operation| &operation.operation_id)
+                    .chain(
+                        snapshot
+                            .background_operations
+                            .iter()
+                            .map(|operation| &operation.operation_id),
+                    )
+                    .chain(
+                        snapshot
+                            .operation_history
+                            .iter()
+                            .map(|operation| &operation.operation_id),
+                    )
+                    .any(|operation_id| *operation_id == parent_fence.operation_id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "detached subagent parent operation fence is not owned by this thread",
+                ));
+            }
+        }
         let durable_receipt = self
             .resident_surface
             .coordinator
@@ -996,6 +1030,11 @@ impl ThreadActor {
                             }
                         };
                         next_task.completed_at = Some(event.occurred_at);
+                        // A terminal child cannot leave an actionable
+                        // approval marker behind. The detached mailbox is
+                        // terminalized separately and the task projection
+                        // must converge to the same state.
+                        next_task.pending_interaction_id = None;
                         next_task.result = output.clone();
                         next_task.error = error.clone();
                         next_task.usage = terminal_usage
@@ -1042,9 +1081,14 @@ impl ThreadActor {
                     },
                 };
                 (
-                    surface::TaskPatch::Upserted {
-                        expected_revision: Some(task.revision),
-                        task: next_task,
+                    surface::TaskPatch::StatusChanged {
+                        task_id: next_task.task_id.clone(),
+                        expected_revision: task.revision,
+                        next_revision: next_task.revision,
+                        status: next_task.status,
+                        completed_at: next_task.completed_at,
+                        result: next_task.result.clone(),
+                        error: next_task.error.clone(),
                     },
                     subagent_patch,
                 )
@@ -1154,8 +1198,17 @@ impl ThreadActor {
                         "detached relay record identity or sequence is invalid",
                     ));
                 }
-                let event: SubagentActivityEvent =
-                    serde_json::from_slice(&record.payload).map_err(io::Error::other)?;
+                let event: SubagentActivityEvent = match serde_json::from_slice(&record.payload) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let relay_error = RelayError::Corrupt {
+                            offset: 0,
+                            reason: format!("invalid typed subagent activity payload: {error}"),
+                        };
+                        reader.quarantine_corrupt(&relay_error);
+                        return Err(io::Error::other(relay_error));
+                    }
+                };
                 if event.surface_commit_id != record.surface_commit_id
                     || event.source_sequence != record.source_sequence
                     || event.task_id.as_str() != task_id
@@ -1214,8 +1267,17 @@ impl ThreadActor {
                         "detached relay record identity or sequence is invalid",
                     ));
                 }
-                let event: SubagentActivityEvent =
-                    serde_json::from_slice(&record.payload).map_err(io::Error::other)?;
+                let event: SubagentActivityEvent = match serde_json::from_slice(&record.payload) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let relay_error = RelayError::Corrupt {
+                            offset: 0,
+                            reason: format!("invalid typed subagent activity payload: {error}"),
+                        };
+                        reader.quarantine_corrupt(&relay_error);
+                        return Err(io::Error::other(relay_error));
+                    }
+                };
                 if event.surface_commit_id != record.surface_commit_id
                     || event.source_sequence != record.source_sequence
                     || event.task_id.as_str() != binding.task_id
