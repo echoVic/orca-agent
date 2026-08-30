@@ -1950,6 +1950,8 @@ enum StoredClosedThreadReceiptV1 {
 struct StoredOperationTerminalAtCursorV1 {
     operation_id: SurfaceOperationId,
     terminal: OperationTerminal,
+    #[serde(default)]
+    completion_proof: super::SurfaceOperationCompletionProof,
     cursor: SurfaceCursor,
     commit_class: CommitClass,
     batch_digest: Sha256Digest,
@@ -2594,6 +2596,7 @@ impl StoredOperationTerminalAtCursorV1 {
         Self {
             operation_id: value.operation_id.clone(),
             terminal: value.terminal.clone(),
+            completion_proof: value.completion_proof.clone(),
             cursor: value.cursor.clone(),
             commit_class: value.commit_class.clone(),
             batch_digest: value.batch_digest.clone(),
@@ -2604,6 +2607,7 @@ impl StoredOperationTerminalAtCursorV1 {
         OperationTerminalAtCursor {
             operation_id: self.operation_id,
             terminal: self.terminal,
+            completion_proof: self.completion_proof,
             cursor: self.cursor,
             commit_class: self.commit_class,
             batch_digest: self.batch_digest,

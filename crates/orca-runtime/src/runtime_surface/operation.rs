@@ -10,6 +10,7 @@ use super::identity::{
     SurfaceOperationId, SurfaceRequestId, SurfaceSettlementId, SurfaceTaskId, SurfaceTurnId,
     SurfaceWorkflowResultId, SurfaceWorkflowRunId, ThreadOwnerEpoch, UnixMillis,
 };
+use super::projection::SurfaceOperationCompletionProof;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const SURFACE_RESERVATION_LEASE_MS: u64 = 30_000;
@@ -875,6 +876,8 @@ pub struct OperationTerminalRecord {
     pub usage: UsageTotals,
     pub source_diagnostic_digest: Option<Sha256Digest>,
     pub settlement_receipts: Vec<SurfaceSettlementReceipt>,
+    #[serde(default)]
+    pub completion_proof: SurfaceOperationCompletionProof,
     pub committed_at: UnixMillis,
 }
 

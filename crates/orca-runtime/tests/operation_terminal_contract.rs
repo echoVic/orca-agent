@@ -9,6 +9,10 @@ use orca_runtime::budget_controller::BudgetController;
 use orca_runtime::lifecycle::{
     AgentLoopResult, RuntimeSessionLifecycle, RuntimeTaskActor, RuntimeTaskKind,
 };
+use orca_runtime::surface::{
+    SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT, SurfaceCompletionVerification,
+    SurfaceOperationCompletionProof, SurfaceVerificationResult,
+};
 
 #[test]
 fn agent_loop_budget_stop_carries_typed_terminal() {
@@ -101,6 +105,10 @@ fn session_completed_terminal_emits_typed_terminal_payload() {
     assert_eq!(terminal_payload["usage"]["turns"], 2);
     assert_eq!(terminal_payload["checkpoint_id"], "cp-9");
     assert_eq!(terminal_payload["resumable"], true);
+    assert_eq!(
+        event.payload["completion_proof"]["verification"]["state"],
+        "unverified"
+    );
 }
 
 #[test]
@@ -180,4 +188,99 @@ fn runtime_actor_no_longer_enforces_hidden_ceiling() {
             .expect("unlimited turns");
         assert_eq!(started.turn(), turn);
     }
+}
+
+#[test]
+fn surface_verification_proof_preserves_fields_with_bounded_output() {
+    let source = orca_core::verification::VerificationResult {
+        command: "cargo test --workspace".to_string(),
+        success: false,
+        exit_code: Some(17),
+        stdout: "o".repeat(SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT + 128),
+        stderr: "stderr".to_string(),
+    };
+
+    let projected = SurfaceVerificationResult::from_verification(&source);
+
+    assert_eq!(projected.command.as_str(), source.command);
+    assert_eq!(projected.success, source.success);
+    assert_eq!(projected.exit_code, source.exit_code);
+    assert!(projected.stdout.as_str().len() <= SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT);
+    assert!(projected.stderr.as_str().len() <= SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT);
+    assert!(projected.stdout.as_str().contains("[output truncated]"));
+}
+
+#[test]
+fn completion_proof_has_explicit_verification_truth() {
+    let unverified = SurfaceOperationCompletionProof::unverified("no verifier configured");
+    assert_eq!(
+        unverified.verification,
+        SurfaceCompletionVerification::Unverified
+    );
+
+    let passed = SurfaceVerificationResult {
+        command: orca_runtime::surface::NonEmptyText::try_new("cargo test").unwrap(),
+        success: true,
+        exit_code: Some(0),
+        stdout: orca_runtime::surface::DisplayText::new("ok"),
+        stderr: orca_runtime::surface::DisplayText::new(""),
+    };
+    assert_eq!(
+        SurfaceOperationCompletionProof::from_verification(passed.clone()).verification,
+        SurfaceCompletionVerification::Verified { result: passed }
+    );
+
+    let failed = SurfaceVerificationResult {
+        command: orca_runtime::surface::NonEmptyText::try_new("cargo test").unwrap(),
+        success: false,
+        exit_code: Some(1),
+        stdout: orca_runtime::surface::DisplayText::new(""),
+        stderr: orca_runtime::surface::DisplayText::new("failure"),
+    };
+    assert_eq!(
+        SurfaceOperationCompletionProof::from_verification(failed.clone()).verification,
+        SurfaceCompletionVerification::Failed { result: failed }
+    );
+}
+
+#[test]
+fn session_terminal_event_binds_the_verification_proof() {
+    let result = orca_core::verification::VerificationResult {
+        command: "cargo test".to_string(),
+        success: true,
+        exit_code: Some(0),
+        stdout: "ok".to_string(),
+        stderr: String::new(),
+    };
+    let terminal = OperationTerminal::Completed {
+        usage: BudgetUsage {
+            turns: 1,
+            tool_calls: 0,
+            cost_usd_micros: 0,
+            wall_time_ms: 1,
+        },
+    };
+    let mut events = EventFactory::new("proof-event".to_string());
+    let event = events.session_completed_terminal_with_verification(
+        &terminal,
+        Some("session-proof"),
+        Some(&result),
+    );
+
+    assert_eq!(
+        event.payload["completion_proof"]["verification"]["state"],
+        "verified"
+    );
+    assert_eq!(
+        event.payload["completion_proof"]["verification"]["result"]["command"],
+        "cargo test"
+    );
+    assert_eq!(
+        event.payload["completion_proof"]["verification"]["result"]["stdout"],
+        "ok"
+    );
+    assert_eq!(
+        event.payload["completion_proof"]["verification"]["result"]["exit_code"],
+        0
+    );
 }

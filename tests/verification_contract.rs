@@ -29,7 +29,16 @@ fn verifier_success_keeps_success_status() {
     let completed = find_event(&events, "verification.completed");
     assert_eq!(completed["payload"]["success"], true);
     assert_eq!(completed["payload"]["stdout"], "ok");
-    assert_eq!(events.last().unwrap()["payload"]["status"], "success");
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["payload"]["status"], "success");
+    assert_eq!(
+        terminal["payload"]["completion_proof"]["verification"]["state"],
+        "verified"
+    );
+    assert_eq!(
+        terminal["payload"]["completion_proof"]["verification"]["result"],
+        completed["payload"]
+    );
 }
 
 #[test]
@@ -54,9 +63,15 @@ fn verifier_failure_maps_to_verification_failed() {
     let completed = find_event(&events, "verification.completed");
     assert_eq!(completed["payload"]["success"], false);
     assert_eq!(completed["payload"]["exit_code"], 7);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["payload"]["status"], "verification_failed");
     assert_eq!(
-        events.last().unwrap()["payload"]["status"],
-        "verification_failed"
+        terminal["payload"]["completion_proof"]["verification"]["state"],
+        "failed"
+    );
+    assert_eq!(
+        terminal["payload"]["completion_proof"]["verification"]["result"],
+        completed["payload"]
     );
 }
 

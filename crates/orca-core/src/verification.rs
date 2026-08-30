@@ -24,7 +24,7 @@ use crate::retained_output::{
     DEFAULT_RETAINED_OUTPUT_BYTES, RetainedOutputSnapshot, read_to_retained,
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VerificationResult {
     pub command: String,
     pub success: bool,

@@ -1236,9 +1236,19 @@ impl EventFactory {
     }
 
     pub fn session_completed(&mut self, status: RunStatus, session_id: Option<&str>) -> EventDraft {
+        self.session_completed_with_verification(status, session_id, None)
+    }
+
+    pub fn session_completed_with_verification(
+        &mut self,
+        status: RunStatus,
+        session_id: Option<&str>,
+        verification: Option<&VerificationResult>,
+    ) -> EventDraft {
         let mut payload = json!({
             "status": status
         });
+        insert_completion_proof(&mut payload, verification);
         if let Some(session_id) = session_id {
             payload["session_id"] = json!(session_id);
         }
@@ -1253,6 +1263,19 @@ impl EventFactory {
         terminal: &crate::budget::OperationTerminal,
         session_id: Option<&str>,
     ) -> EventDraft {
+        self.session_completed_terminal_with_verification(terminal, session_id, None)
+    }
+
+    /// Terminal-complete session event carrying the exact verifier result used
+    /// by the runtime completion proof. Keeping this on the terminal event
+    /// lets JSONL consumers compare the evidence without reconstructing it
+    /// from status strings.
+    pub fn session_completed_terminal_with_verification(
+        &mut self,
+        terminal: &crate::budget::OperationTerminal,
+        session_id: Option<&str>,
+        verification: Option<&VerificationResult>,
+    ) -> EventDraft {
         let status = match terminal {
             crate::budget::OperationTerminal::Completed { .. } => "success",
             crate::budget::OperationTerminal::Stopped { .. } => "budget_exhausted",
@@ -1263,6 +1286,7 @@ impl EventFactory {
             "status": status,
             "terminal": terminal,
         });
+        insert_completion_proof(&mut payload, verification);
         if let Some(session_id) = session_id {
             payload["session_id"] = json!(session_id);
         }
@@ -1284,6 +1308,25 @@ impl EventFactory {
             serde_json::to_value(payload).expect("runtime event payload serializes"),
         )
     }
+}
+
+fn insert_completion_proof(payload: &mut Value, verification: Option<&VerificationResult>) {
+    let verification = verification.map_or_else(
+        || json!({ "state": "unverified" }),
+        |verification| {
+            json!({
+                "state": if verification.success { "verified" } else { "failed" },
+                "result": {
+                "command": verification.command,
+                "success": verification.success,
+                "exit_code": verification.exit_code,
+                "stdout": verification.stdout,
+                "stderr": verification.stderr,
+                }
+            })
+        },
+    );
+    payload["completion_proof"] = json!({ "verification": verification });
 }
 
 fn timestamp_ms() -> u64 {

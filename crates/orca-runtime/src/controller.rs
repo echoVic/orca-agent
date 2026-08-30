@@ -252,6 +252,7 @@ struct ThreadTurnCompletion {
     /// Typed operation terminal; the authoritative fact when present (budget
     /// stops carry `OperationTerminal::Stopped`).
     terminal: Option<orca_core::budget::OperationTerminal>,
+    verification: Option<orca_core::verification::VerificationResult>,
 }
 
 enum PreparedThreadTurnOutcome {
@@ -269,6 +270,7 @@ pub enum ThreadTurnOutcome {
         background_workflows: RuntimeBackgroundWorkflows,
         /// Typed operation terminal; the authoritative fact when present.
         terminal: Option<orca_core::budget::OperationTerminal>,
+        verification: Option<orca_core::verification::VerificationResult>,
     },
     ProviderSuspended {
         suspension: Box<RuntimeProviderSuspension>,
@@ -796,7 +798,12 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             }
         };
         let completion =
-            (|| -> io::Result<(RunStatus, crate::lifecycle::TurnEndReason, Option<String>)> {
+            (|| -> io::Result<(
+                RunStatus,
+                crate::lifecycle::TurnEndReason,
+                Option<String>,
+                Option<orca_core::verification::VerificationResult>,
+            )> {
                 let status = result.status;
                 let mut end_reason = result.reason;
                 lifecycle.finish_task(status);
@@ -811,16 +818,16 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                         request.workflow_lifecycle_ingress(),
                     )?;
                 }
-                let status =
+                let (status, verification) =
                     run_verifier_if_needed(status, config.verifier.as_deref(), events, sink)?;
                 if status != result.status {
                     // Verifier (or another post-loop step) changed the terminal
                     // status; the original end reason no longer describes it.
                     end_reason = crate::lifecycle::TurnEndReason::Unclassified;
                 }
-                Ok((status, end_reason, result.error))
+                Ok((status, end_reason, result.error, verification))
             })();
-        let (status, end_reason, error) = match completion {
+        let (status, end_reason, error, verification) = match completion {
             Ok(completion) => completion,
             Err(error) => {
                 if let Some(task) = main_session_task.as_ref() {
@@ -848,6 +855,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             main_session_task,
             background_workflows,
             terminal: Some(result.terminal),
+            verification,
         }))
     }
 }
@@ -883,7 +891,11 @@ impl ThreadTurnCompletion {
                 task.emit_all(events, sink)?;
             }
             if request.emit_session_completed() {
-                sink.emit(events.session_completed(self.status, session.session_id()))?;
+                sink.emit(events.session_completed_with_verification(
+                    self.status,
+                    session.session_id(),
+                    self.verification.as_ref(),
+                ))?;
             }
             return Ok(self.status);
         }
@@ -898,7 +910,11 @@ impl ThreadTurnCompletion {
         }
         if request.emit_session_completed() {
             if let Some(terminal) = self.terminal.as_ref() {
-                sink.emit(events.session_completed_terminal(terminal, session.session_id()))?;
+                sink.emit(events.session_completed_terminal_with_verification(
+                    terminal,
+                    session.session_id(),
+                    self.verification.as_ref(),
+                ))?;
             } else {
                 sink.emit(events.session_completed(self.status, session.session_id()))?;
             }
@@ -939,7 +955,8 @@ impl PreparedThreadTurnOutcome {
             Self::Completed(mut completion) => {
                 let background_workflows = std::mem::take(&mut completion.background_workflows);
                 let end_reason = completion.end_reason;
-                let terminal = completion.terminal.take();
+                let terminal = completion.terminal.clone();
+                let verification = completion.verification.clone();
                 completion
                     .commit(config, session, request, cancel, events, sink)
                     .map(|status| ThreadTurnOutcome::Completed {
@@ -947,6 +964,7 @@ impl PreparedThreadTurnOutcome {
                         end_reason,
                         background_workflows,
                         terminal,
+                        verification,
                     })
             }
             Self::ProviderSuspended {
@@ -968,6 +986,7 @@ impl ThreadTurnOutcome {
                 end_reason: _,
                 background_workflows,
                 terminal,
+                ..
             } => {
                 background_workflows.join_silently();
                 // The typed terminal's exit code is authoritative for budget
@@ -1742,13 +1761,16 @@ fn run_verifier_if_needed(
     verifier: Option<&str>,
     events: &mut EventFactory,
     sink: &mut EventSink<impl io::Write>,
-) -> io::Result<RunStatus> {
+) -> io::Result<(
+    RunStatus,
+    Option<orca_core::verification::VerificationResult>,
+)> {
     if status != RunStatus::Success {
-        return Ok(status);
+        return Ok((status, None));
     }
 
     let Some(command) = verifier else {
-        return Ok(status);
+        return Ok((status, None));
     };
 
     sink.emit(events.verification_started(command))?;
@@ -1757,9 +1779,9 @@ fn run_verifier_if_needed(
     sink.emit(events.verification_completed(&result))?;
 
     if success {
-        Ok(RunStatus::Success)
+        Ok((RunStatus::Success, Some(result)))
     } else {
-        Ok(RunStatus::VerificationFailed)
+        Ok((RunStatus::VerificationFailed, Some(result)))
     }
 }
 

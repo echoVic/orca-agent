@@ -235,6 +235,9 @@ impl ThreadActor {
                     },
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
+                    completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                        "admission repair terminal has no verifier proof",
+                    ),
                     committed_at: surface::UnixMillis::new(0),
                 },
             }],
@@ -243,6 +246,9 @@ impl ThreadActor {
         let value = surface::OperationTerminalAtCursor {
             operation_id: operation_id.clone(),
             terminal: pending.terminal.clone(),
+            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                "admission repair terminal has no verifier proof",
+            ),
             cursor: terminal_batch.cursor_after.clone(),
             commit_class: terminal_batch.commit_class.clone(),
             batch_digest: terminal_batch.batch_digest.clone(),
@@ -4115,6 +4121,9 @@ impl ThreadActor {
                     usage: usage.clone(),
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
+                    completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                        "finalization repair terminal has no verifier proof",
+                    ),
                     committed_at: surface::UnixMillis::new(0),
                 },
             }],
@@ -4123,6 +4132,9 @@ impl ThreadActor {
         let value = surface::OperationTerminalAtCursor {
             operation_id: fence.operation_id.clone(),
             terminal,
+            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                "finalization repair terminal has no verifier proof",
+            ),
             cursor: terminal_batch.cursor_after.clone(),
             commit_class: terminal_batch.commit_class.clone(),
             batch_digest: terminal_batch.batch_digest.clone(),
@@ -4741,6 +4753,9 @@ impl ThreadActor {
                     },
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
+                    completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                        "unadmitted terminal has no verifier proof",
+                    ),
                     committed_at: surface::UnixMillis::new(0),
                 },
             }],
@@ -4754,6 +4769,9 @@ impl ThreadActor {
         let value = surface::OperationTerminalAtCursor {
             operation_id: operation_id.clone(),
             terminal,
+            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                "unadmitted terminal has no verifier proof",
+            ),
             cursor: terminal_batch.cursor_after.clone(),
             commit_class: terminal_batch.commit_class.clone(),
             batch_digest: terminal_batch.batch_digest.clone(),
@@ -5239,6 +5257,12 @@ impl ThreadActor {
         let original_request_id = operation.request_id.clone();
         let thread_id = snapshot.thread.thread_id.clone();
         let thread_owner_epoch = snapshot.thread.owner_epoch;
+        let completion_proof = Self::surface_completion_proof(
+            &snapshot,
+            operation,
+            &terminal,
+            completed_turn.as_ref(),
+        )?;
         let finalize_intent_id =
             surface::SurfaceFinalizeIntentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
@@ -5455,6 +5479,7 @@ impl ThreadActor {
             usage,
             source_diagnostic_digest: None,
             settlement_receipts: Vec::new(),
+            completion_proof,
             committed_at: surface::UnixMillis::new(0),
         };
         let task_terminal_projection = if matches!(
@@ -5511,6 +5536,7 @@ impl ThreadActor {
         let value = surface::OperationTerminalAtCursor {
             operation_id: operation_id.clone(),
             terminal,
+            completion_proof: terminal_record.completion_proof.clone(),
             cursor: terminal_batch.cursor_after.clone(),
             commit_class: terminal_batch.commit_class.clone(),
             batch_digest: terminal_batch.batch_digest.clone(),
@@ -5554,6 +5580,121 @@ impl ThreadActor {
         }
         self.cache_surface_terminal(value.clone());
         Ok(Some(value))
+    }
+
+    fn surface_completion_proof(
+        snapshot: &surface::SurfaceSnapshot,
+        operation: &surface::OperationRecord,
+        terminal: &surface::OperationTerminal,
+        completed_turn: Option<&CompletedTurnOutcome>,
+    ) -> Result<surface::SurfaceOperationCompletionProof, RuntimeHostError> {
+        let verification = completed_turn
+            .and_then(|completed| completed.verification.as_ref())
+            .map(surface::SurfaceVerificationResult::try_from_verification)
+            .transpose()
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("invalid verifier completion proof: {error}"),
+            })?;
+        let mut proof = verification
+            .map(surface::SurfaceOperationCompletionProof::from_verification)
+            .unwrap_or_default();
+        for tool in snapshot.tools.iter().filter(|tool| {
+            operation
+                .generations
+                .iter()
+                .any(|generation| generation.logical_turn_id == tool.request.turn_id)
+        }) {
+            let Some(result) = tool.result.as_ref() else {
+                Self::push_completion_limitation(
+                    &mut proof,
+                    "a tool invocation had no terminal result",
+                );
+                continue;
+            };
+            proof
+                .tool_receipts
+                .push(surface::SurfaceToolCompletionReceipt::from_result(result));
+            if matches!(
+                result.terminal.kind,
+                surface::SurfaceToolResultKind::ExternalEffectAmbiguous
+                    | surface::SurfaceToolResultKind::ObservationUnavailable
+                    | surface::SurfaceToolResultKind::CleanupAmbiguous
+            ) || result.terminal.invocation_started == surface::ToolInvocationStarted::Unknown
+            {
+                Self::push_completion_limitation(
+                    &mut proof,
+                    "a tool invocation has an indeterminate outcome",
+                );
+            }
+        }
+        if let Some(orca_core::budget::OperationTerminal::Stopped {
+            checkpoint_id,
+            resumable: true,
+            ..
+        }) = completed_turn.and_then(|completed| completed.terminal.as_ref())
+            && !checkpoint_id.trim().is_empty()
+        {
+            proof.resume = Some(
+                surface::SurfaceResumeBoundary::new(checkpoint_id.clone()).map_err(|error| {
+                    RuntimeHostError::ThreadStartFailed {
+                        message: format!("invalid completion resume boundary: {error}"),
+                    }
+                })?,
+            );
+        }
+        if matches!(
+            proof.verification,
+            surface::SurfaceCompletionVerification::Unverified
+        ) {
+            Self::push_completion_limitation(&mut proof, "verification was not run");
+        }
+        match terminal {
+            surface::OperationTerminal::Cancelled { .. }
+            | surface::OperationTerminal::Shutdown { .. } => {
+                Self::push_completion_limitation(&mut proof, "operation was cancelled");
+            }
+            surface::OperationTerminal::BudgetExhausted { .. } => {
+                Self::push_completion_limitation(
+                    &mut proof,
+                    "operation stopped at a budget boundary",
+                );
+            }
+            surface::OperationTerminal::NotAdmitted { .. } => {
+                Self::push_completion_limitation(&mut proof, "operation was not admitted");
+            }
+            surface::OperationTerminal::Failed { .. }
+            | surface::OperationTerminal::Panicked { .. }
+            | surface::OperationTerminal::JoinFailed { .. }
+            | surface::OperationTerminal::AbortedByRuntimeRestart { .. } => {
+                Self::push_completion_limitation(
+                    &mut proof,
+                    "operation did not complete successfully",
+                );
+            }
+            surface::OperationTerminal::Succeeded { .. } => {}
+        }
+        proof
+            .validate()
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("invalid completion proof: {error}"),
+            })?;
+        Ok(proof)
+    }
+
+    fn push_completion_limitation(
+        proof: &mut surface::SurfaceOperationCompletionProof,
+        limitation: &'static str,
+    ) {
+        if proof.limitations.len() < surface::SURFACE_COMPLETION_PROOF_LIMITATION_LIMIT
+            && !proof
+                .limitations
+                .iter()
+                .any(|existing| existing.as_str() == limitation)
+        {
+            proof
+                .limitations
+                .push(surface::DisplayText::new(limitation));
+        }
     }
 
     pub(super) fn prepare_goal_surface_continuation_work(
@@ -5819,6 +5960,7 @@ impl ThreadActor {
                     status,
                     end_reason,
                     terminal,
+                    verification,
                     ..
                 }) => {
                     self.state = Some(result.state);
@@ -5834,6 +5976,7 @@ impl ThreadActor {
                             status,
                             end_reason,
                             terminal,
+                            verification,
                         }),
                     )
                 }
@@ -6757,6 +6900,9 @@ impl ThreadActor {
                     },
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
+                    completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                        "cancelled terminal has no verifier proof",
+                    ),
                     committed_at: surface::UnixMillis::new(0),
                 },
             }],
@@ -6769,6 +6915,9 @@ impl ThreadActor {
         let terminal_at_cursor = surface::OperationTerminalAtCursor {
             operation_id: operation_id.clone(),
             terminal,
+            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                "cancelled terminal has no verifier proof",
+            ),
             cursor: terminal_batch.cursor_after.clone(),
             commit_class: terminal_batch.commit_class.clone(),
             batch_digest: terminal_batch.batch_digest.clone(),

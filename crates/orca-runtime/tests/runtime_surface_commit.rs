@@ -1439,6 +1439,9 @@ fn recover_retries_prepared_terminal_batch_before_classifying_operation() {
                 },
                 source_diagnostic_digest: None,
                 settlement_receipts: Vec::new(),
+                completion_proof: SurfaceOperationCompletionProof::unverified(
+                    "test terminal has no verifier proof",
+                ),
                 committed_at: UnixMillis::new(0),
             },
         }],
@@ -1557,6 +1560,9 @@ fn later_successor_recovers_prepared_terminal_before_any_owner_transition() {
                 },
                 source_diagnostic_digest: None,
                 settlement_receipts: Vec::new(),
+                completion_proof: SurfaceOperationCompletionProof::unverified(
+                    "test terminal has no verifier proof",
+                ),
                 committed_at: UnixMillis::new(0),
             },
         }],
@@ -3411,6 +3417,9 @@ fn recorded_shutdown_thread_fixture(
         terminal: OperationTerminal::Cancelled {
             reason: CancelReason::User,
         },
+        completion_proof: SurfaceOperationCompletionProof::unverified(
+            "test terminal has no verifier proof",
+        ),
         cursor: SurfaceCursor {
             next_seq: SequenceNumber::new(2),
             ..closed_cursor.clone()

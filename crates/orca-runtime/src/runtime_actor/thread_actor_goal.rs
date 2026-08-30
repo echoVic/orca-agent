@@ -611,6 +611,9 @@ impl ThreadActor {
                         },
                         source_diagnostic_digest: None,
                         settlement_receipts: Vec::new(),
+                        completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                            "goal recovery terminal has no verifier proof",
+                        ),
                         committed_at: surface::UnixMillis::new(0),
                     },
                 }],
@@ -619,6 +622,9 @@ impl ThreadActor {
             let value = surface::OperationTerminalAtCursor {
                 operation_id: operation_id.clone(),
                 terminal,
+                completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                    "goal recovery terminal has no verifier proof",
+                ),
                 cursor: terminal_batch.cursor_after.clone(),
                 commit_class: terminal_batch.commit_class.clone(),
                 batch_digest: terminal_batch.batch_digest.clone(),

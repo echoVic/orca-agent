@@ -1297,6 +1297,7 @@ pub struct WaitOperationTerminalRequest {
 pub struct OperationTerminalAtCursor {
     pub operation_id: SurfaceOperationId,
     pub terminal: OperationTerminal,
+    pub completion_proof: super::projection::SurfaceOperationCompletionProof,
     pub cursor: SurfaceCursor,
     pub commit_class: CommitClass,
     pub batch_digest: Sha256Digest,
@@ -4640,6 +4641,9 @@ mod closed_command_domain_tests {
                     estimated_cost_usd_micros: 3,
                 },
             },
+            completion_proof: super::super::SurfaceOperationCompletionProof::unverified(
+                "test terminal has no verifier proof",
+            ),
             cursor: cursor(seed),
             commit_class: commit_class(seed),
             batch_digest: digest(seed),

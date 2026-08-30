@@ -2862,6 +2862,10 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                             },
                             source_diagnostic_digest: None,
                             settlement_receipts: Vec::new(),
+                            completion_proof: recovered_completion_proof(
+                                self.state.snapshot(),
+                                &operation,
+                            ),
                             committed_at: super::UnixMillis::new(0),
                         },
                     }],
@@ -3137,6 +3141,10 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                             usage,
                             source_diagnostic_digest: None,
                             settlement_receipts: finalization.settled.clone(),
+                            completion_proof: recovered_completion_proof(
+                                self.state.snapshot(),
+                                &operation,
+                            ),
                             committed_at: super::UnixMillis::new(0),
                         },
                     }],
@@ -9842,6 +9850,28 @@ fn recovered_operation_usage(
         .unwrap_or_else(zero_usage)
 }
 
+fn recovered_completion_proof(
+    snapshot: &super::SurfaceSnapshot,
+    operation: &super::OperationRecord,
+) -> super::SurfaceOperationCompletionProof {
+    let mut proof = super::SurfaceOperationCompletionProof::unverified(
+        "runtime recovery terminal has no verifier proof",
+    );
+    proof.tool_receipts = snapshot
+        .tools
+        .iter()
+        .filter(|tool| {
+            operation
+                .generations
+                .iter()
+                .any(|generation| generation.logical_turn_id == tool.request.turn_id)
+        })
+        .filter_map(|tool| tool.result.as_ref())
+        .map(super::SurfaceToolCompletionReceipt::from_result)
+        .collect();
+    proof
+}
+
 fn terminal_from_terminalization(cause: super::TerminalizationCause) -> super::OperationTerminal {
     match cause {
         super::TerminalizationCause::UserCancel => super::OperationTerminal::Cancelled {
@@ -12113,6 +12143,9 @@ mod tests {
                         usage: zero_usage(),
                         source_diagnostic_digest: None,
                         settlement_receipts: Vec::new(),
+                        completion_proof: super::super::SurfaceOperationCompletionProof::unverified(
+                            "test terminal has no verifier proof",
+                        ),
                         committed_at: super::super::UnixMillis::new(0),
                     },
                 }),

@@ -3560,6 +3560,9 @@ fn terminal_record_for(
         usage,
         source_diagnostic_digest: None,
         settlement_receipts,
+        completion_proof: SurfaceOperationCompletionProof::unverified(
+            "test terminal has no verifier proof",
+        ),
         committed_at: UnixMillis::new(5),
     }
 }
@@ -4642,6 +4645,9 @@ fn exercise_operation_transition(
                 usage: usage(),
                 source_diagnostic_digest: None,
                 settlement_receipts: Vec::new(),
+                completion_proof: SurfaceOperationCompletionProof::unverified(
+                    "test terminal has no verifier proof",
+                ),
                 committed_at: UnixMillis::new(5),
             };
             let events = vec![
@@ -5605,8 +5611,82 @@ fn invariant_terminal_record(
         usage,
         source_diagnostic_digest: None,
         settlement_receipts: Vec::new(),
+        completion_proof: SurfaceOperationCompletionProof::unverified(
+            "test terminal has no verifier proof",
+        ),
         committed_at: UnixMillis::new(9),
     }
+}
+
+#[test]
+fn terminal_rejects_completion_proof_receipt_not_backed_by_operation_tools() {
+    let (operation, _) = stopped_admitted_operation();
+    let terminal_seed = 16_900;
+    let (finalizing, finalize_intent_id) = finalizing_invariant_state(
+        &operation,
+        terminal_seed - 1,
+        terminal_seed,
+        OperationFinalizationCause::GenerationStop(GenerationStopReason::Completed {
+            status: GenerationCompletionStatus::Success,
+        }),
+    );
+    let mut record = invariant_terminal_record(
+        operation.operation_id.clone(),
+        finalize_intent_id,
+        OperationTerminal::Succeeded {
+            usage: vector_usage(),
+        },
+        vector_usage(),
+    );
+    record
+        .completion_proof
+        .tool_receipts
+        .push(SurfaceToolCompletionReceipt {
+            tool_call_id: SurfaceToolCallId::try_new("forged-receipt").unwrap(),
+            terminal: SurfaceToolTerminal {
+                kind: SurfaceToolResultKind::Success,
+                source: ToolTerminalSource::Observed,
+                invocation_started: ToolInvocationStarted::Yes,
+            },
+            result_digest: digest(91),
+            file_change_digest: None,
+        });
+    let terminal = batch(
+        &finalizing,
+        terminal_seed,
+        vec![(
+            operation_scope(&operation),
+            SurfaceEvent::Operation(OperationPatch::Terminal { record }),
+        )],
+    );
+
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &finalizing, &terminal),
+        SurfaceReducerErrorCode::IllegalTransition,
+    );
+}
+
+#[test]
+fn terminal_record_without_completion_proof_defaults_to_unverified() {
+    let record = invariant_terminal_record(
+        SurfaceOperationId::try_from_bytes(uuid_v7_bytes(16_910)).unwrap(),
+        SurfaceFinalizeIntentId::try_from_bytes(uuid_v7_bytes(16_911)).unwrap(),
+        OperationTerminal::Succeeded {
+            usage: vector_usage(),
+        },
+        vector_usage(),
+    );
+    let mut serialized = serde_json::to_value(record).unwrap();
+    serialized
+        .as_object_mut()
+        .unwrap()
+        .remove("completion_proof");
+
+    let restored: OperationTerminalRecord = serde_json::from_value(serialized).unwrap();
+    assert_eq!(
+        restored.completion_proof.verification,
+        SurfaceCompletionVerification::Unverified
+    );
 }
 
 fn goal_generation_identity(

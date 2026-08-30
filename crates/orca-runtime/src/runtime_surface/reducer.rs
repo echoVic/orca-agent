@@ -42,19 +42,19 @@ use super::projection::{
     GoalPatchEnvelope, GoalUsage, ItemPatch, ItemRemovalReason, McpCatalogPatch, OperationPatch,
     PinnedContextPatch, SessionPatch, SettingsPatch, SubagentPatch, SurfaceAssistantStreamState,
     SurfaceBackgroundOperation, SurfaceCapabilityCall, SurfaceCapabilityCallKind,
-    SurfaceCapabilityCallState, SurfaceCompletedModelResponse, SurfaceContextSnapshot,
-    SurfaceFactFamily, SurfaceGoal, SurfaceGoalCloseReason, SurfaceGoalClosedRunReceipt,
-    SurfaceGoalIntent, SurfaceGoalIntentAck, SurfaceGoalOuterTurnReceipt,
-    SurfaceGoalOuterTurnReceiptOrigin, SurfaceGoalPauseReason, SurfaceGoalReceiptState,
-    SurfaceGoalRun, SurfaceGoalRunOrigin, SurfaceGoalRunPhase, SurfaceGoalState,
-    SurfaceGoalStoreReceipt, SurfaceHealthIssue, SurfaceHealthIssueId, SurfaceItem,
-    SurfaceItemOrigin, SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfacePlanSnapshot,
-    SurfaceRemoteTerminalLease, SurfaceRemoteTerminalLeaseState, SurfaceSubagentStatus,
-    SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus, SurfaceTaskType,
-    SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState, SurfaceUsageSnapshot,
-    SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow, SurfaceWorkflowAgent,
-    SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, TaskPatch, ToolInvocationStarted, ToolPatch,
-    WorkflowPatch,
+    SurfaceCapabilityCallState, SurfaceCompletedModelResponse, SurfaceCompletionVerification,
+    SurfaceContextSnapshot, SurfaceFactFamily, SurfaceGoal, SurfaceGoalCloseReason,
+    SurfaceGoalClosedRunReceipt, SurfaceGoalIntent, SurfaceGoalIntentAck,
+    SurfaceGoalOuterTurnReceipt, SurfaceGoalOuterTurnReceiptOrigin, SurfaceGoalPauseReason,
+    SurfaceGoalReceiptState, SurfaceGoalRun, SurfaceGoalRunOrigin, SurfaceGoalRunPhase,
+    SurfaceGoalState, SurfaceGoalStoreReceipt, SurfaceHealthIssue, SurfaceHealthIssueId,
+    SurfaceItem, SurfaceItemOrigin, SurfacePinnedContextEntry, SurfacePinnedContextKind,
+    SurfacePlanSnapshot, SurfaceRemoteTerminalLease, SurfaceRemoteTerminalLeaseState,
+    SurfaceSubagentStatus, SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus,
+    SurfaceTaskType, SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState,
+    SurfaceUsageSnapshot, SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow,
+    SurfaceWorkflowAgent, SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, TaskPatch,
+    ToolInvocationStarted, ToolPatch, WorkflowPatch,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -943,7 +943,7 @@ fn batch_error(
 fn event_error(
     envelope: &SurfaceEventEnvelope,
     code: SurfaceReducerErrorCode,
-    message: &'static str,
+    message: impl Into<String>,
 ) -> SurfaceReducerError {
     SurfaceReducerError {
         code,
@@ -5978,6 +5978,13 @@ fn apply_operation_patch(
                     "verification completion lacks its same-batch start",
                 ));
             }
+            result.validate().map_err(|error| {
+                event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::InvalidOrdering,
+                    format!("verification result exceeds completion proof bounds: {error}"),
+                )
+            })?;
             Ok(())
         }
         OperationPatch::GenerationStopped {
@@ -6518,6 +6525,43 @@ fn apply_operation_patch(
                     "operation terminal lacks finalization",
                 ));
             };
+            let expected_tool_receipts = snapshot
+                .tools
+                .iter()
+                .filter(|tool| {
+                    operation
+                        .generations
+                        .iter()
+                        .any(|generation| generation.logical_turn_id == tool.request.turn_id)
+                })
+                .filter_map(|tool| tool.result.as_ref())
+                .map(super::projection::SurfaceToolCompletionReceipt::from_result)
+                .collect::<Vec<_>>();
+            if record.completion_proof.tool_receipts != expected_tool_receipts {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "terminal completion proof tool receipts do not match recorded tool results",
+                ));
+            }
+            record.completion_proof.validate().map_err(|error| {
+                event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    format!("terminal completion proof is invalid: {error}"),
+                )
+            })?;
+            if matches!(
+                record.completion_proof.verification,
+                SurfaceCompletionVerification::Failed { .. }
+            ) && matches!(record.terminal, OperationTerminal::Succeeded { .. })
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "successful terminal conflicts with failed verifier evidence",
+                ));
+            }
             let settled_matches = finalization.expected_settlements.len()
                 == finalization.settled.len()
                 && finalization
@@ -9459,6 +9503,9 @@ pub(crate) mod tests {
                     },
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
+                    completion_proof: super::super::SurfaceOperationCompletionProof::unverified(
+                        "test terminal has no verifier proof",
+                    ),
                     committed_at: UnixMillis::new(5),
                 },
             }),

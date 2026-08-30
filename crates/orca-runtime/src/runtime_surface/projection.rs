@@ -32,6 +32,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub const ACP_CAPABILITY_TEXT_BYTE_LIMIT: usize = 4_194_304;
 pub const ACP_CAPABILITY_IDENTIFIER_BYTE_LIMIT: usize = 4_096;
+/// Maximum amount of verifier output retained in a durable completion proof.
+/// The complete process output remains available in the ordinary event stream;
+/// a terminal proof must stay small enough to replay and render predictably.
+pub const SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT: usize = 64 * 1024;
+pub const SURFACE_COMPLETION_PROOF_TOOL_RECEIPT_LIMIT: usize = 1_024;
+pub const SURFACE_COMPLETION_PROOF_LIMITATION_LIMIT: usize = 16;
+pub const SURFACE_COMPLETION_PROOF_TEXT_BYTE_LIMIT: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceVerificationResult {
@@ -40,6 +47,197 @@ pub struct SurfaceVerificationResult {
     pub exit_code: Option<i32>,
     pub stdout: DisplayText,
     pub stderr: DisplayText,
+}
+
+impl SurfaceVerificationResult {
+    /// Project the core verifier result into the bounded durable surface form.
+    /// The command and status fields are retained exactly; only output is
+    /// bounded, with an explicit marker when the surface projection truncates.
+    pub fn from_verification(result: &orca_core::verification::VerificationResult) -> Self {
+        Self::try_from_verification(result).expect("verifier command must be non-empty")
+    }
+
+    pub fn try_from_verification(
+        result: &orca_core::verification::VerificationResult,
+    ) -> Result<Self, SurfaceValueError> {
+        Ok(Self {
+            command: NonEmptyText::try_new(result.command.clone())?,
+            success: result.success,
+            exit_code: result.exit_code,
+            stdout: DisplayText::new(bound_completion_output(&result.stdout)),
+            stderr: DisplayText::new(bound_completion_output(&result.stderr)),
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), SurfaceValueError> {
+        if self.stdout.as_str().len() > SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT {
+            return Err(SurfaceValueError::TooLong {
+                maximum: SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT,
+                observed: self.stdout.as_str().len(),
+            });
+        }
+        if self.stderr.as_str().len() > SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT {
+            return Err(SurfaceValueError::TooLong {
+                maximum: SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT,
+                observed: self.stderr.as_str().len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn bound_completion_output(value: &str) -> String {
+    if value.len() <= SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT {
+        return value.to_string();
+    }
+
+    const MARKER: &str = "\n[output truncated]\n";
+    let prefix_limit = SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT.saturating_sub(MARKER.len());
+    let mut prefix_end = prefix_limit.min(value.len());
+    while prefix_end > 0 && !value.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let mut bounded = String::with_capacity(SURFACE_VERIFICATION_OUTPUT_BYTE_LIMIT);
+    bounded.push_str(&value[..prefix_end]);
+    bounded.push_str(MARKER);
+    bounded
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceToolCompletionReceipt {
+    pub tool_call_id: SurfaceToolCallId,
+    pub terminal: SurfaceToolTerminal,
+    pub result_digest: Sha256Digest,
+    pub file_change_digest: Option<Sha256Digest>,
+}
+
+impl SurfaceToolCompletionReceipt {
+    pub fn from_result(result: &SurfaceToolResult) -> Self {
+        let result_digest = Sha256Digest::digest(
+            serde_json::to_vec(result).expect("surface tool result serializes"),
+        );
+        let file_change_digest = result.file_change.as_ref().and_then(|change| match change {
+            SurfaceFileChange::UnifiedDiff { digest, .. } => Some(digest.clone()),
+            SurfaceFileChange::PreviewOmitted { .. } => None,
+        });
+        Self {
+            tool_call_id: result.tool_call_id.clone(),
+            terminal: result.terminal.clone(),
+            result_digest,
+            file_change_digest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceResumeBoundary {
+    pub checkpoint_id: NonEmptyText,
+    pub checkpoint_digest: Sha256Digest,
+}
+
+impl SurfaceResumeBoundary {
+    pub fn new(checkpoint_id: impl Into<String>) -> Result<Self, SurfaceValueError> {
+        let checkpoint_id = NonEmptyText::try_new(checkpoint_id)?;
+        let checkpoint_digest = Sha256Digest::digest(checkpoint_id.as_str().as_bytes());
+        Ok(Self {
+            checkpoint_id,
+            checkpoint_digest,
+        })
+    }
+}
+
+/// The verification truth is explicit: it comes from the verifier's reported
+/// success flag, never from assistant text or an exit-code convention.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "result", rename_all = "snake_case")]
+pub enum SurfaceCompletionVerification {
+    #[default]
+    Unverified,
+    Failed {
+        result: SurfaceVerificationResult,
+    },
+    Verified {
+        result: SurfaceVerificationResult,
+    },
+}
+
+impl SurfaceCompletionVerification {
+    pub fn from_verification(result: SurfaceVerificationResult) -> Self {
+        if result.success {
+            Self::Verified { result }
+        } else {
+            Self::Failed { result }
+        }
+    }
+
+    fn validate(&self) -> Result<(), SurfaceValueError> {
+        match self {
+            Self::Unverified => Ok(()),
+            Self::Failed { result } if result.success => Err(SurfaceValueError::InvalidFormat),
+            Self::Verified { result } if !result.success => Err(SurfaceValueError::InvalidFormat),
+            Self::Failed { result } | Self::Verified { result } => result.validate(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceOperationCompletionProof {
+    pub verification: SurfaceCompletionVerification,
+    pub tool_receipts: Vec<SurfaceToolCompletionReceipt>,
+    pub resume: Option<SurfaceResumeBoundary>,
+    pub limitations: Vec<DisplayText>,
+}
+
+impl SurfaceOperationCompletionProof {
+    pub fn from_verification(result: SurfaceVerificationResult) -> Self {
+        Self {
+            verification: SurfaceCompletionVerification::from_verification(result),
+            ..Self::default()
+        }
+    }
+
+    pub fn unverified(reason: impl Into<String>) -> Self {
+        Self {
+            limitations: vec![DisplayText::new(bound_proof_text(&reason.into()))],
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SurfaceValueError> {
+        self.verification.validate()?;
+        if self.tool_receipts.len() > SURFACE_COMPLETION_PROOF_TOOL_RECEIPT_LIMIT {
+            return Err(SurfaceValueError::TooLong {
+                maximum: SURFACE_COMPLETION_PROOF_TOOL_RECEIPT_LIMIT,
+                observed: self.tool_receipts.len(),
+            });
+        }
+        if self.limitations.len() > SURFACE_COMPLETION_PROOF_LIMITATION_LIMIT {
+            return Err(SurfaceValueError::TooLong {
+                maximum: SURFACE_COMPLETION_PROOF_LIMITATION_LIMIT,
+                observed: self.limitations.len(),
+            });
+        }
+        for limitation in &self.limitations {
+            if limitation.as_str().len() > SURFACE_COMPLETION_PROOF_TEXT_BYTE_LIMIT {
+                return Err(SurfaceValueError::TooLong {
+                    maximum: SURFACE_COMPLETION_PROOF_TEXT_BYTE_LIMIT,
+                    observed: limitation.as_str().len(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn bound_proof_text(value: &str) -> String {
+    if value.len() <= SURFACE_COMPLETION_PROOF_TEXT_BYTE_LIMIT {
+        return value.to_string();
+    }
+    let mut end = SURFACE_COMPLETION_PROOF_TEXT_BYTE_LIMIT;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 #[derive(Clone, PartialEq)]

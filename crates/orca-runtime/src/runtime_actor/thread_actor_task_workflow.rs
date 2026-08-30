@@ -873,6 +873,9 @@ impl ThreadActor {
                             usage: pending.usage.clone(),
                             source_diagnostic_digest: None,
                             settlement_receipts: Vec::new(),
+                            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                                "background workflow terminal has no verifier proof",
+                            ),
                             committed_at: surface::UnixMillis::new(
                                 chrono::Utc::now().timestamp_millis(),
                             ),
@@ -884,6 +887,9 @@ impl ThreadActor {
             pending.terminal_value = Some(surface::OperationTerminalAtCursor {
                 operation_id: pending.operation_id.clone(),
                 terminal: pending.terminal.clone(),
+                completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                    "background workflow terminal has no verifier proof",
+                ),
                 cursor: terminal_batch.cursor_after.clone(),
                 commit_class: terminal_batch.commit_class.clone(),
                 batch_digest: terminal_batch.batch_digest.clone(),
@@ -1472,6 +1478,9 @@ impl ThreadActor {
                             usage: pending.usage.clone(),
                             source_diagnostic_digest: None,
                             settlement_receipts: Vec::new(),
+                            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                                "background workflow terminal has no verifier proof",
+                            ),
                             committed_at: surface::UnixMillis::new(
                                 chrono::Utc::now().timestamp_millis(),
                             ),
@@ -1483,6 +1492,9 @@ impl ThreadActor {
             pending.terminal_value = Some(surface::OperationTerminalAtCursor {
                 operation_id: pending.operation_id.clone(),
                 terminal: pending.terminal.clone(),
+                completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                    "background workflow terminal has no verifier proof",
+                ),
                 cursor: terminal_batch.cursor_after.clone(),
                 commit_class: terminal_batch.commit_class.clone(),
                 batch_digest: terminal_batch.batch_digest.clone(),

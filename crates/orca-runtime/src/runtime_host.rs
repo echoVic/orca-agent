@@ -369,6 +369,7 @@ pub enum ThreadOperationOutcome {
         background_workflows: RuntimeBackgroundWorkflows,
         /// Typed operation terminal; the authoritative fact when present.
         terminal: Option<orca_core::budget::OperationTerminal>,
+        verification: Option<orca_core::verification::VerificationResult>,
     },
     ProviderSuspended {
         suspension: Box<RuntimeProviderSuspension>,
@@ -383,6 +384,7 @@ impl From<RunStatus> for ThreadOperationOutcome {
             end_reason: crate::lifecycle::TurnEndReason::Unclassified,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             terminal: None,
+            verification: None,
         }
     }
 }
@@ -1988,6 +1990,7 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                 },
                 background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
                 terminal: None,
+                verification: None,
             });
         }
         if request.operation_kind() != &HostedOperationKind::Turn
@@ -2016,11 +2019,13 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
                     end_reason,
                     background_workflows,
                     terminal,
+                    verification,
                 } => ThreadOperationOutcome::Completed {
                     status,
                     end_reason,
                     background_workflows,
                     terminal,
+                    verification,
                 },
                 crate::controller::ThreadTurnOutcome::ProviderSuspended {
                     suspension,
@@ -2702,6 +2707,7 @@ struct CompletedTurnOutcome {
     /// Typed operation terminal; the authoritative fact when present (budget
     /// stops carry `OperationTerminal::Stopped`).
     terminal: Option<orca_core::budget::OperationTerminal>,
+    verification: Option<orca_core::verification::VerificationResult>,
 }
 
 impl CompletedTurnOutcome {
@@ -7063,6 +7069,9 @@ fn reconcile_durable_workflow_outcomes_on_start(
                         usage,
                         source_diagnostic_digest: None,
                         settlement_receipts: Vec::new(),
+                        completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                            "provider recovery terminal has no verifier proof",
+                        ),
                         committed_at: surface::UnixMillis::new(
                             chrono::Utc::now().timestamp_millis(),
                         ),
@@ -7503,6 +7512,9 @@ fn reconcile_durable_provider_outcomes_on_start(
                         usage,
                         source_diagnostic_digest: None,
                         settlement_receipts: Vec::new(),
+                        completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                            "workflow recovery terminal has no verifier proof",
+                        ),
                         committed_at: surface::UnixMillis::new(
                             chrono::Utc::now().timestamp_millis(),
                         ),
@@ -10829,6 +10841,7 @@ fn recovered_surface_terminals(
                 surface::OperationTerminalAtCursor {
                     operation_id: record.operation_id.clone(),
                     terminal: record.terminal.clone(),
+                    completion_proof: record.completion_proof.clone(),
                     cursor: batch.cursor_after.clone(),
                     commit_class: batch.commit_class.clone(),
                     batch_digest: batch.batch_digest.clone(),
@@ -20127,6 +20140,7 @@ impl ThreadActor {
                                     status,
                                     end_reason,
                                     terminal,
+                                    verification,
                                     ..
                                 },
                             ) => {
@@ -20134,6 +20148,7 @@ impl ThreadActor {
                                     status: *status,
                                     end_reason: *end_reason,
                                     terminal: terminal.clone(),
+                                    verification: verification.clone(),
                                 };
                                 completed.permits_goal_continuation().then_some(completed)
                             }
@@ -20195,6 +20210,7 @@ impl ThreadActor {
                                         status,
                                         end_reason,
                                         terminal,
+                                        verification,
                                         ..
                                     },
                                 ) => {
@@ -20206,14 +20222,22 @@ impl ThreadActor {
                                                 orca_core::budget::OperationTerminal::Stopped {
                                                     ..
                                                 },
-                                            ) => result.state.events.session_completed_terminal(
-                                                terminal.as_ref().expect("matched stop"),
-                                                result.state.thread.session().session_id(),
-                                            ),
-                                            _ => result.state.events.session_completed(
-                                                status,
-                                                result.state.thread.session().session_id(),
-                                            ),
+                                            ) => result
+                                                .state
+                                                .events
+                                                .session_completed_terminal_with_verification(
+                                                    terminal.as_ref().expect("matched stop"),
+                                                    result.state.thread.session().session_id(),
+                                                    verification.as_ref(),
+                                                ),
+                                            _ => result
+                                                .state
+                                                .events
+                                                .session_completed_with_verification(
+                                                    status,
+                                                    result.state.thread.session().session_id(),
+                                                    verification.as_ref(),
+                                                ),
                                         };
                                         observe_runtime_event(
                                             active.request.event_observer().as_deref(),
@@ -20225,6 +20249,7 @@ impl ThreadActor {
                                         status,
                                         end_reason,
                                         terminal: terminal.clone(),
+                                        verification: verification.clone(),
                                     });
                                     match terminal {
                                         Some(orca_core::budget::OperationTerminal::Stopped {
@@ -21076,6 +21101,7 @@ fn run_headless_session(
     }
     if let ThreadOperationOutcome::Completed {
         terminal,
+        verification,
         background_workflows: _,
         ..
     } = &outcome
@@ -21098,14 +21124,24 @@ fn run_headless_session(
                 status,
                 RunStatus::ApprovalRequired | RunStatus::VerificationFailed
             ) {
-                sink.emit(
-                    events.session_completed_terminal(terminal, thread.session().session_id()),
-                )?;
+                sink.emit(events.session_completed_terminal_with_verification(
+                    terminal,
+                    thread.session().session_id(),
+                    verification.as_ref(),
+                ))?;
             } else {
-                sink.emit(events.session_completed(status, thread.session().session_id()))?;
+                sink.emit(events.session_completed_with_verification(
+                    status,
+                    thread.session().session_id(),
+                    verification.as_ref(),
+                ))?;
             }
         } else {
-            sink.emit(events.session_completed(status, thread.session().session_id()))?;
+            sink.emit(events.session_completed_with_verification(
+                status,
+                thread.session().session_id(),
+                verification.as_ref(),
+            ))?;
         }
     }
     Ok(outcome)
@@ -23158,11 +23194,13 @@ mod tests {
                         end_reason,
                         background_workflows,
                         terminal,
+                        verification,
                     } => ThreadOperationOutcome::Completed {
                         status,
                         end_reason,
                         background_workflows,
                         terminal,
+                        verification,
                     },
                     crate::controller::ThreadTurnOutcome::ProviderSuspended {
                         suspension,
@@ -23202,6 +23240,7 @@ mod tests {
                         checkpoint_id: "surface-goal-continuation".to_string(),
                         resumable: true,
                     }),
+                    verification: None,
                 });
             }
             SurfaceGoalUpdateExecutor.run_turn(thread, request, generation, events, writer, cancel)
@@ -23258,6 +23297,7 @@ mod tests {
                     checkpoint_id: String::new(),
                     resumable: false,
                 }),
+                verification: None,
             })
         }
     }
@@ -23341,11 +23381,13 @@ mod tests {
                         end_reason,
                         background_workflows,
                         terminal,
+                        verification,
                     } => ThreadOperationOutcome::Completed {
                         status,
                         end_reason,
                         background_workflows,
                         terminal,
+                        verification,
                     },
                     crate::controller::ThreadTurnOutcome::ProviderSuspended {
                         suspension,
@@ -34488,6 +34530,7 @@ mod tests {
             end_reason: TurnEndReason::Unclassified,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             terminal: None,
+            verification: None,
         };
         let budget_stop = ThreadOperationOutcome::Completed {
             status: RunStatus::Failed,
@@ -34499,6 +34542,7 @@ mod tests {
                 checkpoint_id: "cp-1".to_string(),
                 resumable: true,
             }),
+            verification: None,
         };
         let cost = ThreadOperationOutcome::Completed {
             status: RunStatus::Failed,
@@ -34512,12 +34556,14 @@ mod tests {
                 checkpoint_id: String::new(),
                 resumable: false,
             }),
+            verification: None,
         };
         let failed = ThreadOperationOutcome::Completed {
             status: RunStatus::Failed,
             end_reason: TurnEndReason::Unclassified,
             background_workflows: RuntimeBackgroundWorkflows::from_vec(Vec::new()),
             terminal: None,
+            verification: None,
         };
 
         let disposition = |outcome: &ThreadOperationOutcome| match outcome {

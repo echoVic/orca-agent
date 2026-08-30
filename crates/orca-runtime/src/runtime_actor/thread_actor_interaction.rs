@@ -3694,6 +3694,9 @@ impl ThreadActor {
             },
             source_diagnostic_digest: None,
             settlement_receipts: Vec::new(),
+            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
+                "interaction terminal has no verifier proof",
+            ),
             committed_at: surface::UnixMillis::new(0),
         };
         let projection = prepare_main_session_task_terminal_projection(
@@ -3728,6 +3731,7 @@ impl ThreadActor {
         self.cache_surface_terminal(surface::OperationTerminalAtCursor {
             operation_id: operation.operation_id,
             terminal,
+            completion_proof: terminal_record.completion_proof.clone(),
             cursor: terminal_batch.cursor_after.clone(),
             commit_class: terminal_batch.commit_class.clone(),
             batch_digest: terminal_batch.batch_digest.clone(),
