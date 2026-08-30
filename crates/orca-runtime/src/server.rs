@@ -8105,6 +8105,11 @@ rl.on("line", (line) => {
                 .find(|event| event["event"] == "thread_started")
                 .and_then(|event| event["threadId"].as_str().map(ToString::to_string))
                 .expect("thread id");
+            let startup_warnings = state
+                .threads
+                .thread(&thread_id)
+                .map(|thread| thread.mcp_registry.errors().to_vec())
+                .unwrap_or_default();
 
             handle_line(
                 &server_config,
@@ -8121,8 +8126,8 @@ rl.on("line", (line) => {
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "MCP elicitation request; observed events: {:?}",
-                    parse_complete_jsonl(&writer.lock().expect("writer").clone())
+                    "MCP elicitation request; startup warnings: {startup_warnings:?}; observed events: {:?}",
+                    parse_complete_jsonl(&writer.lock().expect("writer").clone()),
                 )
             });
             let request_id = request["requestId"]
