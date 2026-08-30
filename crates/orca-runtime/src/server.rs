@@ -8077,11 +8077,13 @@ rl.on("line", (line) => {
             )
             .expect("write fake MCP server");
 
+            let node = orca_platform::shell::resolve_program("node")
+                .expect("node must be discoverable for the MCP fixture");
             let mut config = test_run_config();
             config.cwd = Some(home.to_path_buf());
             config.mcp_servers = vec![McpServerConfig {
                 name: "slow".to_string(),
-                command: Some("node".to_string()),
+                command: Some(node.display().to_string()),
                 args: vec![script.display().to_string()],
                 startup_timeout_ms: Some(10_000),
                 tool_timeout_ms: Some(5_000),
