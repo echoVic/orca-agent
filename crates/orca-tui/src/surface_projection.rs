@@ -1485,7 +1485,10 @@ pub(crate) fn workflow_task_summaries(
             let pending_tool_call = pending_tool_call_for_task(snapshot, task);
             BackgroundTaskSummary {
                 id: task.task_id.as_str().to_string(),
-                parent_task_id: None,
+                parent_task_id: task
+                    .parent_task_id
+                    .as_ref()
+                    .map(|parent| parent.as_str().to_string()),
                 task_type: task_type(task.task_type),
                 status: task_status(task.status),
                 is_backgrounded: task.backgrounded,
@@ -1572,7 +1575,7 @@ pub(crate) fn workflow_task_summaries(
                 error: task.error.as_ref().map(|value| value.as_str().to_string()),
                 retry_count: task.retry_count,
                 output_truncated: task.output_truncated,
-                publication_revision: None,
+                publication_revision: Some(task.revision.get()),
             }
         })
         .collect()
@@ -2348,6 +2351,65 @@ mod tests {
                 .iter()
                 .any(|item| item.id == task.task_id.as_str())
         );
+    }
+
+    #[test]
+    fn workflow_task_projection_preserves_parent_identity_and_revision() {
+        let mut snapshot = goal_projection_snapshot();
+        let parent_id = SurfaceTaskId::try_new("task-parent").unwrap();
+        let parent = SurfaceTask {
+            task_id: parent_id.clone(),
+            revision: TaskRevision::try_new(3).unwrap(),
+            task_type: SurfaceTaskType::Workflow,
+            status: orca_runtime::surface::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: DisplayText::new("parent task"),
+            created_at: UnixMillis::new(1_000),
+            started_at: Some(UnixMillis::new(1_000)),
+            completed_at: None,
+            parent_operation: None,
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        };
+        let child = SurfaceTask {
+            task_id: SurfaceTaskId::try_new("task-child").unwrap(),
+            revision: TaskRevision::try_new(7).unwrap(),
+            task_type: SurfaceTaskType::Subagent,
+            status: orca_runtime::surface::SurfaceTaskStatus::Running,
+            backgrounded: true,
+            description: DisplayText::new("child task"),
+            created_at: UnixMillis::new(1_001),
+            started_at: Some(UnixMillis::new(1_001)),
+            completed_at: None,
+            parent_operation: None,
+            parent_task_id: Some(parent_id),
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        };
+        snapshot.tasks = vec![parent, child];
+
+        let task = workflow_task_summaries(&snapshot)
+            .into_iter()
+            .find(|task| task.id == "task-child")
+            .expect("child task projection");
+
+        assert_eq!(task.parent_task_id.as_deref(), Some("task-parent"));
+        assert_eq!(task.publication_revision, Some(7));
     }
 
     #[test]
