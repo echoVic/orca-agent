@@ -6,6 +6,7 @@ use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 use crate::background_tasks::is_terminal_task_status;
 use crate::protocol::UserAction;
 use crate::types::{AppState, PanelMode};
+use crate::workflow_panel::TaskTreeKeyResult;
 
 pub(crate) fn handle_workflows_panel_key(
     key_code: KeyCode,
@@ -25,7 +26,23 @@ pub(crate) fn handle_workflows_panel_key(
             state.select_next_workflow_task();
             true
         }
-        KeyCode::Enter => state.open_selected_background_approval_dialog(),
+        KeyCode::Enter => {
+            if state.open_selected_background_approval_dialog() {
+                return true;
+            }
+            match state.handle_workflow_tree_key(key_code) {
+                TaskTreeKeyResult::OpenTranscript(request) => {
+                    let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
+                    true
+                }
+                TaskTreeKeyResult::Handled => true,
+                TaskTreeKeyResult::Unhandled => false,
+            }
+        }
+        KeyCode::Left | KeyCode::Right => !matches!(
+            state.handle_workflow_tree_key(key_code),
+            TaskTreeKeyResult::Unhandled
+        ),
         KeyCode::Char('s') => {
             let Some(task) = selected_stoppable_task(state) else {
                 return false;

@@ -1485,6 +1485,7 @@ pub(crate) fn workflow_task_summaries(
             let pending_tool_call = pending_tool_call_for_task(snapshot, task);
             BackgroundTaskSummary {
                 id: task.task_id.as_str().to_string(),
+                parent_task_id: None,
                 task_type: task_type(task.task_type),
                 status: task_status(task.status),
                 is_backgrounded: task.backgrounded,

@@ -848,6 +848,7 @@ mod tests {
     fn task_summary_json_marks_backgrounded_main_sessions() {
         let task = BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::ApprovalRequired,
             is_backgrounded: true,

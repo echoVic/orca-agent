@@ -320,6 +320,14 @@ pub struct TuiTaskLifecycle {
     pub turn: u32,
 }
 
+/// A read-only child transcript lookup. The runtime validates the task's
+/// current publication revision before returning any transcript content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTranscriptRequest {
+    pub task_id: String,
+    pub expected_revision: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum UserAction {
     StartSideConversation {
@@ -403,6 +411,7 @@ pub enum UserAction {
     ForegroundTask {
         task_id: String,
     },
+    ReadTaskTranscript(TaskTranscriptRequest),
     RespondToInteraction {
         key: TuiInteractionKey,
         response: TuiInteractionResponse,

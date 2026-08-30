@@ -1564,6 +1564,7 @@ mod tests {
         let mut f = EventFactory::new("run-1".to_string());
         let task = BackgroundTaskSummary {
             id: "task-1".to_string(),
+            parent_task_id: None,
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
             is_backgrounded: false,
@@ -1624,6 +1625,7 @@ mod tests {
         let mut f = EventFactory::new("run-1".to_string());
         let task = BackgroundTaskSummary {
             id: "main-session-1".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::ApprovalRequired,
             is_backgrounded: true,

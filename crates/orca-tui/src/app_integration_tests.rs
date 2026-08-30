@@ -60,6 +60,7 @@ use crate::composer_textarea::{
 use crate::idle_submit_actions::handle_idle_submit;
 use crate::key_event_actions::handle_transcript_search_key;
 use crate::protocol::PendingTuiInput;
+use crate::protocol::TaskTranscriptRequest;
 use crate::protocol::{TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
 use crate::selection::{SelectionGranularity, SelectionPos, TranscriptSelection};
 use crate::slash_command_actions::handle_slash_command;
@@ -1510,6 +1511,7 @@ fn matching_task_update(
 fn workflow_task(id: &str, name: &str) -> orca_core::task_types::BackgroundTaskSummary {
     orca_core::task_types::BackgroundTaskSummary {
         id: id.to_string(),
+        parent_task_id: None,
         task_type: orca_core::task_types::TaskType::Workflow,
         status: orca_core::task_types::TaskStatus::Running,
         is_backgrounded: false,
@@ -1866,6 +1868,64 @@ fn workflows_panel_enter_opens_selected_background_approval() {
     let dialog = state.approval_dialog.as_ref().expect("approval dialog");
     assert_eq!(dialog.background_task_id.as_deref(), Some("task-approval"));
     assert_eq!(state.status, AppStatus::WaitingApproval);
+}
+
+#[test]
+fn workflows_panel_enter_requests_child_transcript_by_task_and_revision() {
+    let (mut state, rx) = test_state();
+    let mut task = workflow_task("task-child", "child agent");
+    task.task_type = orca_core::task_types::TaskType::Subagent;
+    task.publication_revision = Some(42);
+    state.show_workflows();
+    state.replace_workflow_tasks_for_test(vec![task]);
+
+    let action_tx = state.event_tx.clone();
+    assert!(handle_workflows_panel_key(
+        KeyCode::Enter,
+        &mut state,
+        &action_tx
+    ));
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(UserAction::ReadTaskTranscript(TaskTranscriptRequest {
+            task_id,
+            expected_revision: Some(42),
+        })) if task_id == "task-child"
+    ));
+}
+
+#[test]
+fn workflows_panel_enter_prioritizes_child_approval_over_transcript() {
+    let (mut state, rx) = test_state();
+    let mut task = workflow_task("task-child", "child agent");
+    task.task_type = orca_core::task_types::TaskType::Subagent;
+    task.publication_revision = Some(42);
+    task.status = orca_core::task_types::TaskStatus::ApprovalRequired;
+    task.pending_tool_call = Some(orca_core::task_types::PendingToolCallSummary {
+        id: "child-tool-1".to_string(),
+        name: "bash".to_string(),
+        action: orca_core::approval_types::ActionKind::Shell,
+        target: None,
+        arguments: "cargo test".to_string(),
+    });
+    state.show_workflows();
+    state.replace_workflow_tasks_for_test(vec![task]);
+
+    let action_tx = state.event_tx.clone();
+    assert!(handle_workflows_panel_key(
+        KeyCode::Enter,
+        &mut state,
+        &action_tx
+    ));
+
+    let dialog = state.approval_dialog.as_ref().expect("approval dialog");
+    assert_eq!(dialog.background_task_id.as_deref(), Some("task-child"));
+    assert_eq!(state.status, AppStatus::WaitingApproval);
+    assert!(
+        rx.try_recv().is_err(),
+        "approval must win over transcript read"
+    );
 }
 
 #[test]

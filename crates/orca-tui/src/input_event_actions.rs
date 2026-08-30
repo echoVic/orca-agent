@@ -1379,6 +1379,7 @@ mod tests {
     fn test_workflow_task(id: &str) -> orca_core::task_types::BackgroundTaskSummary {
         orca_core::task_types::BackgroundTaskSummary {
             id: id.to_string(),
+            parent_task_id: None,
             task_type: orca_core::task_types::TaskType::Workflow,
             status: orca_core::task_types::TaskStatus::Running,
             is_backgrounded: false,

@@ -3470,6 +3470,7 @@ fn spawn_worker_reaper(
 fn task_summary(record: &TaskRecord) -> BackgroundTaskSummary {
     BackgroundTaskSummary {
         id: record.id.clone(),
+        parent_task_id: record.parent_task_id.clone(),
         task_type: record.task_type,
         status: record.status,
         is_backgrounded: record.is_backgrounded,

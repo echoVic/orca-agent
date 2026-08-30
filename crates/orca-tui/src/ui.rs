@@ -1196,9 +1196,9 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     frame.render_widget(block, area);
 
     let selected_index = state.workflow_selected_index();
-    let tasks = state.workflow_tasks().iter().collect::<Vec<_>>();
+    let task_rows = state.workflow_visible_tasks();
 
-    if tasks.is_empty() {
+    if task_rows.is_empty() {
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -1216,7 +1216,8 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     let header_h: u16 = 1;
     let row_h: u16 = 2;
     let mut constraints = vec![Constraint::Length(hint_h), Constraint::Length(header_h)];
-    constraints.extend(tasks.iter().enumerate().map(|(index, task)| {
+    constraints.extend(task_rows.iter().enumerate().map(|(index, row)| {
+        let task = row.task;
         let detail_rows = if index == selected_index {
             workflow_metadata_row_count(task)
                 + workflow_phase_detail_rows(task).len() as u16
@@ -1243,10 +1244,17 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     ]));
     frame.render_widget(header, rows[1]);
 
-    for (index, task) in tasks.iter().enumerate() {
+    for (index, row) in task_rows.iter().enumerate() {
+        let task = row.task;
         let row_area = rows[index + 2];
         let selected = index == selected_index;
         let marker = if selected { ">" } else { " " };
+        let tree_indent = "  ".repeat(row.depth);
+        let tree_marker = match (row.has_children, row.expanded) {
+            (true, true) => "v ",
+            (true, false) => "> ",
+            (false, _) => "  ",
+        };
         let name = task.name.as_deref().unwrap_or(task.description.as_str());
         let task_type = task_type_label(task);
         let status = task_status_label(task.status);
@@ -1274,17 +1282,17 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
                     .iter()
                     .map(|_| Constraint::Length(1)),
             );
-            for agent in &task.workflow_agents {
+            for _agent in &task.workflow_agents {
                 row_constraints.push(Constraint::Length(1));
-                if agent.transcript_path.is_some() {
-                    row_constraints.push(Constraint::Length(1));
-                }
             }
         }
         let parts = Layout::vertical(row_constraints).split(row_area);
 
         let label = Paragraph::new(Line::from(vec![
-            Span::styled(format!("{marker} {name}"), name_style),
+            Span::styled(
+                format!("{marker} {tree_indent}{tree_marker}{name}"),
+                name_style,
+            ),
             Span::styled("  ", Style::default()),
             Span::styled(task_type, Style::default().fg(theme.muted)),
             Span::styled("  ", Style::default()),
@@ -1322,11 +1330,6 @@ fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
                 let line = Paragraph::new(agent_row_label(agent, theme));
                 frame.render_widget(line, parts[agent_row_index]);
                 agent_row_index += 1;
-                if let Some(path) = agent.transcript_path.as_deref() {
-                    let line = Paragraph::new(agent_transcript_row_label(path, theme));
-                    frame.render_widget(line, parts[agent_row_index]);
-                    agent_row_index += 1;
-                }
             }
         }
     }
@@ -1336,10 +1339,18 @@ fn workflow_panel_action_hint<'a>(
     selected_task: Option<&BackgroundTaskSummary>,
     theme: &Theme,
 ) -> Line<'a> {
-    let mut spans = vec![Span::styled(" ↑↓ select", Style::default().fg(theme.muted))];
+    let mut spans = vec![Span::styled(
+        " ↑↓ select · ← collapse · → expand",
+        Style::default().fg(theme.muted),
+    )];
     if selected_task.is_some_and(is_approval_actionable_task) {
         spans.push(Span::styled(
             " · Enter approve",
+            Style::default().fg(theme.muted),
+        ));
+    } else if selected_task.is_some_and(|task| task.task_type == TaskType::Subagent) {
+        spans.push(Span::styled(
+            " · Enter transcript",
             Style::default().fg(theme.muted),
         ));
     }
@@ -1360,10 +1371,7 @@ fn workflow_panel_action_hint<'a>(
 }
 
 fn is_approval_actionable_task(task: &BackgroundTaskSummary) -> bool {
-    task.task_type == TaskType::MainSession
-        && task.status == TaskStatus::ApprovalRequired
-        && task.is_backgrounded
-        && task.pending_tool_call.is_some()
+    task.status == TaskStatus::ApprovalRequired && task.pending_tool_call.is_some()
 }
 
 fn is_stoppable_task(task: &BackgroundTaskSummary) -> bool {
@@ -1471,10 +1479,7 @@ fn workflow_metadata_row_count(task: &BackgroundTaskSummary) -> u16 {
 }
 
 fn workflow_agent_row_count(task: &BackgroundTaskSummary) -> u16 {
-    task.workflow_agents
-        .iter()
-        .map(|agent| 1 + u16::from(agent.transcript_path.is_some()))
-        .sum()
+    task.workflow_agents.len().min(u16::MAX as usize) as u16
 }
 
 fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Vec<Line<'a>> {
@@ -1762,13 +1767,6 @@ fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<
         Span::styled(elapsed, Style::default().fg(theme.muted)),
         Span::styled(usage, Style::default().fg(theme.muted)),
         Span::styled(detail, Style::default().fg(theme.error)),
-    ])
-}
-
-fn agent_transcript_row_label<'a>(path: &str, theme: &Theme) -> Line<'a> {
-    Line::from(vec![
-        Span::styled("      full result ", Style::default().fg(theme.muted)),
-        Span::styled(path.to_string(), Style::default().fg(theme.text)),
     ])
 }
 
@@ -7691,6 +7689,7 @@ mod tests {
     fn workflow_progress_label_summarizes_agents_and_phases() {
         let task = BackgroundTaskSummary {
             id: "task-1".to_string(),
+            parent_task_id: None,
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
             is_backgrounded: false,
@@ -7745,6 +7744,7 @@ mod tests {
         state.panel_mode = PanelMode::Workflows;
         state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-subagent".to_string(),
+            parent_task_id: None,
             task_type: TaskType::Subagent,
             status: TaskStatus::Running,
             is_backgrounded: false,
@@ -7820,6 +7820,7 @@ mod tests {
         state.panel_mode = PanelMode::Workflows;
         state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-workflow".to_string(),
+            parent_task_id: None,
             task_type: TaskType::Workflow,
             status: TaskStatus::Completed,
             is_backgrounded: false,
@@ -7905,8 +7906,7 @@ mod tests {
         assert!(rendered.contains("elapsed 2s"));
         assert!(rendered.contains("150 tok"));
         assert!(rendered.contains("$0.000025"));
-        assert!(rendered.contains("full result"));
-        assert!(rendered.contains("/tmp/agent-1.json"));
+        assert!(!rendered.contains("/tmp/agent-1.json"));
         assert!(rendered.contains("run workflow-run-1"));
         assert!(
             rendered
@@ -7960,6 +7960,7 @@ mod tests {
     fn workflow_panel_labels_main_session_tasks() {
         let task = BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Completed,
             is_backgrounded: false,
@@ -8002,6 +8003,7 @@ mod tests {
     fn workflow_panel_labels_backgrounded_main_session_tasks() {
         let task = BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Running,
             is_backgrounded: true,
@@ -8043,6 +8045,7 @@ mod tests {
     fn workflow_panel_labels_backgrounded_approval_tool() {
         let task = BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::ApprovalRequired,
             is_backgrounded: true,
@@ -8089,6 +8092,7 @@ mod tests {
         state.panel_mode = PanelMode::Workflows;
         state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Failed,
             is_backgrounded: true,
@@ -8142,6 +8146,7 @@ mod tests {
         state.panel_mode = PanelMode::Workflows;
         state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Failed,
             is_backgrounded: true,
@@ -8196,6 +8201,7 @@ mod tests {
     fn workflow_metadata_row_count_counts_bounded_task_detail_rows() {
         let task = BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Completed,
             is_backgrounded: true,
@@ -8239,6 +8245,7 @@ mod tests {
         state.panel_mode = PanelMode::Workflows;
         state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Completed,
             is_backgrounded: true,
@@ -8287,11 +8294,58 @@ mod tests {
     }
 
     #[test]
+    fn workflows_panel_renders_expanded_child_tasks_with_tree_indentation() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Workflows;
+        let mut parent = workflow_task_for_agent_dashboard(
+            "parent",
+            "parent-agent",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        parent.name = Some("Parent task".to_string());
+        parent.workflow_agents.clear();
+        let mut child = workflow_task_for_agent_dashboard(
+            "child",
+            "child-agent",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        child.task_type = TaskType::Subagent;
+        child.parent_task_id = Some(parent.id.clone());
+        child.name = Some("Child task".to_string());
+        child.workflow_agents.clear();
+        state.replace_workflow_tasks_for_test(vec![parent, child]);
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw collapsed tree");
+        let collapsed = format!("{:?}", terminal.backend().buffer());
+        assert!(collapsed.contains("Parent task"));
+        assert!(!collapsed.contains("Child task"));
+
+        assert!(matches!(
+            state.handle_workflow_tree_key(crossterm::event::KeyCode::Right),
+            crate::workflow_panel::TaskTreeKeyResult::Handled
+        ));
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw expanded tree");
+        let expanded = format!("{:?}", terminal.backend().buffer());
+        assert!(expanded.contains("v Parent task"));
+        assert!(expanded.contains("  Child task"));
+    }
+
+    #[test]
     fn workflows_panel_renders_contextual_action_hints_for_selected_task() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Workflows;
         state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Running,
             is_backgrounded: true,
@@ -8358,6 +8412,7 @@ mod tests {
         state.panel_mode = PanelMode::Workflows;
         state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-main".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::Running,
             is_backgrounded: true,
@@ -8410,6 +8465,7 @@ mod tests {
         state.panel_mode = PanelMode::Workflows;
         state.replace_workflow_tasks_for_test(vec![BackgroundTaskSummary {
             id: "task-approval".to_string(),
+            parent_task_id: None,
             task_type: TaskType::MainSession,
             status: TaskStatus::ApprovalRequired,
             is_backgrounded: true,
@@ -8470,6 +8526,7 @@ mod tests {
     ) -> BackgroundTaskSummary {
         BackgroundTaskSummary {
             id: format!("task-{workflow_name}"),
+            parent_task_id: None,
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
             is_backgrounded: false,

@@ -528,6 +528,11 @@ pub(crate) fn hosted_tui_controller_loop(
                     &event_tx,
                 );
             }
+            // The runtime surface owns the eventual transcript reader. Keep
+            // this request typed across the TUI command boundary so the
+            // reader can validate task identity and publication revision;
+            // the current hosted controller has no filesystem fallback.
+            Ok(UserAction::ReadTaskTranscript(_)) => {}
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
                 handle_hosted_task_action(
                     HostedTaskAction::ResolveBackgroundApproval { id, approved },

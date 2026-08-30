@@ -23,6 +23,7 @@ use crate::slash_command_actions::{SlashOutcome, handle_composer_slash_command};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus, PanelMode};
 use crate::vim::VimState;
+use crate::workflow_panel_actions::handle_workflows_panel_key;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,6 +185,12 @@ pub(crate) fn handle_running_key(
     theme: &Theme,
 ) -> bool {
     if state.show_shortcuts {
+        return true;
+    }
+    if state.panel_mode == PanelMode::Workflows
+        && handle_workflows_panel_key(key.code, state, action_tx)
+    {
+        vim_state.cancel_pending_command();
         return true;
     }
     if state.panel_mode == PanelMode::Conversation

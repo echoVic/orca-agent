@@ -375,6 +375,7 @@ fn session(id: &str, title: &str) -> SessionSummary {
 fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
     BackgroundTaskSummary {
         id: id.to_string(),
+        parent_task_id: None,
         task_type: TaskType::Workflow,
         status: TaskStatus::Running,
         is_backgrounded: false,
@@ -2303,6 +2304,7 @@ fn show_workflows_preserves_available_selection() {
     state.replace_workflow_tasks_for_test(vec![
         BackgroundTaskSummary {
             id: "task-1".to_string(),
+            parent_task_id: None,
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
             is_backgrounded: false,
@@ -2434,6 +2436,7 @@ fn workflow_events_update_panel_and_queue_model_notification() {
     let mut state = state();
     state.apply_workflow_tasks_for_test(vec![BackgroundTaskSummary {
         id: "task-1".to_string(),
+        parent_task_id: None,
         task_type: TaskType::Workflow,
         status: TaskStatus::Completed,
         is_backgrounded: false,
@@ -2741,6 +2744,7 @@ fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
     let mut state = state();
     state.apply_workflow_tasks_for_test(vec![BackgroundTaskSummary {
         id: "task-main".to_string(),
+        parent_task_id: None,
         task_type: TaskType::MainSession,
         status: TaskStatus::Running,
         is_backgrounded: true,
@@ -2859,6 +2863,7 @@ fn backgrounded_main_session_completion_adds_system_notice() {
     let mut state = state();
     state.apply_workflow_tasks_for_test(vec![BackgroundTaskSummary {
         id: "task-main".to_string(),
+        parent_task_id: None,
         task_type: TaskType::MainSession,
         status: TaskStatus::Running,
         is_backgrounded: true,

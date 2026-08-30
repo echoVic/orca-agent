@@ -106,6 +106,9 @@ pub struct PendingToolCallSummary {
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundTaskSummary {
     pub id: String,
+    /// Stable parent identity used by projected task trees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     #[serde(rename = "type")]
     pub task_type: TaskType,
     pub status: TaskStatus,
