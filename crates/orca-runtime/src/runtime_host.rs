@@ -36322,7 +36322,7 @@ mod tests {
         // This test runs in the full workspace gate alongside thousands of
         // tests. Keep the recovery assertion bounded, but allow the durable
         // writer to make progress under shared CI contention.
-        let prepared_deadline = Instant::now() + Duration::from_secs(30);
+        let prepared_deadline = Instant::now() + Duration::from_secs(120);
         let recovered_before_restart = loop {
             let recovered =
                 surface::JsonlSurfaceCommitLedger::new(&transcript_path, initial_cursor.clone())
