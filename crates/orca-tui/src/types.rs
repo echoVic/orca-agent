@@ -17,6 +17,7 @@ use orca_core::proposed_plan::ProposedPlanStreamParser;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_file_search::{SearchPhase, SearchProgress};
 use orca_runtime::history::SessionSummary;
+use orca_runtime::onboarding::FirstRunState;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 #[cfg(test)]
@@ -392,6 +393,10 @@ pub struct AppState {
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
     pub setup_step: u8,
+    /// Runtime-owned first-run disclosure state. The TUI may render and
+    /// acknowledge it, but never mutates folder trust as a side effect.
+    pub(crate) first_run: Option<FirstRunState>,
+    pub(crate) first_run_error: Option<String>,
     pub show_shortcuts: bool,
     pub input_history: Vec<String>,
     pub(crate) pending_pastes: Vec<(String, String)>,
@@ -571,6 +576,8 @@ impl AppState {
             interaction: InteractionState::default(),
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
+            first_run: None,
+            first_run_error: None,
             show_shortcuts: false,
             input_history: load_input_history(),
             pending_pastes: Vec::new(),

@@ -4318,48 +4318,86 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
 
     match state.setup_step {
         0 => {
-            let width = 60u16.min(area.width.saturating_sub(4));
-            let height = 16u16.min(area.height.saturating_sub(2));
+            let width = 78u16.min(area.width.saturating_sub(4));
+            let height = 18u16.min(area.height.saturating_sub(2));
             let popup_area = centered_rect(area, width, height);
-
-            let content = vec![
+            let mut content = vec![Line::from(Span::styled(
+                "  Before the first run, review this workspace security boundary.",
+                Style::default().fg(Color::White),
+            ))];
+            if let Some(first_run) = &state.first_run {
+                content.extend([
+                    Line::from(Span::styled(
+                        format!("  Workspace: {}", first_run.workspace.display()),
+                        Style::default().fg(Color::Cyan),
+                    )),
+                    Line::from(Span::styled(
+                        format!("  Auth file: {}", first_run.auth_path.display()),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "  Folder trust: {}",
+                            if first_run.workspace_trusted {
+                                "trusted"
+                            } else {
+                                "untrusted"
+                            }
+                        ),
+                        Style::default().fg(if first_run.workspace_trusted {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        }),
+                    )),
+                    Line::from(Span::styled(
+                        "  Generated tools remain sandboxed and may request explicit access.",
+                        Style::default().fg(Color::White),
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "  Local doctor checks: {} pass, {} warn, {} fail",
+                            first_run
+                                .diagnostics
+                                .checks
+                                .iter()
+                                .filter(|check| {
+                                    check.status == orca_runtime::diagnostics::DiagnosticStatus::Pass
+                                })
+                                .count(),
+                            first_run
+                                .diagnostics
+                                .checks
+                                .iter()
+                                .filter(|check| {
+                                    check.status == orca_runtime::diagnostics::DiagnosticStatus::Warn
+                                })
+                                .count(),
+                            first_run
+                                .diagnostics
+                                .checks
+                                .iter()
+                                .filter(|check| {
+                                    check.status == orca_runtime::diagnostics::DiagnosticStatus::Fail
+                                })
+                                .count(),
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ]);
+            } else if let Some(error) = &state.first_run_error {
+                content.push(Line::from(Span::styled(
+                    format!("  Cannot inspect security state: {error}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            content.extend([
                 Line::from(""),
                 Line::from(Span::styled(
-                    "   ___                ",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled(
-                    "  / _ \\ _ __ ___ __ _ ",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled(
-                    " | | | | '__/ __/ _` |",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled(
-                    " | |_| | | | (_| (_| |",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled(
-                    "  \\___/|_|  \\___\\__,_|",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  A DeepSeek-native coding agent",
-                    Style::default().fg(Color::White),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Let's get you set up!",
-                    Style::default().fg(Color::Green),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Press Enter to continue...",
+                    "  Press Enter to acknowledge and continue; Esc to exit.",
                     Style::default().fg(Color::DarkGray),
                 )),
-            ];
+            ]);
 
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -4367,7 +4405,9 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                 .title(" Welcome ")
                 .border_style(Style::default().fg(Color::Cyan));
 
-            let paragraph = Paragraph::new(content).block(block);
+            let paragraph = Paragraph::new(content)
+                .wrap(Wrap { trim: false })
+                .block(block);
             frame.render_widget(paragraph, popup_area);
         }
         1 => {
@@ -4422,6 +4462,11 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
             let height = 12u16.min(area.height.saturating_sub(2));
             let popup_area = centered_rect(area, width, height);
 
+            let auth_path = state
+                .first_run
+                .as_ref()
+                .map(|first_run| first_run.auth_path.display().to_string())
+                .unwrap_or_else(|| "~/.orca/auth.json".to_string());
             let content = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -4432,7 +4477,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Saved to: ~/.orca/auth.json",
+                    format!("  Saved to: {auth_path}"),
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(""),

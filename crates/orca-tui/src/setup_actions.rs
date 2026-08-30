@@ -6,6 +6,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_textarea::{Input, TextArea};
 
 use orca_core::config::RunConfig;
+use orca_runtime::onboarding::acknowledge_first_run_in;
 
 use crate::composer_textarea::{make_setup_textarea, make_textarea};
 use crate::protocol::UserAction;
@@ -36,8 +37,30 @@ pub(crate) fn handle_setup_key(
     match state.setup_step {
         0 => match key.code {
             KeyCode::Enter => {
-                state.setup_step = 1;
-                *textarea = make_setup_textarea(theme);
+                let Some(first_run) = state.first_run.as_mut() else {
+                    state.push_message(ChatMessage::Error(
+                        state
+                            .first_run_error
+                            .clone()
+                            .unwrap_or_else(|| "cannot inspect first-run security state".into()),
+                    ));
+                    return Ok(SetupFlow::Continue);
+                };
+                if !first_run.acknowledged {
+                    if let Err(error) = acknowledge_first_run_in(first_run) {
+                        state.push_message(ChatMessage::Error(format!(
+                            "failed to record security disclosure: {error}"
+                        )));
+                        return Ok(SetupFlow::Continue);
+                    }
+                    first_run.acknowledged = true;
+                }
+                if config.api_key.is_none() {
+                    state.setup_step = 1;
+                    *textarea = make_setup_textarea(theme);
+                } else {
+                    state.setup_step = 2;
+                }
             }
             KeyCode::Esc => {
                 return Ok(SetupFlow::Exit(0));

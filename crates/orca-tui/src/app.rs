@@ -15,6 +15,7 @@ use orca_core::config::{HistoryMode, RunConfig};
 #[cfg(test)]
 use orca_core::conversation::Message;
 use orca_runtime::history;
+use orca_runtime::onboarding;
 #[cfg(test)]
 use orca_runtime::runtime_host::HostedOperationKind;
 #[cfg(test)]
@@ -161,7 +162,17 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
 
     let model_name = config.model.display_name().to_string();
 
-    let needs_setup = config.api_key.is_none();
+    // A credential is not proof that the user has seen the workspace and
+    // sandbox disclosure. Inspect the same policy-bound record used by the
+    // runtime; an inspection failure stays fail-closed in the setup screen.
+    let first_run_result = onboarding::inspect_first_run(&config);
+    let first_run = first_run_result.as_ref().ok().cloned();
+    let first_run_error = first_run_result.err().map(|error| error.to_string());
+    let needs_disclosure = first_run_error.is_some()
+        || first_run
+            .as_ref()
+            .is_none_or(|state| !state.acknowledged);
+    let needs_setup = config.api_key.is_none() || needs_disclosure;
     let should_show_picker = config.show_session_picker
         && !needs_setup
         && config.prompt.trim().is_empty()
@@ -190,6 +201,8 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     state.workspace_git = workspace_status.git;
     state.approval_mode = config.approval_mode;
     state.reasoning_effort = config.reasoning_effort;
+    state.first_run = first_run;
+    state.first_run_error = first_run_error;
     if let Some(page) = picker_page
         && !page.sessions.is_empty()
     {
@@ -201,7 +214,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
 
     if needs_setup {
         state.status = AppStatus::Setup;
-        state.setup_step = 0;
+        state.setup_step = if needs_disclosure { 0 } else { 1 };
     }
 
     let initial_prompt = if config.prompt.trim().is_empty() {
@@ -256,7 +269,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
 
     let mut vim_state =
         VimState::with_insert_escape(config.vim_mode, config.vim_insert_escape.clone());
-    let mut textarea = if needs_setup {
+    let mut textarea = if needs_setup && state.setup_step == 1 {
         make_setup_textarea(pending_terminal_session.theme())
     } else {
         if let Some(prompt) = initial_prompt.clone()
