@@ -1,258 +1,42 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # 模型
 
+交互式或无头运行通过 --model 选择提供商模型：
 
-Orca 支持 DeepSeek V4 文本模型和实验性的 V4 Flash Vision 模型。本页涵盖模型选择、多模态输入、推理强度和成本权衡。
+~~~bash
+orca --model deepseek-v4-pro "解释当前架构"
+orca exec --model deepseek-v4-flash "修复导入顺序" \
+  --verifier "cargo fmt --check"
+~~~
 
-## 可用模型
+支持哪些模型名和 endpoint 行为取决于所选提供商。示例模型名不代表每个 endpoint 都支持它。启动任务前运行 orca doctor，检查本地实际生效的模型和 endpoint 配置。
 
-### 模型对比表
+## 持久化选择
 
-| 属性 | deepseek-v4-flash | deepseek-v4-flash-vision-exp | deepseek-v4-pro |
-|------|-------------------|--------------------------------|-----------------|
-| **主要用例** | 快速编辑和常规编码 | 截图、图表、流程图和视觉智能体任务 | 架构设计和复杂调试 |
-| **图片输入** | 视觉预处理 | 直接输入 | 视觉预处理 |
-| **上下文窗口** | 1M tokens | 1M tokens | 1M tokens |
-| **最大输出 tokens** | 384K | 384K | 384K |
-| **推理** | 支持 | 支持 | 支持 |
-| **工具使用** | 支持 | 支持 | 支持 |
-| **高峰输入/输出价格** | 3 / 9 元每百万 tokens | 3 / 9 元每百万 tokens | 9 / 27 元每百万 tokens |
+可以在用户配置或环境变量中设置模型：
 
-<Callout type="info">
+~~~toml
+model = "deepseek-v4-pro"
+reasoning_effort = "high"
+~~~
 
-`deepseek-v4-flash-vision-exp` 是 2026 年 8 月 21 日发布的实验模型。详见
-DeepSeek 官方[图像理解指南](https://api-docs.deepseek.com/zh-cn/guides/vision)
-和[价格说明](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)。
+~~~bash
+export ORCA_MODEL="deepseek-v4-pro"
+export ORCA_REASONING_EFFORT="high"
+~~~
 
-</Callout>
+推理强度支持 low、high 和 max。应通过配置或交互式模型设置它；公开 CLI 不提供单次运行的此类控制。
 
-### 何时使用每个模型
+## 基于证据选择
 
+先使用工作区配置的模型。只有任务确实需要不同能力、延迟或成本特征时才切换，并记录验证器结果。执行预算与模型选择是独立的：
 
-<Tabs>
-<Tab label={"deepseek-v4-flash（默认）"}>
+~~~bash
+orca exec \
+  --model deepseek-v4-flash \
+  --max-turns 15 \
+  --max-cost-usd 2 \
+  --verifier "cargo test -p parser" \
+  "重构解析器"
+~~~
 
-
-在以下情况选择 `deepseek-v4-flash`：
-
-- **编辑现有代码**——跨 1–5 个文件的中小型更改
-- **搜索和理解**——查找函数、追踪调用路径、解释代码
-- **运行测试和修复**——快速迭代的测试驱动开发
-- **批量重构**——在许多文件上应用一致的模式
-- **脚本和自动化**——CI 管道中的 `orca exec`
-- **快速原型设计**——搭建组件、编写样板代码
-
-```bash
-# 默认行为——flash 模型
-orca "给仪表板添加加载动画"
-
-# 显式使用 flash
-orca --model deepseek-v4-flash "修复所有文件中的导入顺序"
-
-# 带 flash 的无头模式
-orca exec "给 React 组件添加错误边界" --model deepseek-v4-flash
-```
-
-
-</Tab>
-<Tab label={"deepseek-v4-flash-vision-exp"}>
-
-
-当任务依赖视觉输入时，选择 `deepseek-v4-flash-vision-exp`：
-
-- 检查 UI 截图和错误对话框
-- 读取流程图、图表或扫描文档
-- 将渲染结果与视觉参考进行比较
-- 把图片理解与 Orca 的常规编码工具结合使用
-
-TUI 在所有模型选择下都接受 JPEG、PNG、GIF 和 WebP 图片。视觉模型直接
-接收图片；`auto`、Pro 和 Flash 会先调用视觉模型生成与当前任务相关的图片
-分析，再由所选编码模型继续处理。
-
-- 按 `Ctrl+V` 读取当前系统剪贴板图片。Windows 还支持 `Alt+V`；如果终端
-  会把 `Super+V` 转发给应用而不是自行消费快捷键，也可以使用 `Cmd+V`。
-- 将图片文件拖入终端，或粘贴本地图片路径和 `file://` URL。
-- 通过普通 `@file` 选择器选择图片。
-
-附件在输入框中显示为原子的 `[Image #N]`。Backspace 或 Delete 会删除整个
-附件，`Ctrl+U` 会清空草稿及附件。仅图片消息、运行中的排队消息、队列编辑
-和提交失败恢复都会保留图片数据。剪贴板解码在后台执行；若读取完成前按
-Enter，Orca 会等待图片就绪后再提交。没有图形剪贴板的 SSH 会话应粘贴或
-提及远端主机上的图片路径；WSL 会在可用时读取 Windows 剪贴板。光标位于
-图片附件时按 Enter 可打开预览，消息区中的图片也可点击查看；查看器支持
-`+`/`-` 缩放、方向键平移、`0` 恢复适配和 Esc 关闭。
-Kitty 和 Ghostty 通过 Kitty Graphics 协议显示原生像素；iTerm2 和 WezTerm
-使用 inline-image 协议。不支持图片协议的终端（包括 Apple Terminal）会降级为
-低分辨率真彩色字符预览。
-
-ACP 客户端可以发送标准图片内容块。Orca 支持内联 base64 图片和公开的
-HTTP(S) 图片 URL，持久化可回放图片输入，并默认使用 `high` 细节级别。
-本地内联附件限制为 5 MiB，以确保完整请求始终位于 Orca 的持久化原子提交边界内。
-
-</Tab>
-<Tab label={"deepseek-v4-pro"}>
-
-
-在以下情况选择 `deepseek-v4-pro`：
-
-- **架构设计**——设计系统、选择模式、规划迁移
-- **复杂调试**——跨许多文件的多步骤根因分析
-- **遗留代码理解**——导航具有深度依赖的不熟悉代码库
-- **性能优化**——识别瓶颈并提出优化方案
-- **安全审计**——使用深度推理分析代码漏洞
-- **多文件重构**——组织具有许多依赖变更的项目结构
-- **测试生成**——编写具有边界情况覆盖的综合测试套件
-- **入门指导**——理解新代码库并生成文档
-
-```bash
-# 用于复杂调试的 pro 模型
-orca --model deepseek-v4-pro "调试 WebSocket 重连逻辑中的竞态条件"
-
-# 用于架构的 pro 模型
-orca --model deepseek-v4-pro "设计从 REST 到 GraphQL 的迁移策略"
-
-#  pro + 高推理努力
-orca --model deepseek-v4-pro --reasoning-effort high "重构整个数据层以支持多租户"
-```
-
-
-</Tab>
-</Tabs>
-
-### 决策树
-
-```
-任务是否为：
-├── 需要理解图片？
-│   ├── auto / Pro / Flash → 视觉预处理后交给所选模型
-│   └── deepseek-v4-flash-vision-exp → 直接输入图片
-├── 简单/机械性？（搜索、编辑、格式化）
-│   └── deepseek-v4-flash
-├── 中等复杂度？（多文件变更、测试编写）
-│   ├── < 10 个文件 → deepseek-v4-flash
-│   └── > 10 个文件 → deepseek-v4-pro
-├── 复杂/创造性？（架构、调试、设计）
-│   └── deepseek-v4-pro
-└── 不确定？
-    └── 从 flash 开始，如果智能体遇到困难则升级到 pro
-```
-
----
-
-## 推理努力级别
-
-所有受支持的 V4 模型都接受推理强度控制。
-
-### 推理努力表
-
-| 级别 | 描述 | 使用场景 | 相对费用 | 相对速度 |
-|------|------|----------|----------|----------|
-| `low` | 最小推理，快速响应 | 搜索、简单编辑、格式化 | 0.5× | 快 2 倍 |
-| `medium` | 平衡推理（默认） | 大多数任务 | 1.0× | 基准 |
-| `high` | 深度推理、全面分析 | 复杂规划、调试、架构 | 2.0× | 慢 2 倍 |
-
-### 设置推理努力
-
-#### CLI 标志
-
-```bash
-# 低努力用于快速搜索
-orca --reasoning-effort low "查找所有已弃用 API 的实例"
-
-# 中等（默认）用于大多数任务
-orca --reasoning-effort medium "给 API 层添加缓存"
-
-# 高努力用于复杂架构
-orca --model deepseek-v4-pro --reasoning-effort high "重新设计状态管理层"
-```
-
-#### 配置文件
-
-```toml
-[agent]
-reasoning_effort = "medium"  # 所有会话的默认值
-```
-
-#### 每回合通过斜杠命令
-
-在 TUI 中，你可以在会话中途更改推理：
-
-```
-/reasoning high
-```
-
-> **提示：** 从 `medium` 开始。将 `low` 用于快速搜索，仅在任务真正需要深度分析时使用 `high`。模型在 `low` 努力下仍会产生正确的结果——只是不会探索尽可能多的替代方案。
-
----
-
-## 会话期间切换模型
-
-你可以在会话中途切换模型。Orca 优雅地处理过渡：
-
-
-<Steps>
-<Step>
-
-**当前上下文**被保留并发送到新模型
-
-</Step>
-<Step>
-
-**推理努力**重置为新模型的配置默认值
-
-</Step>
-<Step>
-
-**Token 计数**从会话现有预算继续
-
-</Step>
-</Steps>
-
-
-```bash
-# 在 TUI 中，使用以下命令切换模型：
-/model deepseek-v4-pro
-# 或
-/model deepseek-v4-flash
-# 或
-/model deepseek-v4-flash-vision-exp
-```
-
-> **注意：** 切换模型时，前缀缓存会中断（不同模型 = 不同的缓存键）。切换后的第一回合会较慢，因为上下文需要重新处理。
-
----
-
-## 成本优化技巧
-
-### 1. 从 flash 开始
-
-对于 80% 的任务，`deepseek-v4-flash` 是正确的选择。只有在遇到复杂性障碍时才升级到 `pro`。
-
-### 2. 战略性使用推理努力
-
-- `low` 用于搜索/导航（节省 50% 费用）
-- `medium` 用于大多数任务
-- `high` 用于架构/调试（2× 费用，但结果更好）
-
-### 3. 利用前缀缓存
-
-保持同一会话运行以受益于缓存。开始新会话会丢失缓存命中。
-
-### 4. 设置预算门控
-
-```bash
-orca exec "重构 API" --max-cost 2.00 --max-turns 15
-```
-
-### 5. 对批量任务使用 `orca exec`
-
-无头模式避免 TUI 开销，每回合稍快一些。
-
-### 6. 实时监控费用
-
-TUI 显示每回合费用和总会话费用：
-
-```
-回合 5 费用：$0.08 | 会话总计：$0.42 | 预算：$10.00
-```
+模型、凭据、endpoint 与信任的优先级见[配置说明](configuration.md)。

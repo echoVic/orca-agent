@@ -1,202 +1,40 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+# Skills
 
-# Skills 与插件
+一个 skill 是包含 SKILL.md 指令文件的目录。Orca 从以下位置发现 skills：
 
+1. 设置 ORCA_HOME 时读取 $ORCA_HOME/skills，否则读取 ~/.orca/skills；
+2. ~/.agents/skills；
+3. 已受信任项目中的 .orca/skills；
+4. 已受信任项目中的 .agents/skills。
 
-技能是扩展 Orca 在特定任务领域能力的模块化指令集。它们通过 `SKILL.md` 文件加载并注入智能体的上下文中。本页涵盖技能结构、加载方式以及优秀技能的要素。
+项目 skill 在工作区受信任前不会加载，避免刚打开的仓库静默注入指令。
 
-## SKILL.md 结构
+## 最小 skill
 
-### 结构
-
-`SKILL.md` 文件是 Orca 识别并加载到上下文中的特定结构的 markdown 文档。
-
-```markdown
+~~~markdown
 ---
-name: testing
-version: "1.0"
-description: "使用 Orca 编写测试的最佳实践"
-triggers:
-  - "test"
-  - "测试"
-  - "unit test"
-  - "jest"
-  - "vitest"
-tools:
-  - read_file
-  - write_file
-  - shell
-  - grep
+name: Rust review
+description: 检查 Rust 改动的正确性和恢复风险
+when_to_use: 修改运行时所有权或持久化逻辑时使用
+paths:
+  - "crates/**/*.rs"
 ---
 
-# 测试技能
+评论前先阅读真正拥有状态的运行时路径。
+优先报告具体失败模式和缺失测试。
+~~~
 
-## 何时使用此技能
+目录名就是 skill ID，只能包含 ASCII 字母、数字、连字符或下划线。支持的元数据字段是 name、description、when_to_use 和 paths。
 
-当满足以下条件时加载此技能：
-- 用户要求编写测试
-- 任务涉及测试驱动开发
-- 需要提高测试覆盖率
-- 正在设置测试基础设施
+## 调用 skill
 
-## 核心原则
+在提示词中按 ID 引用已发现的 skill：
 
-1. **测试行为，而非实现**——测试应描述代码做什么，而非如何实现
-2. **保持测试快速**——单元测试应在每个 100ms 内运行
-3. **每个测试一个断言**——清晰的失败消息
-4. **使用描述性名称**——测试名称应描述场景和预期结果
-5. **遵循 Arrange-Act-Assert 模式**
+~~~text
+$rust-review 审查当前分支。
+$rust-review:permissions 审查权限改动。
+~~~
 
-## 测试模式
+冒号后的可选文本会替换 skill 正文中的 {{arg}}。TUI 的 mention 搜索也会展示已发现的 skills。
 
-### 单元测试结构
-
-```typescript
-describe('[组件/功能]', () => {
-  describe('[场景]', () => {
-    it('应该 [预期行为]', async () => {
-      // Arrange
-      const input = ...;
-      
-      // Act
-      const result = await functionUnderTest(input);
-      
-      // Assert
-      expect(result).toBe(expected);
-    });
-  });
-});
-```
-
-### 反模式
-
-- ❌ 测试内部实现细节
-- ❌ 过度模拟（仅模拟必要内容）
-- ❌ 依赖执行顺序的测试
-- ❌ 随机或时间依赖的测试
-- ❌ 测试框架而非代码本身
-
-## 与 Orca 集成
-
-<Callout type="info">
-
-当 Orca 加载此技能时，它将： 1. 优先按照这些模式编写测试 2. 建议边界情况检查清单 3. 生成适当的测试框架代码 4. 避免列出的反模式 5. 验证测试是否遵循 AAA 模式
-
-</Callout>
-```
-
-### 元数据字段
-
-| 字段 | 必填 | 描述 |
-|------|------|------|
-| `name` | ✅ | 唯一技能标识符（小写，连字符分隔） |
-| `version` | ✅ | 语义化版本 |
-| `description` | ✅ | 一行描述 |
-| `triggers` | | 自动建议此技能的关键字 |
-| `tools` | | 此技能需要访问的工具 |
-
----
-
-## 加载技能
-
-### 自动发现
-
-Orca 在以下位置自动发现技能：
-
-1. **项目级**：当前工作目录中的 `.orca/skills/`
-2. **全局级**：`~/.config/orca/skills/`
-3. **内置**：Orca 的内置技能（testing、refactoring 等）
-
-### 加载方法
-
-#### 1. 显式加载
-
-```
-@skill:testing 为认证模块编写单元测试
-```
-
-```
-$testing 为认证模块编写单元测试
-```
-
-#### 2. 基于触发器的加载
-
-当你的消息匹配技能的触发器时，Orca 建议加载它：
-
-```
-你：为登录模块编写单元测试
-
-<Callout type="info">
-
-Orca: 💡 建议使用 "testing" 技能。       是否加载？[Y/n]
-
-</Callout>
-```
-
-#### 3. 编程式加载
-
-```bash
-orca skill load testing
-orca skill list
-orca skill unload testing
-```
-
-### 技能组合
-
-多个技能可以同时加载：
-
-```
-$testing $react $typescript 为 React TypeScript 组件编写测试
-```
-
-组合时：
-- 所有加载的技能合并到系统提示词中
-- 后面的技能在冲突时覆盖前面的
-- 触发器检测在所有加载的技能上工作
-
----
-
-## 什么是优秀的技能
-
-### 高质量技能的特征
-
-| 标准 | 描述 |
-|------|------|
-| **特异性** | 专注于狭窄、定义明确的任务领域 |
-| **可操作性** | 提供具体模式和示例，而非仅理论 |
-| **简洁性** | 总内容在 200 行以下——模型注意力有限 |
-| **示例丰富** | 每个模式都使用代码示例 |
-| **反模式** | 明确指出不该做什么 |
-| **工具感知** | 告诉 Orca 使用哪些工具以及何时使用 |
-| **框架特定** | 针对特定框架（React、Vue 等） |
-
-### 好技能 vs. 差技能
-
-| 方面 | 好技能 | 差技能 |
-|------|--------|--------|
-| 长度 | 50–150 行 | 500+ 行 |
-| 示例 | 具体代码示例 | 模糊描述 |
-| 范围 | "测试 React hooks" | "如何编写代码" |
-| 反模式 | 明确列出 | 缺失 |
-
----
-
-## 内置技能
-
-Orca 内置以下技能：
-
-| 技能 | 触发器 | 描述 |
-|------|--------|------|
-| `testing` | test、测试、jest、vitest | 编写全面测试 |
-| `refactoring` | refactor、重构、clean | 安全重构模式 |
-| `code-review` | review、代码审查、PR | 代码审查清单 |
-| `debugging` | debug、调试、bug、error | 系统化调试 |
-| `performance` | performance、优化、slow | 性能模式 |
-| `security` | security、漏洞、audit | 安全最佳实践 |
-| `documentation` | docs、文档、readme | 生成文档 |
-| `api-design` | API、REST、endpoint | API 设计模式 |
-| `database` | database、SQL、migration | 数据库优化 |
-| `react` | react、component、JSX | React 特定模式 |
-| `typescript` | typescript、TS、types | TypeScript 最佳实践 |
-
-> **提示：** 你可以通过在项目中创建 `.orca/skills/<name>/SKILL.md` 来覆盖内置技能。项目级技能优先于内置技能。
+公开 CLI 没有加载或卸载 skill 的命令。新增、编辑或删除 SKILL.md 后，启动引用它的任务即可。

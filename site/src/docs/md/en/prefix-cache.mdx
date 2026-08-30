@@ -1,296 +1,48 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # Prefix Cache
 
+Provider prefix caching can reduce repeated input work when consecutive model
+requests share an identical leading prefix. It is a provider optimization, not
+an Orca durability or correctness boundary.
 
-Orca leverages **byte-level prefix caching** to dramatically speed up repeated context sends. When parts of the context window remain unchanged across turns, the API server can reuse the cached computation instead of reprocessing tokens from scratch.
+## What usually preserves a prefix
 
-## What is Prefix Caching?
+- keep the model and system configuration stable across related turns;
+- keep related work in one recorded conversation;
+- avoid injecting timestamps or other changing text near the start of every
+  request; and
+- let Orca manage compaction instead of reconstructing history in a script.
 
-Prefix caching is an optimization where the API server caches the key-value (KV) tensors for the initial portion (prefix) of the context. On subsequent requests with the same prefix, the cached tensors are reused, avoiding redundant computation.
+Any change to the prefix may reduce or eliminate a cache hit. The provider is
+the authority for whether tokens were cached.
 
-### How It Works
+## Observe provider-reported usage
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Prefix Cache Mechanics                        │
-│                                                                 │
-│  Turn 1: [System Prompt][Project Context][Conversation Turn 1]   │
-│          └─────────────── CACHED ──────────────┘                │
-│                                                                 │
-│  Turn 2: [System Prompt][Project Context][Conversation Turn 1]   │
-│          └─────────────── CACHED (reuse) ──────────────┘        │
-│          [Conversation Turn 2: NEW]                              │
-│                                                                 │
-│  Turn 3: [System Prompt][Project Context][Conversation Turn 1]   │
-│          └─────────────── CACHED (reuse) ──────────────┘        │
-│          [Conversation Turn 2: CACHED] [Conversation Turn 3: NEW]│
-│                                                                 │
-│  Each turn, the cache grows as more conversation history is      │
-│  added. The system prompt and project context are always         │
-│  cached from the first turn.                                    │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+When the provider returns cache-token usage, Orca includes it in
+usage.updated events:
 
-<div class="docs-diagram">
+~~~bash
+orca exec --output-format jsonl "Inspect the current implementation" |
+  jq -c 'select(.type == "usage.updated") | .payload'
+~~~
 
-![Prefix Cache mechanics — sequence diagram showing cache hit vs miss paths across Orca → cache store → DeepSeek API.](/docs-assets/diagram-prefix-cache.svg)
-
-</div>
-
-### Cache Hit vs Miss
-
-| Scenario | Cache Status | Impact |
-|----------|-------------|--------|
-| Same session, next turn | Hit on prefix | 50–80% faster processing |
-| New session, same project | Partial hit (system prompt only) | 20–30% faster |
-| Different project | Miss | Full processing time |
-| Model changed | Miss | Full processing time |
-| After compaction | Partial hit (prefix preserved) | 30–50% faster |
-
----
-
-## Byte-Level Alignment
-
-Orca ensures the context prefix is **byte-level aligned** for optimal caching. This means:
-
-### Stable Ordering
-
-<Callout type="warning">
-
-The context is always assembled in the same order:
-
-</Callout>
-
-
-<Steps>
-<Step>
-
-System prompt (fixed, never changes)
-
-</Step>
-<Step>
-
-Project context (sorted by path, depth-limited)
-
-</Step>
-<Step>
-
-Conversation history (chronological)
-
-</Step>
-<Step>
-
-Per-turn scratch (current turn only)
-
-</Step>
-</Steps>
-
-
-Any deviation in ordering would break the cache. Orca enforces this rigorously:
-
-```
-✅ Good (cacheable):
-[System] → [Project: src/, tests/, docs/] → [Turn 1, Turn 2, Turn 3]
-
-❌ Bad (not cacheable):
-[System] → [Project: tests/, src/, docs/] → [Turn 3, Turn 1, Turn 2]
-```
-
-### Byte-Level Consistency
-
-Orca ensures byte-level consistency by:
-
-- **Fixed system prompt**: The system prompt is identical across all turns in a session
-- **Stable file ordering**: Project files are sorted by path before injection
-- **Deterministic formatting**: All injected content uses consistent whitespace and encoding
-- **Versioned tool schema**: Tool descriptions are identical for the same model version
-
-Even a single character change in the prefix invalidates the cache for that and all subsequent turns.
-
-### What Breaks the Cache
-
-| Action | Cache Impact |
-|--------|-------------|
-| New message in same session | Extends cache (prefix preserved) |
-| Model switch | Full cache miss |
-| Project file changes | Partial miss (project context changes) |
-| Approval mode change | Usually none (doesn't affect prefix) |
-| Compaction | Partial hit (prefix preserved) |
-| New session | Full cache miss |
-| Restarting Orca | Full cache miss (server-side cache expires) |
-
----
-
-## Reasoning Replay
-
-One of the most powerful aspects of Orca's prefix caching is **reasoning replay**. When the model performs extensive reasoning on a task, that reasoning becomes part of the conversation history. On subsequent turns, the model can "replay" its previous reasoning:
-
-```
-Turn 1 Reasoning:
-"I need to refactor the login flow. Let me trace the call path:
-login() → validateCredentials() → checkSession() → generateToken()
-The issue is that checkSession() doesn't validate the token expiry.
-I need to add expiry checking before generating a new token."
-
-Turn 2 (cache hit on Turn 1 reasoning):
-Model: "Based on my previous analysis, I need to modify checkSession()
-to add token expiry validation. Let me also check the test coverage."
-```
-
-Without prefix caching, the model would need to re-process all of Turn 1's reasoning tokens. With caching, it can directly reference previous reasoning without re-computation.
-
-### Benefits
-
-- **Consistency**: The model maintains coherence across turns by referencing its own reasoning
-- **Speed**: Reasoning-heavy sessions speed up over time as more gets cached
-- **Depth**: The model can reason deeper because it doesn't waste computation re-analyzing
-
----
-
-## Compaction and Cache Preservation
-
-Orca's compaction strategy is designed to **maximize cache preservation**:
-
-```
-Before Compaction:
-[System 5K][Project 150K][Turns 1-30: 600K][Scratch 50K] = 805K tokens
-                                                  ↑
-                                             80.5% full → trigger compaction
-
-After Compaction:
-[System 5K][Project 150K][Summary: 50K][Turns 25-30: 100K] = 305K tokens
- └────────── CACHED (prefix) ──────────┘
-```
-
-Key design choices:
-
-
-<Steps>
-<Step title={"**System prompt never changes**"}>
-
-Always the first element, always cached
-
-</Step>
-<Step title={"**Project context is latest-only**"}>
-
-When files change, only the changed portions invalidate the cache
-
-</Step>
-<Step title={"**Compaction preserves prefix**"}>
-
-Older turns are compressed into summaries, not removed from the prefix
-
-</Step>
-<Step title={"**Summaries are deterministic**"}>
-
-Compressed turns produce the same summary text each time, maintaining cacheability
-
-</Step>
-</Steps>
-
-
-### Cache Recovery After Compaction
-
-After compaction, the cache partially recovers:
-
-- **System prompt**: 100% cached (always)
-- **Project context**: Mostly cached (only changed files invalidate)
-- **Conversation history**: New summary text = partial cache miss for the compacted portion
-- **New turns**: Full miss (as always)
-
-The net effect is that after compaction, the first turn is slower (new summary computation) but subsequent turns regain cache hits.
-
----
-
-## Multi-Run Benefits
-
-Prefix caching provides compounding benefits across multiple runs:
-
-### Same Session, Many Turns
-
-```
-Turn 1:   Cache miss (builds prefix)
-Turn 2:   Cache hit on Turn 1 → 60% faster
-Turn 3:   Cache hit on Turns 1-2 → 70% faster
-Turn 10:  Cache hit on Turns 1-9 → 80% faster
-Turn 20:  Cache hit on Turns 1-19 → 85% faster
-```
-
-### Same Project, Multiple Sessions
-
-```
-Session A: Cache miss (builds project prefix)
-Session B (same project): Partial hit on project context → 30% faster
-Session C (same project): Partial hit + system prompt hit → 35% faster
-```
-
-### Same Task, Iterative Refinement
-
-```
-Run 1:     Cache miss
-Run 2:     "Fix the issue from Run 1" → cache hit on Run 1's reasoning
-Run 3:     "Also fix the edge case" → cache hit on Runs 1-2
-Run 10:    "Apply the same pattern to module X" → deep cache hit
-```
-
----
-
-## Measuring Cache Hits
-
-### Built-in Metrics
-
-Orca reports cache hit rates in multiple places:
-
-#### Per-Turn Display (TUI)
-
-```
-Turn 5:  3.2s | 45K tokens | 18K cached (40%) | $0.09
-Turn 6:  2.8s | 52K tokens | 35K cached (67%) | $0.10
-Turn 7:  2.1s | 48K tokens | 42K cached (88%) | $0.09
-```
-
-The "cached" percentage shows how much of the context was served from the prefix cache.
-
-#### Session Summary
-
-```bash
-orca sessions show 42
-
-# Output:
-# Session: 42
-# Turns: 23
-# Total tokens: 1,240,000
-# Cached tokens: 890,000 (71.8% hit rate)
-# Total time: 62s
-# Cache savings: 180s of processing time
-# Cost: $1.24
-# Effective cost (after cache): $0.35
-```
-
-#### JSONL Events
-
-In `orca exec` mode, cache information is included in the JSONL event stream:
-
-```json
+~~~json
 {
-  "type": "turn_complete",
-  "turn": 5,
   "input_tokens": 45000,
-  "cached_tokens": 18000,
-  "cache_hit_rate": 0.40,
-  "processing_time_ms": 3200,
-  "cost_usd": 0.09
+  "output_tokens": 1200,
+  "cache_tokens": 18000,
+  "total_tokens": 46200,
+  "estimated_cost_usd": 0.09
 }
-```
+~~~
 
-### Cache Optimization Checklist
+Do not invent a cache-hit rate when cache_tokens is missing. Different
+providers may report cache usage differently, and a low cache value does not
+mean the task should be replayed.
 
-<Callout type="danger">
+## Compaction
 
-| Check | How to Verify | |-------|--------------| | Stable system prompt | Check that the system prompt byte-for-byte matches across turns | | Sorted project files | Run `orca context inspect` to see file ordering | | No unnecessary context changes | Avoid modifying config mid-session | | Keep sessions alive | Don't restart Orca between related tasks | | Monitor hit rate | Check `orca sessions show` for cache metrics |
-
-</Callout>
-
-> **Tip:** If you consistently see cache hit rates below 30%, something is breaking the prefix. Common causes: unsorted file injection, dynamic timestamps in the system prompt, or changing the project directory. Use `orca context inspect` to diagnose.
+Context compaction changes the material sent on later turns and can therefore
+change cache behavior. Observe context.compaction.started and
+context.compacted in a JSONL stream when diagnosing a shift. Those events
+describe prompt management; the recorded conversation and terminal tool events
+remain the source of truth for recovery.

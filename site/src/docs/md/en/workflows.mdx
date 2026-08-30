@@ -1,424 +1,52 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # Workflows
 
+Workflows are persisted local programs that coordinate multiple agent calls.
+The public CLI exposes their lifecycle through orca workflow.
 
-Workflows are multi-step procedures that coordinate multiple Orca agents across phases. They support branching, context channels, error recovery, and structured execution. This page covers workflow structure, building blocks, and how to run workflows.
+~~~text
+orca workflow run [OPTIONS] <SCRIPT_OR_NAME>
+orca workflow list [--name NAME] [--run-id RUN_ID] [--status STATUS]
+orca workflow show <TASK_ID>
+orca workflow source <NAME>
+orca workflow stop <TASK_ID>
+orca workflow pause <TASK_ID>
+orca workflow resume <RUN_ID>
+orca workflow clone <RUN_ID>
+orca workflow restart-failed <RUN_ID>
+orca workflow restart-phase <RUN_ID> <PHASE>
+~~~
 
-## Workflow Structure
+## Run a workflow
 
-### Definition
+~~~bash
+orca workflow run ./workflows/review.js --cwd ./my-project
+orca workflow run review --args '{"base":"main"}'
+orca workflow run review --resume-from-run-id RUN_ID
+~~~
 
-A **workflow** is a YAML-defined multi-step process where each step is an independent agent execution. Steps can share context through channels, branch based on conditions, and recover from failures.
+run accepts --cwd, --model, --api-key, --base-url, --args, and
+--resume-from-run-id. It does not accept the headless orca exec budget or
+output options; inspect orca workflow run --help before automating a launch.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Workflow Concept                              │
-│                                                                 │
-│  Goal: "Migrate the codebase to TypeScript"                     │
-│                                                                 │
-│  Step 1: [Agent] Analyze codebase → produce migration plan      │
-│     │                                                           │
-│     ▼                                                           │
-│  Step 2: [Agent] Convert config files (tsconfig, etc.)          │
-│     │                                                           │
-│     ▼                                                           │
-│  Step 3: [Agent] Convert src/auth/                              │
-│     │                                                           │
-│     ▼                                                           │
-│  Step 4: [Agent] Convert src/api/     Step 5: [Agent] Convert   │
-│         (parallel)                        src/utils/ (parallel)  │
-│     │                                    │                     │
-│     ▼                                    ▼                     │
-│  Step 6: [Agent] Integrate and test (depends on 3, 4, 5)       │
-│     │                                                           │
-│     ▼                                                           │
-│  Step 7: [Agent] Final verification                             │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+A named workflow resolves from the configured workflow locations; a path names
+the script directly. Workflow scripts are JavaScript modules with a declared
+metadata export, not YAML files. Keep the script, its verifier logic, and its
+input schema under version control.
 
-### Workflow YAML Structure
+## Observe and recover
 
-```yaml
-# workflows/typescript-migration.yaml
+~~~bash
+orca workflow list --status running
+orca workflow show TASK_ID
+orca workflow pause TASK_ID
+orca workflow resume RUN_ID
+~~~
 
-name: "TypeScript Migration"
-description: "Incrementally migrate a JavaScript codebase to TypeScript"
-version: "1.0"
+Use show to inspect one persisted run. A pause, stop, restart, or clone is
+scoped to its recorded task or run ID. A resumed workflow reuses only durable
+completed boundaries; an interrupted tool action remains potentially applied
+until its target state is checked.
 
-# Workflow-level settings
-settings:
-  model: "deepseek-v4-flash"
-  default_max_turns: 30
-  default_max_cost: 5.00
-  failure_strategy: "continue_on_error"
-
-# Context channels for sharing data between steps
-channels:
-  migration_plan:     # Will hold the analysis output
-  converted_files:    # Will track which files have been converted
-  test_results:       # Will hold test output
-
-# Steps definition
-steps:
-  - id: analyze
-    name: "Analyze Codebase"
-    agent: |
-      Analyze the project structure and create a migration plan:
-      1. Identify all JavaScript files
-      2. Determine dependencies between modules
-      3. Estimate migration complexity
-      4. Output a prioritized migration plan
-    outputs:
-      - channel: migration_plan
-        description: "Migration plan with file priorities"
-    budget:
-      max_turns: 10
-      max_cost: 1.50
-    verifier:
-      run: "test -f .orca/migration-plan.md"
-
-  - id: setup
-    name: "Setup TypeScript Config"
-    depends_on: [analyze]
-    agent: |
-      Set up TypeScript configuration:
-      1. Create tsconfig.json based on the migration plan
-      2. Install type dependencies
-      3. Configure linting for TypeScript
-    outputs:
-      - channel: converted_files
-        description: "List of converted files so far"
-    budget:
-      max_turns: 5
-      max_cost: 0.80
-    verifier:
-      run: "npx tsc --noEmit"
-
-  - id: convert-auth
-    name: "Convert Auth Module"
-    depends_on: [setup]
-    agent: |
-      Convert src/auth/ to TypeScript:
-      1. Add type annotations to all functions
-      2. Create interfaces for data structures
-      3. Fix any type errors
-      4. Run tests to verify
-    inputs:
-      - channel: migration_plan
-    outputs:
-      - channel: converted_files
-        append: true
-    budget:
-      max_turns: 15
-      max_cost: 2.00
-    verifier:
-      run: "npm test -- --testPathPattern=auth"
-
-  - id: convert-api
-    name: "Convert API Module"
-    depends_on: [setup]
-    agent: |
-      Convert src/api/ to TypeScript:
-      1. Add type annotations to API handlers
-      2. Create request/response interfaces
-      3. Fix any type errors
-      4. Run tests to verify
-    inputs:
-      - channel: migration_plan
-    outputs:
-      - channel: converted_files
-        append: true
-    budget:
-      max_turns: 15
-      max_cost: 2.00
-    verifier:
-      run: "npm test -- --testPathPattern=api"
-
-  - id: convert-utils
-    name: "Convert Utils Module"
-    depends_on: [setup]
-    agent: |
-      Convert src/utils/ to TypeScript:
-      1. Add type annotations to utility functions
-      2. Create shared type definitions
-      3. Fix any type errors
-    inputs:
-      - channel: migration_plan
-    outputs:
-      - channel: converted_files
-        append: true
-    budget:
-      max_turns: 10
-      max_cost: 1.50
-    verifier:
-      run: "npm test -- --testPathPattern=utils"
-
-  - id: integrate
-    name: "Integrate and Test"
-    depends_on: [convert-auth, convert-api, convert-utils]
-    agent: |
-      Integrate all converted modules and run full tests:
-      1. Resolve any cross-module type issues
-      2. Run the full test suite
-      3. Fix any integration errors
-    inputs:
-      - channel: converted_files
-      - channel: test_results
-    budget:
-      max_turns: 20
-      max_cost: 3.00
-    verifier:
-      run: "npm test && npx tsc --noEmit"
-
-  - id: final-verify
-    name: "Final Verification"
-    depends_on: [integrate]
-    agent: |
-      Perform final verification:
-      1. Run full test suite
-      2. Check build
-      3. Verify all files in migration plan are converted
-      4. Generate migration report
-    inputs:
-      - channel: converted_files
-    budget:
-      max_turns: 5
-      max_cost: 0.50
-    verifier:
-      run: "npm test && npm run build"
-
-# What to do on workflow completion
-on_complete:
-  action: "report"
-  channel: test_results
-  notification: true
-
-# What to do on workflow failure
-on_failure:
-  strategy: "pause_and_report"
-  channel: test_results
-```
-
----
-
-## Building Blocks
-
-### setup
-
-The `setup` block initializes the workflow environment before any steps run:
-
-```yaml
-settings:
-  # Global model and budget
-  model: "deepseek-v4-flash"
-  default_max_turns: 30
-  default_max_cost: 5.00
-  reasoning_effort: "medium"
-
-  # Environment setup
-  environment:
-    - name: "NODE_ENV"
-      value: "test"
-    - name: "CI"
-      value: "true"
-
-  # Pre-flight commands
-  pre_commands:
-    - "npm ci"
-    - "npm run build"
-
-  # Post-workflow cleanup
-  post_commands:
-    - "npm run clean"
-
-  # Failure handling
-  failure_strategy: "continue_on_error"  # or "stop_on_error" or "pause_on_error"
-  max_parallel_steps: 4
-```
-
-### run
-
-The `agent` block defines what each step's agent does:
-
-```yaml
-steps:
-  - id: my-step
-    agent: |
-      Multi-line instruction for the agent.
-      This is the prompt that Orca will use.
-      
-      The agent has access to:
-      - The current project context
-      - Input channels (from previous steps)
-      - Tools (file, shell, search)
-      - The step's budget constraints
-      
-      Output to the specified channels when done.
-```
-
-### ctx.map
-
-`ctx.map` defines how data flows between steps — mapping input channels to the agent's context and output channels:
-
-```yaml
-steps:
-  - id: step-b
-    depends_on: [step-a]
-    agent: "Process the data"
-    ctx:
-      map:
-        # Map from previous step's output channel to this step's input
-        - from: step-a.output_data
-          to: input_data
-          transform: "json_to_text"
-        
-        # Map multiple channels into a combined input
-        - from: [channel1, channel2]
-          to: combined_input
-          transform: "merge"
-```
-
-### ctx.channel
-
-`ctx.channel` defines persistent data channels that outlive individual steps:
-
-```yaml
-channels:
-  shared_state:       # Available to all steps
-  results:            # Accumulates across steps
-  errors:             # Collects error information
-
-steps:
-  - id: step-1
-    agent: "Produce data"
-    ctx:
-      set:
-        - channel: shared_state
-          value: "initial_value"
-  
-  - id: step-2
-    agent: "Use shared data"
-    ctx:
-      get:
-        - channel: shared_state
-          as: state_value
-      set:
-        - channel: results
-          append: true
-          value: "step_2_result"
-```
-
-### ctx.set and ctx.get
-
-`ctx.set` writes to channels, `ctx.get` reads from them:
-
-```yaml
-steps:
-  - id: producer
-    agent: "Generate a list of affected files"
-    ctx:
-      set:
-        - channel: affected_files
-          value: |
-            src/auth/login.ts
-            src/auth/token.ts
-            src/api/handlers/login.ts
-  
-  - id: consumer
-    agent: "Read the affected files and fix them"
-    ctx:
-      get:
-        - channel: affected_files
-          as: files_to_fix
-```
-
----
-
-## Running Workflows
-
-### Command Line
-
-```bash
-# Run a workflow
-orca workflow run workflows/typescript-migration.yaml
-
-# Run with overrides
-orca workflow run workflows/typescript-migration.yaml \
-  --model deepseek-v4-pro \
-  --max-turns 50 \
-  --max-cost 10.00
-
-# Run specific steps only
-orca workflow run workflows/typescript-migration.yaml \
-  --steps setup,convert-auth,integrate
-
-# Resume a failed workflow
-orca workflow resume <workflow-id>
-
-# Skip completed steps
-orca workflow resume <workflow-id> --skip-completed
-```
-
-### In TUI
-
-```
-/workflow run workflows/typescript-migration.yaml
-/workflow status
-/workflow pause
-/workflow resume
-/workflow skip <step-id>
-/workflow retry <step-id>
-```
-
-### Workflow Status
-
-```bash
-orca workflow status <workflow-id>
-
-# Output:
-# Workflow: TypeScript Migration
-# Status: IN_PROGRESS
-# 
-# Steps:
-#   ✅ analyze      (10 turns, $1.20)
-#   ✅ setup        (5 turns, $0.40)
-#   ✅ convert-auth (12 turns, $1.80)
-#   ✅ convert-api  (14 turns, $2.00)
-#   🔄 convert-utils (3/10 turns, $0.45) ← running
-#   ⏳ integrate
-#   ⏳ final-verify
-# 
-# Channels:
-#   migration_plan: 1.2K tokens
-#   converted_files: 42 files
-#   test_results: pending
-```
-
----
-
-## Workflow vs. Goal Mode
-
-| Feature | Goal Mode | Workflow Mode |
-|---------|-----------|---------------|
-| Granularity | Single agent execution | Multi-step, multi-agent |
-| Dependency | None (single objective) | Step dependencies |
-| Context sharing | Implicit (session) | Explicit channels |
-| Parallelism | Not supported | Supported via `depends_on` |
-| Error recovery | Retry + escalate | Per-step strategy |
-| Budget | Single budget | Per-step budgets + workflow budget |
-| Use case | Single focused task | Complex multi-phase projects |
-| Reusability | Goal templates | Workflow templates |
-
-### When to Use Which
-
-| Scenario | Recommendation |
-|----------|---------------|
-| Fix a bug | Goal mode |
-| Add a feature | Goal mode (complex) or Prompt mode (simple) |
-| Refactor one module | Goal mode |
-| Refactor entire codebase | Workflow mode |
-| Multi-team coordination | Workflow mode |
-| CI/CD pipeline | Workflow mode |
-| Routine maintenance | Goal mode (saved templates) |
+The TUI is the richer surface for live child-agent activity. The command line
+is intentionally limited to launching, inspecting, and controlling persisted
+workflow runs.

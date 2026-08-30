@@ -1,283 +1,77 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # Approval Modes
 
+Approval mode is one input to Orca's effective capability policy. It does not
+override folder trust, permission rules, sandbox enforcement, or an explicit
+denial. When multiple permission rules match, the strictest result wins.
 
-Orca implements a four-mode approval lattice that lets you trade autonomy for control. This page covers all approval modes, how to set them, and best practices for balancing trust with safety.
+## Public modes
 
-## The Approval Lattice
+| Mode | Capability ceiling |
+| --- | --- |
+| plan | Read-only. Write, network, shell, metadata-write, and child-agent capability are denied. |
+| suggest | Workspace-write ceiling with approval required where the runtime asks for it. |
+| auto-edit | Workspace-write ceiling with the normal edit policy. |
+| full-auto | Broadest capability ceiling; still subject to the platform sandbox and configured denials. |
 
-Orca's approval modes form a lattice — each mode is a strict superset of the previous one's permissions:
+Choose the narrowest mode that can complete the task. In particular, full-auto
+is not permission to bypass OS isolation, workspace trust, or denied roots.
 
-Plan is a hard read-only ceiling. Permission rules cannot override it, and a
-missing sandbox backend never falls back to a host shell. For matching rules,
-Orca intentionally chooses the strictest decision among all matching patterns;
-it does not use “most specific rule wins” semantics.
+## Select a mode
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Approval Mode Lattice                          │
-│                                                                 │
-│  plan ──▶ suggest ──▶ auto-edit ──▶ full-auto                   │
-│    │        │          │              │                        │
-│    │        │          │              │                        │
-│    ▼        ▼          ▼              ▼                        │
-│  No tool  Manual     Auto-approve    Auto-approve               │
-│  calls    approval   file edits      everything                 │
-│           for all    + reads        (no checks)                 │
-│           tool calls Shell reqs    Allowed                      │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+For a headless run, use --mode:
 
-### Mode Comparison Table
+~~~bash
+orca exec --mode plan "Inspect the architecture and propose changes"
+orca exec --mode suggest "Fix the failing unit test"
+orca exec --mode auto-edit "Apply the reviewed formatter changes"
+orca exec --mode full-auto "Run the disposable sandbox task"
+~~~
 
-| Mode | File Reads | File Edits | Shell Commands | Network / MCP | Destructive Ops |
-|------|-----------|------------|----------------|---------------|-----------------|
-| `plan` | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `suggest` | ✅ (silent) | ⚠️ (approve) | ⚠️ (approve) | ⚠️ (approve) | ⚠️ (approve) |
-| `auto-edit` | ✅ (silent) | ✅ (auto) | ⚠️ (approve) | ⚠️ (approve) | ⚠️ (approve) |
-| `full-auto` | ✅ (silent) | ✅ (auto) | ✅ (auto) | ✅ (auto) | ✅ (auto) |
+The root interactive command also accepts --mode. Its value can select an
+approval mode for a TUI session, or the server and acp protocol transports; do
+not combine a transport selection with a task prompt or subcommand.
 
-- ✅ = Automatically allowed
-- ⚠️ = Requires user approval
-- ❌ = Not allowed
+The configuration file uses a top-level mode value, and the environment
+override is ORCA_MODE:
 
-### Detailed Behavior
+~~~toml
+mode = "suggest"
+~~~
 
-#### `plan` — Plan Only
+~~~bash
+export ORCA_MODE="suggest"
+~~~
 
-<Callout type="danger">
+CLI options override environment, trusted project configuration, user
+configuration, and built-in defaults.
 
-The agent **never executes** any tools. It only produces plans, reasoning, and proposed tool calls for your review.
+## Change mode in the TUI
 
-</Callout>
+Use /mode to inspect the active mode or set one explicitly:
 
-```
-Agent: I plan to make the following changes:
-       1. Create src/auth/token.rs with 120 lines
-       2. Modify src/auth/login.rs to use the new module
-       3. Update src/mod.rs to export the new module
+~~~text
+/mode
+/mode suggest
+/mode auto-edit
+/mode full-auto
+/plan
+/plan off
+~~~
 
-       Tool call: write_file("src/auth/token.rs")
-       Status: BLOCKED — approval mode is "plan"
-```
+The settings change is applied through the runtime, not by editing a local
+prompt. When a task is waiting on an approval, resolve that approval based on
+the displayed tool, target, and scope rather than changing mode as a shortcut.
 
-**Best for**: Highly regulated environments, teaching and demonstration, reviewing complex refactors before execution.
+## Trust remains separate
 
-#### `suggest` — Suggest and Approve
+Folder trust decides whether a project configuration can contribute settings.
+Inspect or change it with the public trust command only after reviewing the
+workspace:
 
-The agent **suggests** tool calls and you approve each one before execution. File reads are silent (no approval needed).
+~~~bash
+orca trust show --cwd ./project
+orca trust add --cwd ./project
+orca trust remove --cwd ./project
+~~~
 
-```
-Agent: I'd like to read src/auth/login.ts
-       [auto-executed — file reads are silent in suggest mode]
-
-Agent: I'd like to modify src/auth/login.ts (4 changes)
-       [APPROVAL DIALOG]
-       File: src/auth/login.ts
-       Changes: +12 lines, -3 lines
-       Risk: LOW (edits existing file)
-       [Approve] [Deny] [View Diff]
-```
-
-**Best for**: Most TUI use cases. You maintain control over destructive operations while the agent handles routine reading.
-
-#### `auto-edit` — Auto-Approve Edits
-
-The agent **auto-approves** file reads and edits. Shell commands, network calls, and destructive operations still require approval.
-
-```
-Agent: I'll modify src/auth/login.ts to add token expiry validation
-       [auto-executed — file edits are auto-approved in auto-edit mode]
-
-Agent: I need to run npm test to verify the changes
-       [APPROVAL DIALOG]
-       Command: npm test
-       Risk: LOW (read-only test)
-       [Approve] [Deny]
-```
-
-**Best for**: Headless `orca exec` sessions, batch refactors, CI automation. The default for non-interactive mode.
-
-#### `full-auto` — Fully Autonomous
-
-The agent **executes everything** without asking. No approval dialogs for any operation.
-
-```
-Agent: I'll run the full test suite, fix any failures, and commit
-       [all operations auto-executed]
-
-Agent: I need to curl an external API for data
-       [auto-executed — no approval in full-auto mode]
-```
-
-**Best for**: Sandboxed environments, disposable projects, when you trust the agent completely. Use with caution — there is no safety net.
-
----
-
-## Setting the Approval Mode
-
-### CLI Flag
-
-```bash
-orca --approval plan
-orca --approval suggest
-orca --approval auto-edit
-orca --approval full-auto
-```
-
-### Slash Command (TUI Only)
-
-Change approval mode during a session:
-
-```
-/approval plan
-/approval suggest
-/approval auto-edit
-/approval full-auto
-```
-
-### Configuration File
-
-```toml
-[approval]
-mode = "auto-edit"
-```
-
-### Environment Variable
-
-```bash
-export ORCA_APPROVAL="auto-edit"
-```
-
-### Configuration Priority
-
-The approval mode follows the standard configuration priority:
-
-
-<Steps>
-<Step>
-
-CLI flag (`--approval`)
-
-</Step>
-<Step>
-
-Slash command (`/approval`)
-
-</Step>
-<Step>
-
-Environment variable (`ORCA_APPROVAL`)
-
-</Step>
-<Step title={"Project config (`"}>
-
-orca/config.toml`)
-
-</Step>
-<Step title={"Global config (`~/"}>
-
-config/orca/config.toml`)
-
-</Step>
-<Step>
-
-Default (`auto-edit` for both TUI and exec)
-
-</Step>
-</Steps>
-
-
----
-
-## Per-Folder Trust
-
-Orla supports granular approval control based on file location. You can designate folders where edits are automatically approved, regardless of the global approval mode.
-
-### Configuring Trusted Folders
-
-```toml
-[approval]
-mode = "auto-edit"
-
-# Auto-approve all edits within these folders
-trust_folders = [
-    "src/components/ui/",
-    "src/utils/",
-    "src/hooks/",
-]
-
-# Require explicit approval for these command patterns
-require_confirmation_for = [
-    "delete",
-    "rm ",
-    "curl ",
-    "wget ",
-    "sudo ",
-]
-```
-
-### How Trusted Folders Work
-
-| Scenario | Global Mode | Folder in Trust List | Behavior |
-|----------|------------|---------------------|----------|
-| Edit `src/components/ui/button.tsx` | `suggest` | ✅ Yes | Auto-approved |
-| Edit `src/components/ui/` (subfolder) | `suggest` | ✅ Yes | Auto-approved (recursive) |
-| Edit `src/utils/helpers.ts` | `suggest` | ✅ Yes | Auto-approved |
-| Edit `src/auth/login.ts` | `suggest` | ❌ No | Requires approval |
-| Run `npm test` | `suggest` | N/A | Requires approval (shell) |
-| Run `npm test` | `auto-edit` | N/A | Requires approval (shell) |
-
-> **Tip:** Use per-folder trust for UI component libraries, utility modules, or other areas where you want the agent to work freely without constant approval dialogs.
-
----
-
-## Approval Dialog
-
-### Dialog Layout
-
-When approval is required, the TUI shows a non-blocking dialog:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  ⚠️  Approval Required                                          │
-│                                                                 │
-│  Agent wants to:                                                │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  Run shell command: npm test -- --coverage               │    │
-│  │                                                         │    │
-│  │  Working directory: /project/app                        │    │
-│  │  Estimated output: ~200 lines                           │    │
-│  │  Risk: LOW (read-only operation)                        │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-│  Options:                                                       │
-│  [A] Approve     [D] Deny     [V] View Command     [S] Skip     │
-│                                                                 │
-│  Tip: Press [A] to approve and continue, [D] to deny            │
-│                                                                 │
-│  While waiting, the agent can still plan and read files.        │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Dialog Features
-
-- **Non-blocking**: The agent continues working while you decide
-- **Diff preview**: For file edits, press `V` to see a unified diff
-- **Risk assessment**: Automatic classification of operation risk
-- **Command inspection**: Full visibility into shell commands before approval
-- **Quick approve**: Press `A` to approve without opening the dialog
-- **Always allow**: Some dialogs offer "Always allow this pattern" for repetitive tasks
-
-### Risk Assessment Levels
-
-| Level | Criteria | Examples |
-|-------|----------|---------|
-| `LOW` | Read-only, no side effects | `cat`, `ls`, `grep`, `git diff` |
-| `MEDIUM` | Creates/modifies files | `write_file`, `npm install`, `cargo build` |
-| `HIGH` | Destructive or irreversible | `rm`, `delete`, `drop_table`, `curl` (exfiltration) |
-| `CRITICAL` | System-level danger | `rm -rf /`, `sudo`, `mkfs`, `dd if=` |
-
-> **Note:** Risk levels are suggestions, not hard blocks. You can approve any operation regardless of risk level. Orca never auto-blocks — it only flags risk.
+See [Configuration](configuration.md) for precedence and storage locations.

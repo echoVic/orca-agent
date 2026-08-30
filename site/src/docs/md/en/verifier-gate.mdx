@@ -1,345 +1,54 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+# Verification
 
-# Verifier Gate
+Pass a shell command with --verifier when completion needs an independent
+check. Orca runs it after the task and records the result with the run.
 
+~~~bash
+orca exec "Fix the login regression" \
+  --verifier "npm test -- --testPathPattern=login"
 
-The verifier gate is Orca's quality assurance mechanism. It runs an independent verification command after the agent completes a task, ensuring the output actually works. This page covers the gate lifecycle, what makes good and bad verifiers, and how to design verifiers for different task types.
+orca exec "Refactor the parser" \
+  --verifier "cargo test -p parser && cargo clippy -p parser -- -D warnings"
+~~~
 
-## Gate Lifecycle
+## Pick evidence that can fail
 
-### 5-Step Verification Process
+A useful verifier is:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Verifier Gate Lifecycle                       │
-│                                                                 │
-│  Step 1: Agent Completes                                       │
-│  ├── Agent finishes the task (or budget exhausted)              │
-│  ├── Agent's work is saved in the session                      │
-│  └── Control passes to verifier gate                          │
-│                          │                                      │
-│                          ▼                                      │
-│  Step 2: Verifier Preparation                                   │
-│  ├── Resolve verifier command (from flag or config)            │
-│  ├── Set up environment (working directory, env vars)          │
-│  └── Capture current file state snapshot                      │
-│                          │                                      │
-│                          ▼                                      │
-│  Step 3: Verifier Execution                                     │
-│  ├── Execute verifier shell command                           │
-│  ├── Capture stdout, stderr, and exit code                    │
-│  ├── Enforce timeout (default: 5 minutes)                     │
-│  └── Monitor for resource exhaustion                         │
-│                          │                                      │
-│                          ▼                                      │
-│  Step 4: Result Analysis                                        │
-│  ├── Check exit code:                                         │
-│  │     0 → VERIFIER PASSED                                    │
-│  │     non-zero → VERIFIER FAILED                              │
-│  ├── Capture output for agent reference                       │
-│  └── Record result in session database                        │
-│                          │                                      │
-│                          ▼                                      │
-│  Step 5: Gate Decision                                          │
-│  ├── PASSED → Exit code 0 (SUCCESS)                           │
-│  │   └── Agent's work is validated                            │
-│  ├── FAILED → Exit code 3 (VERIFIER_FAILED)                   │
-│  │   └── Agent's work may be incomplete or incorrect          │
-│  └── TIMEOUT → Exit code 3 (VERIFIER_FAILED)                  │
-│      └── Verifier took too long                                │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+- independent of the model's textual claim;
+- narrow enough to identify the changed behavior;
+- deterministic enough to rerun; and
+- fast enough to use routinely.
 
-### Gate Integration with Agent
+~~~bash
+# Good: checks the requested behavior.
+orca exec "Add a parser error case" --verifier "cargo test -p parser parse_error"
 
-The verifier gate is separate from the agent loop:
+# Weak: succeeds without checking the change.
+orca exec "Add a parser error case" --verifier "echo done"
+~~~
 
-```
-Agent Loop:
-  Turn 1 → Turn 2 → ... → Turn N → Agent Complete
-                                        │
-                                        ▼
-                                 ┌─────────────┐
-                                 │ Verifier    │
-                                 │    Gate     │
-                                 └─────────────┘
-                                        │
-                          ┌─────────────┴─────────────┐
-                          ▼                           ▼
-                    PASSED                        FAILED
-                          │                           │
-                    Exit 0                       Exit 3
-                                                  (resume to fix)
-```
+The CLI currently exposes one verifier command per execution. Put multi-step
+checks in a shell script when quoting becomes hard to review:
 
-### Gate Configuration
+~~~bash
+orca exec "Refactor authentication" --verifier "./scripts/verify-auth.sh"
+~~~
 
-```bash
-# Basic verifier
-orca exec "Fix the bug" --verifier "npm test"
+Omit --verifier for work that has no meaningful automated check. There is no
+verifier-default configuration command and no verifier-specific timeout option
+in the public CLI.
 
-# Verifier with timeout
-orca exec "Refactor" --verifier "npm test" --verifier-timeout 10m
+## Resume after a failed check
 
-# Skip verifier
-orca exec "Generate scaffolding" --no-verifier
+A failed verification result is evidence for the next turn, not proof that all
+writes can be replayed. Resume the recorded run with the failure context:
 
-# Verifier in config
-orca config set verifier.default "npm test"
-```
+~~~bash
+orca exec resume SESSION_ID \
+  --verifier "npm test -- --testPathPattern=login" \
+  "Read the verifier failure and fix only the remaining regression"
+~~~
 
----
-
-## Good vs. Bad Verifiers
-
-### Quality Criteria
-
-| Criterion | Good Verifier | Bad Verifier |
-|-----------|--------------|--------------|
-| **Independence** | Validates output independently of the agent's claims | Relies on the agent's self-reporting |
-| **Determinism** | Same input → same output every time | Non-deterministic or flaky |
-| **Specificity** | Checks the exact change requested | Too broad or too narrow |
-| **Speed** | Runs in under 2 minutes | Takes 10+ minutes |
-| **Signal** | Clear pass/fail criteria | Ambiguous results |
-| **Coverage** | Covers the full scope of changes | Only tests a subset |
-
-### Verifier Quality Examples
-
-#### Test Suite Verifiers
-
-```bash
-# ✅ GOOD: Targeted test for specific change
-orca exec "Fix login bug" --verifier "npm test -- --testPathPattern=login"
-
-# ✅ GOOD: Full test suite for comprehensive changes
-orca exec "Refactor auth module" --verifier "npm test"
-
-# ⚠️ MEDIOCRE: Too broad — includes unrelated tests
-orca exec "Fix login bug" --verifier "npm test -- --testPathPattern=auth"
-# (auth tests may include registration, password reset, etc.)
-
-# ❌ BAD: Wrong test — verifies the wrong thing
-orca exec "Fix login bug" --verifier "npm test -- --testPathPattern=register"
-```
-
-#### Compilation Verifiers
-
-```bash
-# ✅ GOOD: Type checking
-orca exec "Add TypeScript types" --verifier "npx tsc --noEmit"
-
-# ✅ GOOD: Build verification
-orca exec "Add new component" --verifier "npm run build"
-
-# ❌ BAD: Just checks file existence
-orca exec "Add new component" --verifier "test -f src/components/NewComp.tsx"
-# (file exists but may have syntax errors)
-```
-
-#### Custom Script Verifiers
-
-```bash
-# ✅ GOOD: Multi-step validation
-orca exec "Add API endpoint" --verifier 'bash -c "curl -s http://localhost:3000/api/health | grep -q ok && curl -s http://localhost:3000/api/new-endpoint | grep -q expected"'
-
-# ✅ GOOD: Output format validation
-orca exec "Fix the formatter" --verifier 'bash -c "node -e \"require(\"./formatter\")().then(r => assert(r.format === \"expected\"))\""'
-
-# ❌ BAD: Always passes
-orca exec "Anything" --verifier "echo done"
-```
-
-### Verifier Patterns by Task Type
-
-<Callout type="info">
-
-| Task Type | Recommended Verifier | |-----------|---------------------| | Bug fix | Targeted test suite (`npm test -- --testPathPattern=X`) | | New feature | Full test suite + build check | | Refactoring | Full test suite + type check + lint | | TypeScript migration | `npx tsc --noEmit` | | Performance optimization | Benchmark script comparing before/after | | Documentation | Spell check + markdown lint | | Config change | Config validation command | | API integration | Health check endpoint | | Database migration | Migration test + data integrity check |
-
-</Callout>
-
----
-
-## Advanced Verifier Patterns
-
-### Multi-Command Verifiers
-
-```bash
-# Run multiple checks in sequence
-orca exec "Full refactor" --verifier 'bash -c "
-  npx tsc --noEmit && \
-  npx eslint src/ && \
-  npm test -- --silent && \
-  npm run build
-"'
-
-# Fail fast on first error
-orca exec "Critical fix" --verifier 'bash -c "
-  npx tsc --noEmit || exit 1
-  npx eslint src/ --max-warnings 0 || exit 1
-  npm test || exit 1
-"'
-```
-
-### Verifier with Setup
-
-```bash
-# Verifier that requires a test server
-orca exec "Add WebSocket endpoint" --verifier 'bash -c "
-  npm run start:test &
-  SERVER_PID=\$!
-  sleep 3
-  node -e \"
-    const ws = new WebSocket(\"ws://localhost:3000/ws\");
-    ws.on(\"open\", () => { ws.close(); process.exit(0); });
-    ws.on(\"error\", () => process.exit(1));
-    setTimeout(() => process.exit(1), 5000);
-  \"
-  kill \$SERVER_PID
-"'
-```
-
-### Verifier with External API
-
-```bash
-# Verifier that tests against a staging API
-orca exec "Update API client" --verifier 'bash -c "
-  curl -sf https://staging.example.com/api/health > /dev/null || exit 1
-  curl -sf https://staging.example.com/api/v2/data | jq -e \".items != null\" || exit 1
-"'
-```
-
-### Verifier as a Separate Script
-
-For complex verification, use a dedicated script:
-
-```bash
-# Create a verification script
-cat > verify.sh << 'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "🔍 Running verification..."
-
-# 1. Type check
-echo "  Type check..."
-npx tsc --noEmit
-
-# 2. Lint
-echo "  Lint..."
-npx eslint src/ --max-warnings 0
-
-# 3. Test
-echo "  Tests..."
-npm test --silent
-
-# 4. Build
-echo "  Build..."
-npm run build
-
-echo "✅ All checks passed!"
-EOF
-chmod +x verify.sh
-
-# Use the script as verifier
-orca exec "Refactor everything" --verifier "./verify.sh"
-```
-
----
-
-## Verifier Gate and Resume
-
-### Verifier Failure → Resume Loop
-
-```bash
-# Step 1: First attempt
-orca exec "Fix all failing tests" --verifier "npm test"
-# Result: 3 tests still failing → Exit 3
-
-# Step 2: Resume — agent sees the test output and fixes more
-orca exec resume <session-id>
-# Result: 1 test still failing → Exit 3
-
-# Step 3: Resume again — agent focuses on the remaining test
-orca exec resume <session-id>
-# Result: All tests pass → Exit 0
-```
-
-### Verifier Output in Resume
-
-When resuming after a verifier failure, the agent automatically receives:
-
-
-<Steps>
-<Step>
-
-The **verifier command** that was run
-
-</Step>
-<Step>
-
-The **stdout and stderr** output
-
-</Step>
-<Step>
-
-The **exit code** (non-zero = failed)
-
-</Step>
-<Step>
-
-The **duration** of the verifier execution
-
-</Step>
-</Steps>
-
-
-This lets the agent understand exactly what went wrong and try to fix it.
-
-### Skipping Verifier on Resume
-
-```bash
-# Resume without running the verifier (to save time)
-orca exec resume <session-id> --no-verifier
-```
-
-### Changing Verifier on Resume
-
-```bash
-# Use a different verifier for the resume
-orca exec resume <session-id> --verifier "npm test -- --testPathPattern=remaining"
-```
-
----
-
-## Monitoring Verifier Performance
-
-### Verifier Metrics in JSONL
-
-```bash
-# Extract verifier results from JSONL
-jq -r 'select(.type=="verifier_complete") | "Status: \(.status) | Duration: \(.duration_ms)ms | Exit: \(.exit_code)"' report.jsonl
-
-# Find verifier failures
-jq -r 'select(.type=="verifier_complete" and .status!="passed") | "FAILED: \(.command) — \(.error_output)"' report.jsonl
-```
-
-### Verifier Performance Dashboard
-
-```bash
-# Aggregate verifier stats across sessions
-jq -r '[.[] | select(.type=="verifier_complete")] | group_by(.status) | map({status: .[0].status, count: length, avg_duration: (map(.duration_ms) | add / length)})' *.jsonl
-```
-
-### Verifier Success Rate by Task Type
-
-```bash
-# Track which task types have the best verifier pass rates
-for f in *.jsonl; do
-  TASK=$(jq -r 'select(.type=="session_start") | .prompt' "$f")
-  RESULT=$(jq -r 'select(.type=="verifier_complete") | .status' "$f")
-  echo "$RESULT: $TASK"
-done | sort | uniq -c
-```
-
-> **Tip:** Design verifiers that are fast, independent, and specific. A bad verifier is worse than no verifier — it gives false confidence or wastes time debugging the verifier instead of the actual code.
+Keep the verifier output with the CI artifact or JSONL stream so reviewers can
+distinguish a verified result from an unverified one.

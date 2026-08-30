@@ -1,239 +1,49 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # MCP 集成
 
+MCP 服务器在用户拥有的 Orca 配置中声明，不由单独的公开命令空间管理。编辑 TOML 后，审查服务器命令或端点，再启动使用该配置的交互式或无头任务。
 
-模型上下文协议（MCP）让 Orca 能够连接外部工具和数据源。本页涵盖配置 MCP 服务器、工具命名和发现、资源和提示，以及流行 MCP 服务器表。
+设置 ORCA_HOME 时，用户配置位于 $ORCA_HOME/config.toml；否则位于 ~/.orca/config.toml。项目配置仅在工作区已受信任后才会生效。
 
-<div class="docs-diagram">
+## Stdio 服务器
 
-![MCP 集成架构 — Orca 的 MCP 工具路由通过 stdio/SSE 传输层连接到 Filesystem、GitHub、Browser 等 MCP 服务器，JSON-RPC 结果回填到智能体回合消息。](/docs-assets/diagram-mcp.svg)
+~~~toml
+[[mcp_servers]]
+name = "repository"
+transport = "stdio"
+command = "node"
+args = ["/absolute/path/to/server.mjs"]
+startup_timeout_ms = 10000
+tool_timeout_ms = 30000
 
-</div>
+[mcp_servers.capabilities]
+read = true
+write = false
+metadata_write = false
+network = false
+shell = false
+agent = false
+~~~
 
-## 配置 MCP 服务器
+## SSE 服务器
 
-### TOML 配置
+~~~toml
+[[mcp_servers]]
+name = "docs"
+transport = "sse"
+url = "https://mcp.example.test/sse"
+headers = { Authorization = "Bearer token-from-environment" }
+startup_timeout_ms = 10000
+tool_timeout_ms = 30000
+~~~
 
-在 Orca 配置的 `[[mcp.servers]]` 部分添加 MCP 服务器：
+transport 只能是 stdio 或 sse。stdio 服务器需要 command；SSE 服务器需要 url。凭据尽量放在环境变量中，并且只授予集成实际所需的能力。
 
-```toml
-# ~/.config/orca/config.toml
+## 安全操作
 
-[mcp]
-enabled = true
-connection_timeout_ms = 5000
-max_servers = 10
+1. 从只读能力集开始。
+2. 本地服务器程序使用绝对路径。
+3. 信任项目配置前先审查工作区。
+4. 使用 orca doctor 验证本地配置和沙箱就绪状态；它是只读的，不会启动 MCP 服务器。
+5. 任务运行期间在交互式 TUI 中查看状态。
 
-# Filesystem 服务器（文件访问必需）
-[[mcp.servers]]
-name = "filesystem"
-command = "npx"
-args = [
-    "-y",
-    "@modelcontextprotocol/server-filesystem",
-    "/absolute/path/to/allowed/directory"
-]
-env = {}
-
-# GitHub 服务器
-[[mcp.servers]]
-name = "github"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
-
-# PostgreSQL 服务器
-[[mcp.servers]]
-name = "postgres"
-command = "npx"
-args = [
-    "-y",
-    "@modelcontextprotocol/server-postgres",
-    "postgresql://user:password@localhost:5432/mydb"
-]
-```
-
-### 服务器配置参考
-
-| 字段 | 类型 | 必填 | 描述 |
-|------|------|------|------|
-| `name` | string | ✅ | 唯一服务器标识符 |
-| `command` | string | ✅ | 启动服务器的命令 |
-| `args` | string[] | ✅ | 命令参数 |
-| `env` | table | | 环境变量 |
-| `disabled` | bool | | 临时禁用服务器 |
-| `priority` | int | | 工具命名优先级（越小 = 越高优先级） |
-
-### 环境变量插值
-
-使用 `${VAR_NAME}` 插值环境变量：
-
-```toml
-env = {
-  GITHUB_TOKEN = "${GITHUB_TOKEN}",
-  API_BASE = "${API_BASE_URL:-https://api.default.com}"
-}
-```
-
----
-
-## 工具命名和发现
-
-### MCP 工具如何暴露
-
-每个 MCP 服务器暴露 Orca 可供智能体使用的工具。工具按服务器名称命名空间分隔：
-
-```
-服务器："github"
-工具：
-  github:list_repositories
-  github:create_pull_request
-  github:get_issue
-
-服务器："postgres"
-工具：
-  postgres:query
-  postgres:list_tables
-  postgres:describe_table
-```
-
-### 工具发现
-
-Orca 在启动时发现 MCP 工具：
-
-```bash
-# 检查已发现的工具
-orca mcp list-tools
-
-# 输出：
-# ✅ github (已连接)
-#   - github:list_repositories
-#   - github:create_pull_request
-# ✅ postgres (已连接)
-#   - postgres:query
-#   - postgres:list_tables
-```
-
----
-
-## MCP 资源和提示
-
-### MCP 资源
-
-MCP 服务器可以暴露**资源**——可注入上下文的数据：
-
-```
-@mcp:github:repository_readme   → 注入仓库 README
-@mcp:postgres:table_schema      → 注入表 schema
-```
-
-### MCP 提示
-
-MCP 服务器也可以暴露**提示**——预定义的交互模式：
-
-```
-/mcp:github:review_pr <pr-number>   → 使用 GitHub API 审查 PR
-/mcp:postgres:schema_review         → 审查数据库 schema
-```
-
-### 列出资源和提示
-
-```bash
-# 列出 MCP 资源
-orca mcp list-resources
-
-# 列出 MCP 提示
-orca mcp list-prompts
-```
-
----
-
-## 流行 MCP 服务器
-
-### 服务器目录
-
-| 服务器 | 包 | 工具 | 用例 |
-|--------|-----|------|------|
-| **Filesystem** | `@modelcontextprotocol/server-filesystem` | 读取、写入、列表、搜索 | 允许目录内的文件访问 |
-| **GitHub** | `@modelcontextprotocol/server-github` | 仓库、PR、问题、文件 | GitHub 自动化 |
-| **PostgreSQL** | `@modelcontextprotocol/server-postgres` | 查询、schema、表 | PostgreSQL 数据库访问 |
-| **Slack** | `@modelcontextprotocol/server-slack` | 消息、频道、文件 | Slack 集成 |
-| **Docker** | `@modelcontextprotocol/server-docker` | 容器、镜像、日志 | Docker 管理 |
-| **Memory** | `@modelcontextprotocol/server-memory` | 存储、检索、搜索 | 持久化内存 |
-| **Fetch** | `@modelcontextprotocol/server-fetch` | 获取、搜索 | Web 内容检索 |
-
-### 流行服务器配置
-
-#### GitHub MCP
-
-```toml
-[[mcp.servers]]
-name = "github"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
-```
-
-#### PostgreSQL MCP
-
-```toml
-[[mcp.servers]]
-name = "postgres"
-command = "npx"
-args = [
-    "-y",
-    "@modelcontextprotocol/server-postgres",
-    "postgresql://user:pass@host:5432/dbname"
-]
-```
-
-#### Memory MCP（持久化知识）
-
-```toml
-[[mcp.servers]]
-name = "memory"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-memory"]
-env = { MEMORY_FILE = "~/.orca-memory.json" }
-```
-
----
-
-## 排查 MCP 问题
-
-### 连接失败
-
-```bash
-# 诊断 MCP 问题
-orca mcp diagnose
-
-# 输出：
-# ✅ filesystem: 已连接
-# ✅ github: 已连接
-# ⚠️ postgres: 连接超时 (5000ms)
-#   → 检查 PostgreSQL 是否正在运行
-#   → 验证连接字符串
-```
-
-### 服务器无响应
-
-```bash
-# 重启特定服务器
-orca mcp restart github
-
-# 重启所有服务器
-orca mcp restart --all
-```
-
-### 配置验证
-
-```bash
-# 验证 MCP 配置
-orca config validate
-
-# 测试每个服务器
-orca mcp test github
-```
-
-> **提示：** 从必要的服务器开始：Filesystem、一个数据库和一个通信工具。限制并发服务器数量——超过 5-6 个会降低智能体速度。
+公开 CLI 不提供列出、重启、测试或诊断单个 MCP 服务器的命令。这些生命周期动作属于运行中会话和配置边界。

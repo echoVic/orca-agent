@@ -1,320 +1,41 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+# 工作流
 
-# Workflows 工作流
+工作流是协调多个 Agent 调用的本地持久化程序。公开 CLI 通过 orca workflow 提供其生命周期操作。
 
-
-工作流是协调多个 Orca 智能体跨阶段的多步骤过程。它们支持分支、上下文通道、错误恢复和结构化执行。本页涵盖工作流结构、构建块以及如何运行工作流。
-
-## 工作流结构
-
-### 定义
-
-**工作流**是 YAML 定义的多步骤过程，其中每个步骤是独立的智能体执行。步骤可以通过通道共享上下文，根据条件分支，并从失败中恢复。
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    工作流概念                                     │
-│                                                                 │
-│  目标："将代码库迁移到 TypeScript"                             │
-│                                                                 │
-│  步骤 1：[智能体] 分析代码库 → 产出迁移计划                    │
-│     │                                                           │
-│     ▼                                                           │
-│  步骤 2：[智能体] 转换配置文件（tsconfig 等）                   │
-│     │                                                           │
-│     ▼                                                           │
-│  步骤 3：[智能体] 转换 src/auth/                                │
-│     │                                                           │
-│     ▼                                                           │
-│  步骤 4：[智能体] 转换 src/api/  步骤 5：[智能体] 转换          │
-│         （并行）                    src/utils/（并行）           │
-│     │                                    │                     │
-│     ▼                                    ▼                     │
-│  步骤 6：[智能体] 集成和测试（依赖 3、4、5）                   │
-│     │                                                           │
-│     ▼                                                           │
-│  步骤 7：[智能体] 最终验证                                      │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 工作流 YAML 结构
-
-```yaml
-# workflows/typescript-migration.yaml
-
-name: "TypeScript 迁移"
-description: "增量式地将 JavaScript 代码库迁移到 TypeScript"
-version: "1.0"
-
-settings:
-  model: "deepseek-v4-flash"
-  default_max_turns: 30
-  default_max_cost: 5.00
-  failure_strategy: "continue_on_error"
-
-channels:
-  migration_plan:
-  converted_files:
-  test_results:
-
-steps:
-  - id: analyze
-    name: "分析代码库"
-    agent: |
-      分析项目结构并创建迁移计划：
-      1. 识别所有 JavaScript 文件
-      2. 确定模块之间的依赖关系
-      3. 评估迁移复杂度
-      4. 输出优先迁移计划
-    outputs:
-      - channel: migration_plan
-    budget:
-      max_turns: 10
-      max_cost: 1.50
-    verifier:
-      run: "test -f .orca/migration-plan.md"
-
-  - id: setup
-    name: "设置 TypeScript 配置"
-    depends_on: [analyze]
-    agent: |
-      设置 TypeScript 配置：
-      1. 根据迁移计划创建 tsconfig.json
-      2. 安装类型依赖
-      3. 配置 TypeScript linting
-    budget:
-      max_turns: 5
-      max_cost: 0.80
-    verifier:
-      run: "npx tsc --noEmit"
-
-  - id: convert-auth
-    name: "转换 Auth 模块"
-    depends_on: [setup]
-    agent: |
-      将 src/auth/ 转换为 TypeScript：
-      1. 为所有函数添加类型注解
-      2. 创建数据结构的接口
-      3. 修复所有类型错误
-      4. 运行测试验证
-    inputs:
-      - channel: migration_plan
-    budget:
-      max_turns: 15
-      max_cost: 2.00
-    verifier:
-      run: "npm test -- --testPathPattern=auth"
-
-  - id: convert-api
-    name: "转换 API 模块"
-    depends_on: [setup]
-    agent: |
-      将 src/api/ 转换为 TypeScript...
-    budget:
-      max_turns: 15
-      max_cost: 2.00
-    verifier:
-      run: "npm test -- --testPathPattern=api"
-
-  - id: integrate
-    name: "集成和测试"
-    depends_on: [convert-auth, convert-api]
-    agent: |
-      集成所有转换的模块并运行完整测试...
-    budget:
-      max_turns: 20
-      max_cost: 3.00
-    verifier:
-      run: "npm test && npx tsc --noEmit"
-
-  - id: final-verify
-    name: "最终验证"
-    depends_on: [integrate]
-    agent: |
-      执行最终验证：
-      1. 运行完整测试套件
-      2. 检查构建
-      3. 验证迁移计划中所有文件均已转换
-    budget:
-      max_turns: 5
-      max_cost: 0.50
-    verifier:
-      run: "npm test && npm run build"
-```
-
----
-
-## 构建块
-
-### setup
-
-`setup` 块在任何步骤运行之前初始化工作流环境：
-
-```yaml
-settings:
-  model: "deepseek-v4-flash"
-  default_max_turns: 30
-  default_max_cost: 5.00
-  environment:
-    - name: "NODE_ENV"
-      value: "test"
-  pre_commands:
-    - "npm ci"
-    - "npm run build"
-  failure_strategy: "continue_on_error"
-  max_parallel_steps: 4
-```
-
-### run
-
-`agent` 块定义每个步骤的智能体行为：
-
-```yaml
-steps:
-  - id: my-step
-    agent: |
-      智能体的多指令提示。
-      这是 Orca 将使用的提示词。
-      
-      智能体可以访问：
-      - 当前项目上下文
-      - 输入通道（来自之前的步骤）
-      - 工具（文件、Shell、搜索）
-      - 步骤的预算约束
-      
-      完成后输出到指定通道。
-```
-
-### ctx.map
-
-`ctx.map` 定义数据如何在步骤之间流动——将输入通道映射到智能体的上下文并输出通道：
-
-```yaml
-steps:
-  - id: step-b
-    depends_on: [step-a]
-    agent: "处理数据"
-    ctx:
-      map:
-        - from: step-a.output_data
-          to: input_data
-          transform: "json_to_text"
-```
-
-### ctx.channel
-
-`ctx.channel` 定义了在单个步骤之外持久存在的持久数据通道：
-
-```yaml
-channels:
-  shared_state:
-  results:
-  errors:
-
-steps:
-  - id: step-1
-    agent: "生成数据"
-    ctx:
-      set:
-        - channel: shared_state
-          value: "initial_value"
-
-  - id: step-2
-    agent: "使用共享数据"
-    ctx:
-      get:
-        - channel: shared_state
-          as: state_value
-      set:
-        - channel: results
-          append: true
-          value: "step_2_result"
-```
-
-### ctx.set 和 ctx.get
-
-`ctx.set` 写入通道，`ctx.get` 从通道读取：
-
-```yaml
-steps:
-  - id: producer
-    agent: "生成受影响文件列表"
-    ctx:
-      set:
-        - channel: affected_files
-          value: "src/auth/login.ts\nsrc/auth/token.ts"
-
-  - id: consumer
-    agent: "读取受影响的文件并修复它们"
-    ctx:
-      get:
-        - channel: affected_files
-          as: files_to_fix
-```
-
----
+~~~text
+orca workflow run [OPTIONS] <SCRIPT_OR_NAME>
+orca workflow list [--name NAME] [--run-id RUN_ID] [--status STATUS]
+orca workflow show <TASK_ID>
+orca workflow source <NAME>
+orca workflow stop <TASK_ID>
+orca workflow pause <TASK_ID>
+orca workflow resume <RUN_ID>
+orca workflow clone <RUN_ID>
+orca workflow restart-failed <RUN_ID>
+orca workflow restart-phase <RUN_ID> <PHASE>
+~~~
 
 ## 运行工作流
 
-### 命令行
+~~~bash
+orca workflow run ./workflows/review.js --cwd ./my-project
+orca workflow run review --args '{"base":"main"}'
+orca workflow run review --resume-from-run-id RUN_ID
+~~~
 
-```bash
-# 运行工作流
-orca workflow run workflows/typescript-migration.yaml
+run 支持 --cwd、--model、--api-key、--base-url、--args 和 --resume-from-run-id。它不接受无头 orca exec 的预算或输出参数；自动化之前先查看 orca workflow run --help。
 
-# 带覆盖参数运行
-orca workflow run workflows/typescript-migration.yaml \
-  --model deepseek-v4-pro \
-  --max-turns 50
+名称形式从配置的工作流目录解析；路径形式直接指定脚本。工作流脚本是带元数据导出的 JavaScript 模块，不是 YAML 文件。应把脚本、验证逻辑和输入模式放进版本控制。
 
-# 仅运行特定步骤
-orca workflow run workflows/typescript-migration.yaml \
-  --steps setup,convert-auth,integrate
+## 观察与恢复
 
-# 恢复失败的工作流
-orca workflow resume <workflow-id>
-```
+~~~bash
+orca workflow list --status running
+orca workflow show TASK_ID
+orca workflow pause TASK_ID
+orca workflow resume RUN_ID
+~~~
 
-### 工作流状态
+使用 show 检查一条已持久化运行。暂停、停止、重启和克隆都绑定其任务或运行 ID。恢复的工作流只复用已完成的持久化边界；中断的工具操作在检查目标状态前都应视为可能已经生效。
 
-```bash
-orca workflow status <workflow-id>
-
-# 输出：
-# 工作流：TypeScript 迁移
-# 状态：进行中
-#
-# 步骤：
-#   ✅ analyze         (10 回合，$1.20)
-#   ✅ setup           (5 回合，$0.40)
-#   ✅ convert-auth    (12 回合，$1.80)
-#   🔄 convert-api     (3/10 回合，$0.45) ← 运行中
-#   ⏳ integrate
-#   ⏳ final-verify
-```
-
----
-
-## 工作流 vs. Goal 模式
-
-| 功能 | Goal 模式 | 工作流模式 |
-|------|-----------|-----------|
-| 粒度 | 单个智能体执行 | 多步骤、多智能体 |
-| 依赖关系 | 无（单个目标） | 步骤依赖关系 |
-| 上下文共享 | 隐式（会话） | 显式通道 |
-| 并行性 | 不支持 | 通过 `depends_on` 支持 |
-| 错误恢复 | 重试 + 升级 | 每步骤策略 |
-| 预算 | 单一预算 | 每步骤预算 + 工作流预算 |
-| 用例 | 单一专注任务 | 复杂多阶段项目 |
-
-### 何时使用哪个
-
-| 场景 | 推荐 |
-|------|------|
-| 修复 bug | Goal 模式 |
-| 添加功能 | Goal 模式（复杂）或 Prompt 模式（简单） |
-| 重构单个模块 | Goal 模式 |
-| 重构整个代码库 | 工作流模式 |
-| CI/CD 管道 | 工作流模式 |
-| 日常维护 | Goal 模式（已保存的模板） |
+需要查看实时子 Agent 活动时，TUI 是更完整的入口。命令行刻意只负责启动、检查和控制已持久化的工作流。

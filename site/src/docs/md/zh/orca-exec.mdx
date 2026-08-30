@@ -1,200 +1,67 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # orca exec
 
+orca exec 用于执行一个非交互任务，是脚本和 CI 的公开入口。需要在任务运行时检查完整对话时，应使用交互式 TUI。
 
-`orca exec` 是 Orca 的无头、非交互式执行模式。它运行单个智能体任务而无需 TUI，使其成为 CI/CD 管道、批量脚本和自动化的理想选择。本页涵盖基本用法、退出码、预算门控、验证器最佳实践和 CI 集成。
+## 语法
 
-## 基本工作流
+~~~text
+orca exec [OPTIONS] [PROMPT]...
+orca exec [OPTIONS] resume [SESSION_ID] [PROMPT]...
+~~~
 
-### 命令结构
+提示词是位置参数。传入 - 时从标准输入读取提示词。
 
-```bash
-orca exec <prompt> [flags]
-```
+~~~bash
+orca exec "修复解析器失败的测试" --verifier "cargo test -p parser"
+printf '%s\n' "总结已修改的文件" | orca exec -
+~~~
 
-### 基本示例
+## 执行参数
 
-```bash
-# 单次执行
-orca exec "修复 src/auth/__tests__/login.test.ts 中的失败测试"
+| 参数 | 用途 |
+| --- | --- |
+| --output-format <text|jsonl> | 选择人类可读文本或每行一个 JSON 事件；默认是 text。 |
+| --cwd <PATH> | 指定工作区。 |
+| --mode <suggest|auto-edit|full-auto|plan> | 选择工具审批策略。 |
+| --model <MODEL>, --api-key <KEY>, --base-url <URL> | 覆盖本次运行的提供商配置。 |
+| --verifier <COMMAND> | 任务结束后执行验证命令。 |
+| --max-turns <N>, --max-tool-calls <N> | 限制模型回合或工具调用数。 |
+| --max-cost-usd <USD>, --max-wall-time-secs <SECONDS> | 限制估算费用或运行时间。 |
+| --no-history | 不记录本次运行。 |
+| --save-history | JSONL 运行同时保留本地会话记录。 |
 
-# 使用特定模型
-orca exec --model deepseek-v4-pro "设计从 REST 到 GraphQL 的迁移"
+所有资源限制默认不设上限。验证器是可选的；没有可靠自动检查时，不要传 --verifier。
 
-# 带预算门控
-orca exec --max-turns 20 --max-cost 3.00 "重构支付模块"
-```
+## CI 示例
 
-### 完整工作流示例
-
-```bash
-#!/usr/bin/env bash
-# run-orca-task.sh
-
-set -euo pipefail
-
-TASK="$1"
-PROJECT_DIR="/path/to/project"
-
-cd "$PROJECT_DIR"
-
-echo "▶ 运行 Orca 任务：$TASK"
+~~~bash
+set -o pipefail
 
 orca exec \
-  "$TASK" \
-  --model deepseek-v4-flash \
-  --max-turns 25 \
-  --max-cost 5.00 \
-  --verifier "npm test -- --silent" \
-  --output "./reports/orca-$(date +%s).jsonl"
+  --cwd "$GITHUB_WORKSPACE" \
+  --mode auto-edit \
+  --max-turns 20 \
+  --max-cost-usd 3 \
+  --verifier "npm test" \
+  "修复失败的测试" \
+  > orca-events.txt
+~~~
 
-EXIT_CODE=$?
+需要结构化事件时，选择 JSONL 并由 shell 重定向标准输出：
 
-case $EXIT_CODE in
-  0)
-    echo "✅ 任务成功完成"
-    ;;
-  2)
-    echo "⏱️  预算耗尽——任务对于分配的预算来说过于复杂"
-    ;;
-  3)
-    echo "❌ 验证器失败——智能体完成但测试未通过"
-    ;;
-  *)
-    echo "⚠️  Orca 退出码为 $EXIT_CODE"
-    ;;
-esac
+~~~bash
+orca exec \
+  --output-format jsonl \
+  --save-history \
+  --verifier "cargo test" \
+  "修复回归" \
+  > orca-events.jsonl
+~~~
 
-exit $EXIT_CODE
-```
+自动化应使用进程退出状态和验证器输出作为门槛。Orca 不承诺一套额外稳定的数字退出码分类，因此脚本不应根据未公开的退出码名称推断结果。
 
----
+## 相关页面
 
-## 退出码
-
-### 完整退出码参考
-
-<Callout type="info">
-
-| 代码 | 名称 | 含义 | 建议操作 | |------|------|------|----------| | `0` | 成功 | 智能体完成任务且验证器通过 | 完成——相信结果 | | `1` | 通用错误 | 未指定错误 | 查看 stderr 了解详情 | | `2` | 预算耗尽 | 达到最大回合数或费用但未完成 | 使用 `orca exec resume` 恢复或增加预算 | | `3` | 验证器失败 | 智能体完成但验证命令返回非零 | 检查验证器输出；智能体可能产出了部分结果 | | `4` | 审批被拒绝 | 智能体在非交互模式下遇到审批墙 | 切换到 `auto-edit` 或 `full-auto`，或在 TUI 模式下运行 | | `5` | 模型错误 | API 错误、速率限制或提供商服务中断 | 延迟后重试；检查 API 状态 | | `6` | 配置错误 | 缺少 API 密钥、模型无效等 | 修复配置并重试 | | `7` | 会话错误 | 状态损坏、加载失败 | 重新开始或修复会话 |
-
-</Callout>
-
----
-
-## 预算门控
-
-### 什么是预算门控？
-
-预算门控是硬性限制，防止智能体无限期运行。每次回合后检查：
-
-| 门控 | 标志 | 默认值 | 描述 |
-|------|------|--------|------|
-| 最大回合数 | `--max-turns` | 50 | 智能体回合（模型调用）最大数量 |
-| 最大费用 | `--max-cost` | $5.00 | 以美元计的最大 token 费用 |
-| 最大时间 | （配置） | 30 分钟 | 最大挂钟时间 |
-
-### 设置预算
-
-```bash
-# 简单任务的保守预算
-orca exec "格式化所有文件" --max-turns 5 --max-cost 0.50
-
-# 中等任务的适中预算
-orca exec "添加输入验证" --max-turns 15 --max-cost 2.00
-
-# 复杂任务的充足预算
-orca exec "重构认证系统" --max-turns 50 --max-cost 10.00
-```
-
----
-
-## 验证器最佳实践
-
-### 什么是验证器？
-
-验证器是一个 Shell 命令，在智能体完成后运行，检查智能体是否成功完成任务。
-
-### 好的验证器 vs. 差的验证器
-
-| 验证器 | 质量 | 原因 |
-|--------|------|------|
-| `npm test` | ✅ 好 | 完整测试套件——全面验证 |
-| `npm test -- --testPathPattern=auth` | ✅ 好 | 针对特定更改的目标测试 |
-| `npx tsc --noEmit` | ✅ 好 | 类型检查——捕获类型错误 |
-| `echo "done"` | ❌ 差 | 总是成功——不提供验证 |
-| `ls src/` | ❌ 差 | 几乎总是成功——无真正检查 |
-
-### 验证器模式
-
-#### 1. 测试套件
-
-```bash
-orca exec "修复登录 bug" --verifier "npm test -- --testPathPattern=login"
-```
-
-#### 2. 类型/编译检查
-
-```bash
-orca exec "重构为 TypeScript" --verifier "npx tsc --noEmit"
-```
-
-#### 3. 多步骤验证
-
-```bash
-orca exec "完整重构" --verifier 'bash -c "npm test && npx tsc --noEmit && npx eslint src/"'
-```
-
----
-
-## CI 集成
-
-### GitHub Actions
-
-```yaml
-name: Orca 自动修复
-
-on:
-  schedule:
-    - cron: "0 2 * * *"
-
-jobs:
-  orca-fix:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - run: npm ci
-      - run: npm install -g @orcla/cli
-      - name: 运行 Orca
-        run: |
-          orca exec "修复任何失败的测试" \
-            --model deepseek-v4-flash \
-            --max-turns 30 \
-            --max-cost 5.00 \
-            --verifier "npm test" \
-            --output orca-report.jsonl
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      - name: 上传报告
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: orca-report
-          path: orca-report.jsonl
-```
-
-### 批处理
-
-```bash
-# 使用 xargs 批量处理多个文件
-git diff --name-only HEAD~5 | grep '\.ts$' | while read file; do
-  echo "处理中：$file"
-  orca exec "为 $file 添加 JSDoc" \
-    --verifier "npx eslint $file" \
-    --max-turns 10
-done
-```
+- [恢复无头运行](orca-exec-resume.md)
+- [消费 JSONL 输出](jsonl-output.md)
+- [CLI 参考](cli-reference.md)

@@ -1,230 +1,36 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
+# 目标导向任务
 
-# Goal 模式
+Orca 的公开 CLI 不要求单独的目标文件格式。将目标、边界和验收条件写进任务请求，再用资源限制和验证器让这些边界可执行。
 
+~~~bash
+orca exec \
+  --mode suggest \
+  --max-turns 20 \
+  --max-tool-calls 80 \
+  --max-cost-usd 3 \
+  --verifier "npm test -- --runInBand" \
+  "修复 token 刷新。只改 src/auth 及其测试；若依赖受阻请说明。"
+~~~
 
-Goal 模式让你可以为 Orca 追求的目标定义结构化的、带预算门控的目标。Goal 是声明式的规范，包含明确的预算控制、成功标准和操作约束。本页涵盖什么是 Goal 模式、如何使用 Goal 命令以及操作栅栏的工作方式。
+## 一份有用的任务说明
 
-## 什么是 Goal 模式？
+重要任务至少应说明四件事：
 
-### 概念
+1. **结果**：完成后必须成立的事实。
+2. **范围**：允许和禁止触及的文件、系统与操作。
+3. **预算**：需要时限制回合、工具调用、费用和运行时间。
+4. **证据**：验证命令或其他可观察的完成检查。
 
-**Goal** 是 YAML 定义的客观目标，Orca 自主追求。Goal 超越了简单的提示词——它们包括明确的预算门控、成功标准和操作约束。
+审批模式是第五个独立约束。plan 始终只读；suggest、auto-edit 和 full-auto 依次扩大执行策略。选择具备写入或网络能力的模式前，先审查工作区及其信任决定。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Goal 模式概念                                 │
-│                                                                 │
-│  Prompt 模式（基础）：                                          │
-│    "修复登录 bug"                                               │
-│    → 智能体工作直到完成或预算耗尽                               │
-│    → 没有明确的成功标准                                         │
-│                                                                 │
-│  Goal 模式（结构化）：                                          │
-│    Goal: {                                                     │
-│      objective: "修复登录 token 过期 bug",                      │
-│      budget: { max_turns: 20, max_cost: $3.00 },               │
-│      verifier: "npm test -- login",                             │
-│      success_criteria: [                                       │
-│        "所有登录测试通过",                                     │
-│        "Token 过期在刷新前被检查"                              │
-│      ]                                                          │
-│    }                                                           │
-│    → 智能体在预算内追求目标                                     │
-│    → 验证器验证成功                                             │
-│    → 操作栅栏防止范围蔓延                                      │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+## 可重复任务
 
-### 何时使用 Goal 模式
+长提示词应放在仓库中的脚本或 CI 任务里，不要依赖自定义命令空间。这样目标可以和验证器一起审查，也便于迁移：
 
-| 场景 | 为什么选择 Goal 模式 |
-|------|---------------------|
-| 多步骤重构 | 预算门控防止失控的变更 |
-| Bug 修复活动 | 成功标准确保彻底解决 |
-| CI 自动化 | 声明式目标更易于版本控制和审查 |
-| 复杂调试 | 带可验证检查点的结构化方法 |
-| 重复性任务 | Goal 可以保存并重新运行 |
-| 团队协作 | Goal 作为清晰的任务规范 |
+~~~bash
+orca exec --output-format jsonl --save-history \
+  --verifier "./scripts/verify-auth.sh" \
+  "$(cat .orca/tasks/fix-token-refresh.txt)" > run.jsonl
+~~~
 
----
-
-## Goal 定义
-
-### 结构
-
-```yaml
-# goals/fix-login-bug.yaml
-
-objective: "修复登录 token 过期验证 bug"
-
-description: |
-  登录模块在生成刷新 token 之前未能验证 token 过期时间，
-  导致过期 token 可以无限期使用。
-
-budget:
-  max_turns: 25
-  max_cost_usd: 4.00
-  max_duration_minutes: 15
-
-verifier:
-  type: command
-  run: "npm test -- --testPathPattern=login"
-  expect: "exit_code == 0"
-
-success_criteria:
-  - "Token 过期在 validateToken() 中被检查"
-  - "过期 token 被拒绝并返回 401"
-  - "所有现有登录测试通过"
-  - "认证模块测试无回归"
-
-fences:
-  max_files_changed: 10
-  forbid_new_files: false
-  forbid_removals: false
-  require_approval_for: ["delete", "rm "]
-
-context:
-  files:
-    - src/auth/token.ts
-    - src/auth/login.ts
-    - src/auth/__tests__/login.test.ts
-  search_terms:
-    - "validateToken"
-    - "token 过期"
-    - "jwt expiration"
-
-on_failure:
-  strategy: "retry_with_feedback"
-  max_retries: 2
-  fallback: "escalate"
-```
-
-### Goal 字段参考
-
-| 字段 | 类型 | 必填 | 描述 |
-|------|------|------|------|
-| `objective` | string | ✅ | 一句话目标 |
-| `description` | string | | 详细上下文和背景 |
-| `budget.max_turns` | int | ✅ | 最大智能体回合数 |
-| `budget.max_cost_usd` | float | ✅ | 最大 token 费用 |
-| `verifier.run` | string | ✅ | 验证命令 |
-| `success_criteria` | string[] | | 人类可读的成功标准 |
-| `fences.max_files_changed` | int | | 限制更改的文件数 |
-| `on_failure.strategy` | enum | | 失败策略（`retry`、`escalate`、`stop`） |
-
----
-
-## Goal 命令
-
-```bash
-# 从 YAML 文件运行 goal
-orca goal run goals/fix-login-bug.yaml
-
-# 带覆盖参数运行
-orca goal run goals/fix-login-bug.yaml --max-turns 30 --max-cost 5.00
-
-# 以无头模式运行
-orca exec --goal goals/fix-login-bug.yaml
-
-# 带内联 goal 运行
-orca goal run --objective "添加深色模式切换" --verifier "npm test" --max-turns 15
-```
-
-### 状态命令
-
-| 命令 | 描述 |
-|------|------|
-| `orca goal run <file>` | 从 YAML 文件运行 goal |
-| `orca goal status <session-id>` | 检查 goal 进度 |
-| `orca goal list` | 列出所有已保存的 goal |
-| `orca goal validate <file>` | 验证 goal YAML 文件 |
-
----
-
-## 操作栅栏
-
-### 什么是操作栅栏？
-
-操作栅栏是**强制约束**，防止智能体偏离 goal 的范围。它们在执行期间充当初等防线。
-
-### 栅栏类型
-
-#### 文件更改限制
-
-```yaml
-fences:
-  max_files_changed: 10
-  max_new_files: 3
-  max_lines_changed: 500
-```
-
-#### 操作禁止
-
-```yaml
-fences:
-  forbid_new_files: true
-  forbid_removals: true
-  forbid_shell: ["curl", "wget"]
-```
-
-#### 审批要求
-
-```yaml
-fences:
-  require_approval_for:
-    - "delete"
-    - "rm "
-    - "DROP"
-```
-
-#### 硬性预算限制
-
-```yaml
-fences:
-  hard_max_turns: 30
-  hard_max_cost_usd: 5.00
-```
-
----
-
-## 失败策略
-
-### 带反馈重试
-
-```yaml
-on_failure:
-  strategy: "retry_with_feedback"
-  max_retries: 2
-```
-
-### 升级
-
-```yaml
-on_failure:
-  strategy: "escalate"
-  max_retries: 1
-  fallback: "pause_for_human"
-```
-
-### 停止并报告
-
-```yaml
-on_failure:
-  strategy: "stop_and_report"
-```
-
----
-
-## Goal 模式 vs. Prompt 模式
-
-| 功能 | Prompt 模式 | Goal 模式 |
-|------|------------|-----------|
-| 范围控制 | 无 | 操作栅栏 |
-| 预算门控 | 基本回合/费用 | 多维（回合、费用、持续时间） |
-| 验证 | 可选验证器 | 内置验证器门控 |
-| 成功标准 | 隐式 | 显式且可共享 |
-| 失败处理 | 手动 | 可配置策略 |
-| 可重用性 | 无 | Goal 模板可保存和重新运行 |
-| 版本控制 | 对话历史 | YAML 在 git 中 |
+已记录运行未完成时，使用新的位置说明恢复。不要假设中断的工具调用已自动回滚。

@@ -1,299 +1,50 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # Models
 
-
-Orca supports DeepSeek's V4 text models and the experimental V4 Flash Vision model. This page covers model selection, multimodal input, reasoning effort levels, and cost tradeoffs.
-
-## Available Models
-
-### Model Comparison Table
-
-| Property | deepseek-v4-flash | deepseek-v4-flash-vision-exp | deepseek-v4-pro |
-|----------|-------------------|--------------------------------|-----------------|
-| **Primary use case** | Quick edits and routine coding | Screenshots, diagrams, charts, and visual-agent tasks | Architecture and complex debugging |
-| **Image input** | Vision analysis | Direct | Vision analysis |
-| **Context window** | 1M tokens | 1M tokens | 1M tokens |
-| **Max output tokens** | 384K | 384K | 384K |
-| **Reasoning** | Yes | Yes | Yes |
-| **Tool use** | Yes | Yes | Yes |
-| **Peak input/output price** | CNY 3 / 9 per 1M tokens | CNY 3 / 9 per 1M tokens | CNY 9 / 27 per 1M tokens |
-
-<Callout type="info">
-
-`deepseek-v4-flash-vision-exp` is an experimental model released on August 21,
-2026. See DeepSeek's official [Vision guide](https://api-docs.deepseek.com/guides/vision)
-and [pricing](https://api-docs.deepseek.com/quick_start/pricing).
-
-</Callout>
-
-### When to Use Each Model
-
-
-<Tabs>
-<Tab label={"deepseek-v4-flash"}>
-
-
-Choose `deepseek-v4-flash` when:
-
-- **Editing existing code** — small to medium changes across 1–5 files
-- **Searching and understanding** — finding functions, tracing call paths, explaining code
-- **Running tests and fixings** — test-driven development with quick iteration
-- **Batch refactors** — applying consistent patterns across many files
-- **Scripting and automation** — `orca exec` in CI pipelines
-- **Quick prototyping** — scaffolding components, writing boilerplate
-
-```bash
-# Default behavior — flash model
-orca "Add a loading spinner to the dashboard"
-
-# Explicit flash
-orca --model deepseek-v4-flash "Fix the import order in all files"
-
-# Headless with flash
-orca exec "Add error boundaries to React components" --model deepseek-v4-flash
-```
-
-
-</Tab>
-<Tab label={"deepseek-v4-flash-vision-exp"}>
-
-
-Choose `deepseek-v4-flash-vision-exp` when the task depends on visual input:
-
-- inspect UI screenshots and error dialogs
-- read diagrams, charts, or scanned documents
-- compare rendered output with a visual reference
-- combine image understanding with Orca's normal coding tools
-
-The TUI accepts JPEG, PNG, GIF, or WebP images with every model selection. The
-vision model receives images directly. `auto`, Pro, and Flash first ask the
-vision model for a task-aware analysis, then continue the turn with the selected
-coding model.
-
-- Press `Ctrl+V` for the current system clipboard image. Windows also supports
-  `Alt+V`; `Cmd+V` works when the terminal forwards `Super+V` instead of
-  consuming the shortcut itself.
-- Drag image files into the terminal, or paste local image paths and `file://`
-  URLs.
-- Select an image through the normal `@file` picker.
-
-Attachments appear as atomic `[Image #N]` items in the composer. Backspace or
-Delete removes the complete item, while `Ctrl+U` clears the draft and its
-attachments. Image-only prompts, queued follow-ups, queue editing, and rejected
-submission recovery preserve the image data. Clipboard decoding runs in the
-background; pressing Enter before it completes waits and then submits the image.
-Place the cursor on an image item and press Enter to open its preview. Submitted
-images also render in the message area and can be clicked. In the viewer, use
-`+`/`-` to zoom, the arrow keys to pan, `0` to fit, and Esc to close.
-Kitty and Ghostty render native pixels through the Kitty graphics protocol;
-iTerm2 and WezTerm use the inline-image protocol. Terminals without an image
-protocol, including Apple Terminal, use a low-resolution true-color cell
-fallback.
-On SSH sessions without a graphical clipboard, paste or mention an image path
-on the remote host. WSL reads the Windows clipboard when available.
-
-ACP clients can send standard image content blocks. Orca accepts inline base64
-images and public HTTP(S) image URLs, persists replayable image inputs, and
-defaults to `high` detail. Local inline attachments are limited to 5 MiB so the
-complete request remains inside Orca's durable commit boundary.
-
-</Tab>
-<Tab label={"deepseek-v4-pro"}>
-
-
-Choose `deepseek-v4-pro` when:
-
-- **Architectural design** — designing systems, choosing patterns, planning migrations
-- **Complex debugging** — multi-step root cause analysis across many files
-- **Legacy code understanding** — navigating unfamiliar codebases with deep interdependencies
-- **Performance optimization** — identifying bottlenecks and proposing optimizations
-- **Security auditing** — analyzing code for vulnerabilities with deep reasoning
-- **Multi-file refactoring** — reorganizing project structure with many interdependent changes
-- **Test generation** — writing comprehensive test suites with edge case coverage
-- **Onboarding** — understanding a new codebase and generating documentation
-
-```bash
-# Pro model for complex debugging
-orca --model deepseek-v4-pro "Debug the race condition in the WebSocket reconnection logic"
-
-# Pro model for architecture
-orca --model deepseek-v4-pro "Design a migration strategy from REST to GraphQL for this codebase"
-
-# Pro with high reasoning effort
-orca --model deepseek-v4-pro --reasoning-effort high "Refactor the entire data layer to support multi-tenancy"
-```
-
-
-</Tab>
-</Tabs>
-
-### Decision Tree
-
-```
-Is the task:
-├── Requires image understanding?
-│   ├── auto / Pro / Flash → vision analysis, then selected model
-│   └── deepseek-v4-flash-vision-exp → direct image input
-├── Simple / mechanical? (search, edit, format)
-│   └── deepseek-v4-flash
-├── Moderate complexity? (multi-file change, test writing)
-│   ├── < 10 files → deepseek-v4-flash
-│   └── > 10 files → deepseek-v4-pro
-├── Complex / creative? (architecture, debugging, design)
-│   └── deepseek-v4-pro
-└── Unsure?
-    └── Start with flash, upgrade to pro if the agent struggles
-```
-
----
-
-## Reasoning Effort Levels
-
-All supported V4 models accept reasoning effort controls.
-
-### Reasoning Effort Table
-
-| Level | Description | Use When | Relative Cost | Relative Speed |
-|-------|-------------|----------|---------------|----------------|
-| `low` | Minimal reasoning, fast responses | Search, simple edits, formatting | 0.5× | 2× faster |
-| `medium` | Balanced reasoning (default) | Most tasks | 1.0× | Baseline |
-| `high` | Deep reasoning, thorough analysis | Complex planning, debugging, architecture | 2.0× | 2× slower |
-
-### How Reasoning Works
-
-Reasoning is the model's internal chain-of-thought process:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Reasoning Process                          │
-│                                                             │
-│  Input:  [context + user message]                           │
-│                                                             │
-│  Model:  [reasoning tokens...]                              │
-│          "I need to find the login handler..."               │
-│          "It's in src/auth/login.ts..."                     │
-│          "I should check the test too..."                   │
-│          "Found it! Now I'll propose the fix."              │
-│                                                             │
-│  Output: [tool calls / text response]                       │
-│                                                             │
-│  ┌─────────┬──────────┬──────────┐                          │
-│  │   low   │  medium  │   high   │                          │
-│  │ ~50 tok │ ~200 tok │ ~500 tok │                          │
-│  └─────────┴──────────┴──────────┘                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Setting Reasoning Effort
-
-#### CLI Flag
-
-```bash
-# Low effort for quick search
-orca --reasoning-effort low "Find all instances of deprecated API"
-
-# Medium (default) for most tasks
-orca --reasoning-effort medium "Add caching to the API layer"
-
-# High effort for complex architecture
-orca --model deepseek-v4-pro --reasoning-effort high "Redesign the state management layer"
-```
-
-#### Config File
-
-```toml
-[agent]
-reasoning_effort = "medium"  # default for all sessions
-```
-
-#### Per-Turn via Slash Command
-
-Within the TUI, you can change reasoning mid-session:
-
-```
-/reasoning high
-```
-
-### Reasoning Cost Tradeoff
-
-| Effort Level | Example Task | Tokens Used | Cost (flash) | Cost (pro) | Time |
-|-------------|-------------|-------------|-------------|-----------|------|
-| `low` | Find file | 50K | $0.05 | $0.20 | 2s |
-| `medium` | Refactor 3 files | 200K | $0.20 | $0.80 | 8s |
-| `high` | Design system | 500K | $0.50 | $2.00 | 20s |
-
-> **Tip:** Start with `medium`. Use `low` for quick searches and `high` only when the task genuinely benefits from deep analysis. The model will still produce correct results at `low` effort — it just won't explore as many alternatives.
-
----
-
-## Model Switching During Sessions
-
-You can switch models mid-session. Orca handles the transition gracefully:
-
-
-<Steps>
-<Step>
-
-The **current context** is preserved and sent to the new model
-
-</Step>
-<Step>
-
-The **reasoning effort** resets to the configured default for the new model
-
-</Step>
-<Step>
-
-**Token accounting** continues from the session's existing budget
-
-</Step>
-</Steps>
-
-
-```bash
-# In TUI, switch models with:
-/model deepseek-v4-pro
-# or
-/model deepseek-v4-flash
-# or
-/model deepseek-v4-flash-vision-exp
-```
-
-> **Note:** When switching models, the prefix cache breaks (different model = different cache key). The first turn after a switch will be slower as the context is processed fresh.
-
----
-
-## Cost Optimization Tips
-
-### 1. Start with flash
-
-For 80% of tasks, `deepseek-v4-flash` is the right choice. Only upgrade to `pro` when you hit a complexity wall.
-
-### 2. Use reasoning effort strategically
-
-- `low` for search/navigation (50% cost savings)
-- `medium` for most tasks
-- `high` for architecture/debugging (2× cost, but better results)
-
-### 3. Leverage prefix cache
-
-Keep the same session running to benefit from caching. Starting a new session loses cache hits.
-
-### 4. Set budget gates
-
-```bash
-orca exec "Refactor the API" --max-cost 2.00 --max-turns 15
-```
-
-### 5. Use `orca exec` for batch tasks
-
-Headless execution avoids TUI overhead and is slightly faster per turn.
-
-### 6. Monitor cost in real-time
-
-The TUI shows cost per turn and total session cost:
-
-```
-Turn 5 cost: $0.08 | Session total: $0.42 | Budget: $10.00
-```
+Select a provider model with --model for an interactive or headless run:
+
+~~~bash
+orca --model deepseek-v4-pro "Explain the current architecture"
+orca exec --model deepseek-v4-flash "Fix the import ordering" \
+  --verifier "cargo fmt --check"
+~~~
+
+The supported model names and endpoint behavior come from the selected
+provider. Do not treat an example model name as a promise that every endpoint
+supports it. Run orca doctor to inspect the effective local model and endpoint
+configuration before launching a task.
+
+## Persistent selection
+
+Set the model in user configuration or through the environment:
+
+~~~toml
+model = "deepseek-v4-pro"
+reasoning_effort = "high"
+~~~
+
+~~~bash
+export ORCA_MODEL="deepseek-v4-pro"
+export ORCA_REASONING_EFFORT="high"
+~~~
+
+The supported reasoning-effort values are low, high, and max. Set it through
+configuration or the interactive model settings; it is not a per-invocation
+public CLI control.
+
+## Choose by evidence
+
+Start from the model configured for the workspace. Change it only when the task
+needs a different capability, latency, or cost profile, then record the
+verifier result. Execution budgets are separate from model selection:
+
+~~~bash
+orca exec \
+  --model deepseek-v4-flash \
+  --max-turns 15 \
+  --max-cost-usd 2 \
+  --verifier "cargo test -p parser" \
+  "Refactor the parser"
+~~~
+
+For model, credential, endpoint, and trust precedence, see
+[Configuration](configuration.md).

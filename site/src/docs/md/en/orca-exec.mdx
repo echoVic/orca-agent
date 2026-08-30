@@ -1,347 +1,72 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # orca exec
 
+orca exec runs one non-interactive task. It is the public entry point for shell
+scripts and CI. The interactive TUI remains the right place to inspect a
+long-running conversation while it is running.
 
-`orca exec` is Orca's headless, non-interactive execution mode. It runs a single agent task without the TUI, making it ideal for CI/CD pipelines, batch scripts, and automation. This page covers basic usage, exit codes, budget gates, verifier best practices, and CI integration.
+## Syntax
 
-## Basic Workflow
+~~~text
+orca exec [OPTIONS] [PROMPT]...
+orca exec [OPTIONS] resume [SESSION_ID] [PROMPT]...
+~~~
 
-### Command Structure
+The prompt is positional. Pass - to read it from standard input.
 
-```bash
-orca exec <prompt> [flags]
-```
+~~~bash
+orca exec "Fix the failing parser test" --verifier "cargo test -p parser"
+printf '%s\n' "Summarize the changed files" | orca exec -
+~~~
 
-### Basic Example
+## Execution options
 
-```bash
-# Run a single task
-orca exec "Fix the failing test in src/auth/__tests__/login.test.ts"
+| Option | Purpose |
+| --- | --- |
+| --output-format <text|jsonl> | Select human-readable text or one JSON object per event. The default is text. |
+| --cwd <PATH> | Use a specific workspace. |
+| --mode <suggest|auto-edit|full-auto|plan> | Select the tool-approval policy. |
+| --model <MODEL>, --api-key <KEY>, --base-url <URL> | Override the effective provider configuration for this run. |
+| --verifier <COMMAND> | Run a verification command after the task. |
+| --max-turns <N>, --max-tool-calls <N> | Limit model turns or tool calls. |
+| --max-cost-usd <USD>, --max-wall-time-secs <SECONDS> | Limit estimated cost or wall-clock time. |
+| --no-history | Do not record this run locally. |
+| --save-history | Record a JSONL run locally as well as writing its stream to stdout. |
 
-# Run with a specific model
-orca exec --model deepseek-v4-pro "Design a migration from REST to GraphQL"
+All resource limits are unlimited until explicitly supplied. A verifier is
+optional: omit --verifier when the task has no meaningful automated check.
 
-# Run with budget gates
-orca exec --max-turns 20 --max-cost 3.00 "Refactor the payment module"
-```
+## CI example
 
-### Complete Workflow Example
-
-```bash
-#!/usr/bin/env bash
-# run-orca-task.sh
-
-set -euo pipefail
-
-TASK="$1"
-PROJECT_DIR="/path/to/project"
-
-cd "$PROJECT_DIR"
-
-echo "▶ Running Orca task: $TASK"
+~~~bash
+set -o pipefail
 
 orca exec \
-  "$TASK" \
-  --model deepseek-v4-flash \
-  --max-turns 25 \
-  --max-cost 5.00 \
-  --verifier "npm test -- --silent" \
-  --output "./reports/orca-$(date +%s).jsonl"
-
-EXIT_CODE=$?
-
-case $EXIT_CODE in
-  0)
-    echo "✅ Task completed successfully"
-    ;;
-  2)
-    echo "⏱️  Budget exhausted — task too complex for the allotted budget"
-    ;;
-  3)
-    echo "❌ Verifier failed — agent completed but tests didn't pass"
-    ;;
-  *)
-    echo "⚠️  Orca exited with code $EXIT_CODE"
-    ;;
-esac
-
-exit $EXIT_CODE
-```
-
----
-
-## Exit Codes
-
-### Complete Exit Code Reference
-
-<Callout type="info">
-
-| Code | Name | Meaning | Recommended Action | |------|------|---------|-------------------| | `0` | SUCCESS | Agent completed the task and verifier passed | Done — trust the result | | `1` | GENERAL_ERROR | Unspecified error | Check stderr for details | | `2` | BUDGET_EXHAUSTED | Max turns or max cost reached without completion | Resume with `orca exec resume` or increase budget | | `3` | VERIFIER_FAILED | Agent finished but verification command failed | Check the verifier output; the agent may have produced partial results | | `4` | APPROVAL_DENIED | Agent hit an approval wall in non-interactive mode | Switch to `auto-edit` or `full-auto`, or run in TUI mode | | `5` | MODEL_ERROR | API error, rate limit, or provider outage | Retry after a delay; check API status | | `6` | CONFIG_ERROR | Missing API key, invalid model, etc. | Fix the configuration and retry | | `7` | SESSION_ERROR | Corrupted state, failed to load | Start fresh or repair the session |
-
-</Callout>
-
-### Exit Code Handling in Scripts
-
-```bash
-# Safe handling
-orca exec "Fix the build error"
-EXIT=$?
-
-if [ $EXIT -eq 0 ]; then
-  echo "Build fixed!"
-elif [ $EXIT -eq 2 ]; then
-  echo "Budget exhausted. Attempting resume with extended budget..."
-  orca exec resume "$SESSION_ID" --max-turns 10 --max-cost 2.00
-elif [ $EXIT -eq 3 ]; then
-  echo "Verifier failed. Checking what the agent did..."
-  cat "$OUTPUT_FILE" | jq '.events[] | select(.type=="tool_result")'
-else
-  echo "Error: $EXIT" >&2
-  exit 1
-fi
-```
-
----
-
-## Budget Gates
-
-### What Are Budget Gates?
-
-Budget gates are hard limits that prevent the agent from running indefinitely. They are checked after every turn:
-
-| Gate | Flag | Default | Description |
-|------|------|---------|-------------|
-| Max turns | `--max-turns` | 50 | Maximum number of agent turns (model calls) |
-| Max cost | `--max-cost` | $5.00 | Maximum token cost in USD |
-| Max time | (config) | 30 min | Maximum wall-clock time |
-| Max output tokens | (config) | 8K/turn | Maximum tokens per model response |
-
-### Budget Check Flow
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Budget Gate Check                             │
-│                                                                 │
-│  After each turn:                                              │
-│                                                                 │
-│  1. Increment turn counter                                     │
-│     turns += 1                                                 │
-│                                                                 │
-│  2. Calculate accumulated cost                                 │
-│     total_cost += input_cost + output_cost                     │
-│                                                                 │
-│  3. Check gates:                                               │
-│     if turns >= max_turns → EXIT 2 (budget exhausted)          │
-│     if total_cost >= max_cost → EXIT 2 (budget exhausted)      │
-│     if wall_time >= max_time → EXIT 2 (budget exhausted)       │
-│                                                                 │
-│  4. If no gates hit → continue to next turn                   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Setting Budgets
-
-```bash
-# Conservative budget for simple tasks
-orca exec "Format all files" --max-turns 5 --max-cost 0.50
-
-# Moderate budget for medium tasks
-orca exec "Add input validation" --max-turns 15 --max-cost 2.00
-
-# Generous budget for complex tasks
-orca exec "Refactor authentication system" --max-turns 50 --max-cost 10.00
-```
-
-### Budget Tracking
-
-```bash
-# Check current session budget
-orca sessions show <session-id>
-
-# Output:
-# Turns: 23 / 50 (46%)
-# Cost:  $2.14 / $5.00 (43%)
-# Time:  12m / 30m (40%)
-```
-
----
-
-## Verifier Best Practices
-
-### What Is a Verifier?
-
-A verifier is a shell command that checks whether the agent successfully completed its task. The verifier runs after the agent finishes (or when budget is exhausted).
-
-### Good Verifiers vs. Bad Verifiers
-
-<Callout type="warning">
-
-| Verifier | Quality | Why | |----------|---------|-----| | `npm test` | ✅ Good | Full test suite — comprehensive validation | | `npm test -- --testPathPattern=auth` | ✅ Good | Targeted tests for specific changes | | `npx tsc --noEmit` | ✅ Good | Type checking — catches type errors | | `cargo check` | ✅ Good | Compilation check — catches build errors | | `grep -r "TODO" src/` | ⚠️ Mediocre | Checks for TODOs but may have false positives | | `echo "done"` | ❌ Bad | Always succeeds — provides no validation | | `ls src/` | ❌ Bad | Almost always succeeds — no real check |
-
-</Callout>
-
-### Verifier Patterns
-
-#### 1. Test Suite
-
-```bash
-orca exec "Fix the login bug" --verifier "npm test -- --testPathPattern=login"
-```
-
-#### 2. Type / Compilation Check
-
-```bash
-orca exec "Refactor to TypeScript" --verifier "npx tsc --noEmit"
-```
-
-#### 3. Lint Check
-
-```bash
-orca exec "Apply code style" --verifier "npx eslint src/ --max-warnings 0"
-```
-
-#### 4. Custom Verification Script
-
-```bash
-orca exec "Add API endpoint" --verifier 'bash -c "curl -s http://localhost:3000/api/health | grep -q \"ok\""'
-```
-
-#### 5. Multi-Step Verification
-
-```bash
-orca exec "Full refactor" --verifier 'bash -c "npm test && npx tsc --noEmit && npx eslint src/"'
-```
-
-### Verifier Failure Handling
-
-When a verifier fails:
-
-
-<Steps>
-<Step>
-
-Orca exits with code `3` (VERIFIER_FAILED)
-
-</Step>
-<Step>
-
-The agent's work is preserved in the session
-
-</Step>
-<Step>
-
-The JSONL output shows exactly what the agent did
-
-</Step>
-<Step>
-
-You can resume with `orca exec resume` to let the agent fix the issues
-
-</Step>
-</Steps>
-
-
-```bash
-# Resume after verifier failure
-orca exec resume <session-id>
-
-# The agent sees the verifier output and tries to fix the issues
-```
-
----
-
-## CI Integration
-
-### GitHub Actions
-
-```yaml
-name: Orca Automated Fixes
-
-on:
-  schedule:
-    - cron: "0 2 * * *"
-  issue:
-    types: [labeled]
-
-jobs:
-  orca-fix:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Orca
-        run: npm install -g @orcla/cli
-
-      - name: Run Orca
-        run: |
-          orca exec "Fix any failing tests" \
-            --model deepseek-v4-flash \
-            --max-turns 30 \
-            --max-cost 5.00 \
-            --verifier "npm test" \
-            --output orca-report.jsonl
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: orca-report
-          path: orca-report.jsonl
-```
-
-### GitLab CI
-
-```yaml
-orca:
-  stage: automation
-  image: node:20
-  script:
-    - npm ci
-    - npm install -g @orcla/cli
-    - orca exec "Fix linting errors" --verifier "npm run lint" --output report.jsonl
-  artifacts:
-    paths:
-      - report.jsonl
-    when: always
-  only:
-    - schedules
-```
-
-### Batch Processing with xargs
-
-```bash
-# Process multiple files in batch
-git diff --name-only HEAD~5 | grep '\.ts$' | while read file; do
-  echo "Processing: $file"
-  orca exec "Add JSDoc to $file" \
-    --verifier "npx eslint $file" \
-    --max-turns 10
-done
-```
-
-### Monitoring Dashboard
-
-Parse JSONL output for monitoring:
-
-```bash
-# Extract cost per task
-jq -r 'select(.type=="turn_complete") | "\(.turn): \(.cost_usd)"' report.jsonl
-
-# Extract tool calls
-jq -r 'select(.type=="tool_call") | "\(.tool_name)(\(.arguments | fromjson | keys | join(", ")))"' report.jsonl
-
-# Find verifier failures
-jq -r 'select(.type=="session_complete" and .verifier_status!="passed") | "VERIFIER FAILED: \(.verifier_output)"' report.jsonl
-```
+  --cwd "$GITHUB_WORKSPACE" \
+  --mode auto-edit \
+  --max-turns 20 \
+  --max-cost-usd 3 \
+  --verifier "npm test" \
+  "Fix the failing tests" \
+  > orca-events.txt
+~~~
+
+For a structured stream, select JSONL and redirect stdout:
+
+~~~bash
+orca exec \
+  --output-format jsonl \
+  --save-history \
+  --verifier "cargo test" \
+  "Fix the regression" \
+  > orca-events.jsonl
+~~~
+
+Use the process exit status and the verifier output as the automation gate.
+Orca does not publish a stable numeric taxonomy beyond that process result, so
+scripts should not infer semantics from undocumented exit-code labels.
+
+## Related commands
+
+- [Resume a headless run](orca-exec-resume.md)
+- [Consume JSONL output](jsonl-output.md)
+- [CLI reference](cli-reference.md)

@@ -1,350 +1,41 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
-# Session Commands
-
-
-Orca provides a rich set of session management commands accessible via the `/` prefix in the TUI input. This page covers all session commands, the session picker, and session storage.
-
-## Session Management Commands
-
-### Complete Command Table
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `/new` | Start a fresh session | `/new` |
-| `/resume <id>` | Resume an existing session | `/resume 42` |
-| `/fork <spec>` | Fork from a session checkpoint | `/fork 42:turn-17` |
-| `/rename <name>` | Rename the current session | `/rename Fix auth bug` |
-| `/status` | Show session status and budget | `/status` |
-| `/config` | Configure current-session model, reasoning, and approval settings | `/config` |
-| `/copy` | Copy the last assistant message | `/copy` |
-| `/export` | Export session as JSON | `/export` |
-| `/delete <id>` | Permanently delete a session | `/delete 42` |
-| `/sessions` | List all sessions in the picker | `/sessions` |
-
-### Composer Editing Shortcuts
-
-When the composer contains a draft, editing owns terminal-native readline keys before global or transcript actions:
-
-| Key | Draft action | Empty-composer fallback |
-|-----|--------------|-------------------------|
-| `Ctrl+A` / `Ctrl+E` | Move to line start / end | Same editor action |
-| `Ctrl+B` / `Ctrl+F` | Move left / right | `Ctrl+F` opens transcript search |
-| `Alt+B` / `Alt+F` | Move one word left / right | Same editor action |
-| `Ctrl+P` / `Ctrl+N` | Move up / down | Browse prompt history |
-| `Ctrl+W` | Delete previous word | No application action |
-| `Ctrl+D` | Delete forward | Scroll transcript half a page down |
-| `Ctrl+K` | Delete to line end | Open shortcut help |
-| `Ctrl+U` | Clear the composer | Scroll transcript half a page up |
-| `Esc` | Exit Vim Insert/command state | Backtrack only when the composer is empty |
-
-In a running turn, `Ctrl+B` backgrounds the turn only when the composer is empty. Multiline drafts own Up and Down; otherwise those keys scroll the running transcript. `Ctrl+C` remains the process-level cancel/quit control.
-
-### `/config` — Configure the Current Session
-
-```
-/config
-```
-
-The interactive panel edits the current session's model, reasoning effort, and approval mode. Use Up and Down to select a setting, Left and Right to change it, Enter to apply all changes, and Esc to close without applying.
-
-### `/new` — Start a New Session
-
-```
-/new
-```
-
-Creates a fresh session with:
-- New context window (1M tokens available)
-- Same project context (file tree, git status)
-- Default config applied (model, approval, etc.)
-- Old session is preserved and can be resumed
-
-When to use:
-- You've completed one task and are starting another
-- The context window is getting full
-- You want to reset the conversation history
-
-### `/resume` — Resume an Existing Session
-
-```
-/resume <session-id>
-```
-
-Resumes a previous session, restoring:
-- Full conversation history
-- All tool results and file changes
-- Budget state (remaining turns and cost)
-- Cursor position and view state
-
-```bash
-# Resume session 42
-/resume 42
-
-# Resume the last session
-/resume last
-```
-
-### `/fork` — Fork from a Checkpoint
-
-```
-/fork <session-id>:<turn-id>
-```
-
-Creates a new session that branches from a specific point in another session:
-
-```
-# Fork from turn 17 of session 42
-/fork 42:turn-17
-
-# Fork from the beginning of session 42
-/fork 42:turn-1
-
-# Fork with a custom name
-/fork 42:turn-17 Fix the alternative approach
-```
-
-Forking is useful when:
-- You want to try an alternative approach without losing the original
-- A session has gone down a rabbit hole and you want to backtrack
-- You want to compare two solutions side by side
-
-```
-Session 42: [Plan A → ... → Turn 17] [Turn 18: Plan B starts here]
-                              │
-                              ▼
-Session 103: [Turn 1 → ... → Turn 17] → [Plan C starts here]
-                              ↑
-                     Forked from session 42, turn 17
-```
-
-### `/rename` — Rename a Session
-
-```
-/rename Fix the login token expiry bug
-```
-
-Sets a human-readable name for the session. Names are shown in the session picker and `sessions list`.
-
-### `/status` — Show Session Status
-
-```
-/status
-```
-
-Displays:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Session Status                                                 │
-│                                                                 │
-│  Name:      Fix the login token expiry bug                      │
-│  ID:        42                                                  │
-│  Model:     deepseek-v4-flash                                   │
-│  Turns:     15 / 100                                            │
-│  Cost:      $0.42 / $10.00                                      │
-│  Context:   620K / 1000K tokens (62%)                           │
-│  Approval:  suggest                                             │
-│  Status:    active                                              │
-│                                                                 │
-│  Last activity: 2 minutes ago                                  │
-│  Created:       2026-08-10 14:32:00                            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### `/copy` — Copy Last Message
-
-```
-/copy
-```
-
-Copies the last assistant message to the system clipboard. Useful for:
-- Pasting results into issue trackers
-- Sharing solutions with teammates
-- Saving code snippets to documentation
-
----
-
-## Mode Commands
-
-Orca also provides mode-switching commands:
-
-| Command | Description |
-|---------|-------------|
-| `/plan` | Switch to `plan` approval mode |
-| `/suggest` | Switch to `suggest` approval mode |
-| `/auto-edit` | Switch to `auto-edit` approval mode |
-| `/full-auto` | Switch to `full-auto` approval mode |
-| `/reasoning low` | Set reasoning effort to low |
-| `/reasoning medium` | Set reasoning effort to medium |
-| `/reasoning high` | Set reasoning effort to high |
-| `/model <name>` | Switch to a different model |
-| `/verbose` | Toggle debug logging |
-
-### Examples
-
-```
-# Switch to plan mode for careful review
-/plan
-
-# Switch to pro model for complex debugging
-/model deepseek-v4-pro
-
-# Set high reasoning effort for architecture design
-/reasoning high
-```
-
----
-
-## Session Picker
-
-### Accessing the Picker
-
-Press `Ctrl+S` or type `/sessions` to open the session picker.
-
-### Picker Layout
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Session Picker                                                │
-│                                                                 │
-│  🔍 Filter: [type to filter...]                                 │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  ⭐ 42  Fix the login token expiry bug     15 turns      │    │
-│  │      deepseek-v4-flash · $0.42 · 2 min ago              │    │
-│  │                                                         │    │
-│  │    103  Alternative approach for auth      3 turns       │    │
-│  │      deepseek-v4-flash · $0.08 · 5 min ago              │    │
-│  │                                                         │    │
-│  │    101  Refactor payment module            28 turns      │    │
-│  │      deepseek-v4-pro · $2.14 · 1 hour ago               │    │
-│  │                                                         │    │
-│  │     98  Add dark mode toggle              8 turns       │    │
-│  │      deepseek-v4-flash · $0.24 · 3 hours ago            │    │
-│  │                                                         │    │
-│  │     95  Debug WebSocket reconnection      22 turns      │    │
-│  │      deepseek-v4-pro · $1.87 · yesterday                 │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-│  [Enter] Resume  [F] Fork  [D] Delete  [R] Rename  [Esc] Close  │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Picker Features
-
-- **Filter**: Type to filter sessions by name or ID
-- **Sort**: By last activity, turn count, or cost
-- **Starred**: The current session is starred
-- **Preview**: Press `P` to preview session content without resuming
-- **Bulk delete**: Hold `Shift` to select multiple sessions for deletion
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `↑` / `k` | Move up |
-| `↓` / `j` | Move down |
-| `Enter` | Resume selected session |
-| `F` | Fork from selected session |
-| `D` | Delete selected session |
-| `R` | Rename selected session |
-| `P` | Preview session content |
-| `/` | Focus filter |
-| `Esc` | Close picker |
-
----
-
-## Session Storage
-
-### Storage Location
-
-Orca stores sessions as SQLite databases:
-
-| Platform | Path |
-|----------|------|
-| macOS | `~/Library/Application Support/orca/sessions/` |
-| Linux | `~/.local/share/orca/sessions/` |
-| Windows | `%APPDATA%/orca/sessions/` |
-
-### Session Database Schema
-
-Each session is stored as a separate SQLite database:
-
-```sql
-CREATE TABLE turns (
-    id INTEGER PRIMARY KEY,
-    session_id INTEGER NOT NULL,
-    turn_index INTEGER NOT NULL,
-    role TEXT NOT NULL,           -- 'user', 'assistant', 'tool'
-    content TEXT NOT NULL,
-    tool_calls TEXT,              -- JSON array of tool calls
-    tool_results TEXT,            -- JSON array of tool results
-    tokens_input INTEGER,
-    tokens_output INTEGER,
-    reasoning_tokens INTEGER,
-    cost_usd REAL,
-    created_at TIMESTAMP,
-    compacted BOOLEAN DEFAULT 0
-);
-
-CREATE TABLE tool_events (
-    id INTEGER PRIMARY KEY,
-    turn_id INTEGER NOT NULL,
-    tool_name TEXT NOT NULL,
-    arguments TEXT NOT NULL,      -- JSON
-    result TEXT,                  -- JSON
-    status TEXT NOT NULL,         -- 'success', 'error', 'denied'
-    duration_ms INTEGER,
-    approved BOOLEAN DEFAULT 1,
-    created_at TIMESTAMP
-);
-
-CREATE TABLE session_metadata (
-    id INTEGER PRIMARY KEY,
-    name TEXT,
-    model TEXT,
-    approval_mode TEXT,
-    status TEXT,                  -- 'active', 'paused', 'completed'
-    created_at TIMESTAMP,
-    last_active_at TIMESTAMP,
-    total_turns INTEGER DEFAULT 0,
-    total_cost_usd REAL DEFAULT 0,
-    context_window_used INTEGER DEFAULT 0
-);
-```
-
-### Manual Session Management
-
-```bash
-# List all sessions
-orca sessions list
-
-# Show session details
-orca sessions show 42
-
-# Export session as JSON
-orca sessions export 42 > session-42.json
-
-# Delete a session
-orca sessions delete 42
-
-# Purge all completed sessions older than 30 days
-orca sessions purge --older-than 30d
-```
-
-### Session Backup
-
-Sessions are stored as individual `.db` files. To back up:
-
-```bash
-# Copy the sessions directory
-cp -r ~/.local/share/orca/sessions/ /backup/orca-sessions/
-
-# Or use Orca's export command for structured backup
-orca sessions export --all > all-sessions.json
-```
-
-> **Tip:** Session databases are portable. You can copy them between machines or include them in version control for team collaboration.
+# Conversation Continuity
+
+Orca stores recorded conversations locally so an interactive or headless task
+can continue from a durable boundary. The public command line exposes
+continuity at launch time rather than a separate session-administration
+namespace.
+
+## Interactive startup
+
+~~~bash
+orca --resume SESSION_ID
+orca --fork SESSION_ID
+orca --continue
+~~~
+
+Omit the selector after --resume to open the interactive picker. Use the picker
+to browse recorded conversations and select the one to resume or fork.
+
+## Headless startup
+
+~~~bash
+orca exec --resume SESSION_ID "Continue the investigation"
+orca exec --fork SESSION_ID "Explore a second implementation"
+orca exec --continue "Finish the verifier failure"
+orca exec resume SESSION_ID "Continue from the checkpoint"
+~~~
+
+Use --resume-at MESSAGE_ID only with resume or continue when a run must restore
+through a specific persisted message. See
+[Resume a Headless Run](orca-exec-resume.md) for the mutual-exclusion rules.
+
+## What is durable
+
+A recorded conversation includes model and tool history needed to resume, but
+durability is not a claim that every in-flight external effect completed. After
+a crash or interruption, inspect a tool that started without a terminal result
+before issuing the same write, network request, or command again.
+
+The interactive picker is the supported surface for browsing local history. For
+automation, keep the chosen session ID with the job metadata and pass it back
+through one of the commands above.
