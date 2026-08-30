@@ -121,6 +121,14 @@ pub trait SurfaceCommitLedger {
     fn checkpoint(&mut self, receipt: &SurfaceBatchReceipt) -> Result<(), SurfaceLedgerError>;
 
     fn probe_commit(&self, commit_id: &SurfaceCommitId, digest: &Sha256Digest) -> CommitProbe;
+
+    /// Returns the durable receipt for a commit id without requiring the
+    /// caller to know the batch digest. This is used to make command retries
+    /// idempotent after a lost actor reply; implementations that cannot
+    /// provide an index may conservatively return `None`.
+    fn lookup_commit(&self, _commit_id: &SurfaceCommitId) -> Option<SurfaceBatchReceipt> {
+        None
+    }
 }
 
 pub struct InMemorySurfaceCommitLedger {
@@ -250,6 +258,13 @@ impl SurfaceCommitLedger for InMemorySurfaceCommitLedger {
             Err(_) => CommitProbe::Conflict,
         }
     }
+
+    fn lookup_commit(&self, commit_id: &SurfaceCommitId) -> Option<SurfaceBatchReceipt> {
+        self.receipts
+            .get(commit_id)
+            .cloned()
+            .map(SurfaceBatchReceipt::Ephemeral)
+    }
 }
 
 pub(crate) enum RuntimeSurfaceCommitLedger {
@@ -288,6 +303,13 @@ impl SurfaceCommitLedger for RuntimeSurfaceCommitLedger {
         match self {
             Self::Recorded(ledger) => ledger.probe_commit(commit_id, digest),
             Self::Ephemeral(ledger) => ledger.probe_commit(commit_id, digest),
+        }
+    }
+
+    fn lookup_commit(&self, commit_id: &SurfaceCommitId) -> Option<SurfaceBatchReceipt> {
+        match self {
+            Self::Recorded(ledger) => ledger.lookup_commit(commit_id),
+            Self::Ephemeral(ledger) => ledger.lookup_commit(commit_id),
         }
     }
 }
@@ -4372,6 +4394,27 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
                 cursor_after: batch.cursor_after.clone(),
             })
         }
+    }
+
+    fn lookup_commit(&self, commit_id: &SurfaceCommitId) -> Option<SurfaceBatchReceipt> {
+        let index = self.commit_index.as_ref().ok()?;
+        let indexed = index.get(commit_id)?;
+        if !indexed.committed {
+            return None;
+        }
+        let CommitClass::Recorded {
+            durable_revision, ..
+        } = &indexed.batch.commit_class
+        else {
+            return None;
+        };
+        Some(SurfaceBatchReceipt::Recorded(DurableBatchReceipt {
+            commit_id: commit_id.clone(),
+            durable_revision: *durable_revision,
+            event_count: indexed.batch.event_count,
+            batch_digest: indexed.batch.batch_digest.clone(),
+            cursor_after: indexed.batch.cursor_after.clone(),
+        }))
     }
 }
 

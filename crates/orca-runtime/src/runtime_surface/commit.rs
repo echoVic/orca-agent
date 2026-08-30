@@ -2010,6 +2010,12 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         &mut self.ledger
     }
 
+    /// Look up a previously committed batch by id for idempotent command
+    /// retries after the caller lost the original reply.
+    pub fn lookup_commit(&self, commit_id: &super::SurfaceCommitId) -> Option<super::SurfaceBatchReceipt> {
+        self.ledger.lookup_commit(commit_id)
+    }
+
     pub(crate) fn map_ledger<M>(
         self,
         map: impl FnOnce(L) -> M,

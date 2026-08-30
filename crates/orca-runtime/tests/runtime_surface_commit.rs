@@ -267,7 +267,12 @@ fn in_memory_ledger_commits_ephemeral_batches_without_fabricating_durability() {
         ),
         CommitProbe::Present(receipt.clone())
     );
-    assert_eq!(ledger.append_complete_batch(&batch), Ok(receipt));
+    assert_eq!(ledger.append_complete_batch(&batch), Ok(receipt.clone()));
+    let commit_id = match &batch.commit_class {
+        CommitClass::Ephemeral { commit_id, .. } => commit_id,
+        CommitClass::Recorded { .. } => unreachable!(),
+    };
+    assert_eq!(ledger.lookup_commit(commit_id), Some(receipt));
 }
 
 #[test]
@@ -1275,6 +1280,11 @@ fn jsonl_ledger_recovers_exact_prepared_and_committed_identity() {
     assert!(matches!(
         reopened.probe_commit(commit_id, &batch.batch_digest),
         CommitProbe::Present(SurfaceBatchReceipt::Recorded(receipt))
+            if receipt.batch_digest == batch.batch_digest
+    ));
+    assert!(matches!(
+        reopened.lookup_commit(commit_id),
+        Some(SurfaceBatchReceipt::Recorded(receipt))
             if receipt.batch_digest == batch.batch_digest
     ));
 }

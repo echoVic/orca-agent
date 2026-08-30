@@ -132,6 +132,8 @@ pub const HOST_COMMAND_CAPACITY: usize = 16;
 pub const THREAD_COMMAND_CAPACITY: usize = 16;
 pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
 const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SUBAGENT_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SUBAGENT_ACTIVITY_DEDUPE_CAPACITY: usize = 4096;
 const SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS: usize = 3;
 #[cfg(test)]
@@ -1931,7 +1933,7 @@ impl surface::RuntimeWorkflowLifecycleIngress for RuntimeSurfaceWorkflowLifecycl
         Some(Arc::new(RuntimeSurfaceSubagentActivityIngress {
             command_tx: self.command_tx.clone(),
             fence: self.fence.clone(),
-            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            seen: Arc::new(std::sync::Mutex::new(VecDeque::new())),
         }))
     }
 
@@ -1955,7 +1957,7 @@ impl surface::RuntimeWorkflowLifecycleIngress for RuntimeSurfaceWorkflowLifecycl
 struct RuntimeSurfaceSubagentActivityIngress {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
-    seen: Arc<std::sync::Mutex<Vec<(surface::SurfaceCommitId, surface::Sha256Digest)>>>,
+    seen: Arc<std::sync::Mutex<VecDeque<(surface::SurfaceCommitId, surface::Sha256Digest)>>>,
 }
 
 impl surface::RuntimeSubagentActivityIngress for RuntimeSurfaceSubagentActivityIngress {
@@ -2004,10 +2006,14 @@ impl surface::RuntimeSubagentActivityIngress for RuntimeSurfaceSubagentActivityI
             .recv()
             .map_err(|_| surface_semantic_ingress_ack_error())?;
         if result.is_ok() {
-            self.seen
+            let mut seen = self
+                .seen
                 .lock()
-                .map_err(|_| io::Error::other("activity ingress dedupe state poisoned"))?
-                .push((commit_id, digest));
+                .map_err(|_| io::Error::other("activity ingress dedupe state poisoned"))?;
+            if seen.len() >= SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
+                seen.pop_front();
+            }
+            seen.push_back((commit_id, digest));
         }
         result
     }
@@ -11250,6 +11256,9 @@ struct ThreadActor {
     ephemeral_close_commit_failures: usize,
     prompt_queue: crate::prompt_queue::PromptQueueState,
     prompt_queue_path: Option<PathBuf>,
+    /// Bounded process-local idempotency cache for activity commands whose
+    /// reply may be lost after the surface commit was durably applied.
+    subagent_activity_dedupe: VecDeque<(surface::SurfaceCommitId, surface::Sha256Digest)>,
 }
 
 struct ResidentSurfaceSlot(Option<ResidentSurfaceState>);
@@ -15797,6 +15806,7 @@ impl ThreadActor {
             ephemeral_close_commit_failures,
             prompt_queue,
             prompt_queue_path,
+            subagent_activity_dedupe: VecDeque::new(),
         }
     }
 
@@ -16365,6 +16375,54 @@ impl ThreadActor {
         }
     }
 
+    /// Drain durable detached-child relay frames from the actor loop. This is
+    /// driven by the runtime clock instead of a TUI poll so headless/ACP
+    /// clients receive the same activity stream. Surface commits provide the
+    /// acknowledgement cursor; the task mirror is only read here.
+    fn drain_subagent_relays_for_active(&mut self, active: &mut ActiveOperation) {
+        let Some(fence) = active.surface_operation.clone() else {
+            return;
+        };
+        let candidates = active
+            .task_registry
+            .list()
+            .into_iter()
+            .filter(|summary| summary.task_type == orca_core::task_types::TaskType::Subagent)
+            .filter_map(|summary| {
+                active
+                    .task_registry
+                    .get(summary.id.as_str())
+                    .and_then(|record| {
+                        record
+                            .continuation_attempt_id
+                            .map(|attempt| (record.id, attempt.to_string()))
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        for (task_id, attempt_id) in candidates {
+            if let Err(error) = self.drain_subagent_relay(
+                active,
+                fence.clone(),
+                task_id.as_str(),
+                attempt_id.as_str(),
+            ) {
+                // Child startup/cleanup and relay lease renewal can race a
+                // tick. Retry those transient states; malformed frames are
+                // quarantined by the relay reader and surfaced diagnostically.
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::NotConnected
+                ) {
+                    eprintln!("orca: subagent relay drain deferred: {error}");
+                }
+            }
+        }
+    }
+
     async fn run(
         mut self,
         mut command_rx: tokio_mpsc::Receiver<ThreadCommand>,
@@ -16675,6 +16733,10 @@ impl ThreadActor {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(25)), if has_terminal_waiters => {
                     self.cancel_surface_terminal_waiters();
+                    self.active = Some(active);
+                }
+                _ = tokio::time::sleep(SUBAGENT_RELAY_POLL_INTERVAL) => {
+                    self.drain_subagent_relays_for_active(&mut active);
                     self.active = Some(active);
                 }
                 wake = capability_change_rx.recv(), if !capability_change_rx.is_closed() => {
@@ -22022,6 +22084,22 @@ mod tests {
     const RESERVATION_TERMINAL_FAILURE_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
     const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn subagent_activity_dedupe_cache_evicts_oldest_entry() {
+        let mut cache = VecDeque::new();
+        for index in 0..=SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
+            let id = surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .unwrap();
+            let digest = surface::Sha256Digest::new([index as u8; 32]);
+            if cache.len() >= SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
+                cache.pop_front();
+            }
+            cache.push_back((id, digest));
+        }
+        assert_eq!(cache.len(), SUBAGENT_ACTIVITY_DEDUPE_CAPACITY);
+        assert_eq!(cache.front().unwrap().1.as_bytes()[0], 1);
+    }
 
     #[test]
     fn surface_request_text_numbers_only_images_and_skips_empty_text() {

@@ -494,6 +494,51 @@ impl ThreadActor {
         }
 
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        if self
+            .resident_surface
+            .coordinator
+            .lookup_commit(&event.surface_commit_id)
+            .is_some()
+        {
+            // The surface ledger is durable and therefore takes precedence
+            // over the bounded in-memory cache. A committed event can be
+            // retried after a lost reply; its sequence is already reflected
+            // in the projection, so acknowledge it without applying a second
+            // patch. A future sequence under the same id is a conflict.
+            let current_sequence = snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.subagent_id == event.subagent_id)
+                .map_or(0, |subagent| subagent.revision.get());
+            if event.source_sequence <= current_sequence {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "subagent activity commit id was reused for a future sequence",
+            ));
+        }
+
+        // A command sender can lose the reply after the surface batch has
+        // committed. Treat an exact retry as a no-op before validating the
+        // next projection revision; otherwise the already-applied sequence
+        // would be rejected as non-contiguous. Keep this cache bounded: the
+        // durable surface ledger remains the recovery authority and detached
+        // relay replay resumes from the projected revision after restart.
+        if let Some((_, digest)) = self
+            .subagent_activity_dedupe
+            .iter()
+            .find(|(commit_id, _)| *commit_id == event.surface_commit_id)
+        {
+            if *digest == event.digest {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "subagent activity commit id was reused with a conflicting digest",
+            ));
+        }
+
         let existing_subagent = snapshot
             .subagents
             .iter()
@@ -533,7 +578,11 @@ impl ThreadActor {
                     started_at: Some(event.occurred_at),
                     completed_at: None,
                     parent_operation: Some(fence.operation_id.clone()),
-                    parent_task_id: None,
+                    parent_task_id: active
+                        .task_registry
+                        .get(event.task_id.as_str())
+                        .and_then(|record| record.parent_task_id)
+                        .and_then(|parent| surface::SurfaceTaskId::try_new(parent).ok()),
                     background_fence: None,
                     workflow_run_id: None,
                     subagent_id: Some(event.subagent_id.clone()),
@@ -679,9 +728,15 @@ impl ThreadActor {
                     surface::SurfaceEvent::Subagent(subagent_patch),
                 ),
             ],
-            Some(event.surface_commit_id),
+            Some(event.surface_commit_id.clone()),
         );
         self.commit_surface_generation_batch_with_retry(fence, &batch)?;
+
+        if self.subagent_activity_dedupe.len() >= super::SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
+            self.subagent_activity_dedupe.pop_front();
+        }
+        self.subagent_activity_dedupe
+            .push_back((event.surface_commit_id.clone(), event.digest.clone()));
 
         // This is deliberately a repairable latest-state mirror. The source
         // event reached the surface ledger before the registry is touched.
