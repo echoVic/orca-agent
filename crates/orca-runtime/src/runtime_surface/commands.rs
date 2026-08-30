@@ -1063,7 +1063,7 @@ impl RuntimeSurfaceClientHandle {
 
     /// Reads a child transcript through the actor-owned typed surface.
     ///
-    /// The request is fenced by the task publication revision; callers must
+    /// The request is fenced by the actor-owned surface task revision; callers must
     /// treat a stale result as a signal to refresh the projected task list.
     pub fn read_task_transcript(
         &self,
@@ -2993,7 +2993,7 @@ pub struct PinnedContextMutationOutput {
 pub struct TaskTranscriptSnapshot {
     /// The task whose checkpoint was read.
     pub task_id: SurfaceTaskId,
-    /// Publication revision used to fence the task lookup.
+    /// Surface task revision used to fence the task lookup.
     pub task_revision: TaskRevision,
     /// CAS revision of the continuation record that supplied this checkpoint.
     pub checkpoint_revision: u64,

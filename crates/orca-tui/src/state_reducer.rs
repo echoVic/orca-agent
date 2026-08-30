@@ -18,7 +18,7 @@ use crate::surface_projection::{
 use crate::transcript_state::ChatMessage;
 use crate::types::{
     AppState, AppStatus, ApprovalDialog, PanelMode, PlanApprovalDialog, SessionPickerPhase,
-    SideConversationUiState,
+    SideConversationUiState, TaskTranscriptViewState,
 };
 use crate::user_input_dialog::UserInputDialog;
 
@@ -86,7 +86,9 @@ impl AppState {
             TuiEvent::SurfaceProjectionSynced(projection) => {
                 self.apply_surface_projection_state(*projection);
             }
-            TuiEvent::NewSessionStarted => {}
+            TuiEvent::NewSessionStarted => {
+                self.task_transcript = None;
+            }
             TuiEvent::SessionProjectionReset(projection) => {
                 if !SurfaceSessionProjectionState::accepts_reset(&projection)
                     || !SurfaceOperationProjectionState::accepts_reset(&projection)
@@ -94,6 +96,7 @@ impl AppState {
                     return;
                 }
                 self.reset_session_projection();
+                self.task_transcript = None;
                 self.apply_surface_projection_state(*projection);
             }
             TuiEvent::SavedSessionsUpdated {
@@ -155,6 +158,9 @@ impl AppState {
             TuiEvent::BackgroundTaskOutputAttached { .. } => {
                 self.suppress_background_main_session_output = false;
                 self.panel_mode = PanelMode::Conversation;
+            }
+            TuiEvent::TaskTranscriptResult { request, result } => {
+                self.task_transcript = Some(TaskTranscriptViewState { request, result });
             }
             TuiEvent::ReasoningDelta(text) => {
                 if self.suppress_background_main_session_output {

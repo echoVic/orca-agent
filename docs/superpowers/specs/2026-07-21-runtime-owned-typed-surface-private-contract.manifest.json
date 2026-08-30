@@ -4658,9 +4658,11 @@
       "ReadTaskTranscript",
       "current",
       [
-        "crates/orca-tui/src/protocol.rs:414",
+        "crates/orca-tui/src/protocol.rs:504",
         "crates/orca-tui/src/workflow_panel_actions.rs:35",
-        "crates/orca-tui/src/hosted_controller.rs:535"
+        "crates/orca-tui/src/hosted_controller.rs:531",
+        "crates/orca-tui/src/surface_client.rs:420",
+        "crates/orca-tui/src/state_reducer.rs:162"
       ],
       "task_read",
       "UserAction::ReadTaskTranscript{task_id,expected_revision}",

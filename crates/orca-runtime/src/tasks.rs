@@ -1213,6 +1213,19 @@ impl TaskRegistry {
             .checkpoint
             .as_ref()
             .ok_or(TaskTranscriptReadError::Unavailable)?;
+        // A resumed attempt may legitimately expose the checkpoint that
+        // seeded it until its first new checkpoint is committed.  Accept only
+        // that explicit predecessor or the current attempt; never project a
+        // checkpoint from an unrelated attempt even if its digest is valid.
+        if checkpoint.attempt_id != continuation.current_attempt.attempt_id
+            && continuation
+                .current_attempt
+                .resumed_from_attempt_id
+                .as_ref()
+                != Some(&checkpoint.attempt_id)
+        {
+            return Err(TaskTranscriptReadError::BindingMismatch);
+        }
         let items = project_checkpoint_transcript(checkpoint)
             .map_err(map_task_transcript_continuation_error)?;
 

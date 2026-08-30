@@ -30,10 +30,10 @@ use crate::hosted_side::{
 use crate::hosted_submission::{handle_hosted_queued_prompt, handle_hosted_submitted_turn};
 use crate::hosted_workflow::{HostedWorkflowAction, handle_hosted_workflow_action};
 use crate::operation_controller::TuiSurfaceTaskControl;
-use crate::protocol::SessionAttachmentId;
-use crate::protocol::{TuiEvent, UserAction};
+use crate::protocol::{SessionAttachmentId, TaskTranscriptResult, TuiEvent, UserAction};
 use crate::slash_command_actions::decode_settings_intent;
 use crate::submitted_turn::SubmittedTurn;
+use crate::surface_client;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_tui_controller_loop(
@@ -528,11 +528,19 @@ pub(crate) fn hosted_tui_controller_loop(
                     &event_tx,
                 );
             }
-            // The runtime surface owns the eventual transcript reader. Keep
-            // this request typed across the TUI command boundary so the
-            // reader can validate task identity and publication revision;
-            // the current hosted controller has no filesystem fallback.
-            Ok(UserAction::ReadTaskTranscript(_)) => {}
+            Ok(UserAction::ReadTaskTranscript(request)) => {
+                let result = thread
+                    .as_ref()
+                    .map(|thread| {
+                        surface_client::read_task_transcript(&thread.typed_surface(), &request)
+                    })
+                    .unwrap_or_else(|| {
+                        TaskTranscriptResult::unavailable(
+                            "cannot read task transcript before a session exists",
+                        )
+                    });
+                let _ = event_tx.send(TuiEvent::TaskTranscriptResult { request, result });
+            }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
                 handle_hosted_task_action(
                     HostedTaskAction::ResolveBackgroundApproval { id, approved },
@@ -637,7 +645,7 @@ mod tests {
     use crate::agent_runtime::TuiAgentRuntime;
     use crate::bridge;
     use crate::operation_controller::TuiSurfaceTaskControl;
-    use crate::protocol::{AttachedTuiEvent, TuiEvent, UserAction};
+    use crate::protocol::{AttachedTuiEvent, TaskTranscriptResult, TuiEvent, UserAction};
 
     fn next_controller_event(event_rx: &mpsc::Receiver<TuiEvent>) -> TuiEvent {
         loop {
@@ -699,6 +707,22 @@ mod tests {
     #[test]
     fn hosted_controller_dispatches_rejections_in_fifo_order_and_exits_cleanly() {
         let (_home, action_tx, event_rx, mut runtime) = spawn_controller();
+
+        action_tx
+            .send(UserAction::ReadTaskTranscript(
+                crate::protocol::TaskTranscriptRequest {
+                    task_id: "task-transcript".to_string(),
+                    expected_revision: 1,
+                },
+            ))
+            .expect("transcript action");
+        assert!(matches!(
+            next_controller_event(&event_rx),
+            TuiEvent::TaskTranscriptResult {
+                result: TaskTranscriptResult::Unavailable(error),
+                ..
+            } if error.message == "cannot read task transcript before a session exists"
+        ));
 
         action_tx
             .send(UserAction::StopTask {

@@ -51,8 +51,19 @@ use crate::workspace_status::GitIdentity;
 
 use crate::interaction_state::PendingInteractionSubmission;
 use crate::protocol::{
-    PendingWorkflowNotification, SessionAttachmentId, TuiInteractionKey, UserAction,
+    PendingWorkflowNotification, SessionAttachmentId, TaskTranscriptRequest, TaskTranscriptResult,
+    TuiInteractionKey, UserAction,
 };
+
+/// Local read-only state for the child transcript detail view. The runtime
+/// remains the source of truth; this cache only remembers the latest request
+/// and typed reply for rendering and stale-response handling.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct TaskTranscriptViewState {
+    pub(crate) request: TaskTranscriptRequest,
+    pub(crate) result: TaskTranscriptResult,
+}
 #[derive(Debug, Clone, Default)]
 pub struct PendingWorkflowNotificationQueue {
     inner: Arc<Mutex<VecDeque<PendingWorkflowNotification>>>,
@@ -426,6 +437,7 @@ pub struct AppState {
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
     pub(crate) workflow_panel: WorkflowPanelState,
+    pub(crate) task_transcript: Option<TaskTranscriptViewState>,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
     pub tick: u64,
@@ -461,6 +473,16 @@ impl ScrollAmount for i32 {
 }
 
 impl AppState {
+    #[allow(dead_code)]
+    pub(crate) fn task_transcript(&self) -> Option<&TaskTranscriptViewState> {
+        self.task_transcript.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear_task_transcript(&mut self) {
+        self.task_transcript = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn stage_pending_interaction_submission(
         &mut self,
@@ -607,6 +629,7 @@ impl AppState {
             recovery_prompt_selected: 0,
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
+            task_transcript: None,
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,
             tick: 0,
@@ -912,6 +935,7 @@ impl AppState {
 
     pub(crate) fn reset_session_projection(&mut self) {
         self.surface_session.reset();
+        self.task_transcript = None;
         self.clear_messages();
         self.clear_plan_panel();
         self.transcript.proposed_plan_parser = ProposedPlanStreamParser::default();

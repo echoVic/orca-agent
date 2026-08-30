@@ -307,7 +307,8 @@ pub mod surface {
         SurfaceWorkflowPhase, SurfaceWorkflowResult, SurfaceWorkflowResultId,
         SurfaceWorkflowResultStatus, SurfaceWorkflowRunId, SurfaceWorkflowStatus,
         SuspendedFinalizationCause, SuspensionCause, TaskControlAction, TaskControlOutput,
-        TaskPatch, TaskRevision, TerminalProjectionDeferredState, TerminalizationCause,
+        TaskPatch, TaskRevision, TaskTranscriptItem, TaskTranscriptSnapshot,
+        TaskTranscriptToolStatus, TerminalProjectionDeferredState, TerminalizationCause,
         ThreadCursorAckRequirement, ThreadItemTurnFilter, ThreadOwnerEpoch, ThreadOwnershipLease,
         ThreadPageCursor, ThreadPageQuery, ThreadPersistence, ThreadSettingsReceipt,
         ToolInvocationRevision, ToolInvocationStarted, ToolInvocationStartedReceiptV1, ToolPatch,
@@ -318,7 +319,6 @@ pub mod surface {
         WorkflowControlAction, WorkflowControlOutput, WorkflowPatch, WorkflowRevision,
         ZeroizingProcessLocalSecret, canonical_batch_digest, canonical_batch_encoded_bytes,
         canonical_event_digest, canonical_replayability_digest,
-        TaskTranscriptItem, TaskTranscriptSnapshot, TaskTranscriptToolStatus,
         decide_post_materialization_recovery, preflight_batch, reconcile_finalize_intent,
         reduce_batch, select_shutdown_cause,
     };

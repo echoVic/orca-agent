@@ -3608,6 +3608,41 @@ mod tests {
     }
 
     #[test]
+    fn task_transcript_read_survives_independent_task_registry_publication_update() {
+        let (registry, coordinator, prepared, lease) =
+            prepared_continuation("transcript-surface-fence");
+        coordinator
+            .commit_checkpoint(
+                &lease,
+                lease.revision,
+                checkpoint(lease.attempt_id.clone(), 0, 0),
+            )
+            .expect("commit transcript checkpoint");
+
+        // The registry's lease/status publication counter is a repairable
+        // mirror version, not the SurfaceTask revision used by the TUI fence.
+        let before = registry
+            .get(&prepared.latest_task_id)
+            .expect("task record")
+            .publication_revision;
+        registry
+            .mark_running(&prepared.latest_task_id)
+            .expect("publish independent task update");
+        let after = registry
+            .get(&prepared.latest_task_id)
+            .expect("updated task record")
+            .publication_revision;
+        assert!(after > before);
+
+        let transcript = registry
+            .read_task_transcript(&prepared.latest_task_id)
+            .expect("read checkpoint-backed transcript");
+        assert_eq!(transcript.task_id, prepared.latest_task_id);
+        assert_eq!(transcript.checkpoint_revision, 2);
+        assert!(transcript.items.is_empty());
+    }
+
+    #[test]
     fn expired_owner_without_checkpoint_reconciles_indeterminate() {
         let (_registry, coordinator, prepared, _lease) =
             prepared_continuation("continuation-orphan-unsafe");

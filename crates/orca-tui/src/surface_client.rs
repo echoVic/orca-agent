@@ -23,14 +23,15 @@ use orca_runtime::surface::{
     SurfaceGoalFence, SurfaceImageDetail, SurfaceImageSource, SurfaceInputRequest,
     SurfaceInputRequestBlock, SurfaceInteractionKind, SurfaceOperationId,
     SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceUnavailableReason,
-    SurfaceWorkflowRunId, TaskControlAction, TransferBackgroundOutput, UncommittedMutation,
-    WaitOperationTerminalResult, WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId,
+    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TaskRevision,
+    TransferBackgroundOutput, UncommittedMutation, WaitOperationTerminalResult,
+    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
 use crate::operation_controller::{SurfacePresentationCancellation, TuiSurfaceTaskControl};
-use crate::protocol::TuiEvent;
+use crate::protocol::{TaskTranscriptRequest, TaskTranscriptResult, TuiEvent};
 use crate::surface_projection::{
     GoalProjectionPresentation, SurfaceProjectionState, TuiSurfaceProjection,
 };
@@ -408,6 +409,59 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
     let snapshot = (*attachment.baseline.snapshot).clone();
     detach(&surface, &attachment.client);
     Ok(snapshot)
+}
+
+/// Read a child transcript through the runtime-owned typed surface.
+///
+/// This helper intentionally returns a protocol result instead of an
+/// `io::Result`: stale task fences and unavailable checkpoints are expected
+/// query outcomes, not adapter failures. The only data crossing the helper is
+/// the bounded [`TaskTranscriptSnapshot`] projection.
+pub(crate) fn read_task_transcript(
+    thread: &RuntimeSurfaceThreadHandle,
+    request: &TaskTranscriptRequest,
+) -> TaskTranscriptResult {
+    let task_id = match SurfaceTaskId::try_new(request.task_id.clone()) {
+        Ok(task_id) => task_id,
+        Err(_) => return TaskTranscriptResult::invalid("invalid task transcript task id"),
+    };
+    let expected_revision = match TaskRevision::try_new(request.expected_revision) {
+        Ok(revision) => revision,
+        Err(_) => {
+            return TaskTranscriptResult::invalid("invalid task transcript publication revision");
+        }
+    };
+
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { .. }
+        | AttachResult::Unavailable { .. }
+        | AttachResult::ThreadClosed { .. }
+        | AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. } => {
+            return TaskTranscriptResult::unavailable(
+                "typed task transcript surface is unavailable",
+            );
+        }
+    };
+
+    let result =
+        attachment
+            .client
+            .read_task_transcript(SurfaceRequestId::new(), task_id, expected_revision);
+    detach(&surface, &attachment.client);
+
+    match result {
+        Ok(result) => TaskTranscriptResult::from_surface(result),
+        Err(_) => TaskTranscriptResult::unavailable("typed task transcript query failed"),
+    }
 }
 
 pub(crate) fn rebind_background_presentations(
@@ -2689,6 +2743,37 @@ fn detach(surface: &RuntimeSurfaceHandle, client: &RuntimeSurfaceClientHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_transcript_surface_errors_remain_typed_and_path_free() {
+        let result =
+            TaskTranscriptResult::from_surface(orca_runtime::surface::SurfaceReadResult::Stale {
+                request_id: SurfaceRequestId::new(),
+                error: orca_runtime::surface::SurfaceReadError {
+                    class: orca_runtime::surface::SurfaceReadErrorClass::Stale,
+                    code: orca_runtime::surface::SurfaceReadErrorCode::StaleRevision,
+                    message: DisplayText::new("task transcript revision is stale"),
+                    current_revision: None,
+                },
+            });
+        assert!(matches!(
+            result,
+            TaskTranscriptResult::Stale(error)
+                if error.code == orca_runtime::surface::SurfaceReadErrorCode::StaleRevision
+                    && error.message == "task transcript revision is stale"
+                    && error.current_revision.is_none()
+        ));
+    }
+
+    #[test]
+    fn invalid_task_transcript_input_does_not_fall_back_to_filesystem() {
+        let result = TaskTranscriptResult::invalid("invalid task transcript task id");
+        assert!(matches!(
+            result,
+            TaskTranscriptResult::Invalid(error)
+                if error.code == orca_runtime::surface::SurfaceReadErrorCode::InvalidRequest
+        ));
+    }
 
     #[test]
     fn goal_projection_cursor_requires_committed_identity_and_sequence() {

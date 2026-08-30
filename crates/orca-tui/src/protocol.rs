@@ -9,7 +9,10 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::PlanItem;
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
-use orca_runtime::surface::{RuntimeSurfaceThreadHandle, SurfaceOperationId};
+use orca_runtime::surface::{
+    RuntimeSurfaceThreadHandle, SurfaceOperationId, SurfaceReadError, SurfaceReadErrorCode,
+    SurfaceReadResult, SurfaceReadRevision, TaskTranscriptSnapshot,
+};
 
 use crate::clipboard_image::ImagePasteRequest;
 use crate::composer_images::ComposerImageAttachment;
@@ -219,6 +222,13 @@ pub enum TuiEvent {
     BackgroundTaskOutputAttached {
         task_id: String,
     },
+    /// Result of a checkpoint-backed child transcript read. The payload is
+    /// deliberately typed so the renderer never needs to inspect runtime
+    /// stores or continuation paths.
+    TaskTranscriptResult {
+        request: TaskTranscriptRequest,
+        result: TaskTranscriptResult,
+    },
     WorkflowNotification {
         id: String,
         prompt: String,
@@ -321,11 +331,91 @@ pub struct TuiTaskLifecycle {
 }
 
 /// A read-only child transcript lookup. The runtime validates the task's
-/// current publication revision before returning any transcript content.
+/// current surface publication revision before returning any transcript content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTranscriptRequest {
     pub task_id: String,
     pub expected_revision: u64,
+}
+
+/// A safe, UI-owned representation of a runtime transcript read error.
+/// `current_revision` is present only for stale task fences; no opaque runtime
+/// token or filesystem path crosses this boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTranscriptError {
+    pub code: SurfaceReadErrorCode,
+    pub message: String,
+    pub current_revision: Option<u64>,
+}
+
+/// Typed result consumed by the TUI transcript detail state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskTranscriptResult {
+    Found(TaskTranscriptSnapshot),
+    NotFound(TaskTranscriptError),
+    Invalid(TaskTranscriptError),
+    Stale(TaskTranscriptError),
+    Unavailable(TaskTranscriptError),
+}
+
+impl TaskTranscriptResult {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(TaskTranscriptError {
+            code: SurfaceReadErrorCode::InvalidRequest,
+            message: message.into(),
+            current_revision: None,
+        })
+    }
+
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(TaskTranscriptError {
+            code: SurfaceReadErrorCode::RuntimeUnavailable,
+            message: message.into(),
+            current_revision: None,
+        })
+    }
+
+    pub(crate) fn from_surface(result: SurfaceReadResult<TaskTranscriptSnapshot>) -> Self {
+        match result {
+            SurfaceReadResult::Found { value, .. } => Self::Found(value),
+            SurfaceReadResult::NotFound { error, .. } => Self::NotFound(error.into()),
+            SurfaceReadResult::Invalid { error, .. } => Self::Invalid(error.into()),
+            SurfaceReadResult::Stale { error, .. } => Self::Stale(error.into()),
+            SurfaceReadResult::Unavailable { error, .. } => Self::Unavailable(error.into()),
+        }
+    }
+}
+
+impl From<SurfaceReadError> for TaskTranscriptError {
+    fn from(error: SurfaceReadError) -> Self {
+        let current_revision = match error.current_revision {
+            Some(SurfaceReadRevision::Task { revision, .. }) => Some(revision.get()),
+            _ => None,
+        };
+        // Runtime diagnostics can contain provider-controlled text. Keep the
+        // TUI contract on stable, path-free messages rather than forwarding a
+        // raw error string across the surface boundary.
+        let message = match error.code {
+            SurfaceReadErrorCode::InvalidRequest => "invalid task transcript request",
+            SurfaceReadErrorCode::NotFound => "task transcript was not found",
+            SurfaceReadErrorCode::StaleRevision => "task transcript revision is stale",
+            SurfaceReadErrorCode::BindingMismatch => "task transcript binding is invalid",
+            SurfaceReadErrorCode::CapabilityDenied => "task transcript access was denied",
+            SurfaceReadErrorCode::ThreadOwnedElsewhere => {
+                "task transcript belongs to another thread"
+            }
+            SurfaceReadErrorCode::ThreadClosed => "task transcript thread is closed",
+            SurfaceReadErrorCode::InvalidCursor
+            | SurfaceReadErrorCode::StoreUnavailable
+            | SurfaceReadErrorCode::RuntimeUnavailable => "task transcript is unavailable",
+        }
+        .to_string();
+        Self {
+            code: error.code,
+            message,
+            current_revision,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

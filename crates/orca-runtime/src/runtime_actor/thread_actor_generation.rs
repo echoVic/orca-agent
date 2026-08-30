@@ -141,6 +141,20 @@ fn surface_task_transcript_item(
     Ok(item)
 }
 
+fn task_transcript_record_matches_surface_task(
+    task_id: &surface::SurfaceTaskId,
+    task: &surface::SurfaceTask,
+    record: &crate::tasks::TaskTranscriptRecord,
+) -> bool {
+    // The surface task is the authority for the public fence.  The registry
+    // publication revision is a separate repairable-mirror counter and is
+    // intentionally not part of this comparison.
+    task.task_id == *task_id
+        && record.task_id == task_id.as_str()
+        && record.parent_task_id.as_deref()
+            == task.parent_task_id.as_ref().map(|parent| parent.as_str())
+}
+
 impl ThreadActor {
     pub(super) fn admits_surface_client(
         &self,
@@ -217,14 +231,7 @@ impl ThreadActor {
                 | crate::tasks::TaskTranscriptReadError::Corrupt,
             ) => return Ok(task_transcript_unavailable(request_id)),
         };
-        if record.task_id != task_id.as_str()
-            || record.publication_revision != expected_revision.get()
-            || record.parent_task_id.as_deref()
-                != current_task
-                    .parent_task_id
-                    .as_ref()
-                    .map(|parent| parent.as_str())
-        {
+        if !task_transcript_record_matches_surface_task(&task_id, current_task, &record) {
             return Ok(task_transcript_binding_error(
                 request_id,
                 Some(current_revision),
@@ -4670,5 +4677,94 @@ impl ThreadActor {
             ),
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod task_transcript_query_tests {
+    use super::*;
+    use orca_core::budget::BudgetUsage;
+
+    fn surface_task(
+        task_id: &str,
+        parent_task_id: Option<&str>,
+        revision: u64,
+    ) -> surface::SurfaceTask {
+        surface::SurfaceTask {
+            task_id: surface::SurfaceTaskId::try_new(task_id).expect("task id"),
+            revision: surface::TaskRevision::try_new(revision).expect("task revision"),
+            task_type: surface::SurfaceTaskType::Subagent,
+            status: surface::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: surface::DisplayText::new("child"),
+            created_at: surface::UnixMillis::new(1),
+            started_at: Some(surface::UnixMillis::new(1)),
+            completed_at: None,
+            parent_operation: None,
+            parent_task_id: parent_task_id
+                .map(|parent| surface::SurfaceTaskId::try_new(parent).expect("parent id")),
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        }
+    }
+
+    fn transcript_record(
+        task_id: &str,
+        parent_task_id: Option<&str>,
+        registry_publication_revision: u64,
+    ) -> crate::tasks::TaskTranscriptRecord {
+        crate::tasks::TaskTranscriptRecord {
+            task_id: task_id.to_string(),
+            parent_task_id: parent_task_id.map(str::to_string),
+            publication_revision: registry_publication_revision,
+            checkpoint_revision: 1,
+            turn: 1,
+            usage: BudgetUsage::default(),
+            complete: false,
+            items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn transcript_binding_uses_surface_fence_not_registry_publication_counter() {
+        let task_id = surface::SurfaceTaskId::try_new("child").expect("task id");
+        let task = surface_task("child", Some("parent"), 7);
+        // Lease acquisition and relay/checkpoint writes advance this counter
+        // independently of the actor-owned SurfaceTask revision.
+        let record = transcript_record("child", Some("parent"), 23);
+
+        assert!(task_transcript_record_matches_surface_task(
+            &task_id, &task, &record
+        ));
+    }
+
+    #[test]
+    fn transcript_binding_rejects_task_or_parent_mismatch() {
+        let task_id = surface::SurfaceTaskId::try_new("child").expect("task id");
+        let task = surface_task("child", Some("parent"), 1);
+
+        assert!(!task_transcript_record_matches_surface_task(
+            &task_id,
+            &task,
+            &transcript_record("other", Some("parent"), 1),
+        ));
+        assert!(!task_transcript_record_matches_surface_task(
+            &task_id,
+            &task,
+            &transcript_record("child", Some("other-parent"), 1),
+        ));
+
+        assert!(!task_transcript_record_matches_surface_task(
+            &task_id,
+            &surface_task("other-child", Some("parent"), 1),
+            &transcript_record("child", Some("parent"), 1),
+        ));
     }
 }
