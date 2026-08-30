@@ -6232,6 +6232,7 @@ fn actor_control_subagent_activity_authorized(batch: &SurfaceCommitBatch) -> boo
             task.task_type == super::SurfaceTaskType::Subagent
                 && task.task_id == owner.task_id
                 && task.subagent_id.as_ref() == Some(subagent_id)
+                && owner.task_revision.get() <= task.revision.get()
                 && source.attempt_id == owner.attempt_id
                 && source.source_sequence > 0
         }
@@ -6735,55 +6736,88 @@ fn actor_generation_permission_request_authorized(
     if context.origin != super::SurfacePermissionOrigin::ChildAgent {
         return false;
     }
-    let Some(committed_turn) = find_tool_turn(state, tool_call_id) else {
-        return false;
-    };
     if context_task_id != task_id
         || context_task_revision != expected_revision
         || context_tool_call_id != tool_call_id
         || activity_id.as_str() != tool_call_id.as_str()
-        || turn_id != &committed_turn
     {
         return false;
     }
-    let Some(task) = state
-        .snapshot()
-        .tasks
-        .iter()
-        .find(|task| task.task_id == *task_id)
-    else {
-        return false;
-    };
-    let Some(subagent) = state
-        .snapshot()
-        .subagents
-        .iter()
-        .find(|subagent| subagent.subagent_id == *agent_id)
-    else {
+    let Some((task, subagent)) = child_permission_owner_matches(
+        state,
+        fence,
+        task_id,
+        *context_task_revision,
+        agent_id,
+        *agent_revision,
+        turn_id,
+    ) else {
         return false;
     };
     task.revision == *expected_revision
         && task.status == super::SurfaceTaskStatus::Running
         && task.pending_interaction_id.is_none()
-        && task.parent_operation.as_ref() == Some(&fence.operation_id)
-        && task.subagent_id.as_ref() == Some(agent_id)
         && subagent.revision == *agent_revision
-        && matches!(
-            &subagent.owner,
-            super::SurfaceSubagentOwner::Generation { fence: owner } if owner == fence
-        )
 }
 
-fn find_tool_turn(
-    state: &SurfaceReducerState,
-    tool_call_id: &super::SurfaceToolCallId,
-) -> Option<super::SurfaceTurnId> {
-    state
-        .snapshot()
-        .tools
+/// Validate a child permission owner against the durable child projection.
+/// This deliberately does not consult `snapshot.tools`: child tool calls are
+/// emitted by the child activity stream, not by the foreground provider
+/// response stream. The source cursor is the turn/attempt binding.
+fn child_permission_owner_matches<'a>(
+    state: &'a SurfaceReducerState,
+    fence: &super::SurfaceOperationFence,
+    task_id: &super::SurfaceTaskId,
+    task_revision: super::TaskRevision,
+    agent_id: &super::SurfaceSubagentId,
+    agent_revision: super::SubagentRevision,
+    turn_id: &super::SurfaceTurnId,
+) -> Option<(&'a super::SurfaceTask, &'a super::SurfaceSubagent)> {
+    let snapshot = state.snapshot();
+    let task = snapshot
+        .tasks
         .iter()
-        .find(|tool| tool.request.tool_call_id == *tool_call_id)
-        .map(|tool| tool.request.turn_id.clone())
+        .find(|task| task.task_id == *task_id)?;
+    let subagent = snapshot
+        .subagents
+        .iter()
+        .find(|subagent| subagent.subagent_id == *agent_id)?;
+    if task.task_type != super::SurfaceTaskType::Subagent
+        || task.task_id != *task_id
+        || task.revision != task_revision
+        || task.subagent_id.as_ref() != Some(agent_id)
+        || subagent.task_id != *task_id
+        || subagent.revision != agent_revision
+        || subagent.source.turn_id != *turn_id
+    {
+        return None;
+    }
+    match &subagent.owner {
+        super::SurfaceSubagentOwner::Generation { fence: owner } => {
+            if owner != fence || task.parent_operation.as_ref() != Some(&fence.operation_id) {
+                return None;
+            }
+        }
+        super::SurfaceSubagentOwner::DetachedTask { owner } => {
+            // Detached tasks have no live generation fence. Their durable
+            // owner ref binds task, initial revision, and attempt; the source
+            // cursor above binds the exact turn currently being authorized.
+            if owner.task_id != *task_id
+                || owner.task_revision.get() > task.revision.get()
+                || subagent.source.attempt_id != owner.attempt_id
+            {
+                return None;
+            }
+            if task
+                .parent_operation
+                .as_ref()
+                .is_some_and(|operation_id| operation_id != &fence.operation_id)
+            {
+                return None;
+            }
+        }
+    }
+    Some((task, subagent))
 }
 
 fn actor_generation_permission_resolution_authorized(
@@ -7105,34 +7139,25 @@ fn actor_generation_permission_task_resolution_authorized(
     if context.origin != super::SurfacePermissionOrigin::ChildAgent {
         return false;
     }
-    let Some(committed_turn) = find_tool_turn(state, tool_call_id) else {
-        return false;
-    };
-    let Some(task) = snapshot.tasks.iter().find(|task| task.task_id == *task_id) else {
-        return false;
-    };
-    let Some(subagent) = snapshot
-        .subagents
-        .iter()
-        .find(|subagent| subagent.subagent_id == *agent_id)
-    else {
+    let Some((task, subagent)) = child_permission_owner_matches(
+        state,
+        fence,
+        task_id,
+        *task_expected_revision,
+        agent_id,
+        *agent_revision,
+        turn_id,
+    ) else {
         return false;
     };
     context_task_id == task_id
         && context_tool_call_id == tool_call_id
         && activity_id.as_str() == tool_call_id.as_str()
-        && turn_id == &committed_turn
         && context_task_revision.get().checked_add(1) == Some(task_expected_revision.get())
         && task.revision == *task_expected_revision
         && task.pending_interaction_id.as_ref() == Some(interaction_id)
         && task.status == super::SurfaceTaskStatus::ApprovalRequired
-        && task.parent_operation.as_ref() == Some(&fence.operation_id)
-        && task.subagent_id.as_ref() == Some(agent_id)
         && subagent.revision == *agent_revision
-        && matches!(
-            &subagent.owner,
-            super::SurfaceSubagentOwner::Generation { fence: owner } if owner == fence
-        )
 }
 
 fn session_permission_settings_delta_authorized(

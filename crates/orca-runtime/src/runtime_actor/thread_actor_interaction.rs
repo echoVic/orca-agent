@@ -2,6 +2,82 @@
 use super::*;
 
 impl ThreadActor {
+    /// Build a surface tool identity for a child capability request. Child
+    /// tools are not provider tools and therefore must never be recovered by
+    /// looking in `snapshot.tools`; that table is reserved for model response
+    /// tool calls. The resulting identity is only used to bind the durable
+    /// interaction/capsule to the child turn and request id.
+    fn surface_child_permission_tool(
+        request: &crate::runtime_permission::RuntimePermissionRequest,
+    ) -> io::Result<surface::SurfaceToolRequest> {
+        use crate::runtime_permission::RuntimePermissionContext;
+
+        let RuntimePermissionContext::Child {
+            turn_id,
+            tool_call_id,
+            ..
+        } = &request.context
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child permission tool requires a child owner context",
+            ));
+        };
+        if request.id != tool_call_id.as_str() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "child permission request id does not match its tool owner",
+            ));
+        }
+        let name = surface::NonEmptyText::try_new("child-permission")
+            .expect("child permission display name is non-empty");
+        let action = if request.permissions.network.is_some() {
+            surface::SurfaceToolAction::Network
+        } else if request
+            .permissions
+            .file_system
+            .as_ref()
+            .is_some_and(|permissions| {
+                permissions
+                    .write
+                    .as_ref()
+                    .is_some_and(|paths| !paths.is_empty())
+            })
+        {
+            surface::SurfaceToolAction::Write
+        } else if request
+            .permissions
+            .file_system
+            .as_ref()
+            .is_some_and(|permissions| {
+                permissions
+                    .read
+                    .as_ref()
+                    .is_some_and(|paths| !paths.is_empty())
+            })
+        {
+            surface::SurfaceToolAction::Read
+        } else {
+            // An empty/extension capability request still needs a stable
+            // action for the authority fingerprint. Shell is the existing
+            // generic effect-bearing action and does not grant anything by
+            // itself; the requested profile remains the capability boundary.
+            surface::SurfaceToolAction::Shell
+        };
+        let raw_arguments = surface::DisplayText::new("{}");
+        let arguments_digest = surface_sha256(raw_arguments.as_str().as_bytes());
+        Ok(surface::SurfaceToolRequest {
+            tool_call_id: tool_call_id.clone(),
+            source_response_id: None,
+            turn_id: turn_id.clone(),
+            name,
+            action,
+            target: request.reason.clone().map(surface::DisplayText::new),
+            raw_arguments,
+            arguments_digest,
+        })
+    }
+
     fn surface_permission_context_for_tool(
         snapshot: &surface::SurfaceSnapshot,
         fence: &surface::SurfaceOperationFence,
@@ -74,19 +150,32 @@ impl ThreadActor {
                         )
                     })?;
                 if task.revision != *task_revision
+                    || task.status != surface::SurfaceTaskStatus::Running
+                    || task.pending_interaction_id.is_some()
                     || subagent.revision != *agent_revision
-                    || task.parent_operation.as_ref() != Some(&fence.operation_id)
                     || task.subagent_id.as_ref() != Some(agent_id)
-                    || !matches!(
-                        &subagent.owner,
-                        surface::SurfaceSubagentOwner::Generation { fence: owner }
-                            if owner == fence
-                    )
+                    || subagent.task_id != *task_id
+                    || subagent.source.turn_id != *turn_id
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "child permission owner epoch or generation is stale",
                     ));
+                }
+                match &subagent.owner {
+                    surface::SurfaceSubagentOwner::Generation { fence: owner }
+                        if owner == fence
+                            && task.parent_operation.as_ref() == Some(&fence.operation_id) => {}
+                    surface::SurfaceSubagentOwner::DetachedTask { owner }
+                        if owner.task_id == *task_id
+                            && owner.task_revision.get() <= task.revision.get()
+                            && subagent.source.attempt_id == owner.attempt_id => {}
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "child permission owner epoch or generation is stale",
+                        ));
+                    }
                 }
                 Ok(surface::SurfacePermissionContext {
                     owner: surface::SurfacePermissionOwnerRef::Child {
@@ -482,21 +571,49 @@ impl ThreadActor {
     ) {
         let result = (|| -> io::Result<()> {
             let snapshot = self.resident_surface.coordinator.state().snapshot();
-            let tool_call_id =
-                surface::SurfaceToolCallId::try_new(request.id.clone()).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "empty permission request id")
-                })?;
-            let tool_request = snapshot
-                .tools
-                .iter()
-                .find(|tool| tool.request.tool_call_id == tool_call_id)
-                .map(|tool| tool.request.clone())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "permission interaction lacks a committed provider tool identity",
-                    )
-                })?;
+            // Provider requests are bound to the committed model tool table;
+            // child requests are bound to their durable task/subagent source
+            // and intentionally do not require (or fabricate) a provider
+            // `SurfaceToolView`.
+            let (tool_request, context) = match &request.context {
+                crate::runtime_permission::RuntimePermissionContext::Foreground { .. } => {
+                    let tool_call_id = surface::SurfaceToolCallId::try_new(request.id.clone())
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "empty permission request id",
+                            )
+                        })?;
+                    let tool_request = snapshot
+                        .tools
+                        .iter()
+                        .find(|tool| tool.request.tool_call_id == tool_call_id)
+                        .map(|tool| tool.request.clone())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "permission interaction lacks a committed provider tool identity",
+                            )
+                        })?;
+                    let context = Self::surface_permission_context_for_tool(
+                        snapshot,
+                        &fence,
+                        &tool_request,
+                        &request.context,
+                    )?;
+                    (tool_request, context)
+                }
+                crate::runtime_permission::RuntimePermissionContext::Child { .. } => {
+                    let tool_request = Self::surface_child_permission_tool(&request)?;
+                    let context = Self::surface_permission_context_for_tool(
+                        snapshot,
+                        &fence,
+                        &tool_request,
+                        &request.context,
+                    )?;
+                    (tool_request, context)
+                }
+            };
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let generation = operation
@@ -504,8 +621,11 @@ impl ThreadActor {
                 .iter()
                 .find(|generation| generation.fence == fence)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "generation missing"))?;
-            if tool_request.source_response_id.is_none()
-                || tool_request.turn_id != generation.logical_turn_id
+            if matches!(
+                &request.context,
+                crate::runtime_permission::RuntimePermissionContext::Foreground { .. }
+            ) && (tool_request.source_response_id.is_none()
+                || tool_request.turn_id != generation.logical_turn_id)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -513,12 +633,6 @@ impl ThreadActor {
                 ));
             }
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool_request)?;
-            let context = Self::surface_permission_context_for_tool(
-                &snapshot,
-                &fence,
-                &tool_request,
-                &request.context,
-            )?;
             let permissions = surface_permission_profile_from_runtime(request.permissions.clone())?;
             let interaction_request = surface::SurfaceInteractionRequest::PermissionRequest {
                 tool_call_id: tool_request.tool_call_id.clone(),
