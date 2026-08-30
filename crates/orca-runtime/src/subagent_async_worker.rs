@@ -24,6 +24,7 @@ use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_core::tool_types;
+use orca_core::thread_identity::TurnId;
 
 use crate::agent_child::{
     ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, ChildAgentRuntimeContext,
@@ -387,12 +388,17 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         task_id: agent_id.clone(),
         attempt_id: prepared.attempt_id.as_str().to_string(),
     });
+    // Allocate the detached child turn before publishing `Started`; this same
+    // identity is persisted in every relay event and supplied to the child
+    // runtime when permission requests are evaluated.
+    let child_turn_id = TurnId::new();
     let activity = Arc::new(ChildAgentActivityEmitter::new(
         SubagentActivityIdentity {
             task_id: surface_task_id.clone(),
             subagent_id: SurfaceSubagentId::try_new(agent_id.clone())
                 .expect("async task registry created a non-empty task id"),
             attempt_id: prepared.attempt_id.clone(),
+            turn_id: child_turn_id.clone(),
             owner: SubagentActivityOwner::DetachedTask {
                 task_id: surface_task_id,
                 task_revision: detached_binding.task_revision,
@@ -444,7 +450,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             root_task_id: Some(&agent_id),
             checkpoint_observer: Some(&checkpoint_observer),
             permission_handler: None,
-            turn_id: None,
+            turn_id: Some(child_turn_id),
             executor: child_executor,
         });
         crate::agent_child::run_child_agent(&config, &child_request, &mut child_runtime)
@@ -1390,6 +1396,7 @@ mod tests {
             SurfaceTaskId::try_new("missing-task").unwrap(),
             SurfaceSubagentId::try_new("missing-subagent").unwrap(),
             crate::agent_continuation::AgentAttemptId::new(),
+            TurnId::new(),
             1,
             SubagentActivityOwner::DetachedTask {
                 task_id: SurfaceTaskId::try_new("missing-task").unwrap(),

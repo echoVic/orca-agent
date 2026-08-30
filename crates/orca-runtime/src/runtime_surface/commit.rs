@@ -6282,8 +6282,7 @@ fn permit_authorizes(
                     || actor_control_workflow_launch_authorized(batch)
                     || actor_control_main_session_transfer_authorized(batch)
                     || actor_control_admission_pair_authorized(batch)
-                    || actor_control_resume_pair_authorized(batch)
-                    || actor_control_subagent_activity_authorized(batch))
+                    || actor_control_resume_pair_authorized(batch))
         }
         SurfacePublisherPermit::Generation { fence, .. } => batch
             .events
@@ -13239,6 +13238,7 @@ mod tests {
             },
             source: super::super::SurfaceSubagentSource::new(
                 super::super::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
+                super::super::SurfaceTurnId::new(),
                 1,
                 super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(122)).unwrap(),
                 super::super::Sha256Digest::new([1; 32]),

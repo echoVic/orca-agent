@@ -8289,6 +8289,7 @@ fn subagent_source_matches_owner(
 
 fn subagent_source_is_next(previous: &SurfaceSubagentSource, next: &SurfaceSubagentSource) -> bool {
     previous.attempt_id == next.attempt_id
+        && previous.turn_id == next.turn_id
         && previous
             .source_sequence
             .checked_add(1)

@@ -16058,10 +16058,68 @@ impl ThreadActor {
                         )
                     }
                 });
+        // A detached worker may outlive the parent generation.  Do not close
+        // an ephemeral thread merely because its parent terminal is visible:
+        // the owner binding and every relay frame must first reach the
+        // surface cursor.  Read failures are treated as not-ready so a
+        // transient persistence problem cannot silently discard activity.
+        let detached_relay_pending = self.detached_relay_pending_for_close();
         completion_visible
+            && !detached_relay_pending
             && !resident.coordinator.has_incomplete_batch()
             && !self.has_pending_surface_transition_retry()
             && self.operation_recovery.terminal_blocked.is_none()
+    }
+
+    fn detached_relay_pending_for_close(&self) -> bool {
+        let Some(state) = self.state.as_ref() else {
+            return true;
+        };
+        let registry = state.thread.session().task_registry().clone();
+        let bindings = match registry.detached_subagent_bindings() {
+            Ok(bindings) => bindings,
+            Err(_) => return true,
+        };
+        let snapshot = self
+            .resident_surface
+            .0
+            .as_ref()
+            .map(|resident| resident.coordinator.state().snapshot().clone());
+        for binding in bindings {
+            let Some(task) = registry.get(&binding.task_id) else {
+                return true;
+            };
+            if !matches!(
+                task.status,
+                orca_core::task_types::TaskStatus::Stopped
+                    | orca_core::task_types::TaskStatus::Completed
+                    | orca_core::task_types::TaskStatus::Failed
+                    | orca_core::task_types::TaskStatus::Cancelled
+            ) {
+                return true;
+            }
+            let after_sequence = snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .subagents
+                        .iter()
+                        .find(|subagent| subagent.task_id.as_str() == binding.task_id)
+                        .map(|subagent| subagent.source.source_sequence)
+                })
+                .unwrap_or(0);
+            let reader = match registry
+                .open_subagent_event_relay_reader(&binding.task_id, binding.attempt_id.as_str())
+            {
+                Ok(reader) => reader,
+                Err(_) => return true,
+            };
+            match reader.read_page(after_sequence) {
+                Ok(page) if page.records.is_empty() => {}
+                Ok(_) | Err(_) => return true,
+            }
+        }
+        false
     }
 
     async fn close_ephemeral_one_shot(&mut self) -> Result<(), surface::SurfaceClientCommandError> {
@@ -16350,6 +16408,32 @@ impl ThreadActor {
     /// clients receive the same activity stream. Surface commits provide the
     /// acknowledgement cursor; the task mirror is only read here.
     fn drain_subagent_relays_for_active(&mut self, active: &mut ActiveOperation) {
+        let detached_bindings = match active.task_registry.detached_subagent_bindings() {
+            Ok(bindings) => bindings
+                .into_iter()
+                .map(|binding| (binding.task_id.clone(), binding))
+                .collect::<std::collections::HashMap<_, _>>(),
+            Err(error) => {
+                eprintln!("orca: detached subagent binding scan failed: {error}");
+                std::collections::HashMap::new()
+            }
+        };
+        for binding in detached_bindings.values() {
+            if let Err(error) = self.drain_detached_subagent_relay(&active.task_registry, binding)
+                && !matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::NotConnected
+                )
+            {
+                eprintln!(
+                    "orca: detached subagent relay drain deferred for {}: {error}",
+                    binding.task_id
+                );
+            }
+        }
         let Some(fence) = active.surface_operation.clone() else {
             return;
         };
@@ -16358,6 +16442,7 @@ impl ThreadActor {
             .list()
             .into_iter()
             .filter(|summary| summary.task_type == orca_core::task_types::TaskType::Subagent)
+            .filter(|summary| !detached_bindings.contains_key(&summary.id))
             .filter_map(|summary| {
                 active
                     .task_registry

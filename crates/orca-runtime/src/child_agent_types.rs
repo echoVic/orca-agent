@@ -413,6 +413,11 @@ pub(crate) struct SubagentActivityEvent {
     pub task_id: SurfaceTaskId,
     pub subagent_id: SurfaceSubagentId,
     pub attempt_id: AgentAttemptId,
+    /// Stable logical turn identity for this child attempt.  The same value
+    /// is passed to the child runtime and permission handler, then persisted
+    /// in the surface source cursor so a request cannot be replayed against a
+    /// different child turn after reconnect or restart.
+    pub turn_id: TurnId,
     pub source_sequence: u64,
     pub occurred_at: UnixMillis,
     pub owner: SubagentActivityOwner,
@@ -421,12 +426,13 @@ pub(crate) struct SubagentActivityEvent {
 }
 
 impl SubagentActivityEvent {
-    pub(crate) const SCHEMA_VERSION: u16 = 1;
+    pub(crate) const SCHEMA_VERSION: u16 = 2;
 
     pub(crate) fn new(
         task_id: SurfaceTaskId,
         subagent_id: SurfaceSubagentId,
         attempt_id: AgentAttemptId,
+        turn_id: TurnId,
         source_sequence: u64,
         owner: SubagentActivityOwner,
         payload: SubagentActivityPayload,
@@ -438,6 +444,7 @@ impl SubagentActivityEvent {
             task_id,
             subagent_id,
             attempt_id,
+            turn_id,
             source_sequence,
             owner,
             payload,
@@ -449,6 +456,7 @@ impl SubagentActivityEvent {
         task_id: SurfaceTaskId,
         subagent_id: SurfaceSubagentId,
         attempt_id: AgentAttemptId,
+        turn_id: TurnId,
         source_sequence: u64,
         owner: SubagentActivityOwner,
         payload: SubagentActivityPayload,
@@ -465,6 +473,7 @@ impl SubagentActivityEvent {
             task_id,
             subagent_id,
             attempt_id,
+            turn_id,
             source_sequence,
             occurred_at,
             owner,
@@ -487,6 +496,7 @@ impl SubagentActivityEvent {
             task_id: &'a SurfaceTaskId,
             subagent_id: &'a SurfaceSubagentId,
             attempt_id: &'a AgentAttemptId,
+            turn_id: &'a TurnId,
             source_sequence: u64,
             occurred_at: UnixMillis,
             owner: &'a SubagentActivityOwner,
@@ -498,6 +508,7 @@ impl SubagentActivityEvent {
             task_id: &self.task_id,
             subagent_id: &self.subagent_id,
             attempt_id: &self.attempt_id,
+            turn_id: &self.turn_id,
             source_sequence: self.source_sequence,
             occurred_at: self.occurred_at,
             owner: &self.owner,
@@ -520,6 +531,7 @@ pub(crate) struct SubagentActivityIdentity {
     pub(crate) task_id: SurfaceTaskId,
     pub(crate) subagent_id: SurfaceSubagentId,
     pub(crate) attempt_id: AgentAttemptId,
+    pub(crate) turn_id: TurnId,
     pub(crate) owner: SubagentActivityOwner,
 }
 
@@ -579,6 +591,7 @@ impl ChildAgentActivityEmitter {
                 self.identity.task_id.clone(),
                 self.identity.subagent_id.clone(),
                 self.identity.attempt_id.clone(),
+                self.identity.turn_id.clone(),
                 next_sequence,
                 self.identity.owner.clone(),
                 payload,
@@ -748,11 +761,13 @@ mod tests {
             fail_once: AtomicBool::new(true),
             events: Mutex::new(Vec::new()),
         });
+        let turn_id = TurnId::new();
         let emitter = ChildAgentActivityEmitter::new(
             SubagentActivityIdentity {
                 task_id: SurfaceTaskId::try_new("task-1").unwrap(),
                 subagent_id: SurfaceSubagentId::try_new("subagent-1").unwrap(),
                 attempt_id: AgentAttemptId::new(),
+                turn_id: turn_id.clone(),
                 owner: SubagentActivityOwner::DetachedTask {
                     task_id: SurfaceTaskId::try_new("task-1").unwrap(),
                     task_revision: TaskRevision::try_new(1).unwrap(),
@@ -779,6 +794,9 @@ mod tests {
         assert_eq!(events[0].source_sequence, 1);
         assert_eq!(events[0].surface_commit_id, events[1].surface_commit_id);
         assert_eq!(events[0].digest, events[1].digest);
+        assert_eq!(events[0].turn_id, turn_id);
+        assert_eq!(events[1].turn_id, events[0].turn_id);
+        assert_eq!(events[2].turn_id, events[0].turn_id);
         assert!(events[0].verify_digest());
         assert_eq!(events[2].source_sequence, 2);
         assert!(events[2].verify_digest());

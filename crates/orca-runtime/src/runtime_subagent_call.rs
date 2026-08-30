@@ -29,8 +29,7 @@ use crate::agent_continuation::{
 use crate::child_agent_types::{
     ChildAgentActivityEmitter, ChildAgentActivityPublisher, ChildAgentActivitySink,
     ChildAgentCheckpointObserver, ChildAgentCompatibilityIdentity, ChildAgentContinuationStart,
-    SubagentActivityEvent, SubagentActivityIdentity, SubagentActivityOwner,
-    SubagentActivityPayload, child_event_output,
+    SubagentActivityEvent, SubagentActivityIdentity, SubagentActivityPayload, child_event_output,
 };
 use crate::child_permission::{ChildPermissionHandler, ChildPermissionIdentity};
 use crate::cost::CostTracker;
@@ -43,7 +42,7 @@ use crate::memory::MemoryBlock;
 use crate::runtime_permission::RuntimePermissionRequestHandler;
 use crate::runtime_surface::RuntimeSubagentActivityIngress;
 use crate::runtime_surface::{
-    DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId, TaskRevision,
+    DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId,
 };
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
@@ -51,6 +50,11 @@ use crate::subagent::{SubagentIsolation, SubagentRequest};
 use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
+
+#[cfg(test)]
+use crate::child_agent_types::SubagentActivityOwner;
+#[cfg(test)]
+use crate::runtime_surface::TaskRevision;
 
 pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) tool_request: ToolRequest,
@@ -72,14 +76,6 @@ pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) root_task_id: Option<String>,
 }
 
-/// The temporary runtime-side activity bridge. The surface actor will replace
-/// this mirror with its ingress, but the child never silently drops an event:
-/// an update failure is returned to the execution path before a tool launches.
-pub(crate) struct TaskRegistryActivitySink {
-    pub(crate) task_registry: TaskRegistry,
-    pub(crate) task_id: String,
-}
-
 /// Synchronous child delivery boundary. The child retains the source event on
 /// failure, so retries present the same commit id and digest to the actor.
 pub(crate) struct RuntimeSubagentActivitySink {
@@ -95,48 +91,6 @@ impl ChildAgentActivitySink for RuntimeSubagentActivitySink {
             ));
         }
         self.ingress.commit_activity(event)
-    }
-}
-
-impl ChildAgentActivitySink for TaskRegistryActivitySink {
-    fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
-        if !event.verify_digest() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "child activity digest verification failed",
-            ));
-        }
-        let (activity, turn, usage) = match event.payload {
-            SubagentActivityPayload::Started { description } => {
-                (format!("started: {}", description.as_str()), None, None)
-            }
-            SubagentActivityPayload::PhaseChanged { phase, turn } => {
-                (format!("phase: {phase:?}"), turn, None)
-            }
-            SubagentActivityPayload::ToolStarted { name, target, .. } => (
-                target
-                    .as_ref()
-                    .map(|target| format!("{name}: {}", target.as_str()))
-                    .unwrap_or(name),
-                None,
-                None,
-            ),
-            SubagentActivityPayload::ToolCompleted { status, .. } => {
-                (format!("tool completed: {status:?}"), None, None)
-            }
-            SubagentActivityPayload::Usage { totals } => {
-                ("usage updated".to_string(), None, Some(totals))
-            }
-            SubagentActivityPayload::CheckpointPublished {
-                checkpoint_revision,
-            } => (format!("checkpoint {checkpoint_revision}"), None, None),
-            SubagentActivityPayload::Completed { status, .. } => {
-                (format!("completed: {status:?}"), None, None)
-            }
-        };
-        self.task_registry
-            .update_subagent_activity(&self.task_id, activity, turn, usage)
-            .map_err(io::Error::other)
     }
 }
 
@@ -867,26 +821,43 @@ fn execute_acquired_sync_subagent(
             );
         }
     };
-    let activity_owner = activity_ingress.as_ref().map_or_else(
-        || SubagentActivityOwner::DetachedTask {
-            task_id: surface_task_id.clone(),
-            task_revision: TaskRevision::try_new(1).expect("one is a valid task revision"),
-            authority_digest: prepared.compatibility.compatibility_hash,
-        },
-        |ingress| ingress.owner(),
-    );
-    let activity_sink: Arc<dyn ChildAgentActivitySink> = match activity_ingress {
-        Some(ingress) => Arc::new(RuntimeSubagentActivitySink { ingress }),
-        None => Arc::new(TaskRegistryActivitySink {
-            task_registry: task_registry.clone(),
-            task_id: registry_task_id.clone(),
-        }),
+    // Synchronous children are part of the foreground surface generation.
+    // Without the actor ingress there is no authoritative delivery boundary;
+    // silently falling back to a task mirror would make the child invisible
+    // to the user and impossible to authorize, so fail before execution.
+    let Some(activity_ingress) = activity_ingress else {
+        let output = continuation_started_failure(
+            tool_request,
+            description,
+            lifecycle,
+            started_task,
+            &child_config,
+            "subagent activity ingress is unavailable; refusing to start an unobservable child"
+                .to_string(),
+            worktree_execution.finish(),
+        );
+        return finalize_started_sync_subagent(
+            output,
+            &coordinator,
+            &lease,
+            &task_registry,
+            &registry_task_id,
+            false,
+        );
     };
+    let activity_owner = activity_ingress.owner();
+    let activity_sink: Arc<dyn ChildAgentActivitySink> =
+        Arc::new(RuntimeSubagentActivitySink { ingress: activity_ingress });
+    // Allocate the child logical turn before the first activity envelope. The
+    // exact value is then shared by the surface source cursor, runtime turn,
+    // and child permission identity for this attempt.
+    let child_turn_id = TurnId::new();
     let activity = Arc::new(ChildAgentActivityEmitter::new(
         SubagentActivityIdentity {
             task_id: surface_task_id.clone(),
             subagent_id: surface_subagent_id.clone(),
             attempt_id: prepared.attempt_id.clone(),
+            turn_id: child_turn_id.clone(),
             owner: activity_owner,
         },
         activity_sink,
@@ -912,7 +883,6 @@ fn execute_acquired_sync_subagent(
             false,
         );
     }
-    let child_turn_id = TurnId::new();
     let child_permission_handler = permission_handler.map(|parent| {
         Arc::new(ChildPermissionHandler::new(
             parent,
@@ -1834,6 +1804,7 @@ mod tests {
             SurfaceTaskId::try_new("task-sync-activity").expect("task id"),
             SurfaceSubagentId::try_new("subagent-sync-activity").expect("subagent id"),
             AgentAttemptId::new(),
+            TurnId::new(),
             1,
             SubagentActivityOwner::DetachedTask {
                 task_id: SurfaceTaskId::try_new("task-sync-activity").expect("task id"),

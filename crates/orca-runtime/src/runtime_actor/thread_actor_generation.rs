@@ -584,6 +584,10 @@ impl ThreadActor {
         };
 
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let durable_receipt = self
+            .resident_surface
+            .coordinator
+            .lookup_commit(&event.surface_commit_id);
         if let Some(stored_source_digest) = self
             .resident_surface
             .coordinator
@@ -613,11 +617,12 @@ impl ThreadActor {
                 "subagent activity commit id was reused for a future sequence",
             ));
         }
-        if self
-            .resident_surface
-            .coordinator
-            .lookup_commit(&event.surface_commit_id)
-            .is_some()
+        if durable_receipt.is_some()
+            && self
+                .resident_surface
+                .coordinator
+                .lookup_subagent_source_digest(&event.surface_commit_id)
+                .is_none()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -713,6 +718,7 @@ impl ThreadActor {
                     owner: projection_owner.clone(),
                     source: surface::SurfaceSubagentSource::new(
                         surface_attempt_id.clone(),
+                        event.turn_id.clone(),
                         event.source_sequence,
                         event.surface_commit_id.clone(),
                         event.digest.clone(),
@@ -793,6 +799,7 @@ impl ThreadActor {
                             owner: projection_owner.clone(),
                             source: surface::SurfaceSubagentSource::new(
                                 surface_attempt_id.clone(),
+                                event.turn_id.clone(),
                                 event.source_sequence,
                                 event.surface_commit_id.clone(),
                                 event.digest.clone(),
@@ -812,6 +819,7 @@ impl ThreadActor {
                         owner: projection_owner.clone(),
                         source: surface::SurfaceSubagentSource::new(
                             surface_attempt_id.clone(),
+                            event.turn_id.clone(),
                             event.source_sequence,
                             event.surface_commit_id.clone(),
                             event.digest.clone(),
@@ -860,6 +868,18 @@ impl ThreadActor {
             ],
             Some(event.surface_commit_id.clone()),
         );
+        if let Some(receipt) = durable_receipt {
+            let stored_batch_digest = match receipt {
+                surface::SurfaceBatchReceipt::Recorded(receipt) => receipt.batch_digest,
+                surface::SurfaceBatchReceipt::Ephemeral(receipt) => receipt.batch_digest,
+            };
+            if stored_batch_digest != batch.batch_digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "subagent activity commit id was reused with a conflicting batch digest",
+                ));
+            }
+        }
         // Activity batches intentionally cross the Thread and Generation
         // scopes: the task cursor and the child projection must advance in
         // one durable commit.  Route through the actor-owned activity
@@ -936,7 +956,11 @@ impl ThreadActor {
                         "detached relay payload does not match its frame",
                     ));
                 }
-                self.commit_surface_subagent_activity(active, fence.clone(), event)?;
+                if matches!(event.owner, SubagentActivityOwner::DetachedTask { .. }) {
+                    self.commit_detached_subagent_activity(&active.task_registry, event)?;
+                } else {
+                    self.commit_surface_subagent_activity(active, fence.clone(), event)?;
+                }
                 after_sequence = record.source_sequence;
             }
             if !page.has_more {

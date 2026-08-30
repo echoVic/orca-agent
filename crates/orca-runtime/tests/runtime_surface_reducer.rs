@@ -28,6 +28,10 @@ fn digest(seed: u8) -> Sha256Digest {
     Sha256Digest::new([seed; 32])
 }
 
+fn subagent_turn_id() -> SurfaceTurnId {
+    SurfaceTurnId::parse("turn_01900000-0000-7000-8000-000000000001").unwrap()
+}
+
 fn path() -> CanonicalPath {
     CanonicalPath::try_new(std::env::temp_dir().join("orca-surface-reducer")).unwrap()
 }
@@ -2585,6 +2589,7 @@ fn subagent_owner() -> SurfaceSubagentOwner {
 fn subagent_source(sequence: u64) -> SurfaceSubagentSource {
     SurfaceSubagentSource::new(
         SurfaceTaskAttemptId::try_new("manifest-attempt").unwrap(),
+        subagent_turn_id(),
         sequence,
         SurfaceCommitId::try_from_bytes(uuid_v7_bytes(6_100u32.wrapping_add(sequence as u32)))
             .unwrap(),

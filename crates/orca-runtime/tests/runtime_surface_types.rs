@@ -917,6 +917,7 @@ fn subagent_and_goal_projection_refinements_are_exact() {
         },
         source: SurfaceSubagentSource::new(
             SurfaceTaskAttemptId::try_new("attempt-41").unwrap(),
+            SurfaceTurnId::new(),
             1,
             SurfaceCommitId::try_from_bytes(uuid_v7_bytes(42)).unwrap(),
             Sha256Digest::new([41; 32]),

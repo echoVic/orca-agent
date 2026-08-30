@@ -1407,11 +1407,15 @@ pub enum SurfaceSubagentOwner {
 }
 
 /// Source cursor persisted with every subagent projection transition. The
-/// tuple `(attempt_id, source_sequence, source_commit_id, source_digest)` is
-/// the replay/idempotency identity for one child event.
+/// tuple `(attempt_id, turn_id, source_sequence, source_commit_id,
+/// source_digest)` is the replay/idempotency identity for one child event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceSubagentSource {
     pub attempt_id: super::SurfaceTaskAttemptId,
+    /// The logical child turn that produced this activity. Keeping it in the
+    /// durable cursor lets permission checks bind to the exact turn after a
+    /// relay reconnect or process restart.
+    pub turn_id: SurfaceTurnId,
     pub source_sequence: u64,
     pub source_commit_id: super::SurfaceCommitId,
     pub source_digest: super::Sha256Digest,
@@ -1420,12 +1424,14 @@ pub struct SurfaceSubagentSource {
 impl SurfaceSubagentSource {
     pub fn new(
         attempt_id: super::SurfaceTaskAttemptId,
+        turn_id: SurfaceTurnId,
         source_sequence: u64,
         source_commit_id: super::SurfaceCommitId,
         source_digest: super::Sha256Digest,
     ) -> Self {
         Self {
             attempt_id,
+            turn_id,
             source_sequence,
             source_commit_id,
             source_digest,
