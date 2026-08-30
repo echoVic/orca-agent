@@ -50,11 +50,13 @@
 
 - [ ] **Step 1: Add RED type and reducer tests**
 
-Require task/subagent/attempt identity, structured phase/tool activity, parent
-task preservation, exact source-sequence successors, duplicate idempotence,
-conflicting digest rejection, stale attempt rejection, detached-task authority,
-and terminal absorption. Require start and terminal fixtures to update task and
-subagent in the same batch.
+Require task/subagent/attempt identity, a source-assigned stable commit ID,
+structured phase/tool activity, same-thread acyclic parent preservation with a
+maximum depth of 32, exact source-sequence successors, duplicate idempotence,
+conflicting commit/digest rejection, stale attempt rejection, detached-task
+authority, and terminal absorption. Require start and terminal fixtures to
+update task and subagent in the same batch; reject self, missing, cross-thread,
+cyclic, and too-deep parents.
 
 - [ ] **Step 2: Observe the RED failures**
 
@@ -91,25 +93,34 @@ cargo fmt --all -- --check
 
 - [ ] **Step 1: Add RED relay contract tests**
 
-Cover reopen and ordered paging, same-digest idempotence, conflicting digest,
-sequence gap, stale lease, old attempt, concurrent append serialization,
-partial final record, corrupt middle record, bounded record/file size, and
+Cover reopen and ordered paging, same-commit/digest idempotence, conflicting
+commit/digest, sequence gap, stale lease, old attempt, concurrent append
+serialization, partial final record, corrupt middle record, 64 KiB record,
+16 MiB attempt, 256-record/1 MiB page bounds, symlink/path traversal, cross-task
+access, incomplete-tail takeover after fencing the old writer, and
 append-before-latest-snapshot crash repair. Assert source task artifacts are not
-rewritten on quarantine.
+rewritten on quarantine and complete invalid records are never truncated.
 
 - [ ] **Step 2: Observe the RED test target does not exist**
 
 ```bash
-cargo test -p orca-runtime --test subagent_event_relay --locked -- --test-threads=1
+cargo test -p orca-runtime --test subagent_event_relay relay_reopens_in_order_and_deduplicates_stable_commit --locked -- --exact --test-threads=1
 ```
 
 - [ ] **Step 3: Implement length-prefixed checksummed records**
 
-Store relay records below the task-session store. Use the existing task lock and
-validate task type, owner, lease epoch, attempt, contiguous sequence, digest, and
-size on every append. Return `Appended` or `AlreadyApplied`; return typed conflict,
-gap, stale-owner, corruption, and limit errors. Update the repairable latest task
+Store relay records below the canonical task-session store through validated
+task-ID mapping and no-follow/exclusive file operations. Use the existing task
+lock and validate task type, owner, lease epoch, attempt, contiguous sequence,
+source-assigned commit ID, digest, and exact limits on every append. Return
+`Appended` or `AlreadyApplied`; return typed conflict, gap, stale-owner,
+containment, corruption, and limit errors. Update the repairable latest task
 mirror only after the append succeeds.
+
+Under a newly acquired lease, truncate only an incomplete EOF record to the last
+checksummed boundary before append. A live reader waits at the tail; a complete
+invalid record quarantines the relay. Persist a terminal tombstone only after the
+surface cursor and continuation checkpoint prove delivery complete.
 
 - [ ] **Step 4: Run relay and task tests**
 
@@ -137,21 +148,25 @@ cargo test -p orca-runtime tasks --lib --locked -- --test-threads=1
 
 Require started before any progress, turn/phase, structured tool start/completion,
 usage, checkpoint, and exactly one terminal event. Assert every event uses the
-same task/subagent/attempt identity and contiguous source sequence. Add a sink
-failure test proving execution stops and an active unsafe tool becomes
-indeterminate.
+same task/subagent/attempt identity and contiguous source sequence. Add injected
+sink failures before tool-start append, after acknowledged append but before
+launch, and after launch but before tool completion. Prove the first does not
+admit the tool and the latter two become indeterminate without automatic replay.
 
 - [ ] **Step 2: Observe RED**
 
 ```bash
-cargo test -p orca-runtime child_agent --lib --locked -- --test-threads=1
-cargo test --test subagent_contract --locked -- --test-threads=1
+cargo test -p orca-runtime child_agent_tests::activity_sink_fences_tool_admission --lib --locked -- --exact --test-threads=1
+cargo test --test subagent_contract sync_subagent_projects_ordered_activity --locked -- --exact --test-threads=1
 ```
 
 - [ ] **Step 3: Replace the infallible observer**
 
-Introduce `ChildAgentActivitySink::publish -> io::Result<()>`, preserve the
-source streaming throttle, and emit complete loop boundaries. Add
+Introduce `ChildAgentActivitySink::publish -> io::Result<()>`, assign each event
+its stable `SurfaceCommitId` before publication, preserve the source streaming
+throttle, and emit complete loop boundaries. Treat acknowledged `ToolStarted` as
+the tool-execution admission fence and a missing durable tool terminal as
+potentially applied. Add
 `RuntimeSubagentActivityIngress` using the workflow lifecycle ingress as the
 ownership template. Thread it from hosted generation through tool dispatch into
 the synchronous child wrapper. Remove the production child `io::sink()` event
@@ -159,16 +174,19 @@ discard path.
 
 - [ ] **Step 4: Commit sync activity atomically**
 
-Have the actor assign one stable commit ID per source event and commit joined
-task/subagent patches. Project legacy headless events only after the surface
-commit. Do not make transient streaming chunks semantic session-journal records.
+Have the actor reuse the source event's stable commit ID and commit joined
+task/subagent patches. Atomically persist the applied attempt/sequence/commit/
+digest cursor with the activity. Project legacy headless events only after the
+surface commit. Do not make transient streaming chunks semantic session-journal
+records.
 
 - [ ] **Step 5: Run GREEN and obsolete-path search**
 
 ```bash
-cargo test -p orca-runtime child_agent --lib --locked -- --test-threads=1
-cargo test --test subagent_contract --locked -- --test-threads=1
-rg -n 'EventSink::new\(io::sink\(\).*subagent|subagent_progress\(' crates/orca-runtime crates/orca-core
+cargo test -p orca-runtime child_agent_tests::activity_sink_fences_tool_admission --lib --locked -- --exact --test-threads=1
+cargo test --test subagent_contract sync_subagent_projects_ordered_activity --locked -- --exact --test-threads=1
+rg -n 'EventSink::new\(io::sink\(\)' crates/orca-runtime/src/runtime_subagent_call.rs crates/orca-runtime/src/subagent_async_worker.rs crates/orca-runtime/src/child_agent_provider_turn.rs
+rg -n 'subagent_progress\(' crates/orca-runtime crates/orca-core
 ```
 
 Production sync paths must use the typed sink; `subagent_progress` must have a
@@ -191,22 +209,32 @@ real projection bridge caller.
 Assert async launch returns promptly but a committed started event becomes
 visible without `subagent_status`. Kill/recreate the host while the worker keeps
 running; require replay of every missing event once, continued live delivery,
-and terminal convergence. Add stable-commit retry, slow-subscriber gap/snapshot,
-stale takeover, and terminal-relay-not-drained cases.
+and terminal convergence. Add append-before-commit,
+ledger-committed-before-cursor-observation, cursor-committed-before-process-ack,
+terminal-retention duplicate delivery, slow-subscriber gap/snapshot, stale
+takeover, and terminal-relay-not-drained cases.
+
+Also cover launch failure after actor-committed `Started`, checkpoint committed
+before notification, terminal relay before continuation terminal, continuation
+terminal before TaskRegistry mirror, and worker death after acknowledged
+`ToolStarted`. Assert continuation owns external-effect recovery, the relay is
+at-least-once delivery, the surface is the single UI authority, and TaskRegistry
+is only a repairable mirror.
 
 - [ ] **Step 2: Observe RED**
 
 ```bash
-cargo test --test subagent_contract --locked -- --test-threads=1
-cargo test -p orca-runtime runtime_host --lib --locked -- --test-threads=1
+cargo test --test subagent_contract async_subagent_replays_once_after_parent_restart --locked -- --exact --test-threads=1
+cargo test -p orca-runtime --test runtime_host detached_subagent_drains_stable_commits_after_restart --locked -- --exact --test-threads=1
 ```
 
 - [ ] **Step 3: Inject the relay sink into the worker**
 
-Write started/progress/checkpoint/terminal records under the active task lease.
-Keep continuation-terminal-before-task-terminal ordering. A relay write failure
-must produce a typed indeterminate or failed task outcome; it must not be
-silently swallowed.
+Write source-ID-assigned started/progress/checkpoint/terminal records under the
+active task lease. Acknowledged tool start is the launch fence. Keep
+continuation-terminal-before-task-terminal ordering. A relay failure before
+admission prevents launch; failure after admission produces a typed
+indeterminate outcome and must not be silently swallowed.
 
 - [ ] **Step 4: Add the actor-owned drainer**
 
@@ -286,8 +314,17 @@ cargo test --test tui_pty_contract --locked -- --test-threads=1
 
 **Files:**
 - Modify: `crates/orca-runtime/src/runtime_surface/interaction.rs`
+- Modify: `crates/orca-runtime/src/runtime_surface/projection.rs`
+- Modify: `crates/orca-runtime/src/runtime_surface/reducer.rs`
+- Modify: `crates/orca-runtime/src/runtime_surface/commands.rs`
+- Modify: `crates/orca-runtime/src/runtime_surface/commit.rs`
 - Modify: `crates/orca-runtime/src/runtime_actor/thread_actor_interaction.rs`
+- Modify: `crates/orca-runtime/src/runtime_actor/thread_actor_operation.rs`
 - Modify: `crates/orca-runtime/src/runtime_permission.rs`
+- Modify: `crates/orca-runtime/src/agent_loop.rs`
+- Modify: `crates/orca-runtime/src/subagent_async_worker.rs`
+- Modify: `crates/orca-runtime/src/subagent_event_relay.rs`
+- Modify: `crates/orca-runtime/src/tasks.rs`
 - Modify: `crates/orca-runtime/src/acp/agent.rs`
 - Modify: `crates/orca-runtime/src/server/processors/permission.rs`
 - Modify: `crates/orca-runtime/src/server/surface_adapter.rs`
@@ -296,43 +333,58 @@ cargo test --test tui_pty_contract --locked -- --test-threads=1
 - Modify: `crates/orca-tui/src/operation_controller.rs`
 - Modify: `crates/orca-tui/src/hosted_session.rs`
 - Test: `tests/session_server_contract.rs`
+- Test: `crates/orca-runtime/tests/runtime_surface_interaction.rs`
 - Test: `crates/orca-tui/src/app_integration_tests.rs`
 
 - [ ] **Step 1: Add RED cross-surface permission matrix**
 
-For TUI, ACP, JSONL, and headless, assert the same exact profile and turn/session
-scope, task/subagent/attempt/activity owner, policy epoch, backend/enforcement
-provenance, first-response-wins, and stale-owner rejection. Simulate commit
-failure and prove no session grant remains. Mark stderr-inferred suggestions as
-non-authoritative.
+For TUI, ACP, JSONL, and headless, assert the same exact profile and allow
+turn/session scope, public foreground-or-detached owner, request/result policy
+epochs, first-response-wins, and stale-owner rejection. Prove private task owner
+tokens never serialize. Distinguish preflight assessment, observed denial, and
+unverified stderr inference. Simulate request and decision append/checkpoint/
+projection failures and prove no orphan grant remains. Add detached mailbox
+tests for request commit ambiguity, actor crash after decision commit, responder
+race/detach, Turn expiry, Session hydration after restart, and worker takeover.
 
 - [ ] **Step 2: Observe RED**
 
 ```bash
-cargo test -p orca-runtime permission --lib --locked -- --test-threads=1
-cargo test --test session_server_contract --locked -- --test-threads=1
-cargo test -p orca-tui permission --lib --locked -- --test-threads=1
+cargo test -p orca-runtime --test runtime_surface_interaction permission_decision_batch_is_atomic_across_policy_epoch --locked -- --exact --test-threads=1
+cargo test --test session_server_contract detached_permission_decision_survives_actor_restart --locked -- --exact --test-threads=1
+cargo test -p orca-tui app_integration_tests::permission_choices_preserve_typed_scope_and_owner --lib --locked -- --exact --test-threads=1
 ```
 
 - [ ] **Step 3: Add owner/evidence and one actor transaction**
 
-Bind interactions to operation, turn, tool, optional task/subagent/attempt/source
-sequence, profile digest, and policy epoch. Commit session settings grant,
-interaction resolution, and task pending-interaction state in one surface batch.
-Only wake the waiter after the commit. Plumb capability/sandbox receipts and
-safe denial provenance.
+Use a public sum owner: foreground operation/turn/tool or detached task owner
+reference/attempt/child-turn/activity/tool. Keep the real `SurfaceTaskFence`
+actor-private. The request batch creates the interaction and sets the one-pending
+task field. The dedicated decision commit validates all preconditions against
+pre-state, resolves with the request epoch, optionally advances Session settings,
+records request/result epochs, and clears task pending state atomically. Make the
+surface ledger authoritative and other settings/task state repairable. Plumb
+preflight assessment, observed capability/sandbox denial receipts, and explicitly
+unverified inference.
 
 - [ ] **Step 4: Migrate every adapter to the typed transaction**
 
-Replace TUI bool answers with explicit decision/scope/profile. Make ACP
-`allow_always` a real session grant. Remove JSONL pre-persistence and all
-permission use of local always-tool/target allowlists. Preserve structured
-commit rejection reasons.
+Replace TUI bool answers with typed allow(scope)/deny decisions. Make ACP
+`allow_always` a real session grant and delete `reject_always`. Remove JSONL
+pre-persistence and all permission use of local always-tool/target allowlists.
+For detached children, relay the request, wait without launching, deliver only a
+surface-committed decision through the lease-fenced mailbox, install Turn for the
+exact child attempt/turn, and hydrate Session for current and future turns.
+Reconcile a missing decision-delivery record from the surface ledger. Preserve
+structured commit rejection reasons.
 
 - [ ] **Step 5: Delete obsolete rails and run GREEN**
 
 Delete legacy queue permission handling, adapter-owned persistence, retired
-permission compatibility variants, and byte-compatibility fixtures.
+permission compatibility variants, byte-compatibility fixtures, permission use
+of TaskRegistry bool approval state, and direct registry presentation/resolution
+fallbacks. Keep tool approval as a separate typed interaction rather than
+silently deleting its recovery behavior.
 
 ```bash
 cargo test -p orca-runtime permission --lib --locked -- --test-threads=1
@@ -348,45 +400,58 @@ The final search must be empty.
 **Files:**
 - Modify: `crates/orca-runtime/src/runtime_surface/projection.rs`
 - Modify: `crates/orca-runtime/src/runtime_surface/reducer.rs`
+- Modify: `crates/orca-runtime/src/runtime_surface/operation.rs`
+- Modify: `crates/orca-runtime/src/runtime_surface/store.rs`
 - Modify: `crates/orca-runtime/src/runtime_host.rs`
+- Modify: `crates/orca-runtime/src/runtime_actor/thread_actor_operation.rs`
+- Modify: `crates/orca-runtime/src/controller.rs`
+- Modify: `crates/orca-core/src/event_schema.rs`
+- Modify: `crates/orca-runtime/src/server.rs`
+- Modify: `crates/orca-tui/src/protocol.rs`
 - Modify: `crates/orca-tui/src/surface_projection.rs`
 - Modify: `crates/orca-tui/src/transcript_state.rs`
+- Modify: `crates/orca-tui/src/state_reducer.rs`
 - Modify: `crates/orca-tui/src/ui.rs`
+- Test: `tests/verification_contract.rs`
 - Test: `crates/orca-runtime/tests/runtime_surface_reducer.rs`
 - Test: `crates/orca-tui/src/state_integration_tests.rs`
 
 - [ ] **Step 1: Add RED proof transition tests**
 
-Require verified only with relevant successful checks, failed check retention,
-explicit unverified completion, bounded output, indeterminate limitation,
-terminal immutability, and restart hydration. Test concise and expanded TUI
-rendering.
+Require the full existing verifier result to survive actor commit, snapshot,
+terminal waiter, JSONL completion, restart hydration, and TUI projection. Then
+require typed tool receipt digests, optional file change digests, resume boundary,
+explicit unverified completion, indeterminate limitation, terminal immutability,
+and concise/expanded TUI rendering. Usage stays on the terminal record.
 
 - [ ] **Step 2: Observe RED**
 
 ```bash
-cargo test -p orca-runtime completion_proof --lib --locked -- --test-threads=1
-cargo test -p orca-tui completion_proof --lib --locked -- --test-threads=1
+cargo test --test verification_contract verifier_result_converges_across_surface_jsonl_and_restart --locked -- --exact --test-threads=1
+cargo test -p orca-tui hosted_tui_foreground_turn_renders_completion_proof --lib --locked -- --exact --test-threads=1
 ```
 
 - [ ] **Step 3: Commit proof with terminal operation state**
 
-Add `SurfaceCompletionProof` and derive it only from committed verifier results
-and evidence. Record limitations for skipped verification, cancellation,
-timeout, degraded projection, lost worker, stale checkpoint, and indeterminate
-tools. Do not infer verification from exit text or model claims.
+Add `SurfaceOperationCompletionProof` to `OperationTerminalRecord`. First make
+the existing complete verifier result a recovered `GenerationRecord` fact and
+commit it with terminal state. Then add bounded tool receipts and resume boundary;
+keep large output/diff in existing tool patches and usage in the terminal record.
+Record limitations for skipped verification, cancellation, timeout, degraded
+projection, lost worker, stale checkpoint, and indeterminate tools. Do not infer
+verification from exit text or model claims.
 
 - [ ] **Step 4: Project the proof into the transcript**
 
 Render one stable terminal summary and an expandable detail view. Preserve
-command, exit status, bounded output summaries, evidence targets, and
-limitations across restart.
+command, exit status, bounded output summaries, typed tool receipt/digests,
+resume boundary, and limitations across restart.
 
 - [ ] **Step 5: Run GREEN**
 
 ```bash
-cargo test -p orca-runtime completion_proof --lib --locked -- --test-threads=1
-cargo test -p orca-tui completion_proof --lib --locked -- --test-threads=1
+cargo test --test verification_contract verifier_result_converges_across_surface_jsonl_and_restart --locked -- --exact --test-threads=1
+cargo test -p orca-tui hosted_tui_foreground_turn_renders_completion_proof --lib --locked -- --exact --test-threads=1
 ```
 
 ### Task 8: Isolate Corrupt Sessions And Bound Search
@@ -403,25 +468,28 @@ cargo test -p orca-tui completion_proof --lib --locked -- --test-threads=1
 
 - [ ] **Step 1: Add RED bounded-reader and quarantine tests**
 
-Cover valid input, valid unterminated final JSON, true EOF truncation, complete
-invalid final JSON, malformed middle record, typed semantic errors, oversized
-line/decoded bytes/record count, and zstd bomb. Require exact typed health and no
-source mutation.
+Cover valid input, complete parseable final JSON without newline (`Healthy`),
+lexically partial plaintext EOF (`RecoverableTail` and ignored), complete invalid
+final JSON (`Quarantined`), malformed middle record (`Quarantined`), typed
+semantic errors, compressed truncation (`Quarantined`), oversized line/decoded
+bytes/record count (`InspectionLimited`), and zstd bomb. Require exact typed
+health and no source mutation.
 
 - [ ] **Step 2: Add RED catalog/search/UI tests**
 
 Mix healthy, bad metadata, bad middle, and bad zstd sessions. Require every
 entry to remain visible across index rebuild and stable pagination; healthy
 search hits survive corrupt files; diagnostics carry health; picker gates
-resume/fork/rename but retains reference/archive/delete actions. Startup catalog
-failure must be visible.
+resume/fork/rename for quarantined and inspection-limited entries, resumes a
+recoverable tail only from the last full commit with a warning, and retains
+reference/archive/delete/export actions. Startup catalog failure must be visible.
 
 - [ ] **Step 3: Observe RED**
 
 ```bash
-cargo test -p orca-runtime thread_store --lib --locked -- --test-threads=1
-cargo test --test thread_store_contract --locked -- --test-threads=1
-cargo test -p orca-tui session_picker --lib --locked -- --test-threads=1
+cargo test -p orca-runtime thread_store::writer::tests::scanner_classifies_every_tail_and_limit --lib --locked -- --exact --test-threads=1
+cargo test --test thread_store_contract corrupt_sessions_are_visible_and_isolated_from_search --locked -- --exact --test-threads=1
+cargo test -p orca-tui session_picker_actions::tests::storage_health_gates_unsafe_actions --lib --locked -- --exact --test-threads=1
 ```
 
 - [ ] **Step 4: Implement one bounded streaming scanner**
@@ -466,8 +534,10 @@ cargo test -p orca-tui session_picker --lib --locked -- --test-threads=1
 
 Test stable text/JSON, secret redaction, no filesystem mutation, unknown trust,
 malformed config, required-failure exit one, warnings exit zero, sandbox backend
-states, custom `ORCA_HOME`, and current cwd. Reject old package/domain, fake
-commands, and unsupported flags in public docs.
+states, custom `ORCA_HOME`, and current cwd. Test env-key and auth-file-key paths
+against a new unknown workspace: both must show the workspace onboarding gate.
+Reject old package/domain, fake commands/flags/config paths, and unsupported
+provider/MCP health claims in both language trees.
 
 - [ ] **Step 2: Observe RED**
 
@@ -486,15 +556,21 @@ Expose `doctor --cwd --format text|json` as a real Clap subcommand.
 
 - [ ] **Step 4: Make first run use the same facts**
 
-Show the resolved auth path, cwd, trust, and sandbox readiness. Keep credential
-write and trust mutation explicit. Unknown trust remains untrusted. Add setup
-transition and custom-home render tests.
+Show the resolved auth path, cwd, trust, and sandbox readiness. Persist only a
+workspace/schema/security-policy acknowledgement under `ORCA_HOME`; keep
+credential write and `orca trust add` explicit. Unknown trust remains untrusted.
+Add env/auth key, new workspace, policy-change, setup transition, and custom-home
+render tests.
 
 - [ ] **Step 5: Rewrite EN/ZH public docs literally**
 
 Use `@blade-ai/orca`, `orcaagent.dev`, actual command/flag output, actual config
-precedence and paths, and explicit doctor limitations. Delete rather than alias
-`orca config`, `orca sessions`, old package/domain, and unsupported examples.
+precedence and paths, and explicit doctor limitations. Store one checked public
+CLI manifest, prove it equals Clap's command/flag tree in a Rust test, and make
+the EN/ZH validator reject command/flag examples outside it. Delete rather than
+alias `orca config`, `orca sessions`, `orca goal`, `orca context`, old
+package/domain, old config schema, unsupported `--max-cost`, `--output`,
+`--jsonl`, approval flags, and provider/MCP-health examples.
 
 - [ ] **Step 6: Run doctor and site GREEN gates**
 
@@ -536,7 +612,7 @@ node --test scripts/test-validate-public-cli-contract.mjs
 node scripts/validate-runtime-surface-contract.mjs
 node scripts/validate-windows-platform-boundaries.mjs
 node scripts/validate-public-cli-contract.mjs
-rg -n '@orcla/cli|orca\.ai|orca config|orca sessions|Permission\(bool\)|persist_session_permission_grant' README* site crates src
+rg -n '@orcla/cli|orca\.ai|orca config|orca sessions|orca goal|orca context|--max-cost([^_]|$)|--output([^-]|$)|--jsonl|Permission\(bool\)|persist_session_permission_grant' README* site crates src
 ```
 
 The final search must be empty except explicit negative fixtures in the public
