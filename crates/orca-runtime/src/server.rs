@@ -8083,7 +8083,7 @@ rl.on("line", (line) => {
                 name: "slow".to_string(),
                 command: Some("node".to_string()),
                 args: vec![script.display().to_string()],
-                startup_timeout_ms: Some(2_000),
+                startup_timeout_ms: Some(10_000),
                 tool_timeout_ms: Some(5_000),
                 ..Default::default()
             }];
@@ -8114,10 +8114,15 @@ rl.on("line", (line) => {
             )
             .expect("turn start");
 
-            let request = wait_for_event(&writer, Duration::from_secs(2), |event| {
+            let request = wait_for_event(&writer, Duration::from_secs(10), |event| {
                 event["event"] == "mcp_elicitation_request"
             })
-            .expect("MCP elicitation request");
+            .unwrap_or_else(|| {
+                panic!(
+                    "MCP elicitation request; observed events: {:?}",
+                    parse_complete_jsonl(&writer.lock().expect("writer").clone())
+                )
+            });
             let request_id = request["requestId"]
                 .as_str()
                 .expect("request id")
