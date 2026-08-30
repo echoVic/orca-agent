@@ -42,6 +42,10 @@ use crate::runtime_surface::{
     DisplayText, Sha256Digest, SurfaceTask, SurfaceTaskId, SurfaceTaskStatus, SurfaceTaskType,
     TaskRevision, UnixMillis, UsageTotals as SurfaceUsageTotals,
 };
+use crate::subagent_event_relay::{
+    RelayError, RelayLease, RelayReadTarget, RelayRecord, SubagentEventRelay,
+    SubagentEventRelayReader,
+};
 use crate::thread_store::redact_sensitive_text;
 
 #[cfg(test)]
@@ -57,6 +61,26 @@ pub struct TaskLease {
     owner_id: String,
     epoch: u64,
     expires_at_ms: i64,
+}
+
+impl TaskLease {
+    /// Returns the task identity guarded by this lease.
+    #[allow(dead_code)] // Consumed by the detached-worker wiring in Task 4.
+    pub(crate) fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    /// Returns the owner identity guarded by this lease.
+    #[allow(dead_code)] // Consumed by the detached-worker wiring in Task 4.
+    pub(crate) fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    /// Returns the monotonically increasing lease epoch.
+    #[allow(dead_code)] // Consumed by the detached-worker wiring in Task 4.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +100,7 @@ pub enum TaskLeaseError {
     Fenced,
     NotFound,
     Terminal,
+    Relay(RelayError),
     Persistence(String),
 }
 
@@ -92,6 +117,7 @@ impl fmt::Display for TaskLeaseError {
             Self::Fenced => formatter.write_str("task lease is no longer current"),
             Self::NotFound => formatter.write_str("task was not found"),
             Self::Terminal => formatter.write_str("task is already terminal"),
+            Self::Relay(error) => write!(formatter, "subagent relay rejected event: {error}"),
             Self::Persistence(error) => write!(formatter, "task persistence failed: {error}"),
         }
     }
@@ -1054,6 +1080,99 @@ impl TaskRegistry {
             record.publication_revision = record.publication_revision.saturating_add(1);
             Ok(())
         })
+    }
+
+    /// Appends a detached subagent event while holding the task's current
+    /// lease mutation boundary.  The relay itself is the durable delivery
+    /// journal; this method only admits a record when the task owner, lease
+    /// epoch, task type, and current continuation attempt all agree.
+    #[allow(dead_code)] // Wired into the detached worker by Task 4.
+    pub(crate) fn append_subagent_event_with_lease(
+        &self,
+        lease: &TaskLease,
+        id: &str,
+        attempt_id: &str,
+        record: RelayRecord,
+    ) -> Result<crate::subagent_event_relay::AppendResult, TaskLeaseError> {
+        let owner_id = self.owner_id.clone();
+        let root = self
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.root.clone())
+            .ok_or_else(|| {
+                TaskLeaseError::Persistence(
+                    "detached subagent relay requires a persistent task-session root".to_string(),
+                )
+            })?;
+        self.mutate_task_for_lease(id, |task| {
+            validate_task_lease(task, lease, &owner_id)?;
+            if lease.task_id() != id {
+                return Err(TaskLeaseError::Fenced);
+            }
+            if task.task_type != TaskType::Subagent {
+                return Err(TaskLeaseError::Persistence(
+                    "subagent relay append requires a subagent task".to_string(),
+                ));
+            }
+            if task
+                .continuation_attempt_id
+                .as_ref()
+                .is_none_or(|expected| expected.as_str() != attempt_id)
+            {
+                return Err(TaskLeaseError::Fenced);
+            }
+            let relay_lease = RelayLease::new(
+                id,
+                task.task_type.into(),
+                lease.owner_id(),
+                lease.epoch(),
+                attempt_id,
+            )
+            .map_err(TaskLeaseError::Relay)?;
+            let relay =
+                SubagentEventRelay::open(&root, relay_lease).map_err(TaskLeaseError::Relay)?;
+            let result = relay.append(record).map_err(TaskLeaseError::Relay)?;
+            // The mirror is deliberately updated only after the relay append
+            // is durable.  A duplicate does not mutate the repairable mirror:
+            // its delivery result is idempotent as well as the journal write.
+            if matches!(
+                result,
+                crate::subagent_event_relay::AppendResult::Appended { .. }
+            ) {
+                task.last_activity_at_ms = Some(now_ms());
+                task.publication_revision = task.publication_revision.saturating_add(1);
+            }
+            Ok(result)
+        })
+    }
+
+    /// Opens a read-only relay for an attempt owned by a durable subagent task.
+    /// The actor can drain this handle while the detached worker retains the
+    /// task's write lease; no task snapshot or relay source bytes are mutated.
+    #[allow(dead_code)] // Wired into the actor-owned relay drainer by Task 4.
+    pub(crate) fn open_subagent_event_relay_reader(
+        &self,
+        id: &str,
+        attempt_id: &str,
+    ) -> Result<SubagentEventRelayReader, TaskLeaseError> {
+        let root = self
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.root.clone())
+            .ok_or_else(|| {
+                TaskLeaseError::Persistence(
+                    "detached subagent relay requires a persistent task-session root".to_string(),
+                )
+            })?;
+        let task = self.get(id).ok_or(TaskLeaseError::NotFound)?;
+        if task.task_type != TaskType::Subagent {
+            return Err(TaskLeaseError::Persistence(
+                "subagent relay read requires a subagent task".to_string(),
+            ));
+        }
+        let target = RelayReadTarget::new(id, task.task_type.into(), attempt_id)
+            .map_err(TaskLeaseError::Relay)?;
+        SubagentEventRelayReader::open(&root, target).map_err(TaskLeaseError::Relay)
     }
 
     pub fn complete_with_usage_and_lease(
@@ -3843,6 +3962,14 @@ fn migrate_legacy_task_sessions(legacy_root: &Path, target_root: &Path) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subagent_event_relay::RelayTaskType;
+
+    fn test_surface_commit_id(seed: u8) -> crate::surface::SurfaceCommitId {
+        let mut bytes = [seed; 16];
+        bytes[6] = 0x70 | (seed & 0x0f);
+        bytes[8] = 0x80 | (seed & 0x3f);
+        crate::surface::SurfaceCommitId::try_from_bytes(bytes).unwrap()
+    }
 
     #[test]
     fn persistent_terminal_reconciliation_receipt_filters_and_sorts_records() {
@@ -4528,6 +4655,75 @@ mod tests {
             owner.summary(&task.id).unwrap().publication_revision,
             Some(2)
         );
+    }
+
+    #[test]
+    fn relay_append_is_lease_and_attempt_fenced_before_updating_task_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let registry =
+            TaskRegistry::new_persistent("relay-session".to_string(), root.clone()).unwrap();
+        let task = registry.create_subagent("durable activity".to_string(), None);
+        let lease = registry.acquire_task_lease(&task.id).unwrap();
+        let attempt = AgentAttemptId::new();
+        registry
+            .mutate_task_for_lease(&task.id, |record| {
+                record.continuation_attempt_id = Some(attempt.clone());
+                Ok(())
+            })
+            .unwrap();
+        let relay_lease = RelayLease::new(
+            &task.id,
+            RelayTaskType::Subagent,
+            lease.owner_id(),
+            lease.epoch(),
+            attempt.as_str(),
+        )
+        .unwrap();
+        let mut invalid = RelayRecord::new(
+            &relay_lease,
+            1,
+            test_surface_commit_id(1),
+            b"started".to_vec(),
+        );
+        invalid.payload = b"tampered".to_vec();
+        assert!(matches!(
+            registry.append_subagent_event_with_lease(&lease, &task.id, attempt.as_str(), invalid,),
+            Err(TaskLeaseError::Relay(RelayError::DigestMismatch { .. }))
+        ));
+        assert_eq!(registry.get(&task.id).unwrap().last_activity_at_ms, None);
+
+        let valid = RelayRecord::new(
+            &relay_lease,
+            1,
+            test_surface_commit_id(1),
+            b"started".to_vec(),
+        );
+        registry
+            .append_subagent_event_with_lease(&lease, &task.id, attempt.as_str(), valid.clone())
+            .unwrap();
+        assert!(
+            registry
+                .get(&task.id)
+                .unwrap()
+                .last_activity_at_ms
+                .is_some()
+        );
+        let revision_after_append = registry.get(&task.id).unwrap().publication_revision;
+        assert!(matches!(
+            registry
+                .append_subagent_event_with_lease(&lease, &task.id, attempt.as_str(), valid)
+                .unwrap(),
+            crate::subagent_event_relay::AppendResult::AlreadyApplied { .. }
+        ));
+        assert_eq!(
+            registry.get(&task.id).unwrap().publication_revision,
+            revision_after_append
+        );
+        let relay = registry
+            .open_subagent_event_relay_reader(&task.id, attempt.as_str())
+            .unwrap();
+        assert_eq!(relay.read_page(0).unwrap().records.len(), 1);
     }
 
     #[test]
