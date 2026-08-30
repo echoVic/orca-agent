@@ -42,6 +42,7 @@
 
 **Files:**
 - Modify: `crates/orca-runtime/src/child_agent_types.rs`
+- Modify: `crates/orca-runtime/src/agent_continuation.rs`
 - Modify: `crates/orca-runtime/src/runtime_surface/projection.rs`
 - Modify: `crates/orca-runtime/src/runtime_surface/reducer.rs`
 - Modify: `crates/orca-runtime/src/runtime_surface/identity.rs`
