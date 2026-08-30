@@ -1397,6 +1397,42 @@ pub enum SurfaceSubagentStatus {
     Cancelled,
 }
 
+/// Durable owner identity for a subagent projection. A detached owner is
+/// intentionally independent from the parent generation: the parent may have
+/// reached a terminal state while the child continues to publish relay frames.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SurfaceSubagentOwner {
+    Generation { fence: SurfaceOperationFence },
+    DetachedTask { owner: super::SurfaceTaskOwnerRef },
+}
+
+/// Source cursor persisted with every subagent projection transition. The
+/// tuple `(attempt_id, source_sequence, source_commit_id, source_digest)` is
+/// the replay/idempotency identity for one child event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceSubagentSource {
+    pub attempt_id: super::SurfaceTaskAttemptId,
+    pub source_sequence: u64,
+    pub source_commit_id: super::SurfaceCommitId,
+    pub source_digest: super::Sha256Digest,
+}
+
+impl SurfaceSubagentSource {
+    pub fn new(
+        attempt_id: super::SurfaceTaskAttemptId,
+        source_sequence: u64,
+        source_commit_id: super::SurfaceCommitId,
+        source_digest: super::Sha256Digest,
+    ) -> Self {
+        Self {
+            attempt_id,
+            source_sequence,
+            source_commit_id,
+            source_digest,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceSubagent {
     pub subagent_id: SurfaceSubagentId,
@@ -1411,7 +1447,8 @@ pub struct SurfaceSubagent {
     pub usage: Option<UsageTotals>,
     pub output: Option<DisplayText>,
     pub error: Option<DisplayText>,
-    pub parent: SurfaceOperationFence,
+    pub owner: SurfaceSubagentOwner,
+    pub source: SurfaceSubagentSource,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1460,7 +1497,8 @@ pub enum SubagentPatch {
         subagent_id: SurfaceSubagentId,
         expected_revision: SubagentRevision,
         next_revision: SubagentRevision,
-        parent: SurfaceOperationFence,
+        owner: SurfaceSubagentOwner,
+        source: SurfaceSubagentSource,
         activity: DisplayText,
         turn: Option<u32>,
         usage: Option<UsageTotals>,
@@ -1469,7 +1507,8 @@ pub enum SubagentPatch {
         subagent_id: SurfaceSubagentId,
         expected_revision: SubagentRevision,
         next_revision: SubagentRevision,
-        parent: SurfaceOperationFence,
+        owner: SurfaceSubagentOwner,
+        source: SurfaceSubagentSource,
         status: SurfaceSubagentTerminalStatus,
         output: Option<DisplayText>,
         error: Option<DisplayText>,

@@ -16393,6 +16393,40 @@ impl ThreadActor {
         }
     }
 
+    /// Drains detached child relays while the parent actor is idle (including
+    /// after the parent generation has terminalized).  Candidates come from
+    /// the session-scoped durable owner sidecar; the actor still validates the
+    /// binding and source cursor before each surface commit.
+    fn drain_subagent_relays_while_idle(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let task_registry = state.thread.session().task_registry().clone();
+        let bindings = match task_registry.detached_subagent_bindings() {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                eprintln!("orca: detached subagent binding scan failed: {error}");
+                return;
+            }
+        };
+        for binding in bindings {
+            if let Err(error) = self.drain_detached_subagent_relay(&task_registry, &binding) {
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::NotConnected
+                ) {
+                    eprintln!(
+                        "orca: detached subagent relay drain deferred for {}: {error}",
+                        binding.task_id
+                    );
+                }
+            }
+        }
+    }
+
     async fn run(
         mut self,
         mut command_rx: tokio_mpsc::Receiver<ThreadCommand>,
@@ -16436,6 +16470,9 @@ impl ThreadActor {
                     .is_some_and(|surface| surface.commit.has_terminal_waiters());
                 tokio::select! {
                     biased;
+                    _ = tokio::time::sleep(SUBAGENT_RELAY_POLL_INTERVAL) => {
+                        self.drain_subagent_relays_while_idle();
+                    }
                     _ = wait_for_surface_transition_retry(surface_retry_at) => {
                         self.retry_pending_surface_transition(None);
                     }
@@ -17610,17 +17647,60 @@ impl ThreadActor {
                     "runtime generation is not active",
                 )));
             }
-            ThreadCommand::SurfaceCommitSubagentActivity { reply, .. } => {
-                let _ = reply.send(Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "runtime generation is not active",
-                )));
+            ThreadCommand::SurfaceCommitSubagentActivity { event, reply, .. } => {
+                let result = if matches!(&event.owner, SubagentActivityOwner::DetachedTask { .. }) {
+                    self.state
+                        .as_ref()
+                        .map(|state| state.thread.session().task_registry().clone())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                "runtime state is unavailable",
+                            )
+                        })
+                        .and_then(|registry| {
+                            self.commit_detached_subagent_activity(&registry, event)
+                        })
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime generation is not active",
+                    ))
+                };
+                let _ = reply.send(result);
             }
-            ThreadCommand::SurfaceDrainSubagentRelay { reply, .. } => {
-                let _ = reply.send(Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "runtime generation is not active",
-                )));
+            ThreadCommand::SurfaceDrainSubagentRelay {
+                task_id,
+                attempt_id,
+                reply,
+                ..
+            } => {
+                let result = self
+                    .state
+                    .as_ref()
+                    .map(|state| state.thread.session().task_registry().clone())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotConnected, "runtime state is unavailable")
+                    })
+                    .and_then(|registry| {
+                        let binding = registry
+                            .detached_subagent_binding(&task_id)
+                            .map_err(io::Error::other)?
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "detached subagent owner binding is missing or stale",
+                                )
+                            })?;
+                        if binding.attempt_id.as_str() != attempt_id {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "detached subagent relay attempt is stale",
+                            ));
+                        }
+                        self.drain_detached_subagent_relay(&registry, &binding)
+                    });
+                let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderFailure { reply, .. }
             | ThreadCommand::SurfaceCommitProviderAttemptFailure { reply, .. } => {

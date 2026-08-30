@@ -912,7 +912,15 @@ fn subagent_and_goal_projection_refinements_are_exact() {
         usage: None,
         output: None,
         error: None,
-        parent: operation_fence(41),
+        owner: SurfaceSubagentOwner::Generation {
+            fence: operation_fence(41),
+        },
+        source: SurfaceSubagentSource::new(
+            SurfaceTaskAttemptId::try_new("attempt-41").unwrap(),
+            1,
+            SurfaceCommitId::try_from_bytes(uuid_v7_bytes(42)).unwrap(),
+            Sha256Digest::new([41; 32]),
+        ),
     };
     let running_refinement = RunningSurfaceSubagent::try_new(running.clone()).unwrap();
     assert_eq!(running_refinement.as_subagent(), &running);

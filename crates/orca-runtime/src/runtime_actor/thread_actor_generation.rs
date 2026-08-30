@@ -462,8 +462,35 @@ impl ThreadActor {
         fence: surface::SurfaceOperationFence,
         event: SubagentActivityEvent,
     ) -> io::Result<()> {
-        if active.surface_operation.as_ref() != Some(&fence)
-            || Self::surface_interaction_admission_closed(active)
+        self.commit_subagent_activity_inner(
+            Some(active),
+            Some(&fence),
+            &active.task_registry,
+            event,
+        )
+    }
+
+    /// Commits a detached child event after the parent generation has ended.
+    /// The durable task binding, rather than a stale generation fence, is the
+    /// authority for this path.
+    pub(super) fn commit_detached_subagent_activity(
+        &mut self,
+        task_registry: &crate::tasks::TaskRegistry,
+        event: SubagentActivityEvent,
+    ) -> io::Result<()> {
+        self.commit_subagent_activity_inner(None, None, task_registry, event)
+    }
+
+    fn commit_subagent_activity_inner(
+        &mut self,
+        active: Option<&ActiveOperation>,
+        fence: Option<&surface::SurfaceOperationFence>,
+        task_registry: &crate::tasks::TaskRegistry,
+        event: SubagentActivityEvent,
+    ) -> io::Result<()> {
+        if let (Some(active), Some(fence)) = (active, fence)
+            && (active.surface_operation.as_ref() != Some(fence)
+                || Self::surface_interaction_admission_closed(active))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -476,30 +503,98 @@ impl ThreadActor {
                 "subagent activity envelope failed schema or digest validation",
             ));
         }
-        let owner_matches_generation = matches!(
-            &event.owner,
-            SubagentActivityOwner::Generation { operation_id }
-                if operation_id == &fence.operation_id
-        );
-        let owner_matches_detached_task = matches!(
-            &event.owner,
-            SubagentActivityOwner::DetachedTask { task_id, .. }
-                if task_id == &event.task_id
-        );
-        if !owner_matches_generation && !owner_matches_detached_task {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "subagent activity owner does not match the active generation",
-            ));
-        }
+        let detached_binding = match &event.owner {
+            SubagentActivityOwner::Generation { operation_id } => {
+                let Some(fence) = fence else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "generation-owned subagent activity requires an active generation",
+                    ));
+                };
+                if operation_id != &fence.operation_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "subagent activity owner does not match the active generation",
+                    ));
+                }
+                None
+            }
+            SubagentActivityOwner::DetachedTask {
+                task_id,
+                task_revision,
+                authority_digest,
+            } => {
+                if task_id != &event.task_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "detached subagent activity task identity is invalid",
+                    ));
+                }
+                let binding = task_registry
+                    .detached_subagent_binding(event.task_id.as_str())
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "detached subagent owner binding is missing or stale",
+                        )
+                    })?;
+                if binding.subagent_id != event.subagent_id.as_str()
+                    || binding.task_revision != *task_revision
+                    || binding.attempt_id != event.attempt_id
+                    || binding.authority_digest != *authority_digest
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "detached subagent activity owner binding is invalid",
+                    ));
+                }
+                Some(binding)
+            }
+        };
+        let surface_attempt_id = surface::SurfaceTaskAttemptId::try_new(event.attempt_id.as_str())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid subagent attempt identity",
+                )
+            })?;
+        let projection_owner = match (&event.owner, fence, detached_binding.as_ref()) {
+            (SubagentActivityOwner::Generation { .. }, Some(fence), _) => {
+                surface::SurfaceSubagentOwner::Generation {
+                    fence: fence.clone(),
+                }
+            }
+            (SubagentActivityOwner::DetachedTask { .. }, _, Some(binding)) => {
+                surface::SurfaceSubagentOwner::DetachedTask {
+                    owner: surface::SurfaceTaskOwnerRef::new(
+                        event.task_id.clone(),
+                        binding.task_revision,
+                        surface_attempt_id.clone(),
+                        binding.authority_digest,
+                    ),
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "subagent activity owner context is unavailable",
+                ));
+            }
+        };
 
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-        if self
+        if let Some(stored_source_digest) = self
             .resident_surface
             .coordinator
-            .lookup_commit(&event.surface_commit_id)
-            .is_some()
+            .lookup_subagent_source_digest(&event.surface_commit_id)
         {
+            if stored_source_digest != event.digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "subagent activity commit id was reused with a conflicting source digest",
+                ));
+            }
             // The surface ledger is durable and therefore takes precedence
             // over the bounded in-memory cache. A committed event can be
             // retried after a lost reply; its sequence is already reflected
@@ -516,6 +611,17 @@ impl ThreadActor {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "subagent activity commit id was reused for a future sequence",
+            ));
+        }
+        if self
+            .resident_surface
+            .coordinator
+            .lookup_commit(&event.surface_commit_id)
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "subagent activity commit id belongs to a different surface event",
             ));
         }
 
@@ -577,9 +683,8 @@ impl ThreadActor {
                     created_at: event.occurred_at,
                     started_at: Some(event.occurred_at),
                     completed_at: None,
-                    parent_operation: Some(fence.operation_id.clone()),
-                    parent_task_id: active
-                        .task_registry
+                    parent_operation: fence.map(|fence| fence.operation_id.clone()),
+                    parent_task_id: task_registry
                         .get(event.task_id.as_str())
                         .and_then(|record| record.parent_task_id)
                         .and_then(|parent| surface::SurfaceTaskId::try_new(parent).ok()),
@@ -605,7 +710,13 @@ impl ThreadActor {
                     usage: None,
                     output: None,
                     error: None,
-                    parent: fence.clone(),
+                    owner: projection_owner.clone(),
+                    source: surface::SurfaceSubagentSource::new(
+                        surface_attempt_id.clone(),
+                        event.source_sequence,
+                        event.surface_commit_id.clone(),
+                        event.digest.clone(),
+                    ),
                 })
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid subagent start")
@@ -622,7 +733,7 @@ impl ThreadActor {
                 )
             }
             (Some(task), Some(subagent), terminal) => {
-                if subagent.task_id != event.task_id || subagent.parent != fence {
+                if subagent.task_id != event.task_id || subagent.owner != projection_owner {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "subagent activity identity is not owned by this generation",
@@ -679,7 +790,13 @@ impl ThreadActor {
                             subagent_id: event.subagent_id.clone(),
                             expected_revision: subagent.revision,
                             next_revision: next_subagent_revision,
-                            parent: fence.clone(),
+                            owner: projection_owner.clone(),
+                            source: surface::SurfaceSubagentSource::new(
+                                surface_attempt_id.clone(),
+                                event.source_sequence,
+                                event.surface_commit_id.clone(),
+                                event.digest.clone(),
+                            ),
                             status,
                             output,
                             error,
@@ -692,7 +809,13 @@ impl ThreadActor {
                         subagent_id: event.subagent_id.clone(),
                         expected_revision: subagent.revision,
                         next_revision: next_subagent_revision,
-                        parent: fence.clone(),
+                        owner: projection_owner.clone(),
+                        source: surface::SurfaceSubagentSource::new(
+                            surface_attempt_id.clone(),
+                            event.source_sequence,
+                            event.surface_commit_id.clone(),
+                            event.digest.clone(),
+                        ),
                         activity: activity.clone(),
                         turn: turn.or(subagent.turn),
                         usage: usage
@@ -722,8 +845,15 @@ impl ThreadActor {
                     surface::SurfaceEvent::Task(task_patch),
                 ),
                 (
-                    surface::SurfaceScope::Generation {
-                        fence: fence.clone(),
+                    match &projection_owner {
+                        surface::SurfaceSubagentOwner::Generation { fence } => {
+                            surface::SurfaceScope::Generation {
+                                fence: fence.clone(),
+                            }
+                        }
+                        surface::SurfaceSubagentOwner::DetachedTask { .. } => {
+                            surface::SurfaceScope::Thread
+                        }
                     },
                     surface::SurfaceEvent::Subagent(subagent_patch),
                 ),
@@ -747,7 +877,7 @@ impl ThreadActor {
 
         // This is deliberately a repairable latest-state mirror. The source
         // event reached the surface ledger before the registry is touched.
-        let _ = active.task_registry.update_subagent_activity(
+        let _ = task_registry.update_subagent_activity(
             event.task_id.as_str(),
             activity.as_str().to_string(),
             turn,
@@ -807,6 +937,62 @@ impl ThreadActor {
                     ));
                 }
                 self.commit_surface_subagent_activity(active, fence.clone(), event)?;
+                after_sequence = record.source_sequence;
+            }
+            if !page.has_more {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Drains a relay whose parent generation is no longer resident.  The
+    /// detached binding is checked by `commit_detached_subagent_activity` for
+    /// every frame; no terminal generation fence is resurrected.
+    pub(super) fn drain_detached_subagent_relay(
+        &mut self,
+        task_registry: &crate::tasks::TaskRegistry,
+        binding: &crate::tasks::DetachedSubagentBinding,
+    ) -> io::Result<()> {
+        let reader = task_registry
+            .open_subagent_event_relay_reader(&binding.task_id, binding.attempt_id.as_str())
+            .map_err(io::Error::other)?;
+        let mut after_sequence = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .subagents
+            .iter()
+            .find(|subagent| subagent.task_id.as_str() == binding.task_id)
+            .map_or(0, |subagent| subagent.source.source_sequence);
+        loop {
+            let page = reader.read_page(after_sequence).map_err(io::Error::other)?;
+            if page.records.is_empty() {
+                return Ok(());
+            }
+            for record in &page.records {
+                if record.task_id != binding.task_id
+                    || record.attempt_id != binding.attempt_id.as_str()
+                    || record.source_sequence <= after_sequence
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "detached relay record identity or sequence is invalid",
+                    ));
+                }
+                let event: SubagentActivityEvent =
+                    serde_json::from_slice(&record.payload).map_err(io::Error::other)?;
+                if event.surface_commit_id != record.surface_commit_id
+                    || event.source_sequence != record.source_sequence
+                    || event.task_id.as_str() != binding.task_id
+                    || event.attempt_id.as_str() != binding.attempt_id.as_str()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "detached relay payload does not match its frame",
+                    ));
+                }
+                self.commit_detached_subagent_activity(task_registry, event)?;
                 after_sequence = record.source_sequence;
             }
             if !page.has_more {

@@ -130,6 +130,30 @@ pub trait SurfaceCommitLedger {
     fn lookup_commit(&self, _commit_id: &SurfaceCommitId) -> Option<SurfaceBatchReceipt> {
         None
     }
+
+    /// Returns the source digest persisted by a committed subagent event.
+    /// Keeping this lookup on the ledger makes retry identity survive actor
+    /// restart instead of relying on a process-local dedupe cache.
+    fn lookup_subagent_source_digest(&self, _commit_id: &SurfaceCommitId) -> Option<Sha256Digest> {
+        None
+    }
+}
+
+fn subagent_source_digest(batch: &SurfaceCommitBatch) -> Option<Sha256Digest> {
+    batch
+        .events
+        .as_slice()
+        .iter()
+        .find_map(|event| match &event.event {
+            SurfaceEvent::Subagent(SubagentPatch::Started { subagent, .. }) => {
+                Some(subagent.as_subagent().source.source_digest)
+            }
+            SurfaceEvent::Subagent(SubagentPatch::Progress { source, .. })
+            | SurfaceEvent::Subagent(SubagentPatch::Completed { source, .. }) => {
+                Some(source.source_digest)
+            }
+            _ => None,
+        })
 }
 
 pub struct InMemorySurfaceCommitLedger {
@@ -266,6 +290,13 @@ impl SurfaceCommitLedger for InMemorySurfaceCommitLedger {
             .cloned()
             .map(SurfaceBatchReceipt::Ephemeral)
     }
+
+    fn lookup_subagent_source_digest(&self, commit_id: &SurfaceCommitId) -> Option<Sha256Digest> {
+        self.committed
+            .iter()
+            .find(|batch| SurfaceCommitIndex::commit_id(batch) == commit_id)
+            .and_then(subagent_source_digest)
+    }
 }
 
 pub(crate) enum RuntimeSurfaceCommitLedger {
@@ -311,6 +342,13 @@ impl SurfaceCommitLedger for RuntimeSurfaceCommitLedger {
         match self {
             Self::Recorded(ledger) => ledger.lookup_commit(commit_id),
             Self::Ephemeral(ledger) => ledger.lookup_commit(commit_id),
+        }
+    }
+
+    fn lookup_subagent_source_digest(&self, commit_id: &SurfaceCommitId) -> Option<Sha256Digest> {
+        match self {
+            Self::Recorded(ledger) => ledger.lookup_subagent_source_digest(commit_id),
+            Self::Ephemeral(ledger) => ledger.lookup_subagent_source_digest(commit_id),
         }
     }
 }
@@ -4454,6 +4492,14 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
             batch_digest: indexed.batch.batch_digest.clone(),
             cursor_after: indexed.batch.cursor_after.clone(),
         }))
+    }
+
+    fn lookup_subagent_source_digest(&self, commit_id: &SurfaceCommitId) -> Option<Sha256Digest> {
+        let index = self.commit_index.as_ref().ok()?;
+        let indexed = index.get(commit_id)?;
+        indexed
+            .committed
+            .then(|| subagent_source_digest(&indexed.batch))?
     }
 }
 

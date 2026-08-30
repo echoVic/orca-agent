@@ -2576,6 +2576,22 @@ fn operation_fence() -> SurfaceOperationFence {
     }
 }
 
+fn subagent_owner() -> SurfaceSubagentOwner {
+    SurfaceSubagentOwner::Generation {
+        fence: operation_fence(),
+    }
+}
+
+fn subagent_source(sequence: u64) -> SurfaceSubagentSource {
+    SurfaceSubagentSource::new(
+        SurfaceTaskAttemptId::try_new("manifest-attempt").unwrap(),
+        sequence,
+        SurfaceCommitId::try_from_bytes(uuid_v7_bytes(6_100u32.wrapping_add(sequence as u32)))
+            .unwrap(),
+        digest(sequence as u8),
+    )
+}
+
 fn workflow(status: SurfaceWorkflowStatus) -> SurfaceWorkflow {
     SurfaceWorkflow {
         workflow_run_id: SurfaceWorkflowRunId::try_new("manifest-workflow").unwrap(),
@@ -2983,7 +2999,8 @@ fn subagent(status: SurfaceSubagentStatus, revision: u64) -> SurfaceSubagent {
         usage: None,
         output: None,
         error: None,
-        parent: operation_fence(),
+        owner: subagent_owner(),
+        source: subagent_source(revision),
     }
 }
 
@@ -3023,7 +3040,8 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
                         subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
                         expected_revision: SubagentRevision::try_new(1).unwrap(),
                         next_revision: SubagentRevision::try_new(2).unwrap(),
-                        parent: operation_fence(),
+                        owner: subagent_owner(),
+                        source: subagent_source(2),
                         activity: DisplayText::new("progress"),
                         turn: Some(1),
                         usage: None,
@@ -3033,7 +3051,8 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
                     subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
                     expected_revision: SubagentRevision::try_new(1).unwrap(),
                     next_revision: SubagentRevision::try_new(2).unwrap(),
-                    parent: operation_fence(),
+                    owner: subagent_owner(),
+                    source: subagent_source(2),
                     status: match terminal {
                         SurfaceSubagentStatus::Completed => {
                             SurfaceSubagentTerminalStatus::Completed
@@ -3094,7 +3113,8 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
             subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
             expected_revision: SubagentRevision::try_new(1).unwrap(),
             next_revision: SubagentRevision::try_new(2).unwrap(),
-            parent: operation_fence(),
+            owner: subagent_owner(),
+            source: subagent_source(2),
             activity: DisplayText::new("illegal reopen"),
             turn: None,
             usage: None,
@@ -8966,7 +8986,7 @@ fn workflow_revision_overflow_is_not_contiguous() {
 #[test]
 fn subagent_revision_overflow_is_not_contiguous() {
     let mut subagent = subagent(SurfaceSubagentStatus::Running, u64::MAX);
-    let parent = subagent.parent.clone();
+    let owner = subagent.owner.clone();
     let subagent_id = subagent.subagent_id.clone();
     subagent.revision = SubagentRevision::try_new(u64::MAX).unwrap();
     let mut initial_snapshot = snapshot();
@@ -8977,13 +8997,14 @@ fn subagent_revision_overflow_is_not_contiguous() {
         12_262,
         vec![(
             SurfaceScope::Generation {
-                fence: parent.clone(),
+                fence: operation_fence(),
             },
             SurfaceEvent::Subagent(SubagentPatch::Progress {
                 subagent_id,
                 expected_revision: SubagentRevision::try_new(u64::MAX).unwrap(),
                 next_revision: SubagentRevision::try_new(u64::MAX).unwrap(),
-                parent,
+                owner,
+                source: subagent_source(u64::MAX),
                 activity: DisplayText::new("overflow"),
                 turn: None,
                 usage: None,

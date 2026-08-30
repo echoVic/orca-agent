@@ -293,6 +293,19 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 1;
         }
     };
+    let detached_binding = match task_registry.detached_subagent_binding(&agent_id) {
+        Ok(Some(binding)) => binding,
+        Ok(None) => {
+            let message = "detached subagent owner binding is missing or stale".to_string();
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+            return 1;
+        }
+        Err(error) => {
+            let message = format!("failed to load detached subagent owner binding: {error}");
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+            return 1;
+        }
+    };
     let continuation_lease = match coordinator
         .acquire(&prepared)
         .or_else(|_| coordinator.acquire(&prepared))
@@ -382,8 +395,8 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             attempt_id: prepared.attempt_id.clone(),
             owner: SubagentActivityOwner::DetachedTask {
                 task_id: surface_task_id,
-                task_revision: TaskRevision::try_new(1).expect("one is a valid task revision"),
-                authority_digest: prepared.compatibility.compatibility_hash,
+                task_revision: detached_binding.task_revision,
+                authority_digest: detached_binding.authority_digest,
             },
         },
         activity_sink,
@@ -794,6 +807,37 @@ pub(crate) fn launch_async_subagent(
             let worktree = launch_worktree.finish_fresh();
             let mut error = continuation_error("failed to prepare async continuation", &error);
             append_worktree_outcome(&mut error, worktree.as_ref());
+            let _ = task_registry.fail(&agent_id, error.clone());
+            return async_launch_output(
+                task_registry,
+                &agent_id,
+                tool_types::ToolResult::failed(tool_request, error, None),
+            );
+        }
+    };
+    // Persist the actor-issued detached owner before the worker is spawned.
+    // The worker later reloads this binding after adoption; configuration
+    // compatibility hashes are not used as authority credentials.
+    let _detached_binding = match task_registry.register_detached_subagent_binding(
+        &agent_id,
+        &agent_id,
+        prepared.attempt_id.clone(),
+        TaskRevision::try_new(1).expect("one is a valid task revision"),
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            let worktree = launch_worktree.finish_fresh();
+            let mut error = format!("failed to persist detached subagent owner: {error}");
+            append_worktree_outcome(&mut error, worktree.as_ref());
+            let projection = coordinator
+                .commit_prepared_terminal(
+                    &prepared,
+                    AgentTerminal::Failed {
+                        error: error.clone(),
+                    },
+                )
+                .ok();
+            let error = append_projection_footer(error, projection.as_ref());
             let _ = task_registry.fail(&agent_id, error.clone());
             return async_launch_output(
                 task_registry,

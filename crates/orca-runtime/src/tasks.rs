@@ -133,10 +133,27 @@ pub struct TaskRegistry {
     cancelled_roots: Arc<Mutex<HashSet<String>>>,
     typed_provider_outcomes: Arc<Mutex<HashMap<String, DurableTypedProviderOutcome>>>,
     continuation_store: AgentContinuationStore,
+    /// Durable actor-issued capabilities for detached child surface writes.
+    /// This is deliberately separate from the task mirror: task records can
+    /// be imported by id, while a binding is scoped to this session and the
+    /// exact continuation attempt that the actor admitted.
+    detached_bindings: Arc<Mutex<HashMap<String, DetachedSubagentBinding>>>,
     persistence: Option<Arc<TaskPersistence>>,
     persistent_open_error: Option<Arc<str>>,
     recover_persisted_active_tasks: bool,
     artifact_storage: Arc<TaskArtifactStorage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct DetachedSubagentBinding {
+    pub(crate) task_id: String,
+    pub(crate) subagent_id: String,
+    pub(crate) parent_task_id: Option<String>,
+    pub(crate) task_revision: TaskRevision,
+    pub(crate) attempt_id: AgentAttemptId,
+    /// Random actor-issued capability digest.  It is never derived solely
+    /// from compatibility/configuration data.
+    pub(crate) authority_digest: Sha256Digest,
 }
 
 impl fmt::Debug for TaskRegistry {
@@ -673,6 +690,7 @@ impl TaskRegistry {
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
             continuation_store,
+            detached_bindings: Arc::new(Mutex::new(HashMap::new())),
             persistence: None,
             persistent_open_error: None,
             recover_persisted_active_tasks: false,
@@ -718,6 +736,7 @@ impl TaskRegistry {
         };
         let typed_provider_outcomes =
             persistence.load_typed_provider_outcomes_unlocked(&session_id)?;
+        let detached_bindings = persistence.load_detached_bindings_unlocked(&session_id)?;
         let mut records = persistence.load_session_records_unlocked(&session_id)?;
         let mut changed = false;
         if recover_interrupted {
@@ -779,6 +798,7 @@ impl TaskRegistry {
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
             continuation_store,
+            detached_bindings: Arc::new(Mutex::new(detached_bindings)),
             persistence: Some(persistence),
             persistent_open_error: None,
             recover_persisted_active_tasks: recover_interrupted,
@@ -868,6 +888,200 @@ impl TaskRegistry {
             return Err(format!("persistent task registry is unavailable: {error}"));
         }
         Ok(self.continuation_store.clone())
+    }
+
+    /// Registers an actor-issued capability for a detached subagent attempt.
+    /// The binding is persisted separately from the repairable task mirror so
+    /// a restarted actor can authorize relay frames even when the parent
+    /// generation is already terminal.
+    pub(crate) fn register_detached_subagent_binding(
+        &self,
+        task_id: &str,
+        subagent_id: &str,
+        attempt_id: AgentAttemptId,
+        task_revision: TaskRevision,
+    ) -> Result<DetachedSubagentBinding, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        let task = self
+            .get(task_id)
+            .ok_or_else(|| format!("detached subagent task '{task_id}' was not found"))?;
+        if task.task_type != TaskType::Subagent {
+            return Err(format!("task '{task_id}' is not a subagent"));
+        }
+        let continuation = self
+            .continuation_store
+            .list_parent_records()
+            .map_err(|error| format!("failed to inspect child continuation: {error}"))?
+            .into_iter()
+            .find(|record| {
+                record.latest_task_id == task_id && record.current_attempt.attempt_id == attempt_id
+            })
+            .ok_or_else(|| {
+                format!("detached subagent task '{task_id}' is not bound to attempt {attempt_id}")
+            })?;
+        if continuation.parent_task_id != task.parent_task_id {
+            return Err(format!(
+                "detached subagent task '{task_id}' parent binding is inconsistent"
+            ));
+        }
+        let key = task_id.to_string();
+        let existing = if let Some(persistence) = self.persistence.as_ref() {
+            let _lock =
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                    .map_err(|error| error.to_string())?;
+            persistence
+                .load_detached_bindings_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?
+                .remove(&key)
+        } else {
+            self.detached_bindings
+                .lock()
+                .map_err(|_| "detached binding lock poisoned".to_string())?
+                .get(&key)
+                .cloned()
+        };
+        if let Some(existing) = existing {
+            if existing.subagent_id == subagent_id
+                && existing.parent_task_id == task.parent_task_id
+                && existing.task_revision == task_revision
+                && existing.attempt_id == attempt_id
+            {
+                self.detached_bindings
+                    .lock()
+                    .map_err(|_| "detached binding lock poisoned".to_string())?
+                    .insert(key, existing.clone());
+                return Ok(existing);
+            }
+            return Err(format!(
+                "detached subagent task '{task_id}' already has a conflicting binding"
+            ));
+        }
+
+        let mut authority_material = Vec::new();
+        authority_material.extend_from_slice(b"orca.detached-subagent.authority.v1\0");
+        authority_material.extend_from_slice(uuid::Uuid::now_v7().as_bytes());
+        authority_material.extend_from_slice(self.session_id.as_bytes());
+        authority_material.extend_from_slice(task_id.as_bytes());
+        authority_material.extend_from_slice(subagent_id.as_bytes());
+        authority_material.extend_from_slice(attempt_id.as_str().as_bytes());
+        let binding = DetachedSubagentBinding {
+            task_id: task_id.to_string(),
+            subagent_id: subagent_id.to_string(),
+            parent_task_id: task.parent_task_id,
+            task_revision,
+            attempt_id,
+            authority_digest: Sha256Digest::digest(authority_material),
+        };
+        if let Some(persistence) = self.persistence.as_ref() {
+            let _lock =
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                    .map_err(|error| error.to_string())?;
+            let mut bindings = persistence
+                .load_detached_bindings_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?;
+            if bindings.insert(key.clone(), binding.clone()).is_some() {
+                return Err(format!(
+                    "detached subagent task '{task_id}' already has a conflicting binding"
+                ));
+            }
+            persistence
+                .write_detached_bindings_unlocked(&self.session_id, &bindings)
+                .map_err(|error| error.to_string())?;
+        }
+        self.detached_bindings
+            .lock()
+            .map_err(|_| "detached binding lock poisoned".to_string())?
+            .insert(key, binding.clone());
+        Ok(binding)
+    }
+
+    /// Returns the current detached binding only when the task and its
+    /// continuation still agree.  A task id imported from another session or
+    /// an attempt superseded by recovery is therefore not an authority.
+    pub(crate) fn detached_subagent_binding(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<DetachedSubagentBinding>, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
+        let binding = if let Some(persistence) = self.persistence.as_ref() {
+            let _lock =
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                    .map_err(|error| error.to_string())?;
+            persistence
+                .load_detached_bindings_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?
+                .get(task_id)
+                .cloned()
+        } else {
+            self.detached_bindings
+                .lock()
+                .map_err(|_| "detached binding lock poisoned".to_string())?
+                .get(task_id)
+                .cloned()
+        };
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        if binding.task_id != task_id {
+            return Ok(None);
+        }
+        let Some(task) = self.get(task_id) else {
+            return Ok(None);
+        };
+        if task.task_type != TaskType::Subagent || task.parent_task_id != binding.parent_task_id {
+            return Ok(None);
+        }
+        let continuation_matches = self
+            .continuation_store
+            .list_parent_records()
+            .map_err(|error| format!("failed to inspect child continuation: {error}"))?
+            .into_iter()
+            .any(|record| {
+                record.latest_task_id == task_id
+                    && record.current_attempt.attempt_id == binding.attempt_id
+            });
+        if !continuation_matches {
+            return Ok(None);
+        }
+        self.detached_bindings
+            .lock()
+            .map_err(|_| "detached binding lock poisoned".to_string())?
+            .insert(task_id.to_string(), binding.clone());
+        Ok(Some(binding))
+    }
+
+    pub(crate) fn detached_subagent_bindings(
+        &self,
+    ) -> Result<Vec<DetachedSubagentBinding>, String> {
+        let keys = if let Some(persistence) = self.persistence.as_ref() {
+            let _lock =
+                ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+                    .map_err(|error| error.to_string())?;
+            persistence
+                .load_detached_bindings_unlocked(&self.session_id)
+                .map_err(|error| error.to_string())?
+                .into_values()
+                .collect::<Vec<_>>()
+        } else {
+            self.detached_bindings
+                .lock()
+                .map_err(|_| "detached binding lock poisoned".to_string())?
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut valid = Vec::new();
+        for binding in keys {
+            if let Some(binding) = self.detached_subagent_binding(&binding.task_id)? {
+                valid.push(binding);
+            }
+        }
+        valid.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        Ok(valid)
     }
 
     pub(crate) fn install_continuation_projection(
@@ -3074,6 +3288,31 @@ impl TaskPersistence {
         self.root
             .join(safe_path_component(session_id))
             .join("typed-provider-outcomes.json")
+    }
+
+    fn session_detached_bindings_path(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(safe_path_component(session_id))
+            .join("detached-subagent-bindings.json")
+    }
+
+    fn load_detached_bindings_unlocked(
+        &self,
+        session_id: &str,
+    ) -> io::Result<HashMap<String, DetachedSubagentBinding>> {
+        let path = self.session_detached_bindings_path(session_id);
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        read_json(&path)
+    }
+
+    fn write_detached_bindings_unlocked(
+        &self,
+        session_id: &str,
+        bindings: &HashMap<String, DetachedSubagentBinding>,
+    ) -> io::Result<()> {
+        write_json_pretty(&self.session_detached_bindings_path(session_id), bindings)
     }
 
     fn session_lock_path(&self, session_id: &str) -> PathBuf {

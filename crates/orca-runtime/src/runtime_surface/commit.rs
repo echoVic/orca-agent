@@ -2121,6 +2121,16 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         self.ledger.lookup_commit(commit_id)
     }
 
+    /// Looks up the source digest carried by a committed subagent event.
+    /// Unlike the process-local activity cache this remains available after a
+    /// runtime restart and therefore closes same-commit-id replay conflicts.
+    pub fn lookup_subagent_source_digest(
+        &self,
+        commit_id: &super::SurfaceCommitId,
+    ) -> Option<super::Sha256Digest> {
+        self.ledger.lookup_subagent_source_digest(commit_id)
+    }
+
     pub(crate) fn map_ledger<M>(
         self,
         map: impl FnOnce(L) -> M,
@@ -6159,6 +6169,76 @@ fn historical_tool_result_commit_authorized(
         && !pinned
 }
 
+/// Actor-controlled child activity commits are intentionally narrow: one
+/// Thread-scoped task projection paired with one child subagent patch.  A
+/// foreground child uses a matching Generation scope; a detached child uses
+/// Thread for transport but carries an explicit durable owner identity.
+fn actor_control_subagent_activity_authorized(batch: &SurfaceCommitBatch) -> bool {
+    let [task_event, subagent_event] = batch.events.as_slice() else {
+        return false;
+    };
+    if !matches!(&task_event.scope, SurfaceScope::Thread) {
+        return false;
+    }
+    let super::SurfaceEvent::Task(super::TaskPatch::Upserted { task, .. }) = &task_event.event
+    else {
+        return false;
+    };
+    let (subagent_id, owner, source, expected_generation) = match &subagent_event.event {
+        super::SurfaceEvent::Subagent(super::SubagentPatch::Started { subagent, .. }) => {
+            let value = subagent.as_subagent();
+            let expected_generation = match &subagent_event.scope {
+                SurfaceScope::Generation { fence } => Some(fence),
+                SurfaceScope::Thread => None,
+                _ => return false,
+            };
+            (
+                &value.subagent_id,
+                &value.owner,
+                &value.source,
+                expected_generation,
+            )
+        }
+        super::SurfaceEvent::Subagent(super::SubagentPatch::Progress {
+            subagent_id,
+            owner,
+            source,
+            ..
+        })
+        | super::SurfaceEvent::Subagent(super::SubagentPatch::Completed {
+            subagent_id,
+            owner,
+            source,
+            ..
+        }) => {
+            let expected_generation = match &subagent_event.scope {
+                SurfaceScope::Generation { fence } => Some(fence),
+                SurfaceScope::Thread => None,
+                _ => return false,
+            };
+            (subagent_id, owner, source, expected_generation)
+        }
+        _ => return false,
+    };
+    match (owner, expected_generation) {
+        (super::SurfaceSubagentOwner::Generation { fence: owner }, Some(scope_fence)) => {
+            task.task_type == super::SurfaceTaskType::Subagent
+                && task.subagent_id.as_ref() == Some(subagent_id)
+                && task.parent_operation.as_ref() == Some(&scope_fence.operation_id)
+                && owner == scope_fence
+                && source.source_sequence > 0
+        }
+        (super::SurfaceSubagentOwner::DetachedTask { owner }, None) => {
+            task.task_type == super::SurfaceTaskType::Subagent
+                && task.task_id == owner.task_id
+                && task.subagent_id.as_ref() == Some(subagent_id)
+                && source.attempt_id == owner.attempt_id
+                && source.source_sequence > 0
+        }
+        _ => false,
+    }
+}
+
 fn permit_authorizes(
     issued_permits: &[SurfacePublisherPermit],
     permit: &SurfacePublisherPermit,
@@ -6197,7 +6277,9 @@ fn permit_authorizes(
                             &event.event,
                             super::SurfaceEvent::Task(super::TaskPatch::Reconciled { .. })
                         )
-                }) || actor_control_workflow_launch_authorized(batch)
+                        && !matches!(&event.event, super::SurfaceEvent::Subagent(_))
+                }) || actor_control_subagent_activity_authorized(batch)
+                    || actor_control_workflow_launch_authorized(batch)
                     || actor_control_main_session_transfer_authorized(batch)
                     || actor_control_admission_pair_authorized(batch)
                     || actor_control_resume_pair_authorized(batch)
@@ -6687,7 +6769,10 @@ fn actor_generation_permission_request_authorized(
         && task.parent_operation.as_ref() == Some(&fence.operation_id)
         && task.subagent_id.as_ref() == Some(agent_id)
         && subagent.revision == *agent_revision
-        && subagent.parent == *fence
+        && matches!(
+            &subagent.owner,
+            super::SurfaceSubagentOwner::Generation { fence: owner } if owner == fence
+        )
 }
 
 fn find_tool_turn(
@@ -7045,7 +7130,10 @@ fn actor_generation_permission_task_resolution_authorized(
         && task.parent_operation.as_ref() == Some(&fence.operation_id)
         && task.subagent_id.as_ref() == Some(agent_id)
         && subagent.revision == *agent_revision
-        && subagent.parent == *fence
+        && matches!(
+            &subagent.owner,
+            super::SurfaceSubagentOwner::Generation { fence: owner } if owner == fence
+        )
 }
 
 fn session_permission_settings_delta_authorized(
@@ -13226,7 +13314,15 @@ mod tests {
             usage: None,
             output: None,
             error: None,
-            parent: fence.clone(),
+            owner: super::super::SurfaceSubagentOwner::Generation {
+                fence: fence.clone(),
+            },
+            source: super::super::SurfaceSubagentSource::new(
+                super::super::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
+                1,
+                super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(122)).unwrap(),
+                super::super::Sha256Digest::new([1; 32]),
+            ),
         });
         let state = SurfaceReducerState::new(snapshot);
         let interaction_id =

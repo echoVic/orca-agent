@@ -50,11 +50,12 @@ use super::projection::{
     SurfaceGoalState, SurfaceGoalStoreReceipt, SurfaceHealthIssue, SurfaceHealthIssueId,
     SurfaceItem, SurfaceItemOrigin, SurfacePinnedContextEntry, SurfacePinnedContextKind,
     SurfacePlanSnapshot, SurfaceRemoteTerminalLease, SurfaceRemoteTerminalLeaseState,
-    SurfaceSubagentStatus, SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus,
-    SurfaceTaskType, SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState,
-    SurfaceUsageSnapshot, SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow,
-    SurfaceWorkflowAgent, SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, TaskPatch,
-    ToolInvocationStarted, ToolPatch, WorkflowPatch,
+    SurfaceSubagentOwner, SurfaceSubagentSource, SurfaceSubagentStatus,
+    SurfaceSubagentTerminalStatus, SurfaceTask, SurfaceTaskStatus, SurfaceTaskType,
+    SurfaceToolResultKind, SurfaceToolView, SurfaceToolViewState, SurfaceUsageSnapshot,
+    SurfaceUserInputState, SurfaceVerificationResult, SurfaceWorkflow, SurfaceWorkflowAgent,
+    SurfaceWorkflowAgentStatus, SurfaceWorkflowStatus, TaskPatch, ToolInvocationStarted, ToolPatch,
+    WorkflowPatch,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1298,15 +1299,25 @@ fn scope_matches_event(scope: &SurfaceScope, event: &SurfaceEvent) -> bool {
             SurfaceScope::Generation { .. } | SurfaceScope::Background { .. }
         ),
         SurfaceEvent::Workflow(_) => matches!(scope, SurfaceScope::Thread),
-        SurfaceEvent::Subagent(SubagentPatch::Started { subagent, .. }) => matches!(
-            scope,
-            SurfaceScope::Generation { fence } if fence == &subagent.as_subagent().parent
-        ),
-        SurfaceEvent::Subagent(SubagentPatch::Progress { parent, .. })
-        | SurfaceEvent::Subagent(SubagentPatch::Completed { parent, .. }) => matches!(
-            scope,
-            SurfaceScope::Generation { fence } if fence == parent
-        ),
+        SurfaceEvent::Subagent(SubagentPatch::Started { subagent, .. }) => {
+            match (scope, &subagent.as_subagent().owner) {
+                (
+                    SurfaceScope::Generation { fence },
+                    SurfaceSubagentOwner::Generation { fence: owner },
+                ) => fence == owner,
+                (SurfaceScope::Thread, SurfaceSubagentOwner::DetachedTask { .. }) => true,
+                _ => false,
+            }
+        }
+        SurfaceEvent::Subagent(SubagentPatch::Progress { owner, .. })
+        | SurfaceEvent::Subagent(SubagentPatch::Completed { owner, .. }) => match (scope, owner) {
+            (
+                SurfaceScope::Generation { fence },
+                SurfaceSubagentOwner::Generation { fence: owner },
+            ) => fence == owner,
+            (SurfaceScope::Thread, SurfaceSubagentOwner::DetachedTask { .. }) => true,
+            _ => false,
+        },
     }
 }
 
@@ -8117,12 +8128,43 @@ fn apply_subagent_patch(
                 .iter()
                 .any(|value| value.subagent_id == subagent.subagent_id)
                 || subagent.revision.get() != 1
+                || subagent.source.source_sequence != 1
             {
                 return Err(event_error(
                     envelope,
                     SurfaceReducerErrorCode::IllegalTransition,
                     "subagent start transition is not allowed",
                 ));
+            }
+            if !subagent_source_matches_owner(&subagent.owner, &subagent.source) {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::ScopeMismatch,
+                    "subagent source cursor does not match its owner",
+                ));
+            }
+            if let SurfaceSubagentOwner::DetachedTask { owner } = &subagent.owner {
+                let Some(task) = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == owner.task_id)
+                else {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::MissingIdentity,
+                        "detached subagent owner task does not exist",
+                    ));
+                };
+                if task.task_type != SurfaceTaskType::Subagent
+                    || task.subagent_id.as_ref() != Some(&subagent.subagent_id)
+                    || task.revision < owner.task_revision
+                {
+                    return Err(event_error(
+                        envelope,
+                        SurfaceReducerErrorCode::ScopeMismatch,
+                        "detached subagent owner task binding is invalid",
+                    ));
+                }
             }
             snapshot.subagents.push(subagent.clone());
             Ok(())
@@ -8131,7 +8173,8 @@ fn apply_subagent_patch(
             subagent_id,
             expected_revision,
             next_revision,
-            parent,
+            owner,
+            source,
             activity,
             turn,
             usage,
@@ -8152,7 +8195,8 @@ fn apply_subagent_patch(
                     .get()
                     .checked_add(1)
                     .is_some_and(|expected_next| next_revision.get() == expected_next)
-                || subagent.parent != *parent
+                || subagent.owner != *owner
+                || !subagent_source_is_next(&subagent.source, source)
             {
                 return Err(event_error(
                     envelope,
@@ -8168,6 +8212,7 @@ fn apply_subagent_patch(
                 ));
             }
             subagent.revision = *next_revision;
+            subagent.source = source.clone();
             subagent.activity = Some(activity.clone());
             subagent.turn = *turn;
             subagent.usage = usage.clone();
@@ -8177,7 +8222,8 @@ fn apply_subagent_patch(
             subagent_id,
             expected_revision,
             next_revision,
-            parent,
+            owner,
+            source,
             status,
             output,
             error,
@@ -8199,7 +8245,8 @@ fn apply_subagent_patch(
                     .get()
                     .checked_add(1)
                     .is_some_and(|expected_next| next_revision.get() == expected_next)
-                || subagent.parent != *parent
+                || subagent.owner != *owner
+                || !subagent_source_is_next(&subagent.source, source)
             {
                 return Err(event_error(
                     envelope,
@@ -8215,6 +8262,7 @@ fn apply_subagent_patch(
                 ));
             }
             subagent.revision = *next_revision;
+            subagent.source = source.clone();
             subagent.status = match status {
                 SurfaceSubagentTerminalStatus::Completed => SurfaceSubagentStatus::Completed,
                 SurfaceSubagentTerminalStatus::Failed => SurfaceSubagentStatus::Failed,
@@ -8226,6 +8274,26 @@ fn apply_subagent_patch(
             Ok(())
         }
     }
+}
+
+fn subagent_source_matches_owner(
+    owner: &super::projection::SurfaceSubagentOwner,
+    source: &SurfaceSubagentSource,
+) -> bool {
+    source.source_sequence > 0
+        && match owner {
+            SurfaceSubagentOwner::Generation { .. } => true,
+            SurfaceSubagentOwner::DetachedTask { owner } => source.attempt_id == owner.attempt_id,
+        }
+}
+
+fn subagent_source_is_next(previous: &SurfaceSubagentSource, next: &SurfaceSubagentSource) -> bool {
+    previous.attempt_id == next.attempt_id
+        && previous
+            .source_sequence
+            .checked_add(1)
+            .is_some_and(|expected| expected == next.source_sequence)
+        && next.source_commit_id != previous.source_commit_id
 }
 
 fn task_status_transition_allowed(from: SurfaceTaskStatus, to: SurfaceTaskStatus) -> bool {

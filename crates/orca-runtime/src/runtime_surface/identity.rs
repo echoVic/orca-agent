@@ -832,6 +832,7 @@ macro_rules! text_id {
 text_id!(
     SurfaceToolCallId,
     SurfaceTaskId,
+    SurfaceTaskAttemptId,
     SurfaceActivityId,
     SurfaceWorkflowRunId,
     SurfaceWorkflowResultId,
@@ -1027,6 +1028,33 @@ pub struct SurfaceTaskFence {
     pub task_id: SurfaceTaskId,
     pub task_revision: TaskRevision,
     pub background_owner: Option<SurfaceBackgroundFence>,
+}
+
+/// Stable, serializable identity for a detached task owner. This is a
+/// projection identity, not a capability: the actor validates it against the
+/// durable continuation record before accepting a detached event.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SurfaceTaskOwnerRef {
+    pub task_id: SurfaceTaskId,
+    pub task_revision: TaskRevision,
+    pub attempt_id: SurfaceTaskAttemptId,
+    pub authority_digest: Sha256Digest,
+}
+
+impl SurfaceTaskOwnerRef {
+    pub fn new(
+        task_id: SurfaceTaskId,
+        task_revision: TaskRevision,
+        attempt_id: SurfaceTaskAttemptId,
+        authority_digest: Sha256Digest,
+    ) -> Self {
+        Self {
+            task_id,
+            task_revision,
+            attempt_id,
+            authority_digest,
+        }
+    }
 }
 
 #[derive(Serialize)]

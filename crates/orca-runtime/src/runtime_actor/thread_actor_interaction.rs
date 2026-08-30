@@ -77,7 +77,11 @@ impl ThreadActor {
                     || subagent.revision != *agent_revision
                     || task.parent_operation.as_ref() != Some(&fence.operation_id)
                     || task.subagent_id.as_ref() != Some(agent_id)
-                    || subagent.parent != *fence
+                    || !matches!(
+                        &subagent.owner,
+                        surface::SurfaceSubagentOwner::Generation { fence: owner }
+                            if owner == fence
+                    )
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
