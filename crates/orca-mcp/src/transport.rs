@@ -235,6 +235,18 @@ impl StdioTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            // Keep the platform loader/runtime contract after clearing the
+            // inherited user environment. In particular, Node and cmd-based
+            // integrations may require SystemRoot to initialize, while PATH
+            // and user variables remain opt-in through config.env.
+            for key in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
+                if let Some(value) = std::env::var_os(key) {
+                    child_command.env(key, value);
+                }
+            }
+        }
         #[cfg(unix)]
         {
             child_command.process_group(0);
