@@ -1,174 +1,126 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # CLI 参考
 
+公开 CLI 契约保持精简。请对已安装的二进制运行 `orca --help`，或运行对应
+子命令的 `--help`。仓库中的 `docs/public-cli-manifest.json` 会在测试中与
+Clap 命令面保持一致。
 
-Orca 有两个顶级命令：`orca`（交互式 TUI）和 `orca exec`（无头模式）。本页记录了所有标志、退出码和配置优先级规则。
+## 安装
 
-## 命令概览
+```bash
+npm install -g @blade-ai/orca
+```
+
+官网和安装器的规范域名是 [orcaagent.dev](https://orcaagent.dev/)。
+
+## 根命令
+
+```text
+orca [OPTIONS] [PROMPT]...
+orca [OPTIONS] <COMMAND>
+```
+
+直接运行 `orca` 会打开交互式 TUI，也可以把提示词作为位置参数传入。
+可见的根命令如下：
 
 | 命令 | 用途 |
-|------|------|
-| `orca` | 启动交互式终端界面 |
-| `orca exec <prompt>` | 运行无头单次会话 |
-| `orca config` | 检查和修改配置 |
-| `orca doctor` | 运行环境诊断 |
-| `orca sessions` | 列出、恢复和管理会话 |
+| --- | --- |
+| `orca doctor` | 检查本地配置、凭据、目录信任和沙箱就绪状态。 |
+| `orca exec` | 非交互执行任务，输出文本或 JSONL 事件。 |
+| `orca workflow` | 执行和检查本地持久化工作流。 |
+| `orca trust` | 查看或更新目录信任。 |
 
----
+根选项包括 `--resume [SESSION_ID]`、`--fork <ID>`、`--continue`、
+`--model <MODEL>`、`--mode <MODE>`、`--api-key <KEY>`、`--base-url <URL>`
+和 `--cwd <PATH>`。交互式运行使用审批模式（`suggest`、`auto-edit`、
+`full-auto` 或 `plan`）。`--mode server` 与 `--mode acp` 则选择协议传输，
+不能与提示词或子命令一起使用。
 
-## `orca`（交互式 TUI）
+## `orca doctor`
 
-### 标志
-
-| 标志 | 缩写 | 类型 | 默认值 | 描述 |
-|------|------|------|--------|------|
-| `--model <name>` | `-m` | string | `deepseek-v4-flash` | 使用的模型 ID |
-| `--approval <mode>` | `-a` | enum | `auto-edit` | 审批模式（`plan`、`suggest`、`auto-edit`、`full-auto`） |
-| `--max-turns <n>` | | int | `100` | 每次会话最大回合数 |
-| `--max-cost <usd>` | | float | `10.00` | 最大 token 费用（美元） |
-| `--resume <id>` | `-r` | string | — | 按 ID 恢复现有会话 |
-| `--fork <spec>` | | string | — | 从会话检查点分叉（`<session-id>:<turn-id>`） |
-| `--workflow <path>` | `-w` | string | — | 加载工作流 YAML 文件 |
-| `--goal <path>` | `-g` | string | — | 加载目标 YAML 文件 |
-| `--cwd <path>` | | string | `.` | 智能体的工作目录 |
-| `--temperature <n>` | | float | `0.7` | 采样温度（0.0–2.0） |
-| `--reasoning-effort <level>` | | enum | `medium` | 推理努力（`low`、`medium`、`high`） |
-| `--verbose` | `-v` | bool | `false` | 显示调试日志 |
-| `--version` | | bool | — | 打印版本并退出 |
-| `--help` | `-h` | bool | — | 打印帮助并退出 |
-
-### 示例
-
-```bash
-# 在当前目录启动新会话
-orca
-
-# 以高推理努力恢复会话 42
-orca --resume 42 --reasoning-effort high
-
-# 使用 pro 模型从回合 17 分叉
-orca --fork 42:turn-17 --model deepseek-v4-pro
-
-# 以完全自动审批模式运行（谨慎使用）
-orca --approval full-auto
+```text
+orca doctor [--cwd <PATH>] [--format <text|json>]
 ```
 
----
+`doctor` 是本地只读的运行前检查。它不会连接模型服务、启动 MCP、配置沙箱
+capability、写入配置，也不会改变目录信任。它输出带类型的 `pass`、`warn`、
+`fail` 检查：
 
-## `orca exec`（无头模式）
+- 配置语法和来源路径；
+- 凭据是否存在及其来源（绝不输出凭据值）；
+- 生效模型和 endpoint 配置；
+- 最近的目录信任决策；
+- 当前平台的沙箱后端。
 
-### 标志
-
-| 标志 | 缩写 | 类型 | 默认值 | 描述 |
-|------|------|------|--------|------|
-| `<prompt>` | | positional | **（必填）** | 智能体的任务描述 |
-| `--model <name>` | `-m` | string | `deepseek-v4-flash` | 模型 ID |
-| `--verifier <cmd>` | `-v` | string | — | 用于验证结果的 Shell 命令 |
-| `--max-turns <n>` | | int | `50` | 最大回合数 |
-| `--max-cost <usd>` | | float | `5.00` | 最大费用 |
-| `--approval <mode>` | `-a` | enum | `auto-edit` | 审批模式（无头模式默认为 `auto-edit`） |
-| `--output <path>` | `-o` | string | stdout | 将 JSONL 事件写入文件 |
-| `--jsonl` | | bool | `true` | 在标准输出上发出 JSONL 事件 |
-| `--temperature <n>` | | float | `0.7` | 采样温度 |
-| `--reasoning-effort <level>` | | enum | `medium` | 推理努力 |
-| `--cwd <path>` | | string | `.` | 工作目录 |
-| `--resume <id>` | `-r` | string | — | 恢复现有 exec 会话 |
-| `--help` | `-h` | bool | — | 打印帮助 |
-
-### 示例
+只有存在 `fail` 时退出码才是 `1`；只有警告时退出码为 `0`。文本适合人工阅读，
+JSON 是稳定的机器接口，字段使用 camelCase，例如 `schemaVersion`。
 
 ```bash
-# 简单单次执行
-orca exec "给设置页面添加深色模式切换"
-
-# 带验证器
-orca exec \
-  "修复 src/ 中所有 TypeScript 错误" \
-  --verifier "npx tsc --noEmit"
-
-# 带预算和输出文件
-orca exec \
-  "重构认证模块以使用 JWT" \
-  --max-turns 25 \
-  --max-cost 4.00 \
-  --output ./reports/auth-refactor.jsonl
+orca doctor
+orca doctor --cwd ./project --format json
 ```
 
-### `orca exec resume`
+## `orca exec`
 
-恢复之前失败或预算耗尽的 exec 会话：
+```text
+orca exec [OPTIONS] [PROMPT]...
+orca exec [OPTIONS] resume [SESSION_ID] [PROMPT]...
+```
+
+支持的执行选项：
+
+| 选项 | 含义 |
+| --- | --- |
+| `--output-format <text|jsonl>` | 人类可读输出，或每行一个 JSON 事件。 |
+| `--cwd <PATH>` | 工作区目录。 |
+| `--mode <suggest|auto-edit|full-auto|plan>` | 工具操作的审批策略。 |
+| `--model <MODEL>` | 覆盖模型。 |
+| `--api-key <KEY>` | 覆盖 API 密钥。 |
+| `--base-url <URL>` | 覆盖 API endpoint。 |
+| `--verifier <COMMAND>` | 任务完成后执行的验证命令。 |
+| `--max-turns <N>` | 本次运行最多模型回合数。 |
+| `--max-tool-calls <N>` | 本次运行最多工具调用数。 |
+| `--max-cost-usd <USD>` | 本次运行的估算费用上限。 |
+| `--max-wall-time-secs <SECONDS>` | 本次运行的最长墙钟时间。 |
+| `--resume <ID>` | 按 ID 或前缀恢复对话。 |
+| `--resume-at <MESSAGE_ID>` | 只恢复到指定持久化消息边界。 |
+| `--fork <ID>` | 分叉保存的对话。 |
+| `--continue` | 继续最近保存的对话。 |
+| `--no-history` | 不写入本次运行的本地历史。 |
+| `--save-history` | 使用 JSONL 输出时仍保存历史。 |
+
+示例：
 
 ```bash
-orca exec resume <session-id>
-
-# 带覆盖参数
-orca exec resume <session-id> --max-turns 10 --max-cost 2.00
+orca exec "修复失败的测试" --verifier "cargo test"
+orca exec --output-format jsonl --max-turns 20 "重构解析器" > run.jsonl
+orca exec resume SESSION_ID --resume-at MESSAGE_ID "从检查点继续"
 ```
 
----
+需要保存输出时使用 shell 重定向；CLI 没有单独的 `--output` 路径选项。
 
-## 退出码
+## `orca workflow`
 
-| 代码 | 含义 |
-|------|------|
-| `0` | 成功——智能体完成任务且验证器通过（如已设置） |
-| `1` | 通用错误——查看 stderr 了解详情 |
-| `2` | 预算耗尽——达到最大回合数或费用但未完成 |
-| `3` | 验证器失败——智能体完成但验证命令返回非零 |
-| `4` | 审批被拒绝——在非交互上下文中用户拒绝了工具调用 |
-| `5` | 模型错误——API 速率限制、无效响应或提供商服务中断 |
-| `6` | 配置错误——缺少 API 密钥、模型无效等 |
-| `7` | 会话错误——状态损坏、加载会话失败 |
+工作流命令提供 `run`、`list`、`show`、`source`、`stop`、`pause`、`resume`、
+`clone`、`restart-failed` 和 `restart-phase`。每个操作都有自己的参数；编写
+脚本前请先查看 `orca workflow <COMMAND> --help`。
 
----
+## `orca trust`
 
-## 配置优先级
+```text
+orca trust [show|add|remove] [--cwd <PATH>]
+```
 
-Orca 按以下顺序解析配置（优先级从高到低）：
+`show` 是只读操作。`add` 和 `remove` 会更新用户目录中的信任存储，执行前请
+确认目录内容和对应的沙箱策略。
 
-| 优先级 | 来源 | 示例 |
-|--------|------|------|
-| 1（最高） | CLI 标志 | `--model deepseek-v4-pro` |
-| 2 | 环境变量 | `ORCA_MODEL=deepseek-v4-pro` |
-| 3 | 项目配置（`.orca/config.toml`） | 项目级设置 |
-| 4 | 全局配置（`~/.config/orca/config.toml`） | 用户默认值 |
-| 5（最低） | 内置默认值 | 硬编码的回退值 |
+## 配置和环境变量
 
-### 环境变量
+设置 `ORCA_HOME` 时，用户配置文件为 `$ORCA_HOME/config.toml`；否则为
+`~/.orca/config.toml`。项目可以提供 `.orca/config.toml`，但只有目录受信任后才会
+加载。生效优先级从高到低为命令行选项、环境变量、受信任项目配置、用户配置和内置
+默认值。
 
-| 变量 | 描述 |
-|------|------|
-| `DEEPSEEK_API_KEY` | DeepSeek 的 API 密钥 |
-| `ORCA_MODEL` | 默认模型 ID |
-| `ORCA_APPROVAL` | 默认审批模式 |
-| `ORCA_MAX_TURNS` | 默认最大回合数 |
-| `ORCA_MAX_COST` | 默认最大费用 |
-| `ORCA_CONFIG_PATH` | 覆盖配置文件位置 |
-| `ORCA_LOG_LEVEL` | 日志级别（`trace`、`debug`、`info`、`warn`、`error`） |
-
----
-
-## `orca config` 子命令
-
-| 命令 | 描述 |
-|------|------|
-| `orca config show` | 显示已解析的配置 |
-| `orca config set <key> <value>` | 设置配置值 |
-| `orca config get <key>` | 获取配置值 |
-| `orca config unset <key>` | 移除配置键 |
-| `orca config validate` | 验证配置并报告错误 |
-| `orca config path` | 打印配置文件路径 |
-
----
-
-## `orca sessions` 子命令
-
-| 命令 | 描述 |
-|------|------|
-| `orca sessions list` | 列出所有会话，包括 ID、状态和最后活动时间 |
-| `orca sessions show <id>` | 显示会话详情（回合数、token、费用） |
-| `orca sessions resume <id>` | 以 TUI 模式恢复会话 |
-| `orca sessions fork <id>:<turn>` | 从特定回合分叉 |
-| `orca sessions delete <id>` | 永久删除会话 |
-| `orca sessions export <id>` | 将会话导出为 JSON |
+支持的环境覆盖包括 `ORCA_API_KEY`/`DEEPSEEK_API_KEY`、
+`ORCA_MODEL`/`DEEPSEEK_MODEL`、`ORCA_BASE_URL`/`DEEPSEEK_BASE_URL`、`ORCA_MODE`
+和 `ORCA_REASONING_EFFORT`/`DEEPSEEK_REASONING_EFFORT`。不要把凭据提交到源码库；
+`orca doctor --format json` 只报告凭据是否存在及其来源。

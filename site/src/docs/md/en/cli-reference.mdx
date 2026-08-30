@@ -1,174 +1,133 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # CLI Reference
 
+The public command line contract is intentionally small. Run `orca --help` or
+the relevant subcommand's `--help` for the binary that is installed on your
+machine. The checked-in contract is also recorded in
+`docs/public-cli-manifest.json`.
 
-Orca has two top-level commands: `orca` (interactive TUI) and `orca exec` (headless). This page documents every flag, exit code, and configuration precedence rule.
+## Install
 
-## Commands Overview
+```bash
+npm install -g @blade-ai/orca
+```
+
+The canonical site and installer are [orcaagent.dev](https://orcaagent.dev/).
+
+## Root command
+
+```text
+orca [OPTIONS] [PROMPT]...
+orca [OPTIONS] <COMMAND>
+```
+
+Running `orca` opens the interactive TUI. A prompt may be supplied as
+positional text. The visible root commands are:
 
 | Command | Purpose |
-|---------|---------|
-| `orca` | Launch the interactive terminal UI |
-| `orca exec <prompt>` | Run a headless one-shot session |
-| `orca config` | Inspect and modify configuration |
-| `orca doctor` | Run environment diagnostics |
-| `orca sessions` | List, resume, and manage sessions |
+| --- | --- |
+| `orca doctor` | Inspect local configuration, credentials, folder trust, and sandbox readiness. |
+| `orca exec` | Run a non-interactive task and emit text or JSONL events. |
+| `orca workflow` | Run and inspect persisted local workflows. |
+| `orca trust` | Show or update folder trust. |
 
----
+Root options are `--resume [SESSION_ID]`, `--fork <ID>`, `--continue`,
+`--model <MODEL>`, `--mode <MODE>`, `--api-key <KEY>`, `--base-url <URL>`, and
+`--cwd <PATH>`. Use an approval mode (`suggest`, `auto-edit`, `full-auto`, or
+`plan`) for an interactive run. `--mode server` and `--mode acp` instead select
+a protocol transport and cannot be combined with a prompt or subcommand.
 
-## `orca` (Interactive TUI)
+## `orca doctor`
 
-### Flags
-
-| Flag | Shorthand | Type | Default | Description |
-|------|-----------|------|---------|-------------|
-| `--model <name>` | `-m` | string | `deepseek-v4-flash` | Model ID to use |
-| `--approval <mode>` | `-a` | enum | `auto-edit` | Approval mode (`plan`, `suggest`, `auto-edit`, `full-auto`) |
-| `--max-turns <n>` | | int | `100` | Maximum turns per session |
-| `--max-cost <usd>` | | float | `10.00` | Maximum token cost in USD |
-| `--resume <id>` | `-r` | string | — | Resume an existing session by ID |
-| `--fork <spec>` | | string | — | Fork from a session checkpoint (`<session-id>:<turn-id>`) |
-| `--workflow <path>` | `-w` | string | — | Load a workflow YAML file |
-| `--goal <path>` | `-g` | string | — | Load a goal YAML file |
-| `--cwd <path>` | | string | `.` | Working directory for the agent |
-| `--temperature <n>` | | float | `0.7` | Sampling temperature (0.0–2.0) |
-| `--reasoning-effort <level>` | | enum | `medium` | Reasoning effort (`low`, `medium`, `high`) |
-| `--verbose` | `-v` | bool | `false` | Show debug logging |
-| `--version` | | bool | — | Print version and exit |
-| `--help` | `-h` | bool | — | Print help and exit |
-
-### Examples
-
-```bash
-# Start a new session in the current directory
-orca
-
-# Resume session 42 with high reasoning effort
-orca --resume 42 --reasoning-effort high
-
-# Fork from turn 17 of session 42, using pro model
-orca --fork 42:turn-17 --model deepseek-v4-pro
-
-# Run with full auto-approval (use with caution)
-orca --approval full-auto
+```text
+orca doctor [--cwd <PATH>] [--format <text|json>]
 ```
 
----
+`doctor` is a local, read-only preflight. It never contacts the provider,
+starts MCP, provisions sandbox capabilities, writes configuration, or changes
+folder trust. It reports typed `pass`, `warn`, and `fail` checks for:
 
-## `orca exec` (Headless)
+- configuration syntax and source paths;
+- credential presence and source (never the credential value);
+- effective model and endpoint configuration;
+- the nearest folder-trust decision; and
+- the platform sandbox backend.
 
-### Flags
-
-| Flag | Shorthand | Type | Default | Description |
-|------|-----------|------|---------|-------------|
-| `<prompt>` | | positional | **(required)** | Task description for the agent |
-| `--model <name>` | `-m` | string | `deepseek-v4-flash` | Model ID |
-| `--verifier <cmd>` | `-v` | string | — | Shell command to verify the result |
-| `--max-turns <n>` | | int | `50` | Maximum turns |
-| `--max-cost <usd>` | | float | `5.00` | Maximum cost |
-| `--approval <mode>` | `-a` | enum | `auto-edit` | Approval mode (headless defaults to `auto-edit`) |
-| `--output <path>` | `-o` | string | stdout | Write JSONL events to file |
-| `--jsonl` | | bool | `true` | Emit JSONL events on stdout |
-| `--temperature <n>` | | float | `0.7` | Sampling temperature |
-| `--reasoning-effort <level>` | | enum | `medium` | Reasoning effort |
-| `--cwd <path>` | | string | `.` | Working directory |
-| `--resume <id>` | `-r` | string | — | Resume an existing exec session |
-| `--help` | `-h` | bool | — | Print help |
-
-### Examples
+Warnings keep exit status `0`. A required failed check returns exit status `1`.
+Text is intended for people; JSON is stable machine-readable output with
+camelCase fields such as `schemaVersion` and `folder-trust` check IDs.
 
 ```bash
-# Simple one-shot
-orca exec "Add a dark mode toggle to the settings page"
-
-# With verifier
-orca exec \
-  "Fix all TypeScript errors in src/" \
-  --verifier "npx tsc --noEmit"
-
-# With budget and output file
-orca exec \
-  "Refactor the auth module to use JWT" \
-  --max-turns 25 \
-  --max-cost 4.00 \
-  --output ./reports/auth-refactor.jsonl
+orca doctor
+orca doctor --cwd ./project --format json
 ```
 
-### `orca exec resume`
+## `orca exec`
 
-Resume a previously failed or budget-exhausted exec session:
+```text
+orca exec [OPTIONS] [PROMPT]...
+orca exec [OPTIONS] resume [SESSION_ID] [PROMPT]...
+```
+
+The supported execution options are:
+
+| Option | Meaning |
+| --- | --- |
+| `--output-format <text|jsonl>` | Human-readable output or one JSON object per event. |
+| `--cwd <PATH>` | Workspace directory. |
+| `--mode <suggest|auto-edit|full-auto|plan>` | Approval policy for tool actions. |
+| `--model <MODEL>` | Model override. |
+| `--api-key <KEY>` | API key override. |
+| `--base-url <URL>` | API endpoint override. |
+| `--verifier <COMMAND>` | Command to run after the task. |
+| `--max-turns <N>` | Maximum model turns for this run. |
+| `--max-tool-calls <N>` | Maximum tool calls for this run. |
+| `--max-cost-usd <USD>` | Maximum estimated cost for this run. |
+| `--max-wall-time-secs <SECONDS>` | Maximum wall-clock time for this run. |
+| `--resume <ID>` | Resume a saved conversation by ID or prefix. |
+| `--resume-at <MESSAGE_ID>` | Restore only through a persisted message boundary. |
+| `--fork <ID>` | Fork a saved conversation. |
+| `--continue` | Continue the latest saved conversation. |
+| `--no-history` | Do not write this run to local history. |
+| `--save-history` | Persist history while using JSONL output. |
+
+Examples:
 
 ```bash
-orca exec resume <session-id>
-
-# With overrides
-orca exec resume <session-id> --max-turns 10 --max-cost 2.00
+orca exec "Fix the failing test" --verifier "cargo test"
+orca exec --output-format jsonl --max-turns 20 "Refactor the parser" > run.jsonl
+orca exec resume SESSION_ID --resume-at MESSAGE_ID "Continue from the checkpoint"
 ```
 
----
+Use shell redirection for an output file. The CLI does not have a separate
+`--output` path option.
 
-## Exit Codes
+## `orca workflow`
 
-| Code | Meaning |
-|------|---------|
-| `0` | Success — agent completed the task and verifier passed (if set) |
-| `1` | General error — check stderr for details |
-| `2` | Budget exhausted — maximum turns or cost reached without completion |
-| `3` | Verifier failed — agent finished but the verification command returned non-zero |
-| `4` | Approval denied — user rejected a tool call in a non-interactive context |
-| `5` | Model error — API rate limit, invalid response, or provider outage |
-| `6` | Configuration error — missing API key, invalid model, etc. |
-| `7` | Session error — corrupted state, failed to load session |
+The workflow command exposes `run`, `list`, `show`, `source`, `stop`, `pause`,
+`resume`, `clone`, `restart-failed`, and `restart-phase`. Each operation is
+local and has its own arguments; inspect `orca workflow <COMMAND> --help`
+before scripting it.
 
----
+## `orca trust`
 
-## Configuration Priority
+```text
+orca trust [show|add|remove] [--cwd <PATH>]
+```
 
-Orca resolves configuration in this order (highest priority first):
+`show` is read-only. `add` and `remove` update the user-owned folder-trust
+store, so use them only after reviewing the directory and its sandbox policy.
 
-| Priority | Source | Example |
-|----------|--------|---------|
-| 1 (highest) | CLI flags | `--model deepseek-v4-pro` |
-| 2 | Environment variables | `ORCA_MODEL=deepseek-v4-pro` |
-| 3 | Project config (`.orca/config.toml`) | Per-project settings |
-| 4 | Global config (`~/.config/orca/config.toml`) | User defaults |
-| 5 (lowest) | Built-in defaults | Hardcoded fallback values |
+## Configuration and environment
 
-### Environment Variables
+The user file is `$ORCA_HOME/config.toml` when `ORCA_HOME` is set, otherwise
+`~/.orca/config.toml`. A project may provide `.orca/config.toml`, but it is
+loaded only after the folder is trusted. Effective precedence is CLI options,
+environment variables, trusted project configuration, user configuration, and
+built-in defaults.
 
-| Variable | Description |
-|----------|-------------|
-| `DEEPSEEK_API_KEY` | API key for DeepSeek |
-| `ORCA_MODEL` | Default model ID |
-| `ORCA_APPROVAL` | Default approval mode |
-| `ORCA_MAX_TURNS` | Default max turns |
-| `ORCA_MAX_COST` | Default max cost |
-| `ORCA_CONFIG_PATH` | Override config file location |
-| `ORCA_LOG_LEVEL` | Logging level (`trace`, `debug`, `info`, `warn`, `error`) |
-
----
-
-## `orca config` Subcommands
-
-| Command | Description |
-|---------|-------------|
-| `orca config show` | Display resolved configuration |
-| `orca config set <key> <value>` | Set a config value |
-| `orca config get <key>` | Get a config value |
-| `orca config unset <key>` | Remove a config key |
-| `orca config validate` | Validate configuration and report errors |
-| `orca config path` | Print the config file path |
-
----
-
-## `orca sessions` Subcommands
-
-| Command | Description |
-|---------|-------------|
-| `orca sessions list` | List all sessions with IDs, status, and last activity |
-| `orca sessions show <id>` | Show session details (turns, tokens, cost) |
-| `orca sessions resume <id>` | Resume a session in TUI mode |
-| `orca sessions fork <id>:<turn>` | Fork from a specific turn |
-| `orca sessions delete <id>` | Permanently delete a session |
-| `orca sessions export <id>` | Export session as JSON |
+Supported environment overrides include `ORCA_API_KEY`/
+`DEEPSEEK_API_KEY`, `ORCA_MODEL`/`DEEPSEEK_MODEL`,
+`ORCA_BASE_URL`/`DEEPSEEK_BASE_URL`, `ORCA_MODE`, and
+`ORCA_REASONING_EFFORT`/`DEEPSEEK_REASONING_EFFORT`. Keep credentials out of
+source control. `orca doctor --format json` reports only whether a credential
+is present and where it came from.

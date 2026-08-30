@@ -1,183 +1,81 @@
-import { Callout, Steps, Step, Tabs, Tab, Kbd } from "../../mdx-components";
-
 # Quickstart
 
-Get Orca running in five steps.
+Install Orca, provide a DeepSeek API key, check local readiness, and choose an
+interactive or headless run.
 
-## Prerequisites
-
-- **macOS 12+**, **Linux (glibc 2.31+)**, or **Windows 10+**
-- **DeepSeek API key** (get one at [platform.deepseek.com](https://platform.deepseek.com))
-- **4GB+ RAM** and **500MB+ disk space**
-
-<Callout type="info" title="Pro tip">
-  Orca detects your OS and architecture automatically. The same binary works on
-  macOS (Apple Silicon & Intel), Linux (x86_64 & aarch64), and Windows.
-</Callout>
-
----
-
-## Install Orca
-
-<Tabs>
-<Tab label="npm">
+## Install
 
 ```bash
-npm install -g @orcla/cli
+npm install -g @blade-ai/orca
+orca --version
 ```
 
-</Tab>
-<Tab label="Native (Linux/macOS)">
+Native installers are published at [orcaagent.dev](https://orcaagent.dev/):
 
 ```bash
-curl -fsSL https://orca.ai/install.sh | sh
+curl -fsSL https://orcaagent.dev/install.sh | sh
 ```
-
-The installer detects your OS and architecture, downloads the latest binary, and places it in `/usr/local/bin`.
-
-</Tab>
-<Tab label="PowerShell (Windows)">
 
 ```powershell
-powershell -c "irm https://orca.ai/install.ps1 | iex"
+irm https://orcaagent.dev/install.ps1 | iex
 ```
 
-</Tab>
-</Tabs>
+## Configure credentials
 
-### Verify installation
+Set a credential in the environment. This avoids placing a secret in a project
+file and works in CI as well as local shells.
 
 ```bash
-orca --version
-# orca 1.0.0 (rustc 1.82.0, aarch64-apple-darwin)
+export ORCA_API_KEY="sk-..."
+# DEEPSEEK_API_KEY is also supported.
 ```
 
----
+Orca also reads `$ORCA_HOME/auth.json` (or `~/.orca/auth.json`) when it
+contains a `DEEPSEEK_API_KEY` entry. Do not commit either form of credential.
 
-## Configure Your API Key
-
-Orca reads your API key from the environment or from its config file.
-
-<Tabs>
-<Tab label="Environment variable (recommended)">
-
-```bash
-export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxxxxxx"
-
-# Add to your shell profile for persistence
-echo 'export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxxxxxx"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-</Tab>
-<Tab label="Config file">
-
-```bash
-orca config set api.key "sk-xxxxxxxxxxxxxxxxxxxx"
-```
-
-</Tab>
-</Tabs>
-
-<Callout type="warning" title="Security note">
-  Orca stores the key in plaintext in `~/.config/orca/config.toml`. For production use,
-  prefer environment variables or a secrets manager.
-</Callout>
-
----
-
-## Launch the TUI
-
-```bash
-# Launch in the current directory
-orca
-
-# Launch in a specific project directory
-orca /path/to/your/project
-
-# Launch with a specific model
-orca --model deepseek-v4-pro
-```
-
-Once the TUI opens:
-
-<Steps>
-<Step title="Enter your goal">
-  Type your objective in the input area — for example: `Add a dark mode toggle to the settings page`
-</Step>
-<Step title="Mention files and resources">
-  Press <Kbd>@</Kbd> to mention files, skills, or MCP resources. Or press <Kbd>/</Kbd> for session commands.
-</Step>
-<Step title="Navigate panes">
-  Press <Kbd>Tab</Kbd> to toggle between chat, file tree, and approval panes.
-</Step>
-</Steps>
-
-<Callout type="info">
-  The TUI shows three main panes: **Chat & Agent Output**, **File Tree**, and **Approvals**.
-  All tool results and reasoning appear in the chat pane in real time.
-</Callout>
-
----
-
-## Run Headlessly (CI / Scripts)
-
-For non-interactive use, use `orca exec`:
-
-```bash
-# Single-shot execution
-orca exec "Fix the failing test in src/auth/__tests__/login.test.ts"
-
-# With a verifier command
-orca exec \
-  "Add input validation to the registration form" \
-  --verifier "npm test -- --testPathPattern=registration"
-
-# With budget gates
-orca exec \
-  "Refactor the payment module to use async/await" \
-  --max-turns 20 \
-  --max-cost 3.00
-
-# Resume a previous exec session
-orca exec resume <session-id>
-```
-
-<Callout type="success" title="Exit codes">
-  `orca exec` exits with code `0` on success and non-zero on failure. It emits JSONL
-  events on stdout for programmatic consumption.
-</Callout>
-
----
-
-## Verify Everything Works
-
-Run the built-in diagnostics:
+## Check local readiness
 
 ```bash
 orca doctor
 ```
 
-Expected output:
+`doctor` is local and read-only. It checks config syntax, credential presence,
+model settings, folder trust, and sandbox readiness. It does not call the
+provider, start MCP, create sandbox capabilities, or alter trust/configuration.
 
-```
-✅ Binary:     orca 1.0.0
-✅ API key:    configured (sk-xxxx...xxxx)
-✅ Model:      deepseek-v4-flash (default)
-✅ Network:    reachable (api.deepseek.com: 443)
-✅ Config:     ~/.config/orca/config.toml (valid)
-✅ Sessions:   ~/.local/share/orca/ (3 sessions)
-✅ MCP:        0 servers configured
+```bash
+orca doctor --cwd ./my-project --format json
 ```
 
-<Callout type="danger" title="Checks failing?">
-  If any check fails, run `orca config validate` for detailed error messages and remediation steps.
-</Callout>
+The JSON report never contains the API key. Warnings exit successfully; a
+failed required check exits with status `1` and includes remediation.
 
----
+## Start an interactive session
 
-## Next Steps
+```bash
+orca --cwd ./my-project
+```
 
-- Read the [CLI Reference](cli-reference.md) for all available commands and flags
-- Set up [Configuration](configuration.md) for model selection, approval modes, and MCP servers
-- Understand the [Agent Loop](agent-loop.md) to get the most out of each turn
+Use `--model`, `--resume`, `--fork`, and `--continue` when needed. In the TUI,
+use `/trust` only after reviewing a folder and its intended permissions.
+
+## Run headlessly
+
+```bash
+orca exec "Fix the failing test" --verifier "cargo test"
+orca exec --output-format jsonl --max-turns 20 "Refactor the parser" > run.jsonl
+```
+
+Use `--mode <suggest|auto-edit|full-auto|plan>` to select the tool approval
+policy. Explicit resource limits are `--max-turns`, `--max-tool-calls`,
+`--max-cost-usd`, and `--max-wall-time-secs`; they are unlimited unless set.
+
+Continue a recorded headless session with:
+
+```bash
+orca exec resume SESSION_ID "Continue from the checkpoint"
+```
+
+See the [CLI Reference](cli-reference.md) for the exact public command and
+option surface, and [Configuration](configuration.md) for configuration
+precedence and trust rules.

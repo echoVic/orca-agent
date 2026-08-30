@@ -1,280 +1,97 @@
-import { Callout, Steps, Step, Tabs, Tab } from "../../mdx-components";
-
 # 配置说明
 
+Orca 没有单独的 `orca config` 命令。请用编辑器修改 TOML 配置文件，再运行
+`orca doctor`：它会验证本地配置并显示生效的模型和 endpoint，不会启动会话。
 
-Orca 使用分层配置系统，支持 TOML 文件、环境变量和 CLI 标志。本页涵盖所有可配置选项及示例。
+## 位置和优先级
 
-## 配置文件位置
+用户配置目录只会按以下规则解析一次：
 
-Orca 按以下顺序在这些位置查找配置：
+1. 设置了环境变量时使用 `$ORCA_HOME`。
+2. 否则使用 `~/.orca`。
 
-1. **项目级**：当前工作目录中的 `.orca/config.toml`
-2. **全局**：`~/.config/orca/config.toml`（Windows 上为 `%APPDATA%/orca/config.toml`）
+该目录中的用户配置文件为 `config.toml`，本地认证文件为 `auth.json`。工作区可以
+提供 `.orca/config.toml`，但只有工作区受信任后 Orca 才会加载它。项目配置可以调整
+展示和模型选择，但不能提供凭据、修改审批模式、添加 MCP server、放宽权限，或配置
+进程启动能力。
 
-使用 `orca config path` 查看解析后的路径。
+同一配置项的优先级从高到低为：
 
----
+1. CLI 选项
+2. 环境变量
+3. 受信任项目中的 `.orca/config.toml`
+4. 用户 `config.toml`
+5. 内置默认值
 
-## TOML 参考
-
-### 完整示例
-
-```toml
-# ~/.config/orca/config.toml
-
-[api]
-key = "sk-xxxxxxxxxxxxxxxxxxxx"
-base_url = "https://api.deepseek.com/v1"
-timeout_seconds = 60
-max_retries = 3
-
-[model]
-default = "deepseek-v4-flash"
-# 按任务选择模型
-# flash 用于快速编辑，pro 用于复杂规划
-
-[approval]
-mode = "suggest"           # plan | suggest | auto-edit | full-auto
-require_confirmation_for = ["delete", "rm", "curl"]
-trust_folders = [
-    "src/components/ui",    # 自动批准此文件夹中的编辑
-    "src/utils",
-]
-
-[agent]
-max_turns = 100
-max_cost_usd = 10.00
-temperature = 0.7
-reasoning_effort = "medium"
-context_compaction_threshold = 0.85  # 上下文达到 85% 时压缩
-
-[safety]
-block_commands = [
-    "rm -rf /",
-    "sudo ",
-    "> /dev/sda",
-]
-allowlist_mode = false
-allowlist_commands = []
-
-[mcp]
-enabled = true
-
-# MCP 服务器配置
-[[mcp.servers]]
-name = "filesystem"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
-env = {}
-
-[[mcp.servers]]
-name = "github"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
-
-[output]
-jsonl = true
-event_log_path = "~/.local/share/orca/events"
-max_events_per_session = 10000
-
-[session]
-storage_path = "~/.local/share/orca/sessions"
-max_sessions = 50
-auto_resume_last = false
-```
-
----
-
-## 模型默认值
-
-| 设置 | 默认值 | 描述 |
-|------|--------|------|
-| `model.default` | `deepseek-v4-flash` | 未提供 `--model` 标志时使用的模型 |
-| `model.temperature` | `0.7` | 控制随机性。越低越确定性，越高越有创造性 |
-| `model.reasoning_effort` | `medium` | 思考深度。`low` 用于快速任务，`high` 用于复杂规划 |
-
-### 模型选择指南
-
-| 模型 | 适用场景 | 费用 | 速度 |
-|------|----------|------|------|
-| `deepseek-v4-flash` | 快速编辑、搜索、简单重构 | 高峰期每百万 tokens 输入 3 元、输出 9 元 | 快 |
-| `deepseek-v4-flash-vision-exp` | 截图、图表、流程图和视觉智能体任务 | 与 Flash 相同 | 快 |
-| `deepseek-v4-pro` | 架构设计、复杂调试、多文件变更 | 高峰期每百万 tokens 输入 9 元、输出 27 元 | 中等 |
-
-> **提示：** 大多数任务从 `deepseek-v4-flash` 开始。当智能体需要跨文件推理或设计新系统时切换到 `deepseek-v4-pro`。
-
----
-
-## 审批默认值
-
-### 审批模式
-
-<Callout type="info">
-
-| 模式 | 行为 | |------|------| | `plan` | 智能体仅生成计划——从不执行工具。你手动批准每个步骤。 | | `suggest` | 智能体建议工具调用。你在执行前批准。（TUI 默认） | | `auto-edit` | 智能体自动批准文件编辑和读取。Shell 命令需要批准。（exec 默认） | | `full-auto` | 智能体自主执行所有操作。仅在可信环境中使用。 |
-
-</Callout>
-
-### 配置审批
+## 最小用户配置
 
 ```toml
-[approval]
+# $ORCA_HOME/config.toml，或 ~/.orca/config.toml
+model = "deepseek-v4-pro"
+base_url = "https://api.deepseek.com"
 mode = "suggest"
+reasoning_effort = "high"
 
-# 要求对这些命令模式进行显式批准
-require_confirmation_for = ["delete", "rm ", "curl ", "wget"]
-
-# 自动批准这些文件夹内的所有编辑
-trust_folders = [
-    "src/components/",
-    "src/utils/",
-]
+[budget]
+max_turns = 20
+max_tool_calls = 80
+max_cost_usd_micros = 2000000
+max_wall_time_ms = 1800000
 ```
 
----
+`mode` 支持 `suggest`、`auto-edit`、`full-auto` 和 `plan`。
+`reasoning_effort` 支持 `low`、`high` 和 `max`。CLI 的资源限制是单次运行范围的：
+需要覆盖存储的预算默认值时，在 `orca exec` 上使用 `--max-turns`、
+`--max-tool-calls`、`--max-cost-usd` 或 `--max-wall-time-secs`。
+配置文件使用整数微美元和毫秒；CLI 分别使用美元和秒。
 
-## 安全设置
+## 凭据
 
-Orca 的安全层在执行之前拦截工具调用。根据你的风险承受能力进行配置。
+优先使用环境变量：
 
-```toml
-[safety]
-# 阻止匹配这些模式的命令（正则表达式）
-block_commands = [
-    "rm -rf /",
-    "sudo ",
-    "mkfs",
-    "dd if=",
-    "> /dev/sd",
-]
-
-# 启用白名单模式：仅允许列出的命令
-allowlist_mode = false
-allowlist_commands = []
+```bash
+export ORCA_API_KEY="sk-..."
+# 同样支持 DEEPSEEK_API_KEY。
 ```
 
-> **注意：** 安全规则使用完整命令字符串的子串匹配。请具体指定以避免误报。
+本地认证文件可以是包含 `DEEPSEEK_API_KEY` 成员的 JSON 对象：
 
----
-
-## MCP 服务器配置
-
-配置 MCP（模型上下文协议）服务器，让 Orca 能够访问外部工具和数据源。
-
-每个 stdio 服务器都必须有明确的能力声明。省略时默认为只读且关闭网络；项目目录下的 `.orca/config.toml` 不能新增或替换 MCP 服务器，也不能改变执行权限。
-
-```toml
-[mcp.servers.capabilities]
-read = true
-write = false
-metadata_write = false
-network = false
-shell = false
-agent = false
-```
-
-### 示例：Filesystem MCP
-
-```toml
-[[mcp.servers]]
-name = "filesystem"
-command = "npx"
-args = [
-    "-y",
-    "@modelcontextprotocol/server-filesystem",
-    "/absolute/path/to/your/project"
-]
-```
-
-### 示例：带环境变量的自定义 MCP 服务器
-
-```toml
-[[mcp.servers]]
-name = "internal-docs"
-command = "node"
-args = ["/path/to/mcp-server/build/index.js"]
-env = {
-    API_KEY = "${MY_API_KEY}",
-    ENDPOINT = "https://docs.internal.corp"
+```json
+{
+  "DEEPSEEK_API_KEY": "sk-..."
 }
 ```
 
-### 示例：多个服务器
+不要提交凭据。`orca doctor --format json` 只报告凭据是否存在和其来源，绝不会输出
+凭据值。
 
-```toml
-[[mcp.servers]]
-name = "github"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }
+## 环境变量覆盖
 
-[[mcp.servers]]
-name = "postgres"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-postgres", "postgresql://user:pass@localhost:5432/mydb"]
+| 用途 | 变量 |
+| --- | --- |
+| 凭据 | `ORCA_API_KEY`、`DEEPSEEK_API_KEY` |
+| 模型 | `ORCA_MODEL`、`DEEPSEEK_MODEL` |
+| Endpoint | `ORCA_BASE_URL`、`DEEPSEEK_BASE_URL` |
+| 审批模式 | `ORCA_MODE` |
+| 推理努力级别 | `ORCA_REASONING_EFFORT`、`DEEPSEEK_REASONING_EFFORT` |
 
-[[mcp.servers]]
-name = "slack"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-slack"]
-env = { SLACK_BOT_TOKEN = "${SLACK_BOT_TOKEN}" }
+无效的 `ORCA_MODE` 或推理努力级别会导致生效配置无法解析。修改环境变量或 TOML 后，
+在执行任务前运行 `orca doctor`。
+
+## 目录信任
+
+新工作区默认是不受信任的。信任决定工作区是否能加载项目配置，以及是否能使用完整的
+写入/网络沙箱模式。查看当前决策：
+
+```bash
+orca trust show --cwd ./project
 ```
 
-### MCP 设置
+确认工作区后再记录显式决策：
 
-```toml
-[mcp]
-enabled = true
-connection_timeout_ms = 5000
-max_servers = 10
-health_check_interval_s = 60
+```bash
+orca trust add --cwd ./project
+orca trust remove --cwd ./project
 ```
 
----
-
-## TUI 交互式配置
-
-在 TUI 中运行 `/config` 会打开当前会话设置面板。它可以修改正在使用的模型、推理强度和审批模式，但不会写入全局或项目配置文件。
-
-- Up / Down：选择设置项
-- Left / Right：修改当前值
-- Enter：应用整组设置
-- Esc：不应用并关闭
-
-该交互面板替代原先只读的 `/config show` 斜杠命令。下方独立的 `orca config show` CLI 命令仍可用于检查文件、环境变量和 CLI 参数合并后的配置。
-
----
-
-## 验证和检查命令
-
-| 命令 | 描述 |
-|------|------|
-| `orca config show` | 显示完全解析的配置及来源 |
-| `orca config validate` | 检查错误、缺失值和类型不匹配 |
-| `orca config get <key>` | 打印单个配置值（例如 `orca config get model.default`） |
-| `orca config set <key> <value>` | 设置值（例如 `orca config set approval.mode auto-edit`） |
-| `orca doctor` | 完整环境诊断，包括网络、API 和 MCP 健康状况 |
-
-### `orca config show` 输出示例
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  配置来源解析                                                    │
-├──────────────────────────────────────────────────────────────────┤
-│  model.default                                                    │
-│    cli:     (未设置)                                              │
-│    env:     (未设置)                                              │
-│    project: (未设置)                                              │
-│    global:  deepseek-v4-flash  ← 激活                           │
-│    builtin: deepseek-v4-flash                                     │
-│                                                                   │
-│  approval.mode                                                    │
-│    cli:     (未设置)                                              │
-│    env:     (未设置)                                              │
-│    project: suggest  ← 激活  (.orca/config.toml)                 │
-│    global:  suggest                                               │
-│    builtin: suggest                                               │
-└──────────────────────────────────────────────────────────────────┘
-```
+嵌套目录采用最近的显式祖先决策；更近的显式不受信任决策会覆盖更宽范围的受信任祖先。

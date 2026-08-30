@@ -58,6 +58,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect local configuration, trust, and sandbox readiness without network access.
+    Doctor(DoctorArgs),
     /// Run a task and emit events.
     Exec(ExecArgs),
     /// Run and inspect local workflows.
@@ -67,6 +69,23 @@ enum Command {
     /// Execute a persisted async subagent task.
     #[command(hide = true)]
     SubagentWorker(SubagentWorkerArgs),
+}
+
+#[derive(Debug, Parser)]
+struct DoctorArgs {
+    /// Workspace directory to inspect.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+
+    /// Output format: text (human-readable) or json (stable machine-readable report).
+    #[arg(long, value_enum, default_value_t = DoctorFormatArg::Text)]
+    format: DoctorFormatArg,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DoctorFormatArg {
+    Json,
+    Text,
 }
 
 #[derive(Debug, Parser)]
@@ -601,6 +620,16 @@ pub fn run() -> i32 {
     }
 
     match cli.command {
+        Some(Command::Doctor(args)) => {
+            orca_runtime::diagnostics::run(orca_runtime::diagnostics::DoctorRequest {
+                cwd: args.cwd,
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                format: match args.format {
+                    DoctorFormatArg::Json => orca_runtime::diagnostics::DoctorOutputFormat::Json,
+                    DoctorFormatArg::Text => orca_runtime::diagnostics::DoctorOutputFormat::Text,
+                },
+            })
+        }
         Some(Command::Exec(args)) => match args.into_request() {
             Ok(request) => orca_runtime::command::exec::run(request),
             Err(message) => {
@@ -660,6 +689,8 @@ fn protocol_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+    use serde_json::Value;
 
     fn parse_exec(args: &[&str]) -> ExecArgs {
         let mut argv = vec!["orca", "exec"];
@@ -671,6 +702,87 @@ mod tests {
             },
             Err(error) => panic!("parse failed: {error}"),
         }
+    }
+
+    #[test]
+    fn public_cli_manifest_matches_visible_clap_surface() {
+        let manifest: Value =
+            serde_json::from_str(include_str!("../docs/public-cli-manifest.json"))
+                .expect("valid public CLI manifest");
+        assert_eq!(manifest["schemaVersion"], 1);
+        assert_eq!(manifest["package"], "@blade-ai/orca");
+        assert_eq!(manifest["website"], "https://orcaagent.dev");
+
+        let command = Cli::command();
+        let visible = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name().to_string())
+            .collect::<Vec<_>>();
+        let expected = manifest["commands"]["root"]
+            .as_array()
+            .expect("root commands")
+            .iter()
+            .map(|value| value.as_str().expect("command name").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, expected);
+
+        let doctor = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "doctor")
+            .expect("doctor command");
+
+        for subcommand in command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
+            let name = subcommand.get_name();
+            let expected = manifest["commands"][name]
+                .as_object()
+                .unwrap_or_else(|| panic!("manifest entry missing for {name}"));
+            let options = subcommand
+                .get_arguments()
+                .filter(|argument| !argument.is_hide_set())
+                .filter_map(|argument| argument.get_long().map(str::to_string))
+                .collect::<Vec<_>>();
+            let expected_options = expected["options"]
+                .as_array()
+                .unwrap_or_else(|| panic!("options missing for {name}"))
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .expect("option name")
+                        .trim_start_matches("--")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(options, expected_options, "options drifted for {name}");
+
+            let subcommands = subcommand
+                .get_subcommands()
+                .filter(|child| !child.is_hide_set())
+                .map(|child| child.get_name().to_string())
+                .filter(|child| child != "help")
+                .collect::<Vec<_>>();
+            let expected_subcommands = expected["subcommands"]
+                .as_array()
+                .unwrap_or_else(|| panic!("subcommands missing for {name}"))
+                .iter()
+                .map(|value| value.as_str().expect("subcommand name").to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                subcommands, expected_subcommands,
+                "subcommands drifted for {name}"
+            );
+        }
+
+        let doctor_options = doctor
+            .get_arguments()
+            .filter(|argument| !argument.is_hide_set())
+            .filter_map(|argument| argument.get_long())
+            .collect::<Vec<_>>();
+        assert_eq!(doctor_options, ["cwd", "format"]);
     }
 
     #[test]

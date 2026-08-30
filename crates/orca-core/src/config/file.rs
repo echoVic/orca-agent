@@ -16,7 +16,9 @@ use crate::config::{
 };
 use crate::subagent_config::SubagentConfig;
 
-const ORCA_HOME_ENV: &str = "ORCA_HOME";
+pub const ORCA_HOME_ENV: &str = "ORCA_HOME";
+pub const USER_CONFIG_FILE: &str = "config.toml";
+pub const AUTH_FILE: &str = "auth.json";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(from = "RawFileConfig")]
@@ -274,17 +276,37 @@ fn default_true() -> bool {
     true
 }
 
-fn config_dir() -> Option<PathBuf> {
+/// Resolve the user-owned Orca configuration directory without creating it.
+/// This resolver is shared by runtime configuration, trust, diagnostics, and
+/// first-run setup.
+pub fn config_dir() -> Option<PathBuf> {
     std::env::var_os(ORCA_HOME_ENV)
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".orca")))
+}
+
+/// Return the user-owned TOML configuration path, if a home directory can be
+/// resolved without creating it.
+pub fn user_config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join(USER_CONFIG_FILE))
+}
+
+/// Return the credential file path used by the local auth-file provider.
+pub fn auth_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join(AUTH_FILE))
+}
+
+/// Return the project-local configuration path for a workspace. The existing
+/// folder-trust gate remains responsible for deciding whether it is loaded.
+pub fn project_config_path(cwd: &Path) -> PathBuf {
+    cwd.join(".orca").join(USER_CONFIG_FILE)
 }
 
 pub fn load_layered_config(cwd: &Path) -> FileConfig {
     let Some(dir) = config_dir() else {
         return load_layered_config_from_optional_paths(None, cwd);
     };
-    load_layered_config_from_optional_paths(Some(&dir.join("config.toml")), cwd)
+    load_layered_config_from_optional_paths(Some(&dir.join(USER_CONFIG_FILE)), cwd)
 }
 
 pub fn load_effective_config(cwd: &Path, cli: ConfigOverrides) -> Result<FileConfig, String> {
@@ -368,7 +390,7 @@ fn load_layered_config_from_optional_paths(
     };
     if config.api_key.is_none() {
         if let Some(path) = user_path.and_then(Path::parent) {
-            config.api_key = load_auth_key(&path.join("auth.json"));
+            config.api_key = load_auth_key(&path.join(AUTH_FILE));
         }
     }
     config
@@ -515,7 +537,7 @@ pub fn save_api_key_checked(api_key: &str) -> io::Result<PathBuf> {
 
 fn save_api_key_checked_to_dir(dir: &Path, api_key: &str) -> io::Result<PathBuf> {
     fs::create_dir_all(&dir)?;
-    let path = dir.join("auth.json");
+    let path = dir.join(AUTH_FILE);
 
     let mut map: HashMap<String, String> = fs::read_to_string(&path)
         .ok()

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "package": "@blade-ai/orca",
+  "website": "https://orcaagent.dev",
+  "commands": {
+    "root": ["doctor", "exec", "workflow", "trust"],
+    "doctor": {
+      "options": ["--cwd", "--format"],
+      "subcommands": []
+    },
+    "exec": {
+      "options": [
+        "--output-format",
+        "--cwd",
+        "--mode",
+        "--model",
+        "--api-key",
+        "--base-url",
+        "--verifier",
+        "--max-turns",
+        "--max-tool-calls",
+        "--max-cost-usd",
+        "--max-wall-time-secs",
+        "--resume",
+        "--resume-at",
+        "--fork",
+        "--continue",
+        "--no-history",
+        "--save-history"
+      ],
+      "subcommands": ["resume"]
+    },
+    "workflow": {
+      "options": [],
+      "subcommands": [
+        "run",
+        "list",
+        "show",
+        "source",
+        "stop",
+        "pause",
+        "resume",
+        "clone",
+        "restart-failed",
+        "restart-phase"
+      ]
+    },
+    "trust": {
+      "options": ["--cwd"],
+      "subcommands": []
+    }
+  }
+}
