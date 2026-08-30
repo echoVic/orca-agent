@@ -45,6 +45,7 @@ pub mod mentions;
 pub mod model_response;
 pub mod network_proxy;
 pub mod notify;
+pub mod onboarding;
 pub mod operation_context;
 pub mod prompt_queue;
 pub mod protocol;
