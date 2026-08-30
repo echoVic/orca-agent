@@ -730,7 +730,14 @@ impl ThreadActor {
             ],
             Some(event.surface_commit_id.clone()),
         );
-        self.commit_surface_generation_batch_with_retry(fence, &batch)?;
+        // Activity batches intentionally cross the Thread and Generation
+        // scopes: the task cursor and the child projection must advance in
+        // one durable commit.  Route through the actor-owned activity
+        // authority rather than the generation-only publisher permit.
+        self.commit_surface_actor_batch_with_retry(&batch)
+            .map_err(|error| {
+                io::Error::other(format!("failed to commit subagent activity: {error:?}"))
+            })?;
 
         if self.subagent_activity_dedupe.len() >= super::SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
             self.subagent_activity_dedupe.pop_front();

@@ -6200,7 +6200,8 @@ fn permit_authorizes(
                 }) || actor_control_workflow_launch_authorized(batch)
                     || actor_control_main_session_transfer_authorized(batch)
                     || actor_control_admission_pair_authorized(batch)
-                    || actor_control_resume_pair_authorized(batch))
+                    || actor_control_resume_pair_authorized(batch)
+                    || actor_control_subagent_activity_authorized(batch))
         }
         SurfacePublisherPermit::Generation { fence, .. } => batch
             .events
@@ -9598,6 +9599,86 @@ fn actor_control_resume_pair_authorized(batch: &SurfaceCommitBatch) -> bool {
         && scoped_operation == operation_id
         && operation_id == &fence.operation_id
         && generation_fence == fence
+}
+
+/// Allows the actor to atomically publish a child task cursor and its
+/// subagent activity projection.  A child event is deliberately a
+/// cross-scope batch (`Thread::Task` + `Generation::Subagent`), so it cannot
+/// use the generation-only permit.  Keep this shape narrow: the actor still
+/// performs the identity/fence checks before constructing the batch and the
+/// reducer validates revisions and transitions against the current state.
+fn actor_control_subagent_activity_authorized(batch: &SurfaceCommitBatch) -> bool {
+    let [task_event, subagent_event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (SurfaceScope::Thread, super::SurfaceEvent::Task(super::TaskPatch::Upserted { task, .. })) =
+        (&task_event.scope, &task_event.event)
+    else {
+        return false;
+    };
+    let (SurfaceScope::Generation { fence }, super::SurfaceEvent::Subagent(patch)) =
+        (&subagent_event.scope, &subagent_event.event)
+    else {
+        return false;
+    };
+    if task.task_type != super::SurfaceTaskType::Subagent
+        || task.subagent_id.is_none()
+        || task.subagent_id.as_ref() != Some(&subagent_id_from_patch(patch))
+        || task.parent_operation.as_ref() != Some(&fence.operation_id)
+        || task.backgrounded
+        || task.background_fence.is_some()
+        || task.workflow_run_id.is_some()
+        || task.pending_interaction_id.is_some()
+    {
+        return false;
+    }
+    match patch {
+        super::SubagentPatch::Started {
+            expected_revision,
+            subagent,
+        } => {
+            task.revision.get() == 1
+                && matches!(expected_revision, super::ExpectedAbsentSubagentRevision)
+                && subagent.as_subagent().task_id == task.task_id
+                && subagent.as_subagent().parent == *fence
+                && subagent.as_subagent().revision.get() == 1
+                && subagent.as_subagent().status == super::SurfaceSubagentStatus::Running
+        }
+        super::SubagentPatch::Progress {
+            subagent_id,
+            expected_revision,
+            next_revision,
+            parent,
+            ..
+        } => {
+            task.revision.get() > 1
+                && subagent_id == task.subagent_id.as_ref().expect("checked above")
+                && parent == fence
+                && expected_revision.get().checked_add(1) == Some(next_revision.get())
+        }
+        super::SubagentPatch::Completed {
+            subagent_id,
+            expected_revision,
+            next_revision,
+            parent,
+            ..
+        } => {
+            task.revision.get() > 1
+                && subagent_id == task.subagent_id.as_ref().expect("checked above")
+                && parent == fence
+                && expected_revision.get().checked_add(1) == Some(next_revision.get())
+        }
+    }
+}
+
+fn subagent_id_from_patch(patch: &super::SubagentPatch) -> super::SurfaceSubagentId {
+    match patch {
+        super::SubagentPatch::Started { subagent, .. } => {
+            subagent.as_subagent().subagent_id.clone()
+        }
+        super::SubagentPatch::Progress { subagent_id, .. }
+        | super::SubagentPatch::Completed { subagent_id, .. } => subagent_id.clone(),
+    }
 }
 
 fn finalizer_event_authorized(
