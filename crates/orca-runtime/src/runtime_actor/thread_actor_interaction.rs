@@ -2744,8 +2744,9 @@ impl ThreadActor {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         if winner_has_session_scope {
-            if let Some((_, config)) = session_permission_settings.as_ref() {
+            let settings = if let Some((settings, config)) = session_permission_settings.as_ref() {
                 self.config = config.clone();
+                settings.effective.clone()
             } else {
                 let settings = self
                     .resident_surface
@@ -2757,7 +2758,10 @@ impl ThreadActor {
                     .clone();
                 hydrate_run_config_from_surface_settings(&mut self.config, &settings)
                     .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-            }
+                settings
+            };
+            self.persist_surface_settings_metadata_if_recorded(&settings)
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         }
         self.apply_surface_interaction_resolution(&interaction_id, &winner_answer);
         let output = surface::RespondInteractionOutput {
