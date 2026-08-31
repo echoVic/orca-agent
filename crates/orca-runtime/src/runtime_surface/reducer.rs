@@ -1388,6 +1388,102 @@ pub(crate) fn detached_child_permission_interaction_matches(
     )
 }
 
+/// Match a detached child permission interaction whose child task has already
+/// terminalized.  Terminal activity clears `pending_interaction_id` as part of
+/// the same durable projection, so the normal running/approval predicate can
+/// no longer classify the orphaned Requested interaction.  Cleanup still must
+/// prove the complete owner tuple before allowing a Thread-scoped cancellation.
+pub(crate) fn detached_child_permission_interaction_terminal_matches(
+    snapshot: &SurfaceSnapshot,
+    interaction: &SurfaceInteractionView,
+) -> bool {
+    if !matches!(
+        interaction.lifecycle,
+        SurfaceInteractionLifecycle::Requested
+    ) {
+        return false;
+    }
+    let (context, owner, tool_call_id, authority) = match child_permission_request(interaction) {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let SurfaceInteractionRequest::PermissionRequest {
+        reason,
+        permissions,
+        ..
+    } = &interaction.request
+    else {
+        return false;
+    };
+    let SurfacePermissionOwnerRef::Child {
+        task_id,
+        task_revision,
+        agent_id,
+        agent_revision,
+        activity_id,
+        turn_id,
+        tool_call_id: owner_tool_call_id,
+    } = owner
+    else {
+        return false;
+    };
+    if context.origin != super::interaction::SurfacePermissionOrigin::ChildAgent
+        || owner_tool_call_id != tool_call_id
+        || activity_id.as_str() != tool_call_id.as_str()
+        || !child_permission_tool_authority_matches(
+            context,
+            reason.as_ref(),
+            permissions,
+            authority,
+        )
+        || !interaction_authority_matches(snapshot, &interaction.fence, authority)
+        || agent_revision.get() == 0
+    {
+        return false;
+    }
+    let Some(task) = snapshot.tasks.iter().find(|task| task.task_id == *task_id) else {
+        return false;
+    };
+    let Some(subagent) = snapshot
+        .subagents
+        .iter()
+        .find(|subagent| subagent.subagent_id == *agent_id)
+    else {
+        return false;
+    };
+    if task.task_type != SurfaceTaskType::Subagent
+        || task.subagent_id.as_ref() != Some(agent_id)
+        || task_revision > &task.revision
+        || task.pending_interaction_id.is_some()
+        || !matches!(
+            task.status,
+            SurfaceTaskStatus::Stopped
+                | SurfaceTaskStatus::Completed
+                | SurfaceTaskStatus::Failed
+                | SurfaceTaskStatus::Cancelled
+        )
+        || task.completed_at.is_none()
+        || subagent.task_id != *task_id
+        || subagent.source.source_sequence < agent_revision.get()
+        || subagent.source.turn_id != *turn_id
+        || !matches!(
+            subagent.status,
+            SurfaceSubagentStatus::Completed
+                | SurfaceSubagentStatus::Failed
+                | SurfaceSubagentStatus::Cancelled
+        )
+    {
+        return false;
+    }
+    let SurfaceSubagentOwner::DetachedTask { owner } = &subagent.owner else {
+        return false;
+    };
+    owner.task_id == *task_id
+        && owner.task_revision <= *task_revision
+        && subagent.source.attempt_id == owner.attempt_id
+        && task.parent_operation.as_ref() == Some(&interaction.fence.operation_id)
+}
+
 /// Counterpart to [`detached_child_permission_interaction_matches`] for the
 /// historical generation scope. Keeping both predicates beside the reducer's
 /// owner classifier prevents commit authorization from treating a malformed
@@ -1521,6 +1617,11 @@ fn interaction_scope_matches_event(
                             }) if requested.interaction_id == interaction.interaction_id
                         )
                     });
+                if matches!(patch, InteractionPatch::Cancelled { .. })
+                    && detached_child_permission_interaction_terminal_matches(snapshot, interaction)
+                {
+                    return matches!(scope, SurfaceScope::Thread);
+                }
                 return match child_permission_owner_scope_matches(
                     snapshot,
                     interaction,
@@ -9811,7 +9912,7 @@ pub(crate) mod tests {
         ));
 
         let cancelled = InteractionPatch::Cancelled {
-            interaction_id: interaction.interaction_id,
+            interaction_id: interaction.interaction_id.clone(),
             expected_revision: InteractionRevision::try_new(1).unwrap(),
             next_revision: InteractionRevision::try_new(2).unwrap(),
             reason: InteractionCancelReason::HostShutdown,
@@ -9829,8 +9930,35 @@ pub(crate) mod tests {
             &cancelled_batch.events.as_slice()[0].event,
         ));
 
-        let subagent = snapshot.subagents.first_mut().expect("fixture subagent");
-        subagent.source.attempt_id =
+        // Terminal activity clears the task's pending marker before the
+        // cleanup scan runs.  The exact detached owner tuple must still make
+        // the orphaned request cancellable at Thread scope.
+        let task = snapshot.tasks.first_mut().expect("fixture task");
+        task.status = SurfaceTaskStatus::Completed;
+        task.pending_interaction_id = None;
+        task.completed_at = Some(super::super::UnixMillis::new(2));
+        snapshot
+            .subagents
+            .first_mut()
+            .expect("fixture subagent")
+            .status = SurfaceSubagentStatus::Completed;
+        assert!(detached_child_permission_interaction_terminal_matches(
+            &snapshot,
+            &interaction,
+        ));
+        assert!(scope_matches_event(
+            &snapshot,
+            &cancelled_batch,
+            &SurfaceScope::Thread,
+            &cancelled_batch.events.as_slice()[0].event,
+        ));
+
+        snapshot
+            .subagents
+            .first_mut()
+            .expect("fixture subagent")
+            .source
+            .attempt_id =
             crate::runtime_surface::SurfaceTaskAttemptId::try_new("superseded-attempt").unwrap();
         assert!(!scope_matches_event(
             &snapshot,

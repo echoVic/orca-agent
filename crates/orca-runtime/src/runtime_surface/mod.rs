@@ -266,7 +266,9 @@ pub use reducer::{
     preflight_batch, reduce_batch,
 };
 pub(crate) use reducer::{
-    detached_child_permission_interaction_matches, generation_child_permission_interaction_matches,
+    detached_child_permission_interaction_matches,
+    detached_child_permission_interaction_terminal_matches,
+    generation_child_permission_interaction_matches,
 };
 
 pub use store::{

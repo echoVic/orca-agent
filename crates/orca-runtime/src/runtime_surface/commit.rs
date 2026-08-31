@@ -2437,6 +2437,9 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                                 &interaction,
                                 true,
                                 false,
+                            ) || super::reducer::detached_child_permission_interaction_terminal_matches(
+                                self.state.snapshot(),
+                                &interaction,
                             ) {
                                 SurfaceScope::Thread
                             } else {
@@ -3503,6 +3506,24 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         &mut self,
         batch: &SurfaceCommitBatch,
     ) -> Result<RecoveredBatchAuthority, SurfaceCommitError> {
+        // A detached Started event is an admission boundary, not a replayable
+        // projection fact. Recovery has no TaskRegistry binding receipt in
+        // the surface batch, so refusing it here prevents a self-consistent
+        // prepared payload from inventing a child owner or parent fence.
+        if batch.events.as_slice().iter().any(|event| {
+            matches!(
+                &event.event,
+                super::SurfaceEvent::Subagent(super::SubagentPatch::Started {
+                    subagent,
+                    ..
+                }) if matches!(
+                    &subagent.as_subagent().owner,
+                    super::SurfaceSubagentOwner::DetachedTask { .. }
+                )
+            )
+        }) {
+            return Err(SurfaceCommitError::StalePublisherPermit);
+        }
         let actor = self.actor_control_permit.clone();
         if permit_authorizes(
             &self.state,
@@ -4900,6 +4921,9 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                             interaction,
                             true,
                             false,
+                        ) || super::reducer::detached_child_permission_interaction_terminal_matches(
+                            self.state.snapshot(),
+                            interaction,
                         )
                     }) =>
             {
@@ -6372,6 +6396,32 @@ fn actor_control_subagent_activity_authorized(
         &subagent_event.event,
         super::SurfaceEvent::Subagent(super::SubagentPatch::Started { .. })
     );
+    let status_pair_is_valid = match &subagent_event.event {
+        super::SurfaceEvent::Subagent(super::SubagentPatch::Started { .. })
+        | super::SurfaceEvent::Subagent(super::SubagentPatch::Progress { .. }) => {
+            task.status == super::SurfaceTaskStatus::Running && task.completed_at.is_none()
+        }
+        super::SurfaceEvent::Subagent(super::SubagentPatch::Completed { status, .. }) => {
+            task.completed_at.is_some()
+                && matches!(
+                    (status, task.status),
+                    (
+                        super::SurfaceSubagentTerminalStatus::Completed,
+                        super::SurfaceTaskStatus::Completed
+                    ) | (
+                        super::SurfaceSubagentTerminalStatus::Failed,
+                        super::SurfaceTaskStatus::Failed
+                    ) | (
+                        super::SurfaceSubagentTerminalStatus::Cancelled,
+                        super::SurfaceTaskStatus::Cancelled
+                    )
+                )
+        }
+        _ => false,
+    };
+    if !status_pair_is_valid {
+        return false;
+    }
     if started
         && (existing_task.is_some()
             || snapshot
@@ -6435,6 +6485,19 @@ fn actor_control_subagent_activity_authorized(
     match (owner, expected_generation) {
         (super::SurfaceSubagentOwner::Generation { fence: owner }, Some(scope_fence)) => {
             operation_fence_is_known(snapshot, scope_fence)
+                && snapshot
+                    .foreground_operation
+                    .iter()
+                    .chain(snapshot.queued_operations.iter())
+                    .chain(snapshot.operation_history.iter())
+                    .flat_map(|operation| operation.generations.iter())
+                    .find(|generation| generation.fence == *scope_fence)
+                    .is_some_and(|generation| {
+                        matches!(
+                            generation.phase,
+                            super::GenerationPhase::Started | super::GenerationPhase::Transferred
+                        )
+                    })
                 && task.task_type == super::SurfaceTaskType::Subagent
                 && task.subagent_id.as_ref() == Some(subagent_id)
                 && task.parent_operation.as_ref() == Some(&scope_fence.operation_id)
@@ -6586,6 +6649,94 @@ fn actor_control_child_permission_task_event(
         .any(|task| task.task_id == *task_id && task.task_type == super::SurfaceTaskType::Subagent)
 }
 
+/// Task ownership changes are a typed background hand-off. Keep them out of
+/// the generic Thread allow-list so a caller cannot rewrite a child task's
+/// ownership or background fence with a bare ActorControl permit.
+fn actor_control_task_ownership_authorized(
+    state: &SurfaceReducerState,
+    event: &super::SurfaceEventEnvelope,
+) -> bool {
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::OwnershipChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            backgrounded,
+            background_fence,
+        }),
+    ) = (&event.scope, &event.event)
+    else {
+        return false;
+    };
+    let Some(task) = state
+        .snapshot()
+        .tasks
+        .iter()
+        .find(|task| task.task_id == *task_id)
+    else {
+        return false;
+    };
+    if task.task_type == super::SurfaceTaskType::Subagent
+        || task.revision != *expected_revision
+        || expected_revision.get().checked_add(1) != Some(next_revision.get())
+        || matches!(
+            task.status,
+            super::SurfaceTaskStatus::Completed
+                | super::SurfaceTaskStatus::Failed
+                | super::SurfaceTaskStatus::Stopped
+                | super::SurfaceTaskStatus::Cancelled
+        )
+    {
+        return false;
+    }
+    match (
+        task.backgrounded,
+        *backgrounded,
+        &task.background_fence,
+        background_fence,
+    ) {
+        (false, true, None, Some(next)) => {
+            task.parent_operation.as_ref() == Some(&next.operation_fence.operation_id)
+        }
+        (true, false, Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Session close remains actor-owned, but is a typed lifecycle transition.
+/// Materialization and health-barrier clearing must not ride a generic permit.
+fn actor_control_session_lifecycle_authorized(
+    state: &SurfaceReducerState,
+    event: &super::SurfaceEventEnvelope,
+) -> bool {
+    let SurfaceScope::Thread = event.scope else {
+        return false;
+    };
+    match &event.event {
+        super::SurfaceEvent::Session(super::SessionPatch::Closing { .. }) => {
+            !state.snapshot().session_health.closing && !state.snapshot().session_health.closed
+        }
+        super::SurfaceEvent::Session(super::SessionPatch::Closed { .. }) => {
+            state.snapshot().session_health.closing && !state.snapshot().session_health.closed
+        }
+        _ => false,
+    }
+}
+
+fn actor_control_generic_event_allowed(event: &super::SurfaceEventEnvelope) -> bool {
+    !matches!(
+        &event.event,
+        super::SurfaceEvent::Task(
+            super::TaskPatch::Upserted { .. } | super::TaskPatch::OwnershipChanged { .. }
+        ) | super::SurfaceEvent::Session(super::SessionPatch::Materialized { .. })
+            | super::SurfaceEvent::Session(super::SessionPatch::HealthIssueCleared { .. })
+            | super::SurfaceEvent::Session(
+                super::SessionPatch::Closing { .. } | super::SessionPatch::Closed { .. }
+            )
+    )
+}
+
 fn permit_authorizes(
     state: &SurfaceReducerState,
     issued_permits: &[SurfacePublisherPermit],
@@ -6628,7 +6779,18 @@ fn permit_authorizes(
                         && !matches!(&event.event, super::SurfaceEvent::Subagent(_))
                         && !actor_control_child_permission_lifecycle_event(state, event)
                         && !actor_control_child_permission_task_event(state, event)
-                }) || actor_control_subagent_activity_authorized(state, batch)
+                        && actor_control_generic_event_allowed(event)
+                }) || (batch.events.as_slice().len() == 1
+                    && actor_control_task_ownership_authorized(
+                        state,
+                        &batch.events.as_slice()[0],
+                    ))
+                    || (batch.events.as_slice().len() == 1
+                        && actor_control_session_lifecycle_authorized(
+                            state,
+                            &batch.events.as_slice()[0],
+                        ))
+                    || actor_control_subagent_activity_authorized(state, batch)
                     || actor_control_workflow_launch_authorized(batch)
                     || actor_control_main_session_transfer_authorized(batch)
                     || actor_control_admission_pair_authorized(batch)
@@ -7121,7 +7283,7 @@ fn actor_generation_permission_request_authorized(
     task.revision == *expected_revision
         && task.status == super::SurfaceTaskStatus::Running
         && task.pending_interaction_id.is_none()
-        && subagent.revision == *agent_revision
+        && child_permission_subagent_revision_matches(subagent, *agent_revision)
 }
 
 /// Extract the parent generation fence carried by an owner-aware permission
@@ -7250,6 +7412,25 @@ fn child_permission_owner_matches<'a>(
     Some((task, subagent))
 }
 
+/// Detached permission requests cross an independent relay from the child
+/// activity stream.  By the time the actor commits the request, the surface
+/// may have observed later activity for the same turn.  The reducer therefore
+/// treats the detached `agent_revision` as a floor, while generation-owned
+/// requests remain exact CAS transitions.
+fn child_permission_subagent_revision_matches(
+    subagent: &super::SurfaceSubagent,
+    expected: super::SubagentRevision,
+) -> bool {
+    if matches!(
+        &subagent.owner,
+        super::SurfaceSubagentOwner::DetachedTask { .. }
+    ) {
+        subagent.revision.get() >= expected.get()
+    } else {
+        subagent.revision == expected
+    }
+}
+
 fn actor_generation_permission_resolution_authorized(
     state: &SurfaceReducerState,
     issued_permits: &[SurfacePublisherPermit],
@@ -7346,6 +7527,15 @@ fn actor_generation_permission_resolution_authorized(
         else {
             return false;
         };
+        let response_permissions = match &receipt.safe_projection {
+            super::SurfaceInteractionSafeProjection::PermissionRequest {
+                decision: super::SurfaceAllowDeny::Allow,
+                scope: super::PermissionGrantScope::Session,
+                permissions,
+                ..
+            } => permissions,
+            _ => return false,
+        };
         if current_settings.thread_revision != *previous_revision
             || previous_revision.get().checked_add(1) != Some(next_settings.thread_revision.get())
             || next_settings.host_revision != current_settings.host_revision
@@ -7372,6 +7562,7 @@ fn actor_generation_permission_resolution_authorized(
                 &next_settings.effective,
                 permissions,
             )
+            || !permission_profile_is_subset(response_permissions, permissions)
         {
             return false;
         }
@@ -7444,6 +7635,15 @@ fn actor_generation_permission_resolution_authorized(
     else {
         return false;
     };
+    let response_permissions = match &receipt.safe_projection {
+        super::SurfaceInteractionSafeProjection::PermissionRequest {
+            decision: super::SurfaceAllowDeny::Allow,
+            scope: super::PermissionGrantScope::Session,
+            permissions,
+            ..
+        } => permissions,
+        _ => return false,
+    };
     if interaction.fence != *fence
         || interaction.kind != super::SurfaceInteractionKind::PermissionRequest
         || interaction.revision != *expected_revision
@@ -7452,18 +7652,8 @@ fn actor_generation_permission_resolution_authorized(
             interaction.lifecycle,
             super::SurfaceInteractionLifecycle::Requested
         )
-        || !matches!(
-            receipt,
-            super::SurfaceInteractionResolutionReceipt {
-                kind: super::SurfaceInteractionKind::PermissionRequest,
-                safe_projection: super::SurfaceInteractionSafeProjection::PermissionRequest {
-                    decision: super::SurfaceAllowDeny::Allow,
-                    scope: super::PermissionGrantScope::Session,
-                    ..
-                },
-                ..
-            }
-        )
+        || receipt.kind != super::SurfaceInteractionKind::PermissionRequest
+        || !permission_profile_is_subset(response_permissions, permissions)
     {
         return false;
     }
@@ -7546,7 +7736,10 @@ fn actor_generation_permission_task_resolution_authorized(
         return false;
     }
     let super::SurfaceInteractionSafeProjection::PermissionRequest {
-        decision, scope, ..
+        decision,
+        scope,
+        permissions: response_permissions,
+        ..
     } = &receipt.safe_projection
     else {
         return false;
@@ -7578,6 +7771,7 @@ fn actor_generation_permission_task_resolution_authorized(
     let super::SurfaceInteractionRequest::PermissionRequest {
         tool_call_id,
         context,
+        permissions: requested_permissions,
         ..
     } = &interaction.request
     else {
@@ -7596,6 +7790,9 @@ fn actor_generation_permission_task_resolution_authorized(
         return false;
     };
     if context.origin != super::SurfacePermissionOrigin::ChildAgent {
+        return false;
+    }
+    if !permission_profile_is_subset(response_permissions, requested_permissions) {
         return false;
     }
     let Some((task, subagent)) = child_permission_owner_matches(
@@ -7624,7 +7821,53 @@ fn actor_generation_permission_task_resolution_authorized(
         && task.revision == *task_expected_revision
         && task.pending_interaction_id.as_ref() == Some(interaction_id)
         && task.status == super::SurfaceTaskStatus::ApprovalRequired
-        && subagent.revision == *agent_revision
+        && child_permission_subagent_revision_matches(subagent, *agent_revision)
+}
+
+fn permission_path_is_subset(
+    candidate: Option<&Vec<super::SurfacePermissionPathLabel>>,
+    requested: Option<&Vec<super::SurfacePermissionPathLabel>>,
+) -> bool {
+    candidate.is_none_or(|candidate| {
+        let requested = requested
+            .into_iter()
+            .flatten()
+            .map(|path| path.0.as_str())
+            .collect::<BTreeSet<_>>();
+        candidate
+            .iter()
+            .all(|path| requested.contains(path.0.as_str()))
+    })
+}
+
+fn permission_profile_is_subset(
+    candidate: &super::SurfacePermissionProfile,
+    requested: &super::SurfacePermissionProfile,
+) -> bool {
+    let file_system_subset = candidate.file_system.as_ref().is_none_or(|candidate| {
+        requested.file_system.as_ref().is_some_and(|requested| {
+            permission_path_is_subset(candidate.read.as_ref(), requested.read.as_ref())
+                && permission_path_is_subset(candidate.write.as_ref(), requested.write.as_ref())
+        })
+    });
+    let network_subset = candidate.network.as_ref().is_none_or(|candidate| {
+        requested.network.as_ref().is_some_and(|requested| {
+            let enabled_subset = match candidate.enabled {
+                None | Some(false) => true,
+                Some(true) => requested.enabled == Some(true),
+            };
+            let requested_domains = requested
+                .domains
+                .iter()
+                .map(|(domain, access)| (domain.0.as_str(), *access))
+                .collect::<std::collections::HashMap<_, _>>();
+            enabled_subset
+                && candidate.domains.iter().all(|(domain, access)| {
+                    requested_domains.get(domain.0.as_str()) == Some(access)
+                })
+        })
+    });
+    file_system_subset && network_subset
 }
 
 fn session_permission_settings_delta_authorized(
@@ -10578,6 +10821,9 @@ fn detached_child_cancellation_authorized(
         interaction,
         true,
         false,
+    ) || super::reducer::detached_child_permission_interaction_terminal_matches(
+        state.snapshot(),
+        interaction,
     )
 }
 
@@ -13832,6 +14078,78 @@ mod tests {
             &other_generation,
             &batch,
             ThreadOwnerEpoch::new(1),
+        ));
+    }
+
+    #[test]
+    fn detached_permission_owner_accepts_a_later_activity_revision() {
+        let mut snapshot = reducer_snapshot();
+        let operation = started_operation();
+        let fence = operation.generations[0].fence.clone();
+        let turn_id = operation.generations[0].logical_turn_id.clone();
+        let task_id = super::super::SurfaceTaskId::try_new("detached-task").unwrap();
+        let agent_id = super::super::SurfaceSubagentId::try_new("detached-agent").unwrap();
+        snapshot.tasks.push(super::super::SurfaceTask {
+            task_id: task_id.clone(),
+            revision: super::super::TaskRevision::try_new(1).unwrap(),
+            task_type: super::super::SurfaceTaskType::Subagent,
+            status: super::super::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: super::super::DisplayText::new("detached task"),
+            created_at: super::super::UnixMillis::new(1),
+            started_at: Some(super::super::UnixMillis::new(1)),
+            completed_at: None,
+            parent_operation: Some(fence.operation_id.clone()),
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: Some(agent_id.clone()),
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        });
+        snapshot.subagents.push(super::super::SurfaceSubagent {
+            subagent_id: agent_id.clone(),
+            task_id: task_id.clone(),
+            revision: super::super::SubagentRevision::try_new(2).unwrap(),
+            description: super::super::DisplayText::new("detached agent"),
+            status: super::super::SurfaceSubagentStatus::Running,
+            activity: Some(super::super::DisplayText::new("tool")),
+            turn: Some(1),
+            usage: None,
+            output: None,
+            error: None,
+            owner: super::super::SurfaceSubagentOwner::DetachedTask {
+                owner: super::super::SurfaceTaskOwnerRef::new(
+                    task_id.clone(),
+                    super::super::TaskRevision::try_new(1).unwrap(),
+                    super::super::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
+                    super::super::Sha256Digest::new([9; 32]),
+                ),
+            },
+            source: super::super::SurfaceSubagentSource::new(
+                super::super::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
+                turn_id,
+                2,
+                super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(175)).unwrap(),
+                super::super::Sha256Digest::new([8; 32]),
+            ),
+        });
+        let state = SurfaceReducerState::new(snapshot);
+        let subagent = &state.snapshot().subagents[0];
+        assert!(child_permission_subagent_revision_matches(
+            subagent,
+            super::super::SubagentRevision::try_new(1).unwrap(),
+        ));
+
+        let mut generation = subagent.clone();
+        generation.owner = super::super::SurfaceSubagentOwner::Generation { fence };
+        assert!(!child_permission_subagent_revision_matches(
+            &generation,
+            super::super::SubagentRevision::try_new(1).unwrap(),
         ));
     }
 

@@ -5361,6 +5361,9 @@ impl ThreadActor {
                         interaction,
                         true,
                         false,
+                    ) || surface::detached_child_permission_interaction_terminal_matches(
+                        snapshot,
+                        interaction,
                     )
                 })
                 .map(|_| surface::SurfaceScope::Thread)
