@@ -6581,6 +6581,80 @@ fn actor_control_subagent_activity_authorized(
     }
 }
 
+/// Workflow execution publishes its durable task/workflow rows immediately
+/// after the provider tool has been admitted. This is a separate, narrow
+/// actor-owned transition from the seven-event standalone workflow launch
+/// batch: it must be tied to a started generation and can only create fresh
+/// revision-one rows with the same task/run identity.
+fn actor_control_workflow_start_facts_authorized(
+    state: &SurfaceReducerState,
+    batch: &SurfaceCommitBatch,
+) -> bool {
+    let [task_event, workflow_event] = batch.events.as_slice() else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Task(super::TaskPatch::Upserted {
+            expected_revision: None,
+            task,
+        }),
+    ) = (&task_event.scope, &task_event.event)
+    else {
+        return false;
+    };
+    let (
+        SurfaceScope::Thread,
+        super::SurfaceEvent::Workflow(super::WorkflowPatch::Started { workflow }),
+    ) = (&workflow_event.scope, &workflow_event.event)
+    else {
+        return false;
+    };
+    let Some(parent_fence) = workflow.parent.as_ref() else {
+        return false;
+    };
+    let generation_is_started = state
+        .snapshot()
+        .foreground_operation
+        .iter()
+        .chain(state.snapshot().queued_operations.iter())
+        .chain(state.snapshot().operation_history.iter())
+        .flat_map(|operation| operation.generations.iter())
+        .find(|generation| generation.fence == *parent_fence)
+        .is_some_and(|generation| {
+            matches!(
+                generation.phase,
+                super::GenerationPhase::Started | super::GenerationPhase::Transferred
+            )
+        });
+    task.task_type == super::SurfaceTaskType::Workflow
+        && task.revision.get() == 1
+        && task.status == super::SurfaceTaskStatus::Running
+        && task.started_at.is_some()
+        && task.completed_at.is_none()
+        && task.parent_operation.as_ref() == Some(&parent_fence.operation_id)
+        && task.parent_task_id.is_none()
+        && task.background_fence.is_none()
+        && task.workflow_run_id.as_ref() == Some(&workflow.workflow_run_id)
+        && workflow.task_id == task.task_id
+        && workflow.revision.get() == 1
+        && matches!(
+            workflow.status,
+            super::SurfaceWorkflowStatus::Queued | super::SurfaceWorkflowStatus::Running
+        )
+        && !state
+            .snapshot()
+            .tasks
+            .iter()
+            .any(|existing| existing.task_id == task.task_id)
+        && !state
+            .snapshot()
+            .workflows
+            .iter()
+            .any(|existing| existing.workflow_run_id == workflow.workflow_run_id)
+        && generation_is_started
+}
+
 fn operation_fence_is_known(
     snapshot: &super::SurfaceSnapshot,
     fence: &super::SurfaceOperationFence,
@@ -6791,6 +6865,7 @@ fn permit_authorizes(
                             &batch.events.as_slice()[0],
                         ))
                     || actor_control_subagent_activity_authorized(state, batch)
+                    || actor_control_workflow_start_facts_authorized(state, batch)
                     || actor_control_workflow_launch_authorized(batch)
                     || actor_control_main_session_transfer_authorized(batch)
                     || actor_control_admission_pair_authorized(batch)

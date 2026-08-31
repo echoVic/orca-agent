@@ -219,7 +219,6 @@ fn validate_detached_subagent_binding(
                 .as_bytes()
                 .iter()
                 .all(|byte| *byte == 0)
-            || parent_fence.generation_id.get() == 0
             || parent_fence.thread_owner_epoch.get() == 0)
     {
         return Err("detached subagent binding has an invalid parent fence".to_string());
@@ -1394,6 +1393,14 @@ impl TaskRegistry {
             self.artifact_storage.as_ref(),
             TaskArtifactStorage::ProcessLocal { .. }
         )
+    }
+
+    /// Detached child relay frames exist only when this registry owns a
+    /// durable task-session root. Foreground/process-local children publish
+    /// activity directly through the actor ingress and must not be probed for
+    /// a relay that cannot exist.
+    pub(crate) fn supports_detached_subagent_relay(&self) -> bool {
+        self.persistence.is_some()
     }
 
     pub(crate) fn workflow_session_dir(&self, cwd: &Path) -> io::Result<PathBuf> {
@@ -5691,10 +5698,40 @@ mod tests {
             permission_response_public_key: [1; 32],
         };
 
+        validate_detached_subagent_binding(Some("task-1"), &binding).unwrap();
+
         let encoded = serde_json::to_vec(&binding).unwrap();
         let decoded: DetachedSubagentBinding = serde_json::from_slice(&encoded).unwrap();
 
         assert_eq!(decoded.parent_fence, Some(fence));
+    }
+
+    #[test]
+    fn detached_binding_accepts_pre_generation_parent_fence() {
+        let fence = SurfaceOperationFence {
+            thread_id: crate::runtime_surface::SurfaceThreadId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            thread_owner_epoch: crate::runtime_surface::ThreadOwnerEpoch::new(1),
+            operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            generation_id: crate::runtime_surface::SurfaceGenerationId::new(0),
+        };
+        let binding = DetachedSubagentBinding {
+            task_id: "task-pre-generation".to_string(),
+            subagent_id: "agent-pre-generation".to_string(),
+            parent_task_id: Some("parent-1".to_string()),
+            task_revision: TaskRevision::try_new(1).unwrap(),
+            attempt_id: AgentAttemptId::new(),
+            parent_fence: Some(fence),
+            authority_digest: Sha256Digest::new([9; 32]),
+            permission_response_public_key: [1; 32],
+        };
+
+        validate_detached_subagent_binding(Some("task-pre-generation"), &binding).unwrap();
     }
 
     #[test]

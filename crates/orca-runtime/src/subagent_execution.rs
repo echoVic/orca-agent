@@ -788,12 +788,16 @@ mod tests {
     use orca_core::tool_types;
     use orca_mcp::McpRegistry;
 
+    use crate::child_agent_types::{SubagentActivityEvent, SubagentActivityOwner};
     use crate::protocol::{
         PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile,
     };
     use crate::runtime_permission::{
         RuntimePermissionContext, RuntimePermissionRequest, RuntimePermissionRequestHandler,
         RuntimePermissionResponse,
+    };
+    use crate::runtime_surface::{
+        RuntimeSubagentActivityIngress, Sha256Digest, SurfaceTaskId, TaskRevision,
     };
     use crate::surface::SurfacePermissionOrigin;
     use crate::tool_turn::ToolTurnOutcome;
@@ -1166,6 +1170,26 @@ mod tests {
 
     struct CapturingPermissionHandler {
         requests: Arc<Mutex<Vec<RuntimePermissionRequest>>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingActivityIngress {
+        events: Mutex<Vec<SubagentActivityEvent>>,
+    }
+
+    impl RuntimeSubagentActivityIngress for CapturingActivityIngress {
+        fn owner(&self) -> SubagentActivityOwner {
+            SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new("permission-test-owner").unwrap(),
+                task_revision: TaskRevision::try_new(1).unwrap(),
+                authority_digest: Sha256Digest::new([7; 32]),
+            }
+        }
+
+        fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
     }
 
     impl RuntimePermissionRequestHandler for CapturingPermissionHandler {
@@ -1879,6 +1903,7 @@ mod tests {
             Arc::new(CapturingPermissionHandler {
                 requests: Arc::clone(&captured),
             });
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
             &config,
@@ -1899,7 +1924,7 @@ mod tests {
             None,
             child_executor_observes_permission_handler::<io::Sink>,
             Some(permission_handler),
-            None,
+            Some(activity_ingress.clone()),
             &mut event_error,
             None,
         )
@@ -1912,6 +1937,7 @@ mod tests {
             requests[0].context,
             RuntimePermissionContext::Child { .. }
         ));
+        assert!(!activity_ingress.events.lock().unwrap().is_empty());
     }
 
     #[test]

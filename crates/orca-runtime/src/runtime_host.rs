@@ -16494,6 +16494,9 @@ impl ThreadActor {
     /// clients receive the same activity stream. Surface commits provide the
     /// acknowledgement cursor; the task mirror is only read here.
     fn drain_subagent_relays_for_active(&mut self, active: &mut ActiveOperation) {
+        if !active.task_registry.supports_detached_subagent_relay() {
+            return;
+        }
         let detached_bindings = match active.task_registry.detached_subagent_bindings() {
             Ok(bindings) => bindings
                 .into_iter()
@@ -16579,6 +16582,14 @@ impl ThreadActor {
         let Some(state) = self.state.as_ref() else {
             return;
         };
+        if !state
+            .thread
+            .session()
+            .task_registry()
+            .supports_detached_subagent_relay()
+        {
+            return;
+        }
         let Some(current_thread_id) = self.resident_surface.0.as_ref().map(|surface| {
             surface
                 .coordinator

@@ -936,7 +936,8 @@ impl ThreadActor {
                     parent_task_id: task_registry
                         .get(event.task_id.as_str())
                         .and_then(|record| record.parent_task_id)
-                        .and_then(|parent| surface::SurfaceTaskId::try_new(parent).ok()),
+                        .and_then(|parent| surface::SurfaceTaskId::try_new(parent).ok())
+                        .filter(|parent| snapshot.tasks.iter().any(|task| task.task_id == *parent)),
                     background_fence: None,
                     workflow_run_id: None,
                     subagent_id: Some(event.subagent_id.clone()),
