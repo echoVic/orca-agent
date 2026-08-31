@@ -1176,7 +1176,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/surface_actions.rs:save_api_key:credentials.update", 2],
   ["crates/orca-tui/src/state_reducer.rs:update:input_history.record", 1],
   ["crates/orca-tui/src/workflow_notifications.rs:submit_pending_workflow_notification:user_action.route", 1],
-  ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 2],
+  ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 3],
 ]);
 
 // Direct calls with an approved typed-surface replacement may be added here
@@ -1214,6 +1214,11 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/diff_highlight.rs:compute_file_scoped_styles_with:expected.insert", 1],
   ["crates/orca-tui/src/diff_highlight.rs:compute_file_scoped_styles_with:refined.insert", 1],
   ["crates/orca-tui/src/diff_highlight.rs:reset:self.hunk_ranges.clear", 1],
+  ["crates/orca-tui/src/workflow_panel.rs:reset_for_session:self.expanded_task_ids.clear", 1],
+  ["crates/orca-tui/src/workflow_panel.rs:handle_tree_key:self.expanded_task_ids.insert", 1],
+  ["crates/orca-tui/src/workflow_panel.rs:ensure_task_visible:self.expanded_task_ids.insert", 1],
+  ["crates/orca-tui/src/workflow_panel.rs:append_visible_tree_rows:visited.insert", 1],
+  ["crates/orca-tui/src/workflow_panel.rs:valid_parent_index:seen.insert", 1],
   ["crates/orca-tui/src/edit_highlight_worker.rs:clear_pending:self.pending.clear", 1],
   ["crates/orca-tui/src/edit_highlight_worker.rs:coalesce_jobs_until_shutdown:positions.insert", 2],
   ["crates/orca-tui/src/edit_highlight_worker.rs:submit:self.pending.clear", 1],
@@ -1814,11 +1819,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 39 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 40 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 39,
-          "current_tui_user_actions must contain 39 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 40,
+          "current_tui_user_actions must contain 40 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

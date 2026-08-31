@@ -152,10 +152,10 @@ pub use identity::{
     WorkflowCatalogRevision, WorkflowRevision, ZeroizingProcessLocalSecret,
 };
 
-pub use ingress::RuntimeSubagentActivityIngress;
 pub use ingress::{
-    RuntimeProviderResponseIngress, RuntimeWorkflowFinished, RuntimeWorkflowIngressReceipt,
-    RuntimeWorkflowLifecycleIngress, RuntimeWorkflowOutcome, RuntimeWorkflowStarted,
+    RuntimeProviderResponseIngress, RuntimeSubagentActivityIngress, RuntimeWorkflowFinished,
+    RuntimeWorkflowIngressReceipt, RuntimeWorkflowLifecycleIngress, RuntimeWorkflowOutcome,
+    RuntimeWorkflowStarted,
 };
 
 pub use interaction::{

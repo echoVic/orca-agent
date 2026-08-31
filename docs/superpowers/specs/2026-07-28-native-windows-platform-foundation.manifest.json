@@ -209,6 +209,20 @@
       "process-ownership-plan"
     ],
     [
+      "subagent-relay-unix-api",
+      "crates/orca-runtime/src/subagent_event_relay.rs",
+      "unix_std_api",
+      2,
+      "process-ownership-plan"
+    ],
+    [
+      "subagent-relay-unix-process-api",
+      "crates/orca-runtime/src/subagent_event_relay.rs",
+      "unix_libc_process",
+      4,
+      "process-ownership-plan"
+    ],
+    [
       "task-test-shells",
       "crates/orca-runtime/src/tasks.rs",
       "unix_shell_spawn",
@@ -219,7 +233,7 @@
       "task-test-unix-process-api",
       "crates/orca-runtime/src/tasks.rs",
       "unix_std_api",
-      2,
+      5,
       "windows-test-portability"
     ],
     [
