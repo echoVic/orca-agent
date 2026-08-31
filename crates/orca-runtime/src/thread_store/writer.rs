@@ -2805,6 +2805,7 @@ mod tests {
         file.write_all(b"{\"type\":\"conversation.message\",\"message\":{\"role\":\"tool\"")
             .expect("write truncated tail");
         file.flush().expect("flush truncated tail");
+        drop(file);
         assert_eq!(
             scan_session(&path).expect("scan truncated tail").health,
             StoredSessionHealth::RecoverableTail
