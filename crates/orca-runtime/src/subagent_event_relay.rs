@@ -1816,6 +1816,7 @@ mod tests {
             first.append(RelayRecord::new(&lease_one, 2, commit_id(2), b"y".to_vec())),
             Err(RelayError::IncompleteTail { .. })
         ));
+        drop(first);
         let (_, lease_two) = lease(root.path(), "owner-b", 2);
         let second = SubagentEventRelay::open(root.path(), lease_two.clone()).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), original_len);

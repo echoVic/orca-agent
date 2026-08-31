@@ -2810,6 +2810,7 @@ mod tests {
             scan_session(&path).expect("scan truncated tail").health,
             StoredSessionHealth::RecoverableTail
         );
+        drop(_writer);
 
         let resumed = SessionWriter::append_to_existing(path.clone())
             .expect("resume at the last complete boundary");
