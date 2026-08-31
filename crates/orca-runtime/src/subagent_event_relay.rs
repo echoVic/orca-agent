@@ -671,7 +671,7 @@ impl SubagentEventRelay {
     fn open_append_file(&self) -> Result<File, RelayError> {
         reject_symlink(&self.relay_path)?;
         let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true).append(true);
+        options.create(true).read(true).write(true);
         #[cfg(unix)]
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
         options.open(&self.relay_path).map_err(io_error)

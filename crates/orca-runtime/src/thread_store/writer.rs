@@ -1693,7 +1693,7 @@ impl EventPublicationStore for SessionWriter {
 
 fn append_usage_baseline(path: &Path) -> io::Result<()> {
     let _lock = acquire_file_lock(path)?;
-    let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     // `append_to_existing` has already classified this as either healthy or
     // a recoverable plaintext tail. Repair only that accepted tail while the
     // append lock is held, before any new JSONL record can be written.
