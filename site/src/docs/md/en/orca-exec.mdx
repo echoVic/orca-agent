@@ -22,13 +22,13 @@ printf '%s\n' "Summarize the changed files" | orca exec -
 
 | Option | Purpose |
 | --- | --- |
-| --output-format <text|jsonl> | Select human-readable text or one JSON object per event. The default is text. |
-| --cwd <PATH> | Use a specific workspace. |
-| --mode <suggest|auto-edit|full-auto|plan> | Select the tool-approval policy. |
-| --model <MODEL>, --api-key <KEY>, --base-url <URL> | Override the effective provider configuration for this run. |
-| --verifier <COMMAND> | Run a verification command after the task. |
-| --max-turns <N>, --max-tool-calls <N> | Limit model turns or tool calls. |
-| --max-cost-usd <USD>, --max-wall-time-secs <SECONDS> | Limit estimated cost or wall-clock time. |
+| --output-format TEXT\|JSONL | Select human-readable text or one JSON object per event. The default is text. |
+| --cwd PATH | Use a specific workspace. |
+| --mode suggest\|auto-edit\|full-auto\|plan | Select the tool-approval policy. |
+| --model MODEL, --api-key KEY, --base-url URL | Override the effective provider configuration for this run. |
+| --verifier COMMAND | Run a verification command after the task. |
+| --max-turns N, --max-tool-calls N | Limit model turns or tool calls. |
+| --max-cost-usd USD, --max-wall-time-secs SECONDS | Limit estimated cost or wall-clock time. |
 | --no-history | Do not record this run locally. |
 | --save-history | Record a JSONL run locally as well as writing its stream to stdout. |
 

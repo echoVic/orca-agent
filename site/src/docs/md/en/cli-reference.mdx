@@ -17,7 +17,7 @@ The canonical site and installer are [orcaagent.dev](https://orcaagent.dev/).
 
 ```text
 orca [OPTIONS] [PROMPT]...
-orca [OPTIONS] <COMMAND>
+orca [OPTIONS] COMMAND
 ```
 
 Running `orca` opens the interactive TUI. A prompt may be supplied as
@@ -39,7 +39,7 @@ a protocol transport and cannot be combined with a prompt or subcommand.
 ## `orca doctor`
 
 ```text
-orca doctor [--cwd <PATH>] [--format <text|json>]
+orca doctor [--cwd PATH] [--format text|json]
 ```
 
 `doctor` is a local, read-only preflight. It never contacts the provider,
@@ -72,20 +72,20 @@ The supported execution options are:
 
 | Option | Meaning |
 | --- | --- |
-| `--output-format <text|jsonl>` | Human-readable output or one JSON object per event. |
-| `--cwd <PATH>` | Workspace directory. |
-| `--mode <suggest|auto-edit|full-auto|plan>` | Approval policy for tool actions. |
-| `--model <MODEL>` | Model override. |
-| `--api-key <KEY>` | API key override. |
-| `--base-url <URL>` | API endpoint override. |
-| `--verifier <COMMAND>` | Command to run after the task. |
-| `--max-turns <N>` | Maximum model turns for this run. |
-| `--max-tool-calls <N>` | Maximum tool calls for this run. |
-| `--max-cost-usd <USD>` | Maximum estimated cost for this run. |
-| `--max-wall-time-secs <SECONDS>` | Maximum wall-clock time for this run. |
-| `--resume <ID>` | Resume a saved conversation by ID or prefix. |
-| `--resume-at <MESSAGE_ID>` | Restore only through a persisted message boundary. |
-| `--fork <ID>` | Fork a saved conversation. |
+| `--output-format TEXT|JSONL` | Human-readable output or one JSON object per event. |
+| `--cwd PATH` | Workspace directory. |
+| `--mode suggest|auto-edit|full-auto|plan` | Approval policy for tool actions. |
+| `--model MODEL` | Model override. |
+| `--api-key KEY` | API key override. |
+| `--base-url URL` | API endpoint override. |
+| `--verifier COMMAND` | Command to run after the task. |
+| `--max-turns N` | Maximum model turns for this run. |
+| `--max-tool-calls N` | Maximum tool calls for this run. |
+| `--max-cost-usd USD` | Maximum estimated cost for this run. |
+| `--max-wall-time-secs SECONDS` | Maximum wall-clock time for this run. |
+| `--resume ID` | Resume a saved conversation by ID or prefix. |
+| `--resume-at MESSAGE_ID` | Restore only through a persisted message boundary. |
+| `--fork ID` | Fork a saved conversation. |
 | `--continue` | Continue the latest saved conversation. |
 | `--no-history` | Do not write this run to local history. |
 | `--save-history` | Persist history while using JSONL output. |
@@ -111,7 +111,7 @@ before scripting it.
 ## `orca trust`
 
 ```text
-orca trust [show|add|remove] [--cwd <PATH>]
+orca trust [show|add|remove] [--cwd PATH]
 ```
 
 `show` is read-only. `add` and `remove` update the user-owned folder-trust

@@ -20,13 +20,13 @@ printf '%s\n' "总结已修改的文件" | orca exec -
 
 | 参数 | 用途 |
 | --- | --- |
-| --output-format <text|jsonl> | 选择人类可读文本或每行一个 JSON 事件；默认是 text。 |
-| --cwd <PATH> | 指定工作区。 |
-| --mode <suggest|auto-edit|full-auto|plan> | 选择工具审批策略。 |
-| --model <MODEL>, --api-key <KEY>, --base-url <URL> | 覆盖本次运行的提供商配置。 |
-| --verifier <COMMAND> | 任务结束后执行验证命令。 |
-| --max-turns <N>, --max-tool-calls <N> | 限制模型回合或工具调用数。 |
-| --max-cost-usd <USD>, --max-wall-time-secs <SECONDS> | 限制估算费用或运行时间。 |
+| --output-format TEXT\|JSONL | 选择人类可读文本或每行一个 JSON 事件；默认是 text。 |
+| --cwd PATH | 指定工作区。 |
+| --mode suggest\|auto-edit\|full-auto\|plan | 选择工具审批策略。 |
+| --model MODEL, --api-key KEY, --base-url URL | 覆盖本次运行的提供商配置。 |
+| --verifier COMMAND | 任务结束后执行验证命令。 |
+| --max-turns N, --max-tool-calls N | 限制模型回合或工具调用数。 |
+| --max-cost-usd USD, --max-wall-time-secs SECONDS | 限制估算费用或运行时间。 |
 | --no-history | 不记录本次运行。 |
 | --save-history | JSONL 运行同时保留本地会话记录。 |
 

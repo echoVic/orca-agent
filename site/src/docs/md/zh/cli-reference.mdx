@@ -16,7 +16,7 @@ npm install -g @blade-ai/orca
 
 ```text
 orca [OPTIONS] [PROMPT]...
-orca [OPTIONS] <COMMAND>
+orca [OPTIONS] COMMAND
 ```
 
 直接运行 `orca` 会打开交互式 TUI，也可以把提示词作为位置参数传入。
@@ -29,16 +29,16 @@ orca [OPTIONS] <COMMAND>
 | `orca workflow` | 执行和检查本地持久化工作流。 |
 | `orca trust` | 查看或更新目录信任。 |
 
-根选项包括 `--resume [SESSION_ID]`、`--fork <ID>`、`--continue`、
-`--model <MODEL>`、`--mode <MODE>`、`--api-key <KEY>`、`--base-url <URL>`
-和 `--cwd <PATH>`。交互式运行使用审批模式（`suggest`、`auto-edit`、
+根选项包括 `--resume [SESSION_ID]`、`--fork ID`、`--continue`、
+`--model MODEL`、`--mode MODE`、`--api-key KEY`、`--base-url URL`
+和 `--cwd PATH`。交互式运行使用审批模式（`suggest`、`auto-edit`、
 `full-auto` 或 `plan`）。`--mode server` 与 `--mode acp` 则选择协议传输，
 不能与提示词或子命令一起使用。
 
 ## `orca doctor`
 
 ```text
-orca doctor [--cwd <PATH>] [--format <text|json>]
+orca doctor [--cwd PATH] [--format text|json]
 ```
 
 `doctor` 是本地只读的运行前检查。它不会连接模型服务、启动 MCP、配置沙箱
@@ -70,20 +70,20 @@ orca exec [OPTIONS] resume [SESSION_ID] [PROMPT]...
 
 | 选项 | 含义 |
 | --- | --- |
-| `--output-format <text|jsonl>` | 人类可读输出，或每行一个 JSON 事件。 |
-| `--cwd <PATH>` | 工作区目录。 |
-| `--mode <suggest|auto-edit|full-auto|plan>` | 工具操作的审批策略。 |
-| `--model <MODEL>` | 覆盖模型。 |
-| `--api-key <KEY>` | 覆盖 API 密钥。 |
-| `--base-url <URL>` | 覆盖 API endpoint。 |
-| `--verifier <COMMAND>` | 任务完成后执行的验证命令。 |
-| `--max-turns <N>` | 本次运行最多模型回合数。 |
-| `--max-tool-calls <N>` | 本次运行最多工具调用数。 |
-| `--max-cost-usd <USD>` | 本次运行的估算费用上限。 |
-| `--max-wall-time-secs <SECONDS>` | 本次运行的最长墙钟时间。 |
-| `--resume <ID>` | 按 ID 或前缀恢复对话。 |
-| `--resume-at <MESSAGE_ID>` | 只恢复到指定持久化消息边界。 |
-| `--fork <ID>` | 分叉保存的对话。 |
+| `--output-format TEXT\|JSONL` | 人类可读输出，或每行一个 JSON 事件。 |
+| `--cwd PATH` | 工作区目录。 |
+| `--mode suggest\|auto-edit\|full-auto\|plan` | 工具操作的审批策略。 |
+| `--model MODEL` | 覆盖模型。 |
+| `--api-key KEY` | 覆盖 API 密钥。 |
+| `--base-url URL` | 覆盖 API endpoint。 |
+| `--verifier COMMAND` | 任务完成后执行的验证命令。 |
+| `--max-turns N` | 本次运行最多模型回合数。 |
+| `--max-tool-calls N` | 本次运行最多工具调用数。 |
+| `--max-cost-usd USD` | 本次运行的估算费用上限。 |
+| `--max-wall-time-secs SECONDS` | 本次运行的最长墙钟时间。 |
+| `--resume ID` | 按 ID 或前缀恢复对话。 |
+| `--resume-at MESSAGE_ID` | 只恢复到指定持久化消息边界。 |
+| `--fork ID` | 分叉保存的对话。 |
 | `--continue` | 继续最近保存的对话。 |
 | `--no-history` | 不写入本次运行的本地历史。 |
 | `--save-history` | 使用 JSONL 输出时仍保存历史。 |
@@ -102,12 +102,12 @@ orca exec resume SESSION_ID --resume-at MESSAGE_ID "从检查点继续"
 
 工作流命令提供 `run`、`list`、`show`、`source`、`stop`、`pause`、`resume`、
 `clone`、`restart-failed` 和 `restart-phase`。每个操作都有自己的参数；编写
-脚本前请先查看 `orca workflow <COMMAND> --help`。
+脚本前请先查看 `orca workflow COMMAND --help`。
 
 ## `orca trust`
 
 ```text
-orca trust [show|add|remove] [--cwd <PATH>]
+orca trust [show|add|remove] [--cwd PATH]
 ```
 
 `show` 是只读操作。`add` 和 `remove` 会更新用户目录中的信任存储，执行前请

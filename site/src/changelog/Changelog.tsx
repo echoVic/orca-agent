@@ -630,6 +630,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.7":
+        "统一同步与异步子代理的活动流，提供可展开且可进入 transcript 的子任务视图，并通过 actor-authenticated 决策、确定性身份、取消线性化、终态清理和严格的 task/subagent authority 配对，收紧 detached permission race。",
       "v0.4.6":
         "固定 capability intersection 与 Plan 硬上限，把 shell 和 MCP stdio 启动统一收敛到 execution broker，拒绝 workspace 越界和后端降级，项目执行配置不再具有权威性，沙箱拒绝文本只作为解释，不再作为提权依据。",
       "v0.4.5":

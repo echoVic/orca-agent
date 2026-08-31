@@ -63,7 +63,7 @@ orca exec "修复失败的测试" --verifier "cargo test"
 orca exec --output-format jsonl --max-turns 20 "重构解析器" > run.jsonl
 ```
 
-用 `--mode <suggest|auto-edit|full-auto|plan>` 选择工具审批策略。显式资源限制是
+用 `--mode suggest|auto-edit|full-auto|plan` 选择工具审批策略。显式资源限制是
 `--max-turns`、`--max-tool-calls`、`--max-cost-usd` 和 `--max-wall-time-secs`；
 未设置时没有隐式上限。
 
