@@ -1810,6 +1810,7 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(&[0, 0, 0, 20, 1, 2]).unwrap();
         file.sync_all().unwrap();
+        drop(file);
         assert!(matches!(first.read_page(0), Ok(RelayPage { .. })));
         assert!(matches!(
             first.append(RelayRecord::new(&lease_one, 2, commit_id(2), b"y".to_vec())),
