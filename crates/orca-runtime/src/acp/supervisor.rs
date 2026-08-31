@@ -3763,7 +3763,7 @@ mod tests {
                             .as_array()
                             .expect("permission options")
                             .len(),
-                        6
+                        5
                     );
                     assert!(value["params"]["toolCall"]["rawInput"].is_object());
                     write_raw_response(
