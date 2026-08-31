@@ -14574,6 +14574,74 @@ mod tests {
             &goal,
             ThreadOwnerEpoch::new(1),
         ));
+
+        let mut poison_task = terminal_history_task(
+            super::super::SurfaceTaskId::try_new("poison-child").unwrap(),
+            super::super::SurfaceTaskStatus::Completed,
+        );
+        poison_task.task_type = super::super::SurfaceTaskType::Subagent;
+        poison_task.status = super::super::SurfaceTaskStatus::Running;
+        poison_task.completed_at = None;
+        poison_task.result = None;
+        poison_task.subagent_id =
+            Some(super::super::SurfaceSubagentId::try_new("poison-child-agent").unwrap());
+        let poison = test_batch_with_events(
+            &state,
+            vec![(
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Task(super::super::TaskPatch::Upserted {
+                    expected_revision: None,
+                    task: poison_task,
+                }),
+            )],
+        );
+        assert!(!permit_authorizes(
+            &state,
+            std::slice::from_ref(&permit),
+            &permit,
+            &poison,
+            ThreadOwnerEpoch::new(1),
+        ));
+
+        let materialized = test_batch_with_events(
+            &state,
+            vec![(
+                SurfaceScope::Thread,
+                super::super::SurfaceEvent::Session(super::super::SessionPatch::Materialized {
+                    thread: state.snapshot().thread.clone(),
+                }),
+            )],
+        );
+        assert!(!permit_authorizes(
+            &state,
+            std::slice::from_ref(&permit),
+            &permit,
+            &materialized,
+            ThreadOwnerEpoch::new(1),
+        ));
+    }
+
+    #[test]
+    fn permission_receipt_profile_must_be_a_subset_of_the_request() {
+        let label =
+            |value| super::super::SurfacePermissionPathLabel(super::super::DisplayText::new(value));
+        let requested = super::super::SurfacePermissionProfile {
+            file_system: Some(super::super::SurfaceFileSystemPermissionProfile {
+                read: None,
+                write: Some(vec![label("/workspace")]),
+            }),
+            network: None,
+        };
+        let exact = requested.clone();
+        let broader = super::super::SurfacePermissionProfile {
+            file_system: Some(super::super::SurfaceFileSystemPermissionProfile {
+                read: None,
+                write: Some(vec![label("/workspace"), label("/etc")]),
+            }),
+            network: None,
+        };
+        assert!(permission_profile_is_subset(&exact, &requested));
+        assert!(!permission_profile_is_subset(&broader, &requested));
     }
 
     #[test]
