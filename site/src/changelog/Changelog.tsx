@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.7":
+        "Unifies synchronous and asynchronous child activity through one durable relay, renders expandable child tasks with transcript access, and closes detached permission races with actor-authenticated decisions, deterministic identities, cancellation linearization, terminal cleanup, and strict task/subagent authority pairing.",
       "v0.4.6":
         "Freezes capability intersection and Plan ceilings, routes shell and MCP stdio launches through an execution broker, rejects workspace escapes and backend fallbacks, makes project execution settings non-authoritative, and keeps sandbox denial text explanatory instead of authority-bearing.",
       "v0.4.5":

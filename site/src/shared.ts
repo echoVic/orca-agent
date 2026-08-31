@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.6";
+export const releaseVersion = "v0.4.7";
 
 export const releases = [
+  {
+    version: "v0.4.7",
+    date: "2026-08-31",
+    title: "Observable subagents and fenced permission recovery",
+    body: "Unifies synchronous and asynchronous child activity through one durable relay, renders expandable child tasks with transcript access, and closes detached permission races with actor-authenticated decisions, deterministic identities, cancellation linearization, terminal cleanup, and strict task/subagent authority pairing.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.7",
+  },
   {
     version: "v0.4.6",
     date: "2026-08-29",
