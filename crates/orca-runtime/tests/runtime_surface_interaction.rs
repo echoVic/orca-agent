@@ -143,6 +143,10 @@ fn permission_tool_request() -> ToolRequest {
     }
 }
 
+fn native_permission_root(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("orca-runtime-permission-{name}"))
+}
+
 fn provider_response_for_tool(
     request: &ToolRequest,
     turn_id: orca_core::thread_identity::TurnId,
@@ -548,7 +552,7 @@ impl ThreadOperationExecutor for PermissionExecutor {
                 permissions: RequestPermissionProfile {
                     file_system: Some(RequestFileSystemPermissions {
                         read: None,
-                        write: Some(vec![PathBuf::from("/workspace/output")]),
+                        write: Some(vec![native_permission_root("output")]),
                         entries: None,
                     }),
                     network: None,
@@ -673,7 +677,7 @@ impl ThreadOperationExecutor for BlockingResolvedPermissionExecutor {
                 permissions: RequestPermissionProfile {
                     file_system: Some(RequestFileSystemPermissions {
                         read: None,
-                        write: Some(vec![PathBuf::from("/workspace/output")]),
+                        write: Some(vec![native_permission_root("output")]),
                         entries: None,
                     }),
                     network: None,
@@ -1718,12 +1722,14 @@ fn native_permission_allow_cannot_widen_requested_profile() {
     };
     assert!(response_rx.try_recv().is_err());
 
+    let requested_root = native_permission_root("output");
+    let secret_root = native_permission_root("secret");
     let widened = SurfacePermissionProfile {
         file_system: Some(SurfaceFileSystemPermissionProfile {
             read: None,
             write: Some(vec![
-                SurfacePermissionPathLabel(DisplayText::new("/workspace/output")),
-                SurfacePermissionPathLabel(DisplayText::new("/workspace/secret")),
+                SurfacePermissionPathLabel(DisplayText::new(requested_root.to_string_lossy())),
+                SurfacePermissionPathLabel(DisplayText::new(secret_root.to_string_lossy())),
             ]),
         }),
         network: None,
@@ -1782,7 +1788,7 @@ fn native_permission_allow_cannot_widen_requested_profile() {
             .file_system
             .and_then(|profile| profile.write)
             .unwrap(),
-        vec![PathBuf::from("/workspace/output")]
+        vec![requested_root.clone()]
     );
     let snapshot = fresh_interaction_attachment(&surface).baseline.snapshot;
     assert!(
@@ -1791,7 +1797,7 @@ fn native_permission_allow_cannot_widen_requested_profile() {
             .effective
             .additional_working_directories
             .iter()
-            .any(|directory| directory.path.as_path() == PathBuf::from("/workspace/output"))
+            .any(|directory| directory.path.as_path() == requested_root.as_path())
     );
     let terminal = attachment
         .client
