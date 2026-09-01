@@ -6,7 +6,7 @@ use crate::protocol::UserAction;
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 40] = [
+const CURRENT_ACTIONS: [(&str, &str); 43] = [
     ("StartSideConversation", "host_session_lifecycle_mutation"),
     ("ToggleSideConversation", "host_session_lifecycle_mutation"),
     ("CloseSideConversation", "host_session_lifecycle_mutation"),
@@ -38,6 +38,9 @@ const CURRENT_ACTIONS: [(&str, &str); 40] = [
     ("GoalResume", "goal_session_operation_mutation"),
     ("ResolveBackgroundApproval", "interaction_mutation"),
     ("StopTask", "task_mutation"),
+    ("ResumeTask", "task_mutation"),
+    ("RetryTask", "task_mutation"),
+    ("FollowUpTask", "task_mutation"),
     ("ForegroundTask", "task_ownership_mutation"),
     ("ReadTaskTranscript", "task_read"),
     ("RespondToInteraction", "interaction_mutation"),
