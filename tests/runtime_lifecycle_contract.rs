@@ -2127,6 +2127,7 @@ impl RuntimeSubagentStatusLookup for FakeSubagentStatusLookup {
             error: None,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation_id: Some("continuation-1".to_string()),

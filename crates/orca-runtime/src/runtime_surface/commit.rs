@@ -6288,6 +6288,51 @@ fn actor_control_subagent_activity_authorized(
     state: &SurfaceReducerState,
     batch: &SurfaceCommitBatch,
 ) -> bool {
+    // A continuation command has already admitted the new child through its
+    // Started relay batch. The actor emits one fenced Running -> Running task
+    // refresh only to acknowledge that launch to the caller. Keep this
+    // single-event form narrow so an actor permit cannot mutate arbitrary
+    // task state without a matching subagent projection.
+    if let [task_event] = batch.events.as_slice() {
+        if !matches!(&task_event.scope, SurfaceScope::Thread) {
+            return false;
+        }
+        let super::SurfaceEvent::Task(super::TaskPatch::StatusChanged {
+            task_id,
+            expected_revision,
+            next_revision,
+            status: super::SurfaceTaskStatus::Running,
+            completed_at: None,
+            result: None,
+            error: None,
+        }) = &task_event.event
+        else {
+            return false;
+        };
+        let Some(task) = state
+            .snapshot()
+            .tasks
+            .iter()
+            .find(|task| task.task_id == *task_id)
+        else {
+            return false;
+        };
+        return task.task_type == super::SurfaceTaskType::Subagent
+            && task.status == super::SurfaceTaskStatus::Running
+            && task.completed_at.is_none()
+            && task.subagent_id.as_ref().is_some_and(|subagent_id| {
+                state.snapshot().subagents.iter().any(|subagent| {
+                    subagent.subagent_id == *subagent_id
+                        && subagent.task_id == *task_id
+                        && subagent.status == super::SurfaceSubagentStatus::Running
+                })
+            })
+            && task.revision == *expected_revision
+            && expected_revision
+                .get()
+                .checked_add(1)
+                .is_some_and(|expected| next_revision.get() == expected);
+    }
     let [task_event, subagent_event] = batch.events.as_slice() else {
         return false;
     };
@@ -6344,7 +6389,7 @@ fn actor_control_subagent_activity_authorized(
             (
                 &value.subagent_id,
                 &value.owner,
-                &value.source,
+                Some(&value.source),
                 expected_generation,
                 None,
                 Some(value.revision),
@@ -6374,8 +6419,27 @@ fn actor_control_subagent_activity_authorized(
             (
                 subagent_id,
                 owner,
-                source,
+                Some(source),
                 expected_generation,
+                Some(*expected_revision),
+                Some(*next_revision),
+            )
+        }
+        super::SurfaceEvent::Subagent(super::SubagentPatch::Stopped {
+            subagent_id,
+            expected_revision,
+            next_revision,
+            owner,
+            ..
+        }) => {
+            if !matches!(&subagent_event.scope, SurfaceScope::Thread) {
+                return false;
+            }
+            (
+                subagent_id,
+                owner,
+                None,
+                None,
                 Some(*expected_revision),
                 Some(*next_revision),
             )
@@ -6417,6 +6481,9 @@ fn actor_control_subagent_activity_authorized(
                     )
                 )
         }
+        super::SurfaceEvent::Subagent(super::SubagentPatch::Stopped { .. }) => {
+            task.status == super::SurfaceTaskStatus::Stopped && task.completed_at.is_some()
+        }
         _ => false,
     };
     if !status_pair_is_valid {
@@ -6449,7 +6516,7 @@ fn actor_control_subagent_activity_authorized(
             && task.revision.get() == 1
             && expected_subagent_revision.is_none()
             && next_subagent_revision.is_some_and(|revision| revision.get() == 1)
-            && source.source_sequence == 1
+            && source.is_some_and(|source| source.source_sequence == 1)
     } else {
         let Some(current_task) = existing_task else {
             return false;
@@ -6471,12 +6538,14 @@ fn actor_control_subagent_activity_authorized(
                     .checked_add(1)
                     .is_some_and(|expected| revision.get() == expected)
             })
-            && current_subagent
-                .source
-                .source_sequence
-                .checked_add(1)
-                .is_some_and(|expected| source.source_sequence == expected)
-            && source.turn_id == current_subagent.source.turn_id
+            && source.is_none_or(|source| {
+                current_subagent
+                    .source
+                    .source_sequence
+                    .checked_add(1)
+                    .is_some_and(|expected| source.source_sequence == expected)
+                    && source.turn_id == current_subagent.source.turn_id
+            })
     };
     if !revision_shape_is_valid {
         return false;
@@ -6484,6 +6553,9 @@ fn actor_control_subagent_activity_authorized(
 
     match (owner, expected_generation) {
         (super::SurfaceSubagentOwner::Generation { fence: owner }, Some(scope_fence)) => {
+            let Some(source) = source else {
+                return false;
+            };
             operation_fence_is_known(snapshot, scope_fence)
                 && snapshot
                     .foreground_operation
@@ -6546,8 +6618,9 @@ fn actor_control_subagent_activity_authorized(
                 && task.task_id == owner.task_id
                 && task.subagent_id.as_ref() == Some(subagent_id)
                 && owner.task_revision.get() <= task.revision.get()
-                && source.attempt_id == owner.attempt_id
-                && source.source_sequence > 0
+                && source.is_none_or(|source| {
+                    source.attempt_id == owner.attempt_id && source.source_sequence > 0
+                })
                 // A detached owner is still subordinate to the operation
                 // that admitted it.  Keep the operation id in the durable
                 // task row and require it to resolve to known operation
@@ -14193,10 +14266,12 @@ mod tests {
             description: super::super::DisplayText::new("detached agent"),
             status: super::super::SurfaceSubagentStatus::Running,
             activity: Some(super::super::DisplayText::new("tool")),
+            subagent_activity_history: Vec::new(),
             turn: Some(1),
             usage: None,
             output: None,
             error: None,
+            continuation: None,
             owner: super::super::SurfaceSubagentOwner::DetachedTask {
                 owner: super::super::SurfaceTaskOwnerRef::new(
                     task_id.clone(),
@@ -14209,6 +14284,7 @@ mod tests {
                 super::super::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
                 turn_id,
                 2,
+                super::super::UnixMillis::new(2),
                 super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(175)).unwrap(),
                 super::super::Sha256Digest::new([8; 32]),
             ),
@@ -14289,10 +14365,12 @@ mod tests {
             description: super::super::DisplayText::new("child agent"),
             status: super::super::SurfaceSubagentStatus::Running,
             activity: Some(super::super::DisplayText::new("bash")),
+            subagent_activity_history: Vec::new(),
             turn: Some(1),
             usage: None,
             output: None,
             error: None,
+            continuation: None,
             owner: super::super::SurfaceSubagentOwner::Generation {
                 fence: fence.clone(),
             },
@@ -14300,6 +14378,7 @@ mod tests {
                 super::super::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
                 turn_id.clone(),
                 1,
+                super::super::UnixMillis::new(1),
                 super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(122)).unwrap(),
                 super::super::Sha256Digest::new([1; 32]),
             ),

@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.8":
+        "Turns child-agent observability into an interactive TUI workspace: a bounded conversation activity dock, unified task and workflow navigation, live transcript inspection, revision-fenced child controls, durable activity history, workflow previews, and cancellation that absorbs late child events without terminal spam.",
       "v0.4.7":
         "Unifies synchronous and asynchronous child activity through one durable relay, renders expandable child tasks with transcript access, and closes detached permission races with actor-authenticated decisions, deterministic identities, cancellation linearization, terminal cleanup, and strict task/subagent authority pairing.",
       "v0.4.6":
@@ -630,6 +632,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.8":
+        "把子代理可观测性变成可操作的 TUI 工作区：Conversation 提供有界实时活动摘要，/tasks 统一普通子代理、后台任务和 Workflow，支持实时 transcript、带 revision fence 的 child 控制、持久化活动历史、Workflow preview，并在取消时吸收迟到事件，避免终端刷屏。",
       "v0.4.7":
         "统一同步与异步子代理的活动流，提供可展开且可进入 transcript 的子任务视图，并通过 actor-authenticated 决策、确定性身份、取消线性化、终态清理和严格的 task/subagent authority 配对，收紧 detached permission race。",
       "v0.4.6":

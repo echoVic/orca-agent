@@ -349,6 +349,15 @@ impl TuiSurfaceActions {
         crate::surface_client::stop_task(&self.thread, task_id, control, event_tx)
     }
 
+    pub(crate) fn continue_subagent(
+        &self,
+        task_id: &str,
+        mode: &str,
+        prompt: Option<&str>,
+    ) -> Result<SurfaceProjectionState, String> {
+        crate::surface_client::continue_subagent(&self.thread, task_id, mode, prompt)
+    }
+
     pub(crate) fn foreground_task(
         &self,
         task_id: &str,

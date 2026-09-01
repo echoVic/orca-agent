@@ -804,7 +804,7 @@ patch_name_matcher!(
 patch_name_matcher!(
     subagent_patch_name,
     SubagentPatch,
-    [Started, Progress, Completed]
+    [Started, Progress, Completed, Stopped]
 );
 patch_name_matcher!(
     goal_patch_name,
@@ -908,10 +908,12 @@ fn subagent_and_goal_projection_refinements_are_exact() {
         description: DisplayText::new("focused projection"),
         status: SurfaceSubagentStatus::Running,
         activity: None,
+        subagent_activity_history: Vec::new(),
         turn: None,
         usage: None,
         output: None,
         error: None,
+        continuation: None,
         owner: SurfaceSubagentOwner::Generation {
             fence: operation_fence(41),
         },
@@ -919,6 +921,7 @@ fn subagent_and_goal_projection_refinements_are_exact() {
             SurfaceTaskAttemptId::try_new("attempt-41").unwrap(),
             SurfaceTurnId::new(),
             1,
+            UnixMillis::new(4_242),
             SurfaceCommitId::try_from_bytes(uuid_v7_bytes(42)).unwrap(),
             Sha256Digest::new([41; 32]),
         ),
@@ -928,6 +931,15 @@ fn subagent_and_goal_projection_refinements_are_exact() {
     assert_eq!(
         serde_json::to_value(&running_refinement).unwrap(),
         serde_json::to_value(&running).unwrap()
+    );
+
+    let mut timestamped = serde_json::to_value(&running).unwrap();
+    timestamped["source"]["occurred_at"] = serde_json::json!(4_242);
+    let timestamped: SurfaceSubagent = serde_json::from_value(timestamped).unwrap();
+    assert_eq!(
+        serde_json::to_value(timestamped).unwrap()["source"]["occurred_at"],
+        serde_json::json!(4_242),
+        "subagent activity time must survive the durable surface wire shape"
     );
 
     let mut completed = running;

@@ -2591,6 +2591,7 @@ fn subagent_source(sequence: u64) -> SurfaceSubagentSource {
         SurfaceTaskAttemptId::try_new("manifest-attempt").unwrap(),
         subagent_turn_id(),
         sequence,
+        UnixMillis::new(sequence as i64),
         SurfaceCommitId::try_from_bytes(uuid_v7_bytes(6_100u32.wrapping_add(sequence as u32)))
             .unwrap(),
         digest(sequence as u8),
@@ -3000,10 +3001,12 @@ fn subagent(status: SurfaceSubagentStatus, revision: u64) -> SurfaceSubagent {
         description: DisplayText::new("manifest subagent"),
         status,
         activity: None,
+        subagent_activity_history: Vec::new(),
         turn: None,
         usage: None,
         output: None,
         error: None,
+        continuation: None,
         owner: subagent_owner(),
         source: subagent_source(revision),
     }
@@ -3050,6 +3053,8 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
                         activity: DisplayText::new("progress"),
                         turn: Some(1),
                         usage: None,
+                        subagent_activity_history: Vec::new(),
+                        continuation: None,
                     }
                 }
                 (_, terminal) => SubagentPatch::Completed {
@@ -3071,6 +3076,8 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
                     output: None,
                     error: None,
                     usage: None,
+                    subagent_activity_history: Vec::new(),
+                    continuation: None,
                 },
             };
             let pair = (
@@ -3123,6 +3130,8 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
             activity: DisplayText::new("illegal reopen"),
             turn: None,
             usage: None,
+            subagent_activity_history: Vec::new(),
+            continuation: None,
         };
         let batch = batch(
             &state,
@@ -3140,6 +3149,113 @@ fn subagent_transitions_are_generated_from_manifest_and_terminals_absorb() {
             SurfaceReducerErrorCode::IllegalTransition,
         );
     }
+}
+
+#[test]
+fn subagent_progress_advances_the_durable_activity_time() {
+    let mut initial = snapshot();
+    initial
+        .subagents
+        .push(subagent(SurfaceSubagentStatus::Running, 1));
+    let state = SurfaceReducerState::new(initial);
+    let patch = SubagentPatch::Progress {
+        subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
+        expected_revision: SubagentRevision::try_new(1).unwrap(),
+        next_revision: SubagentRevision::try_new(2).unwrap(),
+        owner: subagent_owner(),
+        source: subagent_source(2),
+        activity: DisplayText::new("running tests"),
+        turn: Some(2),
+        usage: None,
+        subagent_activity_history: Vec::new(),
+        continuation: None,
+    };
+    let next = applied(reduce_batch(
+        SurfaceReduceMode::Live,
+        &state,
+        &batch(
+            &state,
+            10_900,
+            vec![(
+                SurfaceScope::Generation {
+                    fence: operation_fence(),
+                },
+                SurfaceEvent::Subagent(patch),
+            )],
+        ),
+    ));
+
+    assert_eq!(next.snapshot().subagents[0].source.occurred_at.get(), 2);
+}
+
+#[test]
+fn actor_stopped_subagent_absorbs_late_child_progress() {
+    let attempt_id = SurfaceTaskAttemptId::try_new("manifest-attempt").unwrap();
+    let owner = SurfaceSubagentOwner::DetachedTask {
+        owner: SurfaceTaskOwnerRef::new(
+            SurfaceTaskId::try_new("manifest-task").unwrap(),
+            TaskRevision::try_new(1).unwrap(),
+            attempt_id.clone(),
+            digest(42),
+        ),
+    };
+    let mut initial = snapshot();
+    let mut running = subagent(SurfaceSubagentStatus::Running, 1);
+    running.owner = owner.clone();
+    running.source.attempt_id = attempt_id;
+    initial.subagents.push(running);
+    let state = SurfaceReducerState::new(initial);
+    let stopped = applied(reduce_batch(
+        SurfaceReduceMode::Live,
+        &state,
+        &batch(
+            &state,
+            10_901,
+            vec![(
+                SurfaceScope::Thread,
+                SurfaceEvent::Subagent(SubagentPatch::Stopped {
+                    subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
+                    expected_revision: SubagentRevision::try_new(1).unwrap(),
+                    next_revision: SubagentRevision::try_new(2).unwrap(),
+                    owner: owner.clone(),
+                    subagent_activity_history: vec![orca_core::task_types::SubagentActivityEntry {
+                        occurred_at_ms: 2,
+                        activity: "stopped by user".to_string(),
+                        turn: None,
+                    }],
+                    continuation: None,
+                }),
+            )],
+        ),
+    ));
+    assert_eq!(
+        stopped.snapshot().subagents[0].status,
+        SurfaceSubagentStatus::Cancelled
+    );
+
+    let late_progress = batch(
+        &stopped,
+        10_902,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Subagent(SubagentPatch::Progress {
+                subagent_id: SurfaceSubagentId::try_new("manifest-subagent").unwrap(),
+                expected_revision: SubagentRevision::try_new(2).unwrap(),
+                next_revision: SubagentRevision::try_new(3).unwrap(),
+                owner,
+                source: subagent_source(2),
+                activity: DisplayText::new("late child output"),
+                turn: Some(1),
+                usage: None,
+                subagent_activity_history: Vec::new(),
+                continuation: None,
+            }),
+        )],
+    );
+    rejected(
+        reduce_batch(SurfaceReduceMode::Live, &stopped, &late_progress),
+        SurfaceReducerErrorCode::IllegalTransition,
+    );
 }
 
 fn task_status_name(status: SurfaceTaskStatus) -> &'static str {
@@ -9013,6 +9129,8 @@ fn subagent_revision_overflow_is_not_contiguous() {
                 activity: DisplayText::new("overflow"),
                 turn: None,
                 usage: None,
+                subagent_activity_history: Vec::new(),
+                continuation: None,
             }),
         )],
     );

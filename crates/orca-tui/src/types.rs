@@ -23,6 +23,7 @@ use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 #[cfg(test)]
 use orca_runtime::surface::SurfaceOperationId;
 
+use crate::agent_workspace::AgentWorkspaceState;
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::edit_highlight::EditHighlightState;
 #[cfg(test)]
@@ -62,7 +63,8 @@ use crate::protocol::{
 #[allow(dead_code)]
 pub(crate) struct TaskTranscriptViewState {
     pub(crate) request: TaskTranscriptRequest,
-    pub(crate) result: TaskTranscriptResult,
+    pub(crate) result: Option<TaskTranscriptResult>,
+    pub(crate) scroll: u16,
 }
 #[derive(Debug, Clone, Default)]
 pub struct PendingWorkflowNotificationQueue {
@@ -437,6 +439,7 @@ pub struct AppState {
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
     pub(crate) workflow_panel: WorkflowPanelState,
+    pub(crate) agent_workspace: AgentWorkspaceState,
     pub(crate) task_transcript: Option<TaskTranscriptViewState>,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
@@ -473,14 +476,39 @@ impl ScrollAmount for i32 {
 }
 
 impl AppState {
-    #[allow(dead_code)]
     pub(crate) fn task_transcript(&self) -> Option<&TaskTranscriptViewState> {
         self.task_transcript.as_ref()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn clear_task_transcript(&mut self) {
         self.task_transcript = None;
+    }
+
+    pub(crate) fn begin_task_transcript_request(&mut self, request: TaskTranscriptRequest) {
+        self.task_transcript = Some(TaskTranscriptViewState {
+            request,
+            result: None,
+            scroll: 0,
+        });
+    }
+
+    pub(crate) fn task_transcript_scroll(&self) -> u16 {
+        self.task_transcript
+            .as_ref()
+            .map(|view| view.scroll)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn scroll_task_transcript_up(&mut self) {
+        if let Some(view) = self.task_transcript.as_mut() {
+            view.scroll = view.scroll.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn scroll_task_transcript_down(&mut self) {
+        if let Some(view) = self.task_transcript.as_mut() {
+            view.scroll = view.scroll.saturating_add(1);
+        }
     }
 
     #[cfg(test)]
@@ -629,6 +657,7 @@ impl AppState {
             recovery_prompt_selected: 0,
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
+            agent_workspace: AgentWorkspaceState::default(),
             task_transcript: None,
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,

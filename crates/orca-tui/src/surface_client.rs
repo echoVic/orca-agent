@@ -687,6 +687,35 @@ pub(crate) fn stop_task(
         let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
         return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
     }
+    if task.task_type == orca_runtime::surface::SurfaceTaskType::Subagent {
+        let result = attachment.client.task_control(
+            SurfaceRequestId::new(),
+            TaskControlAction::Stop {
+                fence: SurfaceTaskFence {
+                    task_id: task.task_id.clone(),
+                    task_revision: task.revision,
+                    background_owner: task.background_fence.clone(),
+                },
+            },
+        );
+        detach(&surface, &attachment.client);
+        match result.map_err(|error| format!("typed TUI subagent stop failed: {error:?}"))? {
+            MutationReply::Committed { .. } => {}
+            MutationReply::Deferred { mutation, .. } => {
+                return Err(format!(
+                    "typed TUI subagent stop deferred: request={:?} commit={:?}",
+                    mutation.request_id, mutation.commit_id
+                ));
+            }
+            MutationReply::Uncommitted { mutation } => {
+                return Err(format!(
+                    "typed TUI subagent stop did not commit: {mutation:?}"
+                ));
+            }
+        }
+        let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
+        return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
+    }
     if task.task_type != orca_runtime::surface::SurfaceTaskType::Workflow
         && task.workflow_run_id.is_none()
     {
@@ -734,6 +763,91 @@ pub(crate) fn stop_task(
         }
     }
 
+    let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
+    Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot))
+}
+
+pub(crate) fn continue_subagent(
+    thread: &RuntimeSurfaceThreadHandle,
+    task_id: &str,
+    mode: &str,
+    prompt: Option<&str>,
+) -> Result<SurfaceProjectionState, String> {
+    let surface = thread.surface();
+    let attachment = match surface.attach_fresh(FreshAttachRequest {
+        request_id: SurfaceRequestId::new(),
+        role: SurfaceAttachmentRole::Tui,
+        requested_capabilities: BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::ManageTask,
+        ]),
+        interaction_capabilities: BTreeSet::new(),
+    }) {
+        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::Denied { .. } => {
+            return Err("typed child continuation attachment denied".to_string());
+        }
+        AttachResult::Unavailable { .. } => {
+            return Err("typed child continuation runtime unavailable".to_string());
+        }
+        AttachResult::ThreadClosed { .. } => {
+            return Err("typed child continuation thread is closed".to_string());
+        }
+        AttachResult::CursorAttached { .. }
+        | AttachResult::SnapshotRequired { .. }
+        | AttachResult::InvalidCursor { .. } => {
+            return Err("typed child continuation attachment was not fresh".to_string());
+        }
+    };
+    let task = match attachment
+        .baseline
+        .snapshot
+        .tasks
+        .iter()
+        .find(|task| task.task_id.as_str() == task_id)
+    {
+        Some(task) => task,
+        None => {
+            detach(&surface, &attachment.client);
+            return Err(format!("surface task '{task_id}' not found"));
+        }
+    };
+    let fence = SurfaceTaskFence {
+        task_id: task.task_id.clone(),
+        task_revision: task.revision,
+        background_owner: task.background_fence.clone(),
+    };
+    let action = match (mode, prompt) {
+        ("resume", _) => TaskControlAction::Resume { fence },
+        ("retry", _) => TaskControlAction::Retry { fence },
+        ("follow-up", Some(prompt)) => TaskControlAction::FollowUp {
+            fence,
+            prompt: NonEmptyText::try_new(prompt.trim().to_string())
+                .map_err(|_| "child follow-up cannot be empty".to_string())?,
+        },
+        _ => {
+            detach(&surface, &attachment.client);
+            return Err("invalid child continuation control".to_string());
+        }
+    };
+    let result = attachment
+        .client
+        .task_control(SurfaceRequestId::new(), action);
+    detach(&surface, &attachment.client);
+    match result.map_err(|error| format!("typed child continuation failed: {error:?}"))? {
+        MutationReply::Committed { .. } => {}
+        MutationReply::Deferred { mutation, .. } => {
+            return Err(format!(
+                "typed child continuation deferred: {:?}",
+                mutation.request_id
+            ));
+        }
+        MutationReply::Uncommitted { mutation } => {
+            return Err(format!(
+                "typed child continuation did not commit: {mutation:?}"
+            ));
+        }
+    }
     let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
     Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot))
 }

@@ -69,8 +69,9 @@ Session ID。`/history` 已移除；`/clear` 仅作为 `/new` 的隐藏兼容别
 `Ctrl+L` 只清除屏幕内容和终端回滚区，不会清除当前会话上下文。退出 TUI 时，
 Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
 
-使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标，使用 `/workflows`
-查看后台任务，使用 `/trust` 管理当前目录的沙箱权限。
+使用 `/plan` 进行只读规划，使用 `/goal` 管理持久目标。`/tasks` 是统一任务工作区，
+集中展示普通子代理、后台命令、监控任务和 Workflow child；`/agents` 是它的别名，
+`/workflows` 则保留 Workflow 专用运行树。使用 `/trust` 管理当前目录的沙箱权限。
 
 ## 核心能力
 
@@ -89,7 +90,9 @@ Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
   单次运行，预算耗尽时先结算当前工具、创建检查点，再以退出码 4 结束，并在
   JSONL 流中携带类型化终端对象。
 - 运行没有固定轮次上限的持久目标（Goal 累计 token 预算耗尽时会禁用自动续跑），
-  并通过子智能体和 JavaScript 工作流处理长任务。
+  并通过子智能体和 JavaScript 工作流处理长任务。Conversation 最多保留 4 行
+  子代理实时摘要，每个 child 最多持久化 8 条活动历史；`/tasks` 可进入实时
+  transcript，并按 child 的可恢复状态提供 stop、resume、retry 和 follow-up。
 - 在工作区受信任后加载项目指令、Skills、Plugins、自定义工具、MCP 工具和资源。
 - 为编辑器、测试框架和 CI 提供稳定的 JSONL、app-server 与 Agent Client
   Protocol（ACP）协议。
@@ -119,6 +122,8 @@ Completions，并按 DeepSeek 要求在工具调用轮次完整回传服务端�
 - Goal 和会话存储在异步 Actor 循环之外执行；即使磁盘变慢或 SQLite 忙碌，
   取消、状态查询等无关控制也不会被一起卡住。
 - 取消前台 turn 时，会同时停止它拥有的子智能体任务树，但不会误伤无关任务。
+- 使用 Esc 取消时会提交唯一的 child 终态并忽略该 attempt 的迟到活动，父会话恢复
+  输入后，已停止的子代理不会继续向终端刷屏。
 - 切换会话时先启动新 Runtime，再关闭当前 Runtime。重命名、分叉、归档与删除
   经过 revision 校验和持久化提交，旧会话附件排队中的事件不会污染新会话。
 - Runtime Surface 与平台边界契约会在 CI 中验证，通过后才构建 macOS、Linux

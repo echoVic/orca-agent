@@ -6,6 +6,7 @@ use tui_textarea::TextArea;
 
 use orca_core::config::RunConfig;
 
+use crate::agent_workspace_actions::handle_agent_workspace_key;
 use crate::composer_image_actions::handle_composer_image_preview_key;
 use crate::composer_input_actions::{
     apply_composer_key_input, handle_composer_editor_shortcut, insert_composer_newline,
@@ -62,7 +63,9 @@ pub(crate) fn handle_idle_key(
         return;
     }
 
-    if handle_workflows_panel_key(key.code, state, action_tx) {
+    if handle_agent_workspace_key(key.code, state, action_tx)
+        || handle_workflows_panel_key(key.code, state, action_tx)
+    {
         vim_state.cancel_pending_command();
         return;
     }
@@ -140,6 +143,83 @@ mod tests {
     use crate::test_support::test_run_config;
     use crossterm::event::KeyModifiers;
     use orca_core::config::{ThemeName, VimInsertEscapeSequence};
+
+    fn agent_task(id: &str) -> orca_core::task_types::BackgroundTaskSummary {
+        orca_core::task_types::BackgroundTaskSummary {
+            id: id.to_string(),
+            parent_task_id: None,
+            task_type: orca_core::task_types::TaskType::Subagent,
+            status: orca_core::task_types::TaskStatus::Running,
+            is_backgrounded: false,
+            description: id.to_string(),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            completed_at_ms: None,
+            command: None,
+            agent_type: Some("general".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: Some(id.to_string()),
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
+            subagent_turn: None,
+            last_activity_at_ms: None,
+            continuation: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+            publication_revision: Some(7),
+        }
+    }
+
+    #[test]
+    fn agent_workspace_actions_precede_composer_text_input() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.replace_workflow_tasks_for_test(vec![agent_task("child")]);
+        state.show_agents();
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim = VimState::new(false);
+        let mut textarea = TextArea::default();
+        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+
+        handle_idle_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        );
+
+        assert!(textarea.is_empty());
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::StopTask { task_id }) if task_id == "child"
+        ));
+    }
 
     #[test]
     fn ctrl_u_clears_non_empty_composer_before_half_page_scroll() {

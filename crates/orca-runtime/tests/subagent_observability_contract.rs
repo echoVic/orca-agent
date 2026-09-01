@@ -202,6 +202,7 @@ fn detached_owner_identity_and_source_cursor_are_durable_surface_types() {
     assert!(SURFACE_PROJECTION.contains("source_digest"));
     assert!(SURFACE_PROJECTION.contains("source_commit_id"));
     assert!(SURFACE_PROJECTION.contains("source_sequence"));
+    assert!(SURFACE_PROJECTION.contains("occurred_at"));
     assert!(SURFACE_STORE.contains("Subagent(SubagentPatch)"));
 }
 

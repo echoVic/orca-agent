@@ -322,6 +322,88 @@ mod tests {
         );
         assert_eq!(state.transcript.search.query(), before);
     }
+
+    #[test]
+    fn escape_closes_the_agent_workspace_before_idle_input_handling() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.show_agents();
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        let flow = handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(flow, KeyEventFlow::Continue));
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn escape_returns_from_agent_transcript_before_closing_workspace() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.show_agents();
+        let request = crate::protocol::TaskTranscriptRequest {
+            task_id: "child".to_string(),
+            expected_revision: 4,
+        };
+        state.begin_task_transcript_request(request.clone());
+        state.update(crate::protocol::TuiEvent::TaskTranscriptResult {
+            request: request.clone(),
+            result: crate::protocol::TaskTranscriptResult::unavailable("checkpoint is not ready"),
+        });
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        let first = handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(first, KeyEventFlow::Continue));
+        assert_eq!(state.panel_mode, PanelMode::Agents);
+        assert!(state.task_transcript().is_none());
+
+        state.update(crate::protocol::TuiEvent::TaskTranscriptResult {
+            request,
+            result: crate::protocol::TaskTranscriptResult::unavailable("late checkpoint"),
+        });
+        assert!(
+            state.task_transcript().is_none(),
+            "closing the transcript must revoke ownership of late replies"
+        );
+
+        let second = handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(second, KeyEventFlow::Continue));
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(action_rx.try_recv().is_err());
+    }
 }
 
 pub(crate) fn handle_key_event_preflight<F>(
@@ -422,7 +504,17 @@ where
     }
 
     if state.status == AppStatus::Idle
-        && state.panel_mode == PanelMode::Workflows
+        && state.panel_mode == PanelMode::Agents
+        && state.task_transcript().is_some()
+        && key.code == KeyCode::Esc
+    {
+        vim_state.cancel_pending_command();
+        state.clear_task_transcript();
+        return Ok(KeyEventFlow::Continue);
+    }
+
+    if state.status == AppStatus::Idle
+        && matches!(state.panel_mode, PanelMode::Workflows | PanelMode::Agents)
         && key.code == KeyCode::Esc
     {
         vim_state.cancel_pending_command();

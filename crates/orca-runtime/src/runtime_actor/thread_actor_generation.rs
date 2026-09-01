@@ -948,6 +948,13 @@ impl ThreadActor {
                     retry_count: 0,
                     output_truncated: false,
                 };
+                let mut activity_history = Vec::new();
+                orca_core::task_types::append_subagent_activity_history(
+                    &mut activity_history,
+                    description.as_str().to_string(),
+                    None,
+                    event.occurred_at.get(),
+                );
                 let subagent = surface::RunningSurfaceSubagent::try_new(surface::SurfaceSubagent {
                     subagent_id: event.subagent_id.clone(),
                     task_id: event.task_id.clone(),
@@ -956,15 +963,21 @@ impl ThreadActor {
                     description: description.clone(),
                     status: surface::SurfaceSubagentStatus::Running,
                     activity: Some(description.clone()),
+                    subagent_activity_history: activity_history,
                     turn: None,
                     usage: None,
                     output: None,
                     error: None,
+                    continuation: task_registry
+                        .continuation_projection(event.task_id.as_str())
+                        .map_err(io::Error::other)?
+                        .map(surface_subagent_continuation),
                     owner: projection_owner.clone(),
                     source: surface::SurfaceSubagentSource::new(
                         surface_attempt_id.clone(),
                         event.turn_id.clone(),
                         event.source_sequence,
+                        event.occurred_at,
                         event.surface_commit_id.clone(),
                         event.digest.clone(),
                     ),
@@ -1017,6 +1030,21 @@ impl ThreadActor {
                     .clone()
                     .map(surface_usage_totals)
                     .or_else(|| task.usage.clone());
+                // The surface projection is the authoritative history. The
+                // registry mirror is repairable and may lag during relay
+                // replay or actor recovery, so it must not be used to build
+                // the next durable patch.
+                let mut activity_history = existing_subagent
+                    .map(|subagent| subagent.subagent_activity_history.clone())
+                    .unwrap_or_default();
+                let next_turn = turn.or(subagent.turn);
+                let next_activity = activity.clone();
+                orca_core::task_types::append_subagent_activity_history(
+                    &mut activity_history,
+                    next_activity.as_str().to_string(),
+                    next_turn,
+                    event.occurred_at.get(),
+                );
                 let subagent_patch = match terminal {
                     Some((status, output, error, terminal_usage)) => {
                         next_task.status = match status {
@@ -1051,6 +1079,7 @@ impl ThreadActor {
                                 surface_attempt_id.clone(),
                                 event.turn_id.clone(),
                                 event.source_sequence,
+                                event.occurred_at,
                                 event.surface_commit_id.clone(),
                                 event.digest.clone(),
                             ),
@@ -1060,6 +1089,11 @@ impl ThreadActor {
                             usage: terminal_usage
                                 .map(surface_usage_totals)
                                 .or_else(|| subagent.usage.clone()),
+                            subagent_activity_history: activity_history.clone(),
+                            continuation: task_registry
+                                .continuation_projection(event.task_id.as_str())
+                                .map_err(io::Error::other)?
+                                .map(surface_subagent_continuation),
                         }
                     }
                     None => surface::SubagentPatch::Progress {
@@ -1071,6 +1105,7 @@ impl ThreadActor {
                             surface_attempt_id.clone(),
                             event.turn_id.clone(),
                             event.source_sequence,
+                            event.occurred_at,
                             event.surface_commit_id.clone(),
                             event.digest.clone(),
                         ),
@@ -1079,6 +1114,11 @@ impl ThreadActor {
                         usage: usage
                             .map(surface_usage_totals)
                             .or_else(|| subagent.usage.clone()),
+                        subagent_activity_history: activity_history,
+                        continuation: task_registry
+                            .continuation_projection(event.task_id.as_str())
+                            .map_err(io::Error::other)?
+                            .map(surface_subagent_continuation),
                     },
                 };
                 (
@@ -1152,11 +1192,12 @@ impl ThreadActor {
 
         // This is deliberately a repairable latest-state mirror. The source
         // event reached the surface ledger before the registry is touched.
-        let _ = task_registry.update_subagent_activity(
+        let _ = task_registry.update_subagent_activity_at(
             event.task_id.as_str(),
             activity.as_str().to_string(),
             turn,
             usage,
+            event.occurred_at.get(),
         );
         Ok(())
     }
@@ -1171,6 +1212,17 @@ impl ThreadActor {
         task_id: &str,
         attempt_id: &str,
     ) -> io::Result<()> {
+        // Cancellation is authoritative over late worker activity. Detached
+        // workers may append a frame after the parent has requested stop; do
+        // not feed that frame into a terminal surface task or retry it on
+        // every actor tick.
+        let replay_allowed = active
+            .task_registry
+            .subagent_relay_replay_allowed(task_id)
+            .map_err(io::Error::other)?;
+        if !replay_allowed {
+            return Ok(());
+        }
         let reader = active
             .task_registry
             .open_subagent_event_relay_reader(task_id, attempt_id)
@@ -1241,6 +1293,15 @@ impl ThreadActor {
         task_registry: &crate::tasks::TaskRegistry,
         binding: &crate::tasks::DetachedSubagentBinding,
     ) -> io::Result<()> {
+        // See the active-generation drainer above. A stopped/cancelled child
+        // is no longer an admissible recipient for progress, and its worker
+        // can race one final relay append after cancellation.
+        let replay_allowed = task_registry
+            .subagent_relay_replay_allowed(&binding.task_id)
+            .map_err(io::Error::other)?;
+        if !replay_allowed {
+            return Ok(());
+        }
         let reader = task_registry
             .open_subagent_event_relay_reader(&binding.task_id, binding.attempt_id.as_str())
             .map_err(io::Error::other)?;

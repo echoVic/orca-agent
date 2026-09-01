@@ -1576,9 +1576,28 @@ pub(crate) fn workflow_task_summaries(
                 subagent_current_activity: subagent
                     .and_then(|subagent| subagent.activity.as_ref())
                     .map(|activity| activity.as_str().to_string()),
+                subagent_activity_history: subagent
+                    .map(|subagent| subagent.subagent_activity_history.clone())
+                    .unwrap_or_default(),
                 subagent_turn: subagent.and_then(|subagent| subagent.turn),
-                last_activity_at_ms: task.completed_at.or(task.started_at).map(UnixMillis::get),
-                continuation: None,
+                last_activity_at_ms: subagent
+                    .map(|subagent| subagent.source.occurred_at.get())
+                    .or_else(|| task.completed_at.or(task.started_at).map(UnixMillis::get)),
+                continuation: subagent.and_then(|subagent| {
+                    subagent.continuation.as_ref().map(|continuation| {
+                        orca_core::task_types::TaskContinuationSummary {
+                            continuation_id: continuation.continuation_id.as_str().to_string(),
+                            attempt_id: continuation.attempt_id.as_str().to_string(),
+                            checkpoint_id: continuation
+                                .checkpoint_id
+                                .as_ref()
+                                .map(|checkpoint_id| checkpoint_id.as_str().to_string()),
+                            revision: continuation.revision,
+                            resumable: continuation.resumable,
+                            indeterminate: continuation.indeterminate,
+                        }
+                    })
+                }),
                 result: task.result.as_ref().map(|value| value.as_str().to_string()),
                 error: task.error.as_ref().map(|value| value.as_str().to_string()),
                 retry_count: task.retry_count,
@@ -1987,10 +2006,11 @@ mod tests {
         SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceMcpCatalogSnapshot,
         SurfaceNetworkPermissions, SurfacePermissionRuleSet, SurfacePinnedContextSnapshot,
         SurfacePlanSnapshot, SurfaceReasoningEffort, SurfaceRuntimeSettings, SurfaceScope,
-        SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceTask, SurfaceTaskId,
-        SurfaceTaskType, SurfaceThreadId, SurfaceThreadSnapshot, SurfaceTurnId, TaskPatch,
-        TaskRevision, ThreadOwnerEpoch, ThreadPersistence, UsageTotals as SurfaceUsageTotals,
-        UuidV7, canonical_batch_digest,
+        SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubagent,
+        SurfaceSubagentId, SurfaceSubagentOwner, SurfaceSubagentSource, SurfaceSubagentStatus,
+        SurfaceTask, SurfaceTaskAttemptId, SurfaceTaskId, SurfaceTaskType, SurfaceThreadId,
+        SurfaceThreadSnapshot, SurfaceTurnId, TaskPatch, TaskRevision, ThreadOwnerEpoch,
+        ThreadPersistence, UsageTotals as SurfaceUsageTotals, UuidV7, canonical_batch_digest,
     };
     use orca_runtime::surface::{SurfaceGenerationId, SurfaceUsageSnapshot, UsageRevision};
 
@@ -2418,6 +2438,67 @@ mod tests {
 
         assert_eq!(task.parent_task_id.as_deref(), Some("task-parent"));
         assert_eq!(task.publication_revision, Some(7));
+    }
+
+    #[test]
+    fn subagent_task_projection_uses_the_latest_source_activity_time() {
+        let mut snapshot = goal_projection_snapshot();
+        let task_id = SurfaceTaskId::try_new("task-live-child").unwrap();
+        let subagent_id = SurfaceSubagentId::try_new("agent-live-child").unwrap();
+        snapshot.tasks.push(SurfaceTask {
+            task_id: task_id.clone(),
+            revision: TaskRevision::try_new(2).unwrap(),
+            task_type: SurfaceTaskType::Subagent,
+            status: SurfaceTaskStatus::Running,
+            backgrounded: true,
+            description: DisplayText::new("live child"),
+            created_at: UnixMillis::new(1_000),
+            started_at: Some(UnixMillis::new(1_000)),
+            completed_at: None,
+            parent_operation: None,
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: Some(subagent_id.clone()),
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        });
+        snapshot.subagents.push(SurfaceSubagent {
+            subagent_id,
+            task_id,
+            revision: orca_runtime::surface::SubagentRevision::try_new(2).unwrap(),
+            description: DisplayText::new("live child"),
+            status: SurfaceSubagentStatus::Running,
+            activity: Some(DisplayText::new("bash: cargo test")),
+            subagent_activity_history: Vec::new(),
+            turn: Some(2),
+            usage: None,
+            output: None,
+            error: None,
+            continuation: None,
+            owner: SurfaceSubagentOwner::Generation {
+                fence: operation_fence(44),
+            },
+            source: SurfaceSubagentSource::new(
+                SurfaceTaskAttemptId::try_new("attempt-live-child").unwrap(),
+                SurfaceTurnId::new(),
+                2,
+                UnixMillis::new(2_500),
+                SurfaceCommitId::try_from_bytes(uuid_v7_bytes(45)).unwrap(),
+                Sha256Digest::new([45; 32]),
+            ),
+        });
+
+        let task = workflow_task_summaries(&snapshot)
+            .into_iter()
+            .find(|task| task.id == "task-live-child")
+            .unwrap();
+
+        assert_eq!(task.last_activity_at_ms, Some(2_500));
     }
 
     #[test]

@@ -160,7 +160,18 @@ impl AppState {
                 self.panel_mode = PanelMode::Conversation;
             }
             TuiEvent::TaskTranscriptResult { request, result } => {
-                self.task_transcript = Some(TaskTranscriptViewState { request, result });
+                if !self
+                    .task_transcript
+                    .as_ref()
+                    .is_some_and(|current| current.request == request)
+                {
+                    return;
+                }
+                self.task_transcript = Some(TaskTranscriptViewState {
+                    request,
+                    result: Some(result),
+                    scroll: 0,
+                });
             }
             TuiEvent::ReasoningDelta(text) => {
                 if self.suppress_background_main_session_output {

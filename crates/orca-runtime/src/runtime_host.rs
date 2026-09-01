@@ -139,6 +139,25 @@ const SUBAGENT_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SUBAGENT_ACTIVITY_DEDUPE_CAPACITY: usize = 4096;
 const SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS: usize = 3;
+
+fn surface_subagent_continuation(
+    projection: crate::tasks::TaskContinuationProjection,
+) -> surface::SurfaceSubagentContinuation {
+    surface::SurfaceSubagentContinuation {
+        continuation_id: surface::NonEmptyText::try_new(projection.continuation_id.to_string())
+            .expect("continuation ids are non-empty"),
+        attempt_id: surface::NonEmptyText::try_new(projection.attempt_id.to_string())
+            .expect("attempt ids are non-empty"),
+        checkpoint_id: projection.checkpoint_id.map(|checkpoint_id| {
+            surface::NonEmptyText::try_new(checkpoint_id.to_string())
+                .expect("checkpoint ids are non-empty")
+        }),
+        revision: projection.revision.get(),
+        resumable: projection.resumable,
+        indeterminate: projection.indeterminate,
+    }
+}
+
 #[cfg(test)]
 static PASSTHROUGH_FINISH_FAILURES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -16160,9 +16179,17 @@ impl ThreadActor {
             .as_ref()
             .map(|resident| resident.coordinator.state().snapshot().clone());
         for binding in bindings {
-            let Some(task) = registry.get(&binding.task_id) else {
+            let Some(task) = registry.summary(&binding.task_id) else {
                 return true;
             };
+            // A cancellation request is authoritative even if the worker
+            // wins a final relay append race. Those frames are stale and do
+            // not need to hold an ephemeral thread open for delivery.
+            match registry.subagent_relay_replay_allowed(&binding.task_id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => return true,
+            }
             if !matches!(
                 task.status,
                 orca_core::task_types::TaskStatus::Stopped

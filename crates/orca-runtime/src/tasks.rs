@@ -21,8 +21,9 @@ use orca_core::provider_types::{
     ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, ToolCallProgress, Usage,
 };
 use orca_core::task_types::{
-    BackgroundTaskSummary, PendingToolCallSummary, TaskActivitySummary, TaskContinuationSummary,
-    TaskStatus, TaskType, WorkflowAgentTaskSummary, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
+    BackgroundTaskSummary, PendingToolCallSummary, SubagentActivityEntry, TaskActivitySummary,
+    TaskContinuationSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
+    WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
 use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::ModelResponseIdentity;
@@ -962,6 +963,7 @@ pub struct TaskRecord {
     pub workflow_failure_count: u32,
     pub usage: Option<UsageTotals>,
     pub subagent_current_activity: Option<String>,
+    pub subagent_activity_history: Vec<SubagentActivityEntry>,
     pub subagent_turn: Option<u32>,
     pub last_activity_at_ms: Option<i64>,
     pub(crate) continuation_id: Option<AgentContinuationId>,
@@ -1112,6 +1114,8 @@ struct PersistedTaskRecord {
     usage: Option<UsageTotals>,
     #[serde(default)]
     subagent_current_activity: Option<String>,
+    #[serde(default)]
+    subagent_activity_history: Vec<SubagentActivityEntry>,
     #[serde(default)]
     subagent_turn: Option<u32>,
     #[serde(default)]
@@ -2894,6 +2898,7 @@ impl TaskRegistry {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation_id: None,
@@ -2987,6 +2992,7 @@ impl TaskRegistry {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation_id: None,
@@ -3087,6 +3093,7 @@ impl TaskRegistry {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation_id: None,
@@ -3154,6 +3161,7 @@ impl TaskRegistry {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation_id: None,
@@ -3216,6 +3224,31 @@ impl TaskRegistry {
                 .map(|record| task_summary(&record));
         }
         self.get(id).map(|record| task_summary(&record))
+    }
+
+    /// Returns whether relay activity may still be applied to this task.
+    ///
+    /// Detached workers can outlive cancellation long enough to append a
+    /// final activity frame. Once cancellation has been durably requested (or
+    /// the task has reached a cancellation terminal state), those frames are
+    /// stale and must be discarded rather than retried forever by the actor.
+    /// Persistent registries are refreshed here so the decision observes the
+    /// actor's latest durable stop request instead of a stale in-memory copy.
+    pub(crate) fn subagent_relay_replay_allowed(&self, id: &str) -> Result<bool, String> {
+        let record = if self.persistence.is_some() {
+            self.refresh_task_from_persistence(id)?
+        } else {
+            self.get(id)
+        };
+        let Some(record) = record else {
+            return Ok(false);
+        };
+        Ok(record.task_type == TaskType::Subagent
+            && !record.stop_requested
+            && !matches!(
+                record.status,
+                TaskStatus::Stopping | TaskStatus::Stopped | TaskStatus::Cancelled
+            ))
     }
 
     pub fn get(&self, id: &str) -> Option<TaskRecord> {
@@ -3303,10 +3336,30 @@ impl TaskRegistry {
         turn: Option<u32>,
         usage: Option<UsageTotals>,
     ) -> Result<(), String> {
+        self.update_subagent_activity_at(id, activity, turn, usage, now_ms())
+    }
+
+    /// Updates the live mirror and appends a compact activity sample using
+    /// the event's production timestamp. Relay replay therefore does not
+    /// rewrite history ordering with the time the actor happened to drain it.
+    pub fn update_subagent_activity_at(
+        &self,
+        id: &str,
+        activity: String,
+        turn: Option<u32>,
+        usage: Option<UsageTotals>,
+        occurred_at_ms: i64,
+    ) -> Result<(), String> {
         self.update_task(id, |record| {
             if record.task_type != TaskType::Subagent {
                 return Err(format!("task '{id}' is not a subagent"));
             }
+            orca_core::task_types::append_subagent_activity_history(
+                &mut record.subagent_activity_history,
+                activity.clone(),
+                turn,
+                occurred_at_ms,
+            );
             record.subagent_current_activity = Some(activity);
             if let Some(turn) = turn {
                 record.subagent_turn = Some(turn);
@@ -3314,7 +3367,11 @@ impl TaskRegistry {
             if let Some(usage) = usage {
                 record.usage = Some(usage);
             }
-            record.last_activity_at_ms = Some(now_ms());
+            record.last_activity_at_ms = Some(
+                record
+                    .last_activity_at_ms
+                    .map_or(occurred_at_ms, |existing| existing.max(occurred_at_ms)),
+            );
             Ok(())
         })
     }
@@ -4776,6 +4833,7 @@ impl RuntimeSubagentStatusLookup for TaskRegistry {
                 estimated_cost_usd: usage.estimated_cost_usd,
             }),
             subagent_current_activity: record.subagent_current_activity,
+            subagent_activity_history: record.subagent_activity_history,
             subagent_turn: record.subagent_turn,
             last_activity_at_ms: record.last_activity_at_ms,
             continuation_id: record.continuation_id.map(|id| id.to_string()),
@@ -4821,6 +4879,7 @@ impl PersistedTaskRecord {
             workflow_failure_count: self.workflow_failure_count,
             usage: self.usage,
             subagent_current_activity: self.subagent_current_activity,
+            subagent_activity_history: self.subagent_activity_history,
             subagent_turn: self.subagent_turn,
             last_activity_at_ms: self.last_activity_at_ms,
             continuation_id: self.continuation_id,
@@ -4914,6 +4973,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             workflow_failure_count: record.workflow_failure_count,
             usage: record.usage,
             subagent_current_activity: record.subagent_current_activity.clone(),
+            subagent_activity_history: record.subagent_activity_history.clone(),
             subagent_turn: record.subagent_turn,
             last_activity_at_ms: record.last_activity_at_ms,
             continuation_id: record.continuation_id.clone(),
@@ -5154,6 +5214,7 @@ fn task_summary(record: &TaskRecord) -> BackgroundTaskSummary {
         workflow_failure_count: record.workflow_failure_count,
         usage: record.usage,
         subagent_current_activity: record.subagent_current_activity.clone(),
+        subagent_activity_history: record.subagent_activity_history.clone(),
         subagent_turn: record.subagent_turn,
         last_activity_at_ms: record.last_activity_at_ms,
         continuation: record
@@ -8509,6 +8570,11 @@ while :; do :; done
         );
         assert_eq!(record.subagent_turn, Some(2));
         assert!(record.last_activity_at_ms.is_some());
+        assert_eq!(record.subagent_activity_history.len(), 1);
+        assert_eq!(
+            record.subagent_activity_history[0].activity,
+            "bash: cargo test"
+        );
 
         let summary = registry.list().into_iter().next().unwrap();
         assert_eq!(
@@ -8517,6 +8583,113 @@ while :; do :; done
         );
         assert_eq!(summary.subagent_turn, Some(2));
         assert!(summary.last_activity_at_ms.is_some());
+        assert_eq!(summary.subagent_activity_history.len(), 1);
+    }
+
+    #[test]
+    fn subagent_activity_history_is_bounded_ordered_and_persistent() {
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("activity-history".to_string(), root.path().to_path_buf())
+                .unwrap();
+        let task = registry.create_subagent("inspect auth".to_string(), None);
+        registry.mark_running(&task.id).unwrap();
+
+        for index in 0..10 {
+            registry
+                .update_subagent_activity_at(
+                    &task.id,
+                    format!("tool-{index}"),
+                    Some(index),
+                    None,
+                    1_000 + index as i64,
+                )
+                .unwrap();
+        }
+        // A repeated relay frame is compressed without changing the live
+        // timestamp or consuming another history slot.
+        registry
+            .update_subagent_activity_at(&task.id, "tool-9".to_string(), Some(9), None, 2_000)
+            .unwrap();
+        // An older replay cannot move the recency marker backwards.
+        registry
+            .update_subagent_activity_at(&task.id, "tool-replay".to_string(), Some(8), None, 900)
+            .unwrap();
+
+        let record = registry.get(&task.id).unwrap();
+        assert_eq!(
+            record.subagent_activity_history.len(),
+            orca_core::task_types::MAX_SUBAGENT_ACTIVITY_HISTORY
+        );
+        assert_eq!(
+            record
+                .subagent_activity_history
+                .first()
+                .map(|entry| entry.activity.as_str()),
+            Some("tool-3")
+        );
+        assert_eq!(
+            record
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("tool-replay")
+        );
+        assert_eq!(record.last_activity_at_ms, Some(2_000));
+
+        let reloaded = TaskRegistry::new_persistent_attached(
+            "activity-history".to_string(),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+        let summary = reloaded.summary(&task.id).unwrap();
+        assert_eq!(
+            summary.subagent_activity_history,
+            record.subagent_activity_history
+        );
+        assert_eq!(summary.last_activity_at_ms, Some(2_000));
+    }
+
+    #[test]
+    fn stopped_subagent_relay_is_not_replayable() {
+        let registry = TaskRegistry::new("session-1".to_string());
+        let task = registry.create_subagent("late activity".to_string(), None);
+
+        assert!(registry.subagent_relay_replay_allowed(&task.id).unwrap());
+
+        registry.request_stop(&task.id).unwrap();
+        assert!(!registry.subagent_relay_replay_allowed(&task.id).unwrap());
+
+        registry.stop(&task.id, "stopped".to_string()).unwrap();
+        assert!(!registry.subagent_relay_replay_allowed(&task.id).unwrap());
+
+        let completed = registry.create_subagent("completed activity".to_string(), None);
+        registry
+            .complete(&completed.id, "done".to_string())
+            .unwrap();
+        assert!(
+            registry
+                .subagent_relay_replay_allowed(&completed.id)
+                .unwrap()
+        );
+
+        let failed = registry.create_subagent("failed activity".to_string(), None);
+        registry.fail(&failed.id, "failed".to_string()).unwrap();
+        assert!(registry.subagent_relay_replay_allowed(&failed.id).unwrap());
+    }
+
+    #[test]
+    fn persistent_relay_replay_gate_observes_external_stop_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let parent = TaskRegistry::new_persistent("session-1".to_string(), root.clone()).unwrap();
+        let task = parent.create_subagent("late activity".to_string(), None);
+        assert!(parent.subagent_relay_replay_allowed(&task.id).unwrap());
+
+        let worker = TaskRegistry::new_persistent_attached("session-1".to_string(), root).unwrap();
+        worker.request_stop(&task.id).unwrap();
+
+        assert!(!parent.subagent_relay_replay_allowed(&task.id).unwrap());
     }
 
     #[test]

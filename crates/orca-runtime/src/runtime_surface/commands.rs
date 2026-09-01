@@ -2514,8 +2514,22 @@ pub enum InteractionSelector {
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum TaskControlAction {
-    Stop { fence: SurfaceTaskFence },
-    Foreground { fence: SurfaceTaskFence },
+    Stop {
+        fence: SurfaceTaskFence,
+    },
+    Foreground {
+        fence: SurfaceTaskFence,
+    },
+    Resume {
+        fence: SurfaceTaskFence,
+    },
+    Retry {
+        fence: SurfaceTaskFence,
+    },
+    FollowUp {
+        fence: SurfaceTaskFence,
+        prompt: NonEmptyText,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

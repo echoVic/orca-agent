@@ -10,6 +10,9 @@ use crate::surface_actions::TuiSurfaceActions;
 pub(crate) enum HostedTaskAction {
     Stop { task_id: String },
     Foreground { task_id: String },
+    Resume { task_id: String },
+    Retry { task_id: String },
+    FollowUp { task_id: String, prompt: String },
     ResolveBackgroundApproval { id: String, approved: bool },
 }
 
@@ -27,6 +30,21 @@ pub(crate) fn handle_hosted_task_action(
         HostedTaskAction::Foreground { task_id } => {
             let _ = foreground_task_for_tui(actions.as_ref(), &task_id, control, event_tx);
         }
+        HostedTaskAction::Resume { task_id } => {
+            continue_subagent_for_tui(actions.as_ref(), &task_id, "resume", None, event_tx);
+        }
+        HostedTaskAction::Retry { task_id } => {
+            continue_subagent_for_tui(actions.as_ref(), &task_id, "retry", None, event_tx);
+        }
+        HostedTaskAction::FollowUp { task_id, prompt } => {
+            continue_subagent_for_tui(
+                actions.as_ref(),
+                &task_id,
+                "follow-up",
+                Some(prompt.as_str()),
+                event_tx,
+            );
+        }
         HostedTaskAction::ResolveBackgroundApproval { id, approved } => {
             let resolved = submit_background_approval_response_for_tui(
                 actions.as_ref(),
@@ -38,6 +56,27 @@ pub(crate) fn handle_hosted_task_action(
             if !approved || !resolved {
                 control.cancel_surface_activation();
             }
+        }
+    }
+}
+
+fn continue_subagent_for_tui(
+    actions: Option<&TuiSurfaceActions>,
+    task_id: &str,
+    mode: &str,
+    prompt: Option<&str>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> bool {
+    let Some(actions) = actions else { return false };
+    match actions.continue_subagent(task_id, mode, prompt) {
+        Ok(projection) => {
+            let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+            let _ = event_tx.send(TuiEvent::Notice(format!("Child {mode} started.")));
+            true
+        }
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(error));
+            false
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Hosted TUI action-receive and lifecycle controller ownership.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crossbeam_channel as mpsc;
 use orca_core::config::{HistoryMode, RunConfig};
@@ -34,6 +35,31 @@ use crate::protocol::{SessionAttachmentId, TaskTranscriptResult, TuiEvent, UserA
 use crate::slash_command_actions::decode_settings_intent;
 use crate::submitted_turn::SubmittedTurn;
 use crate::surface_client;
+use crate::surface_projection::SurfaceProjectionState;
+
+const IDLE_SURFACE_PROJECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn poll_idle_surface_projection(
+    thread: Option<&RuntimeThreadHandle>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    last_cursor: &mut Option<orca_runtime::surface::SurfaceCursor>,
+) {
+    let Some(thread) = thread else {
+        *last_cursor = None;
+        return;
+    };
+    let actions = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface());
+    let Ok(snapshot) = actions.read_snapshot() else {
+        return;
+    };
+    if last_cursor.as_ref() == Some(&snapshot.cursor) {
+        return;
+    }
+    *last_cursor = Some(snapshot.cursor.clone());
+    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(
+        SurfaceProjectionState::from_surface_snapshot(&snapshot),
+    )));
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_tui_controller_loop(
@@ -62,6 +88,7 @@ pub(crate) fn hosted_tui_controller_loop(
     );
     let mut thread: Option<RuntimeThreadHandle> = None;
     let mut side_parent: Option<HostedSideParent> = None;
+    let mut last_idle_projection_cursor = None;
 
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
     if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
@@ -107,10 +134,21 @@ pub(crate) fn hosted_tui_controller_loop(
     }
 
     loop {
-        let action = if control.is_shutdown() {
+        let action: Result<UserAction, ()> = if control.is_shutdown() {
             Ok(UserAction::Cancel)
         } else {
-            action_rx.recv()
+            match action_rx.recv_timeout(IDLE_SURFACE_PROJECTION_POLL_INTERVAL) {
+                Ok(action) => Ok(action),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    poll_idle_surface_projection(
+                        thread.as_ref(),
+                        &event_tx,
+                        &mut last_idle_projection_cursor,
+                    );
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+            }
         };
         let side_disallowed = side_parent.is_some()
             && matches!(
@@ -134,6 +172,9 @@ pub(crate) fn hosted_tui_controller_loop(
                     | UserAction::GoalResume
                     | UserAction::RunWorkflow { .. }
                     | UserAction::StopTask { .. }
+                    | UserAction::ResumeTask { .. }
+                    | UserAction::RetryTask { .. }
+                    | UserAction::FollowUpTask { .. }
                     | UserAction::Backtrack)
             );
         if side_disallowed {
@@ -520,6 +561,24 @@ pub(crate) fn hosted_tui_controller_loop(
                     &event_tx,
                 );
             }
+            Ok(UserAction::ResumeTask { task_id }) => handle_hosted_task_action(
+                HostedTaskAction::Resume { task_id },
+                thread.as_ref(),
+                &control,
+                &event_tx,
+            ),
+            Ok(UserAction::RetryTask { task_id }) => handle_hosted_task_action(
+                HostedTaskAction::Retry { task_id },
+                thread.as_ref(),
+                &control,
+                &event_tx,
+            ),
+            Ok(UserAction::FollowUpTask { task_id, prompt }) => handle_hosted_task_action(
+                HostedTaskAction::FollowUp { task_id, prompt },
+                thread.as_ref(),
+                &control,
+                &event_tx,
+            ),
             Ok(UserAction::ForegroundTask { task_id }) => {
                 handle_hosted_task_action(
                     HostedTaskAction::Foreground { task_id },

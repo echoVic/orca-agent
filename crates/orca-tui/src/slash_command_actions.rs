@@ -235,6 +235,12 @@ fn dispatch_slash_command(
         SlashCommand::AgentDashboard => {
             state.show_agents();
         }
+        SlashCommand::TaskWorkspace => {
+            state.show_agents();
+        }
+        SlashCommand::TaskFollowUp { task_id, prompt } => {
+            let _ = action_tx.send(UserAction::FollowUpTask { task_id, prompt });
+        }
         SlashCommand::Remember(note) => {
             let (scope, note) = if let Some(project_note) = note.strip_prefix("project:") {
                 (TuiMemoryScope::Project, project_note.trim().to_string())

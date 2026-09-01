@@ -169,14 +169,17 @@ Orca is DeepSeek-native, so parity should be behavioral, not textual or architec
   - `workflow_complete_task`
   - `workflow_list_tasks`
 
-### Missing for Claude Code Workflow Parity
+### Current Product Loop
 
-- No first-class workflow authoring flow from a natural-language task.
-- No approval preview that shows generated phases and raw JavaScript before launch.
-- No edit/save/cancel loop for a generated workflow.
-- Existing `/workflows` is useful but not yet a full management panel for script, run controls, and saved commands.
-- Named workflows exist, but reusable workflow discovery is not yet treated as a slash-command product surface.
-- Final reporting can still over-trust agent text unless grounded in workflow state/evidence.
+The runtime primitives for draft persistence, preview data, edit/save/cancel, named workflows, pause/resume, and evidence-backed reporting are present. The user-facing loop now connects them as follows:
+
+- Natural-language orchestration requests are routed through `WorkflowDraft` before launch by the runtime system prompt.
+- `WorkflowDraft` results render as a compact TUI preview with phases, estimated agents, concurrency, mutation risk, and expandable raw JavaScript; `WorkflowDraftAction` remains the durable run/edit/save/cancel authority.
+- `/tasks` is the unified workspace for workflow runs, ordinary subagents, shell tasks, and monitors. Conversation keeps a bounded activity dock, while `/workflows` stays focused on workflow phases, agents, transcripts, failures, and stop control.
+- Child stop, resume, retry, and follow-up use typed, revision-fenced task control. Continuations expose explicit ownership, attempt, checkpoint, resumable, and indeterminate state instead of presenting speculative buttons.
+- Keep final reports grounded in durable workflow state and evidence rather than agent-authored claims.
+
+Remaining extensions are saved-workflow catalog browsing, argument editing before rerun, and pause/resume integration with actor-owned workflow ingress receipts. They should extend the existing run manager rather than introduce another task surface.
 
 ### Completion Evidence
 
@@ -185,12 +188,12 @@ As of this implementation, the working tree covers the parity loop described in 
 - `WorkflowDraft` and `WorkflowDraftAction` are model-visible tool surfaces in `crates/orca-tools/src/registry.rs`.
 - Draft persistence, edit, save, cancel, and clone-from-run behavior live in `crates/orca-runtime/src/workflow/draft.rs`.
 - Runtime launch from `draftId`, resume cache reuse, pause/resume, restart failed, restart phase, concise status lines, and child tool-event capture live in `crates/orca-runtime/src/workflow/runner.rs`.
-- TUI runtime bridge support for workflow launch, saved workflow args, and draft actions lives in `crates/orca-tui/src/bridge.rs`.
+- TUI workflow preview, task workspace, saved workflow launch, and typed task controls live in `crates/orca-tui/src/ui.rs`, `crates/orca-tui/src/agent_workspace.rs`, `crates/orca-tui/src/surface_client.rs`, and `crates/orca-tui/src/hosted_workflow.rs`.
 - Saved workflow slash invocation and collision-safe aliases live in `crates/orca-tui/src/commands/mod.rs`.
 - CLI workflow history/control commands live in `src/cli.rs`: `list`, `show`, `source`, `stop`, `pause`, `resume`, `clone`, `restart-failed`, and `restart-phase`.
 - Evidence contracts, deterministic verification statuses, required/failed tool checks, MCP failure checks, mutation-policy checks, and concurrency-threshold checks live in `crates/orca-runtime/src/workflow/verifier.rs`.
 
-The final validation gate for this work is `cargo fmt --check` plus `TMPDIR=/tmp PATH="/Users/bytedance/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin:$PATH" cargo test --workspace -- --nocapture`.
+Local validation uses `cargo fmt --check`, focused workflow/runtime contract tests, and the full `orca-tui` test target. The complete workspace suite remains a CI gate because provider/ACP integration tests may require external services or can block on unavailable supervisors.
 
 ---
 

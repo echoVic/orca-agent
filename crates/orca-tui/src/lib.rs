@@ -2,6 +2,8 @@
 
 mod action_dispatcher;
 mod agent_runtime;
+mod agent_workspace;
+mod agent_workspace_actions;
 pub mod app;
 mod approval_actions;
 mod approval_dialog_actions;

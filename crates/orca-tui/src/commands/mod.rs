@@ -19,6 +19,8 @@ pub enum SlashCommand {
     WorkflowList,
     WorkflowRun { name: String, args: Option<String> },
     AgentDashboard,
+    TaskWorkspace,
+    TaskFollowUp { task_id: String, prompt: String },
     Remember(String),
     SkillList,
     SkillRun { id: String, args: Option<String> },
@@ -148,6 +150,12 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         }
         "workflows" => no_arguments(parts).then_some(SlashCommand::WorkflowList),
         "agents" => no_arguments(parts).then_some(SlashCommand::AgentDashboard),
+        "tasks" => no_arguments(parts).then_some(SlashCommand::TaskWorkspace),
+        "task-follow-up" => {
+            let task_id = parts.next()?.to_string();
+            let prompt = parts.collect::<Vec<_>>().join(" ");
+            (!prompt.trim().is_empty()).then_some(SlashCommand::TaskFollowUp { task_id, prompt })
+        }
         "skills" => no_arguments(parts).then_some(SlashCommand::SkillList),
         "remember" => {
             let note = parts.collect::<Vec<_>>().join(" ");
@@ -189,7 +197,8 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/queue", "List, pause, or start queued prompts"),
         ("/workflow:<name>", "Run a saved workflow"),
         ("/workflows", "Show workflow tasks"),
-        ("/agents", "Show workflow agent dashboard"),
+        ("/agents", "Open Agent Workspace"),
+        ("/tasks", "Open unified Tasks workspace"),
         ("/skills", "Browse and insert a skill"),
         ("/remember", "Save a note to memory"),
         ("/trust", "Manage folder trust for the OS sandbox"),
@@ -645,6 +654,29 @@ mod tests {
     #[test]
     fn parses_agents_command() {
         assert_eq!(parse("/agents"), Some(SlashCommand::AgentDashboard));
+    }
+
+    #[test]
+    fn parses_tasks_command() {
+        assert_eq!(parse("/tasks"), Some(SlashCommand::TaskWorkspace));
+        assert!(
+            all_commands()
+                .iter()
+                .any(|(command, _)| *command == "/tasks")
+        );
+    }
+
+    #[test]
+    fn parses_child_follow_up_with_non_empty_prompt_only() {
+        assert_eq!(
+            parse("/task-follow-up child-1 inspect the failing test"),
+            Some(SlashCommand::TaskFollowUp {
+                task_id: "child-1".to_string(),
+                prompt: "inspect the failing test".to_string(),
+            })
+        );
+        assert_eq!(parse("/task-follow-up child-1   "), None);
+        assert_eq!(parse("/task-follow-up   inspect"), None);
     }
 
     #[test]

@@ -351,7 +351,15 @@ pub(crate) fn handle_scroll_lines(state: &mut AppState, lines: i32, now: Instant
                 }
             }
         }
-        PanelMode::Agents => {}
+        PanelMode::Agents => {
+            for _ in 0..steps {
+                if upward {
+                    state.select_previous_agent();
+                } else {
+                    state.select_next_agent();
+                }
+            }
+        }
         PanelMode::Conversation => {
             if !state.accepts_mouse_scroll_at(now) {
                 return;
@@ -1404,6 +1412,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation: None,
@@ -1432,6 +1441,20 @@ mod tests {
         assert_eq!(state.workflow_selected_index(), 1);
         handle_scroll_lines(&mut state, -3, now);
         assert_eq!(state.workflow_selected_index(), 0);
+
+        // Agents panel: wheel moves the stable agent selection.
+        let mut first_agent = test_workflow_task("agent-a");
+        first_agent.task_type = orca_core::task_types::TaskType::Subagent;
+        first_agent.created_at_ms = 1_000;
+        let mut second_agent = test_workflow_task("agent-b");
+        second_agent.task_type = orca_core::task_types::TaskType::Subagent;
+        second_agent.created_at_ms = 2_000;
+        state.replace_workflow_tasks_for_test(vec![first_agent, second_agent]);
+        state.show_agents();
+        handle_scroll_lines(&mut state, 3, now);
+        assert_eq!(state.agent_selected_index(), 1);
+        handle_scroll_lines(&mut state, -3, now);
+        assert_eq!(state.agent_selected_index(), 0);
 
         // Session picker: wheel moves the session selection.
         state.panel_mode = crate::types::PanelMode::Conversation;

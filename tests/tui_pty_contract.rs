@@ -144,6 +144,128 @@ fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
 }
 
 #[test]
+fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n")
+        .expect("configure full-auto mode");
+    let mut process = PtyProcess::spawn_with_prompt(
+        home.path(),
+        cwd.path(),
+        "subagent async mock_stream_delay_ms 30000",
+    )
+    .expect("spawn detached-subagent TUI in PTY");
+    let mut output = Vec::new();
+    receive_until(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        Duration::from_secs(20),
+        "parent turn did not finish after launching the detached child",
+    );
+
+    process.write(b"/tasks\r").expect("open Tasks workspace");
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Tasks Workspace",
+        "TUI did not open the unified Tasks workspace",
+    );
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "mock_stream_delay_ms 30000",
+        "Tasks workspace did not expose the detached child",
+    );
+    process.write(b"s").expect("stop selected subagent");
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "stopped by user",
+        "Tasks workspace did not converge to the actor-owned stop activity",
+    );
+
+    process.write(&[0x1b]).expect("close Tasks workspace");
+    std::thread::sleep(Duration::from_millis(400));
+    process.drain_output(&mut output);
+    assert!(
+        process
+            .try_wait()
+            .expect("poll TUI after task stop")
+            .is_none(),
+        "stopping a child must keep the parent TUI alive"
+    );
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(
+        rendered.matches("Task stop requested").count() <= 3,
+        "subagent stop notice was rendered in a loop; output={rendered}"
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn tui_escape_cancels_a_running_subagent_and_keeps_the_parent_usable() {
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n")
+        .expect("configure full-auto mode");
+    let mut process = PtyProcess::spawn_with_prompt(
+        home.path(),
+        cwd.path(),
+        "subagent mock_stream_delay_ms 30000",
+    )
+    .expect("spawn foreground-subagent TUI in PTY");
+    let mut output = Vec::new();
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Agents 1 active",
+        "TUI did not expose the running foreground child",
+    );
+
+    let cancel_start = output.len();
+    process
+        .write(&[0x1b])
+        .expect("cancel running turn with Esc");
+    std::thread::sleep(Duration::from_millis(750));
+    process.drain_output(&mut output);
+    assert!(
+        process.try_wait().expect("poll TUI after Esc").is_none(),
+        "Esc cancellation must not terminate the parent TUI"
+    );
+    assert!(
+        output.len().saturating_sub(cancel_start) < 512 * 1024,
+        "Esc cancellation produced an unbounded redraw loop"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output[cancel_start..]).contains("Mock slow stream completed."),
+        "cancelled subagent emitted a post-terminal completion"
+    );
+
+    let follow_up_start = output.len();
+    process
+        .write(b"parent remains usable\r")
+        .expect("submit follow-up after Esc");
+    receive_until_after(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        follow_up_start,
+        Duration::from_secs(10),
+        "parent TUI did not accept a new turn after subagent cancellation",
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
 fn tui_bracketed_image_path_paste_materializes_an_atomic_attachment() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
@@ -425,7 +547,11 @@ fn tui_side_toggle_keeps_transcripts_visible_without_resubmitting() {
 // not re-print them — checking only the post-switch delta would miss content
 // that is genuinely on screen. Rebuilding the grid reflects what the user sees.
 fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &str, failure: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // PTY contracts run in parallel and the mock child may not publish its
+    // first activity frame until other test binaries release the CPU. Wait for
+    // the visible state boundary instead of treating scheduler latency as a
+    // missing projection.
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if screen_contains(output, expected) {
             return;

@@ -152,6 +152,7 @@ fn subagent_source_digest(batch: &SurfaceCommitBatch) -> Option<Sha256Digest> {
             | SurfaceEvent::Subagent(SubagentPatch::Completed { source, .. }) => {
                 Some(source.source_digest)
             }
+            SurfaceEvent::Subagent(SubagentPatch::Stopped { .. }) => None,
             _ => None,
         })
 }

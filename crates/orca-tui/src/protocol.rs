@@ -498,6 +498,16 @@ pub enum UserAction {
     StopTask {
         task_id: String,
     },
+    ResumeTask {
+        task_id: String,
+    },
+    RetryTask {
+        task_id: String,
+    },
+    FollowUpTask {
+        task_id: String,
+        prompt: String,
+    },
     ForegroundTask {
         task_id: String,
     },

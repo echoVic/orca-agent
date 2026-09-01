@@ -404,6 +404,7 @@ fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
         workflow_failure_count: 0,
         usage: None,
         subagent_current_activity: None,
+        subagent_activity_history: Vec::new(),
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,
@@ -2333,6 +2334,7 @@ fn show_workflows_preserves_available_selection() {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation: None,
@@ -2432,7 +2434,98 @@ fn show_agents_uses_dedicated_panel_mode() {
     state.show_agents();
 
     assert_eq!(state.panel_mode, PanelMode::Agents);
-    assert_eq!(state.workflow_selected_index(), 0);
+    assert_eq!(state.agent_selected_index(), 0);
+}
+
+#[test]
+fn agent_workspace_selection_tracks_identity_across_task_refresh() {
+    let mut state = state();
+    let mut first = workflow_task_summary("agent-first", "first");
+    first.task_type = TaskType::Subagent;
+    first.created_at_ms = 1_000;
+    first.started_at_ms = Some(1_000);
+    let mut second = workflow_task_summary("agent-second", "second");
+    second.task_type = TaskType::Subagent;
+    second.created_at_ms = 2_000;
+    second.started_at_ms = Some(2_000);
+    state.replace_workflow_tasks_for_test(vec![second.clone(), first.clone()]);
+    state.show_agents();
+    state.select_next_agent();
+
+    assert_eq!(
+        state.selected_agent_row().map(|row| row.identity()),
+        Some(crate::agent_workspace::AgentWorkspaceIdentity::Task(
+            "agent-second".to_string()
+        ))
+    );
+
+    first.last_activity_at_ms = Some(9_000);
+    second.last_activity_at_ms = Some(3_000);
+    state.apply_workflow_tasks_for_test(vec![first, second]);
+
+    assert_eq!(state.agent_selected_index(), 1);
+    assert_eq!(
+        state.selected_agent_row().map(|row| row.identity()),
+        Some(crate::agent_workspace::AgentWorkspaceIdentity::Task(
+            "agent-second".to_string()
+        ))
+    );
+}
+
+#[test]
+fn open_agent_transcript_refreshes_on_new_publication_and_ignores_stale_reply() {
+    let (tx, rx) = mpsc::unbounded();
+    let mut state = AppState::new(
+        tx,
+        "0.0.0-test".to_string(),
+        "mock".to_string(),
+        "/tmp".to_string(),
+    );
+    let mut task = workflow_task_summary("agent-child", "child");
+    task.task_type = TaskType::Subagent;
+    task.publication_revision = Some(7);
+    state.replace_workflow_tasks_for_test(vec![task.clone()]);
+    let initial_request = crate::protocol::TaskTranscriptRequest {
+        task_id: "agent-child".to_string(),
+        expected_revision: 7,
+    };
+    state.begin_task_transcript_request(initial_request.clone());
+    state.update(TuiEvent::TaskTranscriptResult {
+        request: initial_request,
+        result: crate::protocol::TaskTranscriptResult::unavailable("checkpoint 7"),
+    });
+
+    task.publication_revision = Some(8);
+    state.apply_workflow_tasks_for_test(vec![task]);
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(UserAction::ReadTaskTranscript(crate::protocol::TaskTranscriptRequest {
+            task_id,
+            expected_revision: 8,
+        })) if task_id == "agent-child"
+    ));
+    assert_eq!(
+        state
+            .task_transcript()
+            .map(|view| view.request.expected_revision),
+        Some(8)
+    );
+
+    state.update(TuiEvent::TaskTranscriptResult {
+        request: crate::protocol::TaskTranscriptRequest {
+            task_id: "agent-child".to_string(),
+            expected_revision: 7,
+        },
+        result: crate::protocol::TaskTranscriptResult::unavailable("late checkpoint 7"),
+    });
+
+    assert_eq!(
+        state
+            .task_transcript()
+            .map(|view| view.request.expected_revision),
+        Some(8)
+    );
 }
 
 #[test]
@@ -2465,6 +2558,7 @@ fn workflow_events_update_panel_and_queue_model_notification() {
         workflow_failure_count: 0,
         usage: None,
         subagent_current_activity: None,
+        subagent_activity_history: Vec::new(),
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,
@@ -2773,6 +2867,7 @@ fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
         workflow_failure_count: 0,
         usage: None,
         subagent_current_activity: None,
+        subagent_activity_history: Vec::new(),
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,
@@ -2892,6 +2987,7 @@ fn backgrounded_main_session_completion_adds_system_notice() {
         workflow_failure_count: 0,
         usage: None,
         subagent_current_activity: None,
+        subagent_activity_history: Vec::new(),
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,

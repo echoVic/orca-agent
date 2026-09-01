@@ -7,7 +7,8 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use crossterm::event::KeyCode;
 use orca_core::task_types::{BackgroundTaskSummary, TaskType};
 
-use crate::protocol::{PendingWorkflowNotification, TaskTranscriptRequest};
+use crate::agent_workspace::AgentWorkspaceRow;
+use crate::protocol::{PendingWorkflowNotification, TaskTranscriptRequest, UserAction};
 use crate::types::{AppState, AppStatus, ApprovalDialog, PanelMode};
 
 #[derive(Debug, Clone, Default)]
@@ -301,7 +302,30 @@ impl AppState {
 
     pub fn show_agents(&mut self) {
         self.panel_mode = PanelMode::Agents;
-        self.workflow_panel.clamp_selected();
+        self.agent_workspace.reconcile(self.workflow_panel.tasks());
+    }
+
+    pub(crate) fn select_previous_agent(&mut self) {
+        self.agent_workspace
+            .select_previous(self.workflow_panel.tasks());
+    }
+
+    pub(crate) fn select_next_agent(&mut self) {
+        self.agent_workspace
+            .select_next(self.workflow_panel.tasks());
+    }
+
+    pub(crate) fn agent_selected_index(&self) -> usize {
+        self.agent_workspace.selected()
+    }
+
+    pub(crate) fn agent_rows(&self) -> Vec<AgentWorkspaceRow<'_>> {
+        self.agent_workspace.rows(self.workflow_panel.tasks())
+    }
+
+    pub(crate) fn selected_agent_row(&self) -> Option<AgentWorkspaceRow<'_>> {
+        self.agent_workspace
+            .selected_row(self.workflow_panel.tasks())
     }
 
     pub fn select_previous_workflow_task(&mut self) {
@@ -334,6 +358,7 @@ impl AppState {
 
     pub(crate) fn reset_workflow_panel(&mut self) {
         self.workflow_panel.reset_for_session();
+        self.agent_workspace.reset_for_session();
     }
 
     pub fn open_selected_background_approval_dialog(&mut self) -> bool {
@@ -405,6 +430,8 @@ impl AppState {
             .is_some_and(is_backgrounded_running_main_session);
         let selected_task_id = self.selected_workflow_task().map(|task| task.id.clone());
         self.workflow_panel.replace_tasks(tasks);
+        self.agent_workspace.reconcile(self.workflow_panel.tasks());
+        self.refresh_open_task_transcript();
         if should_reveal_background_approval {
             self.panel_mode = PanelMode::Workflows;
             if let Some(task_id) = self
@@ -440,6 +467,7 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn replace_workflow_tasks_for_test(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         self.workflow_panel.replace_tasks(tasks);
+        self.agent_workspace.reconcile(self.workflow_panel.tasks());
     }
 
     #[cfg(test)]
@@ -450,6 +478,30 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn select_workflow_index_for_test(&mut self, selected: usize) {
         self.workflow_panel.select_index(selected);
+    }
+
+    fn refresh_open_task_transcript(&mut self) {
+        let Some(current) = self.task_transcript.as_ref() else {
+            return;
+        };
+        let Some(expected_revision) = self
+            .workflow_panel
+            .tasks()
+            .iter()
+            .find(|task| task.id == current.request.task_id)
+            .and_then(|task| task.publication_revision)
+            .filter(|revision| *revision > current.request.expected_revision)
+        else {
+            return;
+        };
+        let request = TaskTranscriptRequest {
+            task_id: current.request.task_id.clone(),
+            expected_revision,
+        };
+        if let Some(view) = self.task_transcript.as_mut() {
+            view.request = request.clone();
+        }
+        let _ = self.event_tx.send(UserAction::ReadTaskTranscript(request));
     }
 }
 
@@ -552,6 +604,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(activity_at_ms),
             continuation: None,

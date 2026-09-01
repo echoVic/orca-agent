@@ -1805,7 +1805,8 @@ fn scope_matches_event(
             }
         }
         SurfaceEvent::Subagent(SubagentPatch::Progress { owner, .. })
-        | SurfaceEvent::Subagent(SubagentPatch::Completed { owner, .. }) => match (scope, owner) {
+        | SurfaceEvent::Subagent(SubagentPatch::Completed { owner, .. })
+        | SurfaceEvent::Subagent(SubagentPatch::Stopped { owner, .. }) => match (scope, owner) {
             (
                 SurfaceScope::Generation { fence },
                 SurfaceSubagentOwner::Generation { fence: owner },
@@ -8716,7 +8717,18 @@ fn apply_subagent_patch(
             activity,
             turn,
             usage,
+            subagent_activity_history,
+            continuation,
         } => {
+            if subagent_activity_history.len()
+                > orca_core::task_types::MAX_SUBAGENT_ACTIVITY_HISTORY
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::InvalidOrdering,
+                    "subagent activity history exceeds the bounded limit",
+                ));
+            }
             let Some(subagent) = snapshot
                 .subagents
                 .iter_mut()
@@ -8754,6 +8766,8 @@ fn apply_subagent_patch(
             subagent.activity = Some(activity.clone());
             subagent.turn = *turn;
             subagent.usage = usage.clone();
+            subagent.subagent_activity_history = subagent_activity_history.clone();
+            subagent.continuation = continuation.clone();
             Ok(())
         }
         SubagentPatch::Completed {
@@ -8766,7 +8780,18 @@ fn apply_subagent_patch(
             output,
             error,
             usage,
+            subagent_activity_history,
+            continuation,
         } => {
+            if subagent_activity_history.len()
+                > orca_core::task_types::MAX_SUBAGENT_ACTIVITY_HISTORY
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::InvalidOrdering,
+                    "subagent activity history exceeds the bounded limit",
+                ));
+            }
             let Some(subagent) = snapshot
                 .subagents
                 .iter_mut()
@@ -8809,6 +8834,63 @@ fn apply_subagent_patch(
             subagent.output = output.clone();
             subagent.error = error.clone();
             subagent.usage = usage.clone();
+            subagent.subagent_activity_history = subagent_activity_history.clone();
+            subagent.continuation = continuation.clone();
+            Ok(())
+        }
+        SubagentPatch::Stopped {
+            subagent_id,
+            expected_revision,
+            next_revision,
+            owner,
+            subagent_activity_history,
+            continuation,
+        } => {
+            if subagent_activity_history.len()
+                > orca_core::task_types::MAX_SUBAGENT_ACTIVITY_HISTORY
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::InvalidOrdering,
+                    "subagent activity history exceeds the bounded limit",
+                ));
+            }
+            let Some(subagent) = snapshot
+                .subagents
+                .iter_mut()
+                .find(|value| value.subagent_id == *subagent_id)
+            else {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "absent subagent cannot be stopped",
+                ));
+            };
+            if subagent.revision != *expected_revision
+                || !expected_revision
+                    .get()
+                    .checked_add(1)
+                    .is_some_and(|expected_next| next_revision.get() == expected_next)
+                || subagent.owner != *owner
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::StaleRevision,
+                    "subagent owner or revision is stale",
+                ));
+            }
+            if subagent.status != SurfaceSubagentStatus::Running {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "terminal subagent is absorbing",
+                ));
+            }
+            subagent.revision = *next_revision;
+            subagent.status = SurfaceSubagentStatus::Cancelled;
+            subagent.activity = Some(DisplayText::new("stopped by user"));
+            subagent.subagent_activity_history = subagent_activity_history.clone();
+            subagent.continuation = continuation.clone();
             Ok(())
         }
     }
@@ -9017,6 +9099,15 @@ fn apply_task_patch(
             task.completed_at = *completed_at;
             task.result = result.clone();
             task.error = error.clone();
+            if matches!(
+                status,
+                SurfaceTaskStatus::Stopped
+                    | SurfaceTaskStatus::Completed
+                    | SurfaceTaskStatus::Failed
+                    | SurfaceTaskStatus::Cancelled
+            ) {
+                task.pending_interaction_id = None;
+            }
             Ok(())
         }
         TaskPatch::InteractionChanged {
@@ -9685,15 +9776,18 @@ pub(crate) mod tests {
             description: DisplayText::new("child agent"),
             status: SurfaceSubagentStatus::Running,
             activity: Some(DisplayText::new("bash")),
+            subagent_activity_history: Vec::new(),
             turn: Some(1),
             usage: None,
             output: None,
             error: None,
+            continuation: None,
             owner,
             source: SurfaceSubagentSource::new(
                 attempt_id,
                 child_turn.clone(),
                 1,
+                UnixMillis::new(1),
                 SurfaceCommitId::try_from_bytes(uuid_v7_bytes(206)).unwrap(),
                 digest(207),
             ),

@@ -1536,6 +1536,7 @@ fn workflow_task(id: &str, name: &str) -> orca_core::task_types::BackgroundTaskS
         workflow_failure_count: 0,
         usage: None,
         subagent_current_activity: None,
+        subagent_activity_history: Vec::new(),
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,

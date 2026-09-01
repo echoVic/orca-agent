@@ -192,10 +192,11 @@ newer continuation or surface authority.
 
 ### 4. Task and subagent state commit atomically
 
-`SurfaceTask` gains parent task, agent type, last activity, continuation and
-checkpoint binding, and transcript availability. `SurfaceSubagent` gains task
-and attempt identity, source cursor, phase, current structured tool, last
-activity, and an explicit owner:
+`SurfaceTask` gains parent task, agent type, continuation and checkpoint
+binding, and transcript availability. `SurfaceSubagent` gains task and attempt
+identity, source cursor, phase, current structured tool, and an explicit owner.
+The source cursor carries the event's `occurred_at`; task summaries derive last
+activity from that authoritative child cursor instead of task start/completion:
 
 ```rust
 pub enum SurfaceSubagentOwner {
@@ -252,9 +253,13 @@ It never synthesizes children from workflow labels or reads runtime stores.
 - `Esc` closes the child transcript first, then the task panel.
 - Panel navigation works while the parent is running as well as when idle.
 
-The live row shows status, phase, turn, current tool, usage, and last activity.
-The detail view uses a separate read-only `TranscriptState`; it never replaces
-the parent transcript.
+The default conversation view shows a bounded stack of the most recently active
+ordinary subagents, including status, turn, current activity, usage, and elapsed
+time. Overflow is explicit rather than silently replacing per-agent activity
+with only a total count. The Agents panel combines ordinary subagents and
+workflow agents under one parent/agent/status/detail projection. The Tasks panel
+remains the complete tree and transcript entry point. Its detail view uses a
+separate read-only `TranscriptState`; it never replaces the parent transcript.
 
 `read_task_transcript(task_id, expected_revision)` is a typed runtime-surface
 query. It validates task/continuation/checkpoint binding and returns the latest
@@ -492,10 +497,12 @@ transcripts and user artifacts are preserved.
    applied tool is automatically repeated.
 3. Surface start/progress/terminal batches preserve parent hierarchy, enforce
    owner/attempt/source sequence, and atomically converge task and subagent.
-4. The TUI shows a navigable expandable tree while the parent runs, unthrottled
-   tool boundaries, streaming activity capped at four source events per second,
-   committed activity visible within one second in the deterministic PTY test,
-   and a checkpoint-backed child transcript.
+4. The TUI shows active children up to the bounded default live-stack capacity,
+   reports overflow explicitly, includes ordinary and workflow children in the
+   Agents panel, and keeps a navigable expandable task tree while the parent
+   runs. Tool boundaries are unthrottled, streaming activity is capped at four
+   source events per second, committed activity is visible within one second in
+   the deterministic PTY test, and child transcripts are checkpoint-backed.
 5. Permission choices retain exact profile/scope/owner/provenance across TUI,
    ACP, JSONL, and headless surfaces; detached request/decision delivery survives
    restart; stale answers and failed commits leave no orphan grants.

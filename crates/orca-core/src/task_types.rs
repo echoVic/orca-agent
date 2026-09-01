@@ -102,6 +102,48 @@ pub struct PendingToolCallSummary {
     pub arguments: String,
 }
 
+/// A compact, user-visible activity sample retained for delegated agents.
+///
+/// This is intentionally bounded at the task-registry boundary. The durable
+/// relay remains the complete event source; this list is only the context a
+/// task workspace needs to explain what happened most recently.
+pub const MAX_SUBAGENT_ACTIVITY_HISTORY: usize = 8;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentActivityEntry {
+    pub occurred_at_ms: i64,
+    pub activity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+}
+
+/// Append a compact, bounded activity sample for user-facing task history.
+/// Consecutive identical activity/turn pairs are coalesced so relay polling
+/// cannot consume the history budget without adding information.
+pub fn append_subagent_activity_history(
+    history: &mut Vec<SubagentActivityEntry>,
+    activity: String,
+    turn: Option<u32>,
+    occurred_at_ms: i64,
+) {
+    if history
+        .last()
+        .is_some_and(|entry| entry.activity == activity && entry.turn == turn)
+    {
+        return;
+    }
+    history.push(SubagentActivityEntry {
+        occurred_at_ms,
+        activity,
+        turn,
+    });
+    if history.len() > MAX_SUBAGENT_ACTIVITY_HISTORY {
+        let excess = history.len() - MAX_SUBAGENT_ACTIVITY_HISTORY;
+        history.drain(..excess);
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundTaskSummary {
@@ -154,6 +196,8 @@ pub struct BackgroundTaskSummary {
     pub usage: Option<UsageTotals>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_current_activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagent_activity_history: Vec<SubagentActivityEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_turn: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

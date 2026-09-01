@@ -73,11 +73,14 @@ compatibility alias for `/new`. `Ctrl+L` clears only the displayed transcript
 and terminal scrollback, keeping the current conversation context. On exit,
 Orca prints the exact `orca --resume <SESSION_ID>` command for the session.
 
-Use `/plan` for read-only planning, `/goal` for a persistent objective,
-`/workflows` for background work, and `/trust` to manage the current folder's
-sandbox permissions. Automatic project memory is enabled for recorded sessions
-by default; use `/remember` for explicit user or project facts. See
-[Memory](docs/memory.md) for capture, recall, storage, privacy, and deletion.
+Use `/plan` for read-only planning, `/goal` for a persistent objective, and
+`/tasks` for the unified workspace containing subagents, background commands,
+monitors, and workflow children. `/agents` is an alias for `/tasks`, while
+`/workflows` keeps the workflow-specific run tree. Use `/trust` to manage the
+current folder's sandbox permissions. Automatic project memory is enabled for
+recorded sessions by default; use `/remember` for explicit user or project
+facts. See [Memory](docs/memory.md) for capture, recall, storage, privacy, and
+deletion.
 
 ## What it does
 
@@ -103,6 +106,10 @@ by default; use `/remember` for explicit user or project facts. See
   a new prompt to the same durable child conversation. Task/status output on
   TUI, ACP, JSONL, and headless surfaces includes the current attempt,
   checkpoint, resumable, and indeterminate state.
+- Keeps up to four active child summaries visible in the conversation and up to
+  eight durable activity entries per child. `/tasks` opens live transcripts and
+  exposes only controls the selected child can safely perform: stop, resume,
+  retry, or a revision-fenced follow-up.
 - Learns a bounded set of durable project facts after successfully committed
   turns and retrieves only prompt-relevant facts on later turns.
 - Runs with no implicit turn ceiling; optional `[budget]` limits
@@ -166,6 +173,9 @@ More detail:
   status.
 - Cancelling a foreground turn also stops the subagent task tree it owns;
   unrelated detached work is left alone.
+- Escape-driven cancellation commits one terminal child state and ignores late
+  activity from the cancelled attempt, so a stopped subagent cannot flood the
+  terminal while its parent returns to an interactive prompt.
 - Continuation recovery is deliberately fail-closed. Orca restores only a
   digest-verified conversation checkpoint, never a Rust future or process
   stack. A tool admitted with unknown external side effects makes the

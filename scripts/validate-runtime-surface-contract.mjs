@@ -937,7 +937,7 @@ const TUI_RUNTIME_MUTATION_APIS = new Map([
   ["workflow.continue", [/\bsubmit_pending_workflow_notification\s*\(/g]],
   [
     "task.mutate",
-    [/\b(?:stop_task_for_tui|foreground_task_for_tui)\s*\(/g],
+    [/\b(?:stop_task_for_tui|foreground_task_for_tui|continue_subagent_for_tui)\s*\(/g],
   ],
   [
     "background_approval.respond",
@@ -1134,7 +1134,11 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/hosted_session_lifecycle.rs:reap_hosted_thread:thread.shutdown", 2],
   ["crates/orca-tui/src/app.rs:run_tui_inner:user_action.route", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:host.shutdown", 1],
-  ["crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:task.mutate", 2],
+  ["crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:task.mutate", 5],
+  [
+    "crates/orca-tui/src/agent_workspace_actions.rs:handle_agent_workspace_key:user_action.route",
+    3,
+  ],
   [
     "crates/orca-tui/src/background_tasks.rs:handle_hosted_task_action:background_approval.respond",
     1,
@@ -1164,7 +1168,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/session_picker_actions.rs:dispatch_selected_resume:user_action.route", 1],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:user_action.route", 1],
-  ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 13],
+  ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 14],
   [
     "crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:input_history.record",
     1,
@@ -1176,6 +1180,10 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/surface_actions.rs:save_api_key:credentials.update", 2],
   ["crates/orca-tui/src/state_reducer.rs:update:input_history.record", 1],
   ["crates/orca-tui/src/workflow_notifications.rs:submit_pending_workflow_notification:user_action.route", 1],
+  [
+    "crates/orca-tui/src/workflow_panel.rs:refresh_open_task_transcript:user_action.route",
+    1,
+  ],
   ["crates/orca-tui/src/workflow_panel_actions.rs:handle_workflows_panel_key:user_action.route", 3],
 ]);
 
@@ -1385,7 +1393,7 @@ const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
   ],
   [
     "crates/orca-tui/src/surface_client.rs:stop_task",
-    "8cf51d0e4f98d7a31791546397e1729bbb1e37c451de6af6dd1088979891bce0",
+    "98a77f87b1079206cac72eb205055e0bcc67ee2e481efa2bb8a1caa74e6078e3",
   ],
 ]);
 const BASELINE_UNRESOLVED_USER_ACTION_SEND_FUNCTION_SHA256 = new Map([]);
@@ -1819,11 +1827,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 40 unique variants matching UserAction at baseline",
+      "closed_inventory.current_tui_user_actions has exactly 43 unique variants matching UserAction at baseline",
       (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 40,
-          "current_tui_user_actions must contain 40 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 43,
+          "current_tui_user_actions must contain 43 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

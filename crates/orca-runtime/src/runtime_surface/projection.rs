@@ -1407,8 +1407,9 @@ pub enum SurfaceSubagentOwner {
 }
 
 /// Source cursor persisted with every subagent projection transition. The
-/// tuple `(attempt_id, turn_id, source_sequence, source_commit_id,
-/// source_digest)` is the replay/idempotency identity for one child event.
+/// attempt/turn/sequence/commit/digest fields identify one child event for
+/// replay and idempotency; `occurred_at` carries its authoritative activity
+/// time into projections.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceSubagentSource {
     pub attempt_id: super::SurfaceTaskAttemptId,
@@ -1417,6 +1418,8 @@ pub struct SurfaceSubagentSource {
     /// relay reconnect or process restart.
     pub turn_id: SurfaceTurnId,
     pub source_sequence: u64,
+    /// Wall-clock time captured when the child activity event was produced.
+    pub occurred_at: UnixMillis,
     pub source_commit_id: super::SurfaceCommitId,
     pub source_digest: super::Sha256Digest,
 }
@@ -1426,6 +1429,7 @@ impl SurfaceSubagentSource {
         attempt_id: super::SurfaceTaskAttemptId,
         turn_id: SurfaceTurnId,
         source_sequence: u64,
+        occurred_at: UnixMillis,
         source_commit_id: super::SurfaceCommitId,
         source_digest: super::Sha256Digest,
     ) -> Self {
@@ -1433,6 +1437,7 @@ impl SurfaceSubagentSource {
             attempt_id,
             turn_id,
             source_sequence,
+            occurred_at,
             source_commit_id,
             source_digest,
         }
@@ -1449,12 +1454,25 @@ pub struct SurfaceSubagent {
     pub description: DisplayText,
     pub status: SurfaceSubagentStatus,
     pub activity: Option<DisplayText>,
+    pub subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
     pub turn: Option<u32>,
     pub usage: Option<UsageTotals>,
     pub output: Option<DisplayText>,
     pub error: Option<DisplayText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<SurfaceSubagentContinuation>,
     pub owner: SurfaceSubagentOwner,
     pub source: SurfaceSubagentSource,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SurfaceSubagentContinuation {
+    pub continuation_id: NonEmptyText,
+    pub attempt_id: NonEmptyText,
+    pub checkpoint_id: Option<NonEmptyText>,
+    pub revision: u64,
+    pub resumable: bool,
+    pub indeterminate: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1508,6 +1526,8 @@ pub enum SubagentPatch {
         activity: DisplayText,
         turn: Option<u32>,
         usage: Option<UsageTotals>,
+        subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
+        continuation: Option<SurfaceSubagentContinuation>,
     },
     Completed {
         subagent_id: SurfaceSubagentId,
@@ -1519,6 +1539,19 @@ pub enum SubagentPatch {
         output: Option<DisplayText>,
         error: Option<DisplayText>,
         usage: Option<UsageTotals>,
+        subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
+        continuation: Option<SurfaceSubagentContinuation>,
+    },
+    /// Actor-owned terminal transition produced by an explicit task-control
+    /// request. It intentionally carries no child source cursor: stopping a
+    /// worker is a parent control fact, not a fabricated child event.
+    Stopped {
+        subagent_id: SurfaceSubagentId,
+        expected_revision: SubagentRevision,
+        next_revision: SubagentRevision,
+        owner: SurfaceSubagentOwner,
+        subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
+        continuation: Option<SurfaceSubagentContinuation>,
     },
 }
 

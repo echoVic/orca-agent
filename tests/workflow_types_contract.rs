@@ -125,6 +125,7 @@ fn background_task_summary_matches_sdk_names() {
         workflow_failure_count: 0,
         usage: None,
         subagent_current_activity: None,
+        subagent_activity_history: Vec::new(),
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,

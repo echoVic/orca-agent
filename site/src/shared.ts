@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.7";
+export const releaseVersion = "v0.4.8";
 
 export const releases = [
+  {
+    version: "v0.4.8",
+    date: "2026-09-01",
+    title: "Interactive subagent workspace",
+    body: "Turns child-agent observability into an interactive TUI workspace: a bounded conversation activity dock, unified task and workflow navigation, live transcript inspection, revision-fenced child controls, durable activity history, workflow previews, and cancellation that absorbs late child events without terminal spam.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.8",
+  },
   {
     version: "v0.4.7",
     date: "2026-08-31",

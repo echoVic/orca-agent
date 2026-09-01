@@ -255,6 +255,9 @@
       "GoalResume",
       "ResolveBackgroundApproval",
       "StopTask",
+      "ResumeTask",
+      "RetryTask",
+      "FollowUpTask",
       "ForegroundTask",
       "ReadTaskTranscript",
       "RespondToInteraction",
@@ -4612,10 +4615,10 @@
       "StopTask",
       "current",
       [
-        "crates/orca-tui/src/protocol.rs:400",
+        "crates/orca-tui/src/protocol.rs:492",
         "crates/orca-tui/src/workflow_panel_actions.rs:32",
         "crates/orca-tui/src/background_tasks.rs:24",
-        "crates/orca-tui/src/hosted_controller.rs:452"
+        "crates/orca-tui/src/hosted_controller.rs:556"
       ],
       "task_mutation",
       "UserAction::StopTask{task_id}",
@@ -4628,8 +4631,77 @@
         "SurfaceTaskFence"
       ],
       "MutationReply<TaskControlOutput>",
-      "task panel consumes TaskControlOutput",
+      "task workspace consumes TaskControlOutput",
       "remove_direct_task_registry_mutation"
+    ],
+    [
+      "ResumeTask",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:501",
+        "crates/orca-tui/src/agent_workspace_actions.rs:105",
+        "crates/orca-tui/src/background_tasks.rs:34",
+        "crates/orca-tui/src/hosted_controller.rs:564"
+      ],
+      "task_mutation",
+      "UserAction::ResumeTask{task_id}",
+      "TaskControl(Resume)",
+      "TaskControl(Resume)",
+      [
+        "ManageTask"
+      ],
+      [
+        "SurfaceTaskFence"
+      ],
+      "MutationReply<TaskControlOutput>",
+      "task workspace consumes TaskControlOutput",
+      "remove_direct_task_registry_continuation"
+    ],
+    [
+      "RetryTask",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:504",
+        "crates/orca-tui/src/agent_workspace_actions.rs:101",
+        "crates/orca-tui/src/background_tasks.rs:36",
+        "crates/orca-tui/src/hosted_controller.rs:570"
+      ],
+      "task_mutation",
+      "UserAction::RetryTask{task_id}",
+      "TaskControl(Retry)",
+      "TaskControl(Retry)",
+      [
+        "ManageTask"
+      ],
+      [
+        "SurfaceTaskFence"
+      ],
+      "MutationReply<TaskControlOutput>",
+      "task workspace consumes TaskControlOutput",
+      "remove_direct_task_registry_continuation"
+    ],
+    [
+      "FollowUpTask",
+      "current",
+      [
+        "crates/orca-tui/src/protocol.rs:507",
+        "crates/orca-tui/src/slash_command_actions.rs:242",
+        "crates/orca-tui/src/background_tasks.rs:39",
+        "crates/orca-tui/src/hosted_controller.rs:576"
+      ],
+      "task_mutation",
+      "UserAction::FollowUpTask{task_id,prompt}",
+      "TaskControl(FollowUp)",
+      "TaskControl(FollowUp)",
+      [
+        "ManageTask"
+      ],
+      [
+        "SurfaceTaskFence"
+      ],
+      "MutationReply<TaskControlOutput>",
+      "task workspace consumes TaskControlOutput",
+      "remove_direct_task_registry_continuation"
     ],
     [
       "ForegroundTask",
@@ -7495,7 +7567,7 @@
   ],
   "phase_0a_manifest_invariants": [
     "source_facts has exactly 58 unique variants matching EventType at baseline",
-    "closed_inventory.current_tui_user_actions has exactly 40 unique variants matching UserAction at baseline",
+    "closed_inventory.current_tui_user_actions has exactly 43 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
     "every row length equals its declared column count and every inventory id is unique",
@@ -13321,6 +13393,7 @@
       "SurfaceSessionHealth",
       "SurfaceSettingsSnapshot",
       "SurfaceSubagent",
+      "SurfaceSubagentContinuation",
       "SurfaceSubagentOwner",
       "SurfaceSubagentPhase",
       "SurfaceSubagentSource",

@@ -1920,6 +1920,174 @@ impl ThreadActor {
         }))
     }
 
+    fn continue_surface_subagent(
+        &mut self,
+        request_id: surface::SurfaceRequestId,
+        fence: surface::SurfaceTaskFence,
+        follow_up: Option<String>,
+        control: &str,
+    ) -> Result<
+        surface::MutationReply<surface::TaskControlOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == fence.task_id)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if task.revision != fence.task_revision
+            || task.background_fence != fence.background_owner
+            || task.task_type != surface::SurfaceTaskType::Subagent
+        {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let subagent = task
+            .subagent_id
+            .as_ref()
+            .and_then(|id| {
+                snapshot
+                    .subagents
+                    .iter()
+                    .find(|child| child.subagent_id == *id)
+            })
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let continuation = subagent
+            .continuation
+            .as_ref()
+            .filter(|continuation| continuation.resumable && !continuation.indeterminate)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if subagent.status == surface::SurfaceSubagentStatus::Running {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let registry = self.handle.task_registry();
+        let binding = registry
+            .detached_subagent_binding(task.task_id.as_str())
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let prompt = follow_up.unwrap_or_else(|| match control {
+            "retry" => "Retry from the latest safe checkpoint. Re-check external state before repeating any side effect.".to_string(),
+            _ => "Continue from the latest safe checkpoint.".to_string(),
+        });
+        let tool_request = orca_core::tool_types::ToolRequest {
+            id: format!("task-control-{}", uuid::Uuid::new_v4()),
+            name: orca_core::tool_types::ToolName::Subagent,
+            action: orca_core::approval_types::ActionKind::Agent,
+            target: Some(format!("{} ({control})", task.description.as_str())),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": format!("{} ({control})", task.description.as_str()),
+                    "prompt": prompt,
+                    "mode": "async",
+                    "resume_from": continuation.continuation_id.as_str(),
+                })
+                .to_string(),
+            ),
+        };
+        let cwd = self
+            .config
+            .cwd
+            .as_deref()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let launched = crate::subagent_async_worker::launch_async_subagent(
+            crate::subagent_async_worker::AsyncSubagentLaunchContext {
+                config: &self.config,
+                cwd,
+                tool_request: &tool_request,
+                request: crate::subagent::create_subagent_request(&tool_request),
+                subagent_depth: 0,
+                task_registry: &registry,
+                root_task_id: binding.parent_task_id.as_deref(),
+                parent_fence: binding.parent_fence,
+            },
+        );
+        let launched_task = launched
+            .task
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if launched.result.status != orca_core::tool_types::ToolStatus::Completed {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let surfaced = loop {
+            if let Some(binding) = registry
+                .detached_subagent_binding(&launched_task.id)
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
+            {
+                self.drain_detached_subagent_relay(&registry, &binding)
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            }
+            if let Some(task) = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .tasks
+                .iter()
+                .find(|task| task.task_id.as_str() == launched_task.id)
+                .cloned()
+            {
+                break task;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = registry.request_stop(&launched_task.id);
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let next_revision =
+            surface::TaskRevision::try_new(surfaced.revision.get().saturating_add(1))
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                    task_id: surfaced.task_id.clone(),
+                    expected_revision: surfaced.revision,
+                    next_revision,
+                    status: surface::SurfaceTaskStatus::Running,
+                    completed_at: None,
+                    result: None,
+                    error: None,
+                }),
+            )],
+            None,
+        );
+        self.commit_surface_actor_batch_with_retry(&batch)?;
+        let committed_task = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .tasks
+            .iter()
+            .find(|task| task.task_id == surfaced.task_id)
+            .cloned()
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        Ok(surface::MutationReply::Committed {
+            mutation: surface::CommittedMutation {
+                request_id,
+                target: surface::MutationTarget::Task {
+                    thread_id: snapshot.thread.thread_id,
+                    task_id: committed_task.task_id.clone(),
+                },
+                disposition: surface::MutationDisposition::Accepted,
+                acknowledgements: surface::NonEmptyVec::try_new(vec![
+                    surface::MutationCommitAck::ThreadLocalCursor {
+                        cursor: batch.cursor_after.clone(),
+                        family: surface::SurfaceFactFamily::Task,
+                        event_id: batch.events.as_slice()[0].event_id.clone(),
+                        commit_class: batch.commit_class.clone(),
+                    },
+                ])
+                .expect("child continuation commit has one acknowledgement"),
+            },
+            value: surface::TaskControlOutput {
+                task: committed_task,
+                cursor: batch.cursor_after,
+            },
+        })
+    }
+
     pub(super) fn control_surface_task(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -1934,10 +2102,24 @@ impl ThreadActor {
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        let (fence, foreground) = match action {
-            surface::TaskControlAction::Foreground { fence } => (fence, true),
-            surface::TaskControlAction::Stop { fence } => (fence, false),
+        let (fence, control) = match action {
+            surface::TaskControlAction::Foreground { fence } => (fence, "foreground"),
+            surface::TaskControlAction::Stop { fence } => (fence, "stop"),
+            surface::TaskControlAction::Resume { fence } => (fence, "resume"),
+            surface::TaskControlAction::Retry { fence } => (fence, "retry"),
+            surface::TaskControlAction::FollowUp { fence, prompt } => {
+                return self.continue_surface_subagent(
+                    request_id,
+                    fence,
+                    Some(prompt.as_str().to_string()),
+                    "follow-up",
+                );
+            }
         };
+        if matches!(control, "resume" | "retry") {
+            return self.continue_surface_subagent(request_id, fence, None, control);
+        }
+        let foreground = control == "foreground";
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let Some(task) = snapshot
             .tasks
@@ -1980,6 +2162,188 @@ impl ThreadActor {
                         winning_request_id: None,
                         current_revision,
                     }),
+                },
+            });
+        }
+        if task.task_type == surface::SurfaceTaskType::Subagent {
+            if foreground {
+                return Ok(surface::MutationReply::Uncommitted {
+                    mutation: surface::UncommittedMutation::Invalid {
+                        request_id,
+                        target: Some(target),
+                        error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                            code: surface::SurfaceMutationErrorCode::IllegalState,
+                            message: surface::DisplayText::new(
+                                "subagents cannot be foregrounded as main sessions",
+                            ),
+                            winning_request_id: None,
+                            current_revision,
+                        }),
+                    },
+                });
+            }
+            if matches!(
+                task.status,
+                surface::SurfaceTaskStatus::Stopped
+                    | surface::SurfaceTaskStatus::Completed
+                    | surface::SurfaceTaskStatus::Failed
+                    | surface::SurfaceTaskStatus::Cancelled
+            ) {
+                return Ok(surface::MutationReply::Uncommitted {
+                    mutation: surface::UncommittedMutation::Invalid {
+                        request_id,
+                        target: Some(target),
+                        error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                            code: surface::SurfaceMutationErrorCode::IllegalState,
+                            message: surface::DisplayText::new("subagent task is already terminal"),
+                            winning_request_id: None,
+                            current_revision,
+                        }),
+                    },
+                });
+            }
+            let Some(subagent_id) = task.subagent_id.as_ref() else {
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            };
+            let Some(subagent) = snapshot
+                .subagents
+                .iter()
+                .find(|candidate| candidate.subagent_id == *subagent_id)
+                .cloned()
+            else {
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            };
+            if !matches!(
+                subagent.owner,
+                surface::SurfaceSubagentOwner::DetachedTask { .. }
+            ) || subagent.status != surface::SurfaceSubagentStatus::Running
+            {
+                return Ok(surface::MutationReply::Uncommitted {
+                    mutation: surface::UncommittedMutation::Invalid {
+                        request_id,
+                        target: Some(target),
+                        error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                            code: surface::SurfaceMutationErrorCode::IllegalState,
+                            message: surface::DisplayText::new(
+                                "only a running detached subagent can be stopped independently",
+                            ),
+                            winning_request_id: None,
+                            current_revision,
+                        }),
+                    },
+                });
+            }
+
+            let task_registry = self.handle.task_registry();
+            task_registry
+                .request_stop(task.task_id.as_str())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let stopped_record = task_registry
+                .get(task.task_id.as_str())
+                .filter(|record| record.status == TaskStatus::Stopped)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let completed_at = surface::UnixMillis::new(
+                stopped_record
+                    .completed_at_ms
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+            );
+            let next_task_revision = surface::TaskRevision::try_new(
+                task.revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let next_subagent_revision = surface::SubagentRevision::try_new(
+                subagent
+                    .revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+            )
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            let mut activity_history = subagent.subagent_activity_history.clone();
+            orca_core::task_types::append_subagent_activity_history(
+                &mut activity_history,
+                "stopped by user".to_string(),
+                subagent.turn,
+                completed_at.get(),
+            );
+            let batch = self.surface_event_batch_with_commit_id(
+                vec![
+                    (
+                        surface::SurfaceScope::Thread,
+                        surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                            task_id: task.task_id.clone(),
+                            expected_revision: task.revision,
+                            next_revision: next_task_revision,
+                            status: surface::SurfaceTaskStatus::Stopped,
+                            completed_at: Some(completed_at),
+                            result: Some(surface::DisplayText::new(
+                                stopped_record.result.as_deref().unwrap_or("Task stopped"),
+                            )),
+                            error: None,
+                        }),
+                    ),
+                    (
+                        surface::SurfaceScope::Thread,
+                        surface::SurfaceEvent::Subagent(surface::SubagentPatch::Stopped {
+                            subagent_id: subagent.subagent_id.clone(),
+                            expected_revision: subagent.revision,
+                            next_revision: next_subagent_revision,
+                            owner: subagent.owner.clone(),
+                            subagent_activity_history: activity_history,
+                            // Preserve the last actor-accepted continuation. The registry is
+                            // an execution mirror and may be updated by the kill path before
+                            // this terminal surface event is committed.
+                            continuation: subagent.continuation.clone(),
+                        }),
+                    ),
+                ],
+                None,
+            );
+            self.commit_surface_actor_batch_with_retry(&batch)?;
+            let committed_task = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .tasks
+                .iter()
+                .find(|candidate| candidate.task_id == task.task_id)
+                .cloned()
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+            return Ok(surface::MutationReply::Committed {
+                mutation: surface::CommittedMutation {
+                    request_id,
+                    target,
+                    disposition: surface::MutationDisposition::Accepted,
+                    acknowledgements: surface::NonEmptyVec::try_new(
+                        batch
+                            .events
+                            .as_slice()
+                            .iter()
+                            .map(|event| surface::MutationCommitAck::ThreadLocalCursor {
+                                cursor: batch.cursor_after.clone(),
+                                family: match event.event {
+                                    surface::SurfaceEvent::Task(_) => {
+                                        surface::SurfaceFactFamily::Task
+                                    }
+                                    surface::SurfaceEvent::Subagent(_) => {
+                                        surface::SurfaceFactFamily::Subagent
+                                    }
+                                    _ => unreachable!("subagent stop batch has two fact families"),
+                                },
+                                event_id: event.event_id.clone(),
+                                commit_class: batch.commit_class.clone(),
+                            })
+                            .collect(),
+                    )
+                    .expect("subagent stop commit has task and subagent acknowledgements"),
+                },
+                value: surface::TaskControlOutput {
+                    task: committed_task,
+                    cursor: batch.cursor_after,
                 },
             });
         }

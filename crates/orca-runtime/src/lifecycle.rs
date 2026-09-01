@@ -385,6 +385,7 @@ pub struct RuntimeSubagentStatusRecord {
     pub error: Option<String>,
     pub usage: Option<RuntimeUsageTotals>,
     pub subagent_current_activity: Option<String>,
+    pub subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
     pub subagent_turn: Option<u32>,
     pub last_activity_at_ms: Option<i64>,
     pub continuation_id: Option<String>,

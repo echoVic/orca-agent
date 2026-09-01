@@ -3,7 +3,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
+};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use tui_textarea::TextArea;
@@ -14,11 +16,16 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::task_types::{
     BackgroundTaskSummary, TaskActivitySummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
 };
-use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
+use orca_core::workflow_types::{
+    WorkflowAgentStatus, WorkflowDraft, WorkflowRunStatus, WorkflowSourceMutationRisk,
+};
 use orca_file_search::SearchPhase;
 use orca_runtime::history::{SessionSummary, StoredSessionHealth};
+use orca_runtime::surface::{TaskTranscriptItem, TaskTranscriptToolStatus};
 
+use crate::agent_workspace::{AgentWorkspaceRow, agent_workspace_rows};
 use crate::display_text::{compact_long_text, truncate_to_display_width};
+use crate::protocol::TaskTranscriptResult;
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
 use crate::session_picker_actions::available_session_actions_with_health;
 use crate::shortcuts::{self, ShortcutScope};
@@ -63,15 +70,22 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 
     let plan_height = plan_panel_height(state);
     let goal_height: u16 = if state.current_goal().is_some() { 3 } else { 0 };
-    // An activity indicator sits above the composer while the agent is working (or
-    // waiting on the user), showing status + elapsed time. It takes two rows — a blank
-    // spacer, then the text — so the transcript tail, the indicator, and the input box
-    // don't sit flush against each other. Idle collapses it to zero height so a resting
-    // session has no chrome noise there.
-    let activity_height: u16 = if activity_line(state, theme).is_some() {
-        2
-    } else {
+    // Live child work is visible from the conversation view. Keep the stack bounded so
+    // a large fan-out cannot displace the transcript and composer entirely.
+    let activity_lines = activity_lines(state, theme);
+    let desired_activity_height = 1_u16.saturating_add(activity_lines.len() as u16);
+    let available_activity_height = frame
+        .area()
+        .height
+        .saturating_sub(goal_height)
+        .saturating_sub(plan_height)
+        .saturating_sub(search_height)
+        .saturating_sub(input_height)
+        .saturating_sub(2); // status + at least one transcript row
+    let activity_height: u16 = if activity_lines.is_empty() || available_activity_height < 2 {
         0
+    } else {
+        desired_activity_height.min(available_activity_height)
     };
     let queue_preview_lines = queued_preview_lines(state, frame.area().width, theme);
     let queue_preview_height = queue_preview_lines.len().min(3) as u16;
@@ -100,7 +114,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_plan_panel(frame, chunks[2], state, theme);
     }
     if activity_height > 0 {
-        render_activity(frame, chunks[3], state, theme);
+        render_activity(frame, chunks[3], &activity_lines);
     }
     if queue_preview_height > 0 {
         frame.render_widget(Paragraph::new(queue_preview_lines), chunks[4]);
@@ -1410,30 +1424,31 @@ fn is_foregroundable_task(task: &BackgroundTaskSummary) -> bool {
 }
 
 fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let showing_transcript = state.task_transcript().is_some();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Agents ")
+        .title(if showing_transcript {
+            " Agent Transcript "
+        } else {
+            " Tasks Workspace "
+        })
         .border_style(Style::default().fg(theme.border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let rows = state
-        .workflow_tasks()
-        .iter()
-        .flat_map(|task| {
-            let workflow_name = task.name.as_deref().unwrap_or(task.description.as_str());
-            task.workflow_agents
-                .iter()
-                .map(move |agent| (workflow_name, agent))
-        })
-        .collect::<Vec<_>>();
+    if showing_transcript {
+        render_agent_transcript(frame, inner, state, theme);
+        return;
+    }
+
+    let rows = state.agent_rows();
 
     if rows.is_empty() {
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                " No workflow agents available yet.",
+                " No tasks yet. They will appear here as soon as background work starts.",
                 Style::default().fg(theme.muted),
             )),
         ];
@@ -1441,23 +1456,437 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
         return;
     }
 
-    let mut constraints = vec![Constraint::Length(1)];
-    constraints.extend(rows.iter().map(|_| Constraint::Length(1)));
-    constraints.push(Constraint::Min(0));
-    let areas = Layout::vertical(constraints).split(inner);
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(" Workflow", Style::default().fg(theme.muted)),
-        Span::styled("   Agent", Style::default().fg(theme.muted)),
-        Span::styled("      Status", Style::default().fg(theme.muted)),
-        Span::styled("      Detail", Style::default().fg(theme.muted)),
-    ]));
-    frame.render_widget(header, areas[0]);
+    if inner.height < 3 || inner.width == 0 {
+        return;
+    }
 
-    for (index, (workflow_name, agent)) in rows.iter().enumerate() {
-        frame.render_widget(
-            Paragraph::new(agent_dashboard_row_label(workflow_name, agent, theme)),
-            areas[index + 1],
+    let selected_index = state.agent_selected_index().min(rows.len() - 1);
+    let selected = rows[selected_index];
+    let summary = agent_workspace_summary_line(&rows, theme);
+    let hint = agent_workspace_action_hint(selected, theme);
+    let focus_lines = agent_workspace_focus_lines(selected, theme, inner.width as usize);
+    let fixed_height = 2_u16;
+    let max_focus_height = inner.height.saturating_sub(fixed_height + 1);
+    let focus_height = (focus_lines.len() as u16).min(max_focus_height);
+    let list_height = inner
+        .height
+        .saturating_sub(fixed_height)
+        .saturating_sub(focus_height);
+    let areas = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(list_height),
+        Constraint::Length(focus_height),
+    ])
+    .split(inner);
+
+    frame.render_widget(Paragraph::new(summary), areas[0]);
+    frame.render_widget(Paragraph::new(hint), areas[1]);
+
+    if list_height > 0 {
+        let item_width = inner.width.saturating_sub(3) as usize;
+        let items = rows
+            .iter()
+            .copied()
+            .map(|row| agent_workspace_list_item(row, theme, item_width))
+            .collect::<Vec<_>>();
+        let list = List::new(items).highlight_symbol("› ").highlight_style(
+            theme
+                .selection_style()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
         );
+        let mut list_state = ListState::default();
+        list_state.select(Some(selected_index));
+        frame.render_stateful_widget(list, areas[2], &mut list_state);
+    }
+
+    if focus_height > 0 {
+        frame.render_widget(
+            Paragraph::new(
+                focus_lines
+                    .into_iter()
+                    .take(focus_height as usize)
+                    .collect::<Vec<_>>(),
+            ),
+            areas[3],
+        );
+    }
+}
+
+fn render_agent_transcript(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(view) = state.task_transcript() else {
+        return;
+    };
+    let task_name = state
+        .workflow_tasks()
+        .iter()
+        .find(|task| task.id == view.request.task_id)
+        .map(|task| task.name.as_deref().unwrap_or(task.description.as_str()))
+        .unwrap_or(view.request.task_id.as_str());
+    let mut lines = Vec::new();
+    match view.result.as_ref() {
+        None => {
+            lines.push(Line::from(Span::styled(
+                format!(" Esc back · {task_name}"),
+                Style::default().fg(theme.muted),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Loading safe transcript checkpoint...",
+                Style::default().fg(theme.warning),
+            )));
+        }
+        Some(TaskTranscriptResult::Found(snapshot)) => {
+            let lifecycle = if snapshot.complete {
+                "complete"
+            } else {
+                "live"
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" Esc back", Style::default().fg(theme.muted)),
+                Span::styled(
+                    format!(" · {task_name}"),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        " · checkpoint {} · turn {} · {lifecycle}",
+                        snapshot.checkpoint_revision, snapshot.turn
+                    ),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {} tool calls · {}",
+                    snapshot.usage.tool_calls,
+                    format_elapsed_compact(snapshot.usage.wall_time_ms / 1_000)
+                ),
+                Style::default().fg(theme.muted),
+            )));
+            lines.push(Line::from(""));
+            for item in &snapshot.items {
+                match item {
+                    TaskTranscriptItem::User { content } => push_agent_transcript_text(
+                        &mut lines,
+                        "you › ",
+                        content.as_str(),
+                        theme.text,
+                    ),
+                    TaskTranscriptItem::Assistant { content } => push_agent_transcript_text(
+                        &mut lines,
+                        "agent › ",
+                        content.as_str(),
+                        theme.text,
+                    ),
+                    TaskTranscriptItem::ToolCall { name, .. } => lines.push(Line::from(vec![
+                        Span::styled("tool ↗ ", Style::default().fg(theme.warning)),
+                        Span::styled(name.as_str().to_string(), Style::default().fg(theme.text)),
+                    ])),
+                    TaskTranscriptItem::ToolResult {
+                        content, status, ..
+                    } => {
+                        let (prefix, color) = match status {
+                            TaskTranscriptToolStatus::Completed => ("tool ✓ ", theme.success),
+                            TaskTranscriptToolStatus::Failed => ("tool × ", theme.error),
+                            TaskTranscriptToolStatus::Denied => ("tool denied ", theme.approval),
+                            TaskTranscriptToolStatus::NotImplemented => {
+                                ("tool unsupported ", theme.warning)
+                            }
+                            TaskTranscriptToolStatus::Cancelled => ("tool cancelled ", theme.muted),
+                            TaskTranscriptToolStatus::Indeterminate => {
+                                ("tool indeterminate ", theme.warning)
+                            }
+                        };
+                        push_agent_transcript_text(&mut lines, prefix, content.as_str(), color);
+                    }
+                }
+            }
+        }
+        Some(TaskTranscriptResult::NotFound(error))
+        | Some(TaskTranscriptResult::Invalid(error))
+        | Some(TaskTranscriptResult::Stale(error))
+        | Some(TaskTranscriptResult::Unavailable(error)) => {
+            lines.push(Line::from(Span::styled(
+                format!(" Esc back · {task_name}"),
+                Style::default().fg(theme.muted),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(" Transcript unavailable · {}", error.message),
+                Style::default().fg(theme.error),
+            )));
+            if let Some(current_revision) = error.current_revision {
+                lines.push(Line::from(Span::styled(
+                    format!(" Current task revision: {current_revision}"),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((state.task_transcript_scroll(), 0)),
+        area,
+    );
+}
+
+fn push_agent_transcript_text<'a>(
+    lines: &mut Vec<Line<'a>>,
+    prefix: &str,
+    content: &str,
+    color: Color,
+) {
+    let mut content_lines = content.lines();
+    if let Some(first) = content_lines.next() {
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(color)),
+            Span::styled(first.to_string(), Style::default().fg(color)),
+        ]));
+    }
+    let indent = " ".repeat(prefix.chars().count());
+    lines.extend(content_lines.map(|line| {
+        Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(line.to_string(), Style::default().fg(color)),
+        ])
+    }));
+}
+
+fn agent_workspace_summary_line<'a>(rows: &[AgentWorkspaceRow<'_>], theme: &Theme) -> Line<'a> {
+    let active = rows.iter().filter(|row| row.is_active()).count();
+    let attention = rows.iter().filter(|row| row.requires_attention()).count();
+    let noun = if rows.len() == 1 { "task" } else { "tasks" };
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} {noun}", rows.len()),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {active} active"),
+            Style::default().fg(theme.muted),
+        ),
+    ];
+    if attention > 0 {
+        spans.push(Span::styled(
+            format!(" · {attention} needs approval"),
+            Style::default().fg(theme.approval),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn agent_workspace_action_hint<'a>(row: AgentWorkspaceRow<'_>, theme: &Theme) -> Line<'a> {
+    let mut text = " Esc close · ↑↓ select".to_string();
+    match row {
+        AgentWorkspaceRow::Subagent { task, .. } => {
+            if task.publication_revision.is_some() {
+                text.push_str(" · Enter transcript");
+            }
+            if is_stoppable_task(task) {
+                text.push_str(" · s stop");
+            }
+            if task
+                .continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.resumable && !continuation.indeterminate)
+            {
+                text.push_str(" · r resume · R retry · /task-follow-up");
+            }
+        }
+        AgentWorkspaceRow::BackgroundTask { task, .. } => {
+            if task.task_type == TaskType::Workflow {
+                text.push_str(" · workflow controls in /workflows");
+            } else if is_stoppable_task(task) {
+                text.push_str(" · s stop");
+            }
+        }
+        AgentWorkspaceRow::WorkflowAgent { .. } => {
+            text.push_str(" · workflow-owned · read only");
+        }
+    }
+    Line::from(Span::styled(text, Style::default().fg(theme.muted)))
+}
+
+fn agent_workspace_list_item<'a>(
+    row: AgentWorkspaceRow<'_>,
+    theme: &Theme,
+    width: usize,
+) -> ListItem<'a> {
+    let (name, status, detail, color) = match row {
+        AgentWorkspaceRow::Subagent { task, .. } => {
+            let name = task.name.as_deref().unwrap_or(task.description.as_str());
+            let detail = task
+                .subagent_current_activity
+                .as_deref()
+                .unwrap_or("waiting for activity");
+            (
+                name.to_string(),
+                task_status_label(task.status).to_string(),
+                format!("subagent · {detail}"),
+                task_status_color(task.status, theme),
+            )
+        }
+        AgentWorkspaceRow::BackgroundTask { task, .. } => {
+            let name = task.name.as_deref().unwrap_or(task.description.as_str());
+            let detail = task
+                .subagent_current_activity
+                .as_deref()
+                .or(task.tool.as_deref())
+                .unwrap_or("waiting for activity");
+            (
+                name.to_string(),
+                task_status_label(task.status).to_string(),
+                format!("{} · {detail}", task_type_label(task)),
+                task_status_color(task.status, theme),
+            )
+        }
+        AgentWorkspaceRow::WorkflowAgent { workflow, agent } => {
+            let workflow_name = workflow
+                .name
+                .as_deref()
+                .unwrap_or(workflow.description.as_str());
+            let team = agent
+                .team
+                .as_deref()
+                .map(|team| format!("team {team} · "))
+                .unwrap_or_default();
+            (
+                format!("{workflow_name} / {}", agent.call_path),
+                workflow_agent_status_label(agent.status).to_string(),
+                format!("{team}attempt {}/{}", agent.attempt, agent.max_attempts),
+                workflow_agent_status_color(agent.status, theme),
+            )
+        }
+    };
+    let text = truncate_to_display_width(&format!("● {name} · {status} · {detail}"), width);
+    ListItem::new(Line::from(Span::styled(text, Style::default().fg(color))))
+}
+
+fn agent_workspace_focus_lines<'a>(
+    row: AgentWorkspaceRow<'_>,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'a>> {
+    let line = |text: String, color: Color| {
+        Line::from(Span::styled(
+            truncate_to_display_width(&text, width),
+            Style::default().fg(color),
+        ))
+    };
+    match row {
+        AgentWorkspaceRow::Subagent { task, parent } => {
+            let name = task.name.as_deref().unwrap_or(task.description.as_str());
+            let parent = parent
+                .map(|parent| {
+                    parent
+                        .name
+                        .as_deref()
+                        .unwrap_or(parent.description.as_str())
+                })
+                .unwrap_or("session");
+            let mut metadata = vec![format!("parent {parent}")];
+            metadata.push(format!(
+                "subagent {}",
+                task.agent_type.as_deref().unwrap_or("general")
+            ));
+            if let Some(turn) = task.subagent_turn {
+                metadata.push(format!("turn {turn}"));
+            }
+            if let Some(usage) = task.usage {
+                metadata.push(format!("{} tok", usage.total_tokens()));
+            }
+            metadata.push(elapsed_label(task));
+
+            let mut lines = vec![
+                line(format!(" Focus {name}"), theme.text),
+                line(format!(" {}", metadata.join(" · ")), theme.muted),
+            ];
+            if let Some(activity) = task.subagent_current_activity.as_deref() {
+                lines.push(line(format!(" now {activity}"), theme.warning));
+            }
+            for entry in task.subagent_activity_history.iter().rev().take(4).rev() {
+                let turn = entry
+                    .turn
+                    .map(|turn| format!(" · turn {turn}"))
+                    .unwrap_or_default();
+                lines.push(line(
+                    format!(" history {}{turn}", entry.activity),
+                    theme.muted,
+                ));
+            }
+            if let Some(continuation) = task.continuation.as_ref() {
+                let recovery = if continuation.indeterminate {
+                    format!(
+                        " recovery indeterminate · revision {}",
+                        continuation.revision
+                    )
+                } else if continuation.resumable {
+                    format!(
+                        " recovery resumable {} · revision {}",
+                        continuation.continuation_id, continuation.revision
+                    )
+                } else {
+                    format!(" recovery active · revision {}", continuation.revision)
+                };
+                lines.push(line(recovery, theme.muted));
+            }
+            lines
+        }
+        AgentWorkspaceRow::BackgroundTask { task, parent } => {
+            let name = task.name.as_deref().unwrap_or(task.description.as_str());
+            let parent = parent
+                .map(|parent| {
+                    parent
+                        .name
+                        .as_deref()
+                        .unwrap_or(parent.description.as_str())
+                })
+                .unwrap_or("session");
+            let mut metadata = vec![
+                format!("parent {parent}"),
+                task_type_label(task).to_string(),
+            ];
+            if let Some(usage) = task.usage {
+                metadata.push(format!("{} tok", usage.total_tokens()));
+            }
+            metadata.push(elapsed_label(task));
+            let mut lines = vec![
+                line(format!(" Focus {name}"), theme.text),
+                line(format!(" {}", metadata.join(" · ")), theme.muted),
+            ];
+            if let Some(activity) = task.subagent_current_activity.as_deref() {
+                lines.push(line(format!(" now {activity}"), theme.warning));
+            }
+            lines
+        }
+        AgentWorkspaceRow::WorkflowAgent { workflow, agent } => {
+            let workflow_name = workflow
+                .name
+                .as_deref()
+                .unwrap_or(workflow.description.as_str());
+            let mut metadata = vec![
+                format!("parent {workflow_name}"),
+                "workflow agent".to_string(),
+            ];
+            if let Some(team) = agent.team.as_deref() {
+                metadata.push(format!("team {team}"));
+            }
+            metadata.push(format!("attempt {}/{}", agent.attempt, agent.max_attempts));
+            if let Some(usage) = agent.usage {
+                metadata.push(format!("{} tok", usage.total_tokens()));
+            }
+            if let Some(elapsed) = agent_elapsed_label(agent) {
+                metadata.push(elapsed);
+            }
+            vec![
+                line(format!(" Focus {}", agent.call_path), theme.text),
+                line(format!(" {}", metadata.join(" · ")), theme.muted),
+                line(" workflow-owned · read only".to_string(), theme.muted),
+            ]
+        }
     }
 }
 
@@ -1792,60 +2221,6 @@ fn agent_row_label<'a>(agent: &WorkflowAgentTaskSummary, theme: &Theme) -> Line<
     ])
 }
 
-fn agent_dashboard_row_label<'a>(
-    workflow_name: &str,
-    agent: &WorkflowAgentTaskSummary,
-    theme: &Theme,
-) -> Line<'a> {
-    let status = workflow_agent_status_label(agent.status);
-    let status_color = workflow_agent_status_color(agent.status, theme);
-    let attempt = format!("attempt {}/{}", agent.attempt, agent.max_attempts);
-    let team = agent
-        .team
-        .as_deref()
-        .map(|team| format!("  team {team}"))
-        .unwrap_or_default();
-    let elapsed = agent_elapsed_label(agent)
-        .map(|elapsed| format!("  {elapsed}"))
-        .unwrap_or_default();
-    let usage = agent
-        .usage
-        .map(|usage| {
-            format!(
-                "  {} tok ${:.6}",
-                usage.total_tokens(),
-                usage.estimated_cost_usd
-            )
-        })
-        .unwrap_or_default();
-    let retry = if agent.previous_errors.is_empty() {
-        String::new()
-    } else {
-        format!("  retry errors {}", agent.previous_errors.len())
-    };
-    let error = agent
-        .error
-        .as_deref()
-        .or_else(|| agent.previous_errors.last().map(String::as_str))
-        .map(|error| format!("  {error}"))
-        .unwrap_or_default();
-
-    Line::from(vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(workflow_name.to_string(), Style::default().fg(theme.text)),
-        Span::styled("  ", Style::default()),
-        Span::styled(agent.call_path.clone(), Style::default().fg(theme.text)),
-        Span::styled("  ", Style::default()),
-        Span::styled(status, Style::default().fg(status_color)),
-        Span::styled(team, Style::default().fg(theme.muted)),
-        Span::styled(format!("  {attempt}"), Style::default().fg(theme.muted)),
-        Span::styled(elapsed, Style::default().fg(theme.muted)),
-        Span::styled(usage, Style::default().fg(theme.muted)),
-        Span::styled(retry, Style::default().fg(theme.muted)),
-        Span::styled(error, Style::default().fg(theme.error)),
-    ])
-}
-
 fn workflow_phase_row_label<'a>(
     phase: &orca_core::task_types::WorkflowPhaseTaskSummary,
     theme: &Theme,
@@ -1928,6 +2303,35 @@ fn workflow_agent_status_color(status: WorkflowAgentStatus, theme: &Theme) -> Co
 }
 
 fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
+    subagent_progress_label_with_activity_limit(task, Some(32))
+}
+
+fn subagent_live_progress_label(task: &BackgroundTaskSummary) -> String {
+    let mut parts = Vec::new();
+    if let Some(agent_type) = task.agent_type.as_deref() {
+        parts.push(agent_type.to_string());
+    }
+    if let Some(turn) = task.subagent_turn {
+        parts.push(format!("turn {turn}"));
+    }
+    if let Some(activity) = task.subagent_current_activity.as_deref() {
+        parts.push(activity.to_string());
+    }
+    if let Some(usage) = task.usage {
+        parts.push(format!(
+            "{} tok ${:.6}",
+            usage.total_tokens(),
+            usage.estimated_cost_usd
+        ));
+    }
+    parts.push(elapsed_label(task));
+    parts.join(", ")
+}
+
+fn subagent_progress_label_with_activity_limit(
+    task: &BackgroundTaskSummary,
+    activity_limit: Option<usize>,
+) -> String {
     let mut parts = Vec::new();
     if let Some(agent_type) = task.agent_type.as_deref() {
         parts.push(agent_type.to_string());
@@ -1959,7 +2363,11 @@ fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
     // shell command), so it is clamped and rendered last: when the row
     // truncates, the fixed-width fields stay visible.
     if let Some(activity) = task.subagent_current_activity.as_deref() {
-        parts.push(clamp_label(activity, 32));
+        parts.push(
+            activity_limit
+                .map(|limit| clamp_label(activity, limit))
+                .unwrap_or_else(|| activity.to_string()),
+        );
     }
     parts.join(", ")
 }
@@ -2201,7 +2609,17 @@ fn append_message_lines(
                 Span::styled(status_text, Style::default().fg(theme.muted)),
             ]));
             if let Some(out) = output {
-                append_tool_output_lines(lines, out, *expanded, force_expand, theme);
+                if !is_workflow_draft_tool(name)
+                    || !append_workflow_draft_preview_lines(
+                        lines,
+                        out,
+                        *expanded,
+                        force_expand,
+                        theme,
+                    )
+                {
+                    append_tool_output_lines(lines, out, *expanded, force_expand, theme);
+                }
             }
             if let Some(diff) = diff {
                 append_diff_lines(lines, diff, theme, refined_diff);
@@ -2526,6 +2944,89 @@ fn append_tool_output_lines(
             Style::default().fg(theme.muted),
         )));
     }
+}
+
+fn is_workflow_draft_tool(name: &str) -> bool {
+    matches!(name, "WorkflowDraft" | "workflow_draft")
+}
+
+fn append_workflow_draft_preview_lines(
+    lines: &mut Vec<Line<'static>>,
+    output: &str,
+    expanded: bool,
+    force_expand: bool,
+    theme: &Theme,
+) -> bool {
+    let Ok(draft) = serde_json::from_str::<WorkflowDraft>(output) else {
+        return false;
+    };
+    let risk = match draft.source_mutation_risk {
+        WorkflowSourceMutationRisk::ReadOnlyLikely => "read only likely",
+        WorkflowSourceMutationRisk::SourceMutationPossible => "source mutation possible",
+    };
+    let agents = draft
+        .estimated_agent_count
+        .map(|count| format!("{count} agents"))
+        .unwrap_or_else(|| "dynamic agent count".to_string());
+    lines.push(Line::from(vec![
+        Span::styled(
+            "    Workflow preview · ",
+            Style::default()
+                .fg(theme.approval)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            draft.name.clone(),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("    {}", draft.description),
+        Style::default().fg(theme.text),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("    phases · ", Style::default().fg(theme.muted)),
+        Span::styled(draft.phases.join(" → "), Style::default().fg(theme.border)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "    {agents} · concurrency {} · {risk}",
+            draft.max_configured_concurrent_agents
+        ),
+        Style::default().fg(match draft.source_mutation_risk {
+            WorkflowSourceMutationRisk::ReadOnlyLikely => theme.muted,
+            WorkflowSourceMutationRisk::SourceMutationPossible => theme.warning,
+        }),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("    draft · {}", draft.draft_id),
+        Style::default().fg(theme.muted),
+    )));
+
+    if expanded || force_expand {
+        lines.push(Line::from(Span::styled(
+            "    JavaScript",
+            Style::default()
+                .fg(theme.approval)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let max_lines = if force_expand { usize::MAX } else { 40 };
+        let mut script_lines = draft.script.lines();
+        for script_line in script_lines.by_ref().take(max_lines) {
+            lines.push(Line::from(Span::styled(
+                format!("      {script_line}"),
+                Style::default().fg(theme.muted),
+            )));
+        }
+        let hidden = script_lines.count();
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("      [+{hidden} lines]"),
+                Style::default().fg(theme.muted),
+            )));
+        }
+    }
+    true
 }
 
 fn spinner_frame(tick: u64) -> &'static str {
@@ -3478,16 +3979,38 @@ fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> Color {
     }
 }
 
-/// The activity indicator shown on its own line directly above the composer. Returns
-/// `None` while idle so the line collapses to zero height and a resting session stays
-/// clean; every other status renders a coloured dot, a label, and (while running) the
-/// elapsed wall-clock time.
+/// First activity row used by focused unit tests. Production rendering uses the full
+/// bounded stack returned by `activity_lines`.
+#[cfg(test)]
 fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::style::Color)> {
+    activity_lines(state, theme).into_iter().next()
+}
+
+const MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS: usize = 4;
+
+fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::style::Color)> {
+    let mut lines = Vec::new();
     if state.composer_images.is_paste_in_flight() {
-        return Some(("● reading image...".to_string(), theme.warning));
+        lines.push(("● reading image...".to_string(), theme.warning));
+    } else if let Some(line) = foreground_activity_line(state, theme) {
+        lines.push(line);
     }
+
+    if state.panel_mode == PanelMode::Conversation {
+        lines.extend(background_task_activity_lines(
+            state.workflow_tasks(),
+            theme,
+        ));
+    }
+    lines
+}
+
+fn foreground_activity_line(
+    state: &AppState,
+    theme: &Theme,
+) -> Option<(String, ratatui::style::Color)> {
     match &state.status {
-        AppStatus::Idle => background_task_activity_line(state.workflow_tasks(), theme),
+        AppStatus::Idle => None,
         AppStatus::Setup | AppStatus::SessionPicker => None,
         AppStatus::Running => {
             let live_elapsed = state
@@ -3509,13 +4032,92 @@ fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::st
     }
 }
 
-fn background_task_activity_line(
+fn background_task_activity_lines(
     tasks: &[BackgroundTaskSummary],
     theme: &Theme,
-) -> Option<(String, ratatui::style::Color)> {
-    let activity = TaskActivitySummary::from_tasks(tasks);
+) -> Vec<(String, ratatui::style::Color)> {
+    let subagents = agent_workspace_rows(tasks)
+        .into_iter()
+        .filter_map(|row| match row {
+            AgentWorkspaceRow::Subagent { task, .. }
+                if task.status.is_active() || task.status.requires_attention() =>
+            {
+                Some(task)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let active_count = subagents
+        .iter()
+        .filter(|task| task.status.is_active())
+        .count();
+    let attention_count = subagents
+        .iter()
+        .filter(|task| task.status.requires_attention())
+        .count();
+
+    let mut lines = Vec::new();
+    if !subagents.is_empty() {
+        let mut labels = Vec::new();
+        if active_count > 0 {
+            labels.push(format!("{active_count} active"));
+        }
+        if attention_count > 0 {
+            labels.push(format!("{attention_count} needs approval"));
+        }
+        lines.push((
+            format!("● Agents {} · /tasks manage", labels.join(" · ")),
+            if attention_count > 0 {
+                theme.approval
+            } else {
+                theme.warning
+            },
+        ));
+    }
+    lines.extend(
+        subagents
+            .iter()
+            .take(MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS)
+            .map(|task| {
+                let name = task.name.as_deref().unwrap_or(task.description.as_str());
+                let status = task_status_label(task.status);
+                let detail = subagent_live_progress_label(task);
+                let color = if task.status.requires_attention() {
+                    theme.approval
+                } else {
+                    task_status_color(task.status, theme)
+                };
+                (format!("  ● {name} · {status} · {detail}"), color)
+            }),
+    );
+
+    if subagents.len() > MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS {
+        let hidden = subagents.len() - MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS;
+        let color = if subagents[MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS..]
+            .iter()
+            .any(|task| task.status.requires_attention())
+        {
+            theme.approval
+        } else {
+            theme.muted
+        };
+        lines.push((format!("  +{hidden} more · /tasks manage"), color));
+    }
+
+    let activity = tasks
+        .iter()
+        .filter(|task| task.task_type != TaskType::Subagent)
+        .fold(TaskActivitySummary::default(), |mut activity, task| {
+            if task.status.is_active() {
+                activity.active_count += 1;
+            }
+            if task.status.requires_attention() {
+                activity.attention_count += 1;
+            }
+            activity
+        });
     if !activity.has_active_tasks() && !activity.requires_attention() {
-        return None;
+        return lines;
     }
 
     let mut labels = Vec::with_capacity(2);
@@ -3544,18 +4146,24 @@ fn background_task_activity_line(
     } else {
         theme.warning
     };
-    Some((format!("● {}", labels.join(" · ")), color))
+    lines.push((format!("● {}", labels.join(" · ")), color));
+    lines
 }
 
-fn render_activity(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let Some((text, color)) = activity_line(state, theme) else {
-        return;
-    };
+fn render_activity(
+    frame: &mut Frame,
+    area: Rect,
+    activity_lines: &[(String, ratatui::style::Color)],
+) {
     // First row stays blank as a spacer between the transcript tail and the indicator.
-    let paragraph = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(format!(" {text}"), Style::default().fg(color))),
-    ]);
+    let mut lines = vec![Line::from("")];
+    lines.extend(activity_lines.iter().map(|(text, color)| {
+        Line::from(Span::styled(
+            format!(" {text}"),
+            Style::default().fg(*color),
+        ))
+    }));
+    let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
 }
 
@@ -7760,6 +8368,77 @@ mod tests {
     }
 
     #[test]
+    fn idle_default_view_renders_each_active_subagent_activity() {
+        let mut state = test_state();
+        state.status = AppStatus::Idle;
+        let mut auth = workflow_task_for_agent_dashboard(
+            "auth audit",
+            "auth",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        auth.task_type = TaskType::Subagent;
+        auth.workflow_agents.clear();
+        auth.subagent_turn = Some(2);
+        auth.subagent_current_activity = Some("bash: cargo test auth".to_string());
+        auth.last_activity_at_ms = Some(2_000);
+
+        let mut sandbox = workflow_task_for_agent_dashboard(
+            "sandbox review",
+            "sandbox",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        sandbox.task_type = TaskType::Subagent;
+        sandbox.workflow_agents.clear();
+        sandbox.subagent_turn = Some(3);
+        sandbox.subagent_current_activity = Some("read: sandbox_policy.rs".to_string());
+        sandbox.last_activity_at_ms = Some(3_000);
+        state.replace_workflow_tasks_for_test(vec![auth, sandbox]);
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 18))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("auth audit"));
+        assert!(rendered.contains("bash: cargo test auth"));
+        assert!(rendered.contains("sandbox review"));
+        assert!(rendered.contains("read: sandbox_policy.rs"));
+    }
+
+    #[test]
+    fn default_agent_dock_is_stable_and_reports_overflow() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let tasks = (1..=5)
+            .map(|index| {
+                let mut task = workflow_task_for_agent_dashboard(
+                    &format!("agent {index}"),
+                    &format!("agent-{index}"),
+                    orca_core::workflow_types::WorkflowAgentStatus::Running,
+                );
+                task.task_type = TaskType::Subagent;
+                task.workflow_agents.clear();
+                task.created_at_ms = index * 1_000;
+                task.last_activity_at_ms = Some(index * 1_000);
+                task
+            })
+            .collect::<Vec<_>>();
+
+        let lines = background_task_activity_lines(&tasks, &theme);
+
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0].0, "● Agents 5 active · /tasks manage");
+        assert!(lines[1].0.contains("agent 1"));
+        assert!(lines[4].0.contains("agent 4"));
+        assert_eq!(lines[5].0, "  +1 more · /tasks manage");
+        assert!(lines.iter().all(|(line, _)| !line.contains("agent 5")));
+    }
+
+    #[test]
     fn workflow_progress_label_summarizes_agents_and_phases() {
         let task = BackgroundTaskSummary {
             id: "task-1".to_string(),
@@ -7796,6 +8475,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation: None,
@@ -7851,6 +8531,7 @@ mod tests {
                 estimated_cost_usd: 0.0000252,
             }),
             subagent_current_activity: Some("bash: cargo test".to_string()),
+            subagent_activity_history: Vec::new(),
             subagent_turn: Some(2),
             last_activity_at_ms: Some(1_500),
             continuation: Some(orca_core::task_types::TaskContinuationSummary {
@@ -7947,6 +8628,7 @@ mod tests {
             workflow_failure_count: 1,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation: None,
@@ -8007,9 +8689,11 @@ mod tests {
                 orca_core::workflow_types::WorkflowAgentStatus::Completed,
             ),
         ]);
+        state.select_next_agent();
+        state.select_next_agent();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18))
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
             .expect("test backend");
 
         terminal
@@ -8017,7 +8701,7 @@ mod tests {
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
 
-        assert!(rendered.contains("Agents"));
+        assert!(rendered.contains("Tasks Workspace"));
         assert!(rendered.contains("audit"));
         assert!(rendered.contains("review"));
         assert!(rendered.contains("scan"));
@@ -8028,6 +8712,269 @@ mod tests {
         assert!(rendered.contains("running"));
         assert!(rendered.contains("completed"));
         assert!(rendered.contains("150 tok"));
+    }
+
+    #[test]
+    fn agents_panel_renders_ordinary_subagent_rows() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Agents;
+        let mut task = workflow_task_for_agent_dashboard(
+            "inspect permission relay",
+            "ordinary",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.task_type = TaskType::Subagent;
+        task.workflow_agents.clear();
+        task.subagent_turn = Some(4);
+        task.subagent_current_activity = Some("bash: cargo test child_permission".to_string());
+        state.replace_workflow_tasks_for_test(vec![task]);
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 18))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("inspect permission relay"));
+        assert!(rendered.contains("subagent"));
+        assert!(rendered.contains("turn 4"));
+        assert!(rendered.contains("bash: cargo test child_permission"));
+    }
+
+    #[test]
+    fn agent_workspace_renders_summary_focus_and_truthful_actions() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Agents;
+        let mut parent = workflow_task_for_agent_dashboard(
+            "main audit",
+            "parent",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        parent.task_type = TaskType::MainSession;
+        parent.workflow_agents.clear();
+        parent.id = "parent".to_string();
+        parent.created_at_ms = 500;
+
+        let mut running = workflow_task_for_agent_dashboard(
+            "auth review",
+            "auth",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        running.task_type = TaskType::Subagent;
+        running.workflow_agents.clear();
+        running.id = "auth-child".to_string();
+        running.parent_task_id = Some("parent".to_string());
+        running.created_at_ms = 1_000;
+        running.started_at_ms = Some(current_time_ms().saturating_sub(8_000));
+        running.subagent_turn = Some(4);
+        running.subagent_current_activity = Some("bash: cargo test child_permission".to_string());
+        running.subagent_activity_history = vec![
+            orca_core::task_types::SubagentActivityEntry {
+                occurred_at_ms: 1_001,
+                activity: "read: src/auth.rs".to_string(),
+                turn: Some(3),
+            },
+            orca_core::task_types::SubagentActivityEntry {
+                occurred_at_ms: 1_002,
+                activity: "bash: cargo test child_permission".to_string(),
+                turn: Some(4),
+            },
+        ];
+        running.usage = Some(orca_core::cost_types::UsageTotals {
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_tokens: 10,
+            estimated_cost_usd: 0.0000252,
+        });
+        running.publication_revision = Some(9);
+        running.continuation = Some(orca_core::task_types::TaskContinuationSummary {
+            continuation_id: "continuation-auth".to_string(),
+            attempt_id: "attempt-auth".to_string(),
+            checkpoint_id: Some("checkpoint-auth".to_string()),
+            revision: 3,
+            resumable: true,
+            indeterminate: false,
+        });
+
+        let mut approval = workflow_task_for_agent_dashboard(
+            "sandbox review",
+            "sandbox",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        approval.task_type = TaskType::Subagent;
+        approval.workflow_agents.clear();
+        approval.id = "sandbox-child".to_string();
+        approval.created_at_ms = 2_000;
+        approval.status = TaskStatus::ApprovalRequired;
+        approval.subagent_current_activity = Some("permission: write /tmp/report".to_string());
+        approval.publication_revision = Some(10);
+        state.replace_workflow_tasks_for_test(vec![approval, running, parent]);
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Tasks Workspace"));
+        assert!(rendered.contains("2 tasks"));
+        assert!(rendered.contains("1 active"));
+        assert!(rendered.contains("1 needs approval"));
+        assert!(rendered.contains("auth review"));
+        assert!(rendered.contains("sandbox review"));
+        assert!(rendered.contains("Focus auth review"));
+        assert!(rendered.contains("parent main audit"));
+        assert!(rendered.contains("turn 4"));
+        assert!(rendered.contains("150 tok"));
+        assert!(rendered.contains("bash: cargo test child_permission"));
+        assert!(rendered.contains("history read: src/auth.rs"));
+        assert!(rendered.contains("resumable continuation-auth"));
+        assert!(rendered.contains("Enter transcript"));
+        assert!(rendered.contains("s stop"));
+        assert!(rendered.contains("Esc close"));
+    }
+
+    #[test]
+    fn workflow_owned_agent_focus_does_not_advertise_unsupported_controls() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Agents;
+        state.replace_workflow_tasks_for_test(vec![workflow_task_for_agent_dashboard(
+            "security audit",
+            "scan",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        )]);
+        state.select_next_agent();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("workflow-owned · read only"));
+        assert!(!rendered.contains("Enter transcript"));
+        assert!(!rendered.contains("s stop"));
+        assert!(rendered.contains("Esc close"));
+    }
+
+    #[test]
+    fn agent_workspace_keeps_status_and_composer_visible_in_a_narrow_terminal() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Agents;
+        let mut task = workflow_task_for_agent_dashboard(
+            "permission-boundary-review-with-a-very-long-name",
+            "narrow",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.task_type = TaskType::Subagent;
+        task.workflow_agents.clear();
+        task.subagent_current_activity =
+            Some("bash: cargo test an_extremely_long_test_target_without_spaces".to_string());
+        task.publication_revision = Some(3);
+        state.replace_workflow_tasks_for_test(vec![task]);
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(52, 12))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Tasks Workspace"));
+        assert!(rendered.contains("auto-edit"));
+        assert!(rendered.contains("Esc close"));
+    }
+
+    #[test]
+    fn agent_workspace_renders_the_typed_safe_transcript_checkpoint() {
+        use orca_runtime::surface::{
+            DisplayText, NonEmptyText, SurfaceHistoryId, SurfaceTaskId, TaskRevision,
+            TaskTranscriptItem, TaskTranscriptSnapshot, TaskTranscriptToolStatus,
+        };
+
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Agents;
+        let mut task = workflow_task_for_agent_dashboard(
+            "auth review",
+            "auth",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.id = "auth-child".to_string();
+        task.task_type = TaskType::Subagent;
+        task.workflow_agents.clear();
+        task.publication_revision = Some(9);
+        state.replace_workflow_tasks_for_test(vec![task]);
+        let request = crate::protocol::TaskTranscriptRequest {
+            task_id: "auth-child".to_string(),
+            expected_revision: 9,
+        };
+        state.begin_task_transcript_request(request.clone());
+        state.update(TuiEvent::TaskTranscriptResult {
+            request,
+            result: crate::protocol::TaskTranscriptResult::Found(TaskTranscriptSnapshot {
+                task_id: SurfaceTaskId::try_new("auth-child").unwrap(),
+                task_revision: TaskRevision::try_new(9).unwrap(),
+                checkpoint_revision: 12,
+                turn: 4,
+                usage: orca_core::budget::BudgetUsage {
+                    turns: 4,
+                    tool_calls: 1,
+                    cost_usd_micros: 25,
+                    wall_time_ms: 8_000,
+                },
+                complete: false,
+                items: vec![
+                    TaskTranscriptItem::User {
+                        content: DisplayText::new("Review the permission boundary"),
+                    },
+                    TaskTranscriptItem::Assistant {
+                        content: DisplayText::new("I found the actor-owned check"),
+                    },
+                    TaskTranscriptItem::ToolCall {
+                        id: SurfaceHistoryId::try_new("tool-1").unwrap(),
+                        name: NonEmptyText::try_new("bash").unwrap(),
+                    },
+                    TaskTranscriptItem::ToolResult {
+                        id: SurfaceHistoryId::try_new("tool-1").unwrap(),
+                        content: DisplayText::new("17 tests passed"),
+                        status: TaskTranscriptToolStatus::Completed,
+                    },
+                ],
+            }),
+        });
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Agent Transcript"));
+        assert!(rendered.contains("auth review"));
+        assert!(rendered.contains("checkpoint 12"));
+        assert!(rendered.contains("turn 4"));
+        assert!(rendered.contains("live"));
+        assert!(rendered.contains("Review the permission boundary"));
+        assert!(rendered.contains("I found the actor-owned check"));
+        assert!(rendered.contains("bash"));
+        assert!(rendered.contains("17 tests passed"));
+        assert!(rendered.contains("Esc back"));
     }
 
     #[test]
@@ -8059,6 +9006,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8102,6 +9050,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8144,6 +9093,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8191,6 +9141,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8245,6 +9196,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8300,6 +9252,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8344,6 +9297,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8444,6 +9398,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8535,6 +9490,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(4_000),
             continuation: None,
@@ -8594,6 +9550,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: Some(1_000),
             continuation: None,
@@ -8665,6 +9622,7 @@ mod tests {
             workflow_failure_count: 0,
             usage: None,
             subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation: None,
@@ -10559,5 +11517,59 @@ mod tests {
             "messages area ({}) must not consume the input/status rows (term {h})",
             state.viewport.visible_height
         );
+    }
+
+    #[test]
+    fn workflow_draft_tool_output_renders_a_compact_preview_and_expandable_script() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let output = serde_json::json!({
+            "draftId": "workflow-draft-1",
+            "sessionId": "session-1",
+            "cwd": "/tmp/project",
+            "name": "parallel-audit",
+            "description": "Audit auth and sandbox behavior in parallel.",
+            "phases": ["scan", "review", "report"],
+            "script": "export const meta = { name: 'parallel-audit' };\nexport default await phase('scan', async () => []);",
+            "scriptPath": "/tmp/project/.orca/workflow-drafts/workflow-draft-1/script.js",
+            "estimatedAgentCount": 4,
+            "maxConfiguredConcurrentAgents": 3,
+            "sourceMutationRisk": "read_only_likely",
+            "createdAtMs": 1
+        })
+        .to_string();
+
+        let mut collapsed = Vec::new();
+        assert!(append_workflow_draft_preview_lines(
+            &mut collapsed,
+            &output,
+            false,
+            false,
+            &theme,
+        ));
+        let collapsed_text = collapsed
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed_text.contains("Workflow preview · parallel-audit"));
+        assert!(collapsed_text.contains("scan → review → report"));
+        assert!(collapsed_text.contains("4 agents · concurrency 3 · read only likely"));
+        assert!(!collapsed_text.contains("export default"));
+
+        let mut expanded = Vec::new();
+        assert!(append_workflow_draft_preview_lines(
+            &mut expanded,
+            &output,
+            true,
+            false,
+            &theme,
+        ));
+        let expanded_text = expanded
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_text.contains("JavaScript"));
+        assert!(expanded_text.contains("export default await phase"));
     }
 }
