@@ -3226,7 +3226,9 @@ mod tests {
                     ) => {
                         break (
                             key,
-                            crate::protocol::TuiInteractionResponse::Permission(true),
+                            crate::protocol::TuiInteractionResponse::Permission(
+                                crate::protocol::TuiPermissionDecision::AllowOnce,
+                            ),
                         );
                     }
                     (
@@ -4374,7 +4376,9 @@ mod tests {
             controller
                 .respond_surface_interaction(
                     &key,
-                    &crate::protocol::TuiInteractionResponse::Permission(true)
+                    &crate::protocol::TuiInteractionResponse::Permission(
+                        crate::protocol::TuiPermissionDecision::AllowOnce,
+                    )
                 )
                 .expect("typed permission response")
         );

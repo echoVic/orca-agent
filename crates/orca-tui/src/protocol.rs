@@ -100,10 +100,30 @@ impl TuiInteractionKey {
     }
 }
 
+/// Typed outcome of a permission prompt. The bool wire form could only say
+/// allow/deny for the current turn; this preserves the user's scope choice
+/// (allow once vs. allow for the rest of the session) so the runtime receives
+/// the real [`PermissionGrantScope`] instead of a hard-coded `Turn`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiPermissionDecision {
+    /// Allow this request for the current turn only.
+    AllowOnce,
+    /// Allow this request and remember it for the rest of the session.
+    AllowSession,
+    /// Reject this request.
+    Deny,
+}
+
+impl TuiPermissionDecision {
+    pub fn is_allow(self) -> bool {
+        matches!(self, Self::AllowOnce | Self::AllowSession)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TuiInteractionResponse {
     Approval(bool),
-    Permission(bool),
+    Permission(TuiPermissionDecision),
     UserInput(String),
     McpElicitation {
         accepted: bool,

@@ -3863,7 +3863,9 @@ fn hosted_canonical_permission_uses_operation_fence_and_resumes_turn() {
         assert!(harness.runtime.controller().has_surface_active());
         harness.send(UserAction::RespondToInteraction {
             key,
-            response: TuiInteractionResponse::Permission(true),
+            response: TuiInteractionResponse::Permission(
+                crate::protocol::TuiPermissionDecision::AllowOnce,
+            ),
         });
 
         let terminal =

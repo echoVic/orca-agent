@@ -878,22 +878,32 @@ impl TuiSurfaceTaskControl {
                     },
                 }
             }
-            (TuiInteractionKind::Permission, TuiInteractionResponse::Permission(approved)) => {
+            (TuiInteractionKind::Permission, TuiInteractionResponse::Permission(decision)) => {
                 let permissions = binding
                     .permissions
                     .clone()
                     .ok_or_else(|| io::Error::other("typed TUI permission profile is missing"))?;
-                let decision = if *approved {
-                    orca_runtime::surface::SurfacePermissionClientDecision::Allow {
-                        scope: orca_runtime::surface::PermissionGrantScope::Turn,
-                        permissions,
-                        strict_auto_review: false,
+                let decision = match decision {
+                    crate::protocol::TuiPermissionDecision::AllowOnce => {
+                        orca_runtime::surface::SurfacePermissionClientDecision::Allow {
+                            scope: orca_runtime::surface::PermissionGrantScope::Turn,
+                            permissions,
+                            strict_auto_review: false,
+                        }
                     }
-                } else {
-                    orca_runtime::surface::SurfacePermissionClientDecision::Deny {
-                        scope: orca_runtime::surface::PermissionGrantScope::Turn,
-                        permissions,
-                        strict_auto_review: false,
+                    crate::protocol::TuiPermissionDecision::AllowSession => {
+                        orca_runtime::surface::SurfacePermissionClientDecision::Allow {
+                            scope: orca_runtime::surface::PermissionGrantScope::Session,
+                            permissions,
+                            strict_auto_review: false,
+                        }
+                    }
+                    crate::protocol::TuiPermissionDecision::Deny => {
+                        orca_runtime::surface::SurfacePermissionClientDecision::Deny {
+                            scope: orca_runtime::surface::PermissionGrantScope::Turn,
+                            permissions,
+                            strict_auto_review: false,
+                        }
                     }
                 };
                 orca_runtime::surface::SurfaceClientInteractionAnswer::PermissionRequest {

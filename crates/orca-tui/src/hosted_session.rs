@@ -31,6 +31,7 @@ use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::protocol::SessionAttachmentId;
 use crate::protocol::{
     TuiEvent, TuiInteractionKind, TuiInteractionResponse, TuiMcpElicitationMode,
+    TuiPermissionDecision,
 };
 use crate::surface_actions::TuiSurfaceActions;
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
@@ -106,8 +107,8 @@ impl RuntimePermissionRequestHandler for QueuePermissionHandler {
                 permission_kind: permission_kind(request),
             },
         )?;
-        let approved = match response {
-            TuiInteractionResponse::Permission(approved) => approved,
+        let decision = match response {
+            TuiInteractionResponse::Permission(decision) => decision,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -115,13 +116,22 @@ impl RuntimePermissionRequestHandler for QueuePermissionHandler {
                 ));
             }
         };
+        let (decision, scope) = match decision {
+            TuiPermissionDecision::AllowOnce => (
+                PermissionResponseDecision::Allow,
+                PermissionGrantScope::Turn,
+            ),
+            TuiPermissionDecision::AllowSession => (
+                PermissionResponseDecision::Allow,
+                PermissionGrantScope::Session,
+            ),
+            TuiPermissionDecision::Deny => {
+                (PermissionResponseDecision::Deny, PermissionGrantScope::Turn)
+            }
+        };
         Ok(RuntimePermissionResponse {
-            decision: if approved {
-                PermissionResponseDecision::Allow
-            } else {
-                PermissionResponseDecision::Deny
-            },
-            scope: PermissionGrantScope::Turn,
+            decision,
+            scope,
             permissions: request.permissions.clone(),
             strict_auto_review: false,
         })
