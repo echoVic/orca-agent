@@ -76,6 +76,7 @@ fn run_with_timeout(command: &str, timeout: Duration) -> VerificationResult {
             | LaunchError::EnforcementAdvisory
             | LaunchError::UntrustedProcessClass
             | LaunchError::CapabilityCeilingExceeded
+            | LaunchError::RemoteBackendUnavailable
             | LaunchError::NetworkTargetsUnsupported => io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("verification broker rejected launch: {error:?}"),

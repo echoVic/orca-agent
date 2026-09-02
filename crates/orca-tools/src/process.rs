@@ -83,6 +83,10 @@ pub fn spawn_with_capability(
                 io::ErrorKind::Unsupported,
                 "target-scoped network capabilities are not supported by the selected backend",
             ),
+            LaunchError::RemoteBackendUnavailable => io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote sandbox execution requested but no remote backend is available",
+            ),
             LaunchError::CapabilityCeilingExceeded => io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "process capability exceeds the broker hard ceiling",

@@ -51,17 +51,25 @@ impl ExecutionProfile {
         }
     }
 
+    /// A child may only narrow its parent's authority; it can never widen it or
+    /// cross into a different execution domain. `ReadOnly` is the universal
+    /// floor (it grants no execution), so every profile may drop to it. Within
+    /// the host-execution domain, `TrustedHost` (full host) is a superset of
+    /// `Workspace` (workspace-scoped host), so it may narrow to it. But
+    /// `RemoteSandbox` is a *remote* execution domain: allowing it to become
+    /// `Workspace`/`TrustedHost` would hand the child *local host* execution the
+    /// parent never held, which is an escalation rather than a narrowing.
     pub fn child_may_request(self, requested: Self) -> bool {
         match self {
             Self::ReadOnly => requested == Self::ReadOnly,
             Self::Workspace => matches!(requested, Self::ReadOnly | Self::Workspace),
-            Self::TrustedHost => requested != Self::RemoteSandbox,
-            Self::RemoteSandbox => {
+            Self::TrustedHost => {
                 matches!(
                     requested,
-                    Self::ReadOnly | Self::Workspace | Self::RemoteSandbox
+                    Self::ReadOnly | Self::Workspace | Self::TrustedHost
                 )
             }
+            Self::RemoteSandbox => matches!(requested, Self::ReadOnly | Self::RemoteSandbox),
         }
     }
 }
@@ -800,5 +808,23 @@ mod tests {
         assert!(ExecutionProfile::Workspace.child_may_request(ExecutionProfile::Workspace));
         assert!(!ExecutionProfile::Workspace.child_may_request(ExecutionProfile::TrustedHost));
         assert!(!ExecutionProfile::ReadOnly.child_may_request(ExecutionProfile::Workspace));
+    }
+
+    #[test]
+    fn remote_sandbox_child_cannot_cross_into_host_execution() {
+        // RemoteSandbox is a remote domain; a child may keep it or drop to the
+        // read-only floor, but must never obtain local host execution.
+        assert!(ExecutionProfile::RemoteSandbox.child_may_request(ExecutionProfile::RemoteSandbox));
+        assert!(ExecutionProfile::RemoteSandbox.child_may_request(ExecutionProfile::ReadOnly));
+        assert!(!ExecutionProfile::RemoteSandbox.child_may_request(ExecutionProfile::Workspace));
+        assert!(!ExecutionProfile::RemoteSandbox.child_may_request(ExecutionProfile::TrustedHost));
+    }
+
+    #[test]
+    fn trusted_host_child_narrows_within_host_domain_but_never_goes_remote() {
+        assert!(ExecutionProfile::TrustedHost.child_may_request(ExecutionProfile::TrustedHost));
+        assert!(ExecutionProfile::TrustedHost.child_may_request(ExecutionProfile::Workspace));
+        assert!(ExecutionProfile::TrustedHost.child_may_request(ExecutionProfile::ReadOnly));
+        assert!(!ExecutionProfile::TrustedHost.child_may_request(ExecutionProfile::RemoteSandbox));
     }
 }

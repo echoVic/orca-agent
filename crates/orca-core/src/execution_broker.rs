@@ -15,6 +15,10 @@ pub enum LaunchError {
     UntrustedProcessClass,
     CapabilityCeilingExceeded,
     NetworkTargetsUnsupported,
+    /// The profile requests remote execution, but no remote sandbox backend is
+    /// wired into this broker. Rejecting fail-closed prevents a "nominally
+    /// remote, actually local" launch from silently running on the host.
+    RemoteBackendUnavailable,
     Cwd(io::Error),
     Spawn(io::Error),
 }
@@ -33,6 +37,10 @@ pub struct ExecutionBroker {
     profile: ExecutionProfile,
     backend: String,
     ceiling: CapabilityCeiling,
+    /// Identity of a wired remote execution backend, if any. `None` means this
+    /// broker can only spawn locally, so a `RemoteSandbox` profile must be
+    /// rejected rather than silently satisfied by a local process.
+    remote_backend: Option<String>,
 }
 
 impl ExecutionBroker {
@@ -46,6 +54,7 @@ impl ExecutionBroker {
             profile: ExecutionProfile::Workspace,
             backend: backend.into(),
             ceiling: CapabilityCeiling::from(crate::capability::CapabilitySet::all()),
+            remote_backend: None,
         }
     }
 
@@ -59,6 +68,7 @@ impl ExecutionBroker {
             profile: ExecutionProfile::Workspace,
             backend: backend.into(),
             ceiling,
+            remote_backend: None,
         }
     }
 
@@ -73,6 +83,14 @@ impl ExecutionBroker {
             .capabilities
             .intersect(&profile.capability_ceiling())
             .expect("execution profile capability intersection is valid");
+        self
+    }
+
+    /// Register a concrete remote execution backend. Until this is called, a
+    /// `RemoteSandbox` profile is rejected fail-closed so it can never be
+    /// serviced by the local spawn path.
+    pub fn with_remote_backend(mut self, backend: impl Into<String>) -> Self {
+        self.remote_backend = Some(backend.into());
         self
     }
 
@@ -184,10 +202,16 @@ impl ExecutionBroker {
         capability
             .ensure_subset_of(&self.ceiling)
             .map_err(|_| LaunchError::CapabilityCeilingExceeded)?;
-        if self.profile == ExecutionProfile::RemoteSandbox
-            && capability.process_class != CapabilityProcessClass::RemoteSandbox
-        {
-            return Err(LaunchError::UntrustedProcessClass);
+        if self.profile == ExecutionProfile::RemoteSandbox {
+            // A remote profile is only satisfiable by an actual remote backend.
+            // Without one, refuse rather than fall through to the local spawn
+            // path below, which would run the "remote" workload on the host.
+            if self.remote_backend.is_none() {
+                return Err(LaunchError::RemoteBackendUnavailable);
+            }
+            if capability.process_class != CapabilityProcessClass::RemoteSandbox {
+                return Err(LaunchError::UntrustedProcessClass);
+            }
         }
         if self.profile == ExecutionProfile::TrustedHost {
             return Ok(());
@@ -337,6 +361,30 @@ mod tests {
             )
             .expect("explicit trusted host profile");
         assert!(launched.child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn remote_sandbox_without_backend_refuses_local_launch() {
+        // No remote backend is wired, so a RemoteSandbox profile must fail
+        // closed instead of silently spawning the workload on the host.
+        let broker = ExecutionBroker::new(EnforcementState::Enforced)
+            .with_profile(ExecutionProfile::RemoteSandbox);
+        let error = broker
+            .launch(
+                Command::new("true"),
+                read_only_capability("remote-no-backend"),
+            )
+            .expect_err("remote sandbox without backend must reject");
+        assert!(matches!(error, LaunchError::RemoteBackendUnavailable));
+
+        // authorize_platform shares the same choke point and must also refuse.
+        let platform_error = broker
+            .authorize_platform(&read_only_capability("remote-no-backend-platform"))
+            .expect_err("remote sandbox platform authorization must reject");
+        assert!(matches!(
+            platform_error,
+            LaunchError::RemoteBackendUnavailable
+        ));
     }
 
     #[test]
