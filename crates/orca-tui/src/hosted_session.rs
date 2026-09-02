@@ -314,6 +314,22 @@ fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
             output: string("output").map(str::to_string),
             error: string("error").map(str::to_string),
         }),
+        EventType::WorkflowTasksUpdated => {
+            serde_json::from_value(event.payload.clone())
+                .ok()
+                .map(|payload: serde_json::Value| {
+                    TuiEvent::WorkflowTasksUpdated(
+                        serde_json::from_value(payload.get("tasks").cloned().unwrap_or_default())
+                            .unwrap_or_default(),
+                    )
+                })
+        }
+        EventType::TaskStatusUpdated => event
+            .payload
+            .get("task")
+            .cloned()
+            .and_then(|task| serde_json::from_value(task).ok())
+            .map(TuiEvent::TaskStatusUpdated),
         EventType::PlanUpdated => serde_json::from_value(event.payload.clone()).ok().map(
             |plan: orca_core::plan_types::UpdatePlanArgs| TuiEvent::PlanUpdated {
                 explanation: plan.explanation,
@@ -799,6 +815,22 @@ mod tests {
             runtime_event_to_tui(&completed_response),
             Some(TuiEvent::AssistantResponseCompleted(Some(message), Some(reasoning)))
                 if message == "final answer" && reasoning == "final reasoning"
+        ));
+    }
+
+    #[test]
+    fn runtime_task_events_are_forwarded_to_tui() {
+        let event = EventEnvelope {
+            version: "1".to_string(),
+            run_id: "run".to_string(),
+            seq: 1,
+            timestamp_ms: 0,
+            event_type: EventType::WorkflowTasksUpdated,
+            payload: serde_json::json!({"tasks": []}),
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&event),
+            Some(TuiEvent::WorkflowTasksUpdated(tasks)) if tasks.is_empty()
         ));
     }
 

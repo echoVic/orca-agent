@@ -1264,11 +1264,7 @@ impl TuiSurfaceProjection {
                 SurfaceEvent::Operation(OperationPatch::Terminal { record })
                     if focused_operation.as_ref() == Some(&record.operation_id) =>
                 {
-                    if let Some(status) = operation_terminal_status(&record.terminal) {
-                        projected.push(TuiEvent::SessionCompleted {
-                            status: status.to_string(),
-                        });
-                    }
+                    projected.extend(operation_terminal_events(&record.terminal));
                     focused_operation = None;
                 }
                 SurfaceEvent::Goal(goal_patch) => {
@@ -1459,6 +1455,21 @@ impl TuiSurfaceProjection {
             .find(|operation| &operation.operation_id == operation_id)
             .and_then(|operation| operation.terminal.as_ref())
             .and_then(|record| operation_terminal_status(&record.terminal))
+    }
+
+    pub(crate) fn terminal_error_for_operation(
+        &self,
+        operation_id: &SurfaceOperationId,
+    ) -> Option<String> {
+        let snapshot = self.reducer_state.as_ref()?.snapshot();
+        snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .find(|operation| &operation.operation_id == operation_id)
+            .and_then(|operation| operation.terminal.as_ref())
+            .and_then(|record| operation_terminal_error(&record.terminal))
     }
 
     pub(crate) fn background_task_summary_for_operation(
@@ -1916,6 +1927,46 @@ fn tool_result_status(kind: SurfaceToolResultKind) -> &'static str {
     }
 }
 
+pub(crate) fn operation_terminal_events(terminal: &OperationTerminal) -> Vec<TuiEvent> {
+    let mut events = Vec::with_capacity(2);
+    if let Some(message) = operation_terminal_error(terminal) {
+        events.push(TuiEvent::Error(message));
+    }
+    if let Some(status) = operation_terminal_status(terminal) {
+        events.push(TuiEvent::SessionCompleted {
+            status: status.to_string(),
+        });
+    }
+    events
+}
+
+fn operation_terminal_error(terminal: &OperationTerminal) -> Option<String> {
+    match terminal {
+        OperationTerminal::Failed { message, .. }
+        | OperationTerminal::Panicked { message }
+        | OperationTerminal::JoinFailed { message } => {
+            let message = message.as_str();
+            Some(if message.is_empty() {
+                "Operation failed.".to_string()
+            } else {
+                message.to_string()
+            })
+        }
+        OperationTerminal::AbortedByRuntimeRestart { .. } => {
+            Some("Operation aborted because the runtime restarted.".to_string())
+        }
+        OperationTerminal::BudgetExhausted { .. } => {
+            Some("Operation stopped because its budget was exhausted.".to_string())
+        }
+        OperationTerminal::NotAdmitted { .. } => {
+            Some("Operation could not be admitted by the runtime.".to_string())
+        }
+        OperationTerminal::Succeeded { .. }
+        | OperationTerminal::Cancelled { .. }
+        | OperationTerminal::Shutdown { .. } => None,
+    }
+}
+
 fn operation_terminal_status(terminal: &OperationTerminal) -> Option<&'static str> {
     match terminal {
         OperationTerminal::Succeeded { .. } => Some("success"),
@@ -1996,21 +2047,23 @@ mod tests {
     use super::*;
     use orca_runtime::surface::{
         ByteOffset, CanonicalPath, CommitClass, CompactionState, ContextRevision,
-        CursorSourceRevision, DisplayText, DurableRevision, GoalCatalogRevision, GoalOwnerEpoch,
-        GoalPatch, GoalPatchEnvelope, GoalRevision, GoalUsage, McpCatalogRevision, NonEmptyText,
-        NonEmptyVec, PinnedContextRevision, PlanRevision, PolicyEpoch, ProviderReplayHealth,
-        SequenceNumber, SessionHealthRevision, SessionMetadataRevision, SettingsRevision,
-        Sha256Digest, SurfaceApprovalMode, SurfaceAssistantMessageItem,
-        SurfaceAssistantReasoningItem, SurfaceCommitId, SurfaceContextSnapshot,
-        SurfaceEventEnvelope, SurfaceEventId, SurfaceGoalId, SurfaceGoalStoreReceipt,
-        SurfaceIncarnation, SurfaceInputCorrelationId, SurfaceItemId, SurfaceMcpCatalogSnapshot,
-        SurfaceNetworkPermissions, SurfacePermissionRuleSet, SurfacePinnedContextSnapshot,
-        SurfacePlanSnapshot, SurfaceReasoningEffort, SurfaceRuntimeSettings, SurfaceScope,
-        SurfaceSessionHealth, SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubagent,
-        SurfaceSubagentId, SurfaceSubagentOwner, SurfaceSubagentSource, SurfaceSubagentStatus,
-        SurfaceTask, SurfaceTaskAttemptId, SurfaceTaskId, SurfaceTaskType, SurfaceThreadId,
-        SurfaceThreadSnapshot, SurfaceTurnId, TaskPatch, TaskRevision, ThreadOwnerEpoch,
-        ThreadPersistence, UsageTotals as SurfaceUsageTotals, UuidV7, canonical_batch_digest,
+        CursorSourceRevision, DisplayText, DurableRevision, FailureClass, GoalCatalogRevision,
+        GoalOwnerEpoch, GoalPatch, GoalPatchEnvelope, GoalRevision, GoalUsage, McpCatalogRevision,
+        NonEmptyText, NonEmptyVec, OperationTerminalRecord, PinnedContextRevision, PlanRevision,
+        PolicyEpoch, ProviderReplayHealth, SafeDiagnosticText, SequenceNumber,
+        SessionHealthRevision, SessionMetadataRevision, SettingsRevision, Sha256Digest,
+        SurfaceApprovalMode, SurfaceAssistantMessageItem, SurfaceAssistantReasoningItem,
+        SurfaceCommitId, SurfaceContextSnapshot, SurfaceEventEnvelope, SurfaceEventId,
+        SurfaceFinalizeIntentId, SurfaceGoalId, SurfaceGoalStoreReceipt, SurfaceIncarnation,
+        SurfaceInputCorrelationId, SurfaceItemId, SurfaceMcpCatalogSnapshot,
+        SurfaceNetworkPermissions, SurfaceOperationCompletionProof, SurfacePermissionRuleSet,
+        SurfacePinnedContextSnapshot, SurfacePlanSnapshot, SurfaceReasoningEffort,
+        SurfaceRuntimeSettings, SurfaceScope, SurfaceSessionHealth, SurfaceSettingsSnapshot,
+        SurfaceSnapshot, SurfaceSubagent, SurfaceSubagentId, SurfaceSubagentOwner,
+        SurfaceSubagentSource, SurfaceSubagentStatus, SurfaceTask, SurfaceTaskAttemptId,
+        SurfaceTaskId, SurfaceTaskType, SurfaceThreadId, SurfaceThreadSnapshot, SurfaceTurnId,
+        TaskPatch, TaskRevision, ThreadOwnerEpoch, ThreadPersistence,
+        UsageTotals as SurfaceUsageTotals, UuidV7, canonical_batch_digest,
     };
     use orca_runtime::surface::{SurfaceGenerationId, SurfaceUsageSnapshot, UsageRevision};
 
@@ -3141,6 +3194,72 @@ mod tests {
                 .expect("valid context batch")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn focused_failed_terminal_projects_diagnostic_before_completion() {
+        let before = cursor(0, 1);
+        let operation_id = operation_fence(21).operation_id;
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(2).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(22)).unwrap(),
+        };
+        let event = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(23)).unwrap(),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Operation {
+                operation_id: operation_id.clone(),
+            },
+            event: SurfaceEvent::Operation(OperationPatch::Terminal {
+                record: OperationTerminalRecord {
+                    operation_id: operation_id.clone(),
+                    finalize_intent_id: SurfaceFinalizeIntentId::try_from_bytes(uuid_v7_bytes(24))
+                        .unwrap(),
+                    terminal: OperationTerminal::Failed {
+                        class: FailureClass::Provider,
+                        message: SafeDiagnosticText::try_new(
+                            "DeepSeek provider error: 503 Service Unavailable",
+                        )
+                        .unwrap(),
+                    },
+                    usage: SurfaceUsageTotals {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_tokens: 0,
+                        estimated_cost_usd_micros: 0,
+                    },
+                    source_diagnostic_digest: None,
+                    settlement_receipts: Vec::new(),
+                    completion_proof: SurfaceOperationCompletionProof::unverified(
+                        "test terminal has no verifier proof",
+                    ),
+                    committed_at: UnixMillis::new(1),
+                },
+            }),
+        };
+        let after = SurfaceCursor {
+            next_seq: SequenceNumber::new(1),
+            source_revision: CursorSourceRevision::Recorded {
+                durable_revision: DurableRevision::try_new(2).unwrap(),
+            },
+            ..before.clone()
+        };
+        let batch = commit_batch_with_events(before.clone(), after, vec![event], 25);
+        let mut projection = TuiSurfaceProjection::from_snapshot(before, &[]);
+        projection.focus_operation(operation_id);
+
+        let events = projection
+            .reduce_typed_batch(&batch)
+            .expect("valid failed terminal batch");
+
+        assert!(matches!(
+            events.as_slice(),
+            [TuiEvent::Error(message), TuiEvent::SessionCompleted { status }]
+                if message == "DeepSeek provider error: 503 Service Unavailable"
+                    && status == "failed"
+        ));
     }
 
     #[test]

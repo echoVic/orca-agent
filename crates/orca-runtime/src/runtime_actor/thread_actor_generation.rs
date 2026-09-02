@@ -1,6 +1,43 @@
 // Mechanical ThreadActor method boundary; state ownership lives in runtime_actor controllers.
 use super::*;
-use crate::subagent_event_relay::RelayError;
+use crate::subagent_event_relay::{RelayError, RelayRecord, SubagentEventRelayReader};
+
+fn validate_relay_activity_envelope(
+    reader: &SubagentEventRelayReader,
+    record: &RelayRecord,
+    event: &SubagentActivityEvent,
+    task_id: &str,
+    attempt_id: &str,
+    after_sequence: u64,
+) -> io::Result<()> {
+    let reason = if record.task_id != task_id
+        || record.attempt_id != attempt_id
+        || record.source_sequence <= after_sequence
+    {
+        Some("detached relay record identity or sequence is invalid")
+    } else if event.surface_commit_id != record.surface_commit_id
+        || event.source_sequence != record.source_sequence
+        || event.task_id.as_str() != task_id
+        || event.attempt_id.as_str() != attempt_id
+    {
+        Some("detached relay payload does not match its frame")
+    } else if event.schema_version != SubagentActivityEvent::SCHEMA_VERSION
+        || !event.verify_digest()
+    {
+        Some("subagent activity envelope failed schema or digest validation")
+    } else {
+        None
+    };
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    let relay_error = RelayError::Corrupt {
+        offset: 0,
+        reason: reason.to_string(),
+    };
+    reader.quarantine_corrupt(&relay_error);
+    Err(io::Error::new(io::ErrorKind::InvalidData, relay_error))
+}
 
 fn subagent_activity_projection(
     payload: &SubagentActivityPayload,
@@ -1242,15 +1279,6 @@ impl ThreadActor {
                 return Ok(());
             }
             for record in &page.records {
-                if record.task_id != task_id
-                    || record.attempt_id != attempt_id
-                    || record.source_sequence <= after_sequence
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "detached relay record identity or sequence is invalid",
-                    ));
-                }
                 let event: SubagentActivityEvent = match serde_json::from_slice(&record.payload) {
                     Ok(event) => event,
                     Err(error) => {
@@ -1262,16 +1290,14 @@ impl ThreadActor {
                         return Err(io::Error::other(relay_error));
                     }
                 };
-                if event.surface_commit_id != record.surface_commit_id
-                    || event.source_sequence != record.source_sequence
-                    || event.task_id.as_str() != task_id
-                    || event.attempt_id.as_str() != attempt_id
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "detached relay payload does not match its frame",
-                    ));
-                }
+                validate_relay_activity_envelope(
+                    &reader,
+                    record,
+                    &event,
+                    task_id,
+                    attempt_id,
+                    after_sequence,
+                )?;
                 if matches!(event.owner, SubagentActivityOwner::DetachedTask { .. }) {
                     self.commit_detached_subagent_activity(&active.task_registry, event)?;
                 } else {
@@ -1320,15 +1346,6 @@ impl ThreadActor {
                 return Ok(());
             }
             for record in &page.records {
-                if record.task_id != binding.task_id
-                    || record.attempt_id != binding.attempt_id.as_str()
-                    || record.source_sequence <= after_sequence
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "detached relay record identity or sequence is invalid",
-                    ));
-                }
                 let event: SubagentActivityEvent = match serde_json::from_slice(&record.payload) {
                     Ok(event) => event,
                     Err(error) => {
@@ -1340,16 +1357,14 @@ impl ThreadActor {
                         return Err(io::Error::other(relay_error));
                     }
                 };
-                if event.surface_commit_id != record.surface_commit_id
-                    || event.source_sequence != record.source_sequence
-                    || event.task_id.as_str() != binding.task_id
-                    || event.attempt_id.as_str() != binding.attempt_id.as_str()
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "detached relay payload does not match its frame",
-                    ));
-                }
+                validate_relay_activity_envelope(
+                    &reader,
+                    record,
+                    &event,
+                    &binding.task_id,
+                    binding.attempt_id.as_str(),
+                    after_sequence,
+                )?;
                 self.commit_detached_subagent_activity(task_registry, event)?;
                 after_sequence = record.source_sequence;
             }
@@ -4814,6 +4829,10 @@ impl ThreadActor {
 #[cfg(test)]
 mod task_transcript_query_tests {
     use super::*;
+    use crate::subagent_event_relay::{
+        RelayLease, RelayReadTarget, RelayRecord, RelayTaskType, SubagentEventRelay,
+        SubagentEventRelayReader,
+    };
     use orca_core::budget::BudgetUsage;
 
     fn surface_task(
@@ -4896,6 +4915,69 @@ mod task_transcript_query_tests {
             &task_id,
             &surface_task("other-child", Some("parent"), 1),
             &transcript_record("child", Some("parent"), 1),
+        ));
+    }
+
+    #[test]
+    fn invalid_typed_relay_activity_is_quarantined_after_first_read() {
+        let temp = tempfile::tempdir().expect("relay root");
+        let attempt = crate::agent_continuation::AgentAttemptId::new();
+        let lease = RelayLease::new(
+            "task-1",
+            RelayTaskType::Subagent,
+            "worker",
+            1,
+            attempt.as_str(),
+        )
+        .expect("lease");
+        let relay = SubagentEventRelay::open(temp.path(), lease.clone()).expect("relay");
+        let mut event = SubagentActivityEvent::new(
+            surface::SurfaceTaskId::try_new("task-1").expect("task id"),
+            surface::SurfaceSubagentId::try_new("task-1").expect("subagent id"),
+            attempt.clone(),
+            orca_core::thread_identity::TurnId::new(),
+            1,
+            SubagentActivityOwner::DetachedTask {
+                task_id: surface::SurfaceTaskId::try_new("task-1").expect("task id"),
+                task_revision: surface::TaskRevision::try_new(1).expect("task revision"),
+                authority_digest: surface::Sha256Digest::new([7; 32]),
+            },
+            SubagentActivityPayload::Started {
+                description: surface::DisplayText::new("inspect repo"),
+            },
+        );
+        event.digest = surface::Sha256Digest::new([0; 32]);
+        relay
+            .append(RelayRecord::new(
+                &lease,
+                1,
+                event.surface_commit_id.clone(),
+                serde_json::to_vec(&event).expect("event payload"),
+            ))
+            .expect("transport-valid relay record");
+        drop(relay);
+        let reader = SubagentEventRelayReader::open(
+            temp.path(),
+            RelayReadTarget::new("task-1", RelayTaskType::Subagent, attempt.as_str())
+                .expect("read target"),
+        )
+        .expect("reader");
+        let page = reader.read_page(0).expect("first read");
+
+        let error = validate_relay_activity_envelope(
+            &reader,
+            &page.records[0],
+            &event,
+            "task-1",
+            "attempt-1",
+            0,
+        )
+        .expect_err("invalid typed digest must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            reader.read_page(0),
+            Err(RelayError::Quarantined(_))
         ));
     }
 }

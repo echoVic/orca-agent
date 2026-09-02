@@ -433,6 +433,26 @@ fn workflow_notification_action_carries_notification_boundary() {
 }
 
 #[test]
+fn task_snapshot_keeps_running_subagent_out_of_main_conversation() {
+    let mut state = state();
+    let mut task = workflow_task_summary("agent-1", "backend analysis");
+    task.task_type = TaskType::Subagent;
+    task.name = None;
+    task.subagent_current_activity = Some("bash: cargo test".to_string());
+    task.subagent_activity_history = vec![orca_core::task_types::SubagentActivityEntry {
+        occurred_at_ms: 1_001,
+        activity: "bash: cargo test".to_string(),
+        turn: Some(1),
+    }];
+
+    state.apply_workflow_tasks_for_test(vec![task]);
+
+    assert!(state.transcript.messages.iter().all(|message| {
+        !matches!(message, ChatMessage::Subagent { id, .. } if id == "agent-1")
+    }));
+}
+
+#[test]
 fn session_search_filters_by_title_and_keeps_selection_valid() {
     let mut state = state();
     state.session_picker_sessions = vec![
@@ -623,8 +643,8 @@ fn subagent_events_update_existing_message() {
         error: None,
     });
 
-    assert_eq!(state.transcript.messages.len(), 1);
-    match &state.transcript.messages[0] {
+    assert_eq!(state.transcript.messages.len(), 2);
+    match &state.transcript.messages[1] {
         ChatMessage::Subagent {
             id,
             description,
@@ -658,8 +678,8 @@ fn subagent_progress_updates_existing_message_without_adding_rows() {
         usage: None,
     });
 
-    assert_eq!(state.transcript.messages.len(), 1);
-    match &state.transcript.messages[0] {
+    assert_eq!(state.transcript.messages.len(), 2);
+    match &state.transcript.messages[1] {
         ChatMessage::Subagent {
             id,
             status,
@@ -695,17 +715,17 @@ fn subagent_progress_retains_recent_activity_tail() {
         });
     }
 
-    match &state.transcript.messages[0] {
+    match &state.transcript.messages[1] {
         ChatMessage::Subagent {
             activity_tail,
             turn,
             ..
         } => {
             assert_eq!(*turn, Some(8));
-            assert_eq!(activity_tail.len(), 6);
+            assert_eq!(activity_tail.len(), 8);
             assert_eq!(
                 activity_tail.first().map(String::as_str),
-                Some("activity 3")
+                Some("activity 1")
             );
             assert_eq!(activity_tail.last().map(String::as_str), Some("activity 8"));
         }
@@ -723,8 +743,8 @@ fn expand_toggle_flips_latest_live_subagent() {
     });
 
     assert!(state.toggle_latest_tool_output());
-    match &state.transcript.messages[0] {
-        ChatMessage::Subagent { expanded, .. } => assert!(*expanded),
+    match &state.transcript.messages[1] {
+        ChatMessage::Subagent { expanded, .. } => assert!(!*expanded),
         other => panic!("expected subagent message, got {other:?}"),
     }
 }
@@ -759,6 +779,26 @@ fn completed_subagent_without_start_adds_message() {
         }
         other => panic!("expected subagent message, got {other:?}"),
     }
+}
+
+#[test]
+fn parallel_subagent_starts_update_grouped_launch_announcement() {
+    let mut state = state();
+
+    state.update(TuiEvent::SubagentStarted {
+        id: "agent-1".to_string(),
+        description: "inspect repo".to_string(),
+    });
+    state.update(TuiEvent::SubagentStarted {
+        id: "agent-2".to_string(),
+        description: "review tests".to_string(),
+    });
+
+    assert_eq!(state.transcript.messages.len(), 3);
+    assert!(matches!(
+        &state.transcript.messages[0],
+        ChatMessage::System(text) if text == "Delegating to 2 agents in parallel"
+    ));
 }
 
 #[test]
@@ -1175,6 +1215,27 @@ fn generic_error_does_not_end_a_running_turn() {
     assert!(matches!(
         state.transcript.messages.last(),
         Some(ChatMessage::Error(message)) if message == "recoverable runtime error"
+    ));
+}
+
+#[test]
+fn failed_terminal_keeps_runtime_error_visible_and_returns_idle() {
+    let mut state = state();
+    state.enter_running();
+
+    state.update(TuiEvent::Error(
+        "DeepSeek provider error: 503 Service Unavailable".to_string(),
+    ));
+    state.update(TuiEvent::SessionCompleted {
+        status: "failed".to_string(),
+    });
+
+    assert_eq!(state.status, AppStatus::Idle);
+    assert_eq!(state.running_started_at, None);
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::Error(message))
+            if message == "DeepSeek provider error: 503 Service Unavailable"
     ));
 }
 

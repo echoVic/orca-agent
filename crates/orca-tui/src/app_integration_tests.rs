@@ -2446,11 +2446,19 @@ impl HostedTuiHarness {
         self.action_tx.send(action).expect("hosted TUI action");
     }
 
-    fn recv_until(&self, mut predicate: impl FnMut(&TuiEvent) -> bool) -> TuiEvent {
+    fn recv_until(&self, predicate: impl FnMut(&TuiEvent) -> bool) -> TuiEvent {
+        self.recv_until_timeout(Duration::from_secs(10), predicate)
+    }
+
+    fn recv_until_timeout(
+        &self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&TuiEvent) -> bool,
+    ) -> TuiEvent {
         loop {
             let event = self
                 .event_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(timeout)
                 .expect("hosted TUI event");
             if predicate(&event) {
                 return event;
@@ -2804,6 +2812,33 @@ fn hosted_tui_foreground_turn_uses_canonical_verifier_terminal() {
         assert!(matches!(
             terminal,
             TuiEvent::SessionCompleted { status } if status == "verification_failed"
+        ));
+        harness.shutdown();
+    });
+}
+
+#[test]
+fn hosted_tui_provider_failure_surfaces_diagnostic_before_terminal() {
+    with_orca_home(|_| {
+        let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+
+        harness.send(UserAction::Submit("mock_provider_error".to_string()));
+        let error = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(event, TuiEvent::Error(_))
+        });
+        assert!(matches!(
+            error,
+            TuiEvent::Error(message)
+                if message == "mock provider error: api_key=<redacted>"
+                    && !message.contains("super-secret")
+        ));
+
+        let terminal = harness.recv_until_timeout(Duration::from_secs(30), |event| {
+            matches!(event, TuiEvent::SessionCompleted { .. })
+        });
+        assert!(matches!(
+            terminal,
+            TuiEvent::SessionCompleted { status } if status == "failed"
         ));
         harness.shutdown();
     });

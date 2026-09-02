@@ -22,7 +22,7 @@ use crate::types::{
 };
 use crate::user_input_dialog::UserInputDialog;
 
-const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = 6;
+const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = orca_core::task_types::MAX_SUBAGENT_ACTIVITY_HISTORY;
 const GOAL_NOTICE_OBJECTIVE_WIDTH: usize = 80;
 
 fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
@@ -408,6 +408,30 @@ impl AppState {
                     return;
                 }
                 self.finish_assistant_stream();
+                let announcement_index = self.transcript.messages.iter().rposition(|message| {
+                    matches!(message, ChatMessage::System(text) if text.starts_with("Delegating to "))
+                }).filter(|&index| {
+                    index + 1 < self.transcript.messages.len()
+                        && self.transcript.messages[index + 1..]
+                            .iter()
+                            .all(|message| matches!(message, ChatMessage::Subagent { .. }))
+                });
+                if let Some(index) = announcement_index {
+                    let count = self.transcript.messages[index + 1..]
+                        .iter()
+                        .filter(|message| matches!(message, ChatMessage::Subagent { .. }))
+                        .count()
+                        + 1;
+                    self.mutate_message(index, |message| {
+                        *message = ChatMessage::System(format!(
+                            "Delegating to {count} agents in parallel"
+                        ));
+                    });
+                } else {
+                    self.push_message(ChatMessage::System(
+                        "Delegating to 1 agent in parallel".to_string(),
+                    ));
+                }
                 self.push_message(ChatMessage::Subagent {
                     id,
                     description,
@@ -418,7 +442,7 @@ impl AppState {
                     activity_tail: Vec::new(),
                     turn: None,
                     usage: None,
-                    expanded: false,
+                    expanded: true,
                 });
             }
             TuiEvent::SubagentCompleted {
@@ -499,6 +523,23 @@ impl AppState {
                         }
                     });
                 }
+            }
+            TuiEvent::WorkflowTasksUpdated(tasks) => {
+                if !self.suppress_background_main_session_output {
+                    self.apply_workflow_tasks_update(tasks);
+                }
+            }
+            TuiEvent::TaskStatusUpdated(task) => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
+                let mut tasks = self.workflow_tasks().to_vec();
+                if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == task.id) {
+                    *existing = task;
+                } else {
+                    tasks.push(task);
+                }
+                self.apply_workflow_tasks_update(tasks);
             }
             TuiEvent::WorkflowNotification {
                 id,

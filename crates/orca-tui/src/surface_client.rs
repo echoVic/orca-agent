@@ -34,6 +34,7 @@ use crate::operation_controller::{SurfacePresentationCancellation, TuiSurfaceTas
 use crate::protocol::{TaskTranscriptRequest, TaskTranscriptResult, TuiEvent};
 use crate::surface_projection::{
     GoalProjectionPresentation, SurfaceProjectionState, TuiSurfaceProjection,
+    operation_terminal_events,
 };
 
 #[derive(Debug)]
@@ -933,6 +934,7 @@ pub(crate) fn foreground_task(
     projection.focus_operation(operation_id.clone());
     let delivery_watermark = controller.surface_delivery_watermark(&operation_id);
     let terminal_status = projection.terminal_status_for_operation(&operation_id);
+    let terminal_error = projection.terminal_error_for_operation(&operation_id);
     if terminal_status.is_some() && controller.surface_terminal_was_delivered(&operation_id) {
         return Err(format!(
             "surface task '{task_id}' terminal output was already delivered"
@@ -994,6 +996,9 @@ pub(crate) fn foreground_task(
             projection.delivery_watermark(&operation_id),
         );
         controller.remember_surface_terminal_delivery(operation_id);
+        if let Some(message) = terminal_error {
+            let _ = event_tx.send(TuiEvent::Error(message));
+        }
         let _ = event_tx.send(TuiEvent::SessionCompleted {
             status: status.to_string(),
         });
@@ -2517,6 +2522,7 @@ fn drain_operation_with_boundary(
         }
     }
     if let Some(terminal) = terminal_receipt {
+        let status = terminal_status(terminal.terminal.clone()).to_string();
         controller.complete_surface(operation_id);
         controller.remember_surface_delivery_watermark(
             operation_id.clone(),
@@ -2526,15 +2532,15 @@ fn drain_operation_with_boundary(
         if let Some(compacted) = projected_compacted_event.take() {
             let _ = event_tx.send(compacted);
         }
-        let terminal_event =
-            projected_terminal_event.unwrap_or_else(|| TuiEvent::SessionCompleted {
-                status: terminal_status(terminal.terminal.clone()).to_string(),
-            });
-        let _ = event_tx.send(terminal_event);
+        if let Some(terminal_event) = projected_terminal_event {
+            let _ = event_tx.send(terminal_event);
+        } else {
+            for event in operation_terminal_events(&terminal.terminal) {
+                let _ = event_tx.send(event);
+            }
+        }
         waiter_guard.join();
-        return Ok(TuiHostedOperationOutcome::Turn {
-            status: terminal_status(terminal.terminal).to_string(),
-        });
+        return Ok(TuiHostedOperationOutcome::Turn { status });
     }
     if failure.is_none() && (sealed || !terminal_seen) {
         failure = Some(io::Error::other(

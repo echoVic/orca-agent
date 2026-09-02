@@ -503,8 +503,10 @@ where
         return Ok(KeyEventFlow::Continue);
     }
 
-    if state.status == AppStatus::Idle
-        && state.panel_mode == PanelMode::Agents
+    if matches!(
+        state.status,
+        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+    ) && state.panel_mode == PanelMode::Agents
         && state.task_transcript().is_some()
         && key.code == KeyCode::Esc
     {
@@ -513,8 +515,10 @@ where
         return Ok(KeyEventFlow::Continue);
     }
 
-    if state.status == AppStatus::Idle
-        && matches!(state.panel_mode, PanelMode::Workflows | PanelMode::Agents)
+    if matches!(
+        state.status,
+        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+    ) && matches!(state.panel_mode, PanelMode::Workflows | PanelMode::Agents)
         && key.code == KeyCode::Esc
     {
         vim_state.cancel_pending_command();

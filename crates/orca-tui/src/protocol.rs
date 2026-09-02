@@ -219,6 +219,8 @@ pub enum TuiEvent {
         turn: Option<u32>,
         usage: Option<UsageTotals>,
     },
+    WorkflowTasksUpdated(Vec<orca_core::task_types::BackgroundTaskSummary>),
+    TaskStatusUpdated(orca_core::task_types::BackgroundTaskSummary),
     BackgroundTaskOutputAttached {
         task_id: String,
     },

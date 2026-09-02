@@ -1488,7 +1488,7 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
         let items = rows
             .iter()
             .copied()
-            .map(|row| agent_workspace_list_item(row, theme, item_width))
+            .map(|row| agent_workspace_list_item(row, theme, item_width, state.tick))
             .collect::<Vec<_>>();
         let list = List::new(items).highlight_symbol("› ").highlight_style(
             theme
@@ -1714,8 +1714,9 @@ fn agent_workspace_list_item<'a>(
     row: AgentWorkspaceRow<'_>,
     theme: &Theme,
     width: usize,
+    tick: u64,
 ) -> ListItem<'a> {
-    let (name, status, detail, color) = match row {
+    let (name, status, detail, color, running) = match row {
         AgentWorkspaceRow::Subagent { task, .. } => {
             let name = task.name.as_deref().unwrap_or(task.description.as_str());
             let detail = task
@@ -1727,6 +1728,7 @@ fn agent_workspace_list_item<'a>(
                 task_status_label(task.status).to_string(),
                 format!("subagent · {detail}"),
                 task_status_color(task.status, theme),
+                task.status == TaskStatus::Running,
             )
         }
         AgentWorkspaceRow::BackgroundTask { task, .. } => {
@@ -1741,6 +1743,7 @@ fn agent_workspace_list_item<'a>(
                 task_status_label(task.status).to_string(),
                 format!("{} · {detail}", task_type_label(task)),
                 task_status_color(task.status, theme),
+                task.status == TaskStatus::Running,
             )
         }
         AgentWorkspaceRow::WorkflowAgent { workflow, agent } => {
@@ -1758,10 +1761,12 @@ fn agent_workspace_list_item<'a>(
                 workflow_agent_status_label(agent.status).to_string(),
                 format!("{team}attempt {}/{}", agent.attempt, agent.max_attempts),
                 workflow_agent_status_color(agent.status, theme),
+                agent.status == WorkflowAgentStatus::Running,
             )
         }
     };
-    let text = truncate_to_display_width(&format!("● {name} · {status} · {detail}"), width);
+    let icon = if running { spinner_frame(tick) } else { "●" };
+    let text = truncate_to_display_width(&format!("{icon} {name} · {status} · {detail}"), width);
     ListItem::new(Line::from(Span::styled(text, Style::default().fg(color))))
 }
 
@@ -2308,14 +2313,14 @@ fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
 
 fn subagent_live_progress_label(task: &BackgroundTaskSummary) -> String {
     let mut parts = Vec::new();
+    if let Some(activity) = task.subagent_current_activity.as_deref() {
+        parts.push(activity.to_string());
+    }
     if let Some(agent_type) = task.agent_type.as_deref() {
         parts.push(agent_type.to_string());
     }
     if let Some(turn) = task.subagent_turn {
         parts.push(format!("turn {turn}"));
-    }
-    if let Some(activity) = task.subagent_current_activity.as_deref() {
-        parts.push(activity.to_string());
     }
     if let Some(usage) = task.usage {
         parts.push(format!(
@@ -2653,6 +2658,7 @@ fn append_message_lines(
                 theme,
                 *expanded,
                 force_expand,
+                tick,
             );
         }
         ChatMessage::Error(text) => {
@@ -2830,6 +2836,7 @@ fn append_subagent_lines(
     theme: &Theme,
     expanded: bool,
     force_expand: bool,
+    tick: u64,
 ) {
     let (label, color) = match status {
         "success" | "completed" => ("done", theme.success),
@@ -2865,11 +2872,27 @@ fn append_subagent_lines(
                 Span::styled("  │ ", Style::default().fg(theme.border)),
                 Span::styled(detail, Style::default().fg(theme.muted)),
             ]));
-            if (expanded || force_expand) && !activity_tail.is_empty() {
+            if (expanded || force_expand || status == "running") && !activity_tail.is_empty() {
                 for item in activity_tail {
+                    let is_current = activity.is_some_and(|current| current == item);
                     lines.push(Line::from(vec![
                         Span::styled("  │   ", Style::default().fg(theme.border)),
-                        Span::styled(item.clone(), Style::default().fg(theme.muted)),
+                        Span::styled(
+                            format!(
+                                "{} {}",
+                                if is_current {
+                                    spinner_frame(tick)
+                                } else {
+                                    "·"
+                                },
+                                item
+                            ),
+                            Style::default().fg(if is_current {
+                                theme.warning
+                            } else {
+                                theme.muted
+                            }),
+                        ),
                     ]));
                 }
             }
@@ -3996,10 +4019,15 @@ fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::styl
         lines.push(line);
     }
 
-    if state.panel_mode == PanelMode::Conversation {
+    if matches!(
+        state.panel_mode,
+        PanelMode::Conversation | PanelMode::Agents
+    ) {
         lines.extend(background_task_activity_lines(
             state.workflow_tasks(),
             theme,
+            state.tick,
+            (state.panel_mode == PanelMode::Agents).then(|| state.agent_selected_index()),
         ));
     }
     lines
@@ -4035,6 +4063,8 @@ fn foreground_activity_line(
 fn background_task_activity_lines(
     tasks: &[BackgroundTaskSummary],
     theme: &Theme,
+    tick: u64,
+    selected: Option<usize>,
 ) -> Vec<(String, ratatui::style::Color)> {
     let subagents = agent_workspace_rows(tasks)
         .into_iter()
@@ -4066,19 +4096,31 @@ fn background_task_activity_lines(
             labels.push(format!("{attention_count} needs approval"));
         }
         lines.push((
-            format!("● Agents {} · /tasks manage", labels.join(" · ")),
+            format!("● Agents {} · /agents view", labels.join(" · ")),
             if attention_count > 0 {
                 theme.approval
             } else {
                 theme.warning
             },
         ));
+        lines.push((
+            format!(
+                "  ○ Main [default] · {}",
+                if active_count > 0 {
+                    "running"
+                } else {
+                    "needs attention"
+                }
+            ),
+            theme.text,
+        ));
     }
     lines.extend(
         subagents
             .iter()
             .take(MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS)
-            .map(|task| {
+            .enumerate()
+            .flat_map(|(index, task)| {
                 let name = task.name.as_deref().unwrap_or(task.description.as_str());
                 let status = task_status_label(task.status);
                 let detail = subagent_live_progress_label(task);
@@ -4087,7 +4129,17 @@ fn background_task_activity_lines(
                 } else {
                     task_status_color(task.status, theme)
                 };
-                (format!("  ● {name} · {status} · {detail}"), color)
+                let icon = if selected == Some(index) {
+                    "›"
+                } else if task.status == TaskStatus::Running {
+                    spinner_frame(tick)
+                } else {
+                    "●"
+                };
+                vec![
+                    (format!("  {icon} {name} · {status}"), color),
+                    (format!("    {detail}"), theme.muted),
+                ]
             }),
     );
 
@@ -5775,6 +5827,60 @@ mod tests {
             kind: None,
             expanded: false,
         }
+    }
+
+    #[test]
+    fn running_subagent_renders_activity_history_with_current_spinner() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let message = ChatMessage::Subagent {
+            id: "agent-1".to_string(),
+            description: "inspect repo".to_string(),
+            status: "running".to_string(),
+            output: None,
+            error: None,
+            activity: Some("bash: cargo test".to_string()),
+            activity_tail: vec![
+                "read: Cargo.toml".to_string(),
+                "bash: cargo test".to_string(),
+            ],
+            turn: Some(2),
+            usage: None,
+            expanded: false,
+        };
+
+        let rendered = rendered_text(&build_lines_for_message(
+            &message, &theme, 100, 0, false, None,
+        ));
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("read: Cargo.toml"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("⠋ bash: cargo test"))
+        );
+    }
+
+    #[test]
+    fn live_subagent_progress_label_leads_with_activity() {
+        let mut task = workflow_task_for_agent_dashboard(
+            "auth audit",
+            "auth",
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.task_type = TaskType::Subagent;
+        task.workflow_agents.clear();
+        task.agent_type = Some("general".to_string());
+        task.subagent_turn = Some(3);
+        task.subagent_current_activity = Some("bash: cargo test auth".to_string());
+
+        let label = subagent_live_progress_label(&task);
+
+        assert!(label.starts_with("bash: cargo test auth"));
+        assert!(label.contains("general"));
     }
 
     fn queued(text: &str) -> crate::queued_input::QueuedUserMessage {
@@ -8428,13 +8534,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lines = background_task_activity_lines(&tasks, &theme);
+        let lines = background_task_activity_lines(&tasks, &theme, 0, None);
 
-        assert_eq!(lines.len(), 6);
-        assert_eq!(lines[0].0, "● Agents 5 active · /tasks manage");
-        assert!(lines[1].0.contains("agent 1"));
-        assert!(lines[4].0.contains("agent 4"));
-        assert_eq!(lines[5].0, "  +1 more · /tasks manage");
+        assert_eq!(lines.len(), 11);
+        assert_eq!(lines[0].0, "● Agents 5 active · /agents view");
+        assert!(lines[1].0.contains("Main [default]"));
+        assert!(lines[2].0.contains("agent 1"));
+        assert!(lines[3].0.starts_with("    "));
+        assert!(lines[8].0.contains("agent 4"));
+        assert!(lines[9].0.starts_with("    "));
+        assert_eq!(lines[10].0, "  +1 more · /tasks manage");
         assert!(lines.iter().all(|(line, _)| !line.contains("agent 5")));
     }
 
@@ -8715,7 +8824,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_panel_renders_ordinary_subagent_rows() {
+    fn agent_switcher_keeps_ordinary_subagent_in_bottom_dock() {
         let mut state = test_state();
         state.panel_mode = PanelMode::Agents;
         let mut task = workflow_task_for_agent_dashboard(
@@ -8740,7 +8849,7 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
 
         assert!(rendered.contains("inspect permission relay"));
-        assert!(rendered.contains("subagent"));
+        assert!(rendered.contains("Main [default]"));
         assert!(rendered.contains("turn 4"));
         assert!(rendered.contains("bash: cargo test child_permission"));
     }

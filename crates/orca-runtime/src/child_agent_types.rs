@@ -426,7 +426,8 @@ pub(crate) struct SubagentActivityEvent {
 }
 
 impl SubagentActivityEvent {
-    pub(crate) const SCHEMA_VERSION: u16 = 2;
+    // v3 fences envelopes produced by the pre-canonical digest implementation.
+    pub(crate) const SCHEMA_VERSION: u16 = 3;
 
     pub(crate) fn new(
         task_id: SurfaceTaskId,

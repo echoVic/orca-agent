@@ -8,6 +8,7 @@ use tui_textarea::TextArea;
 use orca_core::config::RunConfig;
 use orca_runtime::history::SessionTranscript;
 
+use crate::agent_workspace_actions::handle_agent_workspace_key;
 use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::config_dialog_actions::handle_config_dialog_key;
 use crate::idle_key_actions::handle_idle_key;
@@ -142,6 +143,12 @@ where
             vim_state,
             theme,
         );
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.status == AppStatus::Running && handle_agent_workspace_key(key.code, state, action_tx)
+    {
+        vim_state.cancel_pending_command();
         return Ok(StatusKeyFlow::Continue);
     }
 

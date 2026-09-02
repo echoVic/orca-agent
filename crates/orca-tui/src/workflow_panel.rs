@@ -408,6 +408,29 @@ impl AppState {
     }
 
     pub(crate) fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
+        let previous_subagent_ids = self
+            .workflow_tasks()
+            .iter()
+            .filter(|task| task.task_type == TaskType::Subagent)
+            .map(|task| task.id.as_str())
+            .collect::<HashSet<_>>();
+        let new_subagents = tasks
+            .iter()
+            .filter(|task| {
+                task.task_type == TaskType::Subagent
+                    && !previous_subagent_ids.contains(task.id.as_str())
+            })
+            .count();
+        if new_subagents > 0
+            && !self.transcript.messages.iter().rev().take(1).any(|message| {
+                matches!(message, crate::transcript_state::ChatMessage::System(text) if text.starts_with("Delegating to "))
+            })
+        {
+            self.finish_assistant_stream();
+            self.push_message(crate::transcript_state::ChatMessage::System(format!(
+                "Delegating to {new_subagents} agents in parallel"
+            )));
+        }
         let was_suppressing_background_output = self.suppress_background_main_session_output;
         let has_backgrounded_running_main_session =
             tasks.iter().any(is_backgrounded_running_main_session);
