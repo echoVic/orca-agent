@@ -23,6 +23,7 @@ use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 #[cfg(test)]
 use orca_runtime::surface::SurfaceOperationId;
 
+use crate::agent_ui_state::AgentUiState;
 use crate::agent_workspace::AgentWorkspaceState;
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::edit_highlight::EditHighlightState;
@@ -440,6 +441,8 @@ pub struct AppState {
     pub panel_mode: PanelMode,
     pub(crate) workflow_panel: WorkflowPanelState,
     pub(crate) agent_workspace: AgentWorkspaceState,
+    pub(crate) agent_ui: AgentUiState,
+    pub(crate) announced_agent_batches: std::collections::HashSet<String>,
     pub(crate) task_transcript: Option<TaskTranscriptViewState>,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
@@ -658,6 +661,8 @@ impl AppState {
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
             agent_workspace: AgentWorkspaceState::default(),
+            agent_ui: AgentUiState::default(),
+            announced_agent_batches: std::collections::HashSet::new(),
             task_transcript: None,
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,
@@ -1259,17 +1264,12 @@ impl AppState {
             .min(self.transcript.messages.len());
         let Some(index) = self.transcript.messages[live_start..]
             .iter()
-            .rposition(|message| {
-                matches!(
-                    message,
-                    ChatMessage::ToolCall { .. } | ChatMessage::Subagent { .. }
-                )
-            })
+            .rposition(|message| matches!(message, ChatMessage::ToolCall { .. }))
         else {
             return false;
         };
         self.mutate_message(live_start + index, |message| match message {
-            ChatMessage::ToolCall { expanded, .. } | ChatMessage::Subagent { expanded, .. } => {
+            ChatMessage::ToolCall { expanded, .. } => {
                 *expanded = !*expanded;
             }
             _ => unreachable!(),
@@ -1337,7 +1337,7 @@ impl AppState {
         }
         let is_last = index + 1 == self.transcript.messages.len();
         match &self.transcript.messages[index] {
-            ChatMessage::ToolCall { status, .. } | ChatMessage::Subagent { status, .. } => {
+            ChatMessage::ToolCall { status, .. } => {
                 !matches!(status.as_str(), "running" | "receiving")
             }
             ChatMessage::Reasoning(_)

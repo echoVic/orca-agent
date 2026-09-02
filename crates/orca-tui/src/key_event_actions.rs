@@ -404,6 +404,78 @@ mod tests {
         assert_eq!(state.panel_mode, PanelMode::Conversation);
         assert!(action_rx.try_recv().is_err());
     }
+
+    #[test]
+    fn dock_navigation_focuses_child_and_escape_returns_to_main() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.update(crate::protocol::TuiEvent::AgentRegistryUpdated {
+            root_thread_id: "root".to_string(),
+            snapshot: orca_core::agent_event::AgentRegistrySnapshot {
+                revision: 1,
+                agents: vec![orca_core::agent_event::AgentSummary {
+                    root_thread_id: "root".to_string(),
+                    batch_id: "batch".to_string(),
+                    batch_size: 1,
+                    agent_id: "agent".to_string(),
+                    thread_id: "child".to_string(),
+                    parent_thread_id: "root".to_string(),
+                    description: "inspect".to_string(),
+                    status: orca_core::agent_event::AgentStatus::Running,
+                    activity: None,
+                    turn: None,
+                    usage: Default::default(),
+                    result: None,
+                    error: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                }],
+            },
+        });
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::FocusAgentThread { thread_id }) if thread_id == "child"
+        ));
+
+        handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::FocusRootThread)
+        ));
+    }
 }
 
 pub(crate) fn handle_key_event_preflight<F>(
@@ -489,6 +561,40 @@ where
     if key.code == KeyCode::Esc && state.viewport.selection.is_some() {
         vim_state.cancel_pending_command();
         state.invalidate_selection();
+        return Ok(KeyEventFlow::Continue);
+    }
+
+    if matches!(
+        state.status,
+        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+    ) && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        && !state.agent_ui.agents().is_empty()
+    {
+        vim_state.cancel_pending_command();
+        if key.code == KeyCode::Up {
+            state.agent_ui.select_previous();
+        } else {
+            state.agent_ui.select_next();
+        }
+        return Ok(KeyEventFlow::Continue);
+    }
+
+    if key.code == KeyCode::Enter
+        && key.modifiers.is_empty()
+        && state.agent_ui.selected_thread_id().is_some()
+        && state.agent_ui.selected_thread_id() != state.agent_ui.focused_thread_id()
+    {
+        vim_state.cancel_pending_command();
+        if let Some(thread_id) = state.agent_ui.focus_selected() {
+            let _ = action_tx.send(UserAction::FocusAgentThread { thread_id });
+        }
+        return Ok(KeyEventFlow::Continue);
+    }
+
+    if key.code == KeyCode::Esc && state.agent_ui.focused_thread_id().is_some() {
+        vim_state.cancel_pending_command();
+        let _ = action_tx.send(UserAction::FocusRootThread);
         return Ok(KeyEventFlow::Continue);
     }
 

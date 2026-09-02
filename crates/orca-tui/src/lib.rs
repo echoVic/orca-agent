@@ -2,6 +2,7 @@
 
 mod action_dispatcher;
 mod agent_runtime;
+mod agent_ui_state;
 mod agent_workspace;
 mod agent_workspace_actions;
 pub mod app;

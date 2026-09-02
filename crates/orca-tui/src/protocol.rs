@@ -5,7 +5,6 @@
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::cancel::OperationId;
-use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::PlanItem;
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
@@ -202,25 +201,15 @@ pub enum TuiEvent {
         explanation: Option<String>,
         plan: Vec<PlanItem>,
     },
-    SubagentStarted {
-        id: String,
-        description: String,
-    },
-    SubagentCompleted {
-        id: String,
-        description: String,
-        status: String,
-        output: Option<String>,
-        error: Option<String>,
-    },
-    SubagentProgress {
-        id: String,
-        activity: String,
-        turn: Option<u32>,
-        usage: Option<UsageTotals>,
-    },
     WorkflowTasksUpdated(Vec<orca_core::task_types::BackgroundTaskSummary>),
     TaskStatusUpdated(orca_core::task_types::BackgroundTaskSummary),
+    AgentRegistryUpdated {
+        root_thread_id: String,
+        snapshot: orca_core::agent_event::AgentRegistrySnapshot,
+    },
+    AgentFocusChanged {
+        focused_thread_id: Option<String>,
+    },
     BackgroundTaskOutputAttached {
         task_id: String,
     },
@@ -427,6 +416,10 @@ pub enum UserAction {
     },
     ToggleSideConversation,
     CloseSideConversation,
+    FocusAgentThread {
+        thread_id: String,
+    },
+    FocusRootThread,
     NewSession,
     ForkCurrentSession {
         title: Option<String>,

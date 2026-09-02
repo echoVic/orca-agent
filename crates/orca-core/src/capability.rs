@@ -24,6 +24,48 @@ pub enum EnforcementState {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionProfile {
+    ReadOnly,
+    #[default]
+    Workspace,
+    TrustedHost,
+    RemoteSandbox,
+}
+
+impl ExecutionProfile {
+    pub fn for_approval_mode(mode: ApprovalMode) -> Self {
+        match mode {
+            ApprovalMode::Plan => Self::ReadOnly,
+            ApprovalMode::Suggest | ApprovalMode::AutoEdit | ApprovalMode::FullAuto => {
+                Self::Workspace
+            }
+        }
+    }
+
+    pub fn capability_ceiling(self) -> CapabilitySet {
+        match self {
+            Self::ReadOnly => CapabilitySet::read_only(),
+            Self::Workspace | Self::TrustedHost | Self::RemoteSandbox => CapabilitySet::all(),
+        }
+    }
+
+    pub fn child_may_request(self, requested: Self) -> bool {
+        match self {
+            Self::ReadOnly => requested == Self::ReadOnly,
+            Self::Workspace => matches!(requested, Self::ReadOnly | Self::Workspace),
+            Self::TrustedHost => requested != Self::RemoteSandbox,
+            Self::RemoteSandbox => {
+                matches!(
+                    requested,
+                    Self::ReadOnly | Self::Workspace | Self::RemoteSandbox
+                )
+            }
+        }
+    }
+}
+
 /// Authority-bearing denial evidence emitted by a sandbox backend. This is
 /// intentionally distinct from stderr diagnostics, which are process
 /// controlled and therefore never suitable for permission escalation.
@@ -482,8 +524,8 @@ mod tests {
 
     use super::{
         CapabilityCeiling, CapabilityProcessClass, CapabilityReceipt, CapabilityRequest,
-        CapabilitySet, EffectiveCapability, EnforcementState, SandboxDenialReceipt,
-        SandboxDenialSource,
+        CapabilitySet, EffectiveCapability, EnforcementState, ExecutionProfile,
+        SandboxDenialReceipt, SandboxDenialSource,
     };
     use crate::approval_types::ApprovalMode;
 
@@ -750,5 +792,13 @@ mod tests {
             ),
             Err(super::CapabilityError::UntrustedProcessClass)
         );
+    }
+
+    #[test]
+    fn child_execution_profile_can_only_narrow_parent_authority() {
+        assert!(ExecutionProfile::Workspace.child_may_request(ExecutionProfile::ReadOnly));
+        assert!(ExecutionProfile::Workspace.child_may_request(ExecutionProfile::Workspace));
+        assert!(!ExecutionProfile::Workspace.child_may_request(ExecutionProfile::TrustedHost));
+        assert!(!ExecutionProfile::ReadOnly.child_may_request(ExecutionProfile::Workspace));
     }
 }

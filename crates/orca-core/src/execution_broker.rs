@@ -4,7 +4,7 @@ use std::process::{Child, Command};
 
 use crate::capability::{
     CapabilityCeiling, CapabilityProcessClass, CapabilityReceipt, EffectiveCapability,
-    EnforcementState, SandboxDenialReceipt, SandboxDenialSource,
+    EnforcementState, ExecutionProfile, SandboxDenialReceipt, SandboxDenialSource,
 };
 use orca_platform::process::ProcessJob;
 
@@ -30,6 +30,7 @@ pub struct BrokerLaunch {
 #[derive(Clone, Debug)]
 pub struct ExecutionBroker {
     enforcement: EnforcementState,
+    profile: ExecutionProfile,
     backend: String,
     ceiling: CapabilityCeiling,
 }
@@ -42,6 +43,7 @@ impl ExecutionBroker {
     pub fn with_backend(enforcement: EnforcementState, backend: impl Into<String>) -> Self {
         Self {
             enforcement,
+            profile: ExecutionProfile::Workspace,
             backend: backend.into(),
             ceiling: CapabilityCeiling::from(crate::capability::CapabilitySet::all()),
         }
@@ -54,6 +56,7 @@ impl ExecutionBroker {
     ) -> Self {
         Self {
             enforcement,
+            profile: ExecutionProfile::Workspace,
             backend: backend.into(),
             ceiling,
         }
@@ -61,6 +64,20 @@ impl ExecutionBroker {
 
     pub fn enforcement(&self) -> EnforcementState {
         self.enforcement
+    }
+
+    pub fn with_profile(mut self, profile: ExecutionProfile) -> Self {
+        self.profile = profile;
+        self.ceiling.capabilities = self
+            .ceiling
+            .capabilities
+            .intersect(&profile.capability_ceiling())
+            .expect("execution profile capability intersection is valid");
+        self
+    }
+
+    pub fn profile(&self) -> ExecutionProfile {
+        self.profile
     }
 
     pub fn launch(
@@ -167,6 +184,14 @@ impl ExecutionBroker {
         capability
             .ensure_subset_of(&self.ceiling)
             .map_err(|_| LaunchError::CapabilityCeilingExceeded)?;
+        if self.profile == ExecutionProfile::RemoteSandbox
+            && capability.process_class != CapabilityProcessClass::RemoteSandbox
+        {
+            return Err(LaunchError::UntrustedProcessClass);
+        }
+        if self.profile == ExecutionProfile::TrustedHost {
+            return Ok(());
+        }
         match self.enforcement {
             EnforcementState::Enforced => {}
             EnforcementState::Unavailable => {
@@ -265,7 +290,7 @@ mod tests {
     use crate::approval_types::ApprovalMode;
     use crate::capability::{
         CapabilityCeiling, CapabilityProcessClass, CapabilityRequest, CapabilitySet,
-        EffectiveCapability, EnforcementState, SandboxDenialSource,
+        EffectiveCapability, EnforcementState, ExecutionProfile, SandboxDenialSource,
     };
 
     fn read_only_capability(id: &str) -> EffectiveCapability {
@@ -289,6 +314,29 @@ mod tests {
             .launch(Command::new("true"), read_only_capability("broker-1"))
             .expect_err("unavailable backend must reject launch");
         assert!(matches!(error, LaunchError::EnforcementUnavailable));
+    }
+
+    #[test]
+    fn trusted_host_is_explicit_and_independent_from_full_auto() {
+        let unavailable = ExecutionBroker::new(EnforcementState::Unavailable);
+        assert_eq!(unavailable.profile(), ExecutionProfile::Workspace);
+        assert!(matches!(
+            unavailable.launch(
+                Command::new("true"),
+                read_only_capability("workspace-unavailable")
+            ),
+            Err(LaunchError::EnforcementUnavailable)
+        ));
+
+        let trusted = ExecutionBroker::new(EnforcementState::Unavailable)
+            .with_profile(ExecutionProfile::TrustedHost);
+        let mut launched = trusted
+            .launch(
+                Command::new("true"),
+                read_only_capability("explicit-trusted-host"),
+            )
+            .expect("explicit trusted host profile");
+        assert!(launched.child.wait().unwrap().success());
     }
 
     #[test]

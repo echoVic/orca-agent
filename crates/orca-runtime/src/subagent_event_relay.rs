@@ -896,7 +896,6 @@ impl SubagentEventRelayReader {
             lock_path,
             target,
         };
-        reader.ensure_not_quarantined()?;
         Ok(reader)
     }
 
@@ -929,6 +928,24 @@ impl SubagentEventRelayReader {
             Err(error) => return Err(error),
         };
         page_from_scan(scan, after_sequence)
+    }
+
+    /// Actor drain semantics: a quarantined attempt is a consumed dead letter,
+    /// not a retryable transport failure.
+    pub(crate) fn read_page_for_drain(&self, after_sequence: u64) -> Result<RelayPage, RelayError> {
+        match self.read_page(after_sequence) {
+            Ok(page) => Ok(page),
+            Err(RelayError::Quarantined(_))
+            | Err(RelayError::Corrupt { .. })
+            | Err(RelayError::RecordTooLarge { .. })
+            | Err(RelayError::AttemptTooLarge { .. }) => Ok(RelayPage {
+                records: Vec::new(),
+                next_source_sequence: None,
+                has_more: false,
+                encoded_bytes: 0,
+            }),
+            Err(error) => Err(error),
+        }
     }
 
     fn scan_records(&self) -> Result<ScanResult, RelayError> {
@@ -1734,6 +1751,12 @@ mod tests {
         ));
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert!(relay.is_quarantined());
+        let reader = SubagentEventRelayReader::open(
+            root.path(),
+            RelayReadTarget::new("task-1", RelayTaskType::Subagent, "attempt-1").unwrap(),
+        )
+        .unwrap();
+        assert!(reader.read_page_for_drain(0).unwrap().records.is_empty());
     }
 
     #[test]

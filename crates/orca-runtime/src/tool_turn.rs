@@ -596,6 +596,12 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     permission_handler: permission_handler_owned.clone(),
                     activity_ingress: workflow_lifecycle_ingress
                         .and_then(|ingress| ingress.subagent_activity_ingress()),
+                    agent_controller: extensions.and_then(|context| {
+                        context
+                            .stores()
+                            .thread_store()
+                            .get::<crate::agent_controller::AgentController>()
+                    }),
                 },
                 child_executor: batch_child_executor,
             });

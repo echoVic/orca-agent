@@ -2,7 +2,8 @@
 use orca_core::approval_rules::PermissionRule;
 use orca_core::approval_rules::{CompiledPermissionRules, PermissionRules};
 use orca_core::approval_types::{
-    ActionKind, ApprovalDecision, ApprovalMode, ApprovalRequest, ApprovalResolution, Decision,
+    ActionKind, ApprovalBehavior, ApprovalDecision, ApprovalMode, ApprovalRequest,
+    ApprovalResolution, Decision,
 };
 
 #[derive(Clone, Debug)]
@@ -28,6 +29,10 @@ impl ApprovalPolicy {
     pub fn with_permission_rules(mut self, rules: PermissionRules) -> Self {
         self.rules = CompiledPermissionRules::from_rules(rules);
         self
+    }
+
+    pub fn behavior(&self) -> ApprovalBehavior {
+        self.mode.behavior()
     }
 
     #[cfg(test)]

@@ -2321,6 +2321,9 @@ pub struct RuntimeThreadStartRequest {
     preloaded: Option<SessionTranscript>,
     inherited_conversation: Option<Conversation>,
     parent_thread_id: Option<String>,
+    agent_root_thread_id: Option<String>,
+    agent_depth: u32,
+    agent_type: Option<orca_core::subagent_types::SubagentType>,
     mcp_registry: Option<McpRegistry>,
     prepared_record_meta: Option<SessionMeta>,
     prepared_runtime_thread_id: Option<String>,
@@ -2342,6 +2345,9 @@ impl RuntimeThreadStartRequest {
             preloaded: None,
             inherited_conversation: None,
             parent_thread_id: None,
+            agent_root_thread_id: None,
+            agent_depth: 0,
+            agent_type: None,
             mcp_registry: None,
             prepared_record_meta: None,
             prepared_runtime_thread_id: None,
@@ -2357,6 +2363,20 @@ impl RuntimeThreadStartRequest {
 
     pub fn with_preloaded(mut self, preloaded: SessionTranscript) -> Self {
         self.preloaded = Some(preloaded);
+        self
+    }
+
+    pub(crate) fn with_agent_parent(
+        mut self,
+        parent_thread_id: impl Into<String>,
+        root_thread_id: impl Into<String>,
+        depth: u32,
+        agent_type: orca_core::subagent_types::SubagentType,
+    ) -> Self {
+        self.parent_thread_id = Some(parent_thread_id.into());
+        self.agent_root_thread_id = Some(root_thread_id.into());
+        self.agent_depth = depth;
+        self.agent_type = Some(agent_type);
         self
     }
 
@@ -2494,7 +2514,7 @@ impl RuntimeThreadStartRequest {
                 let cwd = self.config.cwd.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
                 });
-                let meta = SessionStore::new().create_meta_with_permissions(
+                let mut meta = SessionStore::new().create_meta_with_permissions(
                     &cwd,
                     self.config.provider.as_str(),
                     self.config.model.as_history_value(),
@@ -2504,6 +2524,7 @@ impl RuntimeThreadStartRequest {
                     self.config.permission_rules.clone(),
                     self.config.additional_working_directories.clone(),
                 );
+                meta.parent_id.clone_from(&self.parent_thread_id);
                 let path =
                     crate::history::prospective_session_path(&meta.session_id, meta.created_at);
                 let thread_id = meta.session_id.clone();
@@ -4030,12 +4051,14 @@ pub struct RuntimeHost {
     command_tx: tokio_mpsc::Sender<HostCommand>,
     supervisor: Option<thread::JoinHandle<()>>,
     host_incarnation: surface::HostIncarnation,
+    agent_registry: Arc<crate::agent_registry::AgentRegistry>,
 }
 
 #[derive(Clone)]
 pub struct RuntimeHostHandle {
     command_tx: tokio_mpsc::Sender<HostCommand>,
     host_incarnation: surface::HostIncarnation,
+    agent_registry: Arc<crate::agent_registry::AgentRegistry>,
 }
 
 impl RuntimeHostHandle {
@@ -4052,6 +4075,46 @@ impl RuntimeHostHandle {
         request: RuntimeThreadStartRequest,
     ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
         start_thread_with_sender(&self.command_tx, request)
+    }
+
+    pub(crate) fn start_agent_thread(
+        &self,
+        parent_thread_id: &str,
+        root_thread_id: &str,
+        depth: u32,
+        agent_type: orca_core::subagent_types::SubagentType,
+        config: RunConfig,
+        title: impl Into<String>,
+    ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
+        self.start_thread_with_request(
+            RuntimeThreadStartRequest::new(config, title).with_agent_parent(
+                parent_thread_id,
+                root_thread_id,
+                depth,
+                agent_type,
+            ),
+        )
+    }
+
+    pub fn agent_registry_snapshot(
+        &self,
+        root_thread_id: &str,
+    ) -> orca_core::agent_event::AgentRegistrySnapshot {
+        self.agent_registry.snapshot(root_thread_id)
+    }
+
+    pub fn resolve_live_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(HostCommand::ResolveLiveThread {
+                thread_id: thread_id.to_string(),
+                reply,
+            })
+            .map_err(|_| RuntimeHostError::HostUnavailable)?;
+        receive_reply(receive, "runtime host")?
     }
 
     /// Create a temporary child from the parent's live conversation snapshot.
@@ -4279,6 +4342,13 @@ impl RuntimeHost {
             surface::HostIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated host incarnation is v7");
         let supervisor_host_incarnation = host_incarnation.clone();
+        let agent_registry =
+            crate::agent_registry::AgentRegistry::open_default().map_err(|error| {
+                RuntimeHostError::RuntimeStartFailed {
+                    message: format!("failed to open agent event journal: {error}"),
+                }
+            })?;
+        let supervisor_agent_registry = Arc::clone(&agent_registry);
         let (command_tx, command_rx) = tokio_mpsc::channel(HOST_COMMAND_CAPACITY);
         let supervisor_command_tx = command_tx.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -4325,6 +4395,7 @@ impl RuntimeHost {
                             background_capacity,
                             surface_hub_config,
                             supervisor_host_incarnation,
+                            supervisor_agent_registry,
                         ));
                     }
                     Err(error) => {
@@ -4341,6 +4412,7 @@ impl RuntimeHost {
                 command_tx,
                 supervisor: Some(supervisor),
                 host_incarnation,
+                agent_registry,
             }),
             Ok(Err(error)) | Err(error) => {
                 let _ = supervisor.join();
@@ -4368,6 +4440,7 @@ impl RuntimeHost {
         RuntimeHostHandle {
             command_tx: self.command_tx.clone(),
             host_incarnation: self.host_incarnation.clone(),
+            agent_registry: Arc::clone(&self.agent_registry),
         }
     }
 
@@ -4406,6 +4479,10 @@ enum HostCommand {
     },
     PreparedThreadStart {
         prepared: Result<Box<PreparedStartedRuntimeThread>, RuntimeHostError>,
+        reply: SyncSender<Result<RuntimeThreadHandle, RuntimeHostError>>,
+    },
+    ResolveLiveThread {
+        thread_id: String,
         reply: SyncSender<Result<RuntimeThreadHandle, RuntimeHostError>>,
     },
     JsonlListSessions {
@@ -5067,6 +5144,7 @@ struct PendingTerminalizationTestProbe {
 }
 
 struct ThreadActorEntry {
+    handle: RuntimeThreadHandle,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     join: JoinHandle<()>,
 }
@@ -5098,6 +5176,9 @@ struct PreparedStartedRuntimeThread {
     actor_config: RunConfig,
     actor_title: String,
     parent_thread_id: Option<String>,
+    agent_root_thread_id: Option<String>,
+    agent_depth: u32,
+    agent_type: Option<orca_core::subagent_types::SubagentType>,
     surface_owner: Option<PreparedSurfaceOwner>,
     ephemeral_reservation_timeout: Duration,
     #[cfg(test)]
@@ -5109,6 +5190,9 @@ fn prepare_and_start_runtime_thread(
 ) -> Result<PreparedStartedRuntimeThread, RuntimeHostError> {
     let actor_title = request.title.clone();
     let parent_thread_id = request.parent_thread_id.clone();
+    let agent_root_thread_id = request.agent_root_thread_id.clone();
+    let agent_depth = request.agent_depth;
+    let agent_type = request.agent_type.clone();
     let ephemeral_reservation_timeout = request.ephemeral_reservation_timeout;
     #[cfg(test)]
     let ephemeral_close_commit_failures = request.ephemeral_close_commit_failures;
@@ -5149,6 +5233,9 @@ fn prepare_and_start_runtime_thread(
         actor_config,
         actor_title,
         parent_thread_id,
+        agent_root_thread_id,
+        agent_depth,
+        agent_type,
         surface_owner,
         ephemeral_reservation_timeout,
         #[cfg(test)]
@@ -5179,6 +5266,7 @@ async fn run_host_supervisor(
     background_capacity: usize,
     surface_hub_config: surface::SurfaceHubConfig,
     host_incarnation: surface::HostIncarnation,
+    agent_registry: Arc<crate::agent_registry::AgentRegistry>,
 ) {
     let mut actors = HashMap::<String, ThreadActorEntry>::new();
     let (actor_exit_tx, mut actor_exit_rx) = tokio_mpsc::unbounded_channel::<String>();
@@ -5200,6 +5288,13 @@ async fn run_host_supervisor(
             break;
         };
         match command {
+            HostCommand::ResolveLiveThread { thread_id, reply } => {
+                let result = actors
+                    .get(&thread_id)
+                    .map(|actor| actor.handle.clone())
+                    .ok_or(RuntimeHostError::ThreadUnavailable);
+                let _ = reply.send(result);
+            }
             HostCommand::StartThread { request, reply } => {
                 let completion_tx = command_tx.clone();
                 tokio::spawn(async move {
@@ -5228,6 +5323,9 @@ async fn run_host_supervisor(
                     mut actor_config,
                     actor_title,
                     parent_thread_id,
+                    agent_root_thread_id,
+                    agent_depth,
+                    agent_type,
                     surface_owner,
                     ephemeral_reservation_timeout,
                     #[cfg(test)]
@@ -5268,7 +5366,7 @@ async fn run_host_supervisor(
                     }));
                     continue;
                 }
-                let (command_tx, actor_rx) = tokio_mpsc::channel(THREAD_COMMAND_CAPACITY);
+                let (thread_command_tx, actor_rx) = tokio_mpsc::channel(THREAD_COMMAND_CAPACITY);
                 let (prompt_queue_updates, _) = tokio::sync::watch::channel(
                     crate::prompt_queue::PromptQueueSnapshot::default(),
                 );
@@ -5280,7 +5378,7 @@ async fn run_host_supervisor(
                         &actor_config,
                         &actor_title,
                         host_incarnation.clone(),
-                        command_tx.clone(),
+                        thread_command_tx.clone(),
                         capability_change_tx.clone(),
                         surface_owner,
                         surface_hub_config,
@@ -5312,7 +5410,7 @@ async fn run_host_supervisor(
                     startup_warnings,
                     task_registry,
                     mcp_registry,
-                    command_tx: command_tx.clone(),
+                    command_tx: thread_command_tx.clone(),
                     surface: surface_handle,
                     prompt_queue_updates,
                     prompt_queue_observer: Arc::new(Mutex::new(None)),
@@ -5321,6 +5419,28 @@ async fn run_host_supervisor(
                     )),
                     prompt_queue_dispatch_ready: Arc::new(AtomicBool::new(false)),
                 };
+                let root_thread_id = agent_root_thread_id.unwrap_or_else(|| thread_id.clone());
+                thread
+                    .thread_extensions()
+                    .insert(crate::agent_controller::AgentController::new(
+                        RuntimeHostHandle {
+                            command_tx: command_tx.clone(),
+                            host_incarnation: host_incarnation.clone(),
+                            agent_registry: Arc::clone(&agent_registry),
+                        },
+                        Arc::clone(&agent_registry),
+                        root_thread_id,
+                        thread_id.clone(),
+                        agent_depth,
+                    ));
+                if let Some(subagent_type) = agent_type {
+                    thread
+                        .thread_extensions()
+                        .insert(crate::agent_controller::AgentThreadPolicy {
+                            subagent_type,
+                            depth: agent_depth,
+                        });
+                }
                 let actor_handle = handle.clone();
                 let actor_executor = Arc::clone(&executor);
                 let actor_exit = ThreadActorExitNotifier {
@@ -5343,7 +5463,14 @@ async fn run_host_supervisor(
                     .run(actor_rx, capability_change_rx)
                     .await;
                 });
-                actors.insert(thread_id, ThreadActorEntry { command_tx, join });
+                actors.insert(
+                    thread_id,
+                    ThreadActorEntry {
+                        handle: handle.clone(),
+                        command_tx: thread_command_tx,
+                        join,
+                    },
+                );
                 let _ = reply.send(Ok(handle));
             }
             HostCommand::JsonlListSessions {

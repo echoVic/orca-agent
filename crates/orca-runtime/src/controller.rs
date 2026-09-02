@@ -725,16 +725,26 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             return Err(error);
         }
 
-        let loop_context = AgentLoopContext::new(&cwd, &prompt, 0, true, &SubagentType::General)
-            .with_turn_id(request.turn_id().clone())
-            .with_deferred_cancel_terminal(request.defer_cancel_terminal())
-            .with_root_task_id(request.root_task_id())
-            .with_services(
-                parts.instructions,
-                parts.memory,
-                parts.mcp_registry,
-                parts.hooks,
-            );
+        let agent_policy = thread_extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get::<crate::agent_controller::AgentThreadPolicy>());
+        let default_subagent_type = SubagentType::General;
+        let subagent_type = agent_policy
+            .as_ref()
+            .map(|policy| &policy.subagent_type)
+            .unwrap_or(&default_subagent_type);
+        let subagent_depth = agent_policy.as_ref().map_or(0, |policy| policy.depth);
+        let loop_context =
+            AgentLoopContext::new(&cwd, &prompt, subagent_depth, true, subagent_type)
+                .with_turn_id(request.turn_id().clone())
+                .with_deferred_cancel_terminal(request.defer_cancel_terminal())
+                .with_root_task_id(request.root_task_id())
+                .with_services(
+                    parts.instructions,
+                    parts.memory,
+                    parts.mcp_registry,
+                    parts.hooks,
+                );
         let loop_context = if let (Some(thread_extensions), Some(turn_extension_id)) =
             (thread_extensions, turn_extension_id)
         {

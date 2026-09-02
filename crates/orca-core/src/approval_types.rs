@@ -12,6 +12,14 @@ pub enum ApprovalMode {
     Plan,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalBehavior {
+    Ask,
+    Auto,
+    Never,
+}
+
 impl ApprovalMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -31,17 +39,34 @@ impl ApprovalMode {
             Self::Plan => Self::Suggest,
         }
     }
+
+    pub fn behavior(self) -> ApprovalBehavior {
+        match self {
+            Self::Suggest => ApprovalBehavior::Ask,
+            Self::AutoEdit | Self::Plan => ApprovalBehavior::Auto,
+            Self::FullAuto => ApprovalBehavior::Never,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ApprovalMode;
+    use super::{ApprovalBehavior, ApprovalMode};
 
     #[test]
     fn defaults_to_auto_edit_without_changing_the_mode_cycle() {
         assert_eq!(ApprovalMode::default(), ApprovalMode::AutoEdit);
         assert_eq!(ApprovalMode::Suggest.next(), ApprovalMode::AutoEdit);
         assert_eq!(ApprovalMode::Plan.next(), ApprovalMode::Suggest);
+    }
+
+    #[test]
+    fn full_auto_disables_prompts_without_selecting_trusted_host() {
+        assert_eq!(ApprovalMode::FullAuto.behavior(), ApprovalBehavior::Never);
+        assert_eq!(
+            crate::capability::ExecutionProfile::for_approval_mode(ApprovalMode::FullAuto),
+            crate::capability::ExecutionProfile::Workspace
+        );
     }
 }
 

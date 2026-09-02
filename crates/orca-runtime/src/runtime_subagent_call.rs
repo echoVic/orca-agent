@@ -26,6 +26,7 @@ use crate::agent_continuation::{
     PreparedContinuation, ResumeContinuationInput, WorktreeBinding,
     compute_continuation_compatibility_hash,
 };
+use crate::agent_controller::{AgentController, AgentLaunchRequest, AgentRunMode};
 use crate::child_agent_types::{
     ChildAgentActivityEmitter, ChildAgentActivityPublisher, ChildAgentActivitySink,
     ChildAgentCheckpointObserver, ChildAgentCompatibilityIdentity, ChildAgentContinuationStart,
@@ -71,6 +72,9 @@ pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     pub(crate) task_registry: TaskRegistry,
     pub(crate) root_task_id: Option<String>,
+    pub(crate) agent_controller: Option<Arc<AgentController>>,
+    pub(crate) batch_id: String,
+    pub(crate) batch_size: u32,
 }
 
 /// Synchronous child delivery boundary. The child retains the source event on
@@ -193,6 +197,9 @@ impl RuntimeSubagentInvocation {
         permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
         task_registry: &TaskRegistry,
         root_task_id: Option<&str>,
+        agent_controller: Option<Arc<AgentController>>,
+        batch_id: String,
+        batch_size: u32,
     ) -> Self {
         Self {
             tool_request,
@@ -210,6 +217,9 @@ impl RuntimeSubagentInvocation {
             permission_handler,
             task_registry: task_registry.clone(),
             root_task_id: root_task_id.map(str::to_string),
+            agent_controller,
+            batch_id,
+            batch_size,
         }
     }
 }
@@ -390,12 +400,130 @@ impl RuntimeSubagentBatch {
     }
 }
 
+fn run_threaded_agent_worker(
+    invocation: RuntimeSubagentInvocation,
+    mut lifecycle: RuntimeSessionLifecycle,
+    started_task: RuntimeTaskLifecycle,
+    cancel: CancelToken,
+) -> RuntimeSubagentCallOutput {
+    let RuntimeSubagentInvocation {
+        tool_request,
+        request,
+        config,
+        child_depth: _,
+        permission_handler,
+        agent_controller,
+        batch_id,
+        batch_size,
+        ..
+    } = invocation;
+    let controller = agent_controller.expect("threaded agent branch requires controller");
+    let description = request.description.clone();
+    let launch = controller.launch(AgentLaunchRequest {
+        batch_id,
+        batch_size,
+        agent_id: tool_request.id.clone(),
+        description: description.clone(),
+        prompt: request.prompt,
+        model: request.model,
+        subagent_type: request.subagent_type,
+        mode: match request.mode {
+            crate::subagent::SubagentMode::Sync => AgentRunMode::Sync,
+            crate::subagent::SubagentMode::Async => AgentRunMode::Async,
+        },
+        config: config.clone(),
+        cancel,
+        approval_handler: None,
+        permission_handler,
+    });
+
+    match launch {
+        Ok(launch) => {
+            let status = launch.status;
+            let task_status = if launch.running {
+                RuntimeTaskStatus::Running
+            } else {
+                match status {
+                    RunStatus::Success => RuntimeTaskStatus::Succeeded,
+                    RunStatus::Cancelled => RuntimeTaskStatus::Cancelled,
+                    RunStatus::Failed
+                    | RunStatus::ApprovalRequired
+                    | RunStatus::VerificationFailed => RuntimeTaskStatus::Failed,
+                }
+            };
+            let task = if launch.running {
+                Some(started_task.with_status(task_status))
+            } else {
+                lifecycle
+                    .finish_task(status)
+                    .cloned()
+                    .or_else(|| Some(started_task.with_status(task_status)))
+            };
+            let output = if launch.running {
+                serde_json::json!({
+                    "agent_id": tool_request.id,
+                    "thread_id": launch.thread_id,
+                    "status": "running",
+                })
+                .to_string()
+            } else {
+                launch
+                    .final_message
+                    .clone()
+                    .unwrap_or_else(|| format!("agent {} completed", tool_request.id))
+            };
+            let result = if status == RunStatus::Success {
+                ToolResult::completed(&tool_request, output.clone(), false)
+            } else {
+                ToolResult::failed_after_start(
+                    &tool_request,
+                    launch
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| status.as_str().to_string()),
+                    None,
+                )
+            };
+            let mut cost_tracker = CostTracker::new(config.model.as_deref());
+            cost_tracker.merge_totals(launch.usage);
+            RuntimeSubagentCallOutput {
+                tool_request,
+                description,
+                task,
+                status,
+                result,
+                event_output: (!launch.running).then_some(output),
+                event_error: launch.error,
+                cost_tracker,
+                child_budget_usage: None,
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            RuntimeSubagentCallOutput {
+                result: ToolResult::failed_before_start(&tool_request, &message, None),
+                tool_request,
+                description,
+                task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
+                status: RunStatus::Failed,
+                event_output: None,
+                event_error: Some(message),
+                cost_tracker: CostTracker::new(config.model.as_deref()),
+                child_budget_usage: None,
+            }
+        }
+    }
+}
+
 fn run_subagent_worker(
     invocation: RuntimeSubagentInvocation,
     lifecycle: RuntimeSessionLifecycle,
     started_task: RuntimeTaskLifecycle,
     cancel: CancelToken,
 ) -> RuntimeSubagentCallOutput {
+    if invocation.agent_controller.is_some() {
+        return run_threaded_agent_worker(invocation, lifecycle, started_task, cancel);
+    }
     let RuntimeSubagentInvocation {
         tool_request,
         request,
@@ -412,6 +540,9 @@ fn run_subagent_worker(
         permission_handler,
         task_registry,
         root_task_id,
+        agent_controller: _,
+        batch_id: _,
+        batch_size: _,
     } = invocation;
     let SubagentRequest {
         description,

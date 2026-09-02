@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
+use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::ProposedPlanStreamParser;
-use orca_core::{cost_types::UsageTotals, plan_types::PlanItem};
 
 use crate::composer_images::TuiImage;
 use crate::streaming_markdown::StreamingMarkdownAssembler;
@@ -37,18 +37,6 @@ pub enum ChatMessage {
     PlanUpdate {
         explanation: Option<String>,
         plan: Vec<PlanItem>,
-    },
-    Subagent {
-        id: String,
-        description: String,
-        status: String,
-        output: Option<String>,
-        error: Option<String>,
-        activity: Option<String>,
-        activity_tail: Vec<String>,
-        turn: Option<u32>,
-        usage: Option<UsageTotals>,
-        expanded: bool,
     },
     Error(String),
     System(String),

@@ -6213,15 +6213,6 @@ fn tool_completion_is_not_a_workflow_notification_turn_boundary() {
             kind: None,
         }
     ));
-    assert!(!is_workflow_notification_turn_boundary(
-        &TuiEvent::SubagentCompleted {
-            id: "agent-1".to_string(),
-            description: "inspect".to_string(),
-            status: "success".to_string(),
-            output: None,
-            error: None,
-        }
-    ));
 }
 
 #[test]

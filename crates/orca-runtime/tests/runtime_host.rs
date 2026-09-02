@@ -1441,12 +1441,11 @@ fn stale_interrupt_cannot_cancel_a_newer_operation() {
 #[test]
 fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
     let cwd = tempfile::tempdir().unwrap();
+    let config = test_config(cwd.path().to_path_buf());
     let host = RuntimeHost::start().expect("start runtime host");
+    let host_handle = host.handle();
     let thread = host
-        .start_thread(
-            test_config(cwd.path().to_path_buf()),
-            "sync subagent interrupt",
-        )
+        .start_thread(config, "sync subagent interrupt")
         .expect("start runtime thread");
     let observer = Arc::new(RecordingEventObserver::default());
     let operation = thread
@@ -1458,10 +1457,14 @@ fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
         .expect("start sync subagent turn");
 
     let deadline = Instant::now() + TEST_TIMEOUT;
-    while observer.count(EventType::SubagentStarted) == 0 {
+    while host_handle
+        .agent_registry_snapshot(thread.thread_id())
+        .agents
+        .is_empty()
+    {
         assert!(
             Instant::now() < deadline,
-            "sync subagent did not publish its started lifecycle"
+            "sync agent thread did not reach the registry"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1478,17 +1481,16 @@ fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Cancelled)
     );
-    let events = observer.events();
-    let started = events
-        .iter()
-        .position(|event| event.event_type == EventType::SubagentStarted)
-        .expect("started event");
-    let completed = events
-        .iter()
-        .position(|event| event.event_type == EventType::SubagentCompleted)
-        .expect("completed event before operation terminal");
-    assert!(started < completed);
-    assert_eq!(events[completed].payload["status"], "cancelled");
+    assert_eq!(observer.count(EventType::SubagentStarted), 0);
+    assert_eq!(observer.count(EventType::SubagentCompleted), 0);
+    let agents = host_handle
+        .agent_registry_snapshot(thread.thread_id())
+        .agents;
+    assert_eq!(agents.len(), 1);
+    assert_eq!(
+        agents[0].status,
+        orca_core::agent_event::AgentStatus::Cancelled
+    );
 
     let next = thread
         .start_turn(HostedTurnRequest::new("mock_usage"), io::sink())
@@ -1498,6 +1500,55 @@ fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
             .expect("next turn terminal")
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Success)
+    );
+    host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn async_agent_thread_outlives_parent_turn_and_remains_addressable() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut config = test_config(cwd.path().to_path_buf());
+    config.approval_mode = ApprovalMode::FullAuto;
+    let host = RuntimeHost::start().expect("start runtime host");
+    let host_handle = host.handle();
+    let thread = host
+        .start_thread(config, "async agent thread")
+        .expect("start runtime thread");
+    let observer = Arc::new(RecordingEventObserver::default());
+    let operation = thread
+        .start_turn(
+            HostedTurnRequest::new("subagent async mock_stream_delay_ms 500")
+                .with_event_observer(observer.clone()),
+            io::sink(),
+        )
+        .expect("start parent turn");
+
+    operation
+        .wait_timeout(TEST_TIMEOUT)
+        .expect("parent turn terminal");
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let agent = loop {
+        if let Some(agent) = host_handle
+            .agent_registry_snapshot(thread.thread_id())
+            .agents
+            .into_iter()
+            .next()
+        {
+            break agent;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent was not registered; events={:?}",
+            observer.events()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    assert_ne!(agent.thread_id, thread.thread_id());
+    assert_eq!(agent.parent_thread_id, thread.thread_id());
+    assert!(
+        host_handle.resolve_live_thread(&agent.thread_id).is_ok(),
+        "child thread must remain live after the parent turn settles"
     );
     host.shutdown().expect("shutdown runtime host");
 }

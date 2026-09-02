@@ -255,6 +255,11 @@ impl<'a> RuntimeToolRouter<'a> {
                     permission_handler_owned,
                     workflow_lifecycle_ingress
                         .and_then(|ingress| ingress.subagent_activity_ingress()),
+                    extension_stores.and_then(|stores| {
+                        stores
+                            .thread_store()
+                            .get::<crate::agent_controller::AgentController>()
+                    }),
                     event_error,
                     child_budget.as_ref(),
                 )?;

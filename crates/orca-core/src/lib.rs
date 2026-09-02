@@ -1,5 +1,6 @@
 #![deny(deprecated)]
 
+pub mod agent_event;
 pub mod approval_rules;
 pub mod approval_types;
 pub mod budget;

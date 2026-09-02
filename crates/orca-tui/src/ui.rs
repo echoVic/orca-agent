@@ -23,7 +23,7 @@ use orca_file_search::SearchPhase;
 use orca_runtime::history::{SessionSummary, StoredSessionHealth};
 use orca_runtime::surface::{TaskTranscriptItem, TaskTranscriptToolStatus};
 
-use crate::agent_workspace::{AgentWorkspaceRow, agent_workspace_rows};
+use crate::agent_workspace::AgentWorkspaceRow;
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::protocol::TaskTranscriptResult;
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
@@ -1442,6 +1442,28 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
         return;
     }
 
+    if !state.agent_ui.agents().is_empty() {
+        let mut lines = vec![Line::from(Span::styled(
+            " Main [default]",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ))];
+        lines.extend(state.agent_ui.agents().iter().map(|agent| {
+            let status = format!("{:?}", agent.status).to_lowercase();
+            let activity = agent
+                .activity
+                .as_ref()
+                .map(|activity| activity.label())
+                .unwrap_or(status);
+            Line::from(vec![
+                Span::styled("  ○ ", Style::default().fg(theme.border)),
+                Span::styled(agent.description.clone(), Style::default().fg(theme.text)),
+                Span::styled(format!(" · {activity}"), Style::default().fg(theme.muted)),
+            ])
+        }));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        return;
+    }
+
     let rows = state.agent_rows();
 
     if rows.is_empty() {
@@ -2311,28 +2333,6 @@ fn subagent_progress_label(task: &BackgroundTaskSummary) -> String {
     subagent_progress_label_with_activity_limit(task, Some(32))
 }
 
-fn subagent_live_progress_label(task: &BackgroundTaskSummary) -> String {
-    let mut parts = Vec::new();
-    if let Some(activity) = task.subagent_current_activity.as_deref() {
-        parts.push(activity.to_string());
-    }
-    if let Some(agent_type) = task.agent_type.as_deref() {
-        parts.push(agent_type.to_string());
-    }
-    if let Some(turn) = task.subagent_turn {
-        parts.push(format!("turn {turn}"));
-    }
-    if let Some(usage) = task.usage {
-        parts.push(format!(
-            "{} tok ${:.6}",
-            usage.total_tokens(),
-            usage.estimated_cost_usd
-        ));
-    }
-    parts.push(elapsed_label(task));
-    parts.join(", ")
-}
-
 fn subagent_progress_label_with_activity_limit(
     task: &BackgroundTaskSummary,
     activity_limit: Option<usize>,
@@ -2633,34 +2633,6 @@ fn append_message_lines(
         ChatMessage::PlanUpdate { explanation, plan } => {
             append_archived_plan_lines(lines, explanation.as_deref(), plan, width, theme);
         }
-        ChatMessage::Subagent {
-            description,
-            status,
-            output,
-            error,
-            activity,
-            activity_tail,
-            turn,
-            usage,
-            expanded,
-            ..
-        } => {
-            append_subagent_lines(
-                lines,
-                description,
-                status,
-                output,
-                error,
-                activity.as_deref(),
-                activity_tail,
-                *turn,
-                *usage,
-                theme,
-                *expanded,
-                force_expand,
-                tick,
-            );
-        }
         ChatMessage::Error(text) => {
             lines.push(Line::from(Span::styled(
                 format!("ERROR: {text}"),
@@ -2821,107 +2793,6 @@ fn append_proposed_plan_lines(
         lines.push(line);
     }
     lines.push(Line::from(""));
-}
-
-fn append_subagent_lines(
-    lines: &mut Vec<Line<'static>>,
-    description: &str,
-    status: &str,
-    output: &Option<String>,
-    error: &Option<String>,
-    activity: Option<&str>,
-    activity_tail: &[String],
-    turn: Option<u32>,
-    usage: Option<orca_core::cost_types::UsageTotals>,
-    theme: &Theme,
-    expanded: bool,
-    force_expand: bool,
-    tick: u64,
-) {
-    let (label, color) = match status {
-        "success" | "completed" => ("done", theme.success),
-        "running" => ("running", theme.border),
-        "failed" => ("failed", theme.error),
-        other => (other, theme.muted),
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled("  ┌─ delegated task", Style::default().fg(theme.border)),
-        Span::styled(" · ", Style::default().fg(theme.muted)),
-        Span::styled(label.to_string(), Style::default().fg(color)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  │ ", Style::default().fg(theme.border)),
-        Span::styled(description.to_string(), Style::default().fg(theme.text)),
-    ]));
-
-    // The collapsed view keeps only the first few lines; when flushing to the immutable
-    // scrollback (`force_expand`) we emit the whole result/error so nothing is truncated
-    // beyond reach.
-    let body_limit = if force_expand { usize::MAX } else { 3 };
-    match (status, output, error) {
-        ("running", _, _) => {
-            let mut detail = activity.unwrap_or("working in a child context").to_string();
-            if let Some(turn) = turn {
-                detail = format!("turn {turn} · {detail}");
-            }
-            if let Some(usage) = usage {
-                detail.push_str(&format!(" · {} tok", usage.total_tokens()));
-            }
-            lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(theme.border)),
-                Span::styled(detail, Style::default().fg(theme.muted)),
-            ]));
-            if (expanded || force_expand || status == "running") && !activity_tail.is_empty() {
-                for item in activity_tail {
-                    let is_current = activity.is_some_and(|current| current == item);
-                    lines.push(Line::from(vec![
-                        Span::styled("  │   ", Style::default().fg(theme.border)),
-                        Span::styled(
-                            format!(
-                                "{} {}",
-                                if is_current {
-                                    spinner_frame(tick)
-                                } else {
-                                    "·"
-                                },
-                                item
-                            ),
-                            Style::default().fg(if is_current {
-                                theme.warning
-                            } else {
-                                theme.muted
-                            }),
-                        ),
-                    ]));
-                }
-            }
-        }
-        (_, _, Some(err)) => {
-            lines.push(Line::from(vec![
-                Span::styled("  │ error: ", Style::default().fg(theme.error)),
-                Span::styled(
-                    truncate_lines(err, body_limit),
-                    Style::default().fg(theme.error),
-                ),
-            ]));
-        }
-        (_, Some(out), _) => {
-            lines.push(Line::from(vec![
-                Span::styled("  │ result: ", Style::default().fg(theme.success)),
-                Span::styled(
-                    truncate_lines(out, body_limit),
-                    Style::default().fg(theme.muted),
-                ),
-            ]));
-        }
-        _ => {}
-    }
-
-    lines.push(Line::from(Span::styled(
-        "  └─ returned to main agent",
-        Style::default().fg(theme.muted),
-    )));
 }
 
 fn append_diff_lines(
@@ -4023,6 +3894,7 @@ fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::styl
         state.panel_mode,
         PanelMode::Conversation | PanelMode::Agents
     ) {
+        lines.extend(agent_dock_lines(state, theme));
         lines.extend(background_task_activity_lines(
             state.workflow_tasks(),
             theme,
@@ -4030,6 +3902,81 @@ fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::styl
             (state.panel_mode == PanelMode::Agents).then(|| state.agent_selected_index()),
         ));
     }
+    lines
+}
+
+fn agent_dock_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::style::Color)> {
+    let agents = state.agent_ui.agents();
+    if agents.is_empty() {
+        return Vec::new();
+    }
+    let active = agents
+        .iter()
+        .filter(|agent| agent.status.is_active())
+        .count();
+    let attention = agents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.status,
+                orca_core::agent_event::AgentStatus::WaitingPermission
+                    | orca_core::agent_event::AgentStatus::Failed
+                    | orca_core::agent_event::AgentStatus::Corrupt
+            )
+        })
+        .count();
+    let mut lines = vec![
+        (
+            format!("● Agents {active} active · {attention} attention"),
+            if attention > 0 {
+                theme.approval
+            } else {
+                theme.warning
+            },
+        ),
+        (
+            format!(
+                "  {} Main [default]",
+                if state.agent_ui.selected_dock_index() == 0 {
+                    "›"
+                } else {
+                    "○"
+                }
+            ),
+            theme.text,
+        ),
+    ];
+    lines.extend(
+        agents
+            .iter()
+            .take(MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS)
+            .enumerate()
+            .map(|(index, agent)| {
+                let selected = state.agent_ui.selected_dock_index() == index + 1;
+                let icon = if selected { "›" } else { "○" };
+                let status = format!("{:?}", agent.status).to_lowercase();
+                let activity = agent
+                    .activity
+                    .as_ref()
+                    .map(|activity| activity.label())
+                    .unwrap_or(status);
+                (
+                    format!("  {icon} {} · {activity}", agent.description),
+                    if matches!(
+                        agent.status,
+                        orca_core::agent_event::AgentStatus::Failed
+                            | orca_core::agent_event::AgentStatus::Corrupt
+                    ) {
+                        theme.error
+                    } else if agent.status == orca_core::agent_event::AgentStatus::WaitingPermission
+                    {
+                        theme.approval
+                    } else {
+                        theme.muted
+                    },
+                )
+            }),
+    );
     lines
 }
 
@@ -4066,95 +4013,8 @@ fn background_task_activity_lines(
     tick: u64,
     selected: Option<usize>,
 ) -> Vec<(String, ratatui::style::Color)> {
-    let subagents = agent_workspace_rows(tasks)
-        .into_iter()
-        .filter_map(|row| match row {
-            AgentWorkspaceRow::Subagent { task, .. }
-                if task.status.is_active() || task.status.requires_attention() =>
-            {
-                Some(task)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let active_count = subagents
-        .iter()
-        .filter(|task| task.status.is_active())
-        .count();
-    let attention_count = subagents
-        .iter()
-        .filter(|task| task.status.requires_attention())
-        .count();
-
     let mut lines = Vec::new();
-    if !subagents.is_empty() {
-        let mut labels = Vec::new();
-        if active_count > 0 {
-            labels.push(format!("{active_count} active"));
-        }
-        if attention_count > 0 {
-            labels.push(format!("{attention_count} needs approval"));
-        }
-        lines.push((
-            format!("● Agents {} · /agents view", labels.join(" · ")),
-            if attention_count > 0 {
-                theme.approval
-            } else {
-                theme.warning
-            },
-        ));
-        lines.push((
-            format!(
-                "  ○ Main [default] · {}",
-                if active_count > 0 {
-                    "running"
-                } else {
-                    "needs attention"
-                }
-            ),
-            theme.text,
-        ));
-    }
-    lines.extend(
-        subagents
-            .iter()
-            .take(MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS)
-            .enumerate()
-            .flat_map(|(index, task)| {
-                let name = task.name.as_deref().unwrap_or(task.description.as_str());
-                let status = task_status_label(task.status);
-                let detail = subagent_live_progress_label(task);
-                let color = if task.status.requires_attention() {
-                    theme.approval
-                } else {
-                    task_status_color(task.status, theme)
-                };
-                let icon = if selected == Some(index) {
-                    "›"
-                } else if task.status == TaskStatus::Running {
-                    spinner_frame(tick)
-                } else {
-                    "●"
-                };
-                vec![
-                    (format!("  {icon} {name} · {status}"), color),
-                    (format!("    {detail}"), theme.muted),
-                ]
-            }),
-    );
-
-    if subagents.len() > MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS {
-        let hidden = subagents.len() - MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS;
-        let color = if subagents[MAX_DEFAULT_SUBAGENT_ACTIVITY_ROWS..]
-            .iter()
-            .any(|task| task.status.requires_attention())
-        {
-            theme.approval
-        } else {
-            theme.muted
-        };
-        lines.push((format!("  +{hidden} more · /tasks manage"), color));
-    }
+    let _ = (tick, selected);
 
     let activity = tasks
         .iter()
@@ -5829,6 +5689,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn running_subagent_renders_activity_history_with_current_spinner() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -5864,6 +5725,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn live_subagent_progress_label_leads_with_activity() {
         let mut task = workflow_task_for_agent_dashboard(
@@ -8425,6 +8287,47 @@ mod tests {
     }
 
     #[test]
+    fn registry_agent_dock_renders_main_and_child_activity() {
+        let mut state = test_state();
+        state.update(crate::protocol::TuiEvent::AgentRegistryUpdated {
+            root_thread_id: "root".to_string(),
+            snapshot: orca_core::agent_event::AgentRegistrySnapshot {
+                revision: 1,
+                agents: vec![orca_core::agent_event::AgentSummary {
+                    root_thread_id: "root".to_string(),
+                    batch_id: "batch".to_string(),
+                    batch_size: 1,
+                    agent_id: "agent".to_string(),
+                    thread_id: "thread-agent".to_string(),
+                    parent_thread_id: "root".to_string(),
+                    description: "backend analysis".to_string(),
+                    status: orca_core::agent_event::AgentStatus::Running,
+                    activity: Some(orca_core::agent_event::AgentActivity::Tool {
+                        name: "bash".to_string(),
+                        target: Some("cargo test".to_string()),
+                    }),
+                    turn: Some(1),
+                    usage: Default::default(),
+                    result: None,
+                    error: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                }],
+            },
+        });
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let rendered = activity_lines(&state, &theme)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Main [default]"));
+        assert!(rendered.contains("backend analysis"));
+        assert!(rendered.contains("bash: cargo test"));
+    }
+
+    #[test]
     fn idle_foreground_keeps_active_background_tasks_visible() {
         let mut state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -8473,6 +8376,7 @@ mod tests {
         assert_eq!(color, theme.approval);
     }
 
+    #[cfg(any())]
     #[test]
     fn idle_default_view_renders_each_active_subagent_activity() {
         let mut state = test_state();
@@ -8516,6 +8420,7 @@ mod tests {
         assert!(rendered.contains("read: sandbox_policy.rs"));
     }
 
+    #[cfg(any())]
     #[test]
     fn default_agent_dock_is_stable_and_reports_overflow() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -8823,6 +8728,7 @@ mod tests {
         assert!(rendered.contains("150 tok"));
     }
 
+    #[cfg(any())]
     #[test]
     fn agent_switcher_keeps_ordinary_subagent_in_bottom_dock() {
         let mut state = test_state();

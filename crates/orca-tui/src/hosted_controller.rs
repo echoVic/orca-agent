@@ -18,7 +18,7 @@ use crate::hosted_operation::{HostedOperationAction, handle_hosted_operation_act
 use crate::hosted_plan::{HostedPlanAction, handle_hosted_plan_action};
 use crate::hosted_session::{
     announce_runtime_ready, emit_empty_history_snapshot, emit_typed_history_snapshot,
-    typed_history_startup_eligible,
+    start_agent_registry_watcher, typed_history_startup_eligible,
 };
 use crate::hosted_session_lifecycle::{
     HostedSessionAction, ensure_hosted_thread, handle_hosted_session_action,
@@ -38,6 +38,12 @@ use crate::surface_client;
 use crate::surface_projection::SurfaceProjectionState;
 
 const IDLE_SURFACE_PROJECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+struct HostedAgentFocus {
+    root_thread: RuntimeThreadHandle,
+    root_event_tx: mpsc::Sender<TuiEvent>,
+    root_attachment: SessionAttachmentId,
+}
 
 fn poll_idle_surface_projection(
     thread: Option<&RuntimeThreadHandle>,
@@ -88,6 +94,7 @@ pub(crate) fn hosted_tui_controller_loop(
     );
     let mut thread: Option<RuntimeThreadHandle> = None;
     let mut side_parent: Option<HostedSideParent> = None;
+    let mut agent_focus: Option<HostedAgentFocus> = None;
     let mut last_idle_projection_cursor = None;
 
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
@@ -125,10 +132,12 @@ pub(crate) fn hosted_tui_controller_loop(
             }
         }
         if thread_was_missing && thread.is_some() {
-            announce_runtime_ready(
-                thread.as_ref().expect("startup hosted thread"),
-                &event_tx,
-                &control,
+            let runtime_thread = thread.as_ref().expect("startup hosted thread");
+            announce_runtime_ready(runtime_thread, &event_tx, &control);
+            start_agent_registry_watcher(
+                host.clone(),
+                runtime_thread.thread_id().to_string(),
+                event_tx.clone(),
             );
         }
     }
@@ -185,6 +194,121 @@ pub(crate) fn hosted_tui_controller_loop(
             continue;
         }
         match action {
+            Ok(UserAction::FocusAgentThread { thread_id }) => {
+                if side_parent.is_some() || agent_focus.is_some() {
+                    continue;
+                }
+                let Some(root_thread) = thread.as_ref().cloned() else {
+                    continue;
+                };
+                let target = match host.resolve_live_thread(&thread_id).or_else(|_| {
+                    let mut resumed = config.lock().unwrap().clone();
+                    resumed.history_mode = HistoryMode::Resume(thread_id.clone());
+                    host.start_thread(resumed, format!("Agent {thread_id}"))
+                }) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                            "failed to focus agent thread: {error}"
+                        )));
+                        let _ = event_tx.send(TuiEvent::AgentFocusChanged {
+                            focused_thread_id: None,
+                        });
+                        continue;
+                    }
+                };
+                let batch = match crate::hosted_session::read_hosted_projection_batch(&target) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                            "failed to read agent transcript: {error}"
+                        )));
+                        let _ = event_tx.send(TuiEvent::AgentFocusChanged {
+                            focused_thread_id: None,
+                        });
+                        continue;
+                    }
+                };
+                let root_attachment = session_attachment;
+                let root_sender = event_tx.clone();
+                let focused_attachment = session_attachment.next();
+                let focused_sender = spawn_attached_event_sender_with_routing(
+                    root_event_tx.clone(),
+                    focused_attachment,
+                    Some(attachment_routing.clone()),
+                );
+                agent_focus = Some(HostedAgentFocus {
+                    root_thread,
+                    root_event_tx: root_sender,
+                    root_attachment,
+                });
+                thread = Some(target.clone());
+                session_attachment = focused_attachment;
+                event_tx = focused_sender;
+                AttachmentRouting::switch_attachment(
+                    &attachment_routing,
+                    &root_event_tx,
+                    session_attachment,
+                    Some(root_attachment),
+                    false,
+                );
+                if let Err(error) = crate::hosted_session::project_hosted_thread_attached(
+                    batch.0,
+                    batch.1,
+                    session_attachment,
+                    &root_event_tx,
+                ) {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    continue;
+                }
+                announce_runtime_ready(&target, &event_tx, &control);
+                let _ = event_tx.send(TuiEvent::AgentFocusChanged {
+                    focused_thread_id: Some(thread_id),
+                });
+            }
+            Ok(UserAction::FocusRootThread) => {
+                let Some(focus) = agent_focus.take() else {
+                    continue;
+                };
+                let batch =
+                    match crate::hosted_session::read_hosted_projection_batch(&focus.root_thread) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            agent_focus = Some(focus);
+                            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                "failed to return to main: {error}"
+                            )));
+                            continue;
+                        }
+                    };
+                thread = Some(focus.root_thread.clone());
+                event_tx = focus.root_event_tx;
+                session_attachment = focus.root_attachment;
+                AttachmentRouting::switch_attachment(
+                    &attachment_routing,
+                    &root_event_tx,
+                    session_attachment,
+                    None,
+                    false,
+                );
+                if let Err(error) = crate::hosted_session::project_hosted_thread_attached(
+                    batch.0,
+                    batch.1,
+                    session_attachment,
+                    &root_event_tx,
+                ) {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                    continue;
+                }
+                announce_runtime_ready(
+                    thread.as_ref().expect("focused root thread"),
+                    &event_tx,
+                    &control,
+                );
+                let _ = event_tx.send(TuiEvent::AgentFocusChanged {
+                    focused_thread_id: None,
+                });
+            }
             Ok(UserAction::StartSideConversation { prompt }) => {
                 handle_hosted_side_action(
                     HostedSideAction::Start { prompt },

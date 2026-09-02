@@ -22,7 +22,6 @@ use crate::types::{
 };
 use crate::user_input_dialog::UserInputDialog;
 
-const SUBAGENT_ACTIVITY_TAIL_LIMIT: usize = orca_core::task_types::MAX_SUBAGENT_ACTIVITY_HISTORY;
 const GOAL_NOTICE_OBJECTIVE_WIDTH: usize = 80;
 
 fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
@@ -83,11 +82,32 @@ impl AppState {
                     side.parent_status = status;
                 }
             }
+            TuiEvent::AgentRegistryUpdated {
+                root_thread_id,
+                snapshot,
+            } => {
+                for agent in &snapshot.agents {
+                    if self.announced_agent_batches.insert(agent.batch_id.clone()) {
+                        self.finish_assistant_stream();
+                        self.push_message(ChatMessage::System(format!(
+                            "Delegating to {} agents in parallel",
+                            agent.batch_size
+                        )));
+                    }
+                }
+                self.agent_ui.apply(root_thread_id, snapshot);
+            }
+            TuiEvent::AgentFocusChanged { focused_thread_id } => {
+                self.agent_ui.focus_thread(focused_thread_id);
+                self.scroll_to_bottom();
+            }
             TuiEvent::SurfaceProjectionSynced(projection) => {
                 self.apply_surface_projection_state(*projection);
             }
             TuiEvent::NewSessionStarted => {
                 self.task_transcript = None;
+                self.agent_ui.reset();
+                self.announced_agent_batches.clear();
             }
             TuiEvent::SessionProjectionReset(projection) => {
                 if !SurfaceSessionProjectionState::accepts_reset(&projection)
@@ -402,127 +422,6 @@ impl AppState {
                 // inline (and the panel cleared) when the turn completes, so we avoid pushing a
                 // message on every update to keep the scrollback clean.
                 self.apply_plan_update(explanation, plan);
-            }
-            TuiEvent::SubagentStarted { id, description } => {
-                if self.suppress_background_main_session_output {
-                    return;
-                }
-                self.finish_assistant_stream();
-                let announcement_index = self.transcript.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::System(text) if text.starts_with("Delegating to "))
-                }).filter(|&index| {
-                    index + 1 < self.transcript.messages.len()
-                        && self.transcript.messages[index + 1..]
-                            .iter()
-                            .all(|message| matches!(message, ChatMessage::Subagent { .. }))
-                });
-                if let Some(index) = announcement_index {
-                    let count = self.transcript.messages[index + 1..]
-                        .iter()
-                        .filter(|message| matches!(message, ChatMessage::Subagent { .. }))
-                        .count()
-                        + 1;
-                    self.mutate_message(index, |message| {
-                        *message = ChatMessage::System(format!(
-                            "Delegating to {count} agents in parallel"
-                        ));
-                    });
-                } else {
-                    self.push_message(ChatMessage::System(
-                        "Delegating to 1 agent in parallel".to_string(),
-                    ));
-                }
-                self.push_message(ChatMessage::Subagent {
-                    id,
-                    description,
-                    status: "running".to_string(),
-                    output: None,
-                    error: None,
-                    activity: None,
-                    activity_tail: Vec::new(),
-                    turn: None,
-                    usage: None,
-                    expanded: true,
-                });
-            }
-            TuiEvent::SubagentCompleted {
-                id,
-                description,
-                status,
-                output,
-                error,
-            } => {
-                if self.suppress_background_main_session_output {
-                    return;
-                }
-                let updated = self.transcript.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::Subagent { id: existing_id, .. } if existing_id == &id)
-                });
-
-                if let Some(index) = updated {
-                    self.mutate_message(index, |message| {
-                        let ChatMessage::Subagent {
-                            status: existing_status,
-                            output: existing_output,
-                            error: existing_error,
-                            ..
-                        } = message
-                        else {
-                            unreachable!();
-                        };
-                        *existing_status = status;
-                        *existing_output = output;
-                        *existing_error = error;
-                    });
-                } else {
-                    self.finish_assistant_stream();
-                    self.push_message(ChatMessage::Subagent {
-                        id,
-                        description,
-                        status,
-                        output,
-                        error,
-                        activity: None,
-                        activity_tail: Vec::new(),
-                        turn: None,
-                        usage: None,
-                        expanded: false,
-                    });
-                }
-            }
-            TuiEvent::SubagentProgress {
-                id,
-                activity,
-                turn,
-                usage,
-            } => {
-                if self.suppress_background_main_session_output {
-                    return;
-                }
-                if let Some(index) = self.transcript.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::Subagent { id: existing_id, .. } if existing_id == &id)
-                }) {
-                    self.mutate_message(index, |message| {
-                        let ChatMessage::Subagent {
-                            activity: existing_activity,
-                            activity_tail,
-                            turn: existing_turn,
-                            usage: existing_usage,
-                            ..
-                        } = message
-                        else {
-                            unreachable!();
-                        };
-                        push_subagent_activity_tail(activity_tail, &activity);
-                        *existing_activity = Some(activity);
-                        if turn.is_some() {
-                            *existing_turn = turn;
-                        }
-                        if usage.is_some() {
-                            *existing_usage = usage;
-                        }
-                    });
-                }
             }
             TuiEvent::WorkflowTasksUpdated(tasks) => {
                 if !self.suppress_background_main_session_output {
@@ -1187,16 +1086,6 @@ impl AppState {
             index += 1;
             !remove
         });
-    }
-}
-
-fn push_subagent_activity_tail(tail: &mut Vec<String>, activity: &str) {
-    if tail.last().is_some_and(|last| last == activity) {
-        return;
-    }
-    tail.push(activity.to_string());
-    if tail.len() > SUBAGENT_ACTIVITY_TAIL_LIMIT {
-        tail.drain(0..tail.len() - SUBAGENT_ACTIVITY_TAIL_LIMIT);
     }
 }
 

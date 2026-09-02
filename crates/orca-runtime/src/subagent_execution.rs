@@ -12,6 +12,7 @@ use orca_core::tool_types;
 use orca_mcp::McpRegistry;
 
 use crate::agent_child::ChildAgentExecutor;
+use crate::agent_controller::AgentController;
 use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunError, HookRunner};
 use crate::instructions::ProjectInstructions;
@@ -83,6 +84,7 @@ pub(crate) struct RuntimeSubagentBatchToolTurnRuntime<'a> {
     pub(crate) activity_ingress:
         Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
     pub(crate) permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    pub(crate) agent_controller: Option<Arc<AgentController>>,
 }
 
 struct SubagentBatchExecution {
@@ -213,6 +215,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         workflow_ipc,
         activity_ingress,
         permission_handler,
+        agent_controller,
     } = runtime;
     let execution = execute_subagent_batch(
         config,
@@ -234,6 +237,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         child_executor,
         permission_handler,
         activity_ingress,
+        agent_controller,
         &child_budgets,
     );
 
@@ -295,6 +299,7 @@ fn execute_subagent_batch(
     child_executor: ChildAgentExecutor<io::Sink>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
+    agent_controller: Option<Arc<AgentController>>,
     child_budgets: &[Option<orca_core::budget::BudgetSpec>],
 ) -> SubagentBatchExecution {
     // Each child's own lease bounds it (parent remaining minus outstanding
@@ -309,6 +314,7 @@ fn execute_subagent_batch(
     let mut event_error = None;
     let tool_calls = RuntimeToolCallRuntime::for_normal_execution();
     let mut runtime = tool_calls.start_subagent_batch(cancel);
+    let batch_id = uuid::Uuid::now_v7().to_string();
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         if event_error.is_some() {
@@ -441,9 +447,12 @@ fn execute_subagent_batch(
             permission_handler.clone(),
             task_registry,
             root_task_id,
+            agent_controller.clone(),
+            batch_id.clone(),
+            u32::try_from(tool_requests.len()).unwrap_or(u32::MAX),
         );
         let admission = runtime.admit(idx, invocation, |task| {
-            if !emit_deltas {
+            if !emit_deltas || agent_controller.is_some() {
                 return Ok(());
             }
             sink.emit(task.attach_to_event(events.subagent_started(&tool_id, &description)))
@@ -464,8 +473,10 @@ fn execute_subagent_batch(
             continue;
         };
         cost_tracker.merge(&output.cost_tracker);
-        if emit_deltas {
+        if emit_deltas && agent_controller.is_none() {
             emit_runtime_subagent_terminal(events, sink, &output, &mut event_error);
+        }
+        if emit_deltas {
             emit_batch_event(
                 sink,
                 events.tool_call_completed(&output.result),
@@ -551,6 +562,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         child_executor,
         None,
         None,
+        None,
         event_error,
         child_budget,
     )
@@ -577,6 +589,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
     child_executor: ChildAgentExecutor<io::Sink>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
+    agent_controller: Option<Arc<AgentController>>,
     event_error: &mut Option<io::Error>,
     child_budget: Option<&orca_core::budget::BudgetSpec>,
 ) -> io::Result<(
@@ -623,7 +636,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         ));
     }
 
-    if request.mode == SubagentMode::Async {
+    if request.mode == SubagentMode::Async && agent_controller.is_none() {
         let launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config,
             cwd,
@@ -658,10 +671,13 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         permission_handler,
         task_registry,
         root_task_id,
+        agent_controller.clone(),
+        tool_request.id.clone(),
+        1,
     );
     let tool_calls = RuntimeToolCallRuntime::for_normal_execution();
     let execution = tool_calls.execute_subagent(invocation, cancel, |task| {
-        if !emit_deltas {
+        if !emit_deltas || agent_controller.is_some() {
             return Ok(());
         }
         sink.emit(task.attach_to_event(events.subagent_started(&tool_request.id, &description)))
@@ -670,7 +686,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
     if event_error.is_none() {
         *event_error = execution.event_error;
     }
-    if emit_deltas {
+    if emit_deltas && agent_controller.is_none() {
         emit_runtime_subagent_terminal(events, sink, &execution.output, event_error);
     }
     Ok((execution.output.result, execution.output.child_budget_usage))
@@ -1136,6 +1152,7 @@ mod tests {
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
+                    agent_controller: None,
                 },
                 child_executor: fake_child_executor::<std::io::Sink>,
             });
@@ -1374,6 +1391,7 @@ mod tests {
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
+                    agent_controller: None,
                 },
                 child_executor: cancelling_child_executor::<std::io::Sink>,
             });
@@ -1449,6 +1467,7 @@ mod tests {
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
+                    agent_controller: None,
                 },
                 child_executor: delayed_child_executor::<std::io::Sink>,
             });
@@ -1526,6 +1545,7 @@ mod tests {
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
+                    agent_controller: None,
                 },
                 child_executor: panic_child_executor::<std::io::Sink>,
             });
@@ -1791,6 +1811,7 @@ mod tests {
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
+                    agent_controller: None,
                 },
                 child_executor: cancelled_child_executor::<std::io::Sink>,
             });
@@ -1925,6 +1946,7 @@ mod tests {
             child_executor_observes_permission_handler::<io::Sink>,
             Some(permission_handler),
             Some(activity_ingress.clone()),
+            None,
             &mut event_error,
             None,
         )
@@ -2239,6 +2261,7 @@ mod tests {
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
+                    agent_controller: None,
                 },
                 child_executor: receipt_child_executor::<std::io::Sink>,
             });

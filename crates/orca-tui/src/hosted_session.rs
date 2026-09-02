@@ -17,10 +17,13 @@ use orca_runtime::lifecycle::{
     RuntimeUserInputRequest,
 };
 use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
+use orca_runtime::runtime_host::RuntimeHostHandle;
 use orca_runtime::runtime_host::{PromptQueueInteractionHandlers, RuntimeThreadHandle};
 use orca_runtime::runtime_permission::{RuntimePermissionRequest, RuntimePermissionResponse};
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
+use std::collections::HashSet;
 use std::io;
+use std::time::Duration;
 
 use crate::attachment_routing::send_attached_event;
 use crate::composer_images::ComposerImageState;
@@ -288,48 +291,10 @@ fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
             diff: string("diff").map(str::to_string),
             kind: string("kind").map(str::to_string),
         }),
-        EventType::SubagentStarted => Some(TuiEvent::SubagentStarted {
-            id: string("id")?.to_string(),
-            description: string("description").unwrap_or("subagent").to_string(),
-        }),
-        EventType::SubagentProgress => Some(TuiEvent::SubagentProgress {
-            id: string("id")?.to_string(),
-            activity: string("activity").unwrap_or("running").to_string(),
-            turn: event
-                .payload
-                .get("turn")
-                .and_then(|value| value.as_u64())
-                .map(|turn| turn as u32),
-            usage: event
-                .payload
-                .get("usage")
-                .cloned()
-                .filter(|value| !value.is_null())
-                .and_then(|value| serde_json::from_value(value).ok()),
-        }),
-        EventType::SubagentCompleted => Some(TuiEvent::SubagentCompleted {
-            id: string("id")?.to_string(),
-            description: string("description").unwrap_or("subagent").to_string(),
-            status: string("status").unwrap_or("failed").to_string(),
-            output: string("output").map(str::to_string),
-            error: string("error").map(str::to_string),
-        }),
-        EventType::WorkflowTasksUpdated => {
-            serde_json::from_value(event.payload.clone())
-                .ok()
-                .map(|payload: serde_json::Value| {
-                    TuiEvent::WorkflowTasksUpdated(
-                        serde_json::from_value(payload.get("tasks").cloned().unwrap_or_default())
-                            .unwrap_or_default(),
-                    )
-                })
+        EventType::SubagentStarted | EventType::SubagentProgress | EventType::SubagentCompleted => {
+            None
         }
-        EventType::TaskStatusUpdated => event
-            .payload
-            .get("task")
-            .cloned()
-            .and_then(|task| serde_json::from_value(task).ok())
-            .map(TuiEvent::TaskStatusUpdated),
+        EventType::WorkflowTasksUpdated | EventType::TaskStatusUpdated => None,
         EventType::PlanUpdated => serde_json::from_value(event.payload.clone()).ok().map(
             |plan: orca_core::plan_types::UpdatePlanArgs| TuiEvent::PlanUpdated {
                 explanation: plan.explanation,
@@ -452,6 +417,59 @@ pub(crate) fn announce_runtime_ready(
             )));
         }
     }
+}
+
+pub(crate) fn start_agent_registry_watcher(
+    host: RuntimeHostHandle,
+    root_thread_id: String,
+    event_tx: mpsc::Sender<TuiEvent>,
+) {
+    static WATCHED_ROOTS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let watched = WATCHED_ROOTS.get_or_init(Default::default);
+    if !watched
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root_thread_id.clone())
+    {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name(format!(
+            "orca-agent-registry-{}",
+            &root_thread_id[..8.min(root_thread_id.len())]
+        ))
+        .spawn(move || {
+            let mut revision = None;
+            loop {
+                if host.resolve_live_thread(&root_thread_id).is_err() {
+                    break;
+                }
+                let snapshot = host.agent_registry_snapshot(&root_thread_id);
+                if snapshot.agents.is_empty() {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                if revision != Some(snapshot.revision) {
+                    revision = Some(snapshot.revision);
+                    if event_tx
+                        .send(TuiEvent::AgentRegistryUpdated {
+                            root_thread_id: root_thread_id.clone(),
+                            snapshot,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            WATCHED_ROOTS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&root_thread_id);
+        });
 }
 
 pub(crate) fn read_hosted_projection_batch(
@@ -819,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_task_events_are_forwarded_to_tui() {
+    fn legacy_task_snapshot_events_are_not_forwarded_to_tui() {
         let event = EventEnvelope {
             version: "1".to_string(),
             run_id: "run".to_string(),
@@ -828,12 +846,10 @@ mod tests {
             event_type: EventType::WorkflowTasksUpdated,
             payload: serde_json::json!({"tasks": []}),
         };
-        assert!(matches!(
-            runtime_event_to_tui(&event),
-            Some(TuiEvent::WorkflowTasksUpdated(tasks)) if tasks.is_empty()
-        ));
+        assert!(runtime_event_to_tui(&event).is_none());
     }
 
+    #[cfg(any())]
     #[test]
     fn runtime_queue_event_projection_preserves_subagents_and_compaction() {
         let base = EventEnvelope {

@@ -60,6 +60,8 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
         UserAction::StartSideConversation { .. } => "StartSideConversation",
         UserAction::ToggleSideConversation => "ToggleSideConversation",
         UserAction::CloseSideConversation => "CloseSideConversation",
+        UserAction::FocusAgentThread { .. } => "FocusAgentThread",
+        UserAction::FocusRootThread => "FocusRootThread",
         UserAction::ForkCurrentSession { .. } => "ForkCurrentSession",
         UserAction::RenameCurrentSession { .. } => "RenameCurrentSession",
         UserAction::ResumeSavedSession { .. } => "ResumeSavedSession",

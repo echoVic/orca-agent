@@ -426,6 +426,7 @@ pub struct RunConfig {
 #[serde(rename_all = "camelCase")]
 pub struct DelegationSnapshot {
     pub approval_mode: ApprovalMode,
+    pub execution_profile: crate::capability::ExecutionProfile,
     pub active_permission_profile: Option<ActivePermissionProfile>,
     #[serde(default)]
     pub permission_profiles: HashMap<String, PermissionProfileConfig>,
@@ -440,6 +441,9 @@ impl DelegationSnapshot {
     pub fn from_config(config: &RunConfig) -> Self {
         Self {
             approval_mode: config.approval_mode,
+            execution_profile: crate::capability::ExecutionProfile::for_approval_mode(
+                config.approval_mode,
+            ),
             active_permission_profile: config.active_permission_profile.clone(),
             permission_profiles: config.permission_profiles.clone(),
             runtime_workspace_roots: config.runtime_workspace_roots.clone(),

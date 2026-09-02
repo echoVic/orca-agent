@@ -1274,7 +1274,9 @@ impl ThreadActor {
             .find(|subagent| subagent.task_id.as_str() == task_id)
             .map_or(0, |subagent| subagent.revision.get());
         loop {
-            let page = reader.read_page(after_sequence).map_err(io::Error::other)?;
+            let page = reader
+                .read_page_for_drain(after_sequence)
+                .map_err(io::Error::other)?;
             if page.records.is_empty() {
                 return Ok(());
             }
@@ -1287,17 +1289,21 @@ impl ThreadActor {
                             reason: format!("invalid typed subagent activity payload: {error}"),
                         };
                         reader.quarantine_corrupt(&relay_error);
-                        return Err(io::Error::other(relay_error));
+                        return Ok(());
                     }
                 };
-                validate_relay_activity_envelope(
+                if validate_relay_activity_envelope(
                     &reader,
                     record,
                     &event,
                     task_id,
                     attempt_id,
                     after_sequence,
-                )?;
+                )
+                .is_err()
+                {
+                    return Ok(());
+                }
                 if matches!(event.owner, SubagentActivityOwner::DetachedTask { .. }) {
                     self.commit_detached_subagent_activity(&active.task_registry, event)?;
                 } else {
@@ -1341,7 +1347,9 @@ impl ThreadActor {
             .find(|subagent| subagent.task_id.as_str() == binding.task_id)
             .map_or(0, |subagent| subagent.source.source_sequence);
         loop {
-            let page = reader.read_page(after_sequence).map_err(io::Error::other)?;
+            let page = reader
+                .read_page_for_drain(after_sequence)
+                .map_err(io::Error::other)?;
             if page.records.is_empty() {
                 return Ok(());
             }
@@ -1354,17 +1362,21 @@ impl ThreadActor {
                             reason: format!("invalid typed subagent activity payload: {error}"),
                         };
                         reader.quarantine_corrupt(&relay_error);
-                        return Err(io::Error::other(relay_error));
+                        return Ok(());
                     }
                 };
-                validate_relay_activity_envelope(
+                if validate_relay_activity_envelope(
                     &reader,
                     record,
                     &event,
                     &binding.task_id,
                     binding.attempt_id.as_str(),
                     after_sequence,
-                )?;
+                )
+                .is_err()
+                {
+                    return Ok(());
+                }
                 self.commit_detached_subagent_activity(task_registry, event)?;
                 after_sequence = record.source_sequence;
             }
