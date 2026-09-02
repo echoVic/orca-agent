@@ -433,6 +433,12 @@ fn run_threaded_agent_worker(
         },
         config: config.clone(),
         cancel,
+        // Subagents never inherit an interactive approval handler. The parent's
+        // `RuntimeApprovalHandler` exists only as a non-'static borrow scoped to
+        // the parent turn, so it cannot cross this worker boundary; the legacy
+        // sync child path is identical. A child resolves per-tool approvals from
+        // its own RunConfig (RuntimeConfigApprovalHandler), while user-facing
+        // escalations flow through the scoped permission_handler below.
         approval_handler: None,
         permission_handler,
     });

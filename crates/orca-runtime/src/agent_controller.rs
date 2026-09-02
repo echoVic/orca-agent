@@ -140,17 +140,26 @@ impl AgentController {
             thread_id.clone(),
             attempt_id,
         ));
-        publisher.publish(AgentEvent::Spawned {
+        // A running child must never outlive a failed bookkeeping step. If the
+        // spawn/starting events cannot be journaled, shut the child down before
+        // returning so it does not linger unobserved.
+        if let Err(error) = publisher.publish(AgentEvent::Spawned {
             batch_id: request.batch_id,
             batch_size: request.batch_size,
             parent_thread_id: self.parent_thread_id.clone(),
             description: request.description.clone(),
-        })?;
-        publisher.publish(AgentEvent::Activity {
+        }) {
+            let _ = child.shutdown();
+            return Err(error);
+        }
+        if let Err(error) = publisher.publish(AgentEvent::Activity {
             activity: AgentActivity::Starting,
             turn: None,
             usage: None,
-        })?;
+        }) {
+            let _ = child.shutdown();
+            return Err(error);
+        }
 
         let mut turn = HostedTurnRequest::new(request.prompt)
             .with_task_description(request.description)
@@ -168,18 +177,32 @@ impl AgentController {
                     reason: error.to_string(),
                     usage: AgentUsage::default(),
                 });
+                let _ = child.shutdown();
                 return Err(io::Error::other(error.to_string()));
             }
         };
 
         if request.mode == AgentRunMode::Async {
             let completion_child = child.clone();
-            std::thread::Builder::new()
+            let watcher_publisher = publisher.clone();
+            if let Err(error) = std::thread::Builder::new()
                 .name(format!("orca-agent-wait-{}", request.agent_id))
                 .spawn(move || {
-                    settle_operation(&completion_child, operation, &publisher, None);
+                    settle_operation(&completion_child, operation, &watcher_publisher, None);
                 })
-                .map_err(|error| io::Error::other(format!("failed to watch agent: {error}")))?;
+            {
+                // Without a watcher nothing will settle the running operation,
+                // so the registry would be stuck in `Running` forever. Tear the
+                // child down, record the failure, and surface the error.
+                let reason = format!("failed to watch agent: {error}");
+                let _ = child.interrupt_active();
+                let _ = publisher.publish(AgentEvent::Failed {
+                    reason: reason.clone(),
+                    usage: AgentUsage::default(),
+                });
+                let _ = child.shutdown();
+                return Err(io::Error::other(reason));
+            }
             return Ok(AgentLaunchResult {
                 thread_id,
                 status: RunStatus::Success,
@@ -426,7 +449,14 @@ fn settle_operation(
             },
         ),
     };
-    let _ = publisher.publish(event);
+    // The terminal event is what moves the registry out of `Running`. If it
+    // cannot be journaled, fall back to a `Corrupt` marker so the agent still
+    // reaches a definite terminal status rather than lingering as running.
+    if let Err(error) = publisher.publish(event) {
+        let _ = publisher.publish(AgentEvent::Corrupt {
+            reason: format!("failed to record agent terminal event: {error}"),
+        });
+    }
     AgentLaunchResult {
         thread_id: child.thread_id().to_string(),
         status,
