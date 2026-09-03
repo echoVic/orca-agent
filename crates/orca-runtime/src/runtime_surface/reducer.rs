@@ -1804,7 +1804,8 @@ fn scope_matches_event(
                 _ => false,
             }
         }
-        SurfaceEvent::Subagent(SubagentPatch::Progress { owner, .. })
+        SurfaceEvent::Subagent(SubagentPatch::ChildThreadBound { owner, .. })
+        | SurfaceEvent::Subagent(SubagentPatch::Progress { owner, .. })
         | SurfaceEvent::Subagent(SubagentPatch::Completed { owner, .. })
         | SurfaceEvent::Subagent(SubagentPatch::Stopped { owner, .. }) => match (scope, owner) {
             (
@@ -8770,6 +8771,45 @@ fn apply_subagent_patch(
             subagent.continuation = continuation.clone();
             Ok(())
         }
+        SubagentPatch::ChildThreadBound {
+            subagent_id,
+            expected_revision,
+            next_revision,
+            owner,
+            source,
+            thread_id,
+        } => {
+            let Some(subagent) = snapshot
+                .subagents
+                .iter_mut()
+                .find(|value| value.subagent_id == *subagent_id)
+            else {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::MissingIdentity,
+                    "subagent does not exist",
+                ));
+            };
+            if subagent.revision != *expected_revision
+                || !expected_revision
+                    .get()
+                    .checked_add(1)
+                    .is_some_and(|expected_next| next_revision.get() == expected_next)
+                || subagent.owner != *owner
+                || !subagent_source_is_next(&subagent.source, source)
+                || subagent.status != SurfaceSubagentStatus::Running
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::StaleRevision,
+                    "subagent thread binding is stale",
+                ));
+            }
+            subagent.revision = *next_revision;
+            subagent.source = source.clone();
+            subagent.child_thread_id = Some(thread_id.clone());
+            Ok(())
+        }
         SubagentPatch::Completed {
             subagent_id,
             expected_revision,
@@ -9774,6 +9814,9 @@ pub(crate) mod tests {
             task_id: task_id.clone(),
             revision: agent_revision,
             description: DisplayText::new("child agent"),
+            child_thread_id: None,
+            batch_id: NonEmptyText::try_new("batch-child").unwrap(),
+            batch_size: 1,
             status: SurfaceSubagentStatus::Running,
             activity: Some(DisplayText::new("bash")),
             subagent_activity_history: Vec::new(),

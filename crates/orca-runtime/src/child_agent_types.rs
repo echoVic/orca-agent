@@ -371,6 +371,11 @@ pub(crate) enum SubagentActivityOwner {
 pub(crate) enum SubagentActivityPayload {
     Started {
         description: DisplayText,
+        batch_id: String,
+        batch_size: u32,
+    },
+    ChildThreadBound {
+        thread_id: crate::runtime_surface::SurfaceThreadId,
     },
     PhaseChanged {
         phase: SurfaceSubagentPhase,
@@ -807,6 +812,8 @@ mod tests {
 
         let payload = SubagentActivityPayload::Started {
             description: DisplayText::new("inspect repository"),
+            batch_id: "batch".to_string(),
+            batch_size: 1,
         };
         assert!(emitter.publish_payload(payload.clone()).is_err());
         emitter.publish_payload(payload).unwrap();
@@ -854,6 +861,8 @@ mod tests {
             emitter
                 .publish_payload(SubagentActivityPayload::Started {
                     description: DisplayText::new("start"),
+                    batch_id: "batch".to_string(),
+                    batch_size: 1,
                 })
                 .is_err()
         );

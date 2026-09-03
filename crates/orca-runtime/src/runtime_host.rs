@@ -5428,7 +5428,6 @@ async fn run_host_supervisor(
                             host_incarnation: host_incarnation.clone(),
                             agent_registry: Arc::clone(&agent_registry),
                         },
-                        Arc::clone(&agent_registry),
                         root_thread_id,
                         thread_id.clone(),
                         agent_depth,

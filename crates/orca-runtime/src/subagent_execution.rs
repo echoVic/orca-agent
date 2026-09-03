@@ -302,6 +302,9 @@ fn execute_subagent_batch(
     agent_controller: Option<Arc<AgentController>>,
     child_budgets: &[Option<orca_core::budget::BudgetSpec>],
 ) -> SubagentBatchExecution {
+    #[cfg(test)]
+    let activity_ingress =
+        activity_ingress.or_else(|| Some(crate::runtime_subagent_call::test_activity_ingress()));
     // Each child's own lease bounds it (parent remaining minus outstanding
     // reservations); without a lease the child falls back to the parent
     // config's budget. The child_config is resolved per child below.
@@ -542,6 +545,10 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
     tool_types::ToolResult,
     Option<orca_core::budget::BudgetUsage>,
 )> {
+    #[cfg(test)]
+    let test_ingress = Some(crate::runtime_subagent_call::test_activity_ingress());
+    #[cfg(not(test))]
+    let test_ingress = None;
     execute_subagent_tool_with_activity_ingress(
         config,
         cwd,
@@ -561,7 +568,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         workflow_ipc,
         child_executor,
         None,
-        None,
+        test_ingress,
         None,
         event_error,
         child_budget,
@@ -636,7 +643,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         ));
     }
 
-    if request.mode == SubagentMode::Async && agent_controller.is_none() {
+    if request.mode == SubagentMode::Async {
         let launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config,
             cwd,
@@ -783,7 +790,8 @@ fn emit_rejected_subagent_lifecycle(
 mod tests {
     use std::io;
     use std::process::Command;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
@@ -804,7 +812,10 @@ mod tests {
     use orca_core::tool_types;
     use orca_mcp::McpRegistry;
 
-    use crate::child_agent_types::{SubagentActivityEvent, SubagentActivityOwner};
+    use crate::agent_continuation::ContinuationStatus;
+    use crate::child_agent_types::{
+        SubagentActivityEvent, SubagentActivityOwner, SubagentActivityPayload,
+    };
     use crate::protocol::{
         PermissionGrantScope, PermissionResponseDecision, RequestPermissionProfile,
     };
@@ -1185,6 +1196,20 @@ mod tests {
         })
     }
 
+    fn silent_child_executor<W: io::Write>(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, W>,
+        _child_cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("Mock silent final response.".to_string()),
+            error: None,
+            budget_usage: None,
+        })
+    }
+
     struct CapturingPermissionHandler {
         requests: Arc<Mutex<Vec<RuntimePermissionRequest>>>,
     }
@@ -1207,6 +1232,134 @@ mod tests {
             self.events.lock().unwrap().push(event);
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingTerminalActivityIngress {
+        events: Mutex<Vec<SubagentActivityEvent>>,
+    }
+
+    impl RuntimeSubagentActivityIngress for FailingTerminalActivityIngress {
+        fn owner(&self) -> SubagentActivityOwner {
+            SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new("failing-terminal-owner").unwrap(),
+                task_revision: TaskRevision::try_new(1).unwrap(),
+                authority_digest: Sha256Digest::new([6; 32]),
+            }
+        }
+
+        fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            if matches!(event.payload, SubagentActivityPayload::Completed { .. }) {
+                return Err(io::Error::other("simulated ambiguous terminal commit"));
+            }
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ContinuationCheckingActivityIngress {
+        registry: TaskRegistry,
+        events: Mutex<Vec<SubagentActivityEvent>>,
+        terminal_continuation_statuses: Mutex<Vec<Option<ContinuationStatus>>>,
+    }
+
+    impl ContinuationCheckingActivityIngress {
+        fn new(registry: TaskRegistry) -> Self {
+            Self {
+                registry,
+                events: Mutex::new(Vec::new()),
+                terminal_continuation_statuses: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RuntimeSubagentActivityIngress for ContinuationCheckingActivityIngress {
+        fn owner(&self) -> SubagentActivityOwner {
+            SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new("continuation-order-owner").unwrap(),
+                task_revision: TaskRevision::try_new(1).unwrap(),
+                authority_digest: Sha256Digest::new([8; 32]),
+            }
+        }
+
+        fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            if matches!(event.payload, SubagentActivityPayload::Completed { .. }) {
+                let status = self
+                    .registry
+                    .continuation_projection(event.task_id.as_str())
+                    .ok()
+                    .flatten()
+                    .and_then(|projection| {
+                        self.registry
+                            .continuation_store()
+                            .ok()?
+                            .load_record(&projection.continuation_id)
+                            .ok()?
+                            .map(|record| record.status)
+                    });
+                self.terminal_continuation_statuses
+                    .lock()
+                    .unwrap()
+                    .push(status);
+            }
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    fn hosted_request(id: &str, description: &str, prompt: &str) -> tool_types::ToolRequest {
+        tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": description,
+                    "prompt": prompt,
+                })
+                .to_string(),
+            ),
+            ..subagent_request(id)
+        }
+    }
+
+    fn execute_hosted_batch_for_test(
+        config: RunConfig,
+        cwd: std::path::PathBuf,
+        requests: Vec<tool_types::ToolRequest>,
+        cancel: CancelToken,
+        task_registry: TaskRegistry,
+        activity_ingress: Arc<dyn RuntimeSubagentActivityIngress>,
+        controller: Arc<crate::agent_controller::AgentController>,
+    ) -> super::SubagentBatchExecution {
+        let mut events = EventFactory::new("hosted-cancellation-batch".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        super::execute_subagent_batch(
+            &config,
+            &cwd,
+            &mut events,
+            &mut sink,
+            &requests,
+            0,
+            false,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            unexpected_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress),
+            Some(controller),
+            &[],
+        )
     }
 
     impl RuntimePermissionRequestHandler for CapturingPermissionHandler {
@@ -1960,6 +2113,877 @@ mod tests {
             RuntimePermissionContext::Child { .. }
         ));
         assert!(!activity_ingress.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn threaded_sync_subagent_without_surface_ingress_fails_before_child_launch() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("threaded-sync-missing-ingress".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = subagent_request("threaded-sync-missing-ingress");
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("threaded-sync-missing-ingress".to_string());
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "threaded-sync-missing-ingress".to_string(),
+            "threaded-sync-missing-ingress".to_string(),
+            0,
+        ));
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            fake_child_executor::<io::Sink>,
+            None,
+            None,
+            Some(controller),
+            &mut event_error,
+            None,
+        )
+        .expect("threaded sync launch result");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("surface activity ingress"))
+        );
+        assert!(task_registry.list().is_empty());
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn hosted_async_subagent_still_requires_the_durable_worker_path() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("hosted-async-durable-route".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "inspect later",
+                    "prompt": "inspect later",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+            ..subagent_request("hosted-async-durable-route")
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("hosted-async-durable-route".to_string());
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "hosted-async-durable-route".to_string(),
+            "hosted-async-durable-route".to_string(),
+            0,
+        ));
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            fake_child_executor::<io::Sink>,
+            None,
+            None,
+            Some(controller),
+            &mut event_error,
+            None,
+        )
+        .expect("hosted async route result");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("persistent task ownership"))
+        );
+        assert!(task_registry.list().is_empty());
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn threaded_sync_launch_failure_finishes_the_canonical_registry_task() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_depth = 1;
+        let config = config(subagents);
+        let mut events = EventFactory::new("threaded-sync-launch-failure".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = subagent_request("threaded-sync-launch-failure");
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("threaded-sync-launch-failure".to_string());
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "threaded-sync-launch-failure".to_string(),
+            "threaded-sync-launch-failure".to_string(),
+            1,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            fake_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress.clone()),
+            Some(controller),
+            &mut event_error,
+            None,
+        )
+        .expect("threaded sync launch failure result");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        let tasks = task_registry.list();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, orca_core::task_types::TaskStatus::Failed);
+        let activity = activity_ingress.events.lock().expect("surface activity");
+        assert!(matches!(
+            activity.first().map(|event| &event.payload),
+            Some(crate::child_agent_types::SubagentActivityPayload::Started { .. })
+        ));
+        assert!(matches!(
+            activity.last().map(|event| &event.payload),
+            Some(
+                crate::child_agent_types::SubagentActivityPayload::Completed {
+                    status: crate::runtime_surface::SurfaceSubagentTerminalStatus::Failed,
+                    ..
+                }
+            )
+        ));
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    #[test]
+    fn threaded_sync_registry_stop_interrupts_the_hosted_child() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let cwd_path = cwd.path().to_path_buf();
+        let config = config(SubagentConfig::default());
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "wait until stopped",
+                    "prompt": "mock_stream_delay_ms 30000"
+                })
+                .to_string(),
+            ),
+            ..subagent_request("threaded-sync-registry-stop")
+        };
+        let task_registry = TaskRegistry::new("threaded-sync-registry-stop".to_string());
+        let worker_registry = task_registry.clone();
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "threaded-sync-registry-stop".to_string(),
+            "threaded-sync-registry-stop".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let parent_cancel = CancelToken::new();
+        let cleanup_cancel = parent_cancel.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let mut events = EventFactory::new("threaded-sync-registry-stop".to_string());
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let instructions = ProjectInstructions::default();
+            let memory = MemoryBlock::default();
+            let mcp_registry = McpRegistry::default();
+            let hooks = HookRunner::default();
+            let mut cost_tracker = CostTracker::new(None);
+            let mut event_error = None;
+            let result = super::execute_subagent_tool_with_activity_ingress(
+                &config,
+                &cwd_path,
+                &mut events,
+                &mut sink,
+                &request,
+                0,
+                &instructions,
+                &memory,
+                &mcp_registry,
+                &hooks,
+                false,
+                &mut cost_tracker,
+                &parent_cancel,
+                &worker_registry,
+                None,
+                None,
+                fake_child_executor::<io::Sink>,
+                None,
+                Some(activity_ingress),
+                Some(controller),
+                &mut event_error,
+                None,
+            )
+            .expect("threaded sync stop result")
+            .0;
+            let _ = result_tx.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let task_id = loop {
+            if let Some(task) = task_registry.list().into_iter().next()
+                && task.status == orca_core::task_types::TaskStatus::Running
+            {
+                break task.id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "threaded child never reached running"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        task_registry
+            .request_stop(&task_id)
+            .expect("request registry stop");
+
+        let (stopped_by_registry, result) = match result_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => (true, result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cleanup_cancel.cancel();
+                (
+                    false,
+                    result_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("parent cancellation must clean up delayed child"),
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("threaded child result channel disconnected")
+            }
+        };
+        worker.join().expect("join threaded child caller");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert!(
+            stopped_by_registry,
+            "request_stop(task_id) did not interrupt the hosted child"
+        );
+        assert_eq!(result.status, tool_types::ToolStatus::Cancelled);
+        assert_eq!(
+            task_registry.get(&task_id).expect("registry task").status,
+            orca_core::task_types::TaskStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn stopping_one_hosted_sibling_does_not_cancel_the_other_or_the_parent() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let release_marker = cwd.path().join("release-sibling");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_parallel = 2;
+        let config = config(subagents);
+        let requests = vec![
+            hosted_request(
+                "stop-one",
+                "stop only this child",
+                "mock_stream_delay_ms 10000",
+            ),
+            hosted_request(
+                "finish-one",
+                "finish sibling",
+                &format!("mock_stream_release_marker {}", release_marker.display()),
+            ),
+        ];
+        let task_registry = TaskRegistry::new("hosted-independent-cancel".to_string());
+        let worker_registry = task_registry.clone();
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "hosted-independent-cancel".to_string(),
+            "hosted-independent-cancel".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let parent_cancel = CancelToken::new();
+        let worker_cancel = parent_cancel.clone();
+        let cwd_path = cwd.path().to_path_buf();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let result = execute_hosted_batch_for_test(
+                config,
+                cwd_path,
+                requests,
+                worker_cancel,
+                worker_registry,
+                activity_ingress,
+                controller,
+            );
+            let _ = result_tx.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stopped_task_id = loop {
+            let tasks = task_registry.list();
+            if tasks.len() == 2
+                && tasks
+                    .iter()
+                    .all(|task| task.status == orca_core::task_types::TaskStatus::Running)
+            {
+                break tasks
+                    .iter()
+                    .find(|task| task.description == "stop only this child")
+                    .expect("stopped sibling task")
+                    .id
+                    .clone();
+            }
+            assert!(Instant::now() < deadline, "siblings never reached running");
+            thread::sleep(Duration::from_millis(10));
+        };
+        task_registry
+            .request_stop(&stopped_task_id)
+            .expect("stop one sibling");
+        thread::sleep(Duration::from_millis(100));
+        std::fs::write(&release_marker, "release\n").expect("release sibling");
+
+        let execution = match result_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(execution) => execution,
+            Err(error) => {
+                parent_cancel.cancel();
+                panic!("hosted sibling batch did not finish: {error}");
+            }
+        };
+        worker.join().expect("join hosted batch");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert!(!parent_cancel.is_cancelled());
+        assert_eq!(execution.results[0].0, RunStatus::Cancelled);
+        assert_eq!(
+            execution.results[0].1.status,
+            tool_types::ToolStatus::Cancelled
+        );
+        assert_eq!(execution.results[1].0, RunStatus::Success);
+        assert_eq!(
+            execution.results[1].1.status,
+            tool_types::ToolStatus::Completed
+        );
+    }
+
+    #[test]
+    fn parent_cancellation_propagates_to_every_hosted_child() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.max_parallel = 2;
+        let config = config(subagents);
+        let requests = vec![
+            hosted_request("cancel-a", "cancel child a", "mock_stream_delay_ms 10000"),
+            hosted_request("cancel-b", "cancel child b", "mock_stream_delay_ms 10000"),
+        ];
+        let task_registry = TaskRegistry::new("hosted-parent-cancel".to_string());
+        let worker_registry = task_registry.clone();
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "hosted-parent-cancel".to_string(),
+            "hosted-parent-cancel".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let parent_cancel = CancelToken::new();
+        let worker_cancel = parent_cancel.clone();
+        let cwd_path = cwd.path().to_path_buf();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let result = execute_hosted_batch_for_test(
+                config,
+                cwd_path,
+                requests,
+                worker_cancel,
+                worker_registry,
+                activity_ingress,
+                controller,
+            );
+            let _ = result_tx.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let tasks = task_registry.list();
+            if tasks.len() == 2
+                && tasks
+                    .iter()
+                    .all(|task| task.status == orca_core::task_types::TaskStatus::Running)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "children never reached running");
+            thread::sleep(Duration::from_millis(10));
+        }
+        parent_cancel.cancel();
+
+        let execution = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("parent cancellation must settle every child");
+        worker.join().expect("join hosted batch");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert!(execution.results.iter().all(|(status, result)| {
+            *status == RunStatus::Cancelled && result.status == tool_types::ToolStatus::Cancelled
+        }));
+    }
+
+    #[test]
+    fn hosted_sync_schema_request_uses_the_observable_runtime_route() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("hosted-schema-route".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "schema child",
+                    "prompt": "mock_silent_final",
+                    "schema": { "type": "number" }
+                })
+                .to_string(),
+            ),
+            ..subagent_request("hosted-schema-route")
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("hosted-schema-route".to_string());
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "hosted-schema-route".to_string(),
+            "hosted-schema-route".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            unexpected_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress.clone()),
+            Some(controller),
+            &mut event_error,
+            None,
+        )
+        .expect("hosted schema result");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(
+            result.terminal().started,
+            tool_types::ToolInvocationStarted::Yes
+        );
+        let activity = activity_ingress.events.lock().unwrap();
+        assert!(activity.iter().any(|event| {
+            matches!(
+                event.payload,
+                SubagentActivityPayload::ChildThreadBound { .. }
+            )
+        }));
+        assert_eq!(
+            activity
+                .iter()
+                .filter_map(|event| match event.payload {
+                    SubagentActivityPayload::Completed { ref status, .. } => Some(status),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![&crate::runtime_surface::SurfaceSubagentTerminalStatus::Failed]
+        );
+        assert_eq!(
+            task_registry.list()[0].status,
+            orca_core::task_types::TaskStatus::Failed
+        );
+    }
+
+    #[test]
+    fn hosted_sync_resume_rejects_before_child_launch() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("hosted-resume-rejection".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "resume child",
+                    "prompt": "mock_silent_final",
+                    "resume_from": "missing-continuation"
+                })
+                .to_string(),
+            ),
+            ..subagent_request("hosted-resume-rejection")
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("hosted-resume-rejection".to_string());
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "hosted-resume-rejection".to_string(),
+            "hosted-resume-rejection".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            unexpected_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress.clone()),
+            Some(controller),
+            &mut event_error,
+            None,
+        )
+        .expect("hosted resume rejection");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(
+            result.terminal().started,
+            tool_types::ToolInvocationStarted::No
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("hosted_sync_resume_unsupported") })
+        );
+        assert!(task_registry.list().is_empty());
+        assert!(activity_ingress.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hosted_surface_terminal_observes_committed_continuation_terminal() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("hosted-terminal-order".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = hosted_request(
+            "hosted-terminal-order",
+            "ordered terminal child",
+            "mock_silent_final",
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("hosted-terminal-order".to_string());
+        let activity_ingress = Arc::new(ContinuationCheckingActivityIngress::new(
+            task_registry.clone(),
+        ));
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            silent_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress.clone()),
+            None,
+            &mut event_error,
+            None,
+        )
+        .expect("ordered terminal result");
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert_eq!(
+            activity_ingress
+                .terminal_continuation_statuses
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[Some(ContinuationStatus::Completed)]
+        );
+        assert_eq!(
+            activity_ingress
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    matches!(event.payload, SubagentActivityPayload::Completed { .. })
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn hosted_terminal_commit_failure_returns_indeterminate_result() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("hosted-terminal-failure".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = hosted_request(
+            "hosted-terminal-failure",
+            "terminal failure child",
+            "mock_silent_final",
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("hosted-terminal-failure".to_string());
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "hosted-terminal-failure".to_string(),
+            "hosted-terminal-failure".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(FailingTerminalActivityIngress::default());
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            unexpected_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress.clone()),
+            Some(controller),
+            &mut event_error,
+            None,
+        )
+        .expect("hosted terminal failure result");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Indeterminate);
+        assert!(result.error.as_deref().is_some_and(|error| {
+            error.contains("surface terminal commit failed")
+                && error.contains("Inspect external state before retrying")
+        }));
+        assert_eq!(
+            activity_ingress
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.payload, SubagentActivityPayload::Completed { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn hosted_child_thread_binding_uses_the_canonical_task_identity() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let config = config(SubagentConfig::default());
+        let mut events = EventFactory::new("hosted-canonical-binding".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = hosted_request(
+            "tool-call-is-not-task-id",
+            "canonical binding child",
+            "mock_silent_final",
+        );
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("hosted-canonical-binding".to_string());
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host_handle.clone(),
+            "hosted-canonical-binding".to_string(),
+            "hosted-canonical-binding".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            unexpected_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress.clone()),
+            Some(controller),
+            &mut event_error,
+            None,
+        )
+        .expect("hosted canonical binding result");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        let tasks = task_registry.list();
+        assert_eq!(tasks.len(), 1);
+        let canonical_task_id = tasks[0].id.as_str();
+        assert_ne!(canonical_task_id, request.id);
+        let activity = activity_ingress.events.lock().unwrap();
+        assert!(activity.iter().all(|event| {
+            event.task_id.as_str() == canonical_task_id
+                && event.subagent_id.as_str() == canonical_task_id
+        }));
+        let child_thread_id = activity
+            .iter()
+            .find_map(|event| match &event.payload {
+                SubagentActivityPayload::ChildThreadBound { thread_id } => {
+                    Some(uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string())
+                }
+                _ => None,
+            })
+            .expect("typed child thread binding");
+        drop(activity);
+        let child = host_handle
+            .resolve_live_thread(&child_thread_id)
+            .expect("bound child thread remains live");
+        assert_eq!(child.parent_thread_id(), Some("hosted-canonical-binding"));
+        assert_eq!(
+            child
+                .snapshot()
+                .expect("child transcript snapshot")
+                .session_id(),
+            Some(child_thread_id.as_str())
+        );
+        host.shutdown().expect("shutdown runtime host");
     }
 
     #[test]

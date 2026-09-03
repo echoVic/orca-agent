@@ -6403,6 +6403,14 @@ fn actor_control_subagent_activity_authorized(
             source,
             ..
         })
+        | super::SurfaceEvent::Subagent(super::SubagentPatch::ChildThreadBound {
+            subagent_id,
+            expected_revision,
+            next_revision,
+            owner,
+            source,
+            ..
+        })
         | super::SurfaceEvent::Subagent(super::SubagentPatch::Completed {
             subagent_id,
             expected_revision,
@@ -6462,7 +6470,8 @@ fn actor_control_subagent_activity_authorized(
     );
     let status_pair_is_valid = match &subagent_event.event {
         super::SurfaceEvent::Subagent(super::SubagentPatch::Started { .. })
-        | super::SurfaceEvent::Subagent(super::SubagentPatch::Progress { .. }) => {
+        | super::SurfaceEvent::Subagent(super::SubagentPatch::Progress { .. })
+        | super::SurfaceEvent::Subagent(super::SubagentPatch::ChildThreadBound { .. }) => {
             task.status == super::SurfaceTaskStatus::Running && task.completed_at.is_none()
         }
         super::SurfaceEvent::Subagent(super::SubagentPatch::Completed { status, .. }) => {
@@ -14264,6 +14273,9 @@ mod tests {
             task_id: task_id.clone(),
             revision: super::super::SubagentRevision::try_new(2).unwrap(),
             description: super::super::DisplayText::new("detached agent"),
+            child_thread_id: None,
+            batch_id: super::super::NonEmptyText::try_new("batch-detached").unwrap(),
+            batch_size: 1,
             status: super::super::SurfaceSubagentStatus::Running,
             activity: Some(super::super::DisplayText::new("tool")),
             subagent_activity_history: Vec::new(),
@@ -14363,6 +14375,9 @@ mod tests {
             task_id: task_id.clone(),
             revision: super::super::SubagentRevision::try_new(1).unwrap(),
             description: super::super::DisplayText::new("child agent"),
+            child_thread_id: None,
+            batch_id: super::super::NonEmptyText::try_new("batch-child").unwrap(),
+            batch_size: 1,
             status: super::super::SurfaceSubagentStatus::Running,
             activity: Some(super::super::DisplayText::new("bash")),
             subagent_activity_history: Vec::new(),

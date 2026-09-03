@@ -39,11 +39,86 @@ fn validate_relay_activity_envelope(
     Err(io::Error::new(io::ErrorKind::InvalidData, relay_error))
 }
 
+fn relay_corruption_issue_commit_id(task_id: &str, attempt_id: &str) -> surface::SurfaceCommitId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"orca.subagent-relay.health.v1\0");
+    hasher.update((task_id.len() as u64).to_be_bytes());
+    hasher.update(task_id.as_bytes());
+    hasher.update((attempt_id.len() as u64).to_be_bytes());
+    hasher.update(attempt_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    surface::SurfaceCommitId::try_from_bytes(bytes)
+        .expect("domain-separated relay health identity is UUIDv7-shaped")
+}
+
+fn relay_error_is_corruption(error: &RelayError) -> bool {
+    matches!(
+        error,
+        RelayError::Quarantined(_)
+            | RelayError::Corrupt { .. }
+            | RelayError::RecordTooLarge { .. }
+            | RelayError::AttemptTooLarge { .. }
+    )
+}
+
+fn relay_corruption_surface_events(
+    previous_revision: surface::SessionHealthRevision,
+    issue_commit_id: surface::SurfaceCommitId,
+    task_id: &str,
+    reason: &str,
+    causative_generation: Option<surface::SurfaceOperationFence>,
+) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
+    let next_revision = surface::SessionHealthRevision::try_new(
+        previous_revision
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session health revision exhausted"))?,
+    )
+    .map_err(|_| io::Error::other("session health revision is invalid"))?;
+    let message = surface::DisplayText::new(format!(
+        "subagent relay for task {task_id} is quarantined: {reason}"
+    ));
+    Ok(vec![
+        (
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Session(surface::SessionPatch::HealthIssueAdded {
+                previous_revision,
+                next_revision,
+                id: surface::SurfaceHealthIssueId::Projection(issue_commit_id.clone()),
+                issue: surface::SurfaceHealthIssue::ProjectionDegraded {
+                    commit_id: issue_commit_id,
+                    fact_family: surface::SurfaceFactFamily::Subagent,
+                },
+            }),
+        ),
+        (
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Session(surface::SessionPatch::RuntimeFault {
+                class: surface::FailureClass::Persistence,
+                message,
+                causative_generation,
+            }),
+        ),
+    ])
+}
+
 fn subagent_activity_projection(
     payload: &SubagentActivityPayload,
 ) -> (surface::DisplayText, Option<u32>, Option<UsageTotals>) {
     match payload {
-        SubagentActivityPayload::Started { description } => (description.clone(), None, None),
+        SubagentActivityPayload::Started { description, .. } => (description.clone(), None, None),
+        SubagentActivityPayload::ChildThreadBound { thread_id } => (
+            surface::DisplayText::new(format!(
+                "child thread: {}",
+                uuid::Uuid::from_bytes(*thread_id.as_bytes())
+            )),
+            None,
+            None,
+        ),
         SubagentActivityPayload::PhaseChanged { phase, turn } => (
             surface::DisplayText::new(format!("phase: {phase:?}")),
             *turn,
@@ -194,6 +269,42 @@ fn task_transcript_record_matches_surface_task(
 }
 
 impl ThreadActor {
+    fn surface_subagent_relay_corruption(
+        &mut self,
+        task_id: &str,
+        attempt_id: &str,
+        error: impl fmt::Display,
+        causative_generation: Option<surface::SurfaceOperationFence>,
+    ) -> io::Result<()> {
+        let reason = crate::thread_store::redact_sensitive_text(&error.to_string());
+        let message = format!("subagent relay for task {task_id} is quarantined: {reason}");
+        let issue_commit_id = relay_corruption_issue_commit_id(task_id, attempt_id);
+        let issue_id = surface::SurfaceHealthIssueId::Projection(issue_commit_id.clone());
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        if !snapshot
+            .session_health
+            .issues
+            .iter()
+            .any(|(current, _)| current == &issue_id)
+        {
+            let events = relay_corruption_surface_events(
+                snapshot.session_health.revision,
+                issue_commit_id.clone(),
+                task_id,
+                &reason,
+                causative_generation,
+            )?;
+            let batch = self.surface_event_batch_with_commit_id(events, Some(issue_commit_id));
+            self.commit_surface_actor_batch_with_retry(&batch)
+                .map_err(|commit_error| {
+                    io::Error::other(format!(
+                        "failed to surface quarantined subagent relay: {commit_error:?}"
+                    ))
+                })?;
+        }
+        Err(io::Error::new(io::ErrorKind::InvalidData, message))
+    }
+
     pub(super) fn admits_surface_client(
         &self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -945,7 +1056,12 @@ impl ThreadActor {
 
         let (task_patch, subagent_patch) = match (existing_task, existing_subagent, terminal) {
             (None, None, None) if event.source_sequence == 1 => {
-                let SubagentActivityPayload::Started { description } = &event.payload else {
+                let SubagentActivityPayload::Started {
+                    description,
+                    batch_id,
+                    batch_size,
+                } = &event.payload
+                else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "first subagent activity must be started",
@@ -998,6 +1114,11 @@ impl ThreadActor {
                     revision: surface::SubagentRevision::try_new(1)
                         .expect("one is a valid subagent revision"),
                     description: description.clone(),
+                    child_thread_id: None,
+                    batch_id: surface::NonEmptyText::try_new(batch_id.clone()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid subagent batch id")
+                    })?,
+                    batch_size: (*batch_size).max(1),
                     status: surface::SurfaceSubagentStatus::Running,
                     activity: Some(description.clone()),
                     subagent_activity_history: activity_history,
@@ -1133,29 +1254,48 @@ impl ThreadActor {
                                 .map(surface_subagent_continuation),
                         }
                     }
-                    None => surface::SubagentPatch::Progress {
-                        subagent_id: event.subagent_id.clone(),
-                        expected_revision: subagent.revision,
-                        next_revision: next_subagent_revision,
-                        owner: projection_owner.clone(),
-                        source: surface::SurfaceSubagentSource::new(
-                            surface_attempt_id.clone(),
-                            event.turn_id.clone(),
-                            event.source_sequence,
-                            event.occurred_at,
-                            event.surface_commit_id.clone(),
-                            event.digest.clone(),
-                        ),
-                        activity: activity.clone(),
-                        turn: turn.or(subagent.turn),
-                        usage: usage
-                            .map(surface_usage_totals)
-                            .or_else(|| subagent.usage.clone()),
-                        subagent_activity_history: activity_history,
-                        continuation: task_registry
-                            .continuation_projection(event.task_id.as_str())
-                            .map_err(io::Error::other)?
-                            .map(surface_subagent_continuation),
+                    None => match &event.payload {
+                        SubagentActivityPayload::ChildThreadBound { thread_id } => {
+                            surface::SubagentPatch::ChildThreadBound {
+                                subagent_id: event.subagent_id.clone(),
+                                expected_revision: subagent.revision,
+                                next_revision: next_subagent_revision,
+                                owner: projection_owner.clone(),
+                                source: surface::SurfaceSubagentSource::new(
+                                    surface_attempt_id.clone(),
+                                    event.turn_id.clone(),
+                                    event.source_sequence,
+                                    event.occurred_at,
+                                    event.surface_commit_id.clone(),
+                                    event.digest.clone(),
+                                ),
+                                thread_id: thread_id.clone(),
+                            }
+                        }
+                        _ => surface::SubagentPatch::Progress {
+                            subagent_id: event.subagent_id.clone(),
+                            expected_revision: subagent.revision,
+                            next_revision: next_subagent_revision,
+                            owner: projection_owner.clone(),
+                            source: surface::SurfaceSubagentSource::new(
+                                surface_attempt_id.clone(),
+                                event.turn_id.clone(),
+                                event.source_sequence,
+                                event.occurred_at,
+                                event.surface_commit_id.clone(),
+                                event.digest.clone(),
+                            ),
+                            activity: activity.clone(),
+                            turn: turn.or(subagent.turn),
+                            usage: usage
+                                .map(surface_usage_totals)
+                                .or_else(|| subagent.usage.clone()),
+                            subagent_activity_history: activity_history,
+                            continuation: task_registry
+                                .continuation_projection(event.task_id.as_str())
+                                .map_err(io::Error::other)?
+                                .map(surface_subagent_continuation),
+                        },
                     },
                 };
                 (
@@ -1274,9 +1414,18 @@ impl ThreadActor {
             .find(|subagent| subagent.task_id.as_str() == task_id)
             .map_or(0, |subagent| subagent.revision.get());
         loop {
-            let page = reader
-                .read_page_for_drain(after_sequence)
-                .map_err(io::Error::other)?;
+            let page = match reader.read_page_for_drain(after_sequence) {
+                Ok(page) => page,
+                Err(error) if relay_error_is_corruption(&error) => {
+                    return self.surface_subagent_relay_corruption(
+                        task_id,
+                        attempt_id,
+                        error,
+                        Some(fence.clone()),
+                    );
+                }
+                Err(error) => return Err(io::Error::other(error)),
+            };
             if page.records.is_empty() {
                 return Ok(());
             }
@@ -1289,20 +1438,28 @@ impl ThreadActor {
                             reason: format!("invalid typed subagent activity payload: {error}"),
                         };
                         reader.quarantine_corrupt(&relay_error);
-                        return Ok(());
+                        return self.surface_subagent_relay_corruption(
+                            task_id,
+                            attempt_id,
+                            relay_error,
+                            Some(fence.clone()),
+                        );
                     }
                 };
-                if validate_relay_activity_envelope(
+                if let Err(error) = validate_relay_activity_envelope(
                     &reader,
                     record,
                     &event,
                     task_id,
                     attempt_id,
                     after_sequence,
-                )
-                .is_err()
-                {
-                    return Ok(());
+                ) {
+                    return self.surface_subagent_relay_corruption(
+                        task_id,
+                        attempt_id,
+                        error,
+                        Some(fence.clone()),
+                    );
                 }
                 if matches!(event.owner, SubagentActivityOwner::DetachedTask { .. }) {
                     self.commit_detached_subagent_activity(&active.task_registry, event)?;
@@ -1347,9 +1504,18 @@ impl ThreadActor {
             .find(|subagent| subagent.task_id.as_str() == binding.task_id)
             .map_or(0, |subagent| subagent.source.source_sequence);
         loop {
-            let page = reader
-                .read_page_for_drain(after_sequence)
-                .map_err(io::Error::other)?;
+            let page = match reader.read_page_for_drain(after_sequence) {
+                Ok(page) => page,
+                Err(error) if relay_error_is_corruption(&error) => {
+                    return self.surface_subagent_relay_corruption(
+                        &binding.task_id,
+                        binding.attempt_id.as_str(),
+                        error,
+                        None,
+                    );
+                }
+                Err(error) => return Err(io::Error::other(error)),
+            };
             if page.records.is_empty() {
                 return Ok(());
             }
@@ -1362,20 +1528,28 @@ impl ThreadActor {
                             reason: format!("invalid typed subagent activity payload: {error}"),
                         };
                         reader.quarantine_corrupt(&relay_error);
-                        return Ok(());
+                        return self.surface_subagent_relay_corruption(
+                            &binding.task_id,
+                            binding.attempt_id.as_str(),
+                            relay_error,
+                            None,
+                        );
                     }
                 };
-                if validate_relay_activity_envelope(
+                if let Err(error) = validate_relay_activity_envelope(
                     &reader,
                     record,
                     &event,
                     &binding.task_id,
                     binding.attempt_id.as_str(),
                     after_sequence,
-                )
-                .is_err()
-                {
-                    return Ok(());
+                ) {
+                    return self.surface_subagent_relay_corruption(
+                        &binding.task_id,
+                        binding.attempt_id.as_str(),
+                        error,
+                        None,
+                    );
                 }
                 self.commit_detached_subagent_activity(task_registry, event)?;
                 after_sequence = record.source_sequence;
@@ -4931,6 +5105,56 @@ mod task_transcript_query_tests {
     }
 
     #[test]
+    fn relay_corruption_builds_typed_health_and_runtime_fault_events() {
+        let issue_commit_id =
+            surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .expect("UUIDv7 is a valid surface commit id");
+        let previous_revision =
+            surface::SessionHealthRevision::try_new(1).expect("health revision");
+
+        let events = relay_corruption_surface_events(
+            previous_revision,
+            issue_commit_id.clone(),
+            "task-1",
+            "relay checksum mismatch",
+            None,
+        )
+        .expect("health events");
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Session(surface::SessionPatch::HealthIssueAdded {
+                    previous_revision: previous,
+                    next_revision,
+                    id: surface::SurfaceHealthIssueId::Projection(id),
+                    issue: surface::SurfaceHealthIssue::ProjectionDegraded {
+                        commit_id,
+                        fact_family: surface::SurfaceFactFamily::Subagent,
+                    },
+                }),
+            ) if previous == &previous_revision
+                && next_revision.get() == 2
+                && id == &issue_commit_id
+                && commit_id == &issue_commit_id
+        ));
+        assert!(matches!(
+            &events[1],
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Session(surface::SessionPatch::RuntimeFault {
+                    class: surface::FailureClass::Persistence,
+                    message,
+                    causative_generation: None,
+                }),
+            ) if message.as_str().contains("task-1")
+                && message.as_str().contains("relay checksum mismatch")
+        ));
+    }
+
+    #[test]
     fn invalid_typed_relay_activity_is_quarantined_after_first_read() {
         let temp = tempfile::tempdir().expect("relay root");
         let attempt = crate::agent_continuation::AgentAttemptId::new();
@@ -4956,6 +5180,8 @@ mod task_transcript_query_tests {
             },
             SubagentActivityPayload::Started {
                 description: surface::DisplayText::new("inspect repo"),
+                batch_id: "batch-test".to_string(),
+                batch_size: 1,
             },
         );
         event.digest = surface::Sha256Digest::new([0; 32]);

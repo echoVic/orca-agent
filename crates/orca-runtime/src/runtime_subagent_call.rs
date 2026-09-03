@@ -26,7 +26,9 @@ use crate::agent_continuation::{
     PreparedContinuation, ResumeContinuationInput, WorktreeBinding,
     compute_continuation_compatibility_hash,
 };
-use crate::agent_controller::{AgentController, AgentLaunchRequest, AgentRunMode};
+use crate::agent_controller::{
+    AgentController, AgentLaunchRequest, AgentRunMode, AgentSurfaceActivity,
+};
 use crate::child_agent_types::{
     ChildAgentActivityEmitter, ChildAgentActivityPublisher, ChildAgentActivitySink,
     ChildAgentCheckpointObserver, ChildAgentCompatibilityIdentity, ChildAgentContinuationStart,
@@ -44,8 +46,7 @@ use crate::memory::MemoryBlock;
 use crate::runtime_permission::RuntimePermissionRequestHandler;
 use crate::runtime_surface::RuntimeSubagentActivityIngress;
 use crate::runtime_surface::{
-    DisplayText, Sha256Digest, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId,
-    TaskRevision,
+    DisplayText, SurfaceSubagentId, SurfaceSubagentTerminalStatus, SurfaceTaskId,
 };
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
@@ -83,6 +84,43 @@ pub(crate) struct RuntimeSubagentActivitySink {
     pub(crate) ingress: Arc<dyn RuntimeSubagentActivityIngress>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestSubagentActivityCollector {
+    events: Mutex<Vec<SubagentActivityEvent>>,
+}
+
+#[cfg(test)]
+impl RuntimeSubagentActivityIngress for TestSubagentActivityCollector {
+    fn owner(&self) -> SubagentActivityOwner {
+        SubagentActivityOwner::DetachedTask {
+            task_id: SurfaceTaskId::try_new("headless-test-owner").expect("test task id"),
+            task_revision: crate::runtime_surface::TaskRevision::try_new(1)
+                .expect("test task revision"),
+            authority_digest: crate::runtime_surface::Sha256Digest::new([0; 32]),
+        }
+    }
+
+    fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        if !event.verify_digest() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child activity digest verification failed",
+            ));
+        }
+        self.events
+            .lock()
+            .map_err(|_| io::Error::other("headless activity collector lock poisoned"))?
+            .push(event);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_activity_ingress() -> Arc<dyn RuntimeSubagentActivityIngress> {
+    Arc::new(TestSubagentActivityCollector::default())
+}
+
 impl ChildAgentActivitySink for RuntimeSubagentActivitySink {
     fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
         if !event.verify_digest() {
@@ -92,26 +130,6 @@ impl ChildAgentActivitySink for RuntimeSubagentActivitySink {
             ));
         }
         self.ingress.commit_activity(event)
-    }
-}
-
-/// The pre-surface `RuntimeHost` API still exposes parent lifecycle events but
-/// has no actor-owned surface ingress. Keep that legacy path observable through
-/// its existing parent observer without pretending that the events were
-/// durably committed to a surface. A child that has a permission handler never
-/// uses this fallback; it must have the actor boundary available.
-#[derive(Debug, Default)]
-struct LegacySubagentActivitySink;
-
-impl ChildAgentActivitySink for LegacySubagentActivitySink {
-    fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
-        if !event.verify_digest() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "child activity digest verification failed",
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -301,7 +319,6 @@ impl RuntimeSubagentBatch {
                 event_error: None,
             };
         }
-
         let mut lifecycle =
             RuntimeSessionLifecycle::new(format!("subagent-{}", invocation.tool_request.id));
         let started_task = lifecycle.start_task(RuntimeTaskKind::Subagent).clone();
@@ -323,13 +340,68 @@ impl RuntimeSubagentBatch {
         let panic_request = tool_request.clone();
         let panic_description = description.clone();
         let panic_task = started_task.clone();
-        let worker_cancel = self.cancel.clone();
+        let worker_cancel = if invocation.agent_controller.is_some() {
+            let worker_cancel = CancelToken::new();
+            let parent_cancel = self.cancel.clone();
+            let worker_cancel_bridge = worker_cancel.clone();
+            let watcher = thread::Builder::new()
+                .name(format!("orca-subagent-parent-cancel-{}", tool_request.id))
+                .spawn(move || {
+                    while !worker_cancel_bridge.is_cancelled() {
+                        if parent_cancel.is_cancelled() {
+                            worker_cancel_bridge.cancel();
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                });
+            if let Err(error) = watcher {
+                let message = format!("failed to watch parent cancellation: {error}");
+                return RuntimeSubagentAdmission {
+                    immediate: Some((
+                        index,
+                        RuntimeSubagentCallOutput {
+                            result: ToolResult::failed_before_start(&panic_request, &message, None),
+                            tool_request: panic_request,
+                            description: panic_description,
+                            task: Some(panic_task.with_status(RuntimeTaskStatus::Failed)),
+                            status: RunStatus::Failed,
+                            event_output: None,
+                            event_error: Some(message),
+                            cost_tracker: CostTracker::new(None),
+                            child_budget_usage: None,
+                        },
+                    )),
+                    event_error: None,
+                };
+            }
+            worker_cancel
+        } else {
+            self.cancel.clone()
+        };
+        let worker_cancel_for_thread = worker_cancel.clone();
+        let watcher_cancel = worker_cancel.clone();
+        let worker_cleanup = invocation
+            .agent_controller
+            .as_ref()
+            .map(|_| worker_cancel.clone());
         let join = match thread::Builder::new()
             .name(format!("orca-subagent-{}", tool_request.id))
-            .spawn(move || run_subagent_worker(invocation, lifecycle, started_task, worker_cancel))
-        {
+            .spawn(move || {
+                let output = run_subagent_worker(
+                    invocation,
+                    lifecycle,
+                    started_task,
+                    worker_cancel_for_thread.clone(),
+                );
+                if let Some(worker_cleanup) = worker_cleanup {
+                    worker_cleanup.cancel();
+                }
+                output
+            }) {
             Ok(join) => join,
             Err(error) => {
+                watcher_cancel.cancel();
                 let message = format!("failed to start subagent worker: {error}");
                 return RuntimeSubagentAdmission {
                     immediate: Some((
@@ -402,7 +474,7 @@ impl RuntimeSubagentBatch {
 
 fn run_threaded_agent_worker(
     invocation: RuntimeSubagentInvocation,
-    mut lifecycle: RuntimeSessionLifecycle,
+    _lifecycle: RuntimeSessionLifecycle,
     started_task: RuntimeTaskLifecycle,
     cancel: CancelToken,
 ) -> RuntimeSubagentCallOutput {
@@ -411,26 +483,176 @@ fn run_threaded_agent_worker(
         request,
         config,
         child_depth: _,
+        activity_ingress,
         permission_handler,
         agent_controller,
         batch_id,
         batch_size,
+        task_registry,
+        root_task_id,
         ..
     } = invocation;
     let controller = agent_controller.expect("threaded agent branch requires controller");
     let description = request.description.clone();
+    let mode = match request.mode {
+        crate::subagent::SubagentMode::Sync => AgentRunMode::Sync,
+        crate::subagent::SubagentMode::Async => AgentRunMode::Async,
+    };
+    let (surface_activity, permission_handler, registry_task_id) = if mode == AgentRunMode::Sync {
+        if activity_ingress.is_none() {
+            let message =
+                "threaded synchronous subagent requires actor-owned surface activity ingress";
+            return RuntimeSubagentCallOutput {
+                result: ToolResult::failed_before_start(&tool_request, message, None),
+                tool_request,
+                description,
+                task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
+                status: RunStatus::Failed,
+                event_output: None,
+                event_error: Some(message.to_string()),
+                cost_tracker: CostTracker::new(config.model.as_deref()),
+                child_budget_usage: None,
+            };
+        }
+        if request.resume_from.is_some() {
+            let message = "hosted_sync_resume_unsupported: synchronous hosted subagents cannot resume a continuation";
+            return RuntimeSubagentCallOutput {
+                result: ToolResult::failed_before_start(&tool_request, message, None),
+                tool_request,
+                description,
+                task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
+                status: RunStatus::Failed,
+                event_output: None,
+                event_error: Some(message.to_string()),
+                cost_tracker: CostTracker::new(config.model.as_deref()),
+                child_budget_usage: None,
+            };
+        }
+        if request.isolation != SubagentIsolation::None {
+            let message = "hosted_sync_capability_unsupported: worktree isolation is not supported by the hosted child route";
+            return RuntimeSubagentCallOutput {
+                result: ToolResult::failed_before_start(&tool_request, message, None),
+                tool_request,
+                description,
+                task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
+                status: RunStatus::Failed,
+                event_output: None,
+                event_error: Some(message.to_string()),
+                cost_tracker: CostTracker::new(config.model.as_deref()),
+                child_budget_usage: None,
+            };
+        }
+        let registry_task = task_registry.create_subagent_with_parent(
+            description.clone(),
+            serialized_subagent_type(&request.subagent_type),
+            root_task_id.clone(),
+        );
+        let registry_task_id = registry_task.id.clone();
+        if let Err(error) = task_registry.mark_running(&registry_task_id) {
+            let message = format!("failed to mark threaded subagent task running: {error}");
+            return RuntimeSubagentCallOutput {
+                result: ToolResult::failed_before_start(&tool_request, &message, None),
+                tool_request,
+                description,
+                task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
+                status: RunStatus::Failed,
+                event_output: None,
+                event_error: Some(message),
+                cost_tracker: CostTracker::new(config.model.as_deref()),
+                child_budget_usage: None,
+            };
+        }
+        // Task controls are durable and may arrive through a different actor
+        // than this synchronous worker. Bridge the canonical registry cancel
+        // bit to the hosted child's cancel token so `task_stop` interrupts the
+        // real child instead of only changing a mirror row.
+        let registry_for_cancel = task_registry.clone();
+        let task_cancel = cancel.clone();
+        let task_id_for_cancel = registry_task_id.clone();
+        let watcher = std::thread::Builder::new()
+            .name(format!("orca-agent-cancel-{}", task_id_for_cancel))
+            .spawn(move || {
+                loop {
+                    if registry_for_cancel.is_cancelled(&task_id_for_cancel) {
+                        task_cancel.cancel();
+                        break;
+                    }
+                    let terminal =
+                        registry_for_cancel
+                            .get(&task_id_for_cancel)
+                            .is_none_or(|task| {
+                                !task.status.is_active() && !task.status.requires_attention()
+                            });
+                    if terminal {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            });
+        if let Err(error) = watcher {
+            let message = format!("failed to watch child cancellation: {error}");
+            let _ = task_registry.fail(&registry_task_id, message.clone());
+            return RuntimeSubagentCallOutput {
+                result: ToolResult::failed_before_start(&tool_request, &message, None),
+                tool_request,
+                description,
+                task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
+                status: RunStatus::Failed,
+                event_output: None,
+                event_error: Some(message),
+                cost_tracker: CostTracker::new(config.model.as_deref()),
+                child_budget_usage: None,
+            };
+        }
+        match threaded_sync_surface_activity(
+            &registry_task_id,
+            &registry_task_id,
+            crate::agent_continuation::AgentAttemptId::new(),
+            &description,
+            &batch_id,
+            batch_size,
+            activity_ingress.as_ref().cloned(),
+        ) {
+            Ok(activity) => {
+                let permission_handler = permission_handler.map(|parent| {
+                    Arc::new(ChildPermissionHandler::new(
+                        parent,
+                        activity.permission_identity,
+                    )) as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>
+                });
+                (
+                    Some(activity.surface_activity),
+                    permission_handler,
+                    Some(registry_task_id),
+                )
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let _ = task_registry.fail(&registry_task_id, message.clone());
+                return RuntimeSubagentCallOutput {
+                    result: ToolResult::failed_before_start(&tool_request, &message, None),
+                    tool_request,
+                    description,
+                    task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
+                    status: RunStatus::Failed,
+                    event_output: None,
+                    event_error: Some(message),
+                    cost_tracker: CostTracker::new(config.model.as_deref()),
+                    child_budget_usage: None,
+                };
+            }
+        }
+    } else {
+        (None, permission_handler, None)
+    };
+    let launch_surface_activity = surface_activity.clone();
     let launch = controller.launch(AgentLaunchRequest {
-        batch_id,
-        batch_size,
         agent_id: tool_request.id.clone(),
         description: description.clone(),
         prompt: request.prompt,
         model: request.model,
         subagent_type: request.subagent_type,
-        mode: match request.mode {
-            crate::subagent::SubagentMode::Sync => AgentRunMode::Sync,
-            crate::subagent::SubagentMode::Async => AgentRunMode::Async,
-        },
+        mode,
         config: config.clone(),
         cancel,
         // Subagents never inherit an interactive approval handler. The parent's
@@ -441,11 +663,128 @@ fn run_threaded_agent_worker(
         // escalations flow through the scoped permission_handler below.
         approval_handler: None,
         permission_handler,
+        surface_activity,
     });
 
     match launch {
         Ok(launch) => {
-            let status = launch.status;
+            let mut status = launch.status;
+            let output = if launch.running {
+                let agent_id = registry_task_id
+                    .as_deref()
+                    .unwrap_or(tool_request.id.as_str());
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "thread_id": launch.thread_id,
+                    "status": "running",
+                })
+                .to_string()
+            } else {
+                launch
+                    .final_message
+                    .clone()
+                    .unwrap_or_else(|| format!("agent {} completed", tool_request.id))
+            };
+            let schema_error = if status == RunStatus::Success {
+                request.schema.as_ref().and_then(|schema| {
+                    validate_subagent_output_schema(&description, Some(schema), &output).err()
+                })
+            } else {
+                None
+            };
+            if schema_error.is_some() {
+                status = RunStatus::Failed;
+            }
+            let mut result = if status == RunStatus::Success {
+                ToolResult::completed(&tool_request, output.clone(), false)
+            } else if status == RunStatus::Cancelled {
+                ToolResult::cancelled(
+                    &tool_request,
+                    launch
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "subagent cancelled".to_string()),
+                    None,
+                )
+            } else {
+                ToolResult::failed_after_start(
+                    &tool_request,
+                    schema_error
+                        .or_else(|| launch.error.clone())
+                        .unwrap_or_else(|| status.as_str().to_string()),
+                    None,
+                )
+            };
+            let mut cost_tracker = CostTracker::new(config.model.as_deref());
+            cost_tracker.merge_totals(launch.usage);
+            let usage = launch.usage;
+            let registry_result = if launch.running {
+                Ok(())
+            } else {
+                match (status, registry_task_id.as_deref()) {
+                    (RunStatus::Success, Some(task_id)) => task_registry.complete_with_usage(
+                        task_id,
+                        output.clone(),
+                        Some(orca_core::cost_types::UsageTotals {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_tokens: usage.cache_tokens,
+                            estimated_cost_usd: usage.estimated_cost_usd,
+                        }),
+                    ),
+                    (RunStatus::Cancelled, Some(task_id)) => task_registry.stop_with_usage(
+                        task_id,
+                        launch
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "subagent cancelled".to_string()),
+                        Some(orca_core::cost_types::UsageTotals {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_tokens: usage.cache_tokens,
+                            estimated_cost_usd: usage.estimated_cost_usd,
+                        }),
+                    ),
+                    (_, Some(task_id)) => task_registry.fail_with_usage(
+                        task_id,
+                        launch
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| status.as_str().to_string()),
+                        Some(orca_core::cost_types::UsageTotals {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_tokens: usage.cache_tokens,
+                            estimated_cost_usd: usage.estimated_cost_usd,
+                        }),
+                    ),
+                    (_, None) => Ok(()),
+                }
+            };
+            let mut event_error = launch.error;
+            if let Err(error) = registry_result {
+                event_error = Some(match event_error {
+                    Some(existing) => {
+                        format!("{existing}; task registry settlement failed: {error}")
+                    }
+                    None => format!("task registry settlement failed: {error}"),
+                });
+            }
+            if let Some(activity) = launch_surface_activity.as_ref() {
+                if let Err(surface_error) = activity.publish_terminal(
+                    status,
+                    (status == RunStatus::Success).then_some(output.as_str()),
+                    event_error.as_deref(),
+                    usage,
+                ) {
+                    let message = format!(
+                        "surface terminal commit failed: {surface_error}; Inspect external state before retrying"
+                    );
+                    status = RunStatus::Failed;
+                    event_error = Some(message.clone());
+                    result = ToolResult::indeterminate_after_start(&tool_request, message);
+                }
+            }
             let task_status = if launch.running {
                 RuntimeTaskStatus::Running
             } else {
@@ -457,41 +796,7 @@ fn run_threaded_agent_worker(
                     | RunStatus::VerificationFailed => RuntimeTaskStatus::Failed,
                 }
             };
-            let task = if launch.running {
-                Some(started_task.with_status(task_status))
-            } else {
-                lifecycle
-                    .finish_task(status)
-                    .cloned()
-                    .or_else(|| Some(started_task.with_status(task_status)))
-            };
-            let output = if launch.running {
-                serde_json::json!({
-                    "agent_id": tool_request.id,
-                    "thread_id": launch.thread_id,
-                    "status": "running",
-                })
-                .to_string()
-            } else {
-                launch
-                    .final_message
-                    .clone()
-                    .unwrap_or_else(|| format!("agent {} completed", tool_request.id))
-            };
-            let result = if status == RunStatus::Success {
-                ToolResult::completed(&tool_request, output.clone(), false)
-            } else {
-                ToolResult::failed_after_start(
-                    &tool_request,
-                    launch
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| status.as_str().to_string()),
-                    None,
-                )
-            };
-            let mut cost_tracker = CostTracker::new(config.model.as_deref());
-            cost_tracker.merge_totals(launch.usage);
+            let task = Some(started_task.with_status(task_status));
             RuntimeSubagentCallOutput {
                 tool_request,
                 description,
@@ -499,13 +804,16 @@ fn run_threaded_agent_worker(
                 status,
                 result,
                 event_output: (!launch.running).then_some(output),
-                event_error: launch.error,
+                event_error,
                 cost_tracker,
                 child_budget_usage: None,
             }
         }
         Err(error) => {
             let message = error.to_string();
+            if let Some(task_id) = registry_task_id.as_deref() {
+                let _ = task_registry.fail(task_id, message.clone());
+            }
             RuntimeSubagentCallOutput {
                 result: ToolResult::failed_before_start(&tool_request, &message, None),
                 tool_request,
@@ -519,6 +827,67 @@ fn run_threaded_agent_worker(
             }
         }
     }
+}
+
+struct ThreadedSyncSurfaceActivity {
+    surface_activity: AgentSurfaceActivity,
+    permission_identity: ChildPermissionIdentity,
+}
+
+fn threaded_sync_surface_activity(
+    task_id: &str,
+    subagent_id: &str,
+    attempt_id: crate::agent_continuation::AgentAttemptId,
+    description: &str,
+    batch_id: &str,
+    batch_size: u32,
+    activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
+) -> io::Result<ThreadedSyncSurfaceActivity> {
+    let Some(activity_ingress) = activity_ingress else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "threaded synchronous subagent requires actor-owned activity ingress",
+        ));
+    };
+    let task_id = SurfaceTaskId::try_new(task_id.to_string()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "threaded synchronous subagent has an invalid surface task id",
+        )
+    })?;
+    let subagent_id = SurfaceSubagentId::try_new(subagent_id.to_string()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "threaded synchronous subagent has an invalid surface subagent id",
+        )
+    })?;
+    let turn_id = TurnId::new();
+    let emitter = Arc::new(ChildAgentActivityEmitter::new(
+        SubagentActivityIdentity {
+            task_id: task_id.clone(),
+            subagent_id: subagent_id.clone(),
+            attempt_id,
+            turn_id: turn_id.clone(),
+            owner: activity_ingress.owner(),
+        },
+        Arc::new(RuntimeSubagentActivitySink {
+            ingress: activity_ingress,
+        }),
+    ));
+    Ok(ThreadedSyncSurfaceActivity {
+        permission_identity: ChildPermissionIdentity::new(
+            task_id,
+            subagent_id,
+            turn_id,
+            emitter.revision_source(),
+        ),
+        surface_activity: AgentSurfaceActivity {
+            emitter,
+            description: description.to_string(),
+            batch_id: batch_id.to_string(),
+            batch_size,
+        },
+    })
 }
 
 fn run_subagent_worker(
@@ -961,7 +1330,7 @@ fn execute_acquired_sync_subagent(
             );
         }
     };
-    let surface_subagent_id = match SurfaceSubagentId::try_new(tool_request.id.clone()) {
+    let surface_subagent_id = match SurfaceSubagentId::try_new(registry_task_id.clone()) {
         Ok(subagent_id) => subagent_id,
         Err(error) => {
             let output = continuation_started_failure(
@@ -984,9 +1353,8 @@ fn execute_acquired_sync_subagent(
         }
     };
     // Synchronous children are part of the foreground surface generation.
-    // A permission-capable child must have the actor ingress available. The
-    // only permitted fallback is the legacy host API, whose parent lifecycle
-    // observer remains the authoritative user-visible signal.
+    // Without a live surface ingress, fail closed instead of creating a
+    // second presentation path through the task registry.
     let (activity_owner, activity_sink): (SubagentActivityOwner, Arc<dyn ChildAgentActivitySink>) =
         match activity_ingress {
             Some(activity_ingress) => (
@@ -994,14 +1362,6 @@ fn execute_acquired_sync_subagent(
                 Arc::new(RuntimeSubagentActivitySink {
                     ingress: activity_ingress,
                 }),
-            ),
-            None if permission_handler.is_none() => (
-                SubagentActivityOwner::DetachedTask {
-                    task_id: surface_task_id.clone(),
-                    task_revision: TaskRevision::try_new(1).expect("positive task revision"),
-                    authority_digest: Sha256Digest::new([0; 32]),
-                },
-                Arc::new(LegacySubagentActivitySink),
             ),
             None => {
                 let output = continuation_started_failure(
@@ -1040,6 +1400,8 @@ fn execute_acquired_sync_subagent(
     ));
     if let Err(error) = activity.publish_payload(SubagentActivityPayload::Started {
         description: DisplayText::new(&description),
+        batch_id: format!("sync-{registry_task_id}"),
+        batch_size: 1,
     }) {
         let output = continuation_started_failure(
             tool_request,
@@ -1097,7 +1459,7 @@ fn execute_acquired_sync_subagent(
         run_child_agent(&child_config, &child_request, &mut runtime)
     }));
     let worktree = worktree_execution.finish();
-    let (mut output, panicked) = match child {
+    let (output, panicked) = match child {
         Ok((child, cost_tracker)) => (
             finish_child_output(
                 tool_request,
@@ -1142,6 +1504,15 @@ fn execute_acquired_sync_subagent(
             )
         }
     };
+    let mut output = finalize_started_sync_subagent_with_revision(
+        output,
+        &coordinator,
+        &lease,
+        &shared_revision,
+        &task_registry,
+        &registry_task_id,
+        panicked,
+    );
     let terminal_status = match output.status {
         RunStatus::Success => SurfaceSubagentTerminalStatus::Completed,
         RunStatus::Cancelled => SurfaceSubagentTerminalStatus::Cancelled,
@@ -1160,17 +1531,19 @@ fn execute_acquired_sync_subagent(
             Some(existing) => format!("{existing}\n\n{message}"),
             None => message,
         });
+        output.result = ToolResult::indeterminate_after_start(
+            &output.tool_request,
+            output.event_error.clone().unwrap_or_else(|| {
+                "child activity terminal could not be durably published".to_string()
+            }),
+        );
         output.status = RunStatus::Failed;
+        output.task = output
+            .task
+            .take()
+            .map(|task| task.with_status(RuntimeTaskStatus::Failed));
     }
-    finalize_started_sync_subagent_with_revision(
-        output,
-        &coordinator,
-        &lease,
-        &shared_revision,
-        &task_registry,
-        &registry_task_id,
-        panicked,
-    )
+    output
 }
 
 enum SyncWorktreeExecution {
@@ -1946,6 +2319,7 @@ mod tests {
     use super::*;
     use crate::agent_continuation::{AgentAttemptId, ToolBoundary};
     use crate::runtime_surface::RuntimeSubagentActivityIngress;
+    use crate::runtime_surface::TaskRevision;
 
     #[derive(Debug, Default)]
     struct RecordingActivityIngress {
@@ -1989,6 +2363,8 @@ mod tests {
             },
             SubagentActivityPayload::Started {
                 description: DisplayText::new("inspect the runtime"),
+                batch_id: "batch-runtime".to_string(),
+                batch_size: 1,
             },
         );
 
@@ -1998,6 +2374,55 @@ mod tests {
         assert_eq!(
             ingress.events.lock().expect("recorded events").as_slice(),
             &[event]
+        );
+    }
+
+    #[test]
+    fn threaded_sync_surface_and_permission_use_the_registry_task_identity() {
+        let ingress = Arc::new(RecordingActivityIngress::default());
+        let task_registry = TaskRegistry::new("threaded-sync-canonical-identity".to_string());
+        let task = task_registry.create_subagent("inspect identity".to_string(), None);
+        let activity = threaded_sync_surface_activity(
+            &task.id,
+            &task.id,
+            AgentAttemptId::new(),
+            "inspect identity",
+            "batch-identity",
+            1,
+            Some(ingress.clone()),
+        )
+        .expect("threaded activity");
+        activity
+            .surface_activity
+            .emitter
+            .publish_payload(SubagentActivityPayload::Started {
+                description: DisplayText::new("inspect identity"),
+                batch_id: "batch-identity".to_string(),
+                batch_size: 1,
+            })
+            .expect("publish started activity");
+
+        let events = ingress.events.lock().expect("recorded activity");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].task_id.as_str(), task.id);
+        assert_eq!(events[0].subagent_id.as_str(), task.id);
+        assert_eq!(
+            activity
+                .permission_identity
+                .task_id
+                .as_ref()
+                .expect("permission task identity")
+                .as_str(),
+            task.id
+        );
+        assert_eq!(
+            activity
+                .permission_identity
+                .agent_id
+                .as_ref()
+                .expect("permission agent identity")
+                .as_str(),
+            task.id
         );
     }
 

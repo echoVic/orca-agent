@@ -266,6 +266,8 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         worktree,
         permission_response_public_key,
     } = input;
+    let batch_id = format!("async-{agent_id}");
+    let batch_size = 1;
     let owns_worktree = request.resume_from.is_none();
     let task_registry = match wait_for_async_subagent_adoption(&task_session_id, &cwd, &agent_id) {
         Ok(registry) => registry,
@@ -444,6 +446,8 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
     ));
     if let Err(error) = activity.publish_payload(SubagentActivityPayload::Started {
         description: DisplayText::new(&request.description),
+        batch_id,
+        batch_size,
     }) {
         heartbeat.stop();
         let mut message = format!("child activity start could not be durably published: {error}");
@@ -1463,6 +1467,8 @@ mod tests {
             },
             SubagentActivityPayload::Started {
                 description: DisplayText::new("start"),
+                batch_id: "batch-test".to_string(),
+                batch_size: 1,
             },
         );
         event.digest = crate::runtime_surface::Sha256Digest::new([0; 32]);

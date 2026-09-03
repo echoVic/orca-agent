@@ -1452,6 +1452,11 @@ pub struct SurfaceSubagent {
     pub task_id: SurfaceTaskId,
     pub revision: SubagentRevision,
     pub description: DisplayText,
+    pub batch_id: NonEmptyText,
+    pub batch_size: u32,
+    /// Hosted runtime thread that owns this child's interactive transcript.
+    /// It is absent between admission and successful child-thread creation.
+    pub child_thread_id: Option<SurfaceThreadId>,
     pub status: SurfaceSubagentStatus,
     pub activity: Option<DisplayText>,
     pub subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
@@ -1516,6 +1521,14 @@ pub enum SubagentPatch {
     Started {
         expected_revision: ExpectedAbsentSubagentRevision,
         subagent: RunningSurfaceSubagent,
+    },
+    ChildThreadBound {
+        subagent_id: SurfaceSubagentId,
+        expected_revision: SubagentRevision,
+        next_revision: SubagentRevision,
+        owner: SurfaceSubagentOwner,
+        source: SurfaceSubagentSource,
+        thread_id: SurfaceThreadId,
     },
     Progress {
         subagent_id: SurfaceSubagentId,

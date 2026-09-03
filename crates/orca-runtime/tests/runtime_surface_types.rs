@@ -804,7 +804,7 @@ patch_name_matcher!(
 patch_name_matcher!(
     subagent_patch_name,
     SubagentPatch,
-    [Started, Progress, Completed, Stopped]
+    [Started, ChildThreadBound, Progress, Completed, Stopped]
 );
 patch_name_matcher!(
     goal_patch_name,
@@ -906,6 +906,9 @@ fn subagent_and_goal_projection_refinements_are_exact() {
         task_id: SurfaceTaskId::try_new("task-1").unwrap(),
         revision: SubagentRevision::try_new(1).unwrap(),
         description: DisplayText::new("focused projection"),
+        child_thread_id: None,
+        batch_id: NonEmptyText::try_new("batch-test").unwrap(),
+        batch_size: 1,
         status: SurfaceSubagentStatus::Running,
         activity: None,
         subagent_activity_history: Vec::new(),
