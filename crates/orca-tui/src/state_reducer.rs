@@ -82,23 +82,9 @@ impl AppState {
                     side.parent_status = status;
                 }
             }
-            TuiEvent::AgentRegistryUpdated {
-                root_thread_id,
-                snapshot,
-            } => {
-                for agent in &snapshot.agents {
-                    if self.announced_agent_batches.insert(agent.batch_id.clone()) {
-                        self.finish_assistant_stream();
-                        self.push_message(ChatMessage::System(format!(
-                            "Delegating to {} agents in parallel",
-                            agent.batch_size
-                        )));
-                    }
-                }
-                self.agent_ui.apply(root_thread_id, snapshot);
-            }
-            TuiEvent::AgentFocusChanged { focused_thread_id } => {
-                self.agent_ui.focus_thread(focused_thread_id);
+            TuiEvent::ChildFocusChanged { task_id } => {
+                self.set_focused_child_task_id(task_id);
+                self.task_transcript = None;
                 self.scroll_to_bottom();
             }
             TuiEvent::SurfaceProjectionSynced(projection) => {
@@ -106,8 +92,9 @@ impl AppState {
             }
             TuiEvent::NewSessionStarted => {
                 self.task_transcript = None;
-                self.agent_ui.reset();
-                self.announced_agent_batches.clear();
+                self.agent_dock_selected_task_id = None;
+                self.set_focused_child_task_id(None);
+                self.announced_subagent_batches.clear();
             }
             TuiEvent::SessionProjectionReset(projection) => {
                 if !SurfaceSessionProjectionState::accepts_reset(&projection)
@@ -743,6 +730,90 @@ impl AppState {
             .map(|offset| first + 1 + offset)
     }
 
+    /// Materialize the live surface's child work into the parent transcript.
+    /// The task DTO is already derived from the surface ledger, so this keeps
+    /// the conversation and agent dock on one identity-bound source.
+    pub(crate) fn sync_subagent_transcript_messages(&mut self) {
+        let existing_subagent_ids = self
+            .transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Subagent { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let tasks = self
+            .workflow_tasks()
+            .iter()
+            .filter(|task| {
+                task.task_type == orca_core::task_types::TaskType::Subagent
+                    && (task.status.is_active()
+                        || task.status.requires_attention()
+                        || existing_subagent_ids.contains(&task.id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for task in &tasks {
+            let batch_key = task
+                .subagent_batch_id
+                .clone()
+                .unwrap_or_else(|| task.id.clone());
+            if (task.status.is_active() || task.status.requires_attention())
+                && self.announced_subagent_batches.insert(batch_key)
+            {
+                self.finish_assistant_stream();
+                let batch_size = task.subagent_batch_size.unwrap_or(1).max(1);
+                let noun = if batch_size == 1 {
+                    "agent"
+                } else {
+                    "agents in parallel"
+                };
+                self.push_message(ChatMessage::System(format!(
+                    "Delegating to {batch_size} {noun}"
+                )));
+            }
+
+            let next = ChatMessage::Subagent {
+                id: task.id.clone(),
+                description: task.description.clone(),
+                status: surface_task_status_label(task.status).to_string(),
+                output: task.result.clone(),
+                error: task.error.clone(),
+                activity: task.subagent_current_activity.clone(),
+                activity_tail: task
+                    .subagent_activity_history
+                    .iter()
+                    .map(|entry| entry.activity.clone())
+                    .collect(),
+                turn: task.subagent_turn,
+                usage: task.usage,
+                expanded: task.status == orca_core::task_types::TaskStatus::Running,
+            };
+            if let Some(index) = self.transcript.messages.iter().position(
+                |message| matches!(message, ChatMessage::Subagent { id, .. } if id == &task.id),
+            ) {
+                let expanded = match &self.transcript.messages[index] {
+                    ChatMessage::Subagent { expanded, .. } => {
+                        *expanded || task.status == orca_core::task_types::TaskStatus::Running
+                    }
+                    _ => false,
+                };
+                let mut next = next;
+                if let ChatMessage::Subagent {
+                    expanded: value, ..
+                } = &mut next
+                {
+                    *value = expanded;
+                }
+                self.replace_message(index, next);
+            } else {
+                self.finish_assistant_stream();
+                self.push_message(next);
+            }
+        }
+    }
+
     pub(crate) fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
         let mut surface_session = self.surface_session.clone();
         let session_apply = surface_session.apply_projection(&projection);
@@ -1086,6 +1157,20 @@ impl AppState {
             index += 1;
             !remove
         });
+    }
+}
+
+fn surface_task_status_label(status: orca_core::task_types::TaskStatus) -> &'static str {
+    match status {
+        orca_core::task_types::TaskStatus::Queued => "queued",
+        orca_core::task_types::TaskStatus::Running => "running",
+        orca_core::task_types::TaskStatus::Paused => "paused",
+        orca_core::task_types::TaskStatus::Stopping => "stopping",
+        orca_core::task_types::TaskStatus::Stopped => "stopped",
+        orca_core::task_types::TaskStatus::Completed => "completed",
+        orca_core::task_types::TaskStatus::Failed => "failed",
+        orca_core::task_types::TaskStatus::ApprovalRequired => "approval required",
+        orca_core::task_types::TaskStatus::Cancelled => "cancelled",
     }
 }
 

@@ -23,7 +23,6 @@ use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 #[cfg(test)]
 use orca_runtime::surface::SurfaceOperationId;
 
-use crate::agent_ui_state::AgentUiState;
 use crate::agent_workspace::AgentWorkspaceState;
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
 use crate::edit_highlight::EditHighlightState;
@@ -441,8 +440,11 @@ pub struct AppState {
     pub panel_mode: PanelMode,
     pub(crate) workflow_panel: WorkflowPanelState,
     pub(crate) agent_workspace: AgentWorkspaceState,
-    pub(crate) agent_ui: AgentUiState,
-    pub(crate) announced_agent_batches: std::collections::HashSet<String>,
+    pub(crate) agent_dock_selected_task_id: Option<String>,
+    /// Task identity of the live child currently attached to the conversation.
+    /// The runtime-owned child thread id never crosses the TUI action boundary.
+    pub(crate) focused_child_task_id: Option<String>,
+    pub(crate) announced_subagent_batches: std::collections::HashSet<String>,
     pub(crate) task_transcript: Option<TaskTranscriptViewState>,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
@@ -481,6 +483,14 @@ impl ScrollAmount for i32 {
 impl AppState {
     pub(crate) fn task_transcript(&self) -> Option<&TaskTranscriptViewState> {
         self.task_transcript.as_ref()
+    }
+
+    pub(crate) fn focused_child_task_id(&self) -> Option<&str> {
+        self.focused_child_task_id.as_deref()
+    }
+
+    pub(crate) fn set_focused_child_task_id(&mut self, task_id: Option<String>) {
+        self.focused_child_task_id = task_id;
     }
 
     pub(crate) fn clear_task_transcript(&mut self) {
@@ -661,8 +671,9 @@ impl AppState {
             panel_mode: PanelMode::Conversation,
             workflow_panel: WorkflowPanelState::default(),
             agent_workspace: AgentWorkspaceState::default(),
-            agent_ui: AgentUiState::default(),
-            announced_agent_batches: std::collections::HashSet::new(),
+            agent_dock_selected_task_id: None,
+            focused_child_task_id: None,
+            announced_subagent_batches: std::collections::HashSet::new(),
             task_transcript: None,
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,
@@ -1003,6 +1014,9 @@ impl AppState {
         self.last_ctrl_c = None;
         self.panel_mode = PanelMode::Conversation;
         self.reset_workflow_panel();
+        self.agent_dock_selected_task_id = None;
+        self.focused_child_task_id = None;
+        self.announced_subagent_batches.clear();
         self.pending_workflow_notifications.clear();
         self.suppress_background_main_session_output = false;
         self.last_completed_at = None;
@@ -1264,12 +1278,20 @@ impl AppState {
             .min(self.transcript.messages.len());
         let Some(index) = self.transcript.messages[live_start..]
             .iter()
-            .rposition(|message| matches!(message, ChatMessage::ToolCall { .. }))
+            .rposition(|message| {
+                matches!(
+                    message,
+                    ChatMessage::ToolCall { .. } | ChatMessage::Subagent { .. }
+                )
+            })
         else {
             return false;
         };
         self.mutate_message(live_start + index, |message| match message {
             ChatMessage::ToolCall { expanded, .. } => {
+                *expanded = !*expanded;
+            }
+            ChatMessage::Subagent { expanded, .. } => {
                 *expanded = !*expanded;
             }
             _ => unreachable!(),
@@ -1340,6 +1362,7 @@ impl AppState {
             ChatMessage::ToolCall { status, .. } => {
                 !matches!(status.as_str(), "running" | "receiving")
             }
+            ChatMessage::Subagent { status, .. } => status != "running",
             ChatMessage::Reasoning(_)
             | ChatMessage::Assistant(_)
             | ChatMessage::ProposedPlan(_) => turn_ended || !is_last,

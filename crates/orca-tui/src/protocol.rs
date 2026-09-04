@@ -177,6 +177,13 @@ pub enum TuiEvent {
         parent_status: SideParentStatus,
     },
     SideParentStatusChanged(SideParentStatus),
+    /// The hosted controller changed the visible conversation between the
+    /// parent thread and one of its live delegated children.  The task id is
+    /// the only identity exposed to the TUI; the child thread id remains a
+    /// runtime-owned surface binding.
+    ChildFocusChanged {
+        task_id: Option<String>,
+    },
     #[doc(hidden)]
     SurfaceProjectionSynced(Box<crate::surface_projection::SurfaceProjectionState>),
     TurnStarted {
@@ -223,13 +230,6 @@ pub enum TuiEvent {
     },
     WorkflowTasksUpdated(Vec<orca_core::task_types::BackgroundTaskSummary>),
     TaskStatusUpdated(orca_core::task_types::BackgroundTaskSummary),
-    AgentRegistryUpdated {
-        root_thread_id: String,
-        snapshot: orca_core::agent_event::AgentRegistrySnapshot,
-    },
-    AgentFocusChanged {
-        focused_thread_id: Option<String>,
-    },
     BackgroundTaskOutputAttached {
         task_id: String,
     },
@@ -436,10 +436,15 @@ pub enum UserAction {
     },
     ToggleSideConversation,
     CloseSideConversation,
-    FocusAgentThread {
-        thread_id: String,
+    /// Focus a live child whose surface binding was visible at
+    /// `expected_revision`. The controller re-reads the parent surface and
+    /// rejects stale or unbound requests before changing attachments.
+    FocusChildThread {
+        task_id: String,
+        expected_revision: u64,
     },
-    FocusRootThread,
+    /// Return from a live child attachment to the exact parent attachment.
+    ReturnToParentThread,
     NewSession,
     ForkCurrentSession {
         title: Option<String>,

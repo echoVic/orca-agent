@@ -406,33 +406,50 @@ mod tests {
     }
 
     #[test]
-    fn dock_navigation_focuses_child_and_escape_returns_to_main() {
+    fn dock_navigation_opens_typed_child_transcript_and_escape_returns_to_agent_list() {
         let (action_tx, action_rx) = mpsc::unbounded();
         let mut state = state_with_search_matches();
         state.close_transcript_search();
-        state.update(crate::protocol::TuiEvent::AgentRegistryUpdated {
-            root_thread_id: "root".to_string(),
-            snapshot: orca_core::agent_event::AgentRegistrySnapshot {
-                revision: 1,
-                agents: vec![orca_core::agent_event::AgentSummary {
-                    root_thread_id: "root".to_string(),
-                    batch_id: "batch".to_string(),
-                    batch_size: 1,
-                    agent_id: "agent".to_string(),
-                    thread_id: "child".to_string(),
-                    parent_thread_id: "root".to_string(),
-                    description: "inspect".to_string(),
-                    status: orca_core::agent_event::AgentStatus::Running,
-                    activity: None,
-                    turn: None,
-                    usage: Default::default(),
-                    result: None,
-                    error: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                }],
-            },
-        });
+        state.replace_workflow_tasks_for_test(vec![orca_core::task_types::BackgroundTaskSummary {
+            id: "child".to_string(),
+            parent_task_id: None,
+            task_type: orca_core::task_types::TaskType::Subagent,
+            status: orca_core::task_types::TaskStatus::Running,
+            is_backgrounded: true,
+            description: "inspect".to_string(),
+            created_at_ms: 1,
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            command: None,
+            agent_type: Some("general".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: Some("read: src/lib.rs".to_string()),
+            subagent_activity_history: Vec::new(),
+            subagent_child_thread_id: None,
+            subagent_batch_id: None,
+            subagent_batch_size: None,
+            subagent_turn: Some(1),
+            last_activity_at_ms: Some(2),
+            continuation: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+            publication_revision: Some(7),
+        }]);
         let config = test_run_config();
         let mut vim = crate::vim::VimState::new(false);
 
@@ -458,8 +475,123 @@ mod tests {
         .unwrap();
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::FocusAgentThread { thread_id }) if thread_id == "child"
+            Ok(UserAction::ReadTaskTranscript(crate::protocol::TaskTranscriptRequest {
+                task_id,
+                expected_revision: 7,
+            })) if task_id == "child"
         ));
+        assert_eq!(state.panel_mode, PanelMode::Agents);
+        assert_eq!(
+            state
+                .task_transcript()
+                .map(|view| view.request.task_id.as_str()),
+            Some("child")
+        );
+
+        handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(state.panel_mode, PanelMode::Agents);
+        assert!(state.task_transcript().is_none());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dock_enter_focuses_a_bound_live_child_without_opening_a_checkpoint() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.replace_workflow_tasks_for_test(vec![orca_core::task_types::BackgroundTaskSummary {
+            id: "child".to_string(),
+            parent_task_id: None,
+            task_type: orca_core::task_types::TaskType::Subagent,
+            status: orca_core::task_types::TaskStatus::Running,
+            is_backgrounded: true,
+            description: "inspect".to_string(),
+            created_at_ms: 1,
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            command: None,
+            agent_type: Some("general".to_string()),
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: None,
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: Some("read: src/lib.rs".to_string()),
+            subagent_activity_history: Vec::new(),
+            subagent_child_thread_id: Some("child-thread".to_string()),
+            subagent_batch_id: Some("batch".to_string()),
+            subagent_batch_size: Some(1),
+            subagent_turn: Some(1),
+            last_activity_at_ms: Some(2),
+            continuation: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+            publication_revision: Some(9),
+        }]);
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::FocusChildThread {
+                task_id,
+                expected_revision: 9,
+            }) if task_id == "child"
+        ));
+        assert!(state.task_transcript().is_none());
+    }
+
+    #[test]
+    fn escape_from_live_child_emits_return_and_clears_focus_after_ack() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged {
+            task_id: Some("child".to_string()),
+        });
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
 
         handle_key_event_preflight(
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -473,8 +605,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             action_rx.try_recv(),
-            Ok(UserAction::FocusRootThread)
+            Ok(UserAction::ReturnToParentThread)
         ));
+
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged { task_id: None });
+        assert!(state.focused_child_task_id().is_none());
     }
 }
 
@@ -496,6 +631,17 @@ where
 
     if handle_image_viewer_key(key, state) {
         vim_state.cancel_pending_command();
+        return Ok(KeyEventFlow::Continue);
+    }
+
+    // A focused child owns Esc as the return-to-parent action. Handle it before
+    // the global cancel binding so returning does not interrupt the child turn.
+    if key.code == KeyCode::Esc
+        && key.modifiers.is_empty()
+        && state.focused_child_task_id().is_some()
+    {
+        vim_state.cancel_pending_command();
+        let _ = action_tx.send(UserAction::ReturnToParentThread);
         return Ok(KeyEventFlow::Continue);
     }
 
@@ -569,32 +715,43 @@ where
         AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
     ) && key.modifiers.contains(KeyModifiers::SHIFT)
         && matches!(key.code, KeyCode::Up | KeyCode::Down)
-        && !state.agent_ui.agents().is_empty()
+        && state.workflow_tasks().iter().any(|task| {
+            task.task_type == orca_core::task_types::TaskType::Subagent
+                && (task.status.is_active() || task.status.requires_attention())
+        })
     {
         vim_state.cancel_pending_command();
         if key.code == KeyCode::Up {
-            state.agent_ui.select_previous();
+            state.select_previous_agent_dock_task();
         } else {
-            state.agent_ui.select_next();
+            state.select_next_agent_dock_task();
         }
         return Ok(KeyEventFlow::Continue);
     }
 
-    if key.code == KeyCode::Enter
-        && key.modifiers.is_empty()
-        && state.agent_ui.selected_thread_id().is_some()
-        && state.agent_ui.selected_thread_id() != state.agent_ui.focused_thread_id()
-    {
+    if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+        let Some(task) = state.selected_agent_dock_task() else {
+            return Ok(KeyEventFlow::Unhandled);
+        };
+        let Some(expected_revision) = task.publication_revision else {
+            return Ok(KeyEventFlow::Unhandled);
+        };
         vim_state.cancel_pending_command();
-        if let Some(thread_id) = state.agent_ui.focus_selected() {
-            let _ = action_tx.send(UserAction::FocusAgentThread { thread_id });
+        if task.subagent_child_thread_id.is_some() {
+            let _ = action_tx.send(UserAction::FocusChildThread {
+                task_id: task.id.clone(),
+                expected_revision,
+            });
+        } else {
+            let request = crate::protocol::TaskTranscriptRequest {
+                task_id: task.id.clone(),
+                expected_revision,
+            };
+            state.show_agents();
+            state.select_agent_workspace_task(&request.task_id);
+            state.begin_task_transcript_request(request.clone());
+            let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
         }
-        return Ok(KeyEventFlow::Continue);
-    }
-
-    if key.code == KeyCode::Esc && state.agent_ui.focused_thread_id().is_some() {
-        vim_state.cancel_pending_command();
-        let _ = action_tx.send(UserAction::FocusRootThread);
         return Ok(KeyEventFlow::Continue);
     }
 

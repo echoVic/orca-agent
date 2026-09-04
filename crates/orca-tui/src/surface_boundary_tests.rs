@@ -6,10 +6,12 @@ use crate::protocol::UserAction;
 const MANIFEST: &str = include_str!(
     "../../../docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json"
 );
-const CURRENT_ACTIONS: [(&str, &str); 43] = [
+const CURRENT_ACTIONS: [(&str, &str); 45] = [
     ("StartSideConversation", "host_session_lifecycle_mutation"),
     ("ToggleSideConversation", "host_session_lifecycle_mutation"),
     ("CloseSideConversation", "host_session_lifecycle_mutation"),
+    ("FocusChildThread", "thread_attachment_mutation"),
+    ("ReturnToParentThread", "thread_attachment_mutation"),
     ("NewSession", "host_session_lifecycle_mutation"),
     ("ForkCurrentSession", "host_session_lifecycle_mutation"),
     ("RenameCurrentSession", "host_store_mutation"),
@@ -60,8 +62,8 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
         UserAction::StartSideConversation { .. } => "StartSideConversation",
         UserAction::ToggleSideConversation => "ToggleSideConversation",
         UserAction::CloseSideConversation => "CloseSideConversation",
-        UserAction::FocusAgentThread { .. } => "FocusAgentThread",
-        UserAction::FocusRootThread => "FocusRootThread",
+        UserAction::FocusChildThread { .. } => "FocusChildThread",
+        UserAction::ReturnToParentThread => "ReturnToParentThread",
         UserAction::ForkCurrentSession { .. } => "ForkCurrentSession",
         UserAction::RenameCurrentSession { .. } => "RenameCurrentSession",
         UserAction::ResumeSavedSession { .. } => "ResumeSavedSession",
