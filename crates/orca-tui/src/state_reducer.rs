@@ -85,6 +85,7 @@ impl AppState {
             TuiEvent::ChildFocusChanged { task_id } => {
                 self.set_focused_child_task_id(task_id);
                 self.task_transcript = None;
+                self.panel_mode = PanelMode::Conversation;
                 self.scroll_to_bottom();
             }
             TuiEvent::SurfaceProjectionSynced(projection) => {
