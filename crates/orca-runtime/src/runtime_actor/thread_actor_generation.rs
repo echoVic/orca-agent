@@ -268,6 +268,47 @@ fn task_transcript_record_matches_surface_task(
             == task.parent_task_id.as_ref().map(|parent| parent.as_str())
 }
 
+/// Resolves the child hierarchy from the repairable task mirror without
+/// allowing an invalid parent reference to be rewritten as a root task.  The
+/// parent must already be present in the authoritative surface task tree; an
+/// out-of-order or missing parent is a rejected activity event and leaves the
+/// last accepted projection intact.
+fn resolve_subagent_parent_task_id(
+    task_registry: &crate::tasks::TaskRegistry,
+    task_id: &str,
+    surface_tasks: &[surface::SurfaceTask],
+) -> io::Result<surface::SurfaceTaskId> {
+    let task = task_registry.get(task_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "subagent activity task is missing from the task registry",
+        )
+    })?;
+    let parent_task_id = task.parent_task_id.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "subagent activity task is missing its parent_task_id",
+        )
+    })?;
+    let parent_task_id =
+        surface::SurfaceTaskId::try_new(parent_task_id.to_string()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "subagent activity parent_task_id is invalid",
+            )
+        })?;
+    if !surface_tasks
+        .iter()
+        .any(|task| task.task_id == parent_task_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "subagent activity parent_task_id is not present in the surface task tree",
+        ));
+    }
+    Ok(parent_task_id)
+}
+
 impl ThreadActor {
     fn surface_subagent_relay_corruption(
         &mut self,
@@ -281,12 +322,12 @@ impl ThreadActor {
         let issue_commit_id = relay_corruption_issue_commit_id(task_id, attempt_id);
         let issue_id = surface::SurfaceHealthIssueId::Projection(issue_commit_id.clone());
         let snapshot = self.resident_surface.coordinator.state().snapshot();
-        if !snapshot
+        let already_surfaced = snapshot
             .session_health
             .issues
             .iter()
-            .any(|(current, _)| current == &issue_id)
-        {
+            .any(|(current, _)| current == &issue_id);
+        if !already_surfaced {
             let events = relay_corruption_surface_events(
                 snapshot.session_health.revision,
                 issue_commit_id.clone(),
@@ -301,6 +342,11 @@ impl ThreadActor {
                         "failed to surface quarantined subagent relay: {commit_error:?}"
                     ))
                 })?;
+        }
+        if already_surfaced {
+            // A quarantined relay is sticky. Subsequent actor ticks should be
+            // quiet no-ops once the typed health issue is already durable.
+            return Ok(());
         }
         Err(io::Error::new(io::ErrorKind::InvalidData, message))
     }
@@ -1067,6 +1113,11 @@ impl ThreadActor {
                         "first subagent activity must be started",
                     ));
                 };
+                let parent_task_id = resolve_subagent_parent_task_id(
+                    task_registry,
+                    event.task_id.as_str(),
+                    snapshot.tasks.as_slice(),
+                )?;
                 let task = surface::SurfaceTask {
                     task_id: event.task_id.clone(),
                     revision: surface::TaskRevision::try_new(1)
@@ -1086,11 +1137,7 @@ impl ThreadActor {
                                 .map(|fence| fence.operation_id.clone())
                         })
                     }),
-                    parent_task_id: task_registry
-                        .get(event.task_id.as_str())
-                        .and_then(|record| record.parent_task_id)
-                        .and_then(|parent| surface::SurfaceTaskId::try_new(parent).ok())
-                        .filter(|parent| snapshot.tasks.iter().any(|task| task.task_id == *parent)),
+                    parent_task_id: Some(parent_task_id),
                     background_fence: None,
                     workflow_run_id: None,
                     subagent_id: Some(event.subagent_id.clone()),
@@ -5102,6 +5149,42 @@ mod task_transcript_query_tests {
             &surface_task("other-child", Some("parent"), 1),
             &transcript_record("child", Some("parent"), 1),
         ));
+    }
+
+    #[test]
+    fn subagent_parent_resolution_rejects_missing_or_out_of_order_parent() {
+        let registry = crate::tasks::TaskRegistry::new("parent-resolution".to_string());
+        let child = registry.create_subagent_with_parent(
+            "child".to_string(),
+            Some("general".to_string()),
+            Some("parent".to_string()),
+        );
+        let child_id = child.id;
+        let child_surface = surface_task(&child_id, Some("parent"), 1);
+        let missing = resolve_subagent_parent_task_id(
+            &registry,
+            &child_id,
+            std::slice::from_ref(&child_surface),
+        )
+        .expect_err("missing parent must be rejected");
+        assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
+        assert!(missing.to_string().contains("parent_task_id"));
+
+        let parent_surface = surface_task("parent", None, 1);
+        let parent =
+            resolve_subagent_parent_task_id(&registry, &child_id, &[parent_surface, child_surface])
+                .expect("present parent must resolve");
+        assert_eq!(parent.as_str(), "parent");
+    }
+
+    #[test]
+    fn subagent_parent_resolution_rejects_a_root_task_without_parent() {
+        let registry = crate::tasks::TaskRegistry::new("root-resolution".to_string());
+        let child = registry.create_subagent("child without parent".to_string(), None);
+        let error = resolve_subagent_parent_task_id(&registry, &child.id, &[])
+            .expect_err("subagent without parent must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("missing its parent_task_id"));
     }
 
     #[test]

@@ -163,9 +163,9 @@ fn synchronous_child_activity_has_one_surface_delivery_boundary() {
         "sync child activity must not fall back to a registry-only mirror"
     );
     assert!(
-        sink_selection.contains("LegacySubagentActivitySink")
-            && sink_selection.contains("permission_handler.is_none()"),
-        "legacy activity fallback must remain restricted to children without permission capabilities"
+        sink_selection.contains("RuntimeSubagentActivitySink")
+            && sink_selection.contains("activity ingress is unavailable"),
+        "sync children must use the typed surface sink or fail closed"
     );
 }
 
@@ -173,7 +173,8 @@ fn synchronous_child_activity_has_one_surface_delivery_boundary() {
 fn surface_task_projection_preserves_the_registry_parent_identity() {
     let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_inner");
     assert!(
-        function.contains("parent_task_id: task_registry") && function.contains("parent_task_id"),
+        function.contains("resolve_subagent_parent_task_id")
+            && function.contains("parent_task_id: Some(parent_task_id)"),
         "the first child task projection must derive parent_task_id from the authoritative task registry"
     );
 }
@@ -219,4 +220,99 @@ fn source_digest_is_indexed_for_cross_restart_commit_conflicts() {
     assert!(SURFACE_STORE.contains("lookup_subagent_source_digest"));
     assert!(GENERATION_ACTOR.contains("lookup_subagent_source_digest"));
     assert!(GENERATION_ACTOR.contains("event.digest"));
+}
+
+#[test]
+fn quarantined_relay_health_is_idempotent_after_first_surface_commit() {
+    let function = balanced_block(GENERATION_ACTOR, "fn surface_subagent_relay_corruption");
+    assert!(function.contains("already_surfaced"));
+    assert!(function.contains("return Ok(())"));
+    assert!(
+        function.contains("session_health") && function.contains("HealthIssueId"),
+        "relay corruption must be represented by a typed durable health issue"
+    );
+}
+
+#[test]
+fn async_launch_commits_started_before_worker_spawn_and_reuses_turn_identity() {
+    let launch = balanced_block(ASYNC_SUBAGENT, "pub(crate) fn launch_async_subagent");
+    let started = launch
+        .find("parent_activity.publish_payload(SubagentActivityPayload::Started")
+        .expect("actor launch must commit Started before spawning the worker");
+    let spawned = launch
+        .find("spawn_async_subagent_worker(AsyncSubagentWorkerSpawnContext")
+        .expect("actor launch must spawn the worker after precommit");
+    assert!(started < spawned);
+    assert!(launch[started..spawned].contains("mark_worker_spawned"));
+    assert!(launch.contains("activity_start_precommitted: true"));
+    assert!(launch.contains("child_turn_id: &child_turn_id"));
+    assert!(ASYNC_SUBAGENT.contains("--child-turn-id"));
+    assert!(ASYNC_SUBAGENT.contains("--activity-start-precommitted"));
+}
+
+#[test]
+fn async_launch_failures_terminalize_continuation_before_surface_failure() {
+    let launch = balanced_block(ASYNC_SUBAGENT, "pub(crate) fn launch_async_subagent");
+    let helper = balanced_block(ASYNC_SUBAGENT, "fn finish_async_launch_failure");
+    let continuation = helper
+        .find("coordinator.commit_prepared_terminal(")
+        .expect("launch failure helper must commit the continuation terminal");
+    let surface = helper
+        .find("activity.publish_payload(SubagentActivityPayload::Completed")
+        .expect("launch failure helper must publish a failed surface terminal");
+    assert!(continuation < surface);
+    assert!(launch.matches("finish_async_launch_failure(").count() >= 3);
+    let started_failure = launch
+        .find("failed to commit async subagent Started activity")
+        .expect("Started failure path must be explicit");
+    let started_failure_block = &launch[started_failure..];
+    assert!(
+        !started_failure_block.contains("finish_async_launch_failure(")
+            || started_failure_block
+                .find("finish_async_launch_failure(")
+                .is_some_and(|offset| {
+                    started_failure_block[..offset].contains("The surface sequence starts at one")
+                }),
+        "a rejected Started event must not fabricate a sequence-two surface terminal"
+    );
+}
+
+#[test]
+fn async_surface_terminal_follows_schema_and_continuation_commit() {
+    let worker = balanced_block(
+        ASYNC_SUBAGENT,
+        "pub(crate) fn run_async_subagent_worker_with_executor",
+    );
+    let completed_task = worker
+        .find("let completed_task =")
+        .expect("async worker must settle its lifecycle task");
+    let schema = worker
+        .find("validate_subagent_output_schema")
+        .expect("async worker must validate output schema");
+    let panic_surface_terminal = worker
+        .find("if projection.is_some()\n                && let Err(error) = activity.publish_payload(SubagentActivityPayload::Completed")
+        .expect("async panic path must publish a surface terminal");
+    assert!(
+        panic_surface_terminal
+            > worker
+                .find("let projection = match commit_async_terminal(")
+                .expect("async panic path must commit continuation terminal"),
+        "panic surface terminal must follow continuation terminal"
+    );
+    let surface_terminal = completed_task
+        + worker[completed_task..]
+            .find("activity.publish_payload(SubagentActivityPayload::Completed")
+            .expect("async worker must publish one normal surface terminal");
+    assert!(
+        schema < surface_terminal,
+        "async output schema must be settled before surface terminal"
+    );
+
+    let continuation_terminal = worker
+        .find("let projection = match commit_async_terminal(")
+        .expect("async success path must commit continuation terminal");
+    assert!(
+        continuation_terminal < surface_terminal,
+        "continuation terminal must be authoritative before surface terminal"
+    );
 }

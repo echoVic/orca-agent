@@ -655,6 +655,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
             parent_fence: activity_ingress
                 .as_ref()
                 .and_then(|ingress| ingress.parent_fence()),
+            activity_ingress: activity_ingress.clone(),
         });
         if emit_deltas && let Some(task) = launch.task.as_ref() {
             emit_batch_event(sink, events.task_status_updated(task), event_error);

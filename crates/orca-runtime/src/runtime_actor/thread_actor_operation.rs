@@ -1989,6 +1989,10 @@ impl ThreadActor {
             .cwd
             .as_deref()
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        let activity_ingress = binding
+            .parent_fence
+            .clone()
+            .map(|parent_fence| self.handle.subagent_activity_ingress_for(parent_fence));
         let launched = crate::subagent_async_worker::launch_async_subagent(
             crate::subagent_async_worker::AsyncSubagentLaunchContext {
                 config: &self.config,
@@ -1999,6 +2003,7 @@ impl ThreadActor {
                 task_registry: &registry,
                 root_task_id: binding.parent_task_id.as_deref(),
                 parent_fence: binding.parent_fence,
+                activity_ingress,
             },
         );
         let launched_task = launched

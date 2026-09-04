@@ -1290,6 +1290,61 @@ fn jsonl_ledger_recovers_exact_prepared_and_committed_identity() {
 }
 
 #[test]
+fn jsonl_ledger_indexes_child_thread_bound_source_digest_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("child-thread-bound.jsonl");
+    let mut child_batch = batch(220);
+    let commit_id = match &child_batch.commit_class {
+        CommitClass::Recorded { commit_id, .. } => commit_id.clone(),
+        CommitClass::Ephemeral { .. } => unreachable!(),
+    };
+    let source_digest = digest(221);
+    let source = SurfaceSubagentSource::new(
+        SurfaceTaskAttemptId::try_new("attempt-child-thread-bound").unwrap(),
+        SurfaceTurnId::new(),
+        2,
+        UnixMillis::new(2),
+        commit_id.clone(),
+        source_digest.clone(),
+    );
+    let event_class = child_batch.commit_class.clone();
+    child_batch.events = NonEmptyVec::try_new(vec![SurfaceEventEnvelope {
+        ordinal: 0,
+        event_id: SurfaceEventId::try_from_bytes(uuid(222)).unwrap(),
+        commit_class: event_class.clone(),
+        scope: SurfaceScope::Thread,
+        event: SurfaceEvent::Subagent(SubagentPatch::ChildThreadBound {
+            subagent_id: SurfaceSubagentId::try_new("subagent-child-thread-bound").unwrap(),
+            expected_revision: SubagentRevision::try_new(1).unwrap(),
+            next_revision: SubagentRevision::try_new(2).unwrap(),
+            owner: SurfaceSubagentOwner::DetachedTask {
+                owner: SurfaceTaskOwnerRef::new(
+                    SurfaceTaskId::try_new("task-child-thread-bound").unwrap(),
+                    TaskRevision::try_new(1).unwrap(),
+                    SurfaceTaskAttemptId::try_new("attempt-child-thread-bound").unwrap(),
+                    digest(223),
+                ),
+            },
+            source,
+            thread_id: SurfaceThreadId::try_from_bytes(uuid(224)).unwrap(),
+        }),
+    }])
+    .unwrap();
+    child_batch.batch_digest = canonical_batch_digest(&child_batch);
+
+    let mut ledger = JsonlSurfaceCommitLedger::new(&path, cursor(0));
+    let receipt = ledger.append_complete_batch(&child_batch).unwrap();
+    ledger.checkpoint(&receipt).unwrap();
+    drop(ledger);
+
+    let reopened = JsonlSurfaceCommitLedger::new(&path, cursor(0));
+    assert_eq!(
+        reopened.lookup_subagent_source_digest(&commit_id),
+        Some(source_digest)
+    );
+}
+
+#[test]
 fn jsonl_ledger_probes_the_loaded_index_without_rereading_the_log() {
     let dir = tempfile::tempdir().unwrap();
     let (_owner_dir, owner) = test_owner_lease();

@@ -570,11 +570,28 @@ impl ChildAgentActivityEmitter {
         sink: Arc<dyn ChildAgentActivitySink>,
         published_revision: Arc<AtomicU64>,
     ) -> Self {
+        Self::new_with_revision_source_and_sequence(identity, sink, published_revision, 1)
+    }
+
+    /// Constructs an emitter whose first source sequence is already advanced
+    /// past an actor-committed event. Detached workers use this when the parent
+    /// actor commits `Started` before spawning the process; the worker then
+    /// begins at sequence two without duplicating or racing that start fact.
+    pub(crate) fn new_with_revision_source_and_sequence(
+        identity: SubagentActivityIdentity,
+        sink: Arc<dyn ChildAgentActivitySink>,
+        published_revision: Arc<AtomicU64>,
+        next_sequence: u64,
+    ) -> Self {
+        assert!(
+            next_sequence > 0,
+            "activity source sequence must be non-zero"
+        );
         Self {
             identity,
             sink,
             pending: Mutex::new(PendingSubagentActivity {
-                next_sequence: 1,
+                next_sequence,
                 pending: None,
             }),
             last_streaming: Mutex::new(None),
@@ -769,7 +786,7 @@ impl ChildAgentActivityPublisher for ChildAgentActivityEmitter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::*;
 
@@ -889,5 +906,41 @@ mod tests {
         assert_eq!(events[0].source_sequence, 1);
         assert_eq!(events[1].source_sequence, 1);
         assert_eq!(events[2].source_sequence, 2);
+    }
+
+    #[test]
+    fn precommitted_activity_emitter_starts_at_sequence_two() {
+        let sink = Arc::new(RecordingSink {
+            fail_once: AtomicBool::new(false),
+            events: Mutex::new(Vec::new()),
+        });
+        let turn_id = TurnId::new();
+        let emitter = ChildAgentActivityEmitter::new_with_revision_source_and_sequence(
+            SubagentActivityIdentity {
+                task_id: SurfaceTaskId::try_new("task-precommitted").unwrap(),
+                subagent_id: SurfaceSubagentId::try_new("subagent-precommitted").unwrap(),
+                attempt_id: AgentAttemptId::new(),
+                turn_id: turn_id.clone(),
+                owner: SubagentActivityOwner::DetachedTask {
+                    task_id: SurfaceTaskId::try_new("task-precommitted").unwrap(),
+                    task_revision: TaskRevision::try_new(1).unwrap(),
+                    authority_digest: Sha256Digest::digest("authority-precommitted"),
+                },
+            },
+            sink.clone(),
+            Arc::new(AtomicU64::new(1)),
+            2,
+        );
+        emitter
+            .publish_payload(SubagentActivityPayload::PhaseChanged {
+                phase: SurfaceSubagentPhase::Thinking,
+                turn: Some(1),
+            })
+            .unwrap();
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_sequence, 2);
+        assert_eq!(events[0].turn_id, turn_id);
     }
 }

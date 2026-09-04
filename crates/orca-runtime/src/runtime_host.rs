@@ -3351,6 +3351,21 @@ impl RuntimeThreadHandle {
         self.surface.clone()
     }
 
+    /// Build an actor-backed child activity ingress for a resumed or freshly
+    /// launched detached subagent. The returned sender carries the private
+    /// operation fence and is acknowledged only after the actor commits the
+    /// event to the surface ledger.
+    pub(crate) fn subagent_activity_ingress_for(
+        &self,
+        fence: surface::SurfaceOperationFence,
+    ) -> Arc<dyn surface::RuntimeSubagentActivityIngress> {
+        Arc::new(RuntimeSurfaceSubagentActivityIngress {
+            command_tx: self.command_tx.clone(),
+            fence,
+            seen: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+        })
+    }
+
     fn headless_surface(&self) -> Option<surface::RuntimeSurfaceHandle> {
         let authority = surface::SurfaceAttachAuthority::new(
             self.surface.host_incarnation().clone(),

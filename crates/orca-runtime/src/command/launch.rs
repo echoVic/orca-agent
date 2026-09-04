@@ -66,6 +66,8 @@ pub struct SubagentWorkerLaunchRequest {
     pub worktree_repo_root: Option<PathBuf>,
     pub worktree_path: Option<PathBuf>,
     pub permission_response_public_key: String,
+    pub child_turn_id: String,
+    pub activity_start_precommitted: bool,
 }
 
 pub fn prepare_interactive(request: InteractiveLaunchRequest) -> Result<RunConfig, String> {
@@ -192,6 +194,14 @@ fn run_subagent_worker_with_reader(request: SubagentWorkerLaunchRequest, reader:
             return 1;
         }
     };
+    let child_turn_id =
+        match orca_core::thread_identity::TurnId::parse(request.child_turn_id.clone()) {
+            Ok(turn_id) => turn_id,
+            Err(error) => {
+                eprintln!("orca: invalid detached child turn id: {error}");
+                return 1;
+            }
+        };
     let worktree = match validate_worktree_pair(request.worktree_repo_root, request.worktree_path) {
         Ok(worktree) => worktree,
         Err(error) => {
@@ -233,6 +243,8 @@ fn run_subagent_worker_with_reader(request: SubagentWorkerLaunchRequest, reader:
         child_depth: request.subagent_depth,
         worktree,
         permission_response_public_key: public_key_bytes,
+        child_turn_id,
+        activity_start_precommitted: request.activity_start_precommitted,
     })
 }
 

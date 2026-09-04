@@ -93,6 +93,13 @@ pub struct AsyncSubagentWorkerInput {
     pub child_depth: u32,
     pub worktree: Option<AsyncSubagentWorktree>,
     pub permission_response_public_key: [u8; 32],
+    /// Logical child turn allocated by the admitting actor.  Detached relay
+    /// records must keep this identity across the parent/worker boundary.
+    pub child_turn_id: TurnId,
+    /// The actor already committed `Started` at source sequence one before
+    /// spawning this worker.  Direct test/legacy launches may leave this false
+    /// and let the worker emit the start itself.
+    pub activity_start_precommitted: bool,
 }
 
 pub(crate) struct AsyncSubagentWorkerContext {
@@ -111,6 +118,10 @@ pub(crate) struct AsyncSubagentLaunchContext<'a> {
     /// Parent operation identity retained by detached activity after the
     /// admitting generation leaves the resident actor.
     pub parent_fence: Option<SurfaceOperationFence>,
+    /// Parent actor ingress used to commit the detached `Started` fact before
+    /// any worker process is spawned. The relay worker starts at source
+    /// sequence two after this durable pre-launch commit.
+    pub activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
 }
 
 pub(crate) struct AsyncSubagentLaunchOutput {
@@ -128,6 +139,22 @@ struct AsyncSubagentWorkerSpawnContext<'a> {
     child_depth: u32,
     worktree: Option<&'a AsyncSubagentWorktree>,
     permission_response_public_key: &'a [u8; 32],
+    child_turn_id: &'a TurnId,
+    activity_start_precommitted: bool,
+}
+
+/// Bridges the actor-owned surface ingress into the emitter abstraction used
+/// by child execution.  This is only used for the pre-launch `Started` fact
+/// and for failures before a worker process can adopt the task.
+#[derive(Clone)]
+struct SurfaceActivitySink {
+    ingress: Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>,
+}
+
+impl ChildAgentActivitySink for SurfaceActivitySink {
+    fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        self.ingress.commit_activity(event)
+    }
 }
 
 struct AsyncLaunchWorktree {
@@ -265,9 +292,9 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         child_depth,
         worktree,
         permission_response_public_key,
+        child_turn_id,
+        activity_start_precommitted,
     } = input;
-    let batch_id = format!("async-{agent_id}");
-    let batch_size = 1;
     let owns_worktree = request.resume_from.is_none();
     let task_registry = match wait_for_async_subagent_adoption(&task_session_id, &cwd, &agent_id) {
         Ok(registry) => registry,
@@ -412,25 +439,40 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         task_id: agent_id.clone(),
         attempt_id: prepared.attempt_id.as_str().to_string(),
     });
-    // Allocate the detached child turn before publishing `Started`; this same
-    // identity is persisted in every relay event and supplied to the child
-    // runtime when permission requests are evaluated.
-    let child_turn_id = TurnId::new();
-    let activity = Arc::new(ChildAgentActivityEmitter::new(
-        SubagentActivityIdentity {
-            task_id: surface_task_id.clone(),
-            subagent_id: SurfaceSubagentId::try_new(agent_id.clone())
-                .expect("async task registry created a non-empty task id"),
-            attempt_id: prepared.attempt_id.clone(),
-            turn_id: child_turn_id.clone(),
-            owner: SubagentActivityOwner::DetachedTask {
+    // The admitting actor allocates this identity before process spawn.  Keep
+    // it unchanged for permission requests and every subsequent relay event.
+    let activity = Arc::new(
+        ChildAgentActivityEmitter::new_with_revision_source_and_sequence(
+            SubagentActivityIdentity {
                 task_id: surface_task_id.clone(),
-                task_revision: detached_binding.task_revision,
-                authority_digest: detached_binding.authority_digest,
+                subagent_id: SurfaceSubagentId::try_new(agent_id.clone())
+                    .expect("async task registry created a non-empty task id"),
+                attempt_id: prepared.attempt_id.clone(),
+                turn_id: child_turn_id.clone(),
+                owner: SubagentActivityOwner::DetachedTask {
+                    task_id: surface_task_id.clone(),
+                    task_revision: detached_binding.task_revision,
+                    authority_digest: detached_binding.authority_digest,
+                },
             },
-        },
-        activity_sink,
-    ));
+            activity_sink,
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            if activity_start_precommitted { 2 } else { 1 },
+        ),
+    );
+    if !activity_start_precommitted
+        && let Err(error) = activity.publish_payload(SubagentActivityPayload::Started {
+            description: DisplayText::new(&request.description),
+            batch_id: format!("async-{agent_id}"),
+            batch_size: 1,
+        })
+    {
+        let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+        let mut message = format!("failed to publish async subagent start: {error}");
+        append_worktree_outcome(&mut message, worktree.as_ref());
+        let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+        return 1;
+    }
     let child_permission_handler = Arc::new(DetachedPermissionHandler::new(
         task_registry.clone(),
         detached_binding.clone(),
@@ -444,28 +486,6 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         ),
         cancel.clone(),
     ));
-    if let Err(error) = activity.publish_payload(SubagentActivityPayload::Started {
-        description: DisplayText::new(&request.description),
-        batch_id,
-        batch_size,
-    }) {
-        heartbeat.stop();
-        let mut message = format!("child activity start could not be durably published: {error}");
-        let worktree = finish_async_worker_worktree(worktree, owns_worktree);
-        append_worktree_outcome(&mut message, worktree.as_ref());
-        let projection = commit_async_terminal(
-            &coordinator,
-            &continuation_lease,
-            Some(&shared_revision),
-            AgentTerminal::Failed {
-                error: message.clone(),
-            },
-        )
-        .ok();
-        let message = append_projection_footer(message, projection.as_ref());
-        let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
-        return 1;
-    }
     let mut child_events = EventFactory::new(format!("subagent-{agent_id}"));
     let mut child_lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{agent_id}"));
     child_lifecycle.start_task(RuntimeTaskKind::Subagent);
@@ -509,28 +529,36 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
                 "Async subagent worker panicked after execution started: {}. Inspect external state before retrying.",
                 panic_payload_message(payload)
             );
-            if let Err(error) = activity.publish_payload(SubagentActivityPayload::Completed {
-                status: SurfaceSubagentTerminalStatus::Failed,
-                output: None,
-                error: Some(DisplayText::new(&message)),
-                usage: None,
-            }) {
+            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+            append_worktree_outcome(&mut message, worktree.as_ref());
+            let projection = match commit_async_terminal(
+                &coordinator,
+                &continuation_lease,
+                Some(&shared_revision),
+                AgentTerminal::Indeterminate {
+                    reason: message.clone(),
+                },
+            ) {
+                Ok(projection) => Some(projection),
+                Err(error) => {
+                    message.push_str(&format!(
+                        "\n\nfailed to commit async continuation terminal: {error}"
+                    ));
+                    None
+                }
+            };
+            if projection.is_some()
+                && let Err(error) = activity.publish_payload(SubagentActivityPayload::Completed {
+                    status: SurfaceSubagentTerminalStatus::Failed,
+                    output: None,
+                    error: Some(DisplayText::new(&message)),
+                    usage: None,
+                })
+            {
                 message.push_str(&format!(
                     "\n\nchild activity terminal could not be published: {error}"
                 ));
             }
-            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
-            append_worktree_outcome(&mut message, worktree.as_ref());
-            let terminal = AgentTerminal::Indeterminate {
-                reason: message.clone(),
-            };
-            let projection = commit_async_terminal(
-                &coordinator,
-                &continuation_lease,
-                Some(&shared_revision),
-                terminal,
-            )
-            .ok();
             let message = append_projection_footer(message, projection.as_ref());
             let message = async_subagent_result_payload(message, None);
             let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
@@ -544,29 +572,6 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             SurfaceSubagentTerminalStatus::Failed
         }
     };
-    if let Err(error) = activity.publish_payload(SubagentActivityPayload::Completed {
-        status: terminal_status,
-        output: child.final_message.as_deref().map(DisplayText::new),
-        error: child.error.as_deref().map(DisplayText::new),
-        usage: Some(child_cost_tracker.totals()),
-    }) {
-        let mut message =
-            format!("child activity terminal could not be durably published: {error}");
-        let worktree = finish_async_worker_worktree(worktree, owns_worktree);
-        append_worktree_outcome(&mut message, worktree.as_ref());
-        let projection = commit_async_terminal(
-            &coordinator,
-            &continuation_lease,
-            Some(&shared_revision),
-            AgentTerminal::Indeterminate {
-                reason: message.clone(),
-            },
-        )
-        .ok();
-        let message = append_projection_footer(message, projection.as_ref());
-        let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
-        return 1;
-    }
     let completed_task = child_lifecycle
         .finish_task(child.status)
         .cloned()
@@ -587,24 +592,46 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             validate_subagent_output_schema(&request.description, request.schema.as_ref(), &output)
         {
             append_worktree_outcome(&mut error, worktree.as_ref());
-            let projection = commit_async_terminal(
+            let projection = match commit_async_terminal(
                 &coordinator,
                 &continuation_lease,
                 Some(&shared_revision),
                 AgentTerminal::Failed {
                     error: error.clone(),
                 },
-            )
-            .ok();
-            let error = append_projection_footer(error, projection.as_ref());
+            ) {
+                Ok(projection) => projection,
+                Err(commit_error) => {
+                    let error = format!(
+                        "{error}\n\nfailed to commit async continuation terminal: {commit_error}"
+                    );
+                    let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
+                    let error = async_subagent_result_payload(error, Some(failed_task.payload()));
+                    let _ = task_registry.fail_with_usage_and_lease(
+                        &task_lease,
+                        &agent_id,
+                        error,
+                        usage,
+                    );
+                    return 1;
+                }
+            };
+            let mut error = append_projection_footer(error, Some(&projection));
+            if let Err(activity_error) =
+                activity.publish_payload(SubagentActivityPayload::Completed {
+                    status: SurfaceSubagentTerminalStatus::Failed,
+                    output: None,
+                    error: Some(DisplayText::new(&error)),
+                    usage: usage.map(|_| child_cost_tracker.totals()),
+                })
+            {
+                error.push_str(&format!(
+                    "\n\nchild activity terminal could not be durably published: {activity_error}"
+                ));
+            }
             let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
             let error = async_subagent_result_payload(error, Some(failed_task.payload()));
-            if task_registry
-                .fail_with_usage_and_lease(&task_lease, &agent_id, error, usage)
-                .is_ok()
-            {
-                return 1;
-            }
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, usage);
             return 1;
         }
         append_worktree_outcome(&mut output, worktree.as_ref());
@@ -627,6 +654,24 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             }
         };
         output = append_projection_footer(output, Some(&projection));
+        if let Err(error) = activity.publish_payload(SubagentActivityPayload::Completed {
+            status: terminal_status.clone(),
+            output: Some(DisplayText::new(&output)),
+            error: None,
+            usage: Some(child_cost_tracker.totals()),
+        }) {
+            let error = format!("child activity terminal could not be durably published: {error}");
+            let error = async_subagent_result_payload(
+                error,
+                Some(
+                    completed_task
+                        .with_status(RuntimeTaskStatus::Failed)
+                        .payload(),
+                ),
+            );
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, usage);
+            return 1;
+        }
         let output = async_subagent_result_payload(output, Some(completed_task.payload()));
         if task_registry
             .complete_with_usage_and_lease(&task_lease, &agent_id, output, usage)
@@ -648,14 +693,41 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
                 error: error.clone(),
             },
         };
-        let projection = commit_async_terminal(
+        let projection = match commit_async_terminal(
             &coordinator,
             &continuation_lease,
             Some(&shared_revision),
             terminal,
-        )
-        .ok();
-        let error = append_projection_footer(error, projection.as_ref());
+        ) {
+            Ok(projection) => projection,
+            Err(commit_error) => {
+                let error = format!(
+                    "{error}\n\nfailed to commit async continuation terminal: {commit_error}"
+                );
+                let error = async_subagent_result_payload(
+                    error,
+                    Some(
+                        completed_task
+                            .with_status(RuntimeTaskStatus::Failed)
+                            .payload(),
+                    ),
+                );
+                let _ =
+                    task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, usage);
+                return 1;
+            }
+        };
+        let mut error = append_projection_footer(error, Some(&projection));
+        if let Err(activity_error) = activity.publish_payload(SubagentActivityPayload::Completed {
+            status: terminal_status,
+            output: None,
+            error: Some(DisplayText::new(&error)),
+            usage: Some(child_cost_tracker.totals()),
+        }) {
+            error.push_str(&format!(
+                "\n\nchild activity terminal could not be durably published: {activity_error}"
+            ));
+        }
         let error = async_subagent_result_payload(error, Some(completed_task.payload()));
         if task_registry
             .fail_with_usage_and_lease(&task_lease, &agent_id, error, usage)
@@ -679,6 +751,7 @@ pub(crate) fn launch_async_subagent(
         task_registry,
         root_task_id,
         parent_fence,
+        activity_ingress,
     } = context;
     let mut request = subagent::with_delegation_snapshot(
         request,
@@ -704,6 +777,16 @@ pub(crate) fn launch_async_subagent(
             task: None,
         };
     }
+    let Some(activity_ingress) = activity_ingress else {
+        return AsyncSubagentLaunchOutput {
+            result: tool_types::ToolResult::failed(
+                tool_request,
+                "async subagents require an actor-owned activity ingress for pre-launch Started",
+                None,
+            ),
+            task: None,
+        };
+    };
     let coordinator = match ChildAgentCoordinator::new(task_registry.clone()) {
         Ok(coordinator) => coordinator,
         Err(error) => {
@@ -910,19 +993,65 @@ pub(crate) fn launch_async_subagent(
             );
         }
     };
+    let child_turn_id = TurnId::new();
+    let parent_activity = Arc::new(ChildAgentActivityEmitter::new(
+        SubagentActivityIdentity {
+            task_id: SurfaceTaskId::try_new(agent_id.clone())
+                .expect("async task registry created a non-empty task id"),
+            subagent_id: SurfaceSubagentId::try_new(agent_id.clone())
+                .expect("async task registry created a non-empty task id"),
+            attempt_id: prepared.attempt_id.clone(),
+            turn_id: child_turn_id.clone(),
+            owner: SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new(agent_id.clone())
+                    .expect("async task registry created a non-empty task id"),
+                task_revision: detached_binding.task_revision,
+                authority_digest: detached_binding.authority_digest,
+            },
+        },
+        Arc::new(SurfaceActivitySink {
+            ingress: activity_ingress.clone(),
+        }),
+    ));
+    if let Err(error) = parent_activity.publish_payload(SubagentActivityPayload::Started {
+        description: DisplayText::new(&request.description),
+        batch_id: format!("async-{agent_id}"),
+        batch_size: 1,
+    }) {
+        let worktree = launch_worktree.finish_fresh();
+        let mut message = format!("failed to commit async subagent Started activity: {error}");
+        append_worktree_outcome(&mut message, worktree.as_ref());
+        // The surface sequence starts at one. If Started itself was rejected,
+        // publishing a sequence-two terminal would create an orphaned gap.
+        // Keep the durable continuation/task state fail-closed and let the
+        // rejected Started remain absent from the surface projection.
+        let projection = match coordinator.commit_prepared_terminal(
+            &prepared,
+            AgentTerminal::Failed {
+                error: message.clone(),
+            },
+        ) {
+            Ok(projection) => Some(projection),
+            Err(commit_error) => {
+                message.push_str(&format!(
+                    "\n\nfailed to commit async continuation terminal: {commit_error}"
+                ));
+                None
+            }
+        };
+        let message = append_projection_footer(message, projection.as_ref());
+        let _ = task_registry.fail(&agent_id, message.clone());
+        return async_launch_output(
+            task_registry,
+            &agent_id,
+            tool_types::ToolResult::failed(tool_request, message, None),
+        );
+    }
     if let Err(error) = task_registry.mark_worker_spawned(&agent_id, 0) {
         let worktree = launch_worktree.finish_fresh();
         let mut error = error;
         append_worktree_outcome(&mut error, worktree.as_ref());
-        let projection = coordinator
-            .commit_prepared_terminal(
-                &prepared,
-                AgentTerminal::Failed {
-                    error: error.clone(),
-                },
-            )
-            .ok();
-        error = append_projection_footer(error, projection.as_ref());
+        error = finish_async_launch_failure(&coordinator, &prepared, &parent_activity, error);
         let _ = task_registry.fail(&agent_id, error.clone());
         return async_launch_output(
             task_registry,
@@ -940,6 +1069,8 @@ pub(crate) fn launch_async_subagent(
         child_depth: subagent_depth + 1,
         worktree: launch_worktree.worker.as_ref(),
         permission_response_public_key: &detached_binding.permission_response_public_key,
+        child_turn_id: &child_turn_id,
+        activity_start_precommitted: true,
     }) {
         Ok((child, process_job)) => {
             if let Err(error) =
@@ -948,15 +1079,8 @@ pub(crate) fn launch_async_subagent(
                 let worktree = launch_worktree.finish_fresh();
                 let mut error = format!("failed to own async subagent worker: {error}");
                 append_worktree_outcome(&mut error, worktree.as_ref());
-                let projection = coordinator
-                    .commit_prepared_terminal(
-                        &prepared,
-                        AgentTerminal::Failed {
-                            error: error.clone(),
-                        },
-                    )
-                    .ok();
-                error = append_projection_footer(error, projection.as_ref());
+                error =
+                    finish_async_launch_failure(&coordinator, &prepared, &parent_activity, error);
                 let _ = task_registry.fail(&agent_id, error.clone());
                 return async_launch_output(
                     task_registry,
@@ -970,15 +1094,7 @@ pub(crate) fn launch_async_subagent(
             let worktree = launch_worktree.finish_fresh();
             let mut error = format!("failed to start async subagent worker: {error}");
             append_worktree_outcome(&mut error, worktree.as_ref());
-            let projection = coordinator
-                .commit_prepared_terminal(
-                    &prepared,
-                    AgentTerminal::Failed {
-                        error: error.clone(),
-                    },
-                )
-                .ok();
-            error = append_projection_footer(error, projection.as_ref());
+            error = finish_async_launch_failure(&coordinator, &prepared, &parent_activity, error);
             let _ = task_registry.fail(&agent_id, error.clone());
             return async_launch_output(
                 task_registry,
@@ -1016,6 +1132,40 @@ fn async_launch_output(
         result,
         task: task_registry.summary(agent_id),
     }
+}
+
+fn finish_async_launch_failure(
+    coordinator: &ChildAgentCoordinator,
+    prepared: &PreparedContinuation,
+    activity: &ChildAgentActivityEmitter,
+    mut error: String,
+) -> String {
+    let projection = match coordinator.commit_prepared_terminal(
+        prepared,
+        AgentTerminal::Failed {
+            error: error.clone(),
+        },
+    ) {
+        Ok(projection) => Some(projection),
+        Err(commit_error) => {
+            error.push_str(&format!(
+                "\n\nfailed to commit async continuation terminal: {commit_error}"
+            ));
+            None
+        }
+    };
+    error = append_projection_footer(error, projection.as_ref());
+    if let Err(activity_error) = activity.publish_payload(SubagentActivityPayload::Completed {
+        status: SurfaceSubagentTerminalStatus::Failed,
+        output: None,
+        error: Some(DisplayText::new(&error)),
+        usage: None,
+    }) {
+        error.push_str(&format!(
+            "\n\nchild activity terminal could not be durably published: {activity_error}"
+        ));
+    }
+    error
 }
 
 fn prepare_async_launch_worktree(
@@ -1130,6 +1280,8 @@ fn spawn_async_subagent_worker(
         child_depth,
         worktree,
         permission_response_public_key,
+        child_turn_id,
+        activity_start_precommitted,
     } = context;
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
@@ -1152,7 +1304,12 @@ fn spawn_async_subagent_worker(
         request_json,
         "--permission-response-public-key".to_string(),
         base64::engine::general_purpose::STANDARD.encode(permission_response_public_key),
+        "--child-turn-id".to_string(),
+        child_turn_id.to_string(),
     ];
+    if activity_start_precommitted {
+        worker_args.push("--activity-start-precommitted".to_string());
+    }
     if let Some(model) = config.model.as_history_value() {
         worker_args.extend(["--model".to_string(), model.to_string()]);
     }
@@ -1509,6 +1666,7 @@ mod tests {
             task_registry: &registry,
             root_task_id: None,
             parent_fence: None,
+            activity_ingress: None,
         });
 
         assert_eq!(output.result.status, ToolStatus::Failed);

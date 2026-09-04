@@ -450,6 +450,14 @@ struct SubagentWorkerArgs {
     #[arg(long, hide = true)]
     permission_response_public_key: String,
 
+    /// Logical child turn identity allocated by the admitting actor.
+    #[arg(long, hide = true)]
+    child_turn_id: String,
+
+    /// Whether the admitting actor already committed source sequence one.
+    #[arg(long, hide = true)]
+    activity_start_precommitted: bool,
+
     /// Parent git repository root for isolated worktree cleanup.
     #[arg(long)]
     worktree_repo_root: Option<PathBuf>,
@@ -586,6 +594,8 @@ impl From<SubagentWorkerArgs> for orca_runtime::command::launch::SubagentWorkerL
             subagent_depth: args.subagent_depth,
             request_json: args.request_json,
             permission_response_public_key: args.permission_response_public_key,
+            child_turn_id: args.child_turn_id,
+            activity_start_precommitted: args.activity_start_precommitted,
             worktree_repo_root: args.worktree_repo_root,
             worktree_path: args.worktree_path,
         }
