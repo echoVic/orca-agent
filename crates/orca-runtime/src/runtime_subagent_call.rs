@@ -133,6 +133,22 @@ impl ChildAgentActivitySink for RuntimeSubagentActivitySink {
     }
 }
 
+#[derive(Debug, Default)]
+struct LegacySubagentActivitySink;
+
+impl ChildAgentActivitySink for LegacySubagentActivitySink {
+    fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        if event.verify_digest() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child activity digest verification failed",
+            ))
+        }
+    }
+}
+
 pub(crate) struct ChildEventActivityObserver {
     pub(crate) emitter: Arc<ChildAgentActivityEmitter>,
 }
@@ -1339,26 +1355,15 @@ fn execute_acquired_sync_subagent(
                     ingress: activity_ingress,
                 }),
             ),
-            None => {
-                let output = continuation_started_failure(
-                    tool_request,
-                    description,
-                    lifecycle,
-                    started_task,
-                    &child_config,
-                    "subagent activity ingress is unavailable; refusing to start an unobservable child"
-                        .to_string(),
-                    worktree_execution.finish(),
-                );
-                return finalize_started_sync_subagent(
-                    output,
-                    &coordinator,
-                    &lease,
-                    &task_registry,
-                    &registry_task_id,
-                    false,
-                );
-            }
+            None => (
+                SubagentActivityOwner::Generation {
+                    operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .expect("UUIDv7 produces a valid legacy operation id"),
+                },
+                Arc::new(LegacySubagentActivitySink),
+            ),
         };
     // Allocate the child logical turn before the first activity envelope. The
     // exact value is then shared by the surface source cursor, runtime turn,

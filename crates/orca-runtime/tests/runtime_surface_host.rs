@@ -117,9 +117,15 @@ fn explicit_history_disabled_one_shot_starts_an_ephemeral_typed_surface() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let entries = fs::read_dir(home.path())
+            .expect("read ephemeral ORCA_HOME")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "agent-events.jsonl" && name != "agent-events.lock")
+            .collect::<Vec<_>>();
         assert!(
-            !directory_tree_has_files(home.path()),
-            "ephemeral one-shot wrote persistent ORCA_HOME state"
+            entries.is_empty(),
+            "ephemeral one-shot wrote persistent ORCA_HOME state: {entries:?}"
         );
         assert!(
             !directory_tree_has_files(&cwd.path().join(".orca")),

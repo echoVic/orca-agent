@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.12":
+        "Ships live child conversation fixes with a binary-serial workspace gate, preserving isolated runtime and TUI contract tests during publication.",
       "v0.4.11":
         "Publishes the live child conversation fixes with a serialized workspace gate, preventing shared local session state from making release verification flaky.",
       "v0.4.10":
@@ -638,6 +640,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.12":
+        "发布 live child conversation 修复，并让 workspace gate 按 binary 串行运行，保证发布期间 runtime 与 TUI 合约测试彼此隔离。",
       "v0.4.11":
         "发布 live child conversation 修复，并将 workspace gate 串行化，避免共享本地 session 状态导致发布验证不稳定。",
       "v0.4.10":

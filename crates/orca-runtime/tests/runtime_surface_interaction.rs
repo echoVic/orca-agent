@@ -4238,7 +4238,11 @@ fn find_only_jsonl(root: &Path) -> PathBuf {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 visit(&path, found);
-            } else if path
+            } else if path.parent().is_some_and(|parent| {
+                parent
+                    .components()
+                    .any(|component| component.as_os_str() == "sessions")
+            }) && path
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
             {

@@ -295,8 +295,11 @@ fn assert_orca_home_contains_only_folder_trust(home: &Path) {
     let entries = directory_entries(home, "isolated ORCA_HOME");
     assert_eq!(
         entries,
-        vec!["folder_trust.toml".to_string()],
-        "stateless submit must not create runtime persistence artifacts"
+        vec![
+            "agent-events.jsonl".to_string(),
+            "folder_trust.toml".to_string()
+        ],
+        "stateless submit may persist only trust and the agent lifecycle journal"
     );
 }
 

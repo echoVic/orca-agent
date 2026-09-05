@@ -643,7 +643,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         ));
     }
 
-    if request.mode == SubagentMode::Async {
+    if request.mode == SubagentMode::Async && agent_controller.is_none() {
         let launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config,
             cwd,

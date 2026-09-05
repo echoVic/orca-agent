@@ -335,8 +335,24 @@ fn event_ids<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a str> {
 fn only_session_file(home: &Path) -> PathBuf {
     let mut files = Vec::new();
     collect_jsonl_files(&home.join("sessions"), &mut files);
-    assert_eq!(files.len(), 1, "expected exactly one persisted session");
-    files.pop().unwrap()
+    let mut roots = files
+        .into_iter()
+        .filter(|path| {
+            fs::read_to_string(path)
+                .ok()
+                .and_then(|content| content.lines().next().map(str::to_string))
+                .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+                .is_some_and(|meta| {
+                    meta["type"] == "session.meta" && meta.get("parent_id").is_none()
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots.len(),
+        1,
+        "expected exactly one persisted root session"
+    );
+    roots.pop().unwrap()
 }
 
 fn collect_jsonl_files(path: &Path, files: &mut Vec<PathBuf>) {

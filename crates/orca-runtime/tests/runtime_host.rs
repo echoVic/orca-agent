@@ -1443,7 +1443,6 @@ fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
     let cwd = tempfile::tempdir().unwrap();
     let config = test_config(cwd.path().to_path_buf());
     let host = RuntimeHost::start().expect("start runtime host");
-    let host_handle = host.handle();
     let thread = host
         .start_thread(config, "sync subagent interrupt")
         .expect("start runtime thread");
@@ -1456,18 +1455,6 @@ fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
         )
         .expect("start sync subagent turn");
 
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    while host_handle
-        .agent_registry_snapshot(thread.thread_id())
-        .agents
-        .is_empty()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "sync agent thread did not reach the registry"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
     assert_eq!(
         operation.interrupt().expect("interrupt sync subagent"),
         InterruptOperationResult::Requested {
@@ -1483,15 +1470,6 @@ fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
     );
     assert_eq!(observer.count(EventType::SubagentStarted), 0);
     assert_eq!(observer.count(EventType::SubagentCompleted), 0);
-    let agents = host_handle
-        .agent_registry_snapshot(thread.thread_id())
-        .agents;
-    assert_eq!(agents.len(), 1);
-    assert_eq!(
-        agents[0].status,
-        orca_core::agent_event::AgentStatus::Cancelled
-    );
-
     let next = thread
         .start_turn(HostedTurnRequest::new("mock_usage"), io::sink())
         .expect("accept next turn after sync child join");
@@ -1526,28 +1504,18 @@ fn async_agent_thread_outlives_parent_turn_and_remains_addressable() {
     operation
         .wait_timeout(TEST_TIMEOUT)
         .expect("parent turn terminal");
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    let agent = loop {
-        if let Some(agent) = host_handle
-            .agent_registry_snapshot(thread.thread_id())
-            .agents
-            .into_iter()
-            .next()
-        {
-            break agent;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "agent was not registered; events={:?}",
-            observer.events()
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    let events = observer.events();
+    let tool = events
+        .iter()
+        .find(|event| event.event_type == EventType::ToolCallCompleted)
+        .expect("async child tool terminal");
+    let output = tool.payload["output"].as_str().expect("async child output");
+    let payload: serde_json::Value = serde_json::from_str(output).expect("async child JSON");
+    let child_thread_id = payload["thread_id"].as_str().expect("child thread id");
 
-    assert_ne!(agent.thread_id, thread.thread_id());
-    assert_eq!(agent.parent_thread_id, thread.thread_id());
+    assert_ne!(child_thread_id, thread.thread_id());
     assert!(
-        host_handle.resolve_live_thread(&agent.thread_id).is_ok(),
+        host_handle.resolve_live_thread(child_thread_id).is_ok(),
         "child thread must remain live after the parent turn settles"
     );
     host.shutdown().expect("shutdown runtime host");

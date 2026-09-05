@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.11";
+export const releaseVersion = "v0.4.12";
 
 export const releases = [
+  {
+    version: "v0.4.12",
+    date: "2026-09-05",
+    title: "Deterministic child activity release",
+    body: "Ships live child conversation fixes with a binary-serial workspace gate, preserving isolated runtime and TUI contract tests during publication.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.12",
+  },
   {
     version: "v0.4.11",
     date: "2026-09-05",
