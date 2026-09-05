@@ -2,7 +2,6 @@
 
 mod action_dispatcher;
 mod agent_runtime;
-mod agent_ui_state;
 mod agent_workspace;
 mod agent_workspace_actions;
 pub mod app;
@@ -32,6 +31,7 @@ mod exit_policy;
 mod frame_scheduler;
 mod global_actions;
 mod goal_materialization;
+mod hosted_child;
 mod hosted_context;
 mod hosted_controller;
 mod hosted_goal;

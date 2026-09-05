@@ -76,7 +76,7 @@ pub(crate) fn rotate_side_event_sender(
     routing: &Arc<Mutex<AttachmentRouting>>,
 ) -> mpsc::Sender<TuiEvent> {
     AttachmentRouting::retire_attachment(routing, *attachment);
-    *attachment = attachment.next();
+    *attachment = AttachmentRouting::allocate_next(routing);
     spawn_attached_event_sender_with_routing(
         root_event_tx.clone(),
         *attachment,
@@ -167,7 +167,7 @@ pub(crate) fn handle_hosted_side_action(
             let parent_event_tx = event_tx.clone();
             let parent_attachment = *session_attachment;
             let side_config = Arc::new(Mutex::new(side_config));
-            let side_attachment = parent_attachment.next();
+            let side_attachment = AttachmentRouting::allocate_next(attachment_routing);
             let side_event_tx = spawn_attached_event_sender_with_routing(
                 root_event_tx.clone(),
                 side_attachment,

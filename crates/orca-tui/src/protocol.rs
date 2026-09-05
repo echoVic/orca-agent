@@ -229,6 +229,9 @@ pub enum TuiEvent {
         plan: Vec<PlanItem>,
     },
     WorkflowTasksUpdated(Vec<orca_core::task_types::BackgroundTaskSummary>),
+    /// Task state from an inactive attachment. It updates the agent dock but
+    /// must not replace the visible child conversation transcript.
+    BackgroundTasksUpdated(Vec<orca_core::task_types::BackgroundTaskSummary>),
     TaskStatusUpdated(orca_core::task_types::BackgroundTaskSummary),
     BackgroundTaskOutputAttached {
         task_id: String,
@@ -279,6 +282,13 @@ pub enum TuiEvent {
     },
     NewSessionStarted,
     SessionProjectionReset(Box<crate::surface_projection::SurfaceProjectionState>),
+    /// A focused child recovered its subscription from a fresh snapshot. The
+    /// reducer resets its visible projection but retains the child focus so
+    /// Escape continues to return to the parent.
+    ChildProjectionReset {
+        task_id: String,
+        projection: Box<crate::surface_projection::SurfaceProjectionState>,
+    },
     SavedSessionsUpdated {
         sessions: Vec<orca_runtime::history::SessionSummary>,
         next_offset: Option<usize>,

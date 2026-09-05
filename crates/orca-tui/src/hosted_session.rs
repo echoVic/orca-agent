@@ -17,13 +17,10 @@ use orca_runtime::lifecycle::{
     RuntimeUserInputRequest,
 };
 use orca_runtime::protocol::{PermissionGrantScope, PermissionResponseDecision};
-use orca_runtime::runtime_host::RuntimeHostHandle;
 use orca_runtime::runtime_host::{PromptQueueInteractionHandlers, RuntimeThreadHandle};
 use orca_runtime::runtime_permission::{RuntimePermissionRequest, RuntimePermissionResponse};
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
-use std::collections::HashSet;
 use std::io;
-use std::time::Duration;
 
 use crate::attachment_routing::send_attached_event;
 use crate::composer_images::ComposerImageState;
@@ -429,76 +426,27 @@ pub(crate) fn announce_runtime_ready(
     }
 }
 
-pub(crate) fn start_agent_registry_watcher(
-    host: RuntimeHostHandle,
-    root_thread_id: String,
-    event_tx: mpsc::Sender<TuiEvent>,
-) {
-    static WATCHED_ROOTS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let watched = WATCHED_ROOTS.get_or_init(Default::default);
-    if !watched
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(root_thread_id.clone())
-    {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name(format!(
-            "orca-agent-registry-{}",
-            &root_thread_id[..8.min(root_thread_id.len())]
-        ))
-        .spawn(move || {
-            let mut revision = None;
-            loop {
-                if host.resolve_live_thread(&root_thread_id).is_err() {
-                    break;
-                }
-                let snapshot = host.agent_registry_snapshot(&root_thread_id);
-                if snapshot.agents.is_empty() {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                if revision != Some(snapshot.revision) {
-                    revision = Some(snapshot.revision);
-                    if event_tx
-                        .send(TuiEvent::AgentRegistryUpdated {
-                            root_thread_id: root_thread_id.clone(),
-                            snapshot,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            WATCHED_ROOTS
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&root_thread_id);
-        });
-}
-
 pub(crate) fn read_hosted_projection_batch(
     thread: &RuntimeThreadHandle,
 ) -> Result<(SurfaceProjectionState, Vec<ChatMessage>), String> {
     TuiSurfaceActions::new(thread.typed_surface())
         .read_snapshot()
-        .map(|snapshot| {
-            let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
-            let mut messages =
-                crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
-            if let Some(session_id) = thread.session_id()
-                && let Ok(transcript) = load_saved_history_fallback(session_id)
-            {
-                messages = attach_history_images(messages, &transcript.messages);
-            }
-            (projection, messages)
-        })
+        .map(|snapshot| hosted_projection_batch_from_snapshot(thread, &snapshot))
         .map_err(|error| error.to_string())
+}
+
+pub(crate) fn hosted_projection_batch_from_snapshot(
+    thread: &RuntimeThreadHandle,
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+) -> (SurfaceProjectionState, Vec<ChatMessage>) {
+    let projection = SurfaceProjectionState::from_surface_snapshot(snapshot);
+    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(snapshot);
+    if let Some(session_id) = thread.session_id()
+        && let Ok(transcript) = load_saved_history_fallback(session_id)
+    {
+        messages = attach_history_images(messages, &transcript.messages);
+    }
+    (projection, messages)
 }
 
 pub(crate) fn project_hosted_thread_attached(
@@ -857,96 +805,6 @@ mod tests {
             payload: serde_json::json!({"tasks": []}),
         };
         assert!(runtime_event_to_tui(&event).is_none());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn runtime_queue_event_projection_preserves_subagents_and_compaction() {
-        let base = EventEnvelope {
-            version: "1".to_string(),
-            run_id: "run".to_string(),
-            seq: 1,
-            timestamp_ms: 0,
-            event_type: EventType::SubagentStarted,
-            payload: serde_json::json!({
-                "id": "agent-1",
-                "description": "inspect files"
-            }),
-        };
-        assert!(matches!(
-            runtime_event_to_tui(&base),
-            Some(TuiEvent::SubagentStarted { id, description })
-                if id == "agent-1" && description == "inspect files"
-        ));
-
-        let progress = EventEnvelope {
-            event_type: EventType::SubagentProgress,
-            payload: serde_json::json!({
-                "id": "agent-1",
-                "description": "inspect files",
-                "activity": "reading",
-                "turn": 2,
-                "usage": null
-            }),
-            ..base.clone()
-        };
-        assert!(matches!(
-            runtime_event_to_tui(&progress),
-            Some(TuiEvent::SubagentProgress { id, activity, turn, usage })
-                if id == "agent-1" && activity == "reading" && turn == Some(2) && usage.is_none()
-        ));
-
-        let completed = EventEnvelope {
-            event_type: EventType::SubagentCompleted,
-            payload: serde_json::json!({
-                "id": "agent-1",
-                "description": "inspect files",
-                "status": "success",
-                "output": "done",
-                "error": null
-            }),
-            ..base.clone()
-        };
-        assert!(matches!(
-            runtime_event_to_tui(&completed),
-            Some(TuiEvent::SubagentCompleted { id, status, output, error, .. })
-                if id == "agent-1" && status == "success"
-                    && output.as_deref() == Some("done") && error.is_none()
-        ));
-
-        let compacting = EventEnvelope {
-            event_type: EventType::ContextCompactionStarted,
-            payload: serde_json::json!({}),
-            ..base.clone()
-        };
-        assert!(matches!(
-            runtime_event_to_tui(&compacting),
-            Some(TuiEvent::CompactionStarted)
-        ));
-
-        let compacted = EventEnvelope {
-            event_type: EventType::ContextCompacted,
-            payload: serde_json::json!({
-                "before_messages": 12,
-                "after_messages": 4,
-                "reason": "pressure",
-                "strategy": "summary",
-                "collapsed_messages": 8,
-                "status_text": "context compacted"
-            }),
-            ..base
-        };
-        assert!(matches!(
-            runtime_event_to_tui(&compacted),
-            Some(TuiEvent::Compacted {
-                before_messages: 12,
-                after_messages: 4,
-                reason,
-                strategy,
-                collapsed_messages: 8,
-                status_text,
-            }) if reason == "pressure" && strategy == "summary" && status_text == "context compacted"
-        ));
     }
 
     #[test]

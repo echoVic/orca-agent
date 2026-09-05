@@ -13,7 +13,6 @@ use orca_core::goal_types::ThreadGoal;
 #[cfg(test)]
 use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::ProposedPlanStreamParser;
-#[cfg(test)]
 use orca_core::task_types::BackgroundTaskSummary;
 use orca_file_search::{SearchPhase, SearchProgress};
 use orca_runtime::history::SessionSummary;
@@ -435,6 +434,10 @@ pub struct AppState {
     pub(crate) surface_goal: SurfaceGoalProjectionState,
     pub(crate) surface_operation: SurfaceOperationProjectionState,
     pub(crate) surface_workflow_tasks: SurfaceWorkflowTaskProjectionState,
+    /// Parent/root task snapshot retained while a child conversation is
+    /// visible. Child projections are merged into this list for the agent
+    /// dock instead of replacing sibling activity.
+    pub(crate) background_workflow_tasks: Vec<BackgroundTaskSummary>,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
@@ -666,6 +669,7 @@ impl AppState {
             surface_goal: SurfaceGoalProjectionState::default(),
             surface_operation: SurfaceOperationProjectionState::default(),
             surface_workflow_tasks: SurfaceWorkflowTaskProjectionState::default(),
+            background_workflow_tasks: Vec::new(),
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,
             panel_mode: PanelMode::Conversation,
@@ -1263,7 +1267,12 @@ impl AppState {
     }
 
     pub fn advance_tick(&mut self) {
-        if self.status == AppStatus::Running {
+        if self.status == AppStatus::Running
+            || self
+                .workflow_tasks()
+                .iter()
+                .any(|task| task.status.is_active())
+        {
             self.tick = self.tick.wrapping_add(1);
         }
     }

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use orca_core::cost_types::UsageTotals;
 use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::ProposedPlanStreamParser;
 
@@ -32,6 +33,21 @@ pub enum ChatMessage {
         output: Option<String>,
         diff: Option<String>,
         kind: Option<String>,
+        expanded: bool,
+    },
+    /// A live child execution projected from the parent runtime surface.
+    /// Activity history is intentionally display-only and bounded by the
+    /// runtime projection; the child transcript remains owned by its thread.
+    Subagent {
+        id: String,
+        description: String,
+        status: String,
+        output: Option<String>,
+        error: Option<String>,
+        activity: Option<String>,
+        activity_tail: Vec<String>,
+        turn: Option<u32>,
+        usage: Option<UsageTotals>,
         expanded: bool,
     },
     PlanUpdate {

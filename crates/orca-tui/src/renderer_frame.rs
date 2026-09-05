@@ -43,6 +43,10 @@ impl RendererFrameOwner {
         // Compute demand before clearing an expired notice so this iteration
         // still schedules the final redraw that removes it from the screen.
         let animation_active = state.status == AppStatus::Running
+            || state
+                .workflow_tasks()
+                .iter()
+                .any(|task| task.status.is_active())
             || state.viewport.copy_notice.is_some()
             || state.viewport.drag_edge_scroll.is_some()
             || state.edit_highlight_needs_tick()

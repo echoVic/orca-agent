@@ -710,10 +710,12 @@ where
         return Ok(KeyEventFlow::Continue);
     }
 
-    if matches!(
-        state.status,
-        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
-    ) && key.modifiers.contains(KeyModifiers::SHIFT)
+    if !composer_has_text
+        && matches!(
+            state.status,
+            AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+        )
+        && key.modifiers.contains(KeyModifiers::SHIFT)
         && matches!(key.code, KeyCode::Up | KeyCode::Down)
         && state.workflow_tasks().iter().any(|task| {
             task.task_type == orca_core::task_types::TaskType::Subagent
@@ -729,7 +731,10 @@ where
         return Ok(KeyEventFlow::Continue);
     }
 
-    if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+    if state.panel_mode == PanelMode::Conversation
+        && key.code == KeyCode::Enter
+        && key.modifiers.is_empty()
+    {
         let Some(task) = state.selected_agent_dock_task() else {
             return Ok(KeyEventFlow::Unhandled);
         };

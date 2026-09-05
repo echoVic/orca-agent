@@ -205,6 +205,20 @@ pub(crate) fn hosted_tui_controller_loop(
                 task_id,
                 expected_revision,
             }) => {
+                if child_focus.is_some() {
+                    handle_hosted_child_action(
+                        HostedChildAction::Return,
+                        &mut thread,
+                        &mut child_focus,
+                        side_parent.is_some(),
+                        &host,
+                        &root_event_tx,
+                        &mut event_tx,
+                        &mut session_attachment,
+                        &attachment_routing,
+                        &control,
+                    );
+                }
                 handle_hosted_child_action(
                     HostedChildAction::Focus {
                         task_id,

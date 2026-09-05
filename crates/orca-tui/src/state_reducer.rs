@@ -107,6 +107,23 @@ impl AppState {
                 self.task_transcript = None;
                 self.apply_surface_projection_state(*projection);
             }
+            TuiEvent::ChildProjectionReset {
+                task_id,
+                projection,
+            } => {
+                if !SurfaceSessionProjectionState::accepts_reset(&projection)
+                    || !SurfaceOperationProjectionState::accepts_reset(&projection)
+                {
+                    return;
+                }
+                let background_tasks = self.background_workflow_tasks.clone();
+                self.reset_session_projection();
+                self.background_workflow_tasks = background_tasks;
+                self.set_focused_child_task_id(Some(task_id));
+                self.task_transcript = None;
+                self.panel_mode = PanelMode::Conversation;
+                self.apply_surface_projection_state(*projection);
+            }
             TuiEvent::SavedSessionsUpdated {
                 sessions,
                 next_offset,
@@ -415,6 +432,9 @@ impl AppState {
                 if !self.suppress_background_main_session_output {
                     self.apply_workflow_tasks_update(tasks);
                 }
+            }
+            TuiEvent::BackgroundTasksUpdated(tasks) => {
+                self.apply_background_tasks_update(tasks);
             }
             TuiEvent::TaskStatusUpdated(task) => {
                 if self.suppress_background_main_session_output {
@@ -816,6 +836,13 @@ impl AppState {
     }
 
     pub(crate) fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
+        let mut projection = projection;
+        if self.focused_child_task_id.is_some() {
+            projection.workflow_tasks = merge_background_task_snapshots(
+                &self.background_workflow_tasks,
+                &projection.workflow_tasks,
+            );
+        }
         let mut surface_session = self.surface_session.clone();
         let session_apply = surface_session.apply_projection(&projection);
         let mut surface_operation = self.surface_operation.clone();
@@ -1159,6 +1186,21 @@ impl AppState {
             !remove
         });
     }
+}
+
+fn merge_background_task_snapshots(
+    background: &[orca_core::task_types::BackgroundTaskSummary],
+    focused: &[orca_core::task_types::BackgroundTaskSummary],
+) -> Vec<orca_core::task_types::BackgroundTaskSummary> {
+    let mut merged = background.to_vec();
+    for child_task in focused {
+        if let Some(existing) = merged.iter_mut().find(|task| task.id == child_task.id) {
+            *existing = child_task.clone();
+        } else {
+            merged.push(child_task.clone());
+        }
+    }
+    merged
 }
 
 fn surface_task_status_label(status: orca_core::task_types::TaskStatus) -> &'static str {

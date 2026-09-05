@@ -46,6 +46,10 @@ struct HostedOperationState {
 #[derive(Debug, Default)]
 struct HostedOperationInner {
     surface_active: Option<SurfaceActiveOperation>,
+    /// Interaction bindings for the live child currently shown in the
+    /// conversation. This is separate from the parent's active operation so
+    /// focusing a child never steals cancellation/background ownership.
+    focused_child_surface: Option<SurfaceActiveOperation>,
     surface_presentation_tasks: Vec<SurfacePresentationTask>,
     surface_activation_armed: bool,
     interrupt_requested: bool,
@@ -707,10 +711,27 @@ impl TuiSurfaceTaskControl {
         interaction: &orca_runtime::surface::SurfaceInteractionView,
     ) -> Option<TuiEvent> {
         let mut hosted = self.lock_hosted();
-        let active = hosted.surface_active.as_mut()?;
-        if active.operation_id != interaction.fence.operation_id {
+        let active = if hosted
+            .surface_active
+            .as_ref()
+            .is_some_and(|active| active.operation_id == interaction.fence.operation_id)
+        {
+            hosted
+                .surface_active
+                .as_mut()
+                .expect("active surface checked")
+        } else if hosted
+            .focused_child_surface
+            .as_ref()
+            .is_some_and(|active| active.operation_id == interaction.fence.operation_id)
+        {
+            hosted
+                .focused_child_surface
+                .as_mut()
+                .expect("focused child surface checked")
+        } else {
             return None;
-        }
+        };
         let request_id = format!("{:?}", interaction.interaction_id);
         let (kind, event, permissions) = match &interaction.request {
             orca_runtime::surface::SurfaceInteractionRequest::ToolApproval {
@@ -858,12 +879,23 @@ impl TuiSurfaceTaskControl {
         key: &TuiInteractionKey,
         response: &TuiInteractionResponse,
     ) -> io::Result<bool> {
-        let binding = {
+        let (binding, focused_child) = {
             let hosted = self.lock_hosted();
-            hosted
+            if let Some(binding) = hosted
                 .surface_active
                 .as_ref()
                 .and_then(|active| active.interactions.get(key).cloned())
+            {
+                (Some(binding), false)
+            } else {
+                (
+                    hosted
+                        .focused_child_surface
+                        .as_ref()
+                        .and_then(|active| active.interactions.get(key).cloned()),
+                    true,
+                )
+            }
         };
         let Some(binding) = binding else {
             return Ok(false);
@@ -947,8 +979,19 @@ impl TuiSurfaceTaskControl {
         ) {
             Ok(orca_runtime::surface::MutationReply::Committed { .. }) => {
                 let mut hosted = self.lock_hosted();
-                if let Some(active) = hosted.surface_active.as_mut() {
-                    active.interactions.remove(key);
+                let interactions = if focused_child {
+                    hosted
+                        .focused_child_surface
+                        .as_mut()
+                        .map(|surface| &mut surface.interactions)
+                } else {
+                    hosted
+                        .surface_active
+                        .as_mut()
+                        .map(|surface| &mut surface.interactions)
+                };
+                if let Some(interactions) = interactions {
+                    interactions.remove(key);
                 }
                 Ok(true)
             }
@@ -976,6 +1019,48 @@ impl TuiSurfaceTaskControl {
     #[cfg(test)]
     pub(crate) fn has_surface_active(&self) -> bool {
         self.lock_hosted().surface_active.is_some()
+    }
+
+    pub(crate) fn install_focused_child_surface(
+        &self,
+        client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+    ) -> io::Result<()> {
+        let mut hosted = self.lock_hosted();
+        if hosted.shutdown {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "TUI operation controller is shutting down",
+            ));
+        }
+        hosted.focused_child_surface = Some(SurfaceActiveOperation {
+            client,
+            operation_id,
+            goal_fence: None,
+            ui_operation_id: self.surface_ids.allocate(),
+            interactions: HashMap::new(),
+            background_requested: false,
+            background_handoff_pending: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn clear_focused_child_surface(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) {
+        let mut hosted = self.lock_hosted();
+        if hosted
+            .focused_child_surface
+            .as_ref()
+            .is_some_and(|surface| &surface.operation_id == operation_id)
+        {
+            hosted.focused_child_surface = None;
+        }
+    }
+
+    pub(crate) fn clear_any_focused_child_surface(&self) {
+        self.lock_hosted().focused_child_surface = None;
     }
 
     fn lock_hosted(&self) -> MutexGuard<'_, HostedOperationInner> {

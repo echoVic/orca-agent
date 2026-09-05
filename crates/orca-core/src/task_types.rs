@@ -198,6 +198,14 @@ pub struct BackgroundTaskSummary {
     pub subagent_current_activity: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagent_activity_history: Vec<SubagentActivityEntry>,
+    /// Hosted runtime thread that owns the child's interactive transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_child_thread_id: Option<String>,
+    /// Stable fan-out identity used to render one launch announcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_batch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_batch_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_turn: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.9":
+        "Keeps delegated agent activity visible in Conversation with expanded activity history, per-agent spinners, action-first progress labels, parent activity while a child is focused, and direct switching between live child conversations with routed approvals and input.",
       "v0.4.8":
         "Turns child-agent observability into an interactive TUI workspace: a bounded conversation activity dock, unified task and workflow navigation, live transcript inspection, revision-fenced child controls, durable activity history, workflow previews, and cancellation that absorbs late child events without terminal spam.",
       "v0.4.7":
@@ -632,6 +634,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.9":
+        "让委派 agent 的活动直接显示在 Conversation：运行中的子 agent 自动展开活动历史，列表项显示独立 spinner，进度条优先展示当前工具；聚焦子会话时仍保留父会话的其他 agent 活动，并支持在多个 live child conversation 之间切换，同时正确路由审批和输入。",
       "v0.4.8":
         "把子代理可观测性变成可操作的 TUI 工作区：Conversation 提供有界实时活动摘要，/tasks 统一普通子代理、后台任务和 Workflow，支持实时 transcript、带 revision fence 的 child 控制、持久化活动历史、Workflow preview，并在取消时吸收迟到事件，避免终端刷屏。",
       "v0.4.7":

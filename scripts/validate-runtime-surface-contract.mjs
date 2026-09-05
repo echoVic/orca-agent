@@ -1156,6 +1156,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:input_history.record", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:settings.update", 1],
+  ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:user_action.route", 3],
   ["crates/orca-tui/src/plan_approval_actions.rs:implement:user_action.route", 1],
   ["crates/orca-tui/src/queued_input.rs:request_runtime_queue_pause:user_action.route", 1],
   ["crates/orca-tui/src/queued_input.rs:request_runtime_queue_start:user_action.route", 1],
@@ -1192,6 +1193,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
 const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
+  ["crates/orca-tui/src/hosted_child.rs:return_to_parent:child_focus.event_bridge.stop", 1],
   ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],
   ["crates/orca-tui/src/renderer_loop.rs:run:frame.resume", 1],
@@ -1350,6 +1352,9 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/types.rs:reset_session_projection:self.session_picker_sessions.clear", 1],
   ["crates/orca-tui/src/state_reducer.rs:update:self.atomic_skill_tokens.clear", 1],
   ["crates/orca-tui/src/state_reducer.rs:update:self.mention_bindings.clear", 1],
+  ["crates/orca-tui/src/state_reducer.rs:update:self.announced_subagent_batches.clear", 1],
+  ["crates/orca-tui/src/state_reducer.rs:sync_subagent_transcript_messages:self.announced_subagent_batches.insert", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.announced_subagent_batches.clear", 1],
   ["crates/orca-tui/src/ui.rs:append_code_block:source_line.insert", 1],
   ["crates/orca-tui/src/ui.rs:append_proposed_plan_lines:line.spans.insert", 1],
   ["crates/orca-tui/src/ui.rs:render_markdown:opts.insert", 1],
@@ -1827,11 +1832,11 @@ function invariantRegistry() {
       },
     ],
     [
-      "closed_inventory.current_tui_user_actions has exactly 43 unique variants matching UserAction at baseline",
-      (manifest) => {
+      "closed_inventory.current_tui_user_actions has exactly 45 unique variants matching UserAction at baseline",
+        (manifest) => {
         assertCondition(
-          manifest.closed_inventory.current_tui_user_actions.length === 43,
-          "current_tui_user_actions must contain 43 variants",
+          manifest.closed_inventory.current_tui_user_actions.length === 45,
+          "current_tui_user_actions must contain 45 variants",
         );
         assertUnique(
           manifest.closed_inventory.current_tui_user_actions,

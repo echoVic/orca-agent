@@ -40,21 +40,31 @@ pub(crate) fn handle_agent_workspace_key(
             true
         }
         KeyCode::Enter => {
-            let request = match state.selected_agent_row() {
+            let action = match state.selected_agent_row() {
                 Some(AgentWorkspaceRow::Subagent { task, .. }) => {
-                    task.publication_revision
-                        .map(|expected_revision| TaskTranscriptRequest {
-                            task_id: task.id.clone(),
-                            expected_revision,
-                        })
+                    task.publication_revision.map(|expected_revision| {
+                        if task.subagent_child_thread_id.is_some() {
+                            UserAction::FocusChildThread {
+                                task_id: task.id.clone(),
+                                expected_revision,
+                            }
+                        } else {
+                            UserAction::ReadTaskTranscript(TaskTranscriptRequest {
+                                task_id: task.id.clone(),
+                                expected_revision,
+                            })
+                        }
+                    })
                 }
                 Some(AgentWorkspaceRow::BackgroundTask { .. })
                 | Some(AgentWorkspaceRow::WorkflowAgent { .. })
                 | None => None,
             };
-            if let Some(request) = request {
-                state.begin_task_transcript_request(request.clone());
-                let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
+            if let Some(action) = action {
+                if let UserAction::ReadTaskTranscript(request) = &action {
+                    state.begin_task_transcript_request(request.clone());
+                }
+                let _ = action_tx.send(action);
             }
             true
         }
@@ -160,6 +170,9 @@ mod tests {
             usage: None,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
+            subagent_child_thread_id: None,
+            subagent_batch_id: None,
+            subagent_batch_size: None,
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation: None,
@@ -210,6 +223,30 @@ mod tests {
                 expected_revision: 7,
             })) if task_id == "second"
         ));
+    }
+
+    #[test]
+    fn enter_focuses_a_live_child_instead_of_opening_a_static_transcript() {
+        let (mut state, rx) = state(vec![{
+            let mut task = task("child", 1_000);
+            task.subagent_child_thread_id = Some("thread-child".to_string());
+            task
+        }]);
+
+        let action_tx = state.event_tx.clone();
+        assert!(handle_agent_workspace_key(
+            KeyCode::Enter,
+            &mut state,
+            &action_tx,
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::FocusChildThread {
+                task_id,
+                expected_revision: 7,
+            }) if task_id == "child"
+        ));
+        assert!(state.task_transcript().is_none());
     }
 
     #[test]

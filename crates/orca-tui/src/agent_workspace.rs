@@ -154,6 +154,21 @@ impl AgentWorkspaceState {
         self.remember_selected_identity(tasks);
     }
 
+    pub(crate) fn select_task(&mut self, tasks: &[BackgroundTaskSummary], task_id: &str) -> bool {
+        let rows = agent_workspace_rows(tasks);
+        let Some(index) = rows.iter().position(|row| {
+            matches!(
+                row.identity(),
+                AgentWorkspaceIdentity::Task(ref id) if id == task_id
+            )
+        }) else {
+            return false;
+        };
+        self.selected = index;
+        self.selected_identity = Some(rows[index].identity());
+        true
+    }
+
     pub(crate) fn reconcile(&mut self, tasks: &[BackgroundTaskSummary]) {
         let rows = agent_workspace_rows(tasks);
         if rows.is_empty() {
@@ -221,6 +236,9 @@ mod tests {
             usage: None,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
+            subagent_child_thread_id: None,
+            subagent_batch_id: None,
+            subagent_batch_size: None,
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation: None,

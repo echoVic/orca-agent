@@ -328,6 +328,62 @@ impl AppState {
             .selected_row(self.workflow_panel.tasks())
     }
 
+    pub(crate) fn select_next_agent_dock_task(&mut self) {
+        let visible = self
+            .workflow_panel
+            .tasks()
+            .iter()
+            .filter(|task| {
+                task.task_type == TaskType::Subagent
+                    && (task.status.is_active() || task.status.requires_attention())
+            })
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let next = match self.agent_dock_selected_task_id.as_deref() {
+            None => visible.first().cloned(),
+            Some(selected) => visible
+                .iter()
+                .position(|task_id| task_id == selected)
+                .and_then(|index| visible.get(index.saturating_add(1)))
+                .cloned()
+                .or_else(|| visible.last().cloned()),
+        };
+        self.agent_dock_selected_task_id = next;
+    }
+
+    pub(crate) fn select_previous_agent_dock_task(&mut self) {
+        let visible = self
+            .workflow_panel
+            .tasks()
+            .iter()
+            .filter(|task| {
+                task.task_type == TaskType::Subagent
+                    && (task.status.is_active() || task.status.requires_attention())
+            })
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        self.agent_dock_selected_task_id = self
+            .agent_dock_selected_task_id
+            .as_deref()
+            .and_then(|selected| visible.iter().position(|task_id| task_id == selected))
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| visible.get(index).cloned());
+    }
+
+    pub(crate) fn selected_agent_dock_task(&self) -> Option<&BackgroundTaskSummary> {
+        let selected = self.agent_dock_selected_task_id.as_deref()?;
+        self.workflow_panel.tasks().iter().find(|task| {
+            task.id == selected
+                && task.task_type == TaskType::Subagent
+                && (task.status.is_active() || task.status.requires_attention())
+        })
+    }
+
+    pub(crate) fn select_agent_workspace_task(&mut self, task_id: &str) -> bool {
+        self.agent_workspace
+            .select_task(self.workflow_panel.tasks(), task_id)
+    }
+
     pub fn select_previous_workflow_task(&mut self) {
         self.workflow_panel.select_previous();
     }
@@ -408,6 +464,7 @@ impl AppState {
     }
 
     pub(crate) fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
+        self.background_workflow_tasks = tasks.clone();
         let was_suppressing_background_output = self.suppress_background_main_session_output;
         let has_backgrounded_running_main_session =
             tasks.iter().any(is_backgrounded_running_main_session);
@@ -431,6 +488,7 @@ impl AppState {
         let selected_task_id = self.selected_workflow_task().map(|task| task.id.clone());
         self.workflow_panel.replace_tasks(tasks);
         self.agent_workspace.reconcile(self.workflow_panel.tasks());
+        self.sync_subagent_transcript_messages();
         self.refresh_open_task_transcript();
         if should_reveal_background_approval {
             self.panel_mode = PanelMode::Workflows;
@@ -462,6 +520,14 @@ impl AppState {
                 self.panel_mode = PanelMode::Conversation;
             }
         }
+    }
+
+    /// Refresh only the agent/task workspace from an inactive attachment.
+    /// The focused child transcript remains the visible conversation.
+    pub(crate) fn apply_background_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
+        self.background_workflow_tasks = tasks.clone();
+        self.workflow_panel.replace_tasks(tasks);
+        self.agent_workspace.reconcile(self.workflow_panel.tasks());
     }
 
     #[cfg(test)]
@@ -605,6 +671,9 @@ mod tests {
             usage: None,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
+            subagent_child_thread_id: None,
+            subagent_batch_id: None,
+            subagent_batch_size: None,
             subagent_turn: None,
             last_activity_at_ms: Some(activity_at_ms),
             continuation: None,

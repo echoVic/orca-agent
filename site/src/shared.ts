@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.8";
+export const releaseVersion = "v0.4.9";
 
 export const releases = [
+  {
+    version: "v0.4.9",
+    date: "2026-09-05",
+    title: "Live child conversations in the TUI",
+    body: "Keeps delegated agent activity visible in Conversation with expanded activity history, per-agent spinners, action-first progress labels, parent activity while a child is focused, and direct switching between live child conversations with routed approvals and input.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.9",
+  },
   {
     version: "v0.4.8",
     date: "2026-09-01",

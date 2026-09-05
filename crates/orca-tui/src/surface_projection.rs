@@ -1590,6 +1590,14 @@ pub(crate) fn workflow_task_summaries(
                 subagent_activity_history: subagent
                     .map(|subagent| subagent.subagent_activity_history.clone())
                     .unwrap_or_default(),
+                subagent_child_thread_id: subagent.and_then(|subagent| {
+                    subagent
+                        .child_thread_id
+                        .as_ref()
+                        .map(|thread_id| uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string())
+                }),
+                subagent_batch_id: subagent.map(|subagent| subagent.batch_id.as_str().to_string()),
+                subagent_batch_size: subagent.map(|subagent| subagent.batch_size),
                 subagent_turn: subagent.and_then(|subagent| subagent.turn),
                 last_activity_at_ms: subagent
                     .map(|subagent| subagent.source.occurred_at.get())
@@ -2525,6 +2533,9 @@ mod tests {
             task_id,
             revision: orca_runtime::surface::SubagentRevision::try_new(2).unwrap(),
             description: DisplayText::new("live child"),
+            child_thread_id: None,
+            batch_id: NonEmptyText::try_new("batch-live").unwrap(),
+            batch_size: 1,
             status: SurfaceSubagentStatus::Running,
             activity: Some(DisplayText::new("bash: cargo test")),
             subagent_activity_history: Vec::new(),

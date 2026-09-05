@@ -9,6 +9,7 @@ use crate::types::{AppState, SideParentStatus};
 #[derive(Default)]
 pub(crate) struct AttachmentRouting {
     active: Option<SessionAttachmentId>,
+    next_attachment: u64,
     parent_while_side: Option<SessionAttachmentId>,
     pending_parent_interactions: Vec<(SessionAttachmentId, TuiEvent)>,
     deferred_parent_attachment: Option<SessionAttachmentId>,
@@ -19,11 +20,34 @@ impl AttachmentRouting {
     pub(crate) fn new(active: SessionAttachmentId) -> Self {
         Self {
             active: Some(active),
+            next_attachment: active.value().checked_add(1).unwrap_or(1),
             parent_while_side: None,
             pending_parent_interactions: Vec::new(),
             deferred_parent_attachment: None,
             deferred_parent_events: Vec::new(),
         }
+    }
+
+    /// Allocate an attachment identity that has not been used by this TUI
+    /// controller lifetime. Re-entering a child must not reuse its old id:
+    /// late events from the retired sender would otherwise look current.
+    pub(crate) fn allocate_next(routing: &Arc<Mutex<Self>>) -> SessionAttachmentId {
+        let Ok(mut routing) = routing.lock() else {
+            return SessionAttachmentId::new(1);
+        };
+        if routing.next_attachment == 0 {
+            routing.next_attachment = 1;
+        }
+        let attachment = SessionAttachmentId::new(routing.next_attachment);
+        routing.observe_attachment(attachment);
+        attachment
+    }
+
+    fn observe_attachment(&mut self, attachment: SessionAttachmentId) {
+        self.next_attachment = attachment
+            .value()
+            .checked_add(1)
+            .map_or(self.next_attachment, |next| self.next_attachment.max(next));
     }
 
     pub(crate) fn switch_attachment(
@@ -51,6 +75,10 @@ impl AttachmentRouting {
                     break;
                 }
             }
+        }
+        routing.observe_attachment(attachment);
+        if let Some(parent_while_side) = parent_while_side {
+            routing.observe_attachment(parent_while_side);
         }
         routing.active = Some(attachment);
         routing.parent_while_side = parent_while_side;
@@ -87,6 +115,10 @@ impl AttachmentRouting {
         {
             return;
         }
+        routing.observe_attachment(attachment);
+        if let Some(parent_while_side) = parent_while_side {
+            routing.observe_attachment(parent_while_side);
+        }
         routing.active = Some(attachment);
         routing.parent_while_side = parent_while_side;
         routing.deferred_parent_attachment = Some(attachment);
@@ -117,6 +149,32 @@ impl AttachmentRouting {
             }
         }
     }
+
+    /// Abort a deferred projection and retain only parent interactions that
+    /// must be replayed when the parent is visible again. Ordinary parent
+    /// events are reconstructed from the next surface snapshot instead.
+    pub(crate) fn cancel_deferred_parent_events(
+        routing: &Arc<Mutex<Self>>,
+        root_event_tx: &mpsc::Sender<TuiEvent>,
+    ) {
+        let Ok(mut routing) = routing.lock() else {
+            return;
+        };
+        routing.deferred_parent_attachment = None;
+        for event in std::mem::take(&mut routing.deferred_parent_events) {
+            if is_tui_interaction_event(&event) {
+                let source = routing
+                    .parent_while_side
+                    .unwrap_or_else(|| routing.active.unwrap_or(SessionAttachmentId::new(1)));
+                routing
+                    .pending_parent_interactions
+                    .push((source, event.clone()));
+            }
+            if let Some(status) = side_parent_status_for_event(&event) {
+                let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
+            }
+        }
+    }
 }
 
 fn is_tui_interaction_event(event: &TuiEvent) -> bool {
@@ -127,6 +185,16 @@ fn is_tui_interaction_event(event: &TuiEvent) -> bool {
             | TuiEvent::UserInputRequested { .. }
             | TuiEvent::McpElicitationRequested { .. }
     )
+}
+
+fn background_tasks_from_event(
+    event: &TuiEvent,
+) -> Option<Vec<orca_core::task_types::BackgroundTaskSummary>> {
+    match event {
+        TuiEvent::SurfaceProjectionSynced(projection) => Some(projection.workflow_tasks.clone()),
+        TuiEvent::WorkflowTasksUpdated(tasks) => Some(tasks.clone()),
+        _ => None,
+    }
 }
 
 pub(crate) fn accept_attached_tui_event(
@@ -177,7 +245,10 @@ pub(crate) fn rotate_attached_event_sender(
     event_tx: &mut mpsc::Sender<TuiEvent>,
     routing: Option<&Arc<Mutex<AttachmentRouting>>>,
 ) {
-    *attachment = attachment.next();
+    *attachment = match routing {
+        Some(routing) => AttachmentRouting::allocate_next(routing),
+        None => attachment.next(),
+    };
     *event_tx = match routing {
         Some(routing) => {
             let event_tx = spawn_attached_event_sender_with_routing(
@@ -214,6 +285,9 @@ pub(crate) fn spawn_attached_event_sender_with_routing(
                     } else if routing.parent_while_side == Some(attachment)
                         && routing.active != Some(attachment)
                     {
+                        if let Some(tasks) = background_tasks_from_event(&event) {
+                            let _ = root_event_tx.send(TuiEvent::BackgroundTasksUpdated(tasks));
+                        }
                         if is_tui_interaction_event(&event) {
                             routing
                                 .pending_parent_interactions
@@ -483,5 +557,18 @@ mod tests {
             receive(&root_rx),
             TuiEvent::SideParentStatusChanged(SideParentStatus::NeedsApproval)
         ));
+    }
+
+    #[test]
+    fn attachment_allocator_keeps_child_ids_monotonic_across_focus_cycles() {
+        let parent = SessionAttachmentId::new(1);
+        let routing = Arc::new(Mutex::new(AttachmentRouting::new(parent)));
+
+        let first_child = AttachmentRouting::allocate_next(&routing);
+        let second_child = AttachmentRouting::allocate_next(&routing);
+
+        assert_eq!(first_child.value(), 2);
+        assert_eq!(second_child.value(), 3);
+        assert_ne!(first_child, second_child);
     }
 }

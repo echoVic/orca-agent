@@ -13,7 +13,7 @@ use crate::hosted_runtime::{
     emit_hosted_operation_error, hosted_turn_request, run_hosted_ordinary_turn,
     send_submission_error_with_images,
 };
-use crate::hosted_session::{announce_runtime_ready, start_agent_registry_watcher};
+use crate::hosted_session::announce_runtime_ready;
 use crate::hosted_session_lifecycle::ensure_hosted_thread;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::protocol::TuiEvent;
@@ -79,11 +79,6 @@ pub(crate) fn handle_hosted_queued_prompt(
         announce_runtime_ready(runtime_thread, event_tx, control);
     }
     let runtime_thread = thread.as_ref().expect("queued prompt thread initialized");
-    start_agent_registry_watcher(
-        host.clone(),
-        runtime_thread.thread_id().to_string(),
-        event_tx.clone(),
-    );
     let roots = cfg
         .runtime_workspace_roots
         .clone()
@@ -163,11 +158,6 @@ pub(crate) fn handle_hosted_submitted_turn(
         announce_runtime_ready(runtime_thread, event_tx, control);
     }
     let runtime_thread = thread.as_ref().expect("hosted thread initialized");
-    start_agent_registry_watcher(
-        host.clone(),
-        runtime_thread.thread_id().to_string(),
-        event_tx.clone(),
-    );
     let workspace_roots = cfg
         .runtime_workspace_roots
         .clone()

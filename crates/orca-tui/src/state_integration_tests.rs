@@ -405,6 +405,9 @@ fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
         usage: None,
         subagent_current_activity: None,
         subagent_activity_history: Vec::new(),
+        subagent_child_thread_id: None,
+        subagent_batch_id: None,
+        subagent_batch_size: None,
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,
@@ -433,7 +436,7 @@ fn workflow_notification_action_carries_notification_boundary() {
 }
 
 #[test]
-fn task_snapshot_keeps_running_subagent_out_of_main_conversation() {
+fn task_snapshot_projects_running_subagent_into_main_conversation() {
     let mut state = state();
     let mut task = workflow_task_summary("agent-1", "backend analysis");
     task.task_type = TaskType::Subagent;
@@ -447,46 +450,64 @@ fn task_snapshot_keeps_running_subagent_out_of_main_conversation() {
 
     state.apply_workflow_tasks_for_test(vec![task]);
 
-    assert!(state.transcript.messages.is_empty());
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::Subagent { id, status, .. })
+            if id == "agent-1" && status == "running"
+    ));
 }
 
 #[test]
-fn agent_registry_announces_each_batch_once_without_inline_child_messages() {
+fn surface_projection_announces_group_once_and_projects_inline_child_messages() {
     let mut state = state();
-    let agent = orca_core::agent_event::AgentSummary {
-        root_thread_id: "root".to_string(),
-        batch_id: "batch-1".to_string(),
-        batch_size: 4,
-        agent_id: "agent-1".to_string(),
-        thread_id: "thread-1".to_string(),
-        parent_thread_id: "root".to_string(),
-        description: "backend analysis".to_string(),
-        status: orca_core::agent_event::AgentStatus::Running,
-        activity: Some(orca_core::agent_event::AgentActivity::Thinking),
-        turn: Some(1),
-        usage: Default::default(),
-        result: None,
-        error: None,
-        created_at_ms: 1,
-        updated_at_ms: 1,
-    };
-    let event = TuiEvent::AgentRegistryUpdated {
-        root_thread_id: "root".to_string(),
-        snapshot: orca_core::agent_event::AgentRegistrySnapshot {
-            revision: 1,
-            agents: vec![agent],
-        },
+    let tasks = (1..=4)
+        .map(|index| {
+            let mut task =
+                workflow_task_summary(&format!("agent-{index}"), &format!("analysis {index}"));
+            task.task_type = TaskType::Subagent;
+            task.status = TaskStatus::Running;
+            task.subagent_batch_id = Some("batch-1".to_string());
+            task.subagent_batch_size = Some(4);
+            task
+        })
+        .collect::<Vec<_>>();
+    let projection = SurfaceProjectionState {
+        cursor: crate::surface_projection::test_surface_cursor(1),
+        session_id: Some("root".to_string()),
+        title: "Root".to_string(),
+        usage_revision: 1,
+        usage: UsageTotals::default(),
+        context_revision: 1,
+        context_used_tokens: 0,
+        context_limit_tokens: 128_000,
+        workflow_tasks: tasks,
+        current_goal: None,
+        foreground_operation_id: None,
+        recoverable_operation_id: None,
+        goal_presentation: None,
+        session_presentation: None,
     };
 
-    state.update(event.clone());
-    state.update(event);
+    state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+        projection.clone(),
+    )));
+    state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
 
-    assert_eq!(state.transcript.messages.len(), 1);
+    assert_eq!(state.transcript.messages.len(), 5);
     assert!(matches!(
         &state.transcript.messages[0],
         ChatMessage::System(text) if text == "Delegating to 4 agents in parallel"
     ));
-    assert_eq!(state.agent_ui.agents().len(), 1);
+    assert_eq!(
+        state
+            .transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, ChatMessage::Subagent { .. }))
+            .count(),
+        4
+    );
+    assert_eq!(state.workflow_tasks().len(), 4);
 }
 
 #[test]
@@ -664,184 +685,109 @@ fn approval_needed_event_populates_dialog_options_and_diff() {
     assert_eq!(dialog.current(), ApprovalOption::Once);
 }
 
-#[cfg(any())]
 #[test]
-fn subagent_events_update_existing_message() {
+fn surface_subagent_projection_materializes_and_updates_parent_transcript() {
     let mut state = state();
+    let mut task = workflow_task_summary("agent-1", "inspect repo");
+    task.task_type = orca_core::task_types::TaskType::Subagent;
+    task.status = orca_core::task_types::TaskStatus::Running;
+    task.subagent_current_activity = Some("bash: cargo test".to_string());
+    task.subagent_activity_history = vec![
+        orca_core::task_types::SubagentActivityEntry {
+            occurred_at_ms: 1,
+            activity: "read: Cargo.toml".to_string(),
+            turn: Some(1),
+        },
+        orca_core::task_types::SubagentActivityEntry {
+            occurred_at_ms: 2,
+            activity: "bash: cargo test".to_string(),
+            turn: Some(1),
+        },
+    ];
+    state.apply_workflow_tasks_update(vec![task.clone()]);
 
-    state.update(TuiEvent::SubagentStarted {
-        id: "agent-1".to_string(),
-        description: "inspect repo".to_string(),
-    });
-    state.update(TuiEvent::SubagentCompleted {
-        id: "agent-1".to_string(),
-        description: "inspect repo".to_string(),
-        status: "completed".to_string(),
-        output: Some("done".to_string()),
-        error: None,
-    });
+    let ChatMessage::Subagent {
+        id,
+        status,
+        activity_tail,
+        expanded,
+        ..
+    } = state.transcript.messages.last().expect("subagent message")
+    else {
+        panic!("expected subagent message");
+    };
+    assert_eq!(id, "agent-1");
+    assert_eq!(status, "running");
+    assert_eq!(activity_tail, &vec!["read: Cargo.toml", "bash: cargo test"]);
+    assert!(*expanded, "running subagents must auto-expand");
 
-    assert_eq!(state.transcript.messages.len(), 2);
-    match &state.transcript.messages[1] {
-        ChatMessage::Subagent {
-            id,
-            description,
-            status,
-            output,
-            error,
-            ..
-        } => {
-            assert_eq!(id, "agent-1");
-            assert_eq!(description, "inspect repo");
-            assert_eq!(status, "completed");
-            assert_eq!(output.as_deref(), Some("done"));
-            assert!(error.is_none());
-        }
-        other => panic!("expected subagent message, got {other:?}"),
-    }
-}
-
-#[cfg(any())]
-#[test]
-fn subagent_progress_updates_existing_message_without_adding_rows() {
-    let mut state = state();
-
-    state.update(TuiEvent::SubagentStarted {
-        id: "agent-1".to_string(),
-        description: "inspect repo".to_string(),
-    });
-    state.update(TuiEvent::SubagentProgress {
-        id: "agent-1".to_string(),
-        activity: "bash: echo child".to_string(),
-        turn: Some(1),
-        usage: None,
-    });
-
-    assert_eq!(state.transcript.messages.len(), 2);
-    match &state.transcript.messages[1] {
-        ChatMessage::Subagent {
-            id,
-            status,
-            activity,
-            activity_tail,
-            turn,
-            ..
-        } => {
-            assert_eq!(id, "agent-1");
-            assert_eq!(status, "running");
-            assert_eq!(activity.as_deref(), Some("bash: echo child"));
-            assert_eq!(activity_tail, &vec!["bash: echo child".to_string()]);
-            assert_eq!(*turn, Some(1));
-        }
-        other => panic!("expected subagent message, got {other:?}"),
-    }
-}
-
-#[cfg(any())]
-#[test]
-fn subagent_progress_retains_recent_activity_tail() {
-    let mut state = state();
-
-    state.update(TuiEvent::SubagentStarted {
-        id: "agent-1".to_string(),
-        description: "inspect repo".to_string(),
-    });
-    for index in 1..=8 {
-        state.update(TuiEvent::SubagentProgress {
-            id: "agent-1".to_string(),
-            activity: format!("activity {index}"),
-            turn: Some(index),
-            usage: None,
-        });
-    }
-
-    match &state.transcript.messages[1] {
-        ChatMessage::Subagent {
-            activity_tail,
-            turn,
-            ..
-        } => {
-            assert_eq!(*turn, Some(8));
-            assert_eq!(activity_tail.len(), 8);
-            assert_eq!(
-                activity_tail.first().map(String::as_str),
-                Some("activity 1")
-            );
-            assert_eq!(activity_tail.last().map(String::as_str), Some("activity 8"));
-        }
-        other => panic!("expected subagent message, got {other:?}"),
-    }
-}
-
-#[cfg(any())]
-#[test]
-fn expand_toggle_flips_latest_live_subagent() {
-    let mut state = state();
-
-    state.update(TuiEvent::SubagentStarted {
-        id: "agent-1".to_string(),
-        description: "inspect repo".to_string(),
-    });
-
-    assert!(state.toggle_latest_tool_output());
-    match &state.transcript.messages[1] {
-        ChatMessage::Subagent { expanded, .. } => assert!(!*expanded),
-        other => panic!("expected subagent message, got {other:?}"),
-    }
-}
-
-#[cfg(any())]
-#[test]
-fn completed_subagent_without_start_adds_message() {
-    let mut state = state();
-
-    state.update(TuiEvent::SubagentCompleted {
-        id: "agent-2".to_string(),
-        description: "review code".to_string(),
-        status: "failed".to_string(),
-        output: None,
-        error: Some("boom".to_string()),
-    });
-
-    assert_eq!(state.transcript.messages.len(), 1);
-    match &state.transcript.messages[0] {
-        ChatMessage::Subagent {
-            id,
-            description,
-            status,
-            output,
-            error,
-            ..
-        } => {
-            assert_eq!(id, "agent-2");
-            assert_eq!(description, "review code");
-            assert_eq!(status, "failed");
-            assert!(output.is_none());
-            assert_eq!(error.as_deref(), Some("boom"));
-        }
-        other => panic!("expected subagent message, got {other:?}"),
-    }
-}
-
-#[cfg(any())]
-#[test]
-fn parallel_subagent_starts_update_grouped_launch_announcement() {
-    let mut state = state();
-
-    state.update(TuiEvent::SubagentStarted {
-        id: "agent-1".to_string(),
-        description: "inspect repo".to_string(),
-    });
-    state.update(TuiEvent::SubagentStarted {
-        id: "agent-2".to_string(),
-        description: "review tests".to_string(),
-    });
-
-    assert_eq!(state.transcript.messages.len(), 3);
+    let mut completed = task;
+    completed.status = orca_core::task_types::TaskStatus::Completed;
+    completed.subagent_current_activity = None;
+    completed.result = Some("done".to_string());
+    state.apply_workflow_tasks_update(vec![completed]);
+    assert_eq!(
+        state
+            .transcript
+            .messages
+            .iter()
+            .filter(
+                |message| matches!(message, ChatMessage::Subagent { id, .. } if id == "agent-1")
+            )
+            .count(),
+        1
+    );
     assert!(matches!(
-        &state.transcript.messages[0],
-        ChatMessage::System(text) if text == "Delegating to 2 agents in parallel"
+        state.transcript.messages.last(),
+        Some(ChatMessage::Subagent { status, output, .. })
+            if status == "completed" && output.as_deref() == Some("done")
     ));
+}
+
+#[test]
+fn child_projection_reset_preserves_parent_agent_dock() {
+    let mut state = state();
+    let parent = workflow_task_summary("parent-agent", "parent work");
+    let mut child = workflow_task_summary("child-agent", "child work");
+    child.task_type = orca_core::task_types::TaskType::Subagent;
+    child.status = orca_core::task_types::TaskStatus::Running;
+    state.update(TuiEvent::BackgroundTasksUpdated(vec![parent.clone()]));
+
+    let mut projection = SurfaceProjectionState {
+        cursor: crate::surface_projection::test_surface_cursor(2),
+        session_id: Some("child-session".to_string()),
+        title: "Child session".to_string(),
+        usage_revision: 1,
+        usage: UsageTotals::default(),
+        context_revision: 1,
+        context_used_tokens: 0,
+        context_limit_tokens: 128_000,
+        workflow_tasks: vec![child.clone()],
+        current_goal: None,
+        foreground_operation_id: None,
+        recoverable_operation_id: None,
+        goal_presentation: None,
+        session_presentation: None,
+    };
+    projection.cursor = crate::surface_projection::test_surface_cursor(2);
+    state.update(TuiEvent::ChildProjectionReset {
+        task_id: child.id.clone(),
+        projection: Box::new(projection),
+    });
+
+    assert_eq!(state.focused_child_task_id(), Some(child.id.as_str()));
+    assert!(
+        state
+            .workflow_tasks()
+            .iter()
+            .any(|task| task.id == parent.id)
+    );
+    assert!(
+        state
+            .workflow_tasks()
+            .iter()
+            .any(|task| task.id == child.id)
+    );
 }
 
 #[test]
@@ -2439,6 +2385,9 @@ fn show_workflows_preserves_available_selection() {
             usage: None,
             subagent_current_activity: None,
             subagent_activity_history: Vec::new(),
+            subagent_child_thread_id: None,
+            subagent_batch_id: None,
+            subagent_batch_size: None,
             subagent_turn: None,
             last_activity_at_ms: None,
             continuation: None,
@@ -2663,6 +2612,9 @@ fn workflow_events_update_panel_and_queue_model_notification() {
         usage: None,
         subagent_current_activity: None,
         subagent_activity_history: Vec::new(),
+        subagent_child_thread_id: None,
+        subagent_batch_id: None,
+        subagent_batch_size: None,
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,
@@ -2972,6 +2924,9 @@ fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
         usage: None,
         subagent_current_activity: None,
         subagent_activity_history: Vec::new(),
+        subagent_child_thread_id: None,
+        subagent_batch_id: None,
+        subagent_batch_size: None,
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,
@@ -3092,6 +3047,9 @@ fn backgrounded_main_session_completion_adds_system_notice() {
         usage: None,
         subagent_current_activity: None,
         subagent_activity_history: Vec::new(),
+        subagent_child_thread_id: None,
+        subagent_batch_id: None,
+        subagent_batch_size: None,
         subagent_turn: None,
         last_activity_at_ms: None,
         continuation: None,
