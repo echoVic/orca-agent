@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.13":
+        "Finalizes live child conversation delivery by routing fenced TUI async agents through durable task ownership while preserving legacy hosted agents, root session identity, and isolated release validation.",
       "v0.4.12":
         "Ships live child conversation fixes with a binary-serial workspace gate, preserving isolated runtime and TUI contract tests during publication.",
       "v0.4.11":
@@ -640,6 +642,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.13":
+        "完成 live child conversation 发布：带 parent fence 的 TUI async agent 使用 durable task ownership，同时保留 legacy hosted agent、root session identity 与隔离的发布验证。",
       "v0.4.12":
         "发布 live child conversation 修复，并让 workspace gate 按 binary 串行运行，保证发布期间 runtime 与 TUI 合约测试彼此隔离。",
       "v0.4.11":

@@ -643,7 +643,11 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         ));
     }
 
-    if request.mode == SubagentMode::Async && agent_controller.is_none() {
+    let has_parent_fence = activity_ingress
+        .as_ref()
+        .and_then(|ingress| ingress.parent_fence())
+        .is_some();
+    if request.mode == SubagentMode::Async && (agent_controller.is_none() || has_parent_fence) {
         let launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config,
             cwd,

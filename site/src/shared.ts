@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.12";
+export const releaseVersion = "v0.4.13";
 
 export const releases = [
+  {
+    version: "v0.4.13",
+    date: "2026-09-05",
+    title: "Fenced async child routing",
+    body: "Finalizes live child conversation delivery by routing fenced TUI async agents through durable task ownership while preserving legacy hosted agents, root session identity, and isolated release validation.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.13",
+  },
   {
     version: "v0.4.12",
     date: "2026-09-05",
