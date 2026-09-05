@@ -701,15 +701,75 @@ impl ThreadActor {
                             message: message.clone(),
                         }
                     }
-                    surface::GenerationStopReason::NotStarted { .. } => {
-                        surface::OperationTerminal::Failed {
-                            class: surface::FailureClass::RuntimeInvariant,
-                            message: surface::SafeDiagnosticText::try_new(
-                                "typed Goal completion failed before generation started",
-                            )
-                            .expect("static Goal recovery diagnostic is bounded"),
+                    surface::GenerationStopReason::NotStarted { reason } => match reason {
+                        surface::NotStartedReason::ReservationExpired => {
+                            surface::OperationTerminal::NotAdmitted {
+                                reason: surface::NotAdmittedReason::ReservationExpired,
+                            }
                         }
-                    }
+                        surface::NotStartedReason::Cancelled { cause } => match cause {
+                            surface::TerminalizationCause::GoalPause => {
+                                surface::OperationTerminal::Cancelled {
+                                    reason: surface::CancelReason::GoalPause,
+                                }
+                            }
+                            surface::TerminalizationCause::UserCancel => {
+                                surface::OperationTerminal::Cancelled {
+                                    reason: surface::CancelReason::User,
+                                }
+                            }
+                            surface::TerminalizationCause::HostShutdown => {
+                                surface::OperationTerminal::Shutdown {
+                                    reason: surface::SurfaceShutdownReason::HostShutdown,
+                                }
+                            }
+                            surface::TerminalizationCause::ThreadClose => {
+                                surface::OperationTerminal::Shutdown {
+                                    reason: surface::SurfaceShutdownReason::ThreadClose,
+                                }
+                            }
+                        },
+                        surface::NotStartedReason::Interrupted
+                        | surface::NotStartedReason::RuntimeRestart => {
+                            surface::OperationTerminal::AbortedByRuntimeRestart {
+                                last_generation: operation
+                                    .generations
+                                    .last()
+                                    .map(|generation| generation.fence.generation_id.clone())
+                                    .expect("finalizing operation has a generation"),
+                            }
+                        }
+                        surface::NotStartedReason::StartCommitFailure { message } => {
+                            surface::OperationTerminal::Failed {
+                                class: surface::FailureClass::Persistence,
+                                message: message.clone(),
+                            }
+                        }
+                        surface::NotStartedReason::MissingLiveInputCapsule => {
+                            surface::OperationTerminal::Failed {
+                                class: surface::FailureClass::RuntimeInvariant,
+                                message: surface::SafeDiagnosticText::try_new(
+                                    "non-replayable operation input capsule is unavailable before generation start",
+                                )
+                                .expect("static Goal recovery diagnostic is bounded"),
+                            }
+                        }
+                        surface::NotStartedReason::AdmissionRejected { reason } => {
+                            surface::OperationTerminal::NotAdmitted {
+                                reason: match reason {
+                                    surface::AdmissionRejectionReason::ConfigurationConflict => {
+                                        surface::NotAdmittedReason::ConfigurationConflict
+                                    }
+                                    surface::AdmissionRejectionReason::PolicyConflict => {
+                                        surface::NotAdmittedReason::PolicyConflict
+                                    }
+                                },
+                            }
+                        }
+                        surface::NotStartedReason::Shutdown { reason } => {
+                            surface::OperationTerminal::Shutdown { reason: *reason }
+                        }
+                    },
                 },
                 _ => surface::OperationTerminal::Failed {
                     class: surface::FailureClass::RuntimeInvariant,

@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.15";
+export const releaseVersion = "v0.4.16";
 
 export const releases = [
+  {
+    version: "v0.4.16",
+    date: "2026-09-06",
+    title: "Complete Goal recovery reason mapping",
+    body: "Preserves exact terminal semantics for not-started Goal generations during checkpoint recovery, including admission rejection, reservation expiry, shutdown, and persistence failures.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.16",
+  },
   {
     version: "v0.4.15",
     date: "2026-09-05",

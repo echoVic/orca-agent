@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.16":
+        "Preserves exact terminal semantics for not-started Goal generations during checkpoint recovery, including admission rejection, reservation expiry, shutdown, and persistence failures.",
       "v0.4.15":
         "Preserves prepared Goal terminal batches across checkpoint failure, rebuilds completion proofs from durable tool results, and keeps live-host persistence failures visible until restart.",
       "v0.4.14":
@@ -646,6 +648,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.16":
+        "补齐 checkpoint recovery 对未启动 Goal generation 的终止语义映射，覆盖准入拒绝、预约过期、shutdown 和持久化失败。",
       "v0.4.15":
         "保留 checkpoint 失败时已准备好的 Goal terminal batch，从 durable tool result 重建 completion proof，并让 live host 的持久化故障在重启前保持可见。",
       "v0.4.14":
