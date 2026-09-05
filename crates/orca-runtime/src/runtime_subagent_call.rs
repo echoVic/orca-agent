@@ -498,38 +498,12 @@ fn run_threaded_agent_worker(
         crate::subagent::SubagentMode::Sync => AgentRunMode::Sync,
         crate::subagent::SubagentMode::Async => AgentRunMode::Async,
     };
-    let (surface_activity, permission_handler, registry_task_id) = if mode == AgentRunMode::Sync {
-        if activity_ingress.is_none() {
-            let message =
-                "threaded synchronous subagent requires actor-owned surface activity ingress";
-            return RuntimeSubagentCallOutput {
-                result: ToolResult::failed_before_start(&tool_request, message, None),
-                tool_request,
-                description,
-                task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
-                status: RunStatus::Failed,
-                event_output: None,
-                event_error: Some(message.to_string()),
-                cost_tracker: CostTracker::new(config.model.as_deref()),
-                child_budget_usage: None,
-            };
-        }
+    let (surface_activity, permission_handler, registry_task_id) = if mode == AgentRunMode::Sync
+        && activity_ingress.is_some()
+        && request.isolation == SubagentIsolation::None
+    {
         if request.resume_from.is_some() {
             let message = "hosted_sync_resume_unsupported: synchronous hosted subagents cannot resume a continuation";
-            return RuntimeSubagentCallOutput {
-                result: ToolResult::failed_before_start(&tool_request, message, None),
-                tool_request,
-                description,
-                task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
-                status: RunStatus::Failed,
-                event_output: None,
-                event_error: Some(message.to_string()),
-                cost_tracker: CostTracker::new(config.model.as_deref()),
-                child_budget_usage: None,
-            };
-        }
-        if request.isolation != SubagentIsolation::None {
-            let message = "hosted_sync_capability_unsupported: worktree isolation is not supported by the hosted child route";
             return RuntimeSubagentCallOutput {
                 result: ToolResult::failed_before_start(&tool_request, message, None),
                 tool_request,
@@ -896,7 +870,9 @@ fn run_subagent_worker(
     started_task: RuntimeTaskLifecycle,
     cancel: CancelToken,
 ) -> RuntimeSubagentCallOutput {
-    if invocation.agent_controller.is_some() {
+    if invocation.agent_controller.is_some()
+        && invocation.request.isolation == SubagentIsolation::None
+    {
         return run_threaded_agent_worker(invocation, lifecycle, started_task, cancel);
     }
     let RuntimeSubagentInvocation {

@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.9";
+export const releaseVersion = "v0.4.10";
 
 export const releases = [
+  {
+    version: "v0.4.10",
+    date: "2026-09-05",
+    title: "Reliable live child conversations",
+    body: "Hardens the v0.4.9 child-conversation experience: synchronous and detached subagent activity uses the correct actor-owned surface path, relay logs remain self-contained across precommitted starts, and the typed task contracts cover the interactive TUI workflow.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.10",
+  },
   {
     version: "v0.4.9",
     date: "2026-09-05",

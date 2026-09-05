@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.10":
+        "Hardens the live child conversation path: synchronous and detached subagent activity use the correct actor-owned surface route, precommitted starts keep a self-contained relay sequence, and typed task contracts cover the interactive TUI workflow.",
       "v0.4.9":
         "Keeps delegated agent activity visible in Conversation with expanded activity history, per-agent spinners, action-first progress labels, parent activity while a child is focused, and direct switching between live child conversations with routed approvals and input.",
       "v0.4.8":
@@ -634,6 +636,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.10":
+        "加固 live child conversation：同步与 detached subagent activity 使用正确的 actor-owned surface 路径，预提交 Started 后 relay 仍保持自包含的 sequence，并用 typed task contract 覆盖交互式 TUI 流程。",
       "v0.4.9":
         "让委派 agent 的活动直接显示在 Conversation：运行中的子 agent 自动展开活动历史，列表项显示独立 spinner，进度条优先展示当前工具；聚焦子会话时仍保留父会话的其他 agent 活动，并支持在多个 live child conversation 之间切换，同时正确路由审批和输入。",
       "v0.4.8":

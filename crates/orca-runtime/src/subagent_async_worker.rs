@@ -293,7 +293,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         worktree,
         permission_response_public_key,
         child_turn_id,
-        activity_start_precommitted,
+        activity_start_precommitted: _,
     } = input;
     let owns_worktree = request.resume_from.is_none();
     let task_registry = match wait_for_async_subagent_adoption(&task_session_id, &cwd, &agent_id) {
@@ -457,16 +457,18 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             },
             activity_sink,
             Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            if activity_start_precommitted { 2 } else { 1 },
+            1,
         ),
     );
-    if !activity_start_precommitted
-        && let Err(error) = activity.publish_payload(SubagentActivityPayload::Started {
-            description: DisplayText::new(&request.description),
-            batch_id: format!("async-{agent_id}"),
-            batch_size: 1,
-        })
-    {
+    // The actor may already have committed this start to the surface, but the
+    // worker relay is an independent durable log and must still begin at
+    // sequence one. The parent drainer starts after the surface revision and
+    // therefore skips this duplicate relay record.
+    if let Err(error) = activity.publish_payload(SubagentActivityPayload::Started {
+        description: DisplayText::new(&request.description),
+        batch_id: format!("async-{agent_id}"),
+        batch_size: 1,
+    }) {
         let worktree = finish_async_worker_worktree(worktree, owns_worktree);
         let mut message = format!("failed to publish async subagent start: {error}");
         append_worktree_outcome(&mut message, worktree.as_ref());

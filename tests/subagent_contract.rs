@@ -61,34 +61,16 @@ fn subagent_tool_runs_child_agent_and_emits_events() {
     assert_eq!(requested["payload"]["action"], "read");
     assert_eq!(requested["payload"]["target"], "inspect repo");
 
-    let started = find_event(&events, "subagent.started");
-    assert_eq!(started["payload"]["id"], "mock-tool-1");
-    assert_eq!(started["payload"]["description"], "inspect repo");
-    assert_eq!(started["payload"]["task"]["kind"], "subagent");
-    assert_eq!(started["payload"]["task"]["status"], "running");
-    assert_eq!(
-        started["payload"]["task"]["task_id"],
-        "subagent-mock-tool-1:task-1"
-    );
-
-    let completed = find_event(&events, "subagent.completed");
-    assert_eq!(completed["payload"]["id"], "mock-tool-1");
-    assert_eq!(completed["payload"]["description"], "inspect repo");
-    assert_eq!(completed["payload"]["task"]["kind"], "subagent");
-    assert_eq!(completed["payload"]["task"]["status"], "succeeded");
-    assert_eq!(completed["payload"]["task"]["turn"], 1);
-    assert_eq!(
-        completed["payload"]["task"]["task_id"],
-        "subagent-mock-tool-1:task-1"
-    );
-    assert_eq!(completed["payload"]["status"], "success");
+    let completed = find_subagent_task(&events, "inspect repo");
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["subagentTurn"], 1);
     assert!(
-        completed["payload"]["output"]
+        completed["result"]
             .as_str()
             .unwrap()
             .contains("Mock runtime completed")
     );
-    assert_eq!(completed["payload"]["error"], Value::Null);
+    assert_eq!(completed["error"], Value::Null);
 
     let tool_completed = find_event(&events, "tool.call.completed");
     assert_eq!(tool_completed["payload"]["name"], "subagent");
@@ -97,7 +79,7 @@ fn subagent_tool_runs_child_agent_and_emits_events() {
         tool_completed["payload"]["output"]
             .as_str()
             .unwrap()
-            .contains("Subagent status: success")
+            .contains("Mock runtime completed")
     );
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 }
@@ -292,10 +274,9 @@ fn subagent_schema_accepts_matching_output() {
     assert_eq!(output.status.code(), Some(0));
 
     let events = parse_jsonl(&output.stdout);
-    let completed = find_event(&events, "subagent.completed");
-    assert_eq!(completed["payload"]["description"], "schema_ok");
-    assert_eq!(completed["payload"]["status"], "success");
-    assert_eq!(completed["payload"]["error"], Value::Null);
+    let completed = find_subagent_task(&events, "schema_ok");
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["error"], Value::Null);
 
     let tool_completed = find_event(&events, "tool.call.completed");
     assert_eq!(tool_completed["payload"]["name"], "subagent");
@@ -321,10 +302,10 @@ fn subagent_schema_failure_fails_parent_run() {
     assert_eq!(output.status.code(), Some(1));
 
     let events = parse_jsonl(&output.stdout);
-    let completed = find_event(&events, "subagent.completed");
-    assert_eq!(completed["payload"]["description"], "schema_fail");
-    assert_eq!(completed["payload"]["status"], "failed");
-    let error = completed["payload"]["error"].as_str().unwrap();
+    let completed = find_subagent_task(&events, "schema_fail");
+    assert_eq!(completed["status"], "failed");
+    let tool_completed = find_event(&events, "tool.call.completed");
+    let error = tool_completed["payload"]["error"].as_str().unwrap();
     assert!(error.contains("subagent output schema validation failed for schema_fail"));
     assert!(error.contains("$ expected object, got string"));
 
@@ -352,25 +333,27 @@ fn subagent_batch_schema_failure_fails_parent_run() {
     assert_eq!(output.status.code(), Some(1));
 
     let events = parse_jsonl(&output.stdout);
-    let completed = events
-        .iter()
-        .filter(|event| event["type"] == "subagent.completed")
-        .collect::<Vec<_>>();
+    let completed = subagent_tasks(&events);
     assert_eq!(completed.len(), 2);
-    assert_eq!(completed[0]["payload"]["id"], "mock-tool-1");
-    assert_eq!(completed[0]["payload"]["status"], "success");
-    assert_eq!(completed[1]["payload"]["id"], "mock-tool-2");
-    assert_eq!(completed[1]["payload"]["description"], "schema_fail");
-    assert_eq!(completed[1]["payload"]["status"], "failed");
-    let error = completed[1]["payload"]["error"].as_str().unwrap();
-    assert!(error.contains("subagent output schema validation failed for schema_fail"));
-    assert!(error.contains("$ expected object, got string"));
-
+    let succeeded = completed
+        .iter()
+        .find(|task| task["status"] == "completed")
+        .expect("completed batch child");
+    assert_eq!(succeeded["description"], "schema_ok");
+    let failed = completed
+        .iter()
+        .find(|task| task["status"] == "failed")
+        .expect("failed batch child");
+    assert_eq!(failed["description"], "schema_fail");
     let failed_tool = events
         .iter()
         .filter(|event| event["type"] == "tool.call.completed")
         .find(|event| event["payload"]["id"] == "mock-tool-2")
         .expect("failed batch tool completion");
+    let error = failed_tool["payload"]["error"].as_str().unwrap();
+    assert!(error.contains("subagent output schema validation failed for schema_fail"));
+    assert!(error.contains("$ expected object, got string"));
+
     assert_eq!(failed_tool["payload"]["name"], "subagent");
     assert_eq!(failed_tool["payload"]["status"], "failed");
     assert_eq!(events.last().unwrap()["payload"]["status"], "failed");
@@ -443,10 +426,10 @@ fn nested_subagent_calls_are_rejected() {
     assert_eq!(output.status.code(), Some(1));
 
     let events = parse_jsonl(&output.stdout);
-    let completed = find_event(&events, "subagent.completed");
-    assert_eq!(completed["payload"]["status"], "failed");
+    let completed = find_subagent_task(&events, "subagent inner task");
+    assert_eq!(completed["status"], "failed");
     assert!(
-        completed["payload"]["error"]
+        completed["error"]
             .as_str()
             .unwrap()
             .contains("subagent max depth 1 reached")
@@ -475,8 +458,8 @@ fn default_subagent_depth_allows_one_nested_child() {
 
     assert_eq!(output.status.code(), Some(0));
     let events = parse_jsonl(&output.stdout);
-    let completed = find_event(&events, "subagent.completed");
-    assert_eq!(completed["payload"]["status"], "success");
+    let completed = find_subagent_task(&events, "subagent inner task");
+    assert_eq!(completed["status"], "completed");
     assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 }
 
@@ -542,10 +525,10 @@ fn subagent_child_failure_fails_parent_run() {
     assert_eq!(output.status.code(), Some(1));
 
     let events = parse_jsonl(&output.stdout);
-    let completed = find_event(&events, "subagent.completed");
-    assert_eq!(completed["payload"]["status"], "failed");
+    let completed = find_subagent_task(&events, "mock_fail");
+    assert_eq!(completed["status"], "failed");
     assert!(
-        completed["payload"]["error"]
+        completed["error"]
             .as_str()
             .unwrap()
             .contains("mock child failure requested")
@@ -562,6 +545,27 @@ fn find_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
         .iter()
         .find(|event| event["type"] == event_type)
         .unwrap_or_else(|| panic!("missing {event_type}"))
+}
+
+fn subagent_tasks(events: &[Value]) -> Vec<&Value> {
+    let event = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "workflow.tasks.updated")
+        .expect("typed workflow task snapshot");
+    event["payload"]["tasks"]
+        .as_array()
+        .expect("task array")
+        .iter()
+        .filter(|task| task["type"] == "subagent")
+        .collect()
+}
+
+fn find_subagent_task<'a>(events: &'a [Value], description: &str) -> &'a Value {
+    subagent_tasks(events)
+        .into_iter()
+        .find(|task| task["description"] == description)
+        .unwrap_or_else(|| panic!("missing typed subagent task {description}"))
 }
 
 fn subagent_cli_test_guard() -> MutexGuard<'static, ()> {

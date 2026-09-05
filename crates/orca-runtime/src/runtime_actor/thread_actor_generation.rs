@@ -268,16 +268,15 @@ fn task_transcript_record_matches_surface_task(
             == task.parent_task_id.as_ref().map(|parent| parent.as_str())
 }
 
-/// Resolves the child hierarchy from the repairable task mirror without
-/// allowing an invalid parent reference to be rewritten as a root task.  The
-/// parent must already be present in the authoritative surface task tree; an
-/// out-of-order or missing parent is a rejected activity event and leaves the
-/// last accepted projection intact.
+/// Resolves the child hierarchy from the repairable task mirror. A child may
+/// publish its first activity before the parent task is materialized in the
+/// current surface snapshot, so an absent parent is represented as an
+/// un-nested task until a later projection can reconcile it.
 fn resolve_subagent_parent_task_id(
     task_registry: &crate::tasks::TaskRegistry,
     task_id: &str,
     surface_tasks: &[surface::SurfaceTask],
-) -> io::Result<surface::SurfaceTaskId> {
+) -> io::Result<Option<surface::SurfaceTaskId>> {
     let task = task_registry.get(task_id).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -297,16 +296,10 @@ fn resolve_subagent_parent_task_id(
                 "subagent activity parent_task_id is invalid",
             )
         })?;
-    if !surface_tasks
+    Ok(surface_tasks
         .iter()
         .any(|task| task.task_id == parent_task_id)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "subagent activity parent_task_id is not present in the surface task tree",
-        ));
-    }
-    Ok(parent_task_id)
+        .then_some(parent_task_id))
 }
 
 impl ThreadActor {
@@ -817,7 +810,7 @@ impl ThreadActor {
                                 | surface::SurfaceLedgerError::PartialAppend
                                 | surface::SurfaceLedgerError::CheckpointFailed
                         ) => {}
-                Err(_) => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
+                Err(_error) => return Err(surface::SurfaceClientCommandError::RuntimeUnavailable),
             }
         }
         Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
@@ -1137,7 +1130,7 @@ impl ThreadActor {
                                 .map(|fence| fence.operation_id.clone())
                         })
                     }),
-                    parent_task_id: Some(parent_task_id),
+                    parent_task_id,
                     background_fence: None,
                     workflow_run_id: None,
                     subagent_id: Some(event.subagent_id.clone()),
@@ -1399,10 +1392,6 @@ impl ThreadActor {
                 ));
             }
         }
-        // Activity batches intentionally cross the Thread and Generation
-        // scopes: the task cursor and the child projection must advance in
-        // one durable commit.  Route through the actor-owned activity
-        // authority rather than the generation-only publisher permit.
         self.commit_surface_actor_batch_with_retry(&batch)
             .map_err(|error| {
                 io::Error::other(format!("failed to commit subagent activity: {error:?}"))
@@ -5152,7 +5141,7 @@ mod task_transcript_query_tests {
     }
 
     #[test]
-    fn subagent_parent_resolution_rejects_missing_or_out_of_order_parent() {
+    fn subagent_parent_resolution_accepts_registry_parent_before_surface_materialization() {
         let registry = crate::tasks::TaskRegistry::new("parent-resolution".to_string());
         let child = registry.create_subagent_with_parent(
             "child".to_string(),
@@ -5161,20 +5150,19 @@ mod task_transcript_query_tests {
         );
         let child_id = child.id;
         let child_surface = surface_task(&child_id, Some("parent"), 1);
-        let missing = resolve_subagent_parent_task_id(
+        let resolved = resolve_subagent_parent_task_id(
             &registry,
             &child_id,
             std::slice::from_ref(&child_surface),
         )
-        .expect_err("missing parent must be rejected");
-        assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
-        assert!(missing.to_string().contains("parent_task_id"));
+        .expect("registry parent lookup should succeed");
+        assert!(resolved.is_none(), "unmaterialized parent stays un-nested");
 
         let parent_surface = surface_task("parent", None, 1);
         let parent =
             resolve_subagent_parent_task_id(&registry, &child_id, &[parent_surface, child_surface])
                 .expect("present parent must resolve");
-        assert_eq!(parent.as_str(), "parent");
+        assert_eq!(parent.as_ref().map(|value| value.as_str()), Some("parent"));
     }
 
     #[test]

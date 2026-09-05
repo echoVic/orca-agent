@@ -153,10 +153,8 @@ fn every_child_runtime_constructor_carries_permission_identity() {
 
 #[test]
 fn synchronous_child_activity_has_one_surface_delivery_boundary() {
-    // Keeping a TaskRegistry-only fallback creates two observability models:
-    // one path reaches the parent surface and one path is merely a mirror.
-    // Production child execution must either receive the surface ingress or
-    // fail before starting, so a missing parent cannot silently hide events.
+    // Hosted execution uses the typed surface sink. The standalone CLI keeps
+    // its established observer path when no hosted surface ingress exists.
     let sink_selection = balanced_block(SYNC_SUBAGENT, "let (activity_owner, activity_sink)");
     assert!(
         !sink_selection.contains("TaskRegistryActivitySink"),
@@ -164,8 +162,8 @@ fn synchronous_child_activity_has_one_surface_delivery_boundary() {
     );
     assert!(
         sink_selection.contains("RuntimeSubagentActivitySink")
-            && sink_selection.contains("activity ingress is unavailable"),
-        "sync children must use the typed surface sink or fail closed"
+            && sink_selection.contains("Some(activity_ingress)"),
+        "hosted sync children must use the typed surface sink when available"
     );
 }
 
@@ -174,8 +172,8 @@ fn surface_task_projection_preserves_the_registry_parent_identity() {
     let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_inner");
     assert!(
         function.contains("resolve_subagent_parent_task_id")
-            && function.contains("parent_task_id: Some(parent_task_id)"),
-        "the first child task projection must derive parent_task_id from the authoritative task registry"
+            && function.contains("parent_task_id,"),
+        "the first child task projection must derive parent_task_id from the registry and tolerate publication order"
     );
 }
 
