@@ -54,7 +54,7 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 
 [package]
 name = "blade-deepseek"
-version = "0.4.13"
+version = "0.4.14"
 edition = "2024"
 description = "Orca: a DeepSeek-native coding agent"
 license = "MIT"

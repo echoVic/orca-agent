@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.13";
+export const releaseVersion = "v0.4.14";
 
 export const releases = [
+  {
+    version: "v0.4.14",
+    date: "2026-09-05",
+    title: "Deterministic child activity contracts",
+    body: "Publishes the fenced child routing fixes with typed contract assertions for root sessions, agent journals, legacy hosted agents, and live child task visibility.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.14",
+  },
   {
     version: "v0.4.13",
     date: "2026-09-05",

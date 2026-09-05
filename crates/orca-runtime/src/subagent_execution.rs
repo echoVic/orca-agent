@@ -2176,7 +2176,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_async_subagent_still_requires_the_durable_worker_path() {
+    fn hosted_async_subagent_uses_the_controller_when_no_parent_fence_exists() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let config = config(SubagentConfig::default());
         let mut events = EventFactory::new("hosted-async-durable-route".to_string());
@@ -2234,14 +2234,14 @@ mod tests {
         )
         .expect("hosted async route result");
 
-        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert!(result.error.is_none());
         assert!(
             result
-                .error
+                .output
                 .as_deref()
-                .is_some_and(|error| error.contains("persistent task ownership"))
+                .is_some_and(|output| output.contains("thread_id"))
         );
-        assert!(task_registry.list().is_empty());
         host.shutdown().expect("shutdown runtime host");
     }
 

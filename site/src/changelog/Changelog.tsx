@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.14":
+        "Publishes the fenced child routing fixes with typed contract assertions for root sessions, agent journals, legacy hosted agents, and live child task visibility.",
       "v0.4.13":
         "Finalizes live child conversation delivery by routing fenced TUI async agents through durable task ownership while preserving legacy hosted agents, root session identity, and isolated release validation.",
       "v0.4.12":
@@ -642,6 +644,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.14":
+        "发布 fenced child routing 修复，并用 typed contract 覆盖 root session、agent journal、legacy hosted agent 与 live child task 可见性。",
       "v0.4.13":
         "完成 live child conversation 发布：带 parent fence 的 TUI async agent 使用 durable task ownership，同时保留 legacy hosted agent、root session identity 与隔离的发布验证。",
       "v0.4.12":
