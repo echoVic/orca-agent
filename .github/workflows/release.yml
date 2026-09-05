@@ -58,7 +58,7 @@ jobs:
       - name: Run workspace gate
         env:
           RUST_BACKTRACE: "1"
-        run: cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+        run: cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --test-threads 1
 
   version:
     runs-on: ubuntu-latest
@@ -168,7 +168,7 @@ jobs:
           cargo build -p orca-windows-runner --locked
           cargo nextest run -p orca-tui --lib --locked --profile ci-serial
           cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass
-          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --test-threads 1
       - name: Run native Windows ARM64 behavior gates
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh

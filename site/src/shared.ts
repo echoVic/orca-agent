@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.10";
+export const releaseVersion = "v0.4.11";
 
 export const releases = [
+  {
+    version: "v0.4.11",
+    date: "2026-09-05",
+    title: "Stable serialized release gate",
+    body: "Publishes the live child conversation fixes with a serialized workspace gate, preventing shared local session state from making the release verification flaky.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.11",
+  },
   {
     version: "v0.4.10",
     date: "2026-09-05",

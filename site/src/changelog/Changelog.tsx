@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.11":
+        "Publishes the live child conversation fixes with a serialized workspace gate, preventing shared local session state from making release verification flaky.",
       "v0.4.10":
         "Hardens the live child conversation path: synchronous and detached subagent activity use the correct actor-owned surface route, precommitted starts keep a self-contained relay sequence, and typed task contracts cover the interactive TUI workflow.",
       "v0.4.9":
@@ -636,6 +638,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.11":
+        "发布 live child conversation 修复，并将 workspace gate 串行化，避免共享本地 session 状态导致发布验证不稳定。",
       "v0.4.10":
         "加固 live child conversation：同步与 detached subagent activity 使用正确的 actor-owned surface 路径，预提交 Started 后 relay 仍保持自包含的 sequence，并用 typed task contract 覆盖交互式 TUI 流程。",
       "v0.4.9":

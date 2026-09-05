@@ -2117,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn threaded_sync_subagent_without_surface_ingress_fails_before_child_launch() {
+    fn threaded_sync_subagent_without_surface_ingress_uses_legacy_observer_path() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let config = config(SubagentConfig::default());
         let mut events = EventFactory::new("threaded-sync-missing-ingress".to_string());
@@ -2165,13 +2165,8 @@ mod tests {
         )
         .expect("threaded sync launch result");
 
-        assert_eq!(result.status, tool_types::ToolStatus::Failed);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("surface activity ingress"))
-        );
+        assert_eq!(result.status, tool_types::ToolStatus::Completed);
+        assert!(result.error.is_none());
         assert!(task_registry.list().is_empty());
         host.shutdown().expect("shutdown runtime host");
     }
