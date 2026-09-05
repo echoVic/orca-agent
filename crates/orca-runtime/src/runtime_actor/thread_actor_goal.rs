@@ -589,13 +589,138 @@ impl ThreadActor {
                     | surface::OperationPhase::FinalizingDegraded { .. }
             )
         {
-            let terminal = surface::OperationTerminal::Failed {
-                class: surface::FailureClass::RuntimeInvariant,
-                message: surface::SafeDiagnosticText::try_new(
-                    "typed Goal completion failed after durable finalization started",
-                )
-                .expect("static Goal recovery diagnostic is bounded"),
+            let usage = snapshot
+                .usage
+                .active_operation
+                .as_ref()
+                .filter(|(active_id, _)| active_id == &operation_id)
+                .map(|(_, usage)| usage.clone())
+                .unwrap_or(surface::UsageTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                    estimated_cost_usd_micros: 0,
+                });
+            let terminal = match &finalization.selected_cause {
+                surface::OperationFinalizationCause::GenerationStop(reason) => match reason {
+                    surface::GenerationStopReason::Completed {
+                        status: surface::GenerationCompletionStatus::Success,
+                    } => surface::OperationTerminal::Succeeded {
+                        usage: usage.clone(),
+                    },
+                    surface::GenerationStopReason::Completed {
+                        status: surface::GenerationCompletionStatus::VerificationFailed { message },
+                    } => surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::Verification,
+                        message: message.clone(),
+                    },
+                    surface::GenerationStopReason::Completed {
+                        status: surface::GenerationCompletionStatus::BudgetExhausted { budget },
+                    } => surface::OperationTerminal::BudgetExhausted {
+                        budget: budget.clone(),
+                    },
+                    surface::GenerationStopReason::Cancelled { cause } => match cause {
+                        surface::TerminalizationCause::GoalPause => {
+                            surface::OperationTerminal::Cancelled {
+                                reason: surface::CancelReason::GoalPause,
+                            }
+                        }
+                        surface::TerminalizationCause::UserCancel => {
+                            surface::OperationTerminal::Cancelled {
+                                reason: surface::CancelReason::User,
+                            }
+                        }
+                        surface::TerminalizationCause::HostShutdown => {
+                            surface::OperationTerminal::Shutdown {
+                                reason: surface::SurfaceShutdownReason::HostShutdown,
+                            }
+                        }
+                        surface::TerminalizationCause::ThreadClose => {
+                            surface::OperationTerminal::Shutdown {
+                                reason: surface::SurfaceShutdownReason::ThreadClose,
+                            }
+                        }
+                    },
+                    surface::GenerationStopReason::ExecutionFailed { class, message } => {
+                        let class = match class {
+                            surface::GenerationExecutionFailureClass::Provider => {
+                                surface::FailureClass::Provider
+                            }
+                            surface::GenerationExecutionFailureClass::Tool => {
+                                surface::FailureClass::Tool
+                            }
+                            surface::GenerationExecutionFailureClass::Hook => {
+                                surface::FailureClass::Hook
+                            }
+                            surface::GenerationExecutionFailureClass::Workflow => {
+                                surface::FailureClass::Workflow
+                            }
+                            surface::GenerationExecutionFailureClass::InputResolution => {
+                                surface::FailureClass::InputResolution
+                            }
+                            surface::GenerationExecutionFailureClass::ClientCapabilityUnavailable => {
+                                surface::FailureClass::ClientCapabilityUnavailable
+                            }
+                            surface::GenerationExecutionFailureClass::LegacyApprovalRequired => {
+                                surface::FailureClass::LegacyApprovalRequired
+                            }
+                            surface::GenerationExecutionFailureClass::RuntimeInvariant => {
+                                surface::FailureClass::RuntimeInvariant
+                            }
+                            surface::GenerationExecutionFailureClass::ExternalEffectAmbiguous => {
+                                surface::FailureClass::ExternalEffectAmbiguous
+                            }
+                            surface::GenerationExecutionFailureClass::RemoteResourceCleanupAmbiguous => {
+                                surface::FailureClass::RemoteResourceCleanupAmbiguous
+                            }
+                        };
+                        surface::OperationTerminal::Failed {
+                            class,
+                            message: message.clone(),
+                        }
+                    }
+                    surface::GenerationStopReason::Panicked { message } => {
+                        surface::OperationTerminal::Panicked {
+                            message: message.clone(),
+                        }
+                    }
+                    surface::GenerationStopReason::InterruptedResumable
+                    | surface::GenerationStopReason::ProviderSuspended
+                    | surface::GenerationStopReason::RuntimeRestart => {
+                        surface::OperationTerminal::AbortedByRuntimeRestart {
+                            last_generation: operation
+                                .generations
+                                .last()
+                                .map(|generation| generation.fence.generation_id.clone())
+                                .expect("finalizing operation has a generation"),
+                        }
+                    }
+                    surface::GenerationStopReason::ProjectionFailure { message } => {
+                        surface::OperationTerminal::Failed {
+                            class: surface::FailureClass::Persistence,
+                            message: message.clone(),
+                        }
+                    }
+                    surface::GenerationStopReason::NotStarted { .. } => {
+                        surface::OperationTerminal::Failed {
+                            class: surface::FailureClass::RuntimeInvariant,
+                            message: surface::SafeDiagnosticText::try_new(
+                                "typed Goal completion failed before generation started",
+                            )
+                            .expect("static Goal recovery diagnostic is bounded"),
+                        }
+                    }
+                },
+                _ => surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message: surface::SafeDiagnosticText::try_new(
+                        "typed Goal completion failed after durable finalization started",
+                    )
+                    .expect("static Goal recovery diagnostic is bounded"),
+                },
             };
+            let completion_proof =
+                Self::surface_completion_proof(&snapshot, &operation, &terminal, None)?;
             let terminal_batch = self.surface_operation_batch_with_commit_id(
                 &operation_id,
                 vec![surface::OperationPatch::Terminal {
@@ -603,17 +728,10 @@ impl ThreadActor {
                         operation_id: operation_id.clone(),
                         finalize_intent_id: finalization.finalize_intent_id.clone(),
                         terminal: terminal.clone(),
-                        usage: surface::UsageTotals {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_tokens: 0,
-                            estimated_cost_usd_micros: 0,
-                        },
+                        usage,
                         source_diagnostic_digest: None,
                         settlement_receipts: Vec::new(),
-                        completion_proof: surface::SurfaceOperationCompletionProof::unverified(
-                            "goal recovery terminal has no verifier proof",
-                        ),
+                        completion_proof: completion_proof.clone(),
                         committed_at: surface::UnixMillis::new(0),
                     },
                 }],
@@ -622,9 +740,7 @@ impl ThreadActor {
             let value = surface::OperationTerminalAtCursor {
                 operation_id: operation_id.clone(),
                 terminal,
-                completion_proof: surface::SurfaceOperationCompletionProof::unverified(
-                    "goal recovery terminal has no verifier proof",
-                ),
+                completion_proof,
                 cursor: terminal_batch.cursor_after.clone(),
                 commit_class: terminal_batch.commit_class.clone(),
                 batch_digest: terminal_batch.batch_digest.clone(),
@@ -673,7 +789,8 @@ impl ThreadActor {
                 completed,
                 "Goal recovery terminal must complete exactly once"
             );
-            self.refresh_surface_goal_completion_recovery_block();
+            self.operation_recovery.terminal_blocked =
+                Some("typed Goal terminal checkpoint failed before recovery completed".to_string());
             return Ok(());
         }
         let fence = operation
@@ -756,6 +873,30 @@ impl ThreadActor {
         active: ActiveOperation,
         message: String,
     ) {
+        let retain_prepared_goal_batch = self
+            .resident_surface
+            .coordinator
+            .incomplete_batch()
+            .is_some_and(|batch| {
+                batch.events.as_slice().iter().any(|event| {
+                    matches!(
+                        &event.event,
+                        surface::SurfaceEvent::Goal(surface::GoalPatchEnvelope {
+                            patch: surface::GoalPatch::OuterTurnFinished { .. },
+                            ..
+                        })
+                    )
+                })
+            });
+        if retain_prepared_goal_batch {
+            self.retain_surface_goal_completion_recovery(
+                active,
+                format!(
+                    "typed Goal recovery retained its exact prepared batch for cold recovery; {message}"
+                ),
+            );
+            return;
+        }
         if let Err(error) = self.resident_surface.coordinator.retry_incomplete_batch() {
             self.retain_surface_goal_completion_recovery(
                 active,

@@ -1294,6 +1294,10 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
         self.incomplete.is_some()
     }
 
+    pub(crate) fn incomplete_batch(&self) -> Option<&SurfaceCommitBatch> {
+        self.incomplete.as_ref()
+    }
+
     pub(crate) fn incomplete_batch_is(&self, batch: &SurfaceCommitBatch) -> bool {
         self.incomplete
             .as_ref()

@@ -5993,7 +5993,7 @@ impl ThreadActor {
         Ok(Some(value))
     }
 
-    fn surface_completion_proof(
+    pub(super) fn surface_completion_proof(
         snapshot: &surface::SurfaceSnapshot,
         operation: &surface::OperationRecord,
         terminal: &surface::OperationTerminal,

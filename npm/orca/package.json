@@ -1,6 +1,6 @@
 {
   "name": "@blade-ai/orca",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "description": "Orca CLI: a DeepSeek-native coding agent.",
   "homepage": "https://orcaagent.dev/",
   "license": "MIT",

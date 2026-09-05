@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.14";
+export const releaseVersion = "v0.4.15";
 
 export const releases = [
+  {
+    version: "v0.4.15",
+    date: "2026-09-05",
+    title: "Exact Goal recovery finalization",
+    body: "Preserves prepared Goal terminal batches across checkpoint failure, rebuilds completion proofs from durable tool results, and keeps live-host persistence failures visible until restart.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.15",
+  },
   {
     version: "v0.4.14",
     date: "2026-09-05",

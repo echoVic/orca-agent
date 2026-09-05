@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.15":
+        "Preserves prepared Goal terminal batches across checkpoint failure, rebuilds completion proofs from durable tool results, and keeps live-host persistence failures visible until restart.",
       "v0.4.14":
         "Publishes the fenced child routing fixes with typed contract assertions for root sessions, agent journals, legacy hosted agents, and live child task visibility.",
       "v0.4.13":
@@ -644,6 +646,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.15":
+        "保留 checkpoint 失败时已准备好的 Goal terminal batch，从 durable tool result 重建 completion proof，并让 live host 的持久化故障在重启前保持可见。",
       "v0.4.14":
         "发布 fenced child routing 修复，并用 typed contract 覆盖 root session、agent journal、legacy hosted agent 与 live child task 可见性。",
       "v0.4.13":
