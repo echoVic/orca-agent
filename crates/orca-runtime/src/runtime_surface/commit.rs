@@ -11891,7 +11891,7 @@ fn terminal_failure_class(class: super::GenerationExecutionFailureClass) -> supe
     }
 }
 
-fn terminal_from_generation_stop(
+pub(crate) fn terminal_from_generation_stop(
     operation: &super::OperationRecord,
     reason: &super::GenerationStopReason,
     usage: &super::UsageTotals,
@@ -13108,6 +13108,60 @@ mod tests {
         snapshot.foreground_operation = Some(operation);
         snapshot.interactions.push(interaction);
         (snapshot, operation_id, interaction_id)
+    }
+
+    #[test]
+    fn generation_stop_terminal_mapping_preserves_not_started_reasons() {
+        let operation = started_operation();
+        let usage = super::super::UsageTotals {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_tokens: 0,
+            estimated_cost_usd_micros: 0,
+        };
+        let message = super::super::SafeDiagnosticText::try_new("start failed").unwrap();
+        let cases = [
+            (
+                super::super::NotStartedReason::ReservationExpired,
+                super::super::OperationTerminal::NotAdmitted {
+                    reason: super::super::NotAdmittedReason::ReservationExpired,
+                },
+            ),
+            (
+                super::super::NotStartedReason::StartCommitFailure {
+                    message: message.clone(),
+                },
+                super::super::OperationTerminal::Failed {
+                    class: super::super::FailureClass::Persistence,
+                    message: message.clone(),
+                },
+            ),
+            (
+                super::super::NotStartedReason::AdmissionRejected {
+                    reason: super::super::AdmissionRejectionReason::PolicyConflict,
+                },
+                super::super::OperationTerminal::NotAdmitted {
+                    reason: super::super::NotAdmittedReason::PolicyConflict,
+                },
+            ),
+            (
+                super::super::NotStartedReason::Shutdown {
+                    reason: super::super::SurfaceShutdownReason::HostShutdown,
+                },
+                super::super::OperationTerminal::Shutdown {
+                    reason: super::super::SurfaceShutdownReason::HostShutdown,
+                },
+            ),
+        ];
+        for (reason, expected) in cases {
+            let actual = terminal_from_generation_stop(
+                &operation,
+                &super::super::GenerationStopReason::NotStarted { reason },
+                &usage,
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

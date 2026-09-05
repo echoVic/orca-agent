@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.17":
+        "Reuses the canonical terminal mapping, adds NotStartedReason coverage, and documents exact recovery verification and upgrade behavior.",
       "v0.4.16":
         "Preserves exact terminal semantics for not-started Goal generations during checkpoint recovery, including admission rejection, reservation expiry, shutdown, and persistence failures.",
       "v0.4.15":
@@ -648,6 +650,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.17":
+        "复用 canonical terminal mapping，补充 NotStartedReason 覆盖，并记录 exact recovery 验证与升级方式。",
       "v0.4.16":
         "补齐 checkpoint recovery 对未启动 Goal generation 的终止语义映射，覆盖准入拒绝、预约过期、shutdown 和持久化失败。",
       "v0.4.15":

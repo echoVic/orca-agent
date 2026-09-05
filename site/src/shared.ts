@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.16";
+export const releaseVersion = "v0.4.17";
 
 export const releases = [
+  {
+    version: "v0.4.17",
+    date: "2026-09-06",
+    title: "Review-hardened Goal recovery",
+    body: "Reuses the canonical terminal mapping, adds NotStartedReason coverage, and documents exact recovery verification and upgrade behavior.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.17",
+  },
   {
     version: "v0.4.16",
     date: "2026-09-06",
