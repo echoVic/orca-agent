@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.17";
+export const releaseVersion = "v0.4.18";
 
 export const releases = [
+  {
+    version: "v0.4.18",
+    date: "2026-09-06",
+    title: "Convergent release verification",
+    body: "Uses stable focused runtime and TUI contract gates for release verification while retaining a complete workspace compile check.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.18",
+  },
   {
     version: "v0.4.17",
     date: "2026-09-06",

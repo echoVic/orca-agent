@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.18":
+        "Uses stable focused runtime and TUI contract gates for release verification while retaining a complete workspace compile check.",
       "v0.4.17":
         "Reuses the canonical terminal mapping, adds NotStartedReason coverage, and documents exact recovery verification and upgrade behavior.",
       "v0.4.16":
@@ -650,6 +652,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.18":
+        "采用稳定的 runtime 与 TUI focused contract gate 做发布验证，同时保留完整 workspace compile check。",
       "v0.4.17":
         "复用 canonical terminal mapping，补充 NotStartedReason 覆盖，并记录 exact recovery 验证与升级方式。",
       "v0.4.16":

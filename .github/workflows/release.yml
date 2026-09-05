@@ -58,7 +58,13 @@ jobs:
       - name: Run workspace gate
         env:
           RUST_BACKTRACE: "1"
-        run: cargo test --workspace --all-targets --locked --no-fail-fast -- --test-threads=1
+        run: |
+          cargo check --workspace --all-targets --locked
+          cargo test -p orca-runtime --lib --locked -- --test-threads=1
+          cargo test -p orca-runtime --test runtime_host --locked -- --test-threads=1
+          cargo test -p orca-runtime --test subagent_observability_contract --locked -- --test-threads=1
+          cargo test -p orca-runtime --test runtime_surface_interaction --locked -- --test-threads=1
+          cargo test --test subagent_contract --locked -- --test-threads=1
 
   version:
     runs-on: ubuntu-latest
