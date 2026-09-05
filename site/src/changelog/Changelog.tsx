@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.19":
+        "Runs the release gate against the exact Goal recovery regressions and contract suites while retaining complete workspace compilation.",
       "v0.4.18":
         "Uses stable focused runtime and TUI contract gates for release verification while retaining a complete workspace compile check.",
       "v0.4.17":
@@ -652,6 +654,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.19":
+        "发布 gate 直接执行 Goal recovery 回归和 contract suite，同时保留完整 workspace compile check。",
       "v0.4.18":
         "采用稳定的 runtime 与 TUI focused contract gate 做发布验证，同时保留完整 workspace compile check。",
       "v0.4.17":
