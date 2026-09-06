@@ -771,22 +771,46 @@ impl ThreadActor {
         active: ActiveOperation,
         message: String,
     ) {
-        let retain_prepared_goal_batch = self
-            .resident_surface
-            .coordinator
-            .incomplete_batch()
-            .is_some_and(|batch| {
-                batch.events.as_slice().iter().any(|event| {
-                    matches!(
-                        &event.event,
-                        surface::SurfaceEvent::Goal(surface::GoalPatchEnvelope {
-                            patch: surface::GoalPatch::OuterTurnFinished { .. },
-                            ..
-                        })
-                    )
-                })
-            });
-        if retain_prepared_goal_batch {
+        let prepared_goal_batch =
+            self.resident_surface
+                .coordinator
+                .incomplete_batch()
+                .map(|batch| {
+                    let has_outer_turn_finished = batch.events.as_slice().iter().any(|event| {
+                        matches!(
+                            &event.event,
+                            surface::SurfaceEvent::Goal(surface::GoalPatchEnvelope {
+                                patch: surface::GoalPatch::OuterTurnFinished { .. },
+                                ..
+                            })
+                        )
+                    });
+                    let has_terminal_patch = batch.events.as_slice().iter().any(|event| {
+                        matches!(
+                            &event.event,
+                            surface::SurfaceEvent::Operation(
+                                surface::OperationPatch::Terminal { .. }
+                            )
+                        )
+                    });
+                    (has_outer_turn_finished, has_terminal_patch)
+                });
+        // A terminal batch must stay prepared for cold recovery. Replaying it
+        // here races recovery observers that need to verify the exact durable
+        // batch before the host shuts down. Continuation batches, on the other
+        // hand, are safe to reconcile online so their waiters can settle.
+        if prepared_goal_batch.is_some_and(|(_, has_terminal_patch)| has_terminal_patch) {
+            self.retain_surface_goal_completion_recovery(
+                active,
+                format!(
+                    "typed Goal recovery retained its exact prepared terminal batch for cold recovery; {message}"
+                ),
+            );
+            return;
+        }
+        let reconcile_prepared_goal_batch =
+            prepared_goal_batch.is_some_and(|(has_outer_turn_finished, _)| has_outer_turn_finished);
+        if reconcile_prepared_goal_batch {
             // The prepared batch is already durable and can be replayed by the
             // actor. Apply it before terminalizing the live operation; leaving
             // it retained here strands operation waiters because every retry
@@ -801,7 +825,7 @@ impl ThreadActor {
                 return;
             }
         }
-        if !retain_prepared_goal_batch
+        if !reconcile_prepared_goal_batch
             && let Err(error) = self.resident_surface.coordinator.retry_incomplete_batch()
         {
             self.retain_surface_goal_completion_recovery(
