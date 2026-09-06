@@ -785,21 +785,27 @@ impl ThreadActor {
                             })
                         )
                     });
-                    let has_terminal_patch = batch.events.as_slice().iter().any(|event| {
+                    let has_terminal_goal_decision = batch.events.as_slice().iter().any(|event| {
                         matches!(
                             &event.event,
-                            surface::SurfaceEvent::Operation(
-                                surface::OperationPatch::Terminal { .. }
-                            )
+                            surface::SurfaceEvent::Goal(surface::GoalPatchEnvelope {
+                                patch: surface::GoalPatch::ContinuationDecided {
+                                    decision: surface::GoalContinuationDecision::Stopped { .. },
+                                    ..
+                                },
+                                ..
+                            })
                         )
                     });
-                    (has_outer_turn_finished, has_terminal_patch)
+                    (has_outer_turn_finished, has_terminal_goal_decision)
                 });
         // A terminal batch must stay prepared for cold recovery. Replaying it
         // here races recovery observers that need to verify the exact durable
         // batch before the host shuts down. Continuation batches, on the other
         // hand, are safe to reconcile online so their waiters can settle.
-        if prepared_goal_batch.is_some_and(|(_, has_terminal_patch)| has_terminal_patch) {
+        if prepared_goal_batch
+            .is_some_and(|(_, has_terminal_goal_decision)| has_terminal_goal_decision)
+        {
             self.retain_surface_goal_completion_recovery(
                 active,
                 format!(
