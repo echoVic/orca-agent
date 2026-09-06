@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.24":
+        "Aligns the release Windows gate with the isolated, retry-aware nextest suite used by the main Windows workflow.",
       "v0.4.23":
         "Fixes terminal Goal checkpoint recovery batch classification so durable prepared state remains observable in full workspace runs.",
       "v0.4.22":
@@ -658,6 +660,7 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.24": "发布流程的 Windows gate 统一使用正式 Windows CI 的隔离与重试 nextest 配置。",
       "v0.4.23": "修复完整 workspace 测试中 Goal terminal checkpoint recovery 的 batch 分类，确保 durable prepared state 可观察。",
       "v0.4.22": "修复 Goal terminal checkpoint recovery 的 prepared batch 保留与冷恢复路径。",
       "v0.4.19":
