@@ -58,12 +58,13 @@ pub(crate) fn handle_agent_workspace_key(
                 }
                 Some(AgentWorkspaceRow::BackgroundTask { .. })
                 | Some(AgentWorkspaceRow::WorkflowAgent { .. }) => None,
-                None => state.selected_registry_workspace_agent().map(|agent| {
-                    UserAction::FocusChildThread {
+                Some(AgentWorkspaceRow::RegistryAgent { agent }) => {
+                    Some(UserAction::FocusChildThread {
                         task_id: agent.agent_id.clone(),
                         expected_revision: state.agent_registry.revision,
-                    }
-                }),
+                    })
+                }
+                None => None,
             };
             if let Some(action) = action {
                 if let UserAction::ReadTaskTranscript(request) = &action {
@@ -98,7 +99,11 @@ pub(crate) fn handle_agent_workspace_key(
                 {
                     Some(task.id.clone())
                 }
-                _ => None,
+                Some(AgentWorkspaceRow::RegistryAgent { .. })
+                | Some(AgentWorkspaceRow::WorkflowAgent { .. })
+                | Some(AgentWorkspaceRow::Subagent { .. })
+                | Some(AgentWorkspaceRow::BackgroundTask { .. }) => None,
+                None => None,
             };
             if let Some(task_id) = task_id {
                 let _ = action_tx.send(UserAction::StopTask { task_id });
@@ -122,7 +127,10 @@ pub(crate) fn handle_agent_workspace_key(
                         }
                     })
                 }
-                _ => None,
+                AgentWorkspaceRow::RegistryAgent { .. }
+                | AgentWorkspaceRow::BackgroundTask { .. }
+                | AgentWorkspaceRow::WorkflowAgent { .. }
+                | AgentWorkspaceRow::Subagent { .. } => None,
             });
             if let Some(action) = action {
                 let _ = action_tx.send(action);

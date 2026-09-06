@@ -1446,66 +1446,6 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
     let rows = state.agent_rows();
 
     if rows.is_empty() {
-        if !state.agent_registry.agents.is_empty() {
-            let mut lines = vec![Line::from(Span::styled(
-                " Main [default]",
-                Style::default().fg(theme.text),
-            ))];
-            for (index, agent) in state
-                .agent_registry
-                .agents
-                .iter()
-                .take(MAX_DEFAULT_SUBAGENTS)
-                .enumerate()
-            {
-                let selected = state.agent_selected_index() == index;
-                let icon = if agent.status.is_active() {
-                    spinner_frame(state.tick)
-                } else {
-                    "●"
-                };
-                let status = match &agent.status {
-                    AgentStatus::Queued => "queued",
-                    AgentStatus::Running => "running",
-                    AgentStatus::WaitingPermission => "waiting permission",
-                    AgentStatus::Completed => "completed",
-                    AgentStatus::Failed => "failed",
-                    AgentStatus::Cancelled => "cancelled",
-                    AgentStatus::Corrupt => "corrupt",
-                };
-                lines.push(Line::from(Span::styled(
-                    truncate_to_display_width(
-                        &format!(
-                            "{} {icon} {} · {status}",
-                            if selected { "›" } else { " " },
-                            agent.description
-                        ),
-                        inner.width as usize,
-                    ),
-                    (if selected {
-                        theme.selection_style()
-                    } else {
-                        Style::default()
-                    })
-                    .fg(if agent.status.is_active() {
-                        theme.warning
-                    } else {
-                        theme.muted
-                    }),
-                )));
-                let detail = agent
-                    .activity
-                    .as_ref()
-                    .map(AgentActivity::label)
-                    .unwrap_or_else(|| "no activity recorded".to_string());
-                lines.push(Line::from(Span::styled(
-                    truncate_to_display_width(&format!("   {detail}"), inner.width as usize),
-                    Style::default().fg(theme.muted),
-                )));
-            }
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-            return;
-        }
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -1547,60 +1487,11 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
 
     if list_height > 0 {
         let item_width = inner.width.saturating_sub(3) as usize;
-        let mut items = rows
+        let items = rows
             .iter()
             .copied()
             .map(|row| agent_workspace_list_item(row, theme, item_width, state.tick))
             .collect::<Vec<_>>();
-        let task_ids = rows
-            .iter()
-            .map(|row| row.identity())
-            .filter_map(|identity| match identity {
-                crate::agent_workspace::AgentWorkspaceIdentity::Task(id) => Some(id),
-                crate::agent_workspace::AgentWorkspaceIdentity::WorkflowAgent { .. } => None,
-            })
-            .collect::<std::collections::HashSet<_>>();
-        for agent in state
-            .agent_registry
-            .agents
-            .iter()
-            .filter(|agent| !task_ids.contains(&agent.agent_id))
-        {
-            let icon = if agent.status.is_active() {
-                spinner_frame(state.tick)
-            } else {
-                "●"
-            };
-            let status = match &agent.status {
-                AgentStatus::Queued => "queued",
-                AgentStatus::Running => "running",
-                AgentStatus::WaitingPermission => "waiting permission",
-                AgentStatus::Completed => "completed",
-                AgentStatus::Failed => "failed",
-                AgentStatus::Cancelled => "cancelled",
-                AgentStatus::Corrupt => "corrupt",
-            };
-            items.push(ListItem::new(Line::from(Span::styled(
-                truncate_to_display_width(
-                    &format!("{icon} {} · {status}", agent.description),
-                    item_width,
-                ),
-                Style::default().fg(if agent.status.is_active() {
-                    theme.warning
-                } else {
-                    theme.muted
-                }),
-            ))));
-            let detail = agent
-                .activity
-                .as_ref()
-                .map(AgentActivity::label)
-                .unwrap_or_else(|| "no activity recorded".to_string());
-            items.push(ListItem::new(Line::from(Span::styled(
-                truncate_to_display_width(&format!("  {detail}"), item_width),
-                Style::default().fg(theme.muted),
-            ))));
-        }
         let list = List::new(items).highlight_symbol("› ").highlight_style(
             theme
                 .selection_style()
@@ -1821,6 +1712,9 @@ fn agent_workspace_action_hint<'a>(row: AgentWorkspaceRow<'_>, theme: &Theme) ->
         AgentWorkspaceRow::WorkflowAgent { .. } => {
             text.push_str(" · workflow-owned · read only");
         }
+        AgentWorkspaceRow::RegistryAgent { .. } => {
+            text.push_str(" · Enter open conversation");
+        }
     }
     Line::from(Span::styled(text, Style::default().fg(theme.muted)))
 }
@@ -1879,6 +1773,21 @@ fn agent_workspace_list_item<'a>(
                 agent.status == WorkflowAgentStatus::Running,
             )
         }
+        AgentWorkspaceRow::RegistryAgent { agent } => (
+            agent.description.clone(),
+            registry_agent_status_label(&agent.status).to_string(),
+            agent
+                .activity
+                .as_ref()
+                .map(AgentActivity::label)
+                .unwrap_or_else(|| "waiting for activity".to_string()),
+            if agent.status.is_active() {
+                theme.warning
+            } else {
+                theme.muted
+            },
+            agent.status.is_active(),
+        ),
     };
     let icon = if running { spinner_frame(tick) } else { "●" };
     let text = truncate_to_display_width(&format!("{icon} {name} · {status} · {detail}"), width);
@@ -2018,6 +1927,30 @@ fn agent_workspace_focus_lines<'a>(
                 line(format!(" {}", metadata.join(" · ")), theme.muted),
                 line(" workflow-owned · read only".to_string(), theme.muted),
             ]
+        }
+        AgentWorkspaceRow::RegistryAgent { agent } => {
+            let mut lines = vec![
+                line(format!(" Focus {}", agent.description), theme.text),
+                line(
+                    format!(
+                        " registry child · {}",
+                        registry_agent_status_label(&agent.status)
+                    ),
+                    theme.muted,
+                ),
+            ];
+            if let Some(activity) = agent.activity.as_ref() {
+                let marker = if agent.status.is_active() {
+                    spinner_frame(tick)
+                } else {
+                    "●"
+                };
+                lines.push(line(
+                    format!(" {marker} now {}", activity.label()),
+                    theme.warning,
+                ));
+            }
+            lines
         }
     }
 }
@@ -3041,6 +2974,18 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Failed => "failed",
         TaskStatus::ApprovalRequired => "approval required",
         TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn registry_agent_status_label(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Queued => "queued",
+        AgentStatus::Running => "running",
+        AgentStatus::WaitingPermission => "waiting permission",
+        AgentStatus::Completed => "completed",
+        AgentStatus::Failed => "failed",
+        AgentStatus::Cancelled => "cancelled",
+        AgentStatus::Corrupt => "corrupt",
     }
 }
 

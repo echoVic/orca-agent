@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use orca_core::agent_event::AgentSummary;
 use orca_core::task_types::{BackgroundTaskSummary, TaskType, WorkflowAgentTaskSummary};
 use orca_core::workflow_types::WorkflowAgentStatus;
 
@@ -26,6 +27,9 @@ pub(crate) enum AgentWorkspaceRow<'a> {
         workflow: &'a BackgroundTaskSummary,
         agent: &'a WorkflowAgentTaskSummary,
     },
+    RegistryAgent {
+        agent: &'a AgentSummary,
+    },
 }
 
 impl AgentWorkspaceRow<'_> {
@@ -37,6 +41,7 @@ impl AgentWorkspaceRow<'_> {
                 workflow_task_id: workflow.id.clone(),
                 call_id: agent.call_id.clone(),
             },
+            Self::RegistryAgent { agent } => AgentWorkspaceIdentity::Task(agent.agent_id.clone()),
         }
     }
 
@@ -48,11 +53,23 @@ impl AgentWorkspaceRow<'_> {
                 agent.status,
                 WorkflowAgentStatus::Pending | WorkflowAgentStatus::Running
             ),
+            Self::RegistryAgent { agent } => agent.status.is_active(),
         }
     }
 
     pub(crate) fn requires_attention(self) -> bool {
-        matches!(self, Self::Subagent { task, .. } | Self::BackgroundTask { task, .. } if task.status.requires_attention())
+        match self {
+            Self::Subagent { task, .. } | Self::BackgroundTask { task, .. } => {
+                task.status.requires_attention()
+            }
+            Self::RegistryAgent { agent } => {
+                matches!(
+                    agent.status,
+                    orca_core::agent_event::AgentStatus::WaitingPermission
+                )
+            }
+            Self::WorkflowAgent { .. } => false,
+        }
     }
 
     fn created_at_ms(self) -> i64 {
@@ -62,11 +79,15 @@ impl AgentWorkspaceRow<'_> {
             Self::WorkflowAgent { workflow, agent } => {
                 agent.started_at_ms.unwrap_or(workflow.created_at_ms)
             }
+            Self::RegistryAgent { agent } => agent.created_at_ms,
         }
     }
 }
 
-pub(crate) fn agent_workspace_rows(tasks: &[BackgroundTaskSummary]) -> Vec<AgentWorkspaceRow<'_>> {
+pub(crate) fn agent_workspace_rows<'a>(
+    tasks: &'a [BackgroundTaskSummary],
+    registry: &'a [AgentSummary],
+) -> Vec<AgentWorkspaceRow<'a>> {
     let mut rows = Vec::new();
     for task in tasks {
         if task.task_type == TaskType::Subagent {
@@ -91,6 +112,19 @@ pub(crate) fn agent_workspace_rows(tasks: &[BackgroundTaskSummary]) -> Vec<Agent
             }));
         }
     }
+    let task_ids = rows
+        .iter()
+        .filter_map(|row| match row.identity() {
+            AgentWorkspaceIdentity::Task(id) => Some(id),
+            AgentWorkspaceIdentity::WorkflowAgent { .. } => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    rows.extend(
+        registry
+            .iter()
+            .filter(|agent| !task_ids.contains(&agent.agent_id))
+            .map(|agent| AgentWorkspaceRow::RegistryAgent { agent }),
+    );
     rows.sort_by(|left, right| {
         left.created_at_ms()
             .cmp(&right.created_at_ms())
@@ -127,35 +161,52 @@ impl AgentWorkspaceState {
     pub(crate) fn selected_row<'a>(
         &self,
         tasks: &'a [BackgroundTaskSummary],
+        registry: &'a [AgentSummary],
     ) -> Option<AgentWorkspaceRow<'a>> {
-        agent_workspace_rows(tasks).get(self.selected).copied()
+        agent_workspace_rows(tasks, registry)
+            .get(self.selected)
+            .copied()
     }
 
     pub(crate) fn rows<'a>(
         &self,
         tasks: &'a [BackgroundTaskSummary],
+        registry: &'a [AgentSummary],
     ) -> Vec<AgentWorkspaceRow<'a>> {
-        agent_workspace_rows(tasks)
+        agent_workspace_rows(tasks, registry)
     }
 
-    pub(crate) fn select_previous(&mut self, tasks: &[BackgroundTaskSummary]) {
-        self.reconcile(tasks);
+    pub(crate) fn select_previous(
+        &mut self,
+        tasks: &[BackgroundTaskSummary],
+        registry: &[AgentSummary],
+    ) {
+        self.reconcile(tasks, registry);
         self.selected = self.selected.saturating_sub(1);
-        self.remember_selected_identity(tasks);
+        self.remember_selected_identity(tasks, registry);
     }
 
-    pub(crate) fn select_next(&mut self, tasks: &[BackgroundTaskSummary]) {
-        self.reconcile(tasks);
-        let row_count = agent_workspace_rows(tasks).len();
+    pub(crate) fn select_next(
+        &mut self,
+        tasks: &[BackgroundTaskSummary],
+        registry: &[AgentSummary],
+    ) {
+        self.reconcile(tasks, registry);
+        let row_count = agent_workspace_rows(tasks, registry).len();
         self.selected = self
             .selected
             .saturating_add(1)
             .min(row_count.saturating_sub(1));
-        self.remember_selected_identity(tasks);
+        self.remember_selected_identity(tasks, registry);
     }
 
-    pub(crate) fn select_task(&mut self, tasks: &[BackgroundTaskSummary], task_id: &str) -> bool {
-        let rows = agent_workspace_rows(tasks);
+    pub(crate) fn select_task(
+        &mut self,
+        tasks: &[BackgroundTaskSummary],
+        registry: &[AgentSummary],
+        task_id: &str,
+    ) -> bool {
+        let rows = agent_workspace_rows(tasks, registry);
         let Some(index) = rows.iter().position(|row| {
             matches!(
                 row.identity(),
@@ -169,8 +220,8 @@ impl AgentWorkspaceState {
         true
     }
 
-    pub(crate) fn reconcile(&mut self, tasks: &[BackgroundTaskSummary]) {
-        let rows = agent_workspace_rows(tasks);
+    pub(crate) fn reconcile(&mut self, tasks: &[BackgroundTaskSummary], registry: &[AgentSummary]) {
+        let rows = agent_workspace_rows(tasks, registry);
         if rows.is_empty() {
             self.selected = 0;
             self.selected_identity = None;
@@ -191,8 +242,12 @@ impl AgentWorkspaceState {
         self.selected_identity = None;
     }
 
-    fn remember_selected_identity(&mut self, tasks: &[BackgroundTaskSummary]) {
-        self.selected_identity = agent_workspace_rows(tasks)
+    fn remember_selected_identity(
+        &mut self,
+        tasks: &[BackgroundTaskSummary],
+        registry: &[AgentSummary],
+    ) {
+        self.selected_identity = agent_workspace_rows(tasks, registry)
             .get(self.selected)
             .map(|row| row.identity());
     }
@@ -200,6 +255,7 @@ impl AgentWorkspaceState {
 
 #[cfg(test)]
 mod tests {
+    use orca_core::agent_event::AgentSummary;
     use orca_core::task_types::{
         BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
     };
@@ -268,13 +324,33 @@ mod tests {
         }
     }
 
+    fn registry_agent(agent_id: &str, created_at_ms: i64) -> AgentSummary {
+        AgentSummary {
+            root_thread_id: "root".to_string(),
+            batch_id: "batch-1".to_string(),
+            batch_size: 1,
+            agent_id: agent_id.to_string(),
+            thread_id: format!("thread-{agent_id}"),
+            parent_thread_id: "root".to_string(),
+            description: agent_id.to_string(),
+            status: orca_core::agent_event::AgentStatus::Running,
+            activity: None,
+            turn: None,
+            usage: Default::default(),
+            result: None,
+            error: None,
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+        }
+    }
+
     #[test]
     fn rows_unify_ordinary_and_workflow_agents_in_stable_creation_order() {
         let mut workflow = task("workflow", TaskType::Workflow, 500);
         workflow.workflow_agents = vec![workflow_agent("workflow-child", 2_000)];
         let ordinary = task("ordinary-child", TaskType::Subagent, 1_000);
 
-        let identities = agent_workspace_rows(&[workflow, ordinary])
+        let identities = agent_workspace_rows(&[workflow, ordinary], &[])
             .into_iter()
             .map(|row| row.identity())
             .collect::<Vec<_>>();
@@ -299,7 +375,7 @@ mod tests {
         let mut second = task("second", TaskType::Subagent, 2_000);
         second.last_activity_at_ms = Some(3_000);
 
-        let identities = agent_workspace_rows(&[second, first])
+        let identities = agent_workspace_rows(&[second, first], &[])
             .into_iter()
             .map(|row| row.identity())
             .collect::<Vec<_>>();
@@ -314,15 +390,39 @@ mod tests {
     }
 
     #[test]
+    fn mixed_task_and_registry_rows_share_selection_identity() {
+        let ordinary = task("ordinary", TaskType::Subagent, 1_000);
+        let registry = registry_agent("registry", 2_000);
+        let tasks = [ordinary.clone()];
+        let rows = agent_workspace_rows(&tasks, std::slice::from_ref(&registry));
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            rows[1],
+            super::AgentWorkspaceRow::RegistryAgent { .. }
+        ));
+
+        let mut state = AgentWorkspaceState::default();
+        state.reconcile(&[ordinary.clone()], std::slice::from_ref(&registry));
+        state.select_next(&[ordinary], std::slice::from_ref(&registry));
+        assert_eq!(state.selected(), 1);
+        assert_eq!(
+            state
+                .selected_row(&tasks, std::slice::from_ref(&registry))
+                .map(|row| row.identity()),
+            Some(AgentWorkspaceIdentity::Task("registry".to_string()))
+        );
+    }
+
+    #[test]
     fn reconcile_preserves_selected_agent_identity_across_refreshes() {
         let mut state = AgentWorkspaceState::default();
         let first = task("first", TaskType::Subagent, 1_000);
         let second = task("second", TaskType::Subagent, 2_000);
-        state.reconcile(&[first.clone(), second.clone()]);
-        state.select_next(&[first.clone(), second.clone()]);
+        state.reconcile(&[first.clone(), second.clone()], &[]);
+        state.select_next(&[first.clone(), second.clone()], &[]);
         assert_eq!(
             state
-                .selected_row(&[first.clone(), second.clone()])
+                .selected_row(&[first.clone(), second.clone()], &[])
                 .map(|row| row.identity()),
             Some(AgentWorkspaceIdentity::Task("second".to_string()))
         );
@@ -332,11 +432,13 @@ mod tests {
         let mut refreshed_second = second;
         refreshed_second.last_activity_at_ms = Some(3_000);
         let refreshed = vec![refreshed_second, refreshed_first];
-        state.reconcile(&refreshed);
+        state.reconcile(&refreshed, &[]);
 
         assert_eq!(state.selected(), 1);
         assert_eq!(
-            state.selected_row(&refreshed).map(|row| row.identity()),
+            state
+                .selected_row(&refreshed, &[])
+                .map(|row| row.identity()),
             Some(AgentWorkspaceIdentity::Task("second".to_string()))
         );
     }
@@ -345,12 +447,12 @@ mod tests {
     fn reset_clears_agent_selection() {
         let mut state = AgentWorkspaceState::default();
         let tasks = vec![task("child", TaskType::Subagent, 1_000)];
-        state.reconcile(&tasks);
-        assert!(state.selected_row(&tasks).is_some());
+        state.reconcile(&tasks, &[]);
+        assert!(state.selected_row(&tasks, &[]).is_some());
 
         state.reset_for_session();
 
         assert_eq!(state.selected(), 0);
-        assert!(state.selected_row(&[]).is_none());
+        assert!(state.selected_row(&[], &[]).is_none());
     }
 }

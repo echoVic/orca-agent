@@ -303,17 +303,18 @@ impl AppState {
 
     pub fn show_agents(&mut self) {
         self.panel_mode = PanelMode::Agents;
-        self.agent_workspace.reconcile(self.workflow_panel.tasks());
+        self.agent_workspace
+            .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
     }
 
     pub(crate) fn select_previous_agent(&mut self) {
         self.agent_workspace
-            .select_previous(self.workflow_panel.tasks());
+            .select_previous(self.workflow_panel.tasks(), &self.agent_registry.agents);
     }
 
     pub(crate) fn select_next_agent(&mut self) {
         self.agent_workspace
-            .select_next(self.workflow_panel.tasks());
+            .select_next(self.workflow_panel.tasks(), &self.agent_registry.agents);
     }
 
     pub(crate) fn agent_selected_index(&self) -> usize {
@@ -321,26 +322,13 @@ impl AppState {
     }
 
     pub(crate) fn agent_rows(&self) -> Vec<AgentWorkspaceRow<'_>> {
-        self.agent_workspace.rows(self.workflow_panel.tasks())
+        self.agent_workspace
+            .rows(self.workflow_panel.tasks(), &self.agent_registry.agents)
     }
 
     pub(crate) fn selected_agent_row(&self) -> Option<AgentWorkspaceRow<'_>> {
         self.agent_workspace
-            .selected_row(self.workflow_panel.tasks())
-    }
-
-    /// Returns the registry-backed child selected in the agents workspace when
-    /// there are no legacy task rows.  Registry-only children must remain
-    /// actionable even though they do not have a BackgroundTaskSummary.
-    pub(crate) fn selected_registry_workspace_agent(
-        &self,
-    ) -> Option<&orca_core::agent_event::AgentSummary> {
-        if !self.agent_rows().is_empty() {
-            return None;
-        }
-        self.agent_registry
-            .agents
-            .get(self.agent_workspace.selected())
+            .selected_row(self.workflow_panel.tasks(), &self.agent_registry.agents)
     }
 
     pub(crate) fn select_next_agent_dock_task(&mut self) {
@@ -407,8 +395,11 @@ impl AppState {
     }
 
     pub(crate) fn select_agent_workspace_task(&mut self, task_id: &str) -> bool {
-        self.agent_workspace
-            .select_task(self.workflow_panel.tasks(), task_id)
+        self.agent_workspace.select_task(
+            self.workflow_panel.tasks(),
+            &self.agent_registry.agents,
+            task_id,
+        )
     }
 
     pub fn select_previous_workflow_task(&mut self) {
@@ -514,7 +505,8 @@ impl AppState {
             .is_some_and(is_backgrounded_running_main_session);
         let selected_task_id = self.selected_workflow_task().map(|task| task.id.clone());
         self.workflow_panel.replace_tasks(tasks);
-        self.agent_workspace.reconcile(self.workflow_panel.tasks());
+        self.agent_workspace
+            .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
         self.sync_subagent_transcript_messages();
         self.refresh_open_task_transcript();
         if should_reveal_background_approval {
@@ -554,7 +546,8 @@ impl AppState {
     pub(crate) fn apply_background_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         self.background_workflow_tasks = tasks.clone();
         self.workflow_panel.replace_tasks(tasks);
-        self.agent_workspace.reconcile(self.workflow_panel.tasks());
+        self.agent_workspace
+            .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
     }
 
     pub(crate) fn apply_agent_registry_update(
@@ -563,6 +556,8 @@ impl AppState {
     ) {
         if snapshot.revision >= self.agent_registry.revision {
             self.agent_registry = snapshot;
+            self.agent_workspace
+                .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
             let announcements = self
                 .agent_registry
                 .agents
@@ -594,7 +589,8 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn replace_workflow_tasks_for_test(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         self.workflow_panel.replace_tasks(tasks);
-        self.agent_workspace.reconcile(self.workflow_panel.tasks());
+        self.agent_workspace
+            .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
     }
 
     #[cfg(test)]
