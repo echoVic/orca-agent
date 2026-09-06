@@ -1933,7 +1933,10 @@ fn agent_workspace_focus_lines<'a>(
                     .turn
                     .map(|turn| format!(" · turn {turn}"))
                     .unwrap_or_default();
-                lines.push(line(format!(" · {}{turn}", entry.activity), theme.muted));
+                lines.push(line(
+                    format!(" · history {}{turn}", entry.activity),
+                    theme.muted,
+                ));
             }
             if let Some(continuation) = task.continuation.as_ref() {
                 let recovery = if continuation.indeterminate {
