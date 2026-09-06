@@ -345,12 +345,17 @@ impl RuntimeShellSessionManager {
         } else {
             orca_tools::sandbox::enforcement_state()
         };
+        let execution_profile = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
+            orca_core::capability::ExecutionProfile::TrustedHost
+        } else {
+            orca_core::capability::ExecutionProfile::Workspace
+        };
         let broker = ExecutionBroker::with_backend_and_ceiling(
             enforcement,
             shell_backend_name(),
             shell_capability_ceiling(&command, &metadata_writable_directories),
         )
-        .with_profile(cfg.execution_profile);
+        .with_profile(execution_profile);
 
         #[cfg(windows)]
         if !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
