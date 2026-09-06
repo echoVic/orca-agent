@@ -78,7 +78,7 @@ const copy = {
       ],
     },
     summaries: {
-      "v0.4.21":
+      "v0.4.22":
         "Four-plane agent runtime with independent child transcripts and canonical event reduction.",
       "v0.4.19":
         "Runs the release gate against the exact Goal recovery regressions and contract suites while retaining complete workspace compilation.",
@@ -656,7 +656,7 @@ const copy = {
       ],
     },
     summaries: {
-      "v0.4.21": "四平面 agent runtime：独立子线程、统一 Dock、权限 profile 继承与事件日志。",
+      "v0.4.22": "修复 Goal terminal checkpoint recovery 的 prepared batch 保留与冷恢复路径。",
       "v0.4.19":
         "发布 gate 直接执行 Goal recovery 回归和 contract suite，同时保留完整 workspace compile check。",
       "v0.4.18":
