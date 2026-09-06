@@ -1451,12 +1451,14 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
                 " Main [default]",
                 Style::default().fg(theme.text),
             ))];
-            for agent in state
+            for (index, agent) in state
                 .agent_registry
                 .agents
                 .iter()
                 .take(MAX_DEFAULT_SUBAGENTS)
+                .enumerate()
             {
+                let selected = state.agent_selected_index() == index;
                 let icon = if agent.status.is_active() {
                     spinner_frame(state.tick)
                 } else {
@@ -1473,10 +1475,19 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
                 };
                 lines.push(Line::from(Span::styled(
                     truncate_to_display_width(
-                        &format!(" {icon} {} · {status}", agent.description),
+                        &format!(
+                            "{} {icon} {} · {status}",
+                            if selected { "›" } else { " " },
+                            agent.description
+                        ),
                         inner.width as usize,
                     ),
-                    Style::default().fg(if agent.status.is_active() {
+                    (if selected {
+                        theme.selection_style()
+                    } else {
+                        Style::default()
+                    })
+                    .fg(if agent.status.is_active() {
                         theme.warning
                     } else {
                         theme.muted

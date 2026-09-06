@@ -329,6 +329,20 @@ impl AppState {
             .selected_row(self.workflow_panel.tasks())
     }
 
+    /// Returns the registry-backed child selected in the agents workspace when
+    /// there are no legacy task rows.  Registry-only children must remain
+    /// actionable even though they do not have a BackgroundTaskSummary.
+    pub(crate) fn selected_registry_workspace_agent(
+        &self,
+    ) -> Option<&orca_core::agent_event::AgentSummary> {
+        if !self.agent_rows().is_empty() {
+            return None;
+        }
+        self.agent_registry
+            .agents
+            .get(self.agent_workspace.selected())
+    }
+
     pub(crate) fn select_next_agent_dock_task(&mut self) {
         let visible = self.agent_dock_ids();
         let next = match self.agent_dock_selected_task_id.as_deref() {

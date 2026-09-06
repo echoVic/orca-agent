@@ -57,8 +57,13 @@ pub(crate) fn handle_agent_workspace_key(
                     })
                 }
                 Some(AgentWorkspaceRow::BackgroundTask { .. })
-                | Some(AgentWorkspaceRow::WorkflowAgent { .. })
-                | None => None,
+                | Some(AgentWorkspaceRow::WorkflowAgent { .. }) => None,
+                None => state.selected_registry_workspace_agent().map(|agent| {
+                    UserAction::FocusChildThread {
+                        task_id: agent.agent_id.clone(),
+                        expected_revision: state.agent_registry.revision,
+                    }
+                }),
             };
             if let Some(action) = action {
                 if let UserAction::ReadTaskTranscript(request) = &action {
