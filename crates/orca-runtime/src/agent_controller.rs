@@ -257,7 +257,10 @@ impl AgentController {
             turn = turn.with_approval_handler(handler);
         }
         if let Some(handler) = request.permission_handler {
-            turn = turn.with_permission_handler(handler);
+            turn = turn.with_permission_handler(Arc::new(AgentPermissionHandler {
+                inner: handler,
+                publisher: publisher.clone(),
+            }));
         }
         let operation = match child
             .start_turn_with_output(turn, AgentOutputWriter::new(publisher.clone()))
@@ -501,6 +504,47 @@ impl EventObserver for AgentEventPublisher {
 /// structured lifecycle facts; this writer covers the operation writer bytes.
 struct AgentOutputWriter {
     publisher: Arc<AgentEventPublisher>,
+}
+
+struct AgentPermissionHandler {
+    inner: Arc<dyn RuntimePermissionRequestHandler + Send + Sync>,
+    publisher: Arc<AgentEventPublisher>,
+}
+
+impl RuntimePermissionRequestHandler for AgentPermissionHandler {
+    fn request_permissions(
+        &self,
+        request: &crate::runtime_permission::RuntimePermissionRequest,
+    ) -> io::Result<crate::runtime_permission::RuntimePermissionResponse> {
+        self.publisher.append_registry_event(
+            &self.publisher.thread_id,
+            orca_core::agent_event::AgentEvent::PermissionRequested {
+                description: request
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "permission requested".to_string()),
+            },
+        )?;
+        self.inner.request_permissions(request)
+    }
+
+    fn request_permissions_pre_side_effect(
+        &self,
+        request: &crate::runtime_permission::RuntimePermissionRequest,
+        overlay: &crate::runtime_permission::TurnPermissionOverlay,
+    ) -> io::Result<crate::runtime_permission::RuntimePermissionResponse> {
+        self.publisher.append_registry_event(
+            &self.publisher.thread_id,
+            orca_core::agent_event::AgentEvent::PermissionRequested {
+                description: request
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "permission requested".to_string()),
+            },
+        )?;
+        self.inner
+            .request_permissions_pre_side_effect(request, overlay)
+    }
 }
 
 impl AgentOutputWriter {
