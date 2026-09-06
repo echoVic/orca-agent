@@ -223,7 +223,7 @@ impl AgentController {
             Arc::clone(&self.registry),
             self.root_thread_id.clone(),
             self.parent_thread_id.clone(),
-            request.agent_id.clone(),
+            format!("{}@{}", request.agent_id, thread_id),
             request.description.clone(),
             thread_id.clone(),
             batch_id,
