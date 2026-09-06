@@ -438,6 +438,7 @@ pub struct AppState {
     /// visible. Child projections are merged into this list for the agent
     /// dock instead of replacing sibling activity.
     pub(crate) background_workflow_tasks: Vec<BackgroundTaskSummary>,
+    pub(crate) agent_registry: orca_core::agent_event::AgentRegistrySnapshot,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
@@ -670,6 +671,7 @@ impl AppState {
             surface_operation: SurfaceOperationProjectionState::default(),
             surface_workflow_tasks: SurfaceWorkflowTaskProjectionState::default(),
             background_workflow_tasks: Vec::new(),
+            agent_registry: orca_core::agent_event::AgentRegistrySnapshot::default(),
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,
             panel_mode: PanelMode::Conversation,
@@ -991,6 +993,8 @@ impl AppState {
         self.surface_goal.reset();
         self.surface_operation.reset();
         self.surface_workflow_tasks.reset();
+        self.background_workflow_tasks.clear();
+        self.agent_registry = orca_core::agent_event::AgentRegistrySnapshot::default();
         self.recovery_prompt_visible = false;
         self.recovery_prompt_selected = 0;
         self.surface_metrics.reset();

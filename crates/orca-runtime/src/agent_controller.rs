@@ -145,6 +145,14 @@ impl AgentController {
 
     pub(crate) fn launch(&self, request: AgentLaunchRequest) -> io::Result<AgentLaunchResult> {
         let surface_activity = request.surface_activity;
+        let batch_id = surface_activity
+            .as_ref()
+            .map(|activity| activity.batch_id.clone())
+            .unwrap_or_else(|| format!("batch-{}", request.agent_id));
+        let batch_size = surface_activity
+            .as_ref()
+            .map(|activity| activity.batch_size)
+            .unwrap_or(1);
         if let Some(activity) = surface_activity.as_ref() {
             activity
                 .emitter
@@ -216,6 +224,8 @@ impl AgentController {
             request.agent_id.clone(),
             request.description.clone(),
             thread_id.clone(),
+            batch_id,
+            batch_size,
         ));
         if let Err(error) = publisher.publish_spawned(&thread_id) {
             let _ = child.shutdown();
@@ -339,6 +349,8 @@ struct AgentEventPublisher {
     parent_thread_id: String,
     agent_id: String,
     description: String,
+    batch_id: String,
+    batch_size: u32,
     thread_id: String,
     attempt_id: String,
     next_sequence: AtomicU64,
@@ -353,6 +365,8 @@ impl AgentEventPublisher {
         agent_id: String,
         description: String,
         thread_id: String,
+        batch_id: String,
+        batch_size: u32,
     ) -> Self {
         Self {
             surface_activity: surface_activity.map(AgentSurfacePublisher::new),
@@ -362,6 +376,8 @@ impl AgentEventPublisher {
             attempt_id: format!("attempt-{agent_id}"),
             agent_id,
             description,
+            batch_id,
+            batch_size,
             thread_id,
             next_sequence: AtomicU64::new(1),
         }
@@ -371,8 +387,8 @@ impl AgentEventPublisher {
         self.append_registry_event(
             thread_id,
             orca_core::agent_event::AgentEvent::Spawned {
-                batch_id: format!("batch-{}", self.agent_id),
-                batch_size: 1,
+                batch_id: self.batch_id.clone(),
+                batch_size: self.batch_size,
                 parent_thread_id: self.parent_thread_id.clone(),
                 description: self.description.clone(),
             },

@@ -13,7 +13,7 @@ const AGENT_JOURNAL_FILE: &str = "agent-events.jsonl";
 const AGENT_DEAD_LETTER_FILE: &str = "agent-events.dead-letter.jsonl";
 const AGENT_JOURNAL_LOCK_FILE: &str = "agent-events.lock";
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AgentRegistryState {
     revision: u64,
     agents: HashMap<(String, String), AgentSummary>,
@@ -126,6 +126,11 @@ impl AgentRegistry {
             };
         }
         validate_next_sequence(&state, &event, SequenceMode::Strict)?;
+        // Apply to a private candidate before touching the journal. Semantic
+        // failures (duplicate identity, terminal transition, wrong thread)
+        // must never leave an event on disk that this process did not apply.
+        let mut next_state = state.clone();
+        apply_event(&mut next_state, &event, SequenceMode::Strict)?;
         if let Some(journal) = self.journal.as_ref() {
             let mut encoded = serde_json::to_vec(&event)?;
             encoded.push(b'\n');
@@ -140,7 +145,7 @@ impl AgentRegistry {
             journal.write_all(&encoded)?;
             journal.sync_data()?;
         }
-        apply_event(&mut state, &event, SequenceMode::Strict)?;
+        *state = next_state;
         Ok(())
     }
 

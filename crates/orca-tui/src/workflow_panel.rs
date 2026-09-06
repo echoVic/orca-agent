@@ -530,6 +530,15 @@ impl AppState {
         self.agent_workspace.reconcile(self.workflow_panel.tasks());
     }
 
+    pub(crate) fn apply_agent_registry_update(
+        &mut self,
+        snapshot: orca_core::agent_event::AgentRegistrySnapshot,
+    ) {
+        if snapshot.revision >= self.agent_registry.revision {
+            self.agent_registry = snapshot;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_workflow_tasks_for_test(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         self.workflow_panel.replace_tasks(tasks);

@@ -37,10 +37,6 @@ pub struct ExecutionBroker {
     profile: ExecutionProfile,
     backend: String,
     ceiling: CapabilityCeiling,
-    /// Identity of a wired remote execution backend, if any. `None` means this
-    /// broker can only spawn locally, so a `RemoteSandbox` profile must be
-    /// rejected rather than silently satisfied by a local process.
-    remote_backend: Option<String>,
 }
 
 impl ExecutionBroker {
@@ -54,7 +50,6 @@ impl ExecutionBroker {
             profile: ExecutionProfile::Workspace,
             backend: backend.into(),
             ceiling: CapabilityCeiling::from(crate::capability::CapabilitySet::all()),
-            remote_backend: None,
         }
     }
 
@@ -68,7 +63,6 @@ impl ExecutionBroker {
             profile: ExecutionProfile::Workspace,
             backend: backend.into(),
             ceiling,
-            remote_backend: None,
         }
     }
 
@@ -83,14 +77,6 @@ impl ExecutionBroker {
             .capabilities
             .intersect(&profile.capability_ceiling())
             .expect("execution profile capability intersection is valid");
-        self
-    }
-
-    /// Register a concrete remote execution backend. Until this is called, a
-    /// `RemoteSandbox` profile is rejected fail-closed so it can never be
-    /// serviced by the local spawn path.
-    pub fn with_remote_backend(mut self, backend: impl Into<String>) -> Self {
-        self.remote_backend = Some(backend.into());
         self
     }
 
@@ -203,15 +189,10 @@ impl ExecutionBroker {
             .ensure_subset_of(&self.ceiling)
             .map_err(|_| LaunchError::CapabilityCeilingExceeded)?;
         if self.profile == ExecutionProfile::RemoteSandbox {
-            // A remote profile is only satisfiable by an actual remote backend.
-            // Without one, refuse rather than fall through to the local spawn
-            // path below, which would run the "remote" workload on the host.
-            if self.remote_backend.is_none() {
-                return Err(LaunchError::RemoteBackendUnavailable);
-            }
-            if capability.process_class != CapabilityProcessClass::RemoteSandbox {
-                return Err(LaunchError::UntrustedProcessClass);
-            }
+            // This broker has no remote launcher implementation. A backend
+            // name is metadata only; never let it authorize the local spawn
+            // path, which would run a "remote" workload on the host.
+            return Err(LaunchError::RemoteBackendUnavailable);
         }
         if self.profile == ExecutionProfile::TrustedHost {
             return Ok(());

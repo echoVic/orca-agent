@@ -12,6 +12,7 @@ use tui_textarea::TextArea;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use orca_core::agent_event::{AgentActivity, AgentStatus};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::task_types::{
     BackgroundTaskSummary, TaskActivitySummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
@@ -1464,7 +1465,8 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
     let selected = rows[selected_index];
     let summary = agent_workspace_summary_line(&rows, theme);
     let hint = agent_workspace_action_hint(selected, theme);
-    let focus_lines = agent_workspace_focus_lines(selected, theme, inner.width as usize);
+    let focus_lines =
+        agent_workspace_focus_lines(selected, theme, inner.width as usize, state.tick);
     let fixed_height = 2_u16;
     let max_focus_height = inner.height.saturating_sub(fixed_height + 1);
     let focus_height = (focus_lines.len() as u16).min(max_focus_height);
@@ -1778,6 +1780,7 @@ fn agent_workspace_focus_lines<'a>(
     row: AgentWorkspaceRow<'_>,
     theme: &Theme,
     width: usize,
+    tick: u64,
 ) -> Vec<Line<'a>> {
     let line = |text: String, color: Color| {
         Line::from(Span::styled(
@@ -1814,17 +1817,25 @@ fn agent_workspace_focus_lines<'a>(
                 line(format!(" {}", metadata.join(" · ")), theme.muted),
             ];
             if let Some(activity) = task.subagent_current_activity.as_deref() {
-                lines.push(line(format!(" now {activity}"), theme.warning));
+                let marker = if task.status == TaskStatus::Running {
+                    spinner_frame(tick)
+                } else {
+                    "●"
+                };
+                lines.push(line(format!(" {marker} now {activity}"), theme.warning));
             }
-            for entry in task.subagent_activity_history.iter().rev().take(4).rev() {
+            for entry in task
+                .subagent_activity_history
+                .iter()
+                .rev()
+                .take(orca_core::task_types::MAX_SUBAGENT_ACTIVITY_HISTORY)
+                .rev()
+            {
                 let turn = entry
                     .turn
                     .map(|turn| format!(" · turn {turn}"))
                     .unwrap_or_default();
-                lines.push(line(
-                    format!(" history {}{turn}", entry.activity),
-                    theme.muted,
-                ));
+                lines.push(line(format!(" · {}{turn}", entry.activity), theme.muted));
             }
             if let Some(continuation) = task.continuation.as_ref() {
                 let recovery = if continuation.indeterminate {
@@ -3873,12 +3884,101 @@ fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::styl
         state.panel_mode,
         PanelMode::Conversation | PanelMode::Agents
     ) {
-        lines.extend(background_task_activity_lines(
-            state.workflow_tasks(),
-            theme,
-            state.tick,
-            state.agent_dock_selected_task_id.as_deref(),
+        if !state.agent_registry.agents.is_empty() {
+            lines.extend(agent_registry_activity_lines(
+                &state.agent_registry,
+                theme,
+                state.tick,
+            ));
+            let non_agent_tasks = state
+                .workflow_tasks()
+                .iter()
+                .filter(|task| task.task_type != TaskType::Subagent)
+                .cloned()
+                .collect::<Vec<_>>();
+            lines.extend(background_task_activity_lines(
+                &non_agent_tasks,
+                theme,
+                state.tick,
+                state.agent_dock_selected_task_id.as_deref(),
+            ));
+        } else {
+            lines.extend(background_task_activity_lines(
+                state.workflow_tasks(),
+                theme,
+                state.tick,
+                state.agent_dock_selected_task_id.as_deref(),
+            ));
+        }
+    }
+    lines
+}
+
+fn agent_registry_activity_lines(
+    snapshot: &orca_core::agent_event::AgentRegistrySnapshot,
+    theme: &Theme,
+    tick: u64,
+) -> Vec<(String, ratatui::style::Color)> {
+    let visible = snapshot
+        .agents
+        .iter()
+        .filter(|agent| agent.status.is_active())
+        .collect::<Vec<_>>();
+    if visible.is_empty() {
+        return Vec::new();
+    }
+    let active = visible
+        .iter()
+        .filter(|agent| matches!(&agent.status, AgentStatus::Queued | AgentStatus::Running))
+        .count();
+    let attention = visible
+        .iter()
+        .filter(|agent| matches!(&agent.status, AgentStatus::WaitingPermission))
+        .count();
+    let mut header = format!("● Agents {active} active");
+    if attention > 0 {
+        header.push_str(&format!(" · {attention} attention"));
+    }
+    header.push_str(" · /agents view");
+    let mut lines = vec![(
+        header,
+        if attention > 0 {
+            theme.approval
+        } else {
+            theme.warning
+        },
+    )];
+    lines.push(("  ○ Main [default]".to_string(), theme.text));
+    for agent in visible.iter().take(MAX_DEFAULT_SUBAGENTS) {
+        let icon = if matches!(&agent.status, AgentStatus::Queued | AgentStatus::Running) {
+            spinner_frame(tick)
+        } else {
+            "●"
+        };
+        let status = match &agent.status {
+            AgentStatus::Queued => "queued",
+            AgentStatus::Running => "running",
+            AgentStatus::WaitingPermission => "waiting permission",
+            _ => "idle",
+        };
+        lines.push((
+            format!("  ○ {icon} {} · {status}", agent.description),
+            if matches!(&agent.status, AgentStatus::WaitingPermission) {
+                theme.approval
+            } else {
+                theme.text
+            },
         ));
+        let detail = agent
+            .activity
+            .as_ref()
+            .map(AgentActivity::label)
+            .unwrap_or_else(|| "waiting for activity".to_string());
+        lines.push((format!("    {detail}"), theme.muted));
+    }
+    let overflow = visible.len().saturating_sub(MAX_DEFAULT_SUBAGENTS);
+    if overflow > 0 {
+        lines.push((format!("  +{overflow} more · /tasks manage"), theme.muted));
     }
     lines
 }
