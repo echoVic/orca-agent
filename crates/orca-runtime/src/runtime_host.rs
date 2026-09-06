@@ -5435,18 +5435,19 @@ async fn run_host_supervisor(
                     prompt_queue_dispatch_ready: Arc::new(AtomicBool::new(false)),
                 };
                 let root_thread_id = agent_root_thread_id.unwrap_or_else(|| thread_id.clone());
-                thread
-                    .thread_extensions()
-                    .insert(crate::agent_controller::AgentController::new(
+                thread.thread_extensions().insert(
+                    crate::agent_controller::AgentController::new_with_registry(
                         RuntimeHostHandle {
                             command_tx: command_tx.clone(),
                             host_incarnation: host_incarnation.clone(),
                             agent_registry: Arc::clone(&agent_registry),
                         },
+                        Arc::clone(&agent_registry),
                         root_thread_id,
                         thread_id.clone(),
                         agent_depth,
-                    ));
+                    ),
+                );
                 if let Some(subagent_type) = agent_type {
                     thread
                         .thread_extensions()

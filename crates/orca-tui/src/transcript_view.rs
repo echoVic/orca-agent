@@ -1457,9 +1457,6 @@ fn message_spinner_phase(message: &ChatMessage, tick: u64) -> Option<u8> {
         {
             Some(((tick / 2) % 10) as u8)
         }
-        ChatMessage::Subagent { status, .. } if status == "running" => {
-            Some(((tick / 2) % 10) as u8)
-        }
         _ => None,
     }
 }

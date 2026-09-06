@@ -1287,20 +1287,12 @@ impl AppState {
             .min(self.transcript.messages.len());
         let Some(index) = self.transcript.messages[live_start..]
             .iter()
-            .rposition(|message| {
-                matches!(
-                    message,
-                    ChatMessage::ToolCall { .. } | ChatMessage::Subagent { .. }
-                )
-            })
+            .rposition(|message| matches!(message, ChatMessage::ToolCall { .. }))
         else {
             return false;
         };
         self.mutate_message(live_start + index, |message| match message {
             ChatMessage::ToolCall { expanded, .. } => {
-                *expanded = !*expanded;
-            }
-            ChatMessage::Subagent { expanded, .. } => {
                 *expanded = !*expanded;
             }
             _ => unreachable!(),
@@ -1371,7 +1363,6 @@ impl AppState {
             ChatMessage::ToolCall { status, .. } => {
                 !matches!(status.as_str(), "running" | "receiving")
             }
-            ChatMessage::Subagent { status, .. } => status != "running",
             ChatMessage::Reasoning(_)
             | ChatMessage::Assistant(_)
             | ChatMessage::ProposedPlan(_) => turn_ended || !is_last,

@@ -1,5 +1,6 @@
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
@@ -96,6 +97,7 @@ pub(crate) struct AgentLaunchResult {
 #[derive(Clone)]
 pub(crate) struct AgentController {
     host: RuntimeHostHandle,
+    registry: Arc<crate::agent_registry::AgentRegistry>,
     root_thread_id: String,
     parent_thread_id: String,
     depth: u32,
@@ -113,14 +115,28 @@ impl std::fmt::Debug for AgentController {
 }
 
 impl AgentController {
+    #[cfg(test)]
     pub(crate) fn new(
         host: RuntimeHostHandle,
         root_thread_id: String,
         parent_thread_id: String,
         depth: u32,
     ) -> Self {
+        let registry = crate::agent_registry::AgentRegistry::open_default()
+            .unwrap_or_else(|_| Arc::new(crate::agent_registry::AgentRegistry::in_memory()));
+        Self::new_with_registry(host, registry, root_thread_id, parent_thread_id, depth)
+    }
+
+    pub(crate) fn new_with_registry(
+        host: RuntimeHostHandle,
+        registry: Arc<crate::agent_registry::AgentRegistry>,
+        root_thread_id: String,
+        parent_thread_id: String,
+        depth: u32,
+    ) -> Self {
         Self {
             host,
+            registry,
             root_thread_id,
             parent_thread_id,
             depth,
@@ -192,7 +208,21 @@ impl AgentController {
                 failure_after_started_message(surface_activity.as_ref(), &error.to_string());
             return Err(io::Error::other(message));
         }
-        let publisher = Arc::new(AgentEventPublisher::new(surface_activity));
+        let publisher = Arc::new(AgentEventPublisher::new(
+            surface_activity,
+            Arc::clone(&self.registry),
+            self.root_thread_id.clone(),
+            self.parent_thread_id.clone(),
+            request.agent_id.clone(),
+            request.description.clone(),
+            thread_id.clone(),
+        ));
+        if let Err(error) = publisher.publish_spawned(&thread_id) {
+            let _ = child.shutdown();
+            return Err(io::Error::other(format!(
+                "failed to record delegated child spawn: {error}"
+            )));
+        }
         if let Err(error) = publisher.publish_surface_bound(&thread_id) {
             let terminal_error = publisher.publish_surface_terminal(
                 RunStatus::Failed,
@@ -304,13 +334,68 @@ fn failure_after_started_message(
 
 struct AgentEventPublisher {
     surface_activity: Option<AgentSurfacePublisher>,
+    registry: Arc<crate::agent_registry::AgentRegistry>,
+    root_thread_id: String,
+    parent_thread_id: String,
+    agent_id: String,
+    description: String,
+    thread_id: String,
+    attempt_id: String,
+    next_sequence: AtomicU64,
 }
 
 impl AgentEventPublisher {
-    fn new(surface_activity: Option<AgentSurfaceActivity>) -> Self {
+    fn new(
+        surface_activity: Option<AgentSurfaceActivity>,
+        registry: Arc<crate::agent_registry::AgentRegistry>,
+        root_thread_id: String,
+        parent_thread_id: String,
+        agent_id: String,
+        description: String,
+        thread_id: String,
+    ) -> Self {
         Self {
             surface_activity: surface_activity.map(AgentSurfacePublisher::new),
+            registry,
+            root_thread_id,
+            parent_thread_id,
+            attempt_id: format!("attempt-{agent_id}"),
+            agent_id,
+            description,
+            thread_id,
+            next_sequence: AtomicU64::new(1),
         }
+    }
+
+    fn publish_spawned(&self, thread_id: &str) -> io::Result<()> {
+        self.append_registry_event(
+            thread_id,
+            orca_core::agent_event::AgentEvent::Spawned {
+                batch_id: format!("batch-{}", self.agent_id),
+                batch_size: 1,
+                parent_thread_id: self.parent_thread_id.clone(),
+                description: self.description.clone(),
+            },
+        )
+    }
+
+    fn append_registry_event(
+        &self,
+        thread_id: &str,
+        event: orca_core::agent_event::AgentEvent,
+    ) -> io::Result<()> {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let envelope = orca_core::agent_event::AgentEventEnvelope::new(
+            uuid::Uuid::now_v7().to_string(),
+            self.root_thread_id.clone(),
+            self.agent_id.clone(),
+            thread_id.to_string(),
+            self.attempt_id.clone(),
+            sequence,
+            chrono::Utc::now().timestamp_millis(),
+            event,
+        );
+        self.registry.append(envelope)
     }
 
     fn publish_surface_terminal(
@@ -321,8 +406,29 @@ impl AgentEventPublisher {
         usage: orca_core::cost_types::UsageTotals,
     ) -> io::Result<()> {
         self.surface_activity.as_ref().map_or(Ok(()), |publisher| {
-            publisher.completed(status, output.as_deref(), error.as_deref(), usage)
-        })
+            publisher.completed(status, output.as_deref(), error.as_deref(), usage.clone())
+        })?;
+        let registry_usage = orca_core::agent_event::AgentUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_tokens: usage.cache_tokens,
+            cost_micro_usd: (usage.estimated_cost_usd.max(0.0) * 1_000_000.0).round() as u64,
+        };
+        let event = match status {
+            RunStatus::Success => orca_core::agent_event::AgentEvent::Completed {
+                result: output,
+                usage: registry_usage,
+            },
+            RunStatus::Cancelled => orca_core::agent_event::AgentEvent::Cancelled {
+                reason: error.unwrap_or_else(|| "cancelled".to_string()),
+                usage: registry_usage,
+            },
+            _ => orca_core::agent_event::AgentEvent::Failed {
+                reason: error.unwrap_or_else(|| "agent failed".to_string()),
+                usage: registry_usage,
+            },
+        };
+        self.append_registry_event(&self.thread_id, event)
     }
 
     fn publish_surface_bound(&self, thread_id: &str) -> io::Result<()> {
@@ -336,7 +442,29 @@ impl EventObserver for AgentEventPublisher {
     fn observe(&self, event: &EventEnvelope) -> io::Result<()> {
         self.surface_activity
             .as_ref()
-            .map_or(Ok(()), |surface_activity| surface_activity.observe(event))
+            .map_or(Ok(()), |surface_activity| surface_activity.observe(event))?;
+        let activity = match event.event_type {
+            EventType::TurnStarted => Some(orca_core::agent_event::AgentActivity::Thinking),
+            EventType::ToolCallRequested => Some(orca_core::agent_event::AgentActivity::Tool {
+                name: event.payload["name"].as_str().unwrap_or("tool").to_string(),
+                target: event.payload["target"].as_str().map(str::to_string),
+            }),
+            EventType::AssistantReasoningDelta | EventType::AssistantMessageDelta => {
+                Some(orca_core::agent_event::AgentActivity::Thinking)
+            }
+            _ => None,
+        };
+        if let Some(activity) = activity {
+            self.append_registry_event(
+                &self.thread_id,
+                orca_core::agent_event::AgentEvent::Activity {
+                    activity,
+                    turn: event.payload["turn"].as_u64().map(|value| value as u32),
+                    usage: None,
+                },
+            )?;
+        }
+        Ok(())
     }
 }
 

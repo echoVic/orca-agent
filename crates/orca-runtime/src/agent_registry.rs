@@ -282,6 +282,7 @@ fn apply_event(
             usage,
         } => {
             let agent = require_agent(state, event)?;
+            reject_late_terminal_activity(agent)?;
             agent.status = AgentStatus::Running;
             agent.activity = Some(activity.clone());
             if turn.is_some() {
@@ -293,10 +294,13 @@ fn apply_event(
             agent.updated_at_ms = event.occurred_at_ms;
         }
         AgentEvent::OutputDelta { .. } => {
-            require_agent(state, event)?.updated_at_ms = event.occurred_at_ms;
+            let agent = require_agent(state, event)?;
+            reject_late_terminal_activity(agent)?;
+            agent.updated_at_ms = event.occurred_at_ms;
         }
         AgentEvent::PermissionRequested { description } => {
             let agent = require_agent(state, event)?;
+            reject_late_terminal_activity(agent)?;
             agent.status = AgentStatus::WaitingPermission;
             agent.activity = Some(orca_core::agent_event::AgentActivity::WaitingPermission {
                 description: description.clone(),
@@ -362,6 +366,22 @@ fn require_agent<'a>(
         ));
     }
     Ok(agent)
+}
+
+fn reject_late_terminal_activity(agent: &AgentSummary) -> io::Result<()> {
+    if matches!(
+        agent.status,
+        AgentStatus::Completed
+            | AgentStatus::Failed
+            | AgentStatus::Cancelled
+            | AgentStatus::Corrupt
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "agent event arrived after terminal state",
+        ));
+    }
+    Ok(())
 }
 
 fn consume_dead_letter(state: &mut AgentRegistryState, event: &AgentEventEnvelope, reason: &str) {
@@ -467,6 +487,49 @@ mod tests {
         assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.agents[0].status, AgentStatus::Completed);
         assert_eq!(snapshot.agents[0].result.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn terminal_agent_rejects_late_activity_without_reopening() {
+        let registry = AgentRegistry::in_memory();
+        registry
+            .append(event(
+                1,
+                "spawn-terminal",
+                AgentEvent::Spawned {
+                    batch_id: "batch".to_string(),
+                    batch_size: 1,
+                    parent_thread_id: "root".to_string(),
+                    description: "inspect".to_string(),
+                },
+            ))
+            .unwrap();
+        registry
+            .append(event(
+                2,
+                "done-terminal",
+                AgentEvent::Completed {
+                    result: Some("ok".to_string()),
+                    usage: Default::default(),
+                },
+            ))
+            .unwrap();
+        let error = registry
+            .append(event(
+                3,
+                "late-terminal",
+                AgentEvent::Activity {
+                    activity: orca_core::agent_event::AgentActivity::Thinking,
+                    turn: Some(2),
+                    usage: None,
+                },
+            ))
+            .expect_err("terminal agents must not reopen on late activity");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            registry.snapshot("root").agents[0].status,
+            AgentStatus::Completed
+        );
     }
 
     #[test]

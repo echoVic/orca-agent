@@ -300,7 +300,10 @@ fn new_session_started_resets_conversation_state_and_preserves_runtime_settings(
     )));
     state.update(TuiEvent::NewSessionStarted);
 
-    assert!(state.transcript.messages.is_empty());
+    assert!(matches!(
+        state.transcript.messages.as_slice(),
+        [ChatMessage::System(text)] if text == "Delegating to 1 agent"
+    ));
     assert!(state.current_plan().is_none());
     assert_eq!(state.usage(), &UsageTotals::default());
     assert_eq!(state.context_used_tokens(), 0);
@@ -436,7 +439,7 @@ fn workflow_notification_action_carries_notification_boundary() {
 }
 
 #[test]
-fn task_snapshot_projects_running_subagent_into_main_conversation() {
+fn task_snapshot_keeps_running_subagent_out_of_main_conversation() {
     let mut state = state();
     let mut task = workflow_task_summary("agent-1", "backend analysis");
     task.task_type = TaskType::Subagent;
@@ -451,14 +454,13 @@ fn task_snapshot_projects_running_subagent_into_main_conversation() {
     state.apply_workflow_tasks_for_test(vec![task]);
 
     assert!(matches!(
-        state.transcript.messages.last(),
-        Some(ChatMessage::Subagent { id, status, .. })
-            if id == "agent-1" && status == "running"
+        state.transcript.messages.as_slice(),
+        [ChatMessage::System(text)] if text == "Delegating to 1 agent"
     ));
 }
 
 #[test]
-fn surface_projection_announces_group_once_and_projects_inline_child_messages() {
+fn surface_projection_announces_group_once_without_inline_child_messages() {
     let mut state = state();
     let tasks = (1..=4)
         .map(|index| {
@@ -493,19 +495,17 @@ fn surface_projection_announces_group_once_and_projects_inline_child_messages() 
     )));
     state.update(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
 
-    assert_eq!(state.transcript.messages.len(), 5);
+    assert_eq!(state.transcript.messages.len(), 1);
     assert!(matches!(
         &state.transcript.messages[0],
         ChatMessage::System(text) if text == "Delegating to 4 agents in parallel"
     ));
-    assert_eq!(
+    assert!(
         state
             .transcript
             .messages
             .iter()
-            .filter(|message| matches!(message, ChatMessage::Subagent { .. }))
-            .count(),
-        4
+            .all(|message| matches!(message, ChatMessage::System(_)))
     );
     assert_eq!(state.workflow_tasks().len(), 4);
 }
@@ -686,7 +686,7 @@ fn approval_needed_event_populates_dialog_options_and_diff() {
 }
 
 #[test]
-fn surface_subagent_projection_materializes_and_updates_parent_transcript() {
+fn surface_subagent_projection_updates_dock_without_parent_transcript_materialization() {
     let mut state = state();
     let mut task = workflow_task_summary("agent-1", "inspect repo");
     task.task_type = orca_core::task_types::TaskType::Subagent;
@@ -706,42 +706,27 @@ fn surface_subagent_projection_materializes_and_updates_parent_transcript() {
     ];
     state.apply_workflow_tasks_update(vec![task.clone()]);
 
-    let ChatMessage::Subagent {
-        id,
-        status,
-        activity_tail,
-        expanded,
-        ..
-    } = state.transcript.messages.last().expect("subagent message")
-    else {
-        panic!("expected subagent message");
-    };
-    assert_eq!(id, "agent-1");
-    assert_eq!(status, "running");
-    assert_eq!(activity_tail, &vec!["read: Cargo.toml", "bash: cargo test"]);
-    assert!(*expanded, "running subagents must auto-expand");
+    assert!(state.transcript.messages.iter().all(|message| {
+        !matches!(
+            message,
+            ChatMessage::Assistant(_) | ChatMessage::ToolCall { .. }
+        )
+    }));
+    assert_eq!(state.workflow_tasks().len(), 1);
 
     let mut completed = task;
     completed.status = orca_core::task_types::TaskStatus::Completed;
     completed.subagent_current_activity = None;
     completed.result = Some("done".to_string());
     state.apply_workflow_tasks_update(vec![completed]);
-    assert_eq!(
+    assert!(
         state
             .transcript
             .messages
             .iter()
-            .filter(
-                |message| matches!(message, ChatMessage::Subagent { id, .. } if id == "agent-1")
-            )
-            .count(),
-        1
+            .all(|message| matches!(message, ChatMessage::System(_)))
     );
-    assert!(matches!(
-        state.transcript.messages.last(),
-        Some(ChatMessage::Subagent { status, output, .. })
-            if status == "completed" && output.as_deref() == Some("done")
-    ));
+    assert_eq!(state.workflow_tasks()[0].result.as_deref(), Some("done"));
 }
 
 #[test]

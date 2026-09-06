@@ -751,28 +751,14 @@ impl AppState {
             .map(|offset| first + 1 + offset)
     }
 
-    /// Materialize the live surface's child work into the parent transcript.
-    /// The task DTO is already derived from the surface ledger, so this keeps
-    /// the conversation and agent dock on one identity-bound source.
+    /// Materialize only the root-level delegation announcement. Child state is
+    /// owned by the dock and focused child surface; putting task snapshots in
+    /// `ChatMessage` makes the root transcript a second, stale authority.
     pub(crate) fn sync_subagent_transcript_messages(&mut self) {
-        let existing_subagent_ids = self
-            .transcript
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                ChatMessage::Subagent { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect::<std::collections::HashSet<_>>();
         let tasks = self
             .workflow_tasks()
             .iter()
-            .filter(|task| {
-                task.task_type == orca_core::task_types::TaskType::Subagent
-                    && (task.status.is_active()
-                        || task.status.requires_attention()
-                        || existing_subagent_ids.contains(&task.id))
-            })
+            .filter(|task| task.task_type == orca_core::task_types::TaskType::Subagent)
             .cloned()
             .collect::<Vec<_>>();
         for task in &tasks {
@@ -793,44 +779,6 @@ impl AppState {
                 self.push_message(ChatMessage::System(format!(
                     "Delegating to {batch_size} {noun}"
                 )));
-            }
-
-            let next = ChatMessage::Subagent {
-                id: task.id.clone(),
-                description: task.description.clone(),
-                status: surface_task_status_label(task.status).to_string(),
-                output: task.result.clone(),
-                error: task.error.clone(),
-                activity: task.subagent_current_activity.clone(),
-                activity_tail: task
-                    .subagent_activity_history
-                    .iter()
-                    .map(|entry| entry.activity.clone())
-                    .collect(),
-                turn: task.subagent_turn,
-                usage: task.usage,
-                expanded: task.status == orca_core::task_types::TaskStatus::Running,
-            };
-            if let Some(index) = self.transcript.messages.iter().position(
-                |message| matches!(message, ChatMessage::Subagent { id, .. } if id == &task.id),
-            ) {
-                let expanded = match &self.transcript.messages[index] {
-                    ChatMessage::Subagent { expanded, .. } => {
-                        *expanded || task.status == orca_core::task_types::TaskStatus::Running
-                    }
-                    _ => false,
-                };
-                let mut next = next;
-                if let ChatMessage::Subagent {
-                    expanded: value, ..
-                } = &mut next
-                {
-                    *value = expanded;
-                }
-                self.replace_message(index, next);
-            } else {
-                self.finish_assistant_stream();
-                self.push_message(next);
             }
         }
     }
@@ -1201,20 +1149,6 @@ fn merge_background_task_snapshots(
         }
     }
     merged
-}
-
-fn surface_task_status_label(status: orca_core::task_types::TaskStatus) -> &'static str {
-    match status {
-        orca_core::task_types::TaskStatus::Queued => "queued",
-        orca_core::task_types::TaskStatus::Running => "running",
-        orca_core::task_types::TaskStatus::Paused => "paused",
-        orca_core::task_types::TaskStatus::Stopping => "stopping",
-        orca_core::task_types::TaskStatus::Stopped => "stopped",
-        orca_core::task_types::TaskStatus::Completed => "completed",
-        orca_core::task_types::TaskStatus::Failed => "failed",
-        orca_core::task_types::TaskStatus::ApprovalRequired => "approval required",
-        orca_core::task_types::TaskStatus::Cancelled => "cancelled",
-    }
 }
 
 fn format_argument_bytes(bytes: usize) -> String {
