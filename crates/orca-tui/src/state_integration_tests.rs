@@ -300,10 +300,7 @@ fn new_session_started_resets_conversation_state_and_preserves_runtime_settings(
     )));
     state.update(TuiEvent::NewSessionStarted);
 
-    assert!(matches!(
-        state.transcript.messages.as_slice(),
-        [ChatMessage::System(text)] if text == "Delegating to 1 agent"
-    ));
+    assert!(state.transcript.messages.is_empty());
     assert!(state.current_plan().is_none());
     assert_eq!(state.usage(), &UsageTotals::default());
     assert_eq!(state.context_used_tokens(), 0);
