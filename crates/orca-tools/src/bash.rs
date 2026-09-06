@@ -60,6 +60,26 @@ pub fn execute_with_policy_roots_or_cancel(
     shell_timeout: Duration,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_with_policy_roots_or_cancel_with_profile(
+        request,
+        cwd,
+        additional_roots,
+        output_truncation,
+        shell_timeout,
+        orca_core::capability::ExecutionProfile::Workspace,
+        should_cancel,
+    )
+}
+
+pub fn execute_with_policy_roots_or_cancel_with_profile(
+    request: &ToolRequest,
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    execution_profile: orca_core::capability::ExecutionProfile,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let shell =
         match orca_platform::shell::ShellResolver::for_current_host().resolve_from_environment() {
             Ok(shell) => shell,
@@ -71,13 +91,14 @@ pub fn execute_with_policy_roots_or_cancel(
                 );
             }
         };
-    execute_with_shell_spec_roots_or_cancel(
+    execute_with_shell_spec_roots_or_cancel_with_profile(
         &shell,
         request,
         cwd,
         additional_roots,
         output_truncation,
         shell_timeout,
+        execution_profile,
         should_cancel,
     )
 }
@@ -89,6 +110,28 @@ pub fn execute_with_shell_spec_roots_or_cancel(
     additional_roots: &[std::path::PathBuf],
     output_truncation: ToolOutputTruncation,
     shell_timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    execute_with_shell_spec_roots_or_cancel_with_profile(
+        shell,
+        request,
+        cwd,
+        additional_roots,
+        output_truncation,
+        shell_timeout,
+        orca_core::capability::ExecutionProfile::Workspace,
+        should_cancel,
+    )
+}
+
+pub fn execute_with_shell_spec_roots_or_cancel_with_profile(
+    shell: &ShellSpec,
+    request: &ToolRequest,
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    execution_profile: orca_core::capability::ExecutionProfile,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
     let Some(command) = request
@@ -116,29 +159,51 @@ pub fn execute_with_shell_spec_roots_or_cancel(
         }
         ShellKind::PowerShell(_) | ShellKind::Cmd => unreachable!("guarded above"),
     };
-    execute_command_with_policy_or_cancel(
+    execute_command_with_policy_or_cancel_with_profile(
         request,
         process_command,
         cwd,
         output_truncation,
         shell_timeout,
+        execution_profile,
         should_cancel,
     )
 }
 
+#[allow(dead_code)]
 fn execute_command_with_policy_or_cancel(
+    request: &ToolRequest,
+    process_command: std::process::Command,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    execute_command_with_policy_or_cancel_with_profile(
+        request,
+        process_command,
+        cwd,
+        output_truncation,
+        shell_timeout,
+        orca_core::capability::ExecutionProfile::Workspace,
+        should_cancel,
+    )
+}
+
+fn execute_command_with_policy_or_cancel_with_profile(
     request: &ToolRequest,
     mut process_command: std::process::Command,
     cwd: &Path,
     output_truncation: ToolOutputTruncation,
     shell_timeout: Duration,
+    execution_profile: orca_core::capability::ExecutionProfile,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
     process_command
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (child, process_job, _receipt) = match process::spawn_with_capability(
+    let (child, process_job, _receipt) = match process::spawn_with_capability_profile(
         process_command,
         format!("tool:bash:{}", request.id),
         cwd,
@@ -146,6 +211,7 @@ fn execute_command_with_policy_or_cancel(
         orca_core::capability::CapabilitySet::workspace_write(),
         sandbox::enforcement_state(),
         "tool-sandbox",
+        execution_profile,
     ) {
         Ok(spawned) => spawned,
         Err(error) => {

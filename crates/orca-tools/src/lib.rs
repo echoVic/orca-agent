@@ -129,6 +129,33 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
     mcp_elicitation_handler: Option<&dyn McpElicitationHandler>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
+        request,
+        cwd,
+        additional_roots,
+        mcp_registry,
+        external_tools,
+        output_truncation,
+        shell_timeout_secs,
+        mcp_elicitation_handler,
+        orca_core::capability::ExecutionProfile::Workspace,
+        should_cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
+    request: &ToolRequest,
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+    output_truncation: ToolOutputTruncation,
+    shell_timeout_secs: u64,
+    mcp_elicitation_handler: Option<&dyn McpElicitationHandler>,
+    execution_profile: orca_core::capability::ExecutionProfile,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let shell_timeout = std::time::Duration::from_secs(shell_timeout_secs.max(1));
     let should_cancel = &should_cancel as &dyn Fn() -> bool;
     if !tool_uses_mcp_registry(&request.name) {
@@ -138,6 +165,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
                 .with_output_truncation(output_truncation)
                 .with_shell_timeout(shell_timeout)
                 .with_additional_working_directories(additional_roots.iter().cloned())
+                .with_execution_profile(execution_profile)
                 .with_cancel(should_cancel);
             return reg.execute(request, &ctx);
         }
@@ -146,6 +174,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
             .with_output_truncation(output_truncation)
             .with_shell_timeout(shell_timeout)
             .with_additional_working_directories(additional_roots.iter().cloned())
+            .with_execution_profile(execution_profile)
             .with_cancel(should_cancel);
         return reg.execute(request, &ctx);
     }
@@ -155,6 +184,7 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
         .with_output_truncation(output_truncation)
         .with_shell_timeout(shell_timeout)
         .with_additional_working_directories(additional_roots.iter().cloned())
+        .with_execution_profile(execution_profile)
         .with_mcp(mcp_registry)
         .with_cancel(should_cancel);
     if let Some(handler) = mcp_elicitation_handler {

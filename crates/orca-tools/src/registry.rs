@@ -71,6 +71,7 @@ pub struct ToolContext<'a> {
     pub mcp_registry: Option<&'a McpRegistry>,
     pub mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
     pub should_cancel: Option<&'a dyn Fn() -> bool>,
+    pub execution_profile: orca_core::capability::ExecutionProfile,
 }
 
 impl<'a> ToolContext<'a> {
@@ -83,6 +84,7 @@ impl<'a> ToolContext<'a> {
             mcp_registry: None,
             mcp_elicitation_handler: None,
             should_cancel: None,
+            execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         }
     }
 
@@ -123,6 +125,14 @@ impl<'a> ToolContext<'a> {
 
     pub fn with_cancel(mut self, should_cancel: &'a dyn Fn() -> bool) -> Self {
         self.should_cancel = Some(should_cancel);
+        self
+    }
+
+    pub fn with_execution_profile(
+        mut self,
+        execution_profile: orca_core::capability::ExecutionProfile,
+    ) -> Self {
+        self.execution_profile = execution_profile;
         self
     }
 
@@ -1788,12 +1798,13 @@ impl Tool for BuiltinTool {
             }
             BuiltinExecutor::Glob => glob::execute(request, ctx.cwd, ctx.max_output_bytes()),
             BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes()),
-            BuiltinExecutor::Bash => bash::execute_with_policy_roots_or_cancel(
+            BuiltinExecutor::Bash => bash::execute_with_policy_roots_or_cancel_with_profile(
                 request,
                 ctx.cwd,
                 &ctx.additional_working_directories,
                 ctx.output_truncation,
                 ctx.shell_timeout,
+                ctx.execution_profile,
                 || ctx.is_cancelled(),
             ),
             BuiltinExecutor::ExecCommand => ToolResult::failed(
@@ -2249,12 +2260,13 @@ impl Tool for ExternalTool {
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
-        external::execute_external_tool_with_policy_or_cancel(
+        external::execute_external_tool_with_policy_or_cancel_with_profile(
             &self.tool,
             request,
             ctx.cwd,
             ctx.output_truncation,
             ctx.shell_timeout,
+            ctx.execution_profile,
             || ctx.is_cancelled(),
         )
     }

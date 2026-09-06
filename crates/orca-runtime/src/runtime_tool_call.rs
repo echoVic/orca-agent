@@ -256,7 +256,7 @@ impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
         invocation: &RuntimeReadonlyToolInvocation,
         cancel: &CancelToken,
     ) -> ToolResult {
-        orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
+        orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
             &invocation.request,
             &invocation.cwd,
             &[],
@@ -265,6 +265,7 @@ impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
             invocation.output_truncation,
             READONLY_TOOL_TIMEOUT_SECS,
             None,
+            orca_core::capability::ExecutionProfile::ReadOnly,
             || cancel.is_cancelled(),
         )
     }

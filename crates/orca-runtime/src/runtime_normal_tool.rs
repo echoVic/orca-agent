@@ -71,7 +71,7 @@ pub(crate) fn execute_runtime_normal_tool(
         return write_stdin(invocation, context);
     }
 
-    orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation(
+    orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
         &invocation.request,
         &invocation.cwd,
         &invocation.additional_roots,
@@ -80,6 +80,7 @@ pub(crate) fn execute_runtime_normal_tool(
         invocation.output_truncation,
         invocation.shell_timeout_secs,
         context.mcp_elicitation_handler,
+        invocation.config.execution_profile,
         || context.cancel.is_cancelled(),
     )
 }

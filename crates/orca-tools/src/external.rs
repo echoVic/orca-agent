@@ -111,6 +111,26 @@ pub fn execute_external_tool_with_policy_or_cancel(
     shell_timeout: Duration,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_external_tool_with_policy_or_cancel_with_profile(
+        config,
+        request,
+        cwd,
+        output_truncation,
+        shell_timeout,
+        orca_core::capability::ExecutionProfile::TrustedHost,
+        should_cancel,
+    )
+}
+
+pub fn execute_external_tool_with_policy_or_cancel_with_profile(
+    config: &ExternalToolConfig,
+    request: &ToolRequest,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Duration,
+    execution_profile: orca_core::capability::ExecutionProfile,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = request.raw_arguments.as_deref().unwrap_or("{}");
     let shell =
         match orca_platform::shell::ShellResolver::for_current_host().resolve_from_environment() {
@@ -169,7 +189,7 @@ pub fn execute_external_tool_with_policy_or_cancel(
             agent: true,
         },
     };
-    let (mut child, process_job, _receipt) = match process::spawn_with_capability(
+    let (mut child, process_job, _receipt) = match process::spawn_with_capability_profile(
         command,
         format!("external:{}", config.name),
         cwd,
@@ -177,6 +197,7 @@ pub fn execute_external_tool_with_policy_or_cancel(
         capabilities,
         orca_core::capability::EnforcementState::Advisory,
         "external-tool-user-trusted",
+        execution_profile,
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
