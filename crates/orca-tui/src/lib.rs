@@ -183,6 +183,7 @@ pub(crate) mod test_support {
             cwd: std::env::current_dir().ok(),
             output_format: OutputFormat::Text,
             approval_mode: ApprovalMode::Suggest,
+            execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::from_unchecked(Some("auto".to_string())),

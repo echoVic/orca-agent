@@ -38,8 +38,35 @@ pub fn spawn_with_capability(
     enforcement: EnforcementState,
     backend: &'static str,
 ) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
+    let profile = if process_class == CapabilityProcessClass::UserTrustedIntegration {
+        orca_core::capability::ExecutionProfile::TrustedHost
+    } else {
+        orca_core::capability::ExecutionProfile::Workspace
+    };
+    spawn_with_capability_profile(
+        command,
+        request_id,
+        cwd,
+        process_class,
+        capabilities,
+        enforcement,
+        backend,
+        profile,
+    )
+}
+
+pub fn spawn_with_capability_profile(
+    command: Command,
+    request_id: impl Into<String>,
+    cwd: &Path,
+    process_class: CapabilityProcessClass,
+    capabilities: CapabilitySet,
+    enforcement: EnforcementState,
+    backend: &'static str,
+    profile: orca_core::capability::ExecutionProfile,
+) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
     let request_id = request_id.into();
-    let broker = ExecutionBroker::with_backend(enforcement, backend);
+    let broker = ExecutionBroker::with_backend(enforcement, backend).with_profile(profile);
     let launched = if process_class == CapabilityProcessClass::UserTrustedIntegration {
         broker.launch_user_trusted(command, request_id, cwd.to_path_buf(), capabilities)
     } else {

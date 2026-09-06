@@ -67,6 +67,9 @@ pub fn assemble_run_config(
         cwd: request.runtime_cwd,
         output_format: request.output_format,
         approval_mode: file.mode.unwrap_or_default(),
+        execution_profile: orca_core::capability::ExecutionProfile::for_approval_mode(
+            file.mode.unwrap_or_default(),
+        ),
         provider: request.provider,
         verifier: request.verifier,
         model,

@@ -1,6 +1,6 @@
 use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
@@ -257,7 +257,9 @@ impl AgentController {
         if let Some(handler) = request.permission_handler {
             turn = turn.with_permission_handler(handler);
         }
-        let operation = match child.start_turn(turn, io::sink()) {
+        let operation = match child
+            .start_turn_with_output(turn, AgentOutputWriter::new(publisher.clone()))
+        {
             Ok(operation) => operation,
             Err(error) => {
                 let terminal_error = publisher.publish_surface_terminal(
@@ -353,7 +355,7 @@ struct AgentEventPublisher {
     batch_size: u32,
     thread_id: String,
     attempt_id: String,
-    next_sequence: AtomicU64,
+    next_sequence: Mutex<u64>,
 }
 
 impl AgentEventPublisher {
@@ -373,13 +375,13 @@ impl AgentEventPublisher {
             registry,
             root_thread_id,
             parent_thread_id,
-            attempt_id: format!("attempt-{agent_id}"),
+            attempt_id: format!("attempt-{}", uuid::Uuid::now_v7()),
             agent_id,
             description,
             batch_id,
             batch_size,
             thread_id,
-            next_sequence: AtomicU64::new(1),
+            next_sequence: Mutex::new(1),
         }
     }
 
@@ -400,18 +402,26 @@ impl AgentEventPublisher {
         thread_id: &str,
         event: orca_core::agent_event::AgentEvent,
     ) -> io::Result<()> {
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let mut sequence = self
+            .next_sequence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_sequence = *sequence;
         let envelope = orca_core::agent_event::AgentEventEnvelope::new(
             uuid::Uuid::now_v7().to_string(),
             self.root_thread_id.clone(),
             self.agent_id.clone(),
             thread_id.to_string(),
             self.attempt_id.clone(),
-            sequence,
+            source_sequence,
             chrono::Utc::now().timestamp_millis(),
             event,
         );
-        self.registry.append(envelope)
+        let result = self.registry.append(envelope);
+        if result.is_ok() {
+            *sequence = sequence.saturating_add(1);
+        }
+        result
     }
 
     fn publish_surface_terminal(
@@ -481,6 +491,42 @@ impl EventObserver for AgentEventPublisher {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Preserve child output as a canonical registry delta instead of sending it
+/// to an unobservable sink. The event observer remains responsible for
+/// structured lifecycle facts; this writer covers the operation writer bytes.
+struct AgentOutputWriter {
+    publisher: Arc<AgentEventPublisher>,
+}
+
+impl AgentOutputWriter {
+    fn new(publisher: Arc<AgentEventPublisher>) -> Self {
+        Self { publisher }
+    }
+}
+
+impl Write for AgentOutputWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if !buffer.is_empty() {
+            let text = String::from_utf8_lossy(buffer).into_owned();
+            self.publisher.append_registry_event(
+                &self.publisher.thread_id,
+                orca_core::agent_event::AgentEvent::OutputDelta { text },
+            )?;
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl crate::runtime_host::HostedOperationWriter for AgentOutputWriter {
+    fn finish_generation(&mut self, _commit_terminal: bool) -> io::Result<()> {
+        self.flush()
     }
 }
 

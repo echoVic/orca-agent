@@ -556,7 +556,10 @@ fn focus_child(
             return;
         }
     };
-    let binding = match child_binding(&parent_snapshot, &task_id, expected_revision) {
+    let binding = child_binding(&parent_snapshot, &task_id, expected_revision).or_else(|_| {
+        registry_child_binding(host, parent_thread.thread_id(), &task_id, expected_revision)
+    });
+    let binding = match binding {
         Ok(binding) => binding,
         Err(error) => {
             reject(event_tx, &error);
@@ -598,7 +601,10 @@ fn focus_child(
             return;
         }
     };
-    let current_binding = match child_binding(&current_snapshot, &task_id, expected_revision) {
+    let current_binding = match child_binding(&current_snapshot, &task_id, expected_revision)
+        .or_else(|_| {
+            registry_child_binding(host, parent_thread.thread_id(), &task_id, expected_revision)
+        }) {
         Ok(binding) => binding,
         Err(error) => {
             reject(event_tx, &format!("child focus became stale: {error}"));
@@ -828,6 +834,31 @@ fn child_binding(
         .ok_or_else(|| "the selected child has no live conversation".to_string())?;
     Ok(ChildBinding {
         child_thread_id: uuid::Uuid::from_bytes(*child_thread_id.as_bytes()).to_string(),
+    })
+}
+
+fn registry_child_binding(
+    host: &RuntimeHostHandle,
+    root_thread_id: &str,
+    agent_id: &str,
+    expected_revision: u64,
+) -> Result<ChildBinding, String> {
+    let snapshot = host.agent_registry_snapshot(root_thread_id);
+    if snapshot.revision != expected_revision {
+        return Err(format!(
+            "the selected child agent is stale (expected revision {expected_revision})"
+        ));
+    }
+    let agent = snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == agent_id)
+        .ok_or_else(|| "the selected child agent is no longer present".to_string())?;
+    if agent.parent_thread_id != root_thread_id {
+        return Err("the selected child is not owned by this conversation".to_string());
+    }
+    Ok(ChildBinding {
+        child_thread_id: agent.thread_id.clone(),
     })
 }
 

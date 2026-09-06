@@ -77,6 +77,7 @@ mod tests {
             api_key: None,
             base_url: None,
             approval_mode: ApprovalMode::Suggest,
+            execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             output_format: OutputFormat::Jsonl,
             verifier: None,
             history_mode: HistoryMode::Disabled,

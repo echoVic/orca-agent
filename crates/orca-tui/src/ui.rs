@@ -1446,6 +1446,55 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
     let rows = state.agent_rows();
 
     if rows.is_empty() {
+        if !state.agent_registry.agents.is_empty() {
+            let mut lines = vec![Line::from(Span::styled(
+                " Main [default]",
+                Style::default().fg(theme.text),
+            ))];
+            for agent in state
+                .agent_registry
+                .agents
+                .iter()
+                .take(MAX_DEFAULT_SUBAGENTS)
+            {
+                let icon = if agent.status.is_active() {
+                    spinner_frame(state.tick)
+                } else {
+                    "●"
+                };
+                let status = match &agent.status {
+                    AgentStatus::Queued => "queued",
+                    AgentStatus::Running => "running",
+                    AgentStatus::WaitingPermission => "waiting permission",
+                    AgentStatus::Completed => "completed",
+                    AgentStatus::Failed => "failed",
+                    AgentStatus::Cancelled => "cancelled",
+                    AgentStatus::Corrupt => "corrupt",
+                };
+                lines.push(Line::from(Span::styled(
+                    truncate_to_display_width(
+                        &format!(" {icon} {} · {status}", agent.description),
+                        inner.width as usize,
+                    ),
+                    Style::default().fg(if agent.status.is_active() {
+                        theme.warning
+                    } else {
+                        theme.muted
+                    }),
+                )));
+                let detail = agent
+                    .activity
+                    .as_ref()
+                    .map(AgentActivity::label)
+                    .unwrap_or_else(|| "no activity recorded".to_string());
+                lines.push(Line::from(Span::styled(
+                    truncate_to_display_width(&format!("   {detail}"), inner.width as usize),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+            return;
+        }
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -3889,6 +3938,7 @@ fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::styl
                 &state.agent_registry,
                 theme,
                 state.tick,
+                state.agent_dock_selected_task_id.as_deref(),
             ));
             let non_agent_tasks = state
                 .workflow_tasks()
@@ -3918,12 +3968,9 @@ fn agent_registry_activity_lines(
     snapshot: &orca_core::agent_event::AgentRegistrySnapshot,
     theme: &Theme,
     tick: u64,
+    selected_agent_id: Option<&str>,
 ) -> Vec<(String, ratatui::style::Color)> {
-    let visible = snapshot
-        .agents
-        .iter()
-        .filter(|agent| agent.status.is_active())
-        .collect::<Vec<_>>();
+    let visible = snapshot.agents.iter().collect::<Vec<_>>();
     if visible.is_empty() {
         return Vec::new();
     }
@@ -3961,8 +4008,13 @@ fn agent_registry_activity_lines(
             AgentStatus::WaitingPermission => "waiting permission",
             _ => "idle",
         };
+        let selection = if selected_agent_id == Some(agent.agent_id.as_str()) {
+            "›"
+        } else {
+            "○"
+        };
         lines.push((
-            format!("  ○ {icon} {} · {status}", agent.description),
+            format!("  {selection} {icon} {} · {status}", agent.description),
             if matches!(&agent.status, AgentStatus::WaitingPermission) {
                 theme.approval
             } else {
@@ -4059,7 +4111,12 @@ fn background_task_activity_lines(
                 "●"
             };
             let color = task_status_color(task.status, theme);
-            lines.push((format!("  {selection} {icon} {name} · {status}"), color));
+            let marker = if task.status == TaskStatus::Running && !selected {
+                icon
+            } else {
+                selection
+            };
+            lines.push((format!("  {marker} {name} · {status}"), color));
             let detail = if task.subagent_current_activity.is_some() {
                 subagent_progress_label_with_activity_limit(task, Some(64))
             } else {

@@ -899,6 +899,7 @@ mod tests {
             prompt: String::new(),
             cwd: Some(cwd),
             output_format: OutputFormat::Text,
+            execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             approval_mode: ApprovalMode::Suggest,
             provider: ProviderKind::Mock,
             verifier: None,

@@ -717,10 +717,7 @@ where
         )
         && key.modifiers.contains(KeyModifiers::SHIFT)
         && matches!(key.code, KeyCode::Up | KeyCode::Down)
-        && state.workflow_tasks().iter().any(|task| {
-            task.task_type == orca_core::task_types::TaskType::Subagent
-                && (task.status.is_active() || task.status.requires_attention())
-        })
+        && (!state.workflow_tasks().is_empty() || !state.agent_registry.agents.is_empty())
     {
         vim_state.cancel_pending_command();
         if key.code == KeyCode::Up {
@@ -735,27 +732,33 @@ where
         && key.code == KeyCode::Enter
         && key.modifiers.is_empty()
     {
-        let Some(task) = state.selected_agent_dock_task() else {
-            return Ok(KeyEventFlow::Unhandled);
-        };
-        let Some(expected_revision) = task.publication_revision else {
-            return Ok(KeyEventFlow::Unhandled);
-        };
         vim_state.cancel_pending_command();
-        if task.subagent_child_thread_id.is_some() {
+        if let Some(task) = state.selected_agent_dock_task() {
+            let Some(expected_revision) = task.publication_revision else {
+                return Ok(KeyEventFlow::Unhandled);
+            };
+            if task.subagent_child_thread_id.is_some() {
+                let _ = action_tx.send(UserAction::FocusChildThread {
+                    task_id: task.id.clone(),
+                    expected_revision,
+                });
+            } else {
+                let request = crate::protocol::TaskTranscriptRequest {
+                    task_id: task.id.clone(),
+                    expected_revision,
+                };
+                state.show_agents();
+                state.select_agent_workspace_task(&request.task_id);
+                state.begin_task_transcript_request(request.clone());
+                let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
+            }
+        } else if let Some(agent) = state.selected_agent_registry() {
             let _ = action_tx.send(UserAction::FocusChildThread {
-                task_id: task.id.clone(),
-                expected_revision,
+                task_id: agent.agent_id.clone(),
+                expected_revision: state.agent_registry.revision,
             });
         } else {
-            let request = crate::protocol::TaskTranscriptRequest {
-                task_id: task.id.clone(),
-                expected_revision,
-            };
-            state.show_agents();
-            state.select_agent_workspace_task(&request.task_id);
-            state.begin_task_transcript_request(request.clone());
-            let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
+            return Ok(KeyEventFlow::Unhandled);
         }
         return Ok(KeyEventFlow::Continue);
     }

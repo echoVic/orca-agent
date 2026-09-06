@@ -3648,6 +3648,7 @@ mod tests {
             cwd: None,
             output_format: OutputFormat::Jsonl,
             approval_mode: ApprovalMode::FullAuto,
+            execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::from_unchecked(Some("auto".to_string())),

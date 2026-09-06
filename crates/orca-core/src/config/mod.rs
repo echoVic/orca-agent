@@ -389,6 +389,7 @@ pub struct RunConfig {
     pub cwd: Option<PathBuf>,
     pub output_format: OutputFormat,
     pub approval_mode: ApprovalMode,
+    pub execution_profile: crate::capability::ExecutionProfile,
     pub provider: ProviderKind,
     pub verifier: Option<String>,
     pub model: ModelSelection,
@@ -455,6 +456,7 @@ impl DelegationSnapshot {
 
     pub fn apply_to(&self, config: &mut RunConfig, child_model_override: Option<String>) {
         config.approval_mode = self.approval_mode;
+        config.execution_profile = self.execution_profile;
         config.active_permission_profile = self.active_permission_profile.clone();
         config.permission_profiles = self.permission_profiles.clone();
         config.runtime_workspace_roots = self.runtime_workspace_roots.clone();
@@ -972,6 +974,7 @@ mod tests {
             cwd: None,
             output_format: OutputFormat::Text,
             approval_mode: ApprovalMode::FullAuto,
+            execution_profile: crate::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::DeepSeekFixture,
             verifier: None,
             model: ModelSelection::from_unchecked(Some("deepseek-v4-flash".to_string())),
@@ -1048,6 +1051,7 @@ mod tests {
             cwd: Some(PathBuf::from("/workspace")),
             output_format: OutputFormat::Jsonl,
             approval_mode: ApprovalMode::Plan,
+            execution_profile: crate::capability::ExecutionProfile::ReadOnly,
             provider: ProviderKind::Mock,
             verifier: None,
             model: ModelSelection::parse(Some(AUTO_MODEL.to_string())).unwrap(),
@@ -1090,6 +1094,7 @@ mod tests {
         decoded.apply_to(&mut parent, Some(FLASH_MODEL.to_string()));
 
         assert_eq!(decoded.approval_mode, ApprovalMode::Plan);
+        assert_eq!(decoded.execution_profile, parent.execution_profile);
         assert_eq!(
             decoded.active_permission_profile,
             parent.active_permission_profile

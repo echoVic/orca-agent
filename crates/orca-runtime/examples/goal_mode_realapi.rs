@@ -211,6 +211,7 @@ fn real_api_config(api_key: String, max_cost_usd_micros: u64) -> Result<RunConfi
         cwd: Some(std::env::current_dir().map_err(|error| error.to_string())?),
         output_format: OutputFormat::Jsonl,
         approval_mode: ApprovalMode::FullAuto,
+        execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         provider: ProviderKind::DeepSeek,
         verifier: None,
         model: ModelSelection::parse(Some(FLASH_MODEL.to_string()))?,

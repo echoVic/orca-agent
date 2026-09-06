@@ -9,6 +9,7 @@ use orca_core::task_types::{BackgroundTaskSummary, TaskType};
 
 use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{PendingWorkflowNotification, TaskTranscriptRequest, UserAction};
+use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, AppStatus, ApprovalDialog, PanelMode};
 
 #[derive(Debug, Clone, Default)]
@@ -329,16 +330,7 @@ impl AppState {
     }
 
     pub(crate) fn select_next_agent_dock_task(&mut self) {
-        let visible = self
-            .workflow_panel
-            .tasks()
-            .iter()
-            .filter(|task| {
-                task.task_type == TaskType::Subagent
-                    && (task.status.is_active() || task.status.requires_attention())
-            })
-            .map(|task| task.id.clone())
-            .collect::<Vec<_>>();
+        let visible = self.agent_dock_ids();
         let next = match self.agent_dock_selected_task_id.as_deref() {
             None => visible.first().cloned(),
             Some(selected) => visible
@@ -352,16 +344,7 @@ impl AppState {
     }
 
     pub(crate) fn select_previous_agent_dock_task(&mut self) {
-        let visible = self
-            .workflow_panel
-            .tasks()
-            .iter()
-            .filter(|task| {
-                task.task_type == TaskType::Subagent
-                    && (task.status.is_active() || task.status.requires_attention())
-            })
-            .map(|task| task.id.clone())
-            .collect::<Vec<_>>();
+        let visible = self.agent_dock_ids();
         self.agent_dock_selected_task_id = self
             .agent_dock_selected_task_id
             .as_deref()
@@ -377,6 +360,36 @@ impl AppState {
                 && task.task_type == TaskType::Subagent
                 && (task.status.is_active() || task.status.requires_attention())
         })
+    }
+
+    fn agent_dock_ids(&self) -> Vec<String> {
+        let task_ids = self
+            .workflow_panel
+            .tasks()
+            .iter()
+            .filter(|task| {
+                task.task_type == TaskType::Subagent
+                    && (task.status.is_active() || task.status.requires_attention())
+            })
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let mut ids = task_ids.clone();
+        ids.extend(
+            self.agent_registry
+                .agents
+                .iter()
+                .filter(|agent| agent.status.is_active() && !task_ids.contains(&agent.agent_id))
+                .map(|agent| agent.agent_id.clone()),
+        );
+        ids
+    }
+
+    pub(crate) fn selected_agent_registry(&self) -> Option<&orca_core::agent_event::AgentSummary> {
+        let selected = self.agent_dock_selected_task_id.as_deref()?;
+        self.agent_registry
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == selected && agent.status.is_active())
     }
 
     pub(crate) fn select_agent_workspace_task(&mut self, task_id: &str) -> bool {
@@ -536,6 +549,31 @@ impl AppState {
     ) {
         if snapshot.revision >= self.agent_registry.revision {
             self.agent_registry = snapshot;
+            let announcements = self
+                .agent_registry
+                .agents
+                .iter()
+                .filter(|agent| agent.status.is_active())
+                .filter_map(|agent| {
+                    let batch_key = agent.batch_id.clone();
+                    self.announced_subagent_batches
+                        .insert(batch_key)
+                        .then_some((agent.batch_size.max(1), agent.agent_id.clone()))
+                })
+                .collect::<Vec<_>>();
+            if !announcements.is_empty() {
+                self.finish_assistant_stream();
+                for (batch_size, _) in announcements {
+                    let noun = if batch_size == 1 {
+                        "agent"
+                    } else {
+                        "agents in parallel"
+                    };
+                    self.push_message(ChatMessage::System(format!(
+                        "Delegating to {batch_size} {noun}"
+                    )));
+                }
+            }
         }
     }
 

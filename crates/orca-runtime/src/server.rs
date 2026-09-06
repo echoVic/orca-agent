@@ -8306,6 +8306,7 @@ rl.on("line", (line) => {
             prompt: String::new(),
             cwd: Some(std::env::current_dir().expect("cwd")),
             output_format: OutputFormat::Text,
+            execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             approval_mode: ApprovalMode::FullAuto,
             provider: ProviderKind::Mock,
             verifier: None,

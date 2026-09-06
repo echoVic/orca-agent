@@ -1418,6 +1418,7 @@ fn test_run_config(cwd: &std::path::Path) -> RunConfig {
         cwd: Some(cwd.to_path_buf()),
         output_format: OutputFormat::Jsonl,
         approval_mode: ApprovalMode::FullAuto,
+        execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         provider: ProviderKind::Mock,
         verifier: None,
         model: ModelSelection::parse(None).expect("model"),

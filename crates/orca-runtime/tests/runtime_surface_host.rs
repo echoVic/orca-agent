@@ -1807,6 +1807,7 @@ fn test_config(cwd: std::path::PathBuf) -> RunConfig {
         cwd: Some(cwd),
         output_format: OutputFormat::Jsonl,
         approval_mode: ApprovalMode::Suggest,
+        execution_profile: orca_core::capability::ExecutionProfile::Workspace,
         provider: ProviderKind::Mock,
         verifier: None,
         model: ModelSelection::parse(None).expect("default model"),
