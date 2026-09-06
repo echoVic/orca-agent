@@ -277,8 +277,12 @@ fn async_launch_failures_terminalize_continuation_before_surface_failure() {
 
 #[test]
 fn async_surface_terminal_follows_schema_and_continuation_commit() {
+    // Windows checkouts use CRLF, while this contract inspects Rust source
+    // snippets. Normalize line endings so the architectural assertion is
+    // platform-independent.
+    let async_subagent = ASYNC_SUBAGENT.replace("\r\n", "\n");
     let worker = balanced_block(
-        ASYNC_SUBAGENT,
+        &async_subagent,
         "pub(crate) fn run_async_subagent_worker_with_executor",
     );
     let completed_task = worker
