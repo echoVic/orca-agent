@@ -787,15 +787,23 @@ impl ThreadActor {
                 })
             });
         if retain_prepared_goal_batch {
-            self.retain_surface_goal_completion_recovery(
-                active,
-                format!(
-                    "typed Goal recovery retained its exact prepared batch for cold recovery; {message}"
-                ),
-            );
-            return;
+            // The prepared batch is already durable and can be replayed by the
+            // actor. Apply it before terminalizing the live operation; leaving
+            // it retained here strands operation waiters because every retry
+            // would encounter the same prepared OuterTurnFinished batch.
+            if let Err(error) = self.resident_surface.coordinator.retry_incomplete_batch() {
+                self.retain_surface_goal_completion_recovery(
+                    active,
+                    format!(
+                        "typed Goal recovery retained its exact prepared batch for cold recovery; {error:?}; {message}"
+                    ),
+                );
+                return;
+            }
         }
-        if let Err(error) = self.resident_surface.coordinator.retry_incomplete_batch() {
+        if !retain_prepared_goal_batch
+            && let Err(error) = self.resident_surface.coordinator.retry_incomplete_batch()
+        {
             self.retain_surface_goal_completion_recovery(
                 active,
                 format!(
