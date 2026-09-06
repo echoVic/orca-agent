@@ -1536,11 +1536,60 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
 
     if list_height > 0 {
         let item_width = inner.width.saturating_sub(3) as usize;
-        let items = rows
+        let mut items = rows
             .iter()
             .copied()
             .map(|row| agent_workspace_list_item(row, theme, item_width, state.tick))
             .collect::<Vec<_>>();
+        let task_ids = rows
+            .iter()
+            .map(|row| row.identity())
+            .filter_map(|identity| match identity {
+                crate::agent_workspace::AgentWorkspaceIdentity::Task(id) => Some(id),
+                crate::agent_workspace::AgentWorkspaceIdentity::WorkflowAgent { .. } => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for agent in state
+            .agent_registry
+            .agents
+            .iter()
+            .filter(|agent| !task_ids.contains(&agent.agent_id))
+        {
+            let icon = if agent.status.is_active() {
+                spinner_frame(state.tick)
+            } else {
+                "●"
+            };
+            let status = match &agent.status {
+                AgentStatus::Queued => "queued",
+                AgentStatus::Running => "running",
+                AgentStatus::WaitingPermission => "waiting permission",
+                AgentStatus::Completed => "completed",
+                AgentStatus::Failed => "failed",
+                AgentStatus::Cancelled => "cancelled",
+                AgentStatus::Corrupt => "corrupt",
+            };
+            items.push(ListItem::new(Line::from(Span::styled(
+                truncate_to_display_width(
+                    &format!("{icon} {} · {status}", agent.description),
+                    item_width,
+                ),
+                Style::default().fg(if agent.status.is_active() {
+                    theme.warning
+                } else {
+                    theme.muted
+                }),
+            ))));
+            let detail = agent
+                .activity
+                .as_ref()
+                .map(AgentActivity::label)
+                .unwrap_or_else(|| "no activity recorded".to_string());
+            items.push(ListItem::new(Line::from(Span::styled(
+                truncate_to_display_width(&format!("  {detail}"), item_width),
+                Style::default().fg(theme.muted),
+            ))));
+        }
         let list = List::new(items).highlight_symbol("› ").highlight_style(
             theme
                 .selection_style()
