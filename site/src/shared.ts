@@ -4,15 +4,15 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.20";
+export const releaseVersion = "v0.4.21";
 
 export const releases = [
   {
-    version: "v0.4.20",
+    version: "v0.4.21",
     date: "2026-09-06",
     title: "Four-plane agent runtime",
     body: "Keeps child transcripts out of the root conversation, records canonical agent events, and makes terminal child state sticky.",
-    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.20",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.21",
   },
   {
     version: "v0.4.18",

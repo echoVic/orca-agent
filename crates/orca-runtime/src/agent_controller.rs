@@ -82,6 +82,8 @@ pub(crate) struct AgentLaunchRequest {
         Option<Arc<dyn crate::lifecycle::RuntimeApprovalHandler + Send + Sync>>,
     pub(crate) permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     pub(crate) surface_activity: Option<AgentSurfaceActivity>,
+    pub(crate) batch_id: String,
+    pub(crate) batch_size: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -148,11 +150,11 @@ impl AgentController {
         let batch_id = surface_activity
             .as_ref()
             .map(|activity| activity.batch_id.clone())
-            .unwrap_or_else(|| format!("batch-{}", request.agent_id));
+            .unwrap_or_else(|| request.batch_id.clone());
         let batch_size = surface_activity
             .as_ref()
             .map(|activity| activity.batch_size)
-            .unwrap_or(1);
+            .unwrap_or(request.batch_size.max(1));
         if let Some(activity) = surface_activity.as_ref() {
             activity
                 .emitter

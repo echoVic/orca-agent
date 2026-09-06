@@ -844,7 +844,7 @@ fn registry_child_binding(
     expected_revision: u64,
 ) -> Result<ChildBinding, String> {
     let snapshot = host.agent_registry_snapshot(root_thread_id);
-    if snapshot.revision != expected_revision {
+    if snapshot.revision < expected_revision {
         return Err(format!(
             "the selected child agent is stale (expected revision {expected_revision})"
         ));

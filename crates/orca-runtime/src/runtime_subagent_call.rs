@@ -654,6 +654,8 @@ fn run_threaded_agent_worker(
         approval_handler: None,
         permission_handler,
         surface_activity,
+        batch_id: batch_id.clone(),
+        batch_size,
     });
 
     match launch {

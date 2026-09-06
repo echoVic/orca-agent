@@ -349,7 +349,8 @@ impl RuntimeShellSessionManager {
             enforcement,
             shell_backend_name(),
             shell_capability_ceiling(&command, &metadata_writable_directories),
-        );
+        )
+        .with_profile(cfg.execution_profile);
 
         #[cfg(windows)]
         if !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
