@@ -381,8 +381,8 @@ const atomicJobSpawnContracts = [
   ["crates/orca-runtime/src/subagent_async_worker.rs", "launch_user_trusted("],
   ["crates/orca-runtime/src/workflow/host.rs", "launch_user_trusted("],
   ["crates/orca-runtime/src/shell_session.rs", "broker.launch(process, capability)"],
-  ["crates/orca-tools/src/bash.rs", "spawn_with_capability("],
-  ["crates/orca-tools/src/external.rs", "spawn_with_capability("],
+  ["crates/orca-tools/src/bash.rs", "spawn_with_capability_profile("],
+  ["crates/orca-tools/src/external.rs", "spawn_with_capability_profile("],
   ["crates/orca-tools/src/git.rs", "spawn_user_trusted("],
   ["crates/orca-tools/src/grep.rs", "spawn_user_trusted("],
 ];
