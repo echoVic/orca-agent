@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.23":
+        "Fixes terminal Goal checkpoint recovery batch classification so durable prepared state remains observable in full workspace runs.",
       "v0.4.22":
         "Four-plane agent runtime with independent child transcripts and canonical event reduction.",
       "v0.4.19":
@@ -656,6 +658,7 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.23": "修复完整 workspace 测试中 Goal terminal checkpoint recovery 的 batch 分类，确保 durable prepared state 可观察。",
       "v0.4.22": "修复 Goal terminal checkpoint recovery 的 prepared batch 保留与冷恢复路径。",
       "v0.4.19":
         "发布 gate 直接执行 Goal recovery 回归和 contract suite，同时保留完整 workspace compile check。",
