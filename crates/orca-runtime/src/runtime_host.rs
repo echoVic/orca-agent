@@ -16684,20 +16684,7 @@ impl ThreadActor {
                     .is_some_and(|fence| fence.thread_id == parent_fence.thread_id)
             })
         }) {
-            if let Err(error) = self.drain_detached_subagent_relay(&active.task_registry, binding)
-                && !matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::NotFound
-                        | io::ErrorKind::Interrupted
-                        | io::ErrorKind::NotConnected
-                )
-            {
-                eprintln!(
-                    "orca: detached subagent relay drain deferred for {}: {error}",
-                    binding.task_id
-                );
-            }
+            let _ = self.drain_detached_subagent_relay(&active.task_registry, binding);
         }
         let Some(fence) = active.surface_operation.clone() else {
             return;
@@ -16721,25 +16708,12 @@ impl ThreadActor {
             .collect::<Vec<_>>();
 
         for (task_id, attempt_id) in candidates {
-            if let Err(error) = self.drain_subagent_relay(
+            let _ = self.drain_subagent_relay(
                 active,
                 fence.clone(),
                 task_id.as_str(),
                 attempt_id.as_str(),
-            ) {
-                // Child startup/cleanup and relay lease renewal can race a
-                // tick. Retry those transient states; malformed frames are
-                // quarantined by the relay reader and surfaced diagnostically.
-                if !matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::NotFound
-                        | io::ErrorKind::Interrupted
-                        | io::ErrorKind::NotConnected
-                ) {
-                    eprintln!("orca: subagent relay drain deferred: {error}");
-                }
-            }
+            );
         }
     }
 
@@ -16784,20 +16758,7 @@ impl ThreadActor {
                 .as_ref()
                 .is_some_and(|fence| fence.thread_id == current_thread_id)
         }) {
-            if let Err(error) = self.drain_detached_subagent_relay(&task_registry, &binding) {
-                if !matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::NotFound
-                        | io::ErrorKind::Interrupted
-                        | io::ErrorKind::NotConnected
-                ) {
-                    eprintln!(
-                        "orca: detached subagent relay drain deferred for {}: {error}",
-                        binding.task_id
-                    );
-                }
-            }
+            let _ = self.drain_detached_subagent_relay(&task_registry, &binding);
         }
     }
 

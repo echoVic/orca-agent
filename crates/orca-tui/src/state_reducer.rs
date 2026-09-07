@@ -240,7 +240,7 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
-                if name == "subagent" || name == "update_plan" {
+                if is_panel_owned_tool_progress_name(&name) {
                     return;
                 }
                 if let Some(index) = self.receiving_tool_call_message_index(&id) {
@@ -356,7 +356,7 @@ impl AppState {
                     }
                     return;
                 }
-                if name == "subagent" {
+                if is_panel_owned_tool_progress_name(&name) {
                     return;
                 }
                 let message_index = if let Some(index) =
@@ -1163,7 +1163,7 @@ fn format_argument_bytes(bytes: usize) -> String {
 }
 
 fn is_panel_owned_tool_progress_name(name: &str) -> bool {
-    matches!(name, "subagent" | "update_plan")
+    matches!(name, "subagent" | "subagent_status" | "task_list" | "update_plan")
 }
 
 fn format_compaction_notice(

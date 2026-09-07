@@ -74,6 +74,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     // Live child work is visible from the conversation view. Keep the stack bounded so
     // a large fan-out cannot displace the transcript and composer entirely.
     let activity_lines = activity_lines(state, theme);
+    let queue_preview_lines = queued_preview_lines(state, frame.area().width, theme);
+    let queue_preview_height = queue_preview_lines.len().min(3) as u16;
     let desired_activity_height = 1_u16.saturating_add(activity_lines.len() as u16);
     let available_activity_height = frame
         .area()
@@ -82,15 +84,13 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         .saturating_sub(plan_height)
         .saturating_sub(search_height)
         .saturating_sub(input_height)
+        .saturating_sub(queue_preview_height)
         .saturating_sub(2); // status + at least one transcript row
     let activity_height: u16 = if activity_lines.is_empty() || available_activity_height < 2 {
         0
     } else {
         desired_activity_height.min(available_activity_height)
     };
-    let queue_preview_lines = queued_preview_lines(state, frame.area().width, theme);
-    let queue_preview_height = queue_preview_lines.len().min(3) as u16;
-
     let chunks = main_layout(
         frame.area(),
         goal_height,
@@ -4199,9 +4199,13 @@ fn render_activity(
     area: Rect,
     activity_lines: &[(String, ratatui::style::Color)],
 ) {
+    if area.height == 0 {
+        return;
+    }
     // First row stays blank as a spacer between the transcript tail and the indicator.
     let mut lines = vec![Line::from("")];
-    lines.extend(activity_lines.iter().map(|(text, color)| {
+    let visible_rows = usize::from(area.height.saturating_sub(1));
+    lines.extend(activity_lines.iter().take(visible_rows).map(|(text, color)| {
         Line::from(Span::styled(
             format!(" {text}"),
             Style::default().fg(*color),
@@ -6213,6 +6217,21 @@ mod tests {
         assert_eq!(with_queue[5].height, without_queue[5].height);
         assert_eq!(with_queue[6].height, without_queue[6].height);
         assert_eq!(with_queue[7].height, without_queue[7].height);
+    }
+
+    #[test]
+    fn crowded_bottom_chrome_stays_non_overlapping() {
+        let area = Rect::new(0, 0, 50, 14);
+        let chunks = main_layout(area, 0, 0, 5, 3, 1, 3);
+        for pair in chunks.windows(2) {
+            assert!(
+                pair[0].bottom() <= pair[1].y,
+                "layout regions overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(chunks[7].bottom(), area.bottom());
     }
 
     #[test]
