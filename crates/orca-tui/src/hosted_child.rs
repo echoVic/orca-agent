@@ -454,6 +454,34 @@ fn send_event(event_tx: &mpsc::Sender<TuiEvent>, event: TuiEvent) -> Result<(), 
         .map_err(|_| "TUI event receiver closed".to_string())
 }
 
+fn project_hosted_child_attached(
+    task_id: String,
+    projection: SurfaceProjectionState,
+    messages: Vec<ChatMessage>,
+    attachment: SessionAttachmentId,
+    root_event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    send_attached_event(
+        root_event_tx,
+        attachment,
+        TuiEvent::ChildProjectionReset {
+            task_id,
+            projection: Box::new(projection),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    send_attached_event(
+        root_event_tx,
+        attachment,
+        TuiEvent::HistoryLoaded {
+            messages,
+            plan: None,
+            label: "Inherited conversation context.".to_string(),
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn detach_child_surface(surface: &RuntimeSurfaceHandle, client: &RuntimeSurfaceClientHandle) {
     let _ = surface.detach(
         client,
@@ -556,10 +584,13 @@ fn focus_child(
             return;
         }
     };
-    let binding = child_binding(&parent_snapshot, &task_id, expected_revision).or_else(|_| {
-        registry_child_binding(host, parent_thread.thread_id(), &task_id, expected_revision)
-    });
-    let binding = match binding {
+    let binding = match resolve_child_binding(
+        &parent_snapshot,
+        host,
+        parent_thread.thread_id(),
+        &task_id,
+        expected_revision,
+    ) {
         Ok(binding) => binding,
         Err(error) => {
             reject(event_tx, &error);
@@ -601,10 +632,13 @@ fn focus_child(
             return;
         }
     };
-    let current_binding = match child_binding(&current_snapshot, &task_id, expected_revision)
-        .or_else(|_| {
-            registry_child_binding(host, parent_thread.thread_id(), &task_id, expected_revision)
-        }) {
+    let current_binding = match resolve_child_binding(
+        &current_snapshot,
+        host,
+        parent_thread.thread_id(),
+        &task_id,
+        expected_revision,
+    ) {
         Ok(binding) => binding,
         Err(error) => {
             reject(event_tx, &format!("child focus became stale: {error}"));
@@ -652,7 +686,8 @@ fn focus_child(
     *event_tx = child_event_tx.clone();
     *session_attachment = child_attachment;
 
-    if let Err(error) = project_hosted_thread_attached(
+    if let Err(error) = project_hosted_child_attached(
+        task_id.clone(),
         child_projection,
         child_messages,
         child_attachment,
@@ -687,17 +722,9 @@ fn focus_child(
         child_attachment,
         event_bridge: child_bridge,
     });
-    // The projection and focus marker are sent through the root producer in
-    // order. Start the relay only after the marker is queued so hydration and
+    // Start the relay only after the child reset is queued so hydration and
     // live child events cannot race ahead of the visible focus transition.
     announce_runtime_ready(&child_thread, event_tx, control);
-    let _ = send_attached_event(
-        root_event_tx,
-        child_attachment,
-        TuiEvent::ChildFocusChanged {
-            task_id: Some(task_id.clone()),
-        },
-    );
     for interaction in child_interactions {
         let _ = send_attached_event(root_event_tx, child_attachment, interaction);
     }
@@ -802,6 +829,24 @@ struct ChildBinding {
     child_thread_id: String,
 }
 
+fn resolve_child_binding(
+    snapshot: &SurfaceSnapshot,
+    host: &RuntimeHostHandle,
+    root_thread_id: &str,
+    task_id: &str,
+    expected_revision: u64,
+) -> Result<ChildBinding, String> {
+    let surface_task_present = snapshot
+        .tasks
+        .iter()
+        .any(|task| task.task_id.as_str() == task_id);
+    if surface_task_present {
+        child_binding(snapshot, task_id, expected_revision)
+    } else {
+        registry_child_binding(host, root_thread_id, task_id, expected_revision)
+    }
+}
+
 fn child_binding(
     snapshot: &SurfaceSnapshot,
     task_id: &str,
@@ -828,6 +873,9 @@ fn child_binding(
         .iter()
         .find(|subagent| &subagent.subagent_id == subagent_id)
         .ok_or_else(|| "the selected child has no surface binding".to_string())?;
+    if subagent.status != orca_runtime::surface::SurfaceSubagentStatus::Running {
+        return Err("the selected child is no longer running".to_string());
+    }
     let child_thread_id = subagent
         .child_thread_id
         .as_ref()
@@ -852,7 +900,7 @@ fn registry_child_binding(
     let agent = snapshot
         .agents
         .iter()
-        .find(|agent| agent.agent_id == agent_id)
+        .find(|agent| agent.agent_id == agent_id && agent.status.is_active())
         .ok_or_else(|| "the selected child agent is no longer present".to_string())?;
     if agent.parent_thread_id != root_thread_id {
         return Err("the selected child is not owned by this conversation".to_string());
@@ -876,7 +924,58 @@ pub(crate) fn shutdown_attached_child_on_controller_exit(focus: HostedChildFocus
 
 #[cfg(test)]
 mod tests {
-    use super::ChildBinding;
+    use orca_core::conversation::ConversationTarget;
+    use orca_core::cost_types::UsageTotals;
+    use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
+
+    use super::{ChildBinding, project_hosted_child_attached};
+    use crate::attachment_routing::accept_attached_tui_event;
+    use crate::protocol::SessionAttachmentId;
+    use crate::surface_projection::SurfaceProjectionState;
+    use crate::types::AppState;
+
+    fn task(id: &str, task_type: TaskType) -> BackgroundTaskSummary {
+        BackgroundTaskSummary {
+            id: id.to_string(),
+            parent_task_id: None,
+            task_type,
+            status: TaskStatus::Running,
+            is_backgrounded: false,
+            description: id.to_string(),
+            created_at_ms: 1,
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            command: None,
+            agent_type: None,
+            server: None,
+            tool: None,
+            pending_tool_call: None,
+            name: Some(id.to_string()),
+            workflow_run_id: None,
+            phase_count: None,
+            workflow_progress: None,
+            workflow_phases: Vec::new(),
+            workflow_agents: Vec::new(),
+            workflow_script_path: None,
+            workflow_launch_input: None,
+            workflow_final_summary: None,
+            workflow_failure_count: 0,
+            usage: None,
+            subagent_current_activity: None,
+            subagent_activity_history: Vec::new(),
+            subagent_child_thread_id: None,
+            subagent_batch_id: None,
+            subagent_batch_size: None,
+            subagent_turn: None,
+            last_activity_at_ms: None,
+            continuation: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+            publication_revision: Some(1),
+        }
+    }
 
     #[test]
     fn binding_identity_is_only_the_runtime_resolved_child_id() {
@@ -887,5 +986,81 @@ mod tests {
             child_thread_id: "child-a".to_string(),
         };
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn hosted_child_projection_sets_target_before_merging_child_tasks() {
+        let (action_tx, _action_rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            action_tx,
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        let parent_task = task("parent-task", TaskType::Workflow);
+        let child_task = task("child-task", TaskType::Subagent);
+        state.apply_workflow_tasks_for_test(vec![parent_task.clone()]);
+
+        let attachment = SessionAttachmentId::new(2);
+        state.active_session_attachment = Some(attachment);
+        let projection = SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(2),
+            session_id: Some("child-session".to_string()),
+            title: "Child".to_string(),
+            usage_revision: 1,
+            usage: UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: vec![child_task.clone()],
+            current_goal: None,
+            foreground_operation_id: None,
+            recoverable_operation_id: None,
+            goal_presentation: None,
+            session_presentation: None,
+        };
+        let (root_tx, root_rx) = crossbeam_channel::unbounded();
+
+        project_hosted_child_attached(
+            child_task.id.clone(),
+            projection,
+            Vec::new(),
+            attachment,
+            &root_tx,
+        )
+        .expect("project child");
+        for _ in 0..2 {
+            let event = root_rx.recv().expect("hosted child event");
+            if let Some(event) =
+                accept_attached_tui_event(&mut state, event).expect("active attachment")
+            {
+                state.update(event);
+            }
+        }
+
+        assert_eq!(
+            state.conversation_target(),
+            &ConversationTarget::subagent(child_task.id.clone())
+        );
+        assert_eq!(
+            state
+                .background_workflow_tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![parent_task.id.as_str()]
+        );
+        assert!(
+            state
+                .workflow_tasks()
+                .iter()
+                .any(|task| task.id == parent_task.id)
+        );
+        assert!(
+            state
+                .workflow_tasks()
+                .iter()
+                .any(|task| task.id == child_task.id)
+        );
     }
 }

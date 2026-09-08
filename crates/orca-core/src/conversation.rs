@@ -6,6 +6,36 @@ use serde::{Deserialize, Serialize};
 use crate::approval_types::ActionKind;
 use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
 
+/// The single conversation attachment target used by interactive surfaces.
+/// Keeping the target typed prevents parent, child and sibling navigation from
+/// being represented by a collection of loosely-related booleans.
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ConversationTarget {
+    #[default]
+    Main,
+    Subagent {
+        task_id: String,
+    },
+}
+
+impl ConversationTarget {
+    pub fn main() -> Self {
+        Self::Main
+    }
+    pub fn subagent(task_id: impl Into<String>) -> Self {
+        Self::Subagent {
+            task_id: task_id.into(),
+        }
+    }
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Main => None,
+            Self::Subagent { task_id } => Some(task_id),
+        }
+    }
+}
+
 pub const MISSING_TOOL_TERMINAL_ERROR: &str = "Tool invocation outcome is indeterminate because its terminal result was missing from recovered history. Inspect external state before retrying.";
 pub const IMAGE_ANALYSIS_MESSAGE_PREFIX: &str = "[Image analysis:";
 
@@ -621,6 +651,19 @@ pub fn repaired_missing_tool_result(tool_call: &RawToolCall) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_target_round_trips_main_and_subagent() {
+        assert_eq!(ConversationTarget::default().task_id(), None);
+        let target = ConversationTarget::subagent("child-a");
+        assert_eq!(target.task_id(), Some("child-a"));
+        let encoded = serde_json::to_string(&target).unwrap();
+        assert_eq!(encoded, r#"{"kind":"subagent","task_id":"child-a"}"#);
+        assert_eq!(
+            serde_json::from_str::<ConversationTarget>(&encoded).unwrap(),
+            target
+        );
+    }
 
     #[test]
     fn image_source_debug_never_exposes_payload_or_remote_identifier() {

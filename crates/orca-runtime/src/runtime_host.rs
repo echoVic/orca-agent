@@ -137,6 +137,9 @@ pub const HOST_BACKGROUND_TASK_CAPACITY: usize = 16;
 const WORKFLOW_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SUBAGENT_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SUBAGENT_ACTIVITY_DEDUPE_CAPACITY: usize = 4096;
+// Detached workers have a five-second adoption deadline. Allow that startup
+// window to elapse before turning repeated poll failures into durable health.
+const SUBAGENT_RELAY_FAILURE_POLL_LIMIT: u8 = 120;
 const SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS: usize = 3;
 
@@ -11487,6 +11490,8 @@ struct ThreadActor {
     /// Bounded process-local idempotency cache for activity commands whose
     /// reply may be lost after the surface commit was durably applied.
     subagent_activity_dedupe: VecDeque<(surface::SurfaceCommitId, surface::Sha256Digest)>,
+    /// Consecutive relay drain failures keyed by durable task attempt.
+    subagent_relay_failure_counts: HashMap<String, (String, u8)>,
 }
 
 struct ResidentSurfaceSlot(Option<ResidentSurfaceState>);
@@ -16010,6 +16015,7 @@ impl ThreadActor {
             prompt_queue,
             prompt_queue_path,
             subagent_activity_dedupe: VecDeque::new(),
+            subagent_relay_failure_counts: HashMap::new(),
         }
     }
 
@@ -16684,7 +16690,18 @@ impl ThreadActor {
                     .is_some_and(|fence| fence.thread_id == parent_fence.thread_id)
             })
         }) {
-            let _ = self.drain_detached_subagent_relay(&active.task_registry, binding);
+            match self.drain_detached_subagent_relay(&active.task_registry, binding) {
+                Ok(()) => self.clear_subagent_relay_poll_failure(
+                    &binding.task_id,
+                    binding.attempt_id.as_str(),
+                ),
+                Err(error) => self.record_subagent_relay_poll_failure(
+                    &binding.task_id,
+                    binding.attempt_id.as_str(),
+                    &error,
+                    binding.parent_fence.clone(),
+                ),
+            }
         }
         let Some(fence) = active.surface_operation.clone() else {
             return;
@@ -16708,12 +16725,20 @@ impl ThreadActor {
             .collect::<Vec<_>>();
 
         for (task_id, attempt_id) in candidates {
-            let _ = self.drain_subagent_relay(
+            match self.drain_subagent_relay(
                 active,
                 fence.clone(),
                 task_id.as_str(),
                 attempt_id.as_str(),
-            );
+            ) {
+                Ok(()) => self.clear_subagent_relay_poll_failure(&task_id, &attempt_id),
+                Err(error) => self.record_subagent_relay_poll_failure(
+                    &task_id,
+                    &attempt_id,
+                    &error,
+                    Some(fence.clone()),
+                ),
+            }
         }
     }
 
@@ -16758,7 +16783,18 @@ impl ThreadActor {
                 .as_ref()
                 .is_some_and(|fence| fence.thread_id == current_thread_id)
         }) {
-            let _ = self.drain_detached_subagent_relay(&task_registry, &binding);
+            match self.drain_detached_subagent_relay(&task_registry, &binding) {
+                Ok(()) => self.clear_subagent_relay_poll_failure(
+                    &binding.task_id,
+                    binding.attempt_id.as_str(),
+                ),
+                Err(error) => self.record_subagent_relay_poll_failure(
+                    &binding.task_id,
+                    binding.attempt_id.as_str(),
+                    &error,
+                    binding.parent_fence.clone(),
+                ),
+            }
         }
     }
 
@@ -18013,10 +18049,10 @@ impl ThreadActor {
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceDrainSubagentRelay {
+                fence,
                 task_id,
                 attempt_id,
                 reply,
-                ..
             } => {
                 let result = self
                     .state
@@ -18043,6 +18079,21 @@ impl ThreadActor {
                         }
                         self.drain_detached_subagent_relay(&registry, &binding)
                     });
+                if let Err(error) = &result {
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) {
+                        self.record_subagent_relay_failure(
+                            &task_id,
+                            &attempt_id,
+                            error,
+                            Some(fence),
+                        );
+                    }
+                } else {
+                    self.clear_subagent_relay_poll_failure(&task_id, &attempt_id);
+                }
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderFailure { reply, .. }
@@ -19015,7 +19066,23 @@ impl ThreadActor {
                 attempt_id,
                 reply,
             } => {
-                let result = self.drain_subagent_relay(active, fence, &task_id, &attempt_id);
+                let result =
+                    self.drain_subagent_relay(active, fence.clone(), &task_id, &attempt_id);
+                if let Err(error) = &result {
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) {
+                        self.record_subagent_relay_failure(
+                            &task_id,
+                            &attempt_id,
+                            error,
+                            Some(fence),
+                        );
+                    }
+                } else {
+                    self.clear_subagent_relay_poll_failure(&task_id, &attempt_id);
+                }
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderFailure {

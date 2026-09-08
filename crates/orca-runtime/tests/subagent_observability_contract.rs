@@ -34,6 +34,10 @@ const HOSTED_CONTROLLER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../orca-tui/src/hosted_controller.rs"
 ));
+const HOSTED_CHILD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../orca-tui/src/hosted_child.rs"
+));
 const SURFACE_IDENTITY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/runtime_surface/identity.rs"
@@ -116,6 +120,25 @@ fn task_transcript_action_is_dispatched_instead_of_dropped() {
 }
 
 #[test]
+fn hosted_child_navigation_does_not_bypass_surface_lifecycle_with_registry_state() {
+    let focus = balanced_block(HOSTED_CHILD, "fn focus_child");
+    let projection = balanced_block(HOSTED_CHILD, "fn project_hosted_child_attached");
+    let resolver = balanced_block(HOSTED_CHILD, "fn resolve_child_binding");
+    let surface_binding = balanced_block(HOSTED_CHILD, "fn child_binding");
+    let registry_binding = balanced_block(HOSTED_CHILD, "fn registry_child_binding");
+
+    assert!(focus.contains("project_hosted_child_attached"));
+    assert!(projection.contains("TuiEvent::ChildProjectionReset"));
+    assert!(resolver.contains("surface_task_present"));
+    assert!(
+        !resolver.contains(".or_else"),
+        "a stale or terminal surface task must not fall through to the registry mirror"
+    );
+    assert!(surface_binding.contains("SurfaceSubagentStatus::Running"));
+    assert!(registry_binding.contains("agent.status.is_active()"));
+}
+
+#[test]
 fn every_child_runtime_constructor_carries_permission_identity() {
     let context = balanced_block(CHILD_TYPES, "pub(crate) struct ChildAgentRuntimeContext");
     assert!(
@@ -165,6 +188,14 @@ fn synchronous_child_activity_has_one_surface_delivery_boundary() {
             && sink_selection.contains("Some(activity_ingress)"),
         "hosted sync children must use the typed surface sink when available"
     );
+}
+
+#[test]
+fn threaded_registry_identity_uses_the_surface_task_identity() {
+    let worker = balanced_block(SYNC_SUBAGENT, "fn run_threaded_agent_worker");
+
+    assert!(worker.contains("let registry_agent_id = registry_task_id"));
+    assert!(worker.contains("agent_id: registry_agent_id"));
 }
 
 #[test]
@@ -228,6 +259,36 @@ fn quarantined_relay_health_is_idempotent_after_first_surface_commit() {
     assert!(
         function.contains("session_health") && function.contains("HealthIssueId"),
         "relay corruption must be represented by a typed durable health issue"
+    );
+}
+
+#[test]
+fn relay_lifecycle_failures_have_bounded_retry_and_durable_health() {
+    let poll_failure = balanced_block(GENERATION_ACTOR, "fn record_subagent_relay_poll_failure");
+    let lifecycle_failure = balanced_block(
+        GENERATION_ACTOR,
+        "fn surface_subagent_relay_lifecycle_failure",
+    );
+
+    assert!(poll_failure.contains("SUBAGENT_RELAY_FAILURE_POLL_LIMIT"));
+    assert!(poll_failure.contains("record_subagent_relay_failure"));
+    assert!(
+        lifecycle_failure.contains("HealthIssueId::Projection")
+            && lifecycle_failure.contains("relay_lifecycle_surface_events"),
+        "relay lifecycle failures must remain visible in durable session health"
+    );
+    assert!(
+        RUNTIME_HOST
+            .matches("record_subagent_relay_poll_failure")
+            .count()
+            >= 3,
+        "active and idle actor polling paths must share bounded failure accounting"
+    );
+    assert!(
+        !RUNTIME_HOST.contains(
+            "io::ErrorKind::NotFound | io::ErrorKind::Interrupted | io::ErrorKind::NotConnected"
+        ),
+        "NotFound and NotConnected must not be grouped with retry-only relay outcomes"
     );
 }
 

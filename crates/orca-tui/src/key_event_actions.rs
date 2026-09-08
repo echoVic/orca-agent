@@ -609,7 +609,10 @@ mod tests {
         ));
 
         state.update(crate::protocol::TuiEvent::ChildFocusChanged { task_id: None });
-        assert!(state.focused_child_task_id().is_none());
+        assert_eq!(
+            state.conversation_target(),
+            &orca_core::conversation::ConversationTarget::Main
+        );
     }
 }
 
@@ -638,7 +641,7 @@ where
     // the global cancel binding so returning does not interrupt the child turn.
     if key.code == KeyCode::Esc
         && key.modifiers.is_empty()
-        && state.focused_child_task_id().is_some()
+        && state.conversation_target().task_id().is_some()
     {
         vim_state.cancel_pending_command();
         let _ = action_tx.send(UserAction::ReturnToParentThread);

@@ -1512,9 +1512,17 @@ fn async_agent_thread_outlives_parent_turn_and_remains_addressable() {
         .expect("async child tool terminal");
     let output = tool.payload["output"].as_str().expect("async child output");
     let payload: serde_json::Value = serde_json::from_str(output).expect("async child JSON");
+    let agent_id = payload["agent_id"].as_str().expect("agent id");
     let child_thread_id = payload["thread_id"].as_str().expect("child thread id");
+    let registry = host_handle.agent_registry_snapshot(thread.thread_id());
+    let registry_agent = registry
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == agent_id)
+        .expect("registry entry for launched agent");
 
     assert_ne!(child_thread_id, thread.thread_id());
+    assert_eq!(registry_agent.thread_id, child_thread_id);
     assert!(
         host_handle.resolve_live_thread(child_thread_id).is_ok(),
         "child thread must remain live after the parent turn settles"

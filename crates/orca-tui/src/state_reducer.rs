@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use orca_core::approval_types::ApprovalMode;
+use orca_core::conversation::ConversationTarget;
 use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
 
 use crate::display_text::truncate_to_display_width;
@@ -83,7 +84,17 @@ impl AppState {
                 }
             }
             TuiEvent::ChildFocusChanged { task_id } => {
-                self.set_focused_child_task_id(task_id);
+                // Only snapshot the current workflow task list when transitioning
+                // from Main into a child. For sibling switches (Child -> Child)
+                // reuse the existing background_workflow_tasks so the parent dock
+                // state is never overwritten with a previous child's projection.
+                if task_id.is_some() && self.conversation_target.task_id().is_none() {
+                    self.background_workflow_tasks = self.workflow_panel.tasks().to_vec();
+                }
+                self.set_conversation_target(match task_id {
+                    Some(task_id) => ConversationTarget::subagent(task_id),
+                    None => ConversationTarget::Main,
+                });
                 self.task_transcript = None;
                 self.panel_mode = PanelMode::Conversation;
                 self.scroll_to_bottom();
@@ -94,8 +105,9 @@ impl AppState {
             TuiEvent::NewSessionStarted => {
                 self.task_transcript = None;
                 self.agent_dock_selected_task_id = None;
-                self.set_focused_child_task_id(None);
+                self.set_conversation_target(ConversationTarget::Main);
                 self.announced_subagent_batches.clear();
+                self.announced_subagent_terminals.clear();
             }
             TuiEvent::SessionProjectionReset(projection) => {
                 if !SurfaceSessionProjectionState::accepts_reset(&projection)
@@ -119,7 +131,7 @@ impl AppState {
                 let background_tasks = self.background_workflow_tasks.clone();
                 self.reset_session_projection();
                 self.background_workflow_tasks = background_tasks;
-                self.set_focused_child_task_id(Some(task_id));
+                self.set_conversation_target(ConversationTarget::subagent(task_id));
                 self.task_transcript = None;
                 self.panel_mode = PanelMode::Conversation;
                 self.apply_surface_projection_state(*projection);
@@ -788,7 +800,7 @@ impl AppState {
 
     pub(crate) fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
         let mut projection = projection;
-        if self.focused_child_task_id.is_some() {
+        if self.conversation_target().task_id().is_some() {
             projection.workflow_tasks = merge_background_task_snapshots(
                 &self.background_workflow_tasks,
                 &projection.workflow_tasks,
@@ -1163,7 +1175,10 @@ fn format_argument_bytes(bytes: usize) -> String {
 }
 
 fn is_panel_owned_tool_progress_name(name: &str) -> bool {
-    matches!(name, "subagent" | "subagent_status" | "task_list" | "update_plan")
+    matches!(
+        name,
+        "subagent" | "subagent_status" | "task_list" | "update_plan"
+    )
 }
 
 fn format_compaction_notice(

@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crossterm::event::KeyCode;
-use orca_core::task_types::{BackgroundTaskSummary, TaskType};
+use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 
 use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{PendingWorkflowNotification, TaskTranscriptRequest, UserAction};
@@ -365,7 +365,14 @@ impl AppState {
     }
 
     fn agent_dock_ids(&self) -> Vec<String> {
-        let task_ids = self
+        let surface_subagent_ids = self
+            .workflow_panel
+            .tasks()
+            .iter()
+            .filter(|task| task.task_type == TaskType::Subagent)
+            .map(|task| task.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut ids = self
             .workflow_panel
             .tasks()
             .iter()
@@ -375,12 +382,14 @@ impl AppState {
             })
             .map(|task| task.id.clone())
             .collect::<Vec<_>>();
-        let mut ids = task_ids.clone();
         ids.extend(
             self.agent_registry
                 .agents
                 .iter()
-                .filter(|agent| agent.status.is_active() && !task_ids.contains(&agent.agent_id))
+                .filter(|agent| {
+                    agent.status.is_active()
+                        && !surface_subagent_ids.contains(agent.agent_id.as_str())
+                })
                 .map(|agent| agent.agent_id.clone()),
         );
         ids
@@ -388,6 +397,14 @@ impl AppState {
 
     pub(crate) fn selected_agent_registry(&self) -> Option<&orca_core::agent_event::AgentSummary> {
         let selected = self.agent_dock_selected_task_id.as_deref()?;
+        if self
+            .workflow_panel
+            .tasks()
+            .iter()
+            .any(|task| task.task_type == TaskType::Subagent && task.id == selected)
+        {
+            return None;
+        }
         self.agent_registry
             .agents
             .iter()
@@ -482,7 +499,15 @@ impl AppState {
     }
 
     pub(crate) fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
-        self.background_workflow_tasks = tasks.clone();
+        let previous = self.workflow_panel.tasks().to_vec();
+        // Only update the parent snapshot when Main is focused. While a child
+        // is attached the background_workflow_tasks holds the parent baseline
+        // used by apply_surface_projection_state for dock merging; overwriting
+        // it with incoming projection data would corrupt the sibling-switch
+        // invariant established by ChildProjectionReset.
+        if self.conversation_target().task_id().is_none() {
+            self.background_workflow_tasks = tasks.clone();
+        }
         let was_suppressing_background_output = self.suppress_background_main_session_output;
         let has_backgrounded_running_main_session =
             tasks.iter().any(is_backgrounded_running_main_session);
@@ -508,6 +533,7 @@ impl AppState {
         self.agent_workspace
             .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
         self.sync_subagent_transcript_messages();
+        self.emit_subagent_terminal_notices(&previous);
         self.refresh_open_task_transcript();
         if should_reveal_background_approval {
             self.panel_mode = PanelMode::Workflows;
@@ -541,9 +567,51 @@ impl AppState {
         }
     }
 
+    fn emit_subagent_terminal_notices(&mut self, previous: &[BackgroundTaskSummary]) {
+        let notices = self
+            .workflow_tasks()
+            .iter()
+            .filter(|task| task.task_type == TaskType::Subagent)
+            .filter_map(|task| {
+                let old = previous.iter().find(|old| old.id == task.id)?;
+                if old.status == task.status
+                    || !matches!(
+                        task.status,
+                        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                    )
+                {
+                    return None;
+                }
+                if self.announced_subagent_terminals.contains(&task.id) {
+                    return None;
+                }
+                let name = task.name.as_deref().unwrap_or(task.description.as_str());
+                Some((
+                    task.id.clone(),
+                    match task.status {
+                        TaskStatus::Completed => format!("Agent completed: {name}"),
+                        TaskStatus::Failed => {
+                            format!("Agent failed: {}", task.error.as_deref().unwrap_or(name))
+                        }
+                        TaskStatus::Cancelled => format!("Agent cancelled: {name}"),
+                        _ => unreachable!(),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (id, notice) in notices {
+            self.announced_subagent_terminals.insert(id);
+            self.finish_assistant_stream();
+            self.push_message(ChatMessage::System(notice));
+        }
+    }
+
     /// Refresh only the agent/task workspace from an inactive attachment.
     /// The focused child transcript remains the visible conversation.
     pub(crate) fn apply_background_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
+        if self.conversation_target().task_id().is_some() {
+            return;
+        }
         self.background_workflow_tasks = tasks.clone();
         self.workflow_panel.replace_tasks(tasks);
         self.agent_workspace

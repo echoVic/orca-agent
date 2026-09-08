@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use orca_core::approval_types::ApprovalMode;
+use orca_core::conversation::ConversationTarget;
 #[cfg(test)]
 use orca_core::cost_types::UsageTotals;
 #[cfg(test)]
@@ -376,6 +377,7 @@ impl MentionPopupState {
 }
 
 pub struct AppState {
+    pub(crate) conversation_target: ConversationTarget,
     pub(crate) transcript: TranscriptState,
     pub(crate) image_viewer: Option<ImageViewerState>,
     pub(crate) image_renderer: ImageRenderState,
@@ -445,10 +447,8 @@ pub struct AppState {
     pub(crate) workflow_panel: WorkflowPanelState,
     pub(crate) agent_workspace: AgentWorkspaceState,
     pub(crate) agent_dock_selected_task_id: Option<String>,
-    /// Task identity of the live child currently attached to the conversation.
-    /// The runtime-owned child thread id never crosses the TUI action boundary.
-    pub(crate) focused_child_task_id: Option<String>,
     pub(crate) announced_subagent_batches: std::collections::HashSet<String>,
+    pub(crate) announced_subagent_terminals: std::collections::HashSet<String>,
     pub(crate) task_transcript: Option<TaskTranscriptViewState>,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
@@ -485,16 +485,16 @@ impl ScrollAmount for i32 {
 }
 
 impl AppState {
+    pub(crate) fn conversation_target(&self) -> &ConversationTarget {
+        &self.conversation_target
+    }
+
     pub(crate) fn task_transcript(&self) -> Option<&TaskTranscriptViewState> {
         self.task_transcript.as_ref()
     }
 
-    pub(crate) fn focused_child_task_id(&self) -> Option<&str> {
-        self.focused_child_task_id.as_deref()
-    }
-
-    pub(crate) fn set_focused_child_task_id(&mut self, task_id: Option<String>) {
-        self.focused_child_task_id = task_id;
+    pub(crate) fn set_conversation_target(&mut self, target: ConversationTarget) {
+        self.conversation_target = target;
     }
 
     pub(crate) fn clear_task_transcript(&mut self) {
@@ -671,6 +671,7 @@ impl AppState {
             surface_operation: SurfaceOperationProjectionState::default(),
             surface_workflow_tasks: SurfaceWorkflowTaskProjectionState::default(),
             background_workflow_tasks: Vec::new(),
+            conversation_target: ConversationTarget::Main,
             agent_registry: orca_core::agent_event::AgentRegistrySnapshot::default(),
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,
@@ -678,8 +679,8 @@ impl AppState {
             workflow_panel: WorkflowPanelState::default(),
             agent_workspace: AgentWorkspaceState::default(),
             agent_dock_selected_task_id: None,
-            focused_child_task_id: None,
             announced_subagent_batches: std::collections::HashSet::new(),
+            announced_subagent_terminals: std::collections::HashSet::new(),
             task_transcript: None,
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,
@@ -1023,8 +1024,9 @@ impl AppState {
         self.panel_mode = PanelMode::Conversation;
         self.reset_workflow_panel();
         self.agent_dock_selected_task_id = None;
-        self.focused_child_task_id = None;
+        self.set_conversation_target(ConversationTarget::Main);
         self.announced_subagent_batches.clear();
+        self.announced_subagent_terminals.clear();
         self.pending_workflow_notifications.clear();
         self.suppress_background_main_session_output = false;
         self.last_completed_at = None;

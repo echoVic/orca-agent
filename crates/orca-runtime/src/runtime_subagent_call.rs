@@ -636,8 +636,11 @@ fn run_threaded_agent_worker(
         (None, permission_handler, None)
     };
     let launch_surface_activity = surface_activity.clone();
+    let registry_agent_id = registry_task_id
+        .clone()
+        .unwrap_or_else(|| tool_request.id.clone());
     let launch = controller.launch(AgentLaunchRequest {
-        agent_id: tool_request.id.clone(),
+        agent_id: registry_agent_id,
         description: description.clone(),
         prompt: request.prompt,
         model: request.model,

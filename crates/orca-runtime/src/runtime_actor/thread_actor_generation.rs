@@ -39,7 +39,7 @@ fn validate_relay_activity_envelope(
     Err(io::Error::new(io::ErrorKind::InvalidData, relay_error))
 }
 
-fn relay_corruption_issue_commit_id(task_id: &str, attempt_id: &str) -> surface::SurfaceCommitId {
+fn relay_health_issue_commit_id(task_id: &str, attempt_id: &str) -> surface::SurfaceCommitId {
     let mut hasher = Sha256::new();
     hasher.update(b"orca.subagent-relay.health.v1\0");
     hasher.update((task_id.len() as u64).to_be_bytes());
@@ -53,6 +53,49 @@ fn relay_corruption_issue_commit_id(task_id: &str, attempt_id: &str) -> surface:
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     surface::SurfaceCommitId::try_from_bytes(bytes)
         .expect("domain-separated relay health identity is UUIDv7-shaped")
+}
+
+fn relay_lifecycle_surface_events(
+    previous_revision: surface::SessionHealthRevision,
+    issue_commit_id: surface::SurfaceCommitId,
+    task_id: &str,
+    attempt_id: &str,
+    reason: &str,
+    class: surface::FailureClass,
+    causative_generation: Option<surface::SurfaceOperationFence>,
+) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
+    let next_revision = surface::SessionHealthRevision::try_new(
+        previous_revision
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session health revision exhausted"))?,
+    )
+    .map_err(|_| io::Error::other("session health revision is invalid"))?;
+    let message = surface::DisplayText::new(format!(
+        "subagent relay for task {task_id} attempt {attempt_id} stopped syncing: {reason}"
+    ));
+    Ok(vec![
+        (
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Session(surface::SessionPatch::HealthIssueAdded {
+                previous_revision,
+                next_revision,
+                id: surface::SurfaceHealthIssueId::Projection(issue_commit_id.clone()),
+                issue: surface::SurfaceHealthIssue::ProjectionDegraded {
+                    commit_id: issue_commit_id,
+                    fact_family: surface::SurfaceFactFamily::Subagent,
+                },
+            }),
+        ),
+        (
+            surface::SurfaceScope::Thread,
+            surface::SurfaceEvent::Session(surface::SessionPatch::RuntimeFault {
+                class,
+                message,
+                causative_generation,
+            }),
+        ),
+    ])
 }
 
 fn relay_error_is_corruption(error: &RelayError) -> bool {
@@ -312,7 +355,7 @@ impl ThreadActor {
     ) -> io::Result<()> {
         let reason = crate::thread_store::redact_sensitive_text(&error.to_string());
         let message = format!("subagent relay for task {task_id} is quarantined: {reason}");
-        let issue_commit_id = relay_corruption_issue_commit_id(task_id, attempt_id);
+        let issue_commit_id = relay_health_issue_commit_id(task_id, attempt_id);
         let issue_id = surface::SurfaceHealthIssueId::Projection(issue_commit_id.clone());
         let snapshot = self.resident_surface.coordinator.state().snapshot();
         let already_surfaced = snapshot
@@ -342,6 +385,114 @@ impl ThreadActor {
             return Ok(());
         }
         Err(io::Error::new(io::ErrorKind::InvalidData, message))
+    }
+
+    fn surface_subagent_relay_lifecycle_failure(
+        &mut self,
+        task_id: &str,
+        attempt_id: &str,
+        error: &io::Error,
+        causative_generation: Option<surface::SurfaceOperationFence>,
+    ) -> io::Result<bool> {
+        let issue_commit_id = relay_health_issue_commit_id(task_id, attempt_id);
+        let issue_id = surface::SurfaceHealthIssueId::Projection(issue_commit_id.clone());
+        let Some(resident) = self.resident_surface.0.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "typed surface is unavailable while recording relay failure",
+            ));
+        };
+        let snapshot = resident.coordinator.state().snapshot();
+        if snapshot
+            .session_health
+            .issues
+            .iter()
+            .any(|(current, _)| current == &issue_id)
+        {
+            return Ok(false);
+        }
+        let reason = crate::thread_store::redact_sensitive_text(&error.to_string());
+        let class = match error.kind() {
+            io::ErrorKind::NotFound
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::PermissionDenied => surface::FailureClass::RuntimeInvariant,
+            _ => surface::FailureClass::Persistence,
+        };
+        let events = relay_lifecycle_surface_events(
+            snapshot.session_health.revision,
+            issue_commit_id.clone(),
+            task_id,
+            attempt_id,
+            &reason,
+            class,
+            causative_generation,
+        )?;
+        let batch = self.surface_event_batch_with_commit_id(events, Some(issue_commit_id));
+        self.commit_surface_actor_batch_with_retry(&batch)
+            .map_err(|commit_error| {
+                io::Error::other(format!(
+                    "failed to surface subagent relay lifecycle fault: {commit_error:?}"
+                ))
+            })?;
+        Ok(true)
+    }
+
+    pub(super) fn record_subagent_relay_failure(
+        &mut self,
+        task_id: &str,
+        attempt_id: &str,
+        error: &io::Error,
+        causative_generation: Option<surface::SurfaceOperationFence>,
+    ) {
+        match self.surface_subagent_relay_lifecycle_failure(
+            task_id,
+            attempt_id,
+            error,
+            causative_generation,
+        ) {
+            Ok(true) => eprintln!(
+                "orca: subagent relay lifecycle fault recorded for {task_id} ({:?}): {error}",
+                error.kind()
+            ),
+            Ok(false) => {}
+            Err(record_error) => eprintln!(
+                "orca: subagent relay lifecycle fault for {task_id} ({:?}): {error}; \
+                 diagnostic persistence failed: {record_error}",
+                error.kind()
+            ),
+        }
+    }
+
+    pub(super) fn record_subagent_relay_poll_failure(
+        &mut self,
+        task_id: &str,
+        attempt_id: &str,
+        error: &io::Error,
+        causative_generation: Option<surface::SurfaceOperationFence>,
+    ) {
+        let (tracked_attempt, failures) = self
+            .subagent_relay_failure_counts
+            .entry(task_id.to_string())
+            .or_insert_with(|| (attempt_id.to_string(), 0));
+        if tracked_attempt != attempt_id {
+            *tracked_attempt = attempt_id.to_string();
+            *failures = 0;
+        }
+        *failures = failures.saturating_add(1);
+        if *failures < SUBAGENT_RELAY_FAILURE_POLL_LIMIT {
+            return;
+        }
+        self.record_subagent_relay_failure(task_id, attempt_id, error, causative_generation);
+    }
+
+    pub(super) fn clear_subagent_relay_poll_failure(&mut self, task_id: &str, attempt_id: &str) {
+        if self
+            .subagent_relay_failure_counts
+            .get(task_id)
+            .is_some_and(|(tracked_attempt, _)| tracked_attempt == attempt_id)
+        {
+            self.subagent_relay_failure_counts.remove(task_id);
+        }
     }
 
     pub(super) fn admits_surface_client(
@@ -5222,6 +5373,52 @@ mod task_transcript_query_tests {
                 }),
             ) if message.as_str().contains("task-1")
                 && message.as_str().contains("relay checksum mismatch")
+        ));
+    }
+
+    #[test]
+    fn relay_lifecycle_failure_builds_durable_health_and_runtime_fault_events() {
+        let issue_commit_id = relay_health_issue_commit_id("task-1", "attempt-1");
+        let previous_revision =
+            surface::SessionHealthRevision::try_new(1).expect("health revision");
+
+        let events = relay_lifecycle_surface_events(
+            previous_revision,
+            issue_commit_id.clone(),
+            "task-1",
+            "attempt-1",
+            "runtime state is unavailable",
+            surface::FailureClass::RuntimeInvariant,
+            None,
+        )
+        .expect("health events");
+
+        assert!(matches!(
+            &events[0],
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Session(surface::SessionPatch::HealthIssueAdded {
+                    id: surface::SurfaceHealthIssueId::Projection(id),
+                    issue: surface::SurfaceHealthIssue::ProjectionDegraded {
+                        commit_id,
+                        fact_family: surface::SurfaceFactFamily::Subagent,
+                    },
+                    ..
+                }),
+            ) if id == &issue_commit_id && commit_id == &issue_commit_id
+        ));
+        assert!(matches!(
+            &events[1],
+            (
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Session(surface::SessionPatch::RuntimeFault {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message,
+                    causative_generation: None,
+                }),
+            ) if message.as_str().contains("task-1")
+                && message.as_str().contains("attempt-1")
+                && message.as_str().contains("runtime state is unavailable")
         ));
     }
 

@@ -223,7 +223,7 @@ impl AgentController {
             Arc::clone(&self.registry),
             self.root_thread_id.clone(),
             self.parent_thread_id.clone(),
-            format!("{}@{}", request.agent_id, thread_id),
+            request.agent_id.clone(),
             request.description.clone(),
             thread_id.clone(),
             batch_id,
@@ -936,5 +936,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5]
         );
+    }
+
+    #[test]
+    fn registry_agent_identity_matches_the_surface_task_identity() {
+        let registry = Arc::new(crate::agent_registry::AgentRegistry::in_memory());
+        let publisher = AgentEventPublisher::new(
+            None,
+            registry.clone(),
+            "root-thread".to_string(),
+            "parent-thread".to_string(),
+            "task-child".to_string(),
+            "inspect".to_string(),
+            "child-thread".to_string(),
+            "batch".to_string(),
+            1,
+        );
+
+        publisher
+            .publish_spawned("child-thread")
+            .expect("publish registry spawn");
+
+        let snapshot = registry.snapshot("root-thread");
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].agent_id, "task-child");
+        assert_eq!(snapshot.agents[0].thread_id, "child-thread");
     }
 }

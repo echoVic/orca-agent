@@ -3262,7 +3262,9 @@ impl TaskRegistry {
             self.get(id)
         };
         let Some(record) = record else {
-            return Ok(false);
+            return Err(format!(
+                "subagent relay task '{id}' disappeared without an explicit terminal state"
+            ));
         };
         Ok(record.task_type == TaskType::Subagent
             && !record.stop_requested
@@ -8709,6 +8711,17 @@ while :; do :; done
         let failed = registry.create_subagent("failed activity".to_string(), None);
         registry.fail(&failed.id, "failed".to_string()).unwrap();
         assert!(registry.subagent_relay_replay_allowed(&failed.id).unwrap());
+    }
+
+    #[test]
+    fn missing_subagent_relay_task_is_a_lifecycle_error() {
+        let registry = TaskRegistry::new("session-1".to_string());
+
+        let error = registry
+            .subagent_relay_replay_allowed("missing-task")
+            .expect_err("missing tasks must not look explicitly cleaned up");
+
+        assert!(error.contains("disappeared without an explicit terminal state"));
     }
 
     #[test]

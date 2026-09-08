@@ -240,6 +240,11 @@ pub(crate) fn hosted_tui_controller_loop(
                         &attachment_routing,
                         &control,
                     );
+                    // Invalidate the cached registry revision so the dock
+                    // refreshes on the next idle tick when we return from a
+                    // sibling switch via this path, mirroring the reset in
+                    // ReturnToParentThread.
+                    last_agent_registry_revision = 0;
                 }
                 handle_hosted_child_action(
                     HostedChildAction::Focus {
@@ -271,6 +276,9 @@ pub(crate) fn hosted_tui_controller_loop(
                     &attachment_routing,
                     &control,
                 );
+                // Force the dock to refresh on the next idle tick so it reflects
+                // any registry changes that accumulated while the child was focused.
+                last_agent_registry_revision = 0;
                 last_idle_projection_cursor = None;
             }
             Ok(UserAction::StartSideConversation { prompt }) => {

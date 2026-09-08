@@ -5,6 +5,7 @@ use crate::protocol::{
 use crate::surface_projection::SurfaceProjectionState;
 use crate::transcript_state::ChatMessage;
 use crate::viewport_state::CopyNotice;
+use orca_core::conversation::ConversationTarget;
 use orca_core::plan_types::PlanStatus;
 use orca_core::task_types::{TaskStatus, TaskType};
 
@@ -757,7 +758,10 @@ fn child_projection_reset_preserves_parent_agent_dock() {
         projection: Box::new(projection),
     });
 
-    assert_eq!(state.focused_child_task_id(), Some(child.id.as_str()));
+    assert_eq!(
+        state.conversation_target().task_id(),
+        Some(child.id.as_str())
+    );
     assert!(
         state
             .workflow_tasks()
@@ -2505,6 +2509,49 @@ fn agent_workspace_selection_tracks_identity_across_task_refresh() {
             "agent-second".to_string()
         ))
     );
+}
+
+#[test]
+fn terminal_surface_task_cannot_be_resurrected_by_stale_active_registry_agent() {
+    let mut state = state();
+    let mut task = workflow_task_summary("agent-child", "child");
+    task.task_type = TaskType::Subagent;
+    task.status = TaskStatus::Completed;
+    task.completed_at_ms = Some(2_000);
+    task.publication_revision = Some(3);
+    state.apply_workflow_tasks_for_test(vec![task]);
+    state.apply_agent_registry_update(orca_core::agent_event::AgentRegistrySnapshot {
+        revision: 8,
+        agents: vec![orca_core::agent_event::AgentSummary {
+            root_thread_id: "root".to_string(),
+            batch_id: "batch".to_string(),
+            batch_size: 1,
+            agent_id: "agent-child".to_string(),
+            thread_id: "thread-child".to_string(),
+            parent_thread_id: "root".to_string(),
+            description: "child".to_string(),
+            status: orca_core::agent_event::AgentStatus::Running,
+            activity: None,
+            turn: None,
+            usage: Default::default(),
+            result: None,
+            error: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 2_000,
+        }],
+    });
+
+    state.agent_dock_selected_task_id = Some("agent-child".to_string());
+    assert!(state.selected_agent_dock_task().is_none());
+    assert!(
+        state.selected_agent_registry().is_none(),
+        "the surface task lifecycle must override a stale registry mirror"
+    );
+    assert!(matches!(
+        state.selected_agent_row(),
+        Some(crate::agent_workspace::AgentWorkspaceRow::Subagent { task, .. })
+            if task.status == TaskStatus::Completed
+    ));
 }
 
 #[test]
@@ -5426,6 +5473,134 @@ fn reused_tool_id_live_submission_applies_only_to_new_row() {
 
     assert!(state.refined_diff_styles(0, "edit-1").is_none());
     assert!(state.refined_diff_styles(1, "edit-1").is_some());
+}
+
+/// Sibling agent switch preserves parent workflow task list.
+/// When switching from child-a directly to child-b the background_workflow_tasks
+/// snapshot must come from the parent list, not from child-a's projection.
+#[test]
+fn sibling_child_focus_switch_preserves_parent_workflow_tasks() {
+    let mut state = state();
+
+    // Load two parent-level workflow tasks.
+    let parent_task_a = workflow_task_summary("parent-a", "Parent task A");
+    let parent_task_b = workflow_task_summary("parent-b", "Parent task B");
+    state.apply_workflow_tasks_for_test(vec![parent_task_a.clone(), parent_task_b.clone()]);
+
+    // Enter child-a from Main. The current workflow list (parent tasks) must be
+    // snapshotted into background_workflow_tasks.
+    state.update(TuiEvent::ChildFocusChanged {
+        task_id: Some("child-a".into()),
+    });
+    // Simulate child-a's projection arriving with only child-specific tasks.
+    let child_a_task = {
+        let mut t = workflow_task_summary("child-a-task", "Child A only task");
+        t.task_type = TaskType::Subagent;
+        t
+    };
+    state.apply_workflow_tasks_for_test(vec![child_a_task.clone()]);
+    state.update(TuiEvent::BackgroundTasksUpdated(vec![
+        workflow_task_summary("foreign-child-task", "Foreign child projection"),
+    ]));
+
+    assert_eq!(
+        state
+            .workflow_tasks()
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["child-a-task"],
+        "an unfenced background update must not mutate the focused child dock"
+    );
+
+    // Switch directly to child-b without returning to main.
+    state.update(TuiEvent::ChildFocusChanged {
+        task_id: Some("child-b".into()),
+    });
+
+    // After the sibling switch, background_workflow_tasks must still contain the
+    // PARENT snapshot (parent-a, parent-b), not child-a's projection.
+    let bg = &state.background_workflow_tasks;
+    assert!(
+        bg.iter().any(|t| t.id == "parent-a"),
+        "background_workflow_tasks should contain parent-a after sibling switch, got: {:?}",
+        bg.iter().map(|t| &t.id).collect::<Vec<_>>()
+    );
+    assert!(
+        bg.iter().any(|t| t.id == "parent-b"),
+        "background_workflow_tasks should contain parent-b after sibling switch"
+    );
+    assert!(
+        !bg.iter().any(|t| t.id == "child-a-task"),
+        "background_workflow_tasks must NOT contain child-a-task after sibling switch (parent snapshot must be preserved)"
+    );
+    assert_eq!(
+        state.conversation_target(),
+        &ConversationTarget::Subagent {
+            task_id: "child-b".into()
+        }
+    );
+}
+
+/// End-to-end: main → child-a → main → child-b, verifying conversation_target at
+/// every hop and that a session reset clears the target back to Main.
+#[test]
+fn conversation_target_survives_full_main_child_sibling_session_reset_cycle() {
+    let mut state = state();
+
+    // Start at Main.
+    assert_eq!(state.conversation_target(), &ConversationTarget::Main);
+
+    // Navigate into child-a via ChildFocusChanged.
+    state.update(TuiEvent::ChildFocusChanged {
+        task_id: Some("child-a".into()),
+    });
+    assert_eq!(
+        state.conversation_target(),
+        &ConversationTarget::Subagent {
+            task_id: "child-a".into()
+        }
+    );
+
+    // Navigate back to main.
+    state.update(TuiEvent::ChildFocusChanged { task_id: None });
+    assert_eq!(state.conversation_target(), &ConversationTarget::Main);
+
+    // Navigate into sibling child-b.
+    state.update(TuiEvent::ChildFocusChanged {
+        task_id: Some("child-b".into()),
+    });
+    assert_eq!(
+        state.conversation_target(),
+        &ConversationTarget::Subagent {
+            task_id: "child-b".into()
+        }
+    );
+
+    // A new session must clear the target back to Main.
+    state.update(TuiEvent::NewSessionStarted);
+    assert_eq!(
+        state.conversation_target(),
+        &ConversationTarget::Main,
+        "conversation_target must be Main after NewSessionStarted"
+    );
+
+    // Navigate to another child and verify a second NewSessionStarted still resets.
+    state.update(TuiEvent::ChildFocusChanged {
+        task_id: Some("child-c".into()),
+    });
+    assert_eq!(
+        state.conversation_target(),
+        &ConversationTarget::Subagent {
+            task_id: "child-c".into()
+        },
+    );
+    state.update(TuiEvent::NewSessionStarted);
+    assert_eq!(
+        state.conversation_target(),
+        &ConversationTarget::Main,
+        "conversation_target must be Main after second NewSessionStarted"
+    );
 }
 
 #[test]
