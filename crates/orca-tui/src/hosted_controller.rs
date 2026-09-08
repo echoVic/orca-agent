@@ -94,8 +94,6 @@ pub(crate) fn hosted_tui_controller_loop(
     let mut side_parent: Option<HostedSideParent> = None;
     let mut child_focus: Option<HostedChildFocus> = None;
     let mut last_idle_projection_cursor = None;
-    let mut last_agent_registry_revision = 0_u64;
-    let mut agent_registry_root_thread_id: Option<String> = None;
 
     let startup_history_mode = config.lock().unwrap().history_mode.clone();
     if typed_history_startup_eligible(&startup_history_mode, &preloaded) {
@@ -149,26 +147,6 @@ pub(crate) fn hosted_tui_controller_loop(
                         &event_tx,
                         &mut last_idle_projection_cursor,
                     );
-                    // Registry snapshots are root-scoped. While a child is focused the
-                    // attachment is intentionally isolated, so keep the parent dock state
-                    // intact and refresh it again when focus returns to the root.
-                    if child_focus.is_none() {
-                        if let Some(thread) = thread.as_ref() {
-                            let thread_id = thread.thread_id().to_string();
-                            if agent_registry_root_thread_id.as_deref() != Some(&thread_id) {
-                                agent_registry_root_thread_id = Some(thread_id.clone());
-                                last_agent_registry_revision = 0;
-                            }
-                            let snapshot = host.agent_registry_snapshot(thread.thread_id());
-                            if snapshot.revision > last_agent_registry_revision {
-                                last_agent_registry_revision = snapshot.revision;
-                                let _ = event_tx.send(TuiEvent::AgentRegistryUpdated(snapshot));
-                            }
-                        } else {
-                            agent_registry_root_thread_id = None;
-                            last_agent_registry_revision = 0;
-                        }
-                    }
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
@@ -240,11 +218,6 @@ pub(crate) fn hosted_tui_controller_loop(
                         &attachment_routing,
                         &control,
                     );
-                    // Invalidate the cached registry revision so the dock
-                    // refreshes on the next idle tick when we return from a
-                    // sibling switch via this path, mirroring the reset in
-                    // ReturnToParentThread.
-                    last_agent_registry_revision = 0;
                 }
                 handle_hosted_child_action(
                     HostedChildAction::Focus {
@@ -276,9 +249,6 @@ pub(crate) fn hosted_tui_controller_loop(
                     &attachment_routing,
                     &control,
                 );
-                // Force the dock to refresh on the next idle tick so it reflects
-                // any registry changes that accumulated while the child was focused.
-                last_agent_registry_revision = 0;
                 last_idle_projection_cursor = None;
             }
             Ok(UserAction::StartSideConversation { prompt }) => {

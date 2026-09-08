@@ -298,6 +298,9 @@ fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
             diff: string("diff").map(str::to_string),
             kind: string("kind").map(str::to_string),
         }),
+        // Subagent presentation is reduced once through the runtime surface and
+        // reaches the TUI as SurfaceProjectionSynced. Mapping these raw events
+        // would create a second ordering domain for the same dock state.
         EventType::SubagentStarted | EventType::SubagentProgress | EventType::SubagentCompleted => {
             None
         }

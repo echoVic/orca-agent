@@ -303,18 +303,17 @@ impl AppState {
 
     pub fn show_agents(&mut self) {
         self.panel_mode = PanelMode::Agents;
-        self.agent_workspace
-            .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
+        self.agent_workspace.reconcile(self.workflow_panel.tasks());
     }
 
     pub(crate) fn select_previous_agent(&mut self) {
         self.agent_workspace
-            .select_previous(self.workflow_panel.tasks(), &self.agent_registry.agents);
+            .select_previous(self.workflow_panel.tasks());
     }
 
     pub(crate) fn select_next_agent(&mut self) {
         self.agent_workspace
-            .select_next(self.workflow_panel.tasks(), &self.agent_registry.agents);
+            .select_next(self.workflow_panel.tasks());
     }
 
     pub(crate) fn agent_selected_index(&self) -> usize {
@@ -322,13 +321,12 @@ impl AppState {
     }
 
     pub(crate) fn agent_rows(&self) -> Vec<AgentWorkspaceRow<'_>> {
-        self.agent_workspace
-            .rows(self.workflow_panel.tasks(), &self.agent_registry.agents)
+        self.agent_workspace.rows(self.workflow_panel.tasks())
     }
 
     pub(crate) fn selected_agent_row(&self) -> Option<AgentWorkspaceRow<'_>> {
         self.agent_workspace
-            .selected_row(self.workflow_panel.tasks(), &self.agent_registry.agents)
+            .selected_row(self.workflow_panel.tasks())
     }
 
     pub(crate) fn select_next_agent_dock_task(&mut self) {
@@ -365,15 +363,7 @@ impl AppState {
     }
 
     fn agent_dock_ids(&self) -> Vec<String> {
-        let surface_subagent_ids = self
-            .workflow_panel
-            .tasks()
-            .iter()
-            .filter(|task| task.task_type == TaskType::Subagent)
-            .map(|task| task.id.as_str())
-            .collect::<HashSet<_>>();
-        let mut ids = self
-            .workflow_panel
+        self.workflow_panel
             .tasks()
             .iter()
             .filter(|task| {
@@ -381,42 +371,12 @@ impl AppState {
                     && (task.status.is_active() || task.status.requires_attention())
             })
             .map(|task| task.id.clone())
-            .collect::<Vec<_>>();
-        ids.extend(
-            self.agent_registry
-                .agents
-                .iter()
-                .filter(|agent| {
-                    agent.status.is_active()
-                        && !surface_subagent_ids.contains(agent.agent_id.as_str())
-                })
-                .map(|agent| agent.agent_id.clone()),
-        );
-        ids
-    }
-
-    pub(crate) fn selected_agent_registry(&self) -> Option<&orca_core::agent_event::AgentSummary> {
-        let selected = self.agent_dock_selected_task_id.as_deref()?;
-        if self
-            .workflow_panel
-            .tasks()
-            .iter()
-            .any(|task| task.task_type == TaskType::Subagent && task.id == selected)
-        {
-            return None;
-        }
-        self.agent_registry
-            .agents
-            .iter()
-            .find(|agent| agent.agent_id == selected && agent.status.is_active())
+            .collect()
     }
 
     pub(crate) fn select_agent_workspace_task(&mut self, task_id: &str) -> bool {
-        self.agent_workspace.select_task(
-            self.workflow_panel.tasks(),
-            &self.agent_registry.agents,
-            task_id,
-        )
+        self.agent_workspace
+            .select_task(self.workflow_panel.tasks(), task_id)
     }
 
     pub fn select_previous_workflow_task(&mut self) {
@@ -530,8 +490,7 @@ impl AppState {
             .is_some_and(is_backgrounded_running_main_session);
         let selected_task_id = self.selected_workflow_task().map(|task| task.id.clone());
         self.workflow_panel.replace_tasks(tasks);
-        self.agent_workspace
-            .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
+        self.agent_workspace.reconcile(self.workflow_panel.tasks());
         self.sync_subagent_transcript_messages();
         self.emit_subagent_terminal_notices(&previous);
         self.refresh_open_task_transcript();
@@ -614,51 +573,13 @@ impl AppState {
         }
         self.background_workflow_tasks = tasks.clone();
         self.workflow_panel.replace_tasks(tasks);
-        self.agent_workspace
-            .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
-    }
-
-    pub(crate) fn apply_agent_registry_update(
-        &mut self,
-        snapshot: orca_core::agent_event::AgentRegistrySnapshot,
-    ) {
-        if snapshot.revision >= self.agent_registry.revision {
-            self.agent_registry = snapshot;
-            self.agent_workspace
-                .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
-            let announcements = self
-                .agent_registry
-                .agents
-                .iter()
-                .filter(|agent| agent.status.is_active())
-                .filter_map(|agent| {
-                    let batch_key = agent.batch_id.clone();
-                    self.announced_subagent_batches
-                        .insert(batch_key)
-                        .then_some((agent.batch_size.max(1), agent.agent_id.clone()))
-                })
-                .collect::<Vec<_>>();
-            if !announcements.is_empty() {
-                self.finish_assistant_stream();
-                for (batch_size, _) in announcements {
-                    let noun = if batch_size == 1 {
-                        "agent"
-                    } else {
-                        "agents in parallel"
-                    };
-                    self.push_message(ChatMessage::System(format!(
-                        "Delegating to {batch_size} {noun}"
-                    )));
-                }
-            }
-        }
+        self.agent_workspace.reconcile(self.workflow_panel.tasks());
     }
 
     #[cfg(test)]
     pub(crate) fn replace_workflow_tasks_for_test(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         self.workflow_panel.replace_tasks(tasks);
-        self.agent_workspace
-            .reconcile(self.workflow_panel.tasks(), &self.agent_registry.agents);
+        self.agent_workspace.reconcile(self.workflow_panel.tasks());
     }
 
     #[cfg(test)]

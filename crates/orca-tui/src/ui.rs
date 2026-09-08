@@ -12,7 +12,6 @@ use tui_textarea::TextArea;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use orca_core::agent_event::{AgentActivity, AgentStatus};
 use orca_core::approval_types::ApprovalMode;
 use orca_core::task_types::{
     BackgroundTaskSummary, TaskActivitySummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
@@ -1712,9 +1711,6 @@ fn agent_workspace_action_hint<'a>(row: AgentWorkspaceRow<'_>, theme: &Theme) ->
         AgentWorkspaceRow::WorkflowAgent { .. } => {
             text.push_str(" · workflow-owned · read only");
         }
-        AgentWorkspaceRow::RegistryAgent { .. } => {
-            text.push_str(" · Enter open conversation");
-        }
     }
     Line::from(Span::styled(text, Style::default().fg(theme.muted)))
 }
@@ -1773,21 +1769,6 @@ fn agent_workspace_list_item<'a>(
                 agent.status == WorkflowAgentStatus::Running,
             )
         }
-        AgentWorkspaceRow::RegistryAgent { agent } => (
-            agent.description.clone(),
-            registry_agent_status_label(&agent.status).to_string(),
-            agent
-                .activity
-                .as_ref()
-                .map(AgentActivity::label)
-                .unwrap_or_else(|| "waiting for activity".to_string()),
-            if agent.status.is_active() {
-                theme.warning
-            } else {
-                theme.muted
-            },
-            agent.status.is_active(),
-        ),
     };
     let icon = if running { spinner_frame(tick) } else { "●" };
     let text = truncate_to_display_width(&format!("{icon} {name} · {status} · {detail}"), width);
@@ -1927,30 +1908,6 @@ fn agent_workspace_focus_lines<'a>(
                 line(format!(" {}", metadata.join(" · ")), theme.muted),
                 line(" workflow-owned · read only".to_string(), theme.muted),
             ]
-        }
-        AgentWorkspaceRow::RegistryAgent { agent } => {
-            let mut lines = vec![
-                line(format!(" Focus {}", agent.description), theme.text),
-                line(
-                    format!(
-                        " registry child · {}",
-                        registry_agent_status_label(&agent.status)
-                    ),
-                    theme.muted,
-                ),
-            ];
-            if let Some(activity) = agent.activity.as_ref() {
-                let marker = if agent.status.is_active() {
-                    spinner_frame(tick)
-                } else {
-                    "●"
-                };
-                lines.push(line(
-                    format!(" {marker} now {}", activity.label()),
-                    theme.warning,
-                ));
-            }
-            lines
         }
     }
 }
@@ -2977,18 +2934,6 @@ fn task_status_label(status: TaskStatus) -> &'static str {
     }
 }
 
-fn registry_agent_status_label(status: &AgentStatus) -> &'static str {
-    match status {
-        AgentStatus::Queued => "queued",
-        AgentStatus::Running => "running",
-        AgentStatus::WaitingPermission => "waiting permission",
-        AgentStatus::Completed => "completed",
-        AgentStatus::Failed => "failed",
-        AgentStatus::Cancelled => "cancelled",
-        AgentStatus::Corrupt => "corrupt",
-    }
-}
-
 fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
     match status {
         TaskStatus::Running | TaskStatus::Stopping => theme.warning,
@@ -3941,104 +3886,12 @@ fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::styl
         state.panel_mode,
         PanelMode::Conversation | PanelMode::Agents
     ) {
-        if !state.agent_registry.agents.is_empty() {
-            lines.extend(agent_registry_activity_lines(
-                &state.agent_registry,
-                theme,
-                state.tick,
-                state.agent_dock_selected_task_id.as_deref(),
-            ));
-            let non_agent_tasks = state
-                .workflow_tasks()
-                .iter()
-                .filter(|task| task.task_type != TaskType::Subagent)
-                .cloned()
-                .collect::<Vec<_>>();
-            lines.extend(background_task_activity_lines(
-                &non_agent_tasks,
-                theme,
-                state.tick,
-                state.agent_dock_selected_task_id.as_deref(),
-            ));
-        } else {
-            lines.extend(background_task_activity_lines(
-                state.workflow_tasks(),
-                theme,
-                state.tick,
-                state.agent_dock_selected_task_id.as_deref(),
-            ));
-        }
-    }
-    lines
-}
-
-fn agent_registry_activity_lines(
-    snapshot: &orca_core::agent_event::AgentRegistrySnapshot,
-    theme: &Theme,
-    tick: u64,
-    selected_agent_id: Option<&str>,
-) -> Vec<(String, ratatui::style::Color)> {
-    let visible = snapshot.agents.iter().collect::<Vec<_>>();
-    if visible.is_empty() {
-        return Vec::new();
-    }
-    let active = visible
-        .iter()
-        .filter(|agent| matches!(&agent.status, AgentStatus::Queued | AgentStatus::Running))
-        .count();
-    let attention = visible
-        .iter()
-        .filter(|agent| matches!(&agent.status, AgentStatus::WaitingPermission))
-        .count();
-    let mut header = format!("● Agents {active} active");
-    if attention > 0 {
-        header.push_str(&format!(" · {attention} attention"));
-    }
-    header.push_str(" · /agents view");
-    let mut lines = vec![(
-        header,
-        if attention > 0 {
-            theme.approval
-        } else {
-            theme.warning
-        },
-    )];
-    lines.push(("  ○ Main [default]".to_string(), theme.text));
-    for agent in visible.iter().take(MAX_DEFAULT_SUBAGENTS) {
-        let icon = if matches!(&agent.status, AgentStatus::Queued | AgentStatus::Running) {
-            spinner_frame(tick)
-        } else {
-            "●"
-        };
-        let status = match &agent.status {
-            AgentStatus::Queued => "queued",
-            AgentStatus::Running => "running",
-            AgentStatus::WaitingPermission => "waiting permission",
-            _ => "idle",
-        };
-        let selection = if selected_agent_id == Some(agent.agent_id.as_str()) {
-            "›"
-        } else {
-            "○"
-        };
-        lines.push((
-            format!("  {selection} {icon} {} · {status}", agent.description),
-            if matches!(&agent.status, AgentStatus::WaitingPermission) {
-                theme.approval
-            } else {
-                theme.text
-            },
+        lines.extend(background_task_activity_lines(
+            state.workflow_tasks(),
+            theme,
+            state.tick,
+            state.agent_dock_selected_task_id.as_deref(),
         ));
-        let detail = agent
-            .activity
-            .as_ref()
-            .map(AgentActivity::label)
-            .unwrap_or_else(|| "waiting for activity".to_string());
-        lines.push((format!("    {detail}"), theme.muted));
-    }
-    let overflow = visible.len().saturating_sub(MAX_DEFAULT_SUBAGENTS);
-    if overflow > 0 {
-        lines.push((format!("  +{overflow} more · /tasks manage"), theme.muted));
     }
     lines
 }
@@ -4205,12 +4058,17 @@ fn render_activity(
     // First row stays blank as a spacer between the transcript tail and the indicator.
     let mut lines = vec![Line::from("")];
     let visible_rows = usize::from(area.height.saturating_sub(1));
-    lines.extend(activity_lines.iter().take(visible_rows).map(|(text, color)| {
-        Line::from(Span::styled(
-            format!(" {text}"),
-            Style::default().fg(*color),
-        ))
-    }));
+    lines.extend(
+        activity_lines
+            .iter()
+            .take(visible_rows)
+            .map(|(text, color)| {
+                Line::from(Span::styled(
+                    format!(" {text}"),
+                    Style::default().fg(*color),
+                ))
+            }),
+    );
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
 }

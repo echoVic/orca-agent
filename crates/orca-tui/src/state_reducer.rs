@@ -448,9 +448,6 @@ impl AppState {
             TuiEvent::BackgroundTasksUpdated(tasks) => {
                 self.apply_background_tasks_update(tasks);
             }
-            TuiEvent::AgentRegistryUpdated(snapshot) => {
-                self.apply_agent_registry_update(snapshot);
-            }
             TuiEvent::TaskStatusUpdated(task) => {
                 if self.suppress_background_main_session_output {
                     return;

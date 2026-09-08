@@ -2512,7 +2512,7 @@ fn agent_workspace_selection_tracks_identity_across_task_refresh() {
 }
 
 #[test]
-fn terminal_surface_task_cannot_be_resurrected_by_stale_active_registry_agent() {
+fn terminal_surface_task_is_not_selectable_in_conversation_dock() {
     let mut state = state();
     let mut task = workflow_task_summary("agent-child", "child");
     task.task_type = TaskType::Subagent;
@@ -2520,33 +2520,9 @@ fn terminal_surface_task_cannot_be_resurrected_by_stale_active_registry_agent() 
     task.completed_at_ms = Some(2_000);
     task.publication_revision = Some(3);
     state.apply_workflow_tasks_for_test(vec![task]);
-    state.apply_agent_registry_update(orca_core::agent_event::AgentRegistrySnapshot {
-        revision: 8,
-        agents: vec![orca_core::agent_event::AgentSummary {
-            root_thread_id: "root".to_string(),
-            batch_id: "batch".to_string(),
-            batch_size: 1,
-            agent_id: "agent-child".to_string(),
-            thread_id: "thread-child".to_string(),
-            parent_thread_id: "root".to_string(),
-            description: "child".to_string(),
-            status: orca_core::agent_event::AgentStatus::Running,
-            activity: None,
-            turn: None,
-            usage: Default::default(),
-            result: None,
-            error: None,
-            created_at_ms: 1_000,
-            updated_at_ms: 2_000,
-        }],
-    });
 
     state.agent_dock_selected_task_id = Some("agent-child".to_string());
     assert!(state.selected_agent_dock_task().is_none());
-    assert!(
-        state.selected_agent_registry().is_none(),
-        "the surface task lifecycle must override a stale registry mirror"
-    );
     assert!(matches!(
         state.selected_agent_row(),
         Some(crate::agent_workspace::AgentWorkspaceRow::Subagent { task, .. })
