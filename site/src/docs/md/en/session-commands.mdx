@@ -39,3 +39,40 @@ before issuing the same write, network request, or command again.
 The interactive picker is the supported surface for browsing local history. For
 automation, keep the chosen session ID with the job metadata and pass it back
 through one of the commands above.
+
+## Storage and retention
+
+Recorded sessions have no total byte or record-count limit for resume. Replay
+reads and reduces one record at a time. Individual JSONL records, including
+their newline, are limited to 64 MiB; writes are checked before appending.
+Corrupt records still block recovery. A bounded catalog or search scan may
+report `inspection_limited`, which is not corruption and does not disable
+resume or fork. Resume independently validates the complete history.
+
+New inline images are stored by SHA-256 in the transcript's sibling
+`SESSION.jsonl.assets/` directory. Repeated uses within a session share one
+blob. The versioned JSONL envelope records the digest, decoded length and
+location of each reference. Reading verifies the bytes before restoring the
+original provider and surface input. Legacy inline images remain readable.
+
+Archive moves the assets with the transcript; compression keeps the same
+asset directory. Fork owns an independent copy, so deleting its parent does
+not remove its images. Raw backups must include both the JSONL (or JSONL.zst)
+and its assets. The runtime `JsonlThreadStore::export_session` API instead
+writes portable JSONL with images included. Older Orca versions cannot read
+the new asset envelopes.
+
+Disk retention is explicit and separate from transcript validity:
+
+~~~bash
+orca storage
+orca storage --max-bytes 1073741824
+orca storage --older-than-days 30
+orca storage --older-than-days 30 --apply
+~~~
+
+Without `--apply`, the command only reports usage and deletion candidates.
+Age and quota policies consider archived sessions for deletion, oldest first,
+and account for their image assets. Active sessions and archived sessions
+held by a runtime owner are protected. A quota is a cleanup target, not a
+write or resume gate; the report says whether it could be satisfied.
