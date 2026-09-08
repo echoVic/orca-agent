@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.25";
+export const releaseVersion = "v0.4.26";
 
 export const releases = [
+  {
+    version: "v0.4.26",
+    date: "2026-09-09",
+    title: "Durable multimodal sessions",
+    body: "Stores repeated images as content-addressed assets, streams session recovery without whole-history size gates, adds explicit archive retention, and preserves workflow progress and shutdown semantics.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.26",
+  },
   {
     version: "v0.4.25",
     date: "2026-09-08",

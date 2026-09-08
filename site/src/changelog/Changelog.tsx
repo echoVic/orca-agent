@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import {
-    type Locale,
-    type SeoEntry,
-    applySeoHead,
-    canonicalOrigin,
-    detectInitialLocale,
-    links,
-    localeStorageKey,
-    releaseVersion,
-    releases,
+  type Locale,
+  type SeoEntry,
+  applySeoHead,
+  canonicalOrigin,
+  detectInitialLocale,
+  links,
+  localeStorageKey,
+  releaseVersion,
+  releases,
 } from "../shared";
 
 const canonicalUrl = `${canonicalOrigin}/changelog/`;
@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.26":
+        "Makes multimodal history durable with deduplicated image assets, 64 MiB records, streaming recovery, and opt-in archive retention. Adds per-model image capabilities, simplifies workspace trust setup, and keeps workflow progress and shutdown recovery consistent.",
       "v0.4.25":
         "Unifies TUI navigation on ConversationTarget, applies child projections atomically to protect the parent workflow baseline, aligns registry and surface task identity, and turns subagent relay lifecycle errors into durable health instead of silent drops.",
       "v0.4.24":
@@ -662,6 +664,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.26":
+        "图片按内容寻址去重存储，单记录上限提升至 64 MiB，会话流式恢复不再受总大小限制，并提供独立归档清理策略。支持按模型配置图片能力，精简工作区信任设置，保持工作流进度与关闭恢复一致。",
       "v0.4.25":
         "统一 TUI 导航到 ConversationTarget，聚焦子会话时原子应用子投影以保护父工作流基线，对齐 registry 与 surface 的任务标识，并将 subagent relay 生命周期错误归类为可持久化的健康状态而非静默丢弃。",
       "v0.4.24": "发布流程的 Windows gate 统一使用正式 Windows CI 的隔离与重试 nextest 配置。",
