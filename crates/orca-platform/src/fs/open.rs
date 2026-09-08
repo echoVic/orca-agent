@@ -11,11 +11,20 @@ pub fn open_nofollow_nonblocking(path: &Path) -> Result<File, PlatformError> {
     platform::open_nonblocking(path)
 }
 
+/// Read without sharing or changing the file handle's sequential cursor.
+pub fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    platform::read_at(file, buffer, offset)
+}
+
 #[cfg(unix)]
 mod platform {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
     use super::*;
+
+    pub(super) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        file.read_at(buffer, offset)
+    }
 
     pub(super) fn open(path: &Path) -> Result<File, PlatformError> {
         open_with_flags(path, libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -44,7 +53,7 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
 
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
@@ -52,6 +61,10 @@ mod platform {
     };
 
     use super::*;
+
+    pub(super) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        file.seek_read(buffer, offset)
+    }
 
     pub(super) fn open(path: &Path) -> Result<File, PlatformError> {
         let file = std::fs::OpenOptions::new()

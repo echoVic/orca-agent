@@ -8802,8 +8802,14 @@ fn recovered_background_approval_interactions(
 ) -> HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction> {
     let snapshot = coordinator.state().snapshot();
     let mut committed_resolutions = HashMap::new();
-    if let Ok(recovered) = coordinator.ledger().recover_batches() {
-        for batch in recovered.committed {
+    if let Ok(recovered) = coordinator.ledger().replay_batches() {
+        for entry in recovered {
+            let Ok((committed, batch)) = entry else {
+                return HashMap::new();
+            };
+            if !committed {
+                continue;
+            }
             for envelope in batch.events.as_slice() {
                 let surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
                     interaction_id,
@@ -8990,10 +8996,19 @@ struct RecoveredContinuationResolution {
 }
 
 fn recovered_continuation_resolutions_from_batches(
-    batches: &[surface::SurfaceCommitBatch],
-) -> HashMap<surface::SurfaceInteractionId, RecoveredContinuationResolution> {
+    batches: impl IntoIterator<
+        Item = Result<(bool, surface::SurfaceCommitBatch), surface::SurfaceLedgerError>,
+    >,
+) -> Result<
+    HashMap<surface::SurfaceInteractionId, RecoveredContinuationResolution>,
+    surface::SurfaceLedgerError,
+> {
     let mut recovered = HashMap::new();
-    for batch in batches {
+    for entry in batches {
+        let (committed, batch) = entry?;
+        if !committed {
+            continue;
+        }
         for envelope in batch.events.as_slice() {
             match &envelope.event {
                 surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
@@ -9067,7 +9082,7 @@ fn recovered_continuation_resolutions_from_batches(
             }
         }
     }
-    recovered
+    Ok(recovered)
 }
 
 fn continuation_resolution_requires_dispatch(
@@ -9855,13 +9870,15 @@ fn recover_continuation_turn_owners_on_start(
     let observed_fingerprint =
         cold_recovery_thread_config_fingerprint(config, coordinator.state().snapshot());
     let cold_owner_epoch = coordinator.state().snapshot().thread.owner_epoch;
-    let recovered_batches = coordinator.ledger().recover_batches().map_err(|error| {
+    let recovered_batches = coordinator.ledger().replay_batches().map_err(|error| {
         RuntimeHostError::ThreadStartFailed {
             message: format!("failed to recover continuation answer facts: {error:?}"),
         }
     })?;
-    let recovered_resolutions =
-        recovered_continuation_resolutions_from_batches(&recovered_batches.committed);
+    let recovered_resolutions = recovered_continuation_resolutions_from_batches(recovered_batches)
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to replay continuation answer facts: {error:?}"),
+        })?;
     let candidates = coordinator
         .state()
         .snapshot()
@@ -11190,10 +11207,16 @@ fn recovered_surface_terminals(
     coordinator: &surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
 ) -> HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor> {
     let mut terminals = HashMap::new();
-    let Ok(recovered) = coordinator.ledger().recover_batches() else {
+    let Ok(recovered) = coordinator.ledger().replay_batches() else {
         return terminals;
     };
-    for batch in recovered.committed {
+    for entry in recovered {
+        let Ok((committed, batch)) = entry else {
+            return HashMap::new();
+        };
+        if !committed {
+            continue;
+        }
         for envelope in batch.events.as_slice() {
             let surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal { record }) =
                 &envelope.event
@@ -23177,7 +23200,8 @@ mod tests {
             None,
         );
 
-        let recovered = recovered_continuation_resolutions_from_batches(&[resolved]);
+        let recovered =
+            recovered_continuation_resolutions_from_batches([Ok((true, resolved))]).unwrap();
         let recovered = recovered.get(&interaction_id).unwrap();
         assert_eq!(recovered.receipt, receipt);
         assert_eq!(recovered.answer.as_ref(), Some(&answer));
@@ -23234,7 +23258,10 @@ mod tests {
             vec![resolved.clone(), started.clone()],
             vec![resolved, started.clone(), started],
         ] {
-            let recovered = recovered_continuation_resolutions_from_batches(&batches);
+            let recovered = recovered_continuation_resolutions_from_batches(
+                batches.iter().cloned().map(|batch| Ok((true, batch))),
+            )
+            .unwrap();
             assert_eq!(
                 recovered.get(&interaction_id).unwrap().dispatch_state,
                 RecoveredContinuationDispatchState::Started {

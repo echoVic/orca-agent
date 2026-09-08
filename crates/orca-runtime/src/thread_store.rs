@@ -1,9 +1,14 @@
+mod assets;
 mod live_thread;
 mod local;
 mod pagination;
 mod projection;
+mod reader;
+mod retention;
 #[cfg_attr(test, allow(dead_code))]
 mod session_index;
+#[cfg(test)]
+mod storage_tests;
 mod types;
 mod writer;
 
@@ -27,8 +32,10 @@ pub(crate) use projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     message_to_thread_json, messages_to_thread_items, messages_to_thread_turns,
 };
+pub(crate) use reader::SessionRecordSnapshot;
+pub use retention::{SessionRetentionPolicy, SessionRetentionReport, retain_sessions};
 pub use session_index::SessionSummaryPage;
-pub(crate) use types::{ManualCompactionDurableSnapshot, StoredConversationRecord};
+pub(crate) use types::{ManualCompactionDurableSnapshot, SessionRecord, StoredConversationRecord};
 pub use types::{
     SessionCheckpointRecord, SessionMeta, SessionSummary, SessionTranscript, SortDirection,
     StoredSessionHealth, StoredSessionHealthIssue, StoredThreadItem, StoredThreadItemPage,

@@ -3253,11 +3253,9 @@ impl ThreadActor {
             .resident_surface
             .coordinator
             .ledger()
-            .recover_batches()
-            .map(|batches| {
-                recovered_continuation_resolutions_from_batches(&batches.committed)
-                    .remove(interaction_id)
-            });
+            .replay_batches()
+            .and_then(recovered_continuation_resolutions_from_batches)
+            .map(|mut resolutions| resolutions.remove(interaction_id));
         if !continuation_resolution_requires_dispatch(&receipt) {
             self.resident_surface
                 .interactions

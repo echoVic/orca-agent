@@ -60,6 +60,8 @@ pub struct Cli {
 enum Command {
     /// Inspect local configuration, trust, and sandbox readiness without network access.
     Doctor(DoctorArgs),
+    /// Inspect disk usage and optionally prune archived sessions.
+    Storage(StorageArgs),
     /// Run a task and emit events.
     Exec(ExecArgs),
     /// Run and inspect local workflows.
@@ -69,6 +71,19 @@ enum Command {
     /// Execute a persisted async subagent task.
     #[command(hide = true)]
     SubagentWorker(SubagentWorkerArgs),
+}
+
+#[derive(Debug, Parser)]
+struct StorageArgs {
+    /// Target bytes across session transcripts and image assets.
+    #[arg(long)]
+    max_bytes: Option<u64>,
+    /// Remove archived sessions older than this many days.
+    #[arg(long)]
+    older_than_days: Option<u64>,
+    /// Apply the explicit policy. Without this flag, only preview candidates.
+    #[arg(long)]
+    apply: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -635,6 +650,42 @@ pub fn run() -> i32 {
     }
 
     match cli.command {
+        Some(Command::Storage(args)) => {
+            let policy = orca_runtime::thread_store::SessionRetentionPolicy {
+                max_bytes: args.max_bytes,
+                older_than_days: args.older_than_days,
+            };
+            match orca_runtime::thread_store::retain_sessions(&policy, args.apply) {
+                Ok(report) => {
+                    println!(
+                        "{}: {} bytes; {} bytes after cleanup; quota satisfied: {}",
+                        if report.applied { "Applied" } else { "Dry run" },
+                        report.bytes_before,
+                        report.bytes_after,
+                        report.quota_satisfied,
+                    );
+                    for candidate in &report.candidates {
+                        let status = if report.deleted.contains(&candidate.path) {
+                            "deleted"
+                        } else if report.skipped.contains(&candidate.path) {
+                            "skipped"
+                        } else {
+                            "candidate"
+                        };
+                        println!(
+                            "{status}: {} bytes {}",
+                            candidate.bytes,
+                            candidate.path.display()
+                        );
+                    }
+                    0
+                }
+                Err(error) => {
+                    eprintln!("orca: {error}");
+                    1
+                }
+            }
+        }
         Some(Command::Doctor(args)) => {
             orca_runtime::diagnostics::run(orca_runtime::diagnostics::DoctorRequest {
                 cwd: args.cwd,

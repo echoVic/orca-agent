@@ -3124,16 +3124,11 @@ impl ThreadActor {
                 },
             }));
         }
-        let recovered = self
+        let launch_batch = self
             .resident_surface
             .coordinator
             .ledger()
-            .recover_batches()
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let launch_batch = recovered
-            .committed
-            .iter()
-            .find(|batch| {
+            .find_committed_batch(|batch| {
                 batch.events.as_slice().iter().any(|envelope| {
                     matches!(
                         &envelope.event,
@@ -3143,7 +3138,7 @@ impl ThreadActor {
                     )
                 })
             })
-            .cloned()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         if launch_batch.events.as_slice().len() != 7 {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -3247,16 +3242,11 @@ impl ThreadActor {
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        let recovered = self
+        let admitted_batch = self
             .resident_surface
             .coordinator
             .ledger()
-            .recover_batches()
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let admitted_batch = recovered
-            .committed
-            .iter()
-            .find(|batch| {
+            .find_committed_batch(|batch| {
                 batch.events.as_slice().iter().any(|envelope| {
                     matches!(
                         &envelope.event,
@@ -3266,7 +3256,7 @@ impl ThreadActor {
                     )
                 })
             })
-            .cloned()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         self.resident_surface
             .interactions

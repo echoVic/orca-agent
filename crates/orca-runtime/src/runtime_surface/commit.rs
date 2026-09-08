@@ -540,6 +540,7 @@ struct BoundedPublicationSuffix {
 }
 
 impl BoundedPublicationSuffix {
+    #[cfg(test)]
     fn from_committed(committed: Vec<SurfaceCommitBatch>) -> Self {
         let mut suffix = Self::default();
         let mut expected_after = None;
@@ -997,13 +998,15 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
         if !lease.authorizes_thread(&state.snapshot().thread.thread_id) {
             return Err(SurfaceCommitError::StaleOwnerEpoch);
         }
-        let recovered = ledger
-            .recover_batches()
+        let mut replay = ledger
+            .replay_batches()
             .map_err(SurfaceCommitError::Ledger)?;
-        let committed = recovered.committed;
-        let prepared = recovered.prepared;
+        let first = replay
+            .next()
+            .transpose()
+            .map_err(SurfaceCommitError::Ledger)?;
         let current_owner_epoch = ThreadOwnerEpoch::new(lease.owner_epoch());
-        if let Some(first) = committed.first().or(prepared.as_ref())
+        if let Some((_, first)) = first.as_ref()
             && first.cursor_before.next_seq.get() == 0
         {
             let initial_owner_epoch = first
@@ -1029,10 +1032,17 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
                 .align_rematerialization_baseline(first.cursor_before.clone(), initial_owner_epoch);
         }
         let mut materialized_takeover = None;
-        for batch in &committed {
+        let mut recovered_publications = BoundedPublicationSuffix::default();
+        let mut prepared = None;
+        for entry in first.into_iter().map(Ok).chain(replay) {
+            let (committed, batch) = entry.map_err(SurfaceCommitError::Ledger)?;
+            if !committed {
+                prepared = Some(batch);
+                continue;
+            }
             let candidate_takeover =
-                materialized_takeover_authority(&state, batch, current_owner_epoch);
-            state = match reduce_batch(SurfaceReduceMode::Rematerialization, &state, batch) {
+                materialized_takeover_authority(&state, &batch, current_owner_epoch);
+            state = match reduce_batch(SurfaceReduceMode::Rematerialization, &state, &batch) {
                 SurfaceReduceResult::Applied { state } => state,
                 SurfaceReduceResult::AlreadyApplied { .. } => state,
                 SurfaceReduceResult::Rejected { error } => {
@@ -1042,11 +1052,11 @@ impl<'owner> RuntimeCommitCoordinator<'owner, JsonlSurfaceCommitLedger> {
             if candidate_takeover.is_some() {
                 materialized_takeover = candidate_takeover;
             }
+            recovered_publications.push(&batch);
         }
 
         let cold_takeover_authority =
             recovered_cold_takeover_authority(&state, current_owner_epoch, materialized_takeover);
-        let recovered_publications = BoundedPublicationSuffix::from_committed(committed);
         let mut coordinator = Self::new_with_authority(ledger, state, owner_lease)?;
         coordinator.recovered_publications = recovered_publications;
         coordinator.cold_takeover_authority = cold_takeover_authority;

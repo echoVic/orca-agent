@@ -51,7 +51,9 @@ impl StoredSessionHealth {
     }
 
     pub fn blocks_mutation(self) -> bool {
-        matches!(self, Self::Quarantined | Self::InspectionLimited)
+        // A partial inspection is not proof of corruption. Resume performs
+        // its own complete streaming validation before allowing mutation.
+        matches!(self, Self::Quarantined)
     }
 }
 

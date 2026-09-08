@@ -22,6 +22,8 @@ use sha2::Digest;
 
 use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
+use super::assets;
+use super::reader::{INDEX_BUDGET, SessionRecords, iter_records};
 #[cfg(not(test))]
 use super::session_index;
 use super::types::{
@@ -30,13 +32,9 @@ use super::types::{
     StoredSessionHealthIssue,
 };
 
-/// Bounds shared by every persisted-session reader. Keeping these limits in
-/// the scanner prevents a malformed transcript (or a compressed bomb) from
-/// turning indexing/search into an unbounded allocation.
-pub(crate) const MAX_SESSION_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
-pub(crate) const MAX_SESSION_DECODED_BYTES: u64 = 128 * 1024 * 1024;
-pub(crate) const MAX_SESSION_LINE_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_SESSION_RECORDS: usize = 100_000;
+/// Durable JSONL record bound, including the line terminator. Total history
+/// size is not a validity limit; only inspection readers have a scan budget.
+pub(crate) const MAX_SESSION_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SessionScan {
@@ -87,12 +85,14 @@ pub(crate) fn read_manual_compaction_snapshot(
     path: &Path,
     operation_id: &crate::runtime_surface::SurfaceOperationId,
 ) -> io::Result<Option<ManualCompactionDurableSnapshot>> {
-    let record = read_records(path)?.into_iter().rev().find_map(|record| {
-        let SessionRecord::ManualCompactionSnapshot(record) = record else {
-            return None;
-        };
-        (record.operation_id == *operation_id).then_some(record)
-    });
+    let mut record = None;
+    for candidate in iter_records(path)? {
+        if let SessionRecord::ManualCompactionSnapshot(snapshot) = candidate?
+            && snapshot.operation_id == *operation_id
+        {
+            record = Some(snapshot);
+        }
+    }
     Ok(record.map(|record| ManualCompactionDurableSnapshot {
         operation_id: record.operation_id,
         strategy: record.strategy,
@@ -109,14 +109,13 @@ pub(crate) fn read_manual_compaction_snapshot(
 pub(crate) fn read_prompt_queue_snapshot(
     path: &Path,
 ) -> io::Result<crate::prompt_queue::PromptQueueSnapshot> {
-    Ok(read_records(path)?
-        .into_iter()
-        .rev()
-        .find_map(|record| match record {
-            SessionRecord::PromptQueueSnapshot(snapshot) => Some(snapshot),
-            _ => None,
-        })
-        .unwrap_or_default())
+    let mut latest = None;
+    for record in iter_records(path)? {
+        if let SessionRecord::PromptQueueSnapshot(snapshot) = record? {
+            latest = Some(snapshot);
+        }
+    }
+    Ok(latest.unwrap_or_default())
 }
 
 pub(crate) fn write_prompt_queue_snapshot(
@@ -132,8 +131,9 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
     }
 
     let _lock = acquire_file_lock(path)?;
+    let line = encode_record_line(path, record)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    write_record_line(&mut file, record)?;
+    file.write_all(&line)?;
     file.flush()?;
     #[cfg(not(test))]
     {
@@ -157,13 +157,14 @@ pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::R
         fs::create_dir_all(parent)?;
     }
     let _lock = acquire_file_lock(path)?;
+    let line = encode_record_line(path, record)?;
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .open(path)?;
     repair_incomplete_final_record(&mut file)?;
-    write_record_line(&mut file, record)?;
+    file.write_all(&line)?;
     file.flush()?;
     file.sync_data()?;
     #[cfg(not(test))]
@@ -192,9 +193,15 @@ fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
     let mut line_start = 0_u64;
     loop {
         line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
+        let Some((read, _)) = read_bounded_line(&mut reader, &mut line, MAX_SESSION_LINE_BYTES)?
+        else {
             break;
+        };
+        if line.len() > MAX_SESSION_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record_bytes_limit",
+            ));
         }
         if line.last() == Some(&b'\n') {
             line_start = line_start
@@ -206,7 +213,9 @@ fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
     }
     drop(reader);
 
-    match serde_json::from_slice::<SessionRecord>(&line) {
+    // A disk asset envelope is also a complete JSON record; hydration is
+    // performed by the authoritative scan before tail repair.
+    match serde_json::from_slice::<serde_json::Value>(&line) {
         Ok(_) => {
             file.seek(SeekFrom::End(0))?;
             file.write_all(b"\n")?;
@@ -227,21 +236,45 @@ fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
 
 pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
     let redacted = redact_session_record(record);
-    let mut line = serde_json::to_string(&redacted).map_err(io::Error::other)?;
-    line.push('\n');
-    writer.write_all(line.as_bytes())
+    writer.write_all(&bounded_json_line(&redacted)?)
 }
 
-pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
-    let scan = scan_session(path)?;
-    match scan.health {
-        StoredSessionHealth::Healthy | StoredSessionHealth::RecoverableTail => Ok(scan.records),
-        health => Err(session_health_error(
-            path,
-            health,
-            scan.health_issue.as_ref(),
-        )),
+fn encode_record_line(path: &Path, record: &SessionRecord) -> io::Result<Vec<u8>> {
+    let redacted = redact_session_record(record);
+    // Validate the hydrated representation too. A small reference envelope
+    // must not expand past the reader's allocation bound.
+    let _ = bounded_json_line(&redacted)?;
+    let value = serde_json::to_value(redacted).map_err(io::Error::other)?;
+    let value = assets::externalize(path, value)?;
+    bounded_json_line(&value)
+}
+
+fn bounded_json_line(value: &impl serde::Serialize) -> io::Result<Vec<u8>> {
+    struct Bounded(Vec<u8>);
+    impl Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.0.len().saturating_add(bytes.len()) >= MAX_SESSION_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "record_bytes_limit",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
+    let mut output = Bounded(Vec::new());
+    serde_json::to_writer(&mut output, value).map_err(io::Error::other)?;
+    output.0.push(b'\n');
+    Ok(output.0)
+}
+
+#[cfg(test)]
+pub(crate) fn read_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
+    iter_records(path)?.collect()
 }
 
 pub(crate) fn conversation_record_from_semantic_event(
@@ -277,7 +310,10 @@ fn line_has_invalid_tool_terminal(line: &str) -> bool {
         .is_some_and(|result| result.is_err())
 }
 
-pub(crate) fn rewrite_records_unlocked(path: &Path, records: &[SessionRecord]) -> io::Result<()> {
+pub(crate) fn rewrite_records_unlocked(
+    path: &Path,
+    records: impl IntoIterator<Item = io::Result<SessionRecord>>,
+) -> io::Result<()> {
     atomic_write_with(path, AtomicWritePolicy::NoFollow, |temporary| {
         write_records_to(temporary, path, records)
     })
@@ -290,27 +326,26 @@ pub(crate) fn rewrite_records_unlocked(path: &Path, records: &[SessionRecord]) -
 fn write_records_to(
     file: &mut File,
     target_path: &Path,
-    records: &[SessionRecord],
+    records: impl IntoIterator<Item = io::Result<SessionRecord>>,
 ) -> io::Result<()> {
     if target_path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
         for record in records {
-            write_record_line(&mut encoder, record)?;
+            encoder.write_all(&encode_record_line(target_path, &record?)?)?;
         }
         encoder.finish()?;
     } else {
         let mut writer = io::BufWriter::new(file);
         for record in records {
-            write_record_line(&mut writer, record)?;
+            writer.write_all(&encode_record_line(target_path, &record?)?)?;
         }
         writer.flush()?;
     }
     Ok(())
 }
 
-/// Scan a persisted transcript once, classifying corruption without mutating
-/// the source bytes. The returned records are the valid prefix; callers must
-/// respect `health` before treating that prefix as resumable history.
+/// Build a bounded catalog projection without loading image assets. A partial
+/// projection is not resumable history; authoritative consumers use iter_records.
 pub(crate) fn scan_session(path: &Path) -> io::Result<SessionScan> {
     scan_session_inner(path, false)
 }
@@ -320,8 +355,8 @@ fn scan_session_with_lines(path: &Path) -> io::Result<SessionScan> {
 }
 
 fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionScan> {
-    let file = match open_regular_history_file(path) {
-        Ok(file) => file,
+    let mut reader = match SessionRecords::open(path, Some(INDEX_BUDGET)) {
+        Ok(reader) => reader,
         Err(error) => {
             let metadata = fs::symlink_metadata(path).ok();
             if metadata
@@ -338,134 +373,28 @@ fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionSca
             return Err(error);
         }
     };
-    let encoded_bytes = file.metadata()?.len();
-    let scan = SessionScan::new(path);
-    if encoded_bytes > MAX_SESSION_ENCODED_BYTES {
-        return Ok(scan.issue(
-            StoredSessionHealth::InspectionLimited,
-            "encoded_bytes_limit",
-            None,
-            Some(MAX_SESSION_ENCODED_BYTES),
-        ));
-    }
-
-    let compressed = path.extension().and_then(|ext| ext.to_str()) == Some("zst");
-    if compressed {
-        let decoder = match zstd::stream::read::Decoder::new(file) {
-            Ok(decoder) => decoder,
-            Err(_) => {
-                return Ok(scan.issue(StoredSessionHealth::Quarantined, "zstd_header", None, None));
-            }
+    let mut scan = SessionScan::new(path);
+    while let Some(record) = reader.next() {
+        let Ok(record) = record else {
+            break;
         };
-        scan_reader(std::io::BufReader::new(decoder), scan, true, collect_lines)
-    } else {
-        scan_reader(std::io::BufReader::new(file), scan, false, collect_lines)
-    }
-}
-
-fn scan_reader<R: BufRead>(
-    mut reader: R,
-    mut scan: SessionScan,
-    compressed: bool,
-    collect_lines: bool,
-) -> io::Result<SessionScan> {
-    let mut line = Vec::new();
-    let mut decoded_offset = 0_u64;
-    let mut line_number = 0_u64;
-    loop {
-        line.clear();
-        let (bytes_read, terminated) =
-            match read_bounded_line(&mut reader, &mut line, MAX_SESSION_LINE_BYTES) {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
-                Err(_) => {
-                    return Ok(scan.issue(
-                        StoredSessionHealth::Quarantined,
-                        if compressed {
-                            "zstd_stream"
-                        } else {
-                            "read_error"
-                        },
-                        (line_number > 0).then_some(line_number),
-                        Some(decoded_offset),
-                    ));
-                }
-            };
-        let next_offset = decoded_offset.saturating_add(bytes_read as u64);
-        if next_offset > MAX_SESSION_DECODED_BYTES {
-            return Ok(scan.issue(
-                StoredSessionHealth::InspectionLimited,
-                "decoded_bytes_limit",
-                Some(line_number.saturating_add(1)),
-                Some(decoded_offset),
-            ));
-        }
-        decoded_offset = next_offset;
-        line_number = line_number.saturating_add(1);
-        if line.len() > MAX_SESSION_LINE_BYTES {
-            return Ok(scan.issue(
-                StoredSessionHealth::InspectionLimited,
-                "record_bytes_limit",
-                Some(line_number),
-                Some(decoded_offset.saturating_sub(bytes_read as u64)),
-            ));
-        }
-
-        let content = line_content(&line);
-        if content.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let text = match std::str::from_utf8(content) {
-            Ok(text) => text,
-            Err(_) => {
-                return Ok(scan.issue(
-                    StoredSessionHealth::Quarantined,
-                    "invalid_utf8",
-                    Some(line_number),
-                    Some(decoded_offset.saturating_sub(bytes_read as u64)),
-                ));
-            }
-        };
-
-        let record = match parse_session_record(text) {
-            Ok(record) => record,
-            Err(code) => {
-                if !terminated && code == "incomplete_record" && !compressed {
-                    return Ok(scan.issue(
-                        StoredSessionHealth::RecoverableTail,
-                        "recoverable_tail",
-                        Some(line_number),
-                        Some(decoded_offset.saturating_sub(bytes_read as u64)),
-                    ));
-                }
-                return Ok(scan.issue(
-                    StoredSessionHealth::Quarantined,
-                    code,
-                    Some(line_number),
-                    Some(decoded_offset.saturating_sub(bytes_read as u64)),
-                ));
-            }
-        };
-        if scan.records.len() >= MAX_SESSION_RECORDS {
-            return Ok(scan.issue(
-                StoredSessionHealth::InspectionLimited,
-                "record_count_limit",
-                Some(line_number),
-                Some(decoded_offset),
-            ));
-        }
         scan.records.push(record);
         if collect_lines {
-            scan.lines.push(text.to_string());
+            // Preserve physical line numbers, including blank JSONL lines.
+            scan.lines
+                .resize(reader.line_number as usize, String::new());
+            *scan.lines.last_mut().expect("current line") = reader.text().to_owned();
         }
     }
+    scan.health = reader.health;
+    scan.health_issue = reader.issue;
     Ok(scan)
 }
 
 /// Reads at most `max_bytes + 1` bytes for one line. `read_until` is not used
 /// here because it allocates the entire attacker-controlled line before a
 /// caller can enforce the record limit.
-fn read_bounded_line<R: BufRead>(
+pub(super) fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
     max_bytes: usize,
@@ -497,12 +426,7 @@ fn read_bounded_line<R: BufRead>(
     }
 }
 
-fn line_content(line: &[u8]) -> &[u8] {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    line.strip_suffix(b"\r").unwrap_or(line)
-}
-
-fn parse_session_record(line: &str) -> Result<SessionRecord, &'static str> {
+pub(super) fn parse_session_record(line: &str) -> Result<SessionRecord, &'static str> {
     let value = match serde_json::from_str::<SessionRecord>(line) {
         Ok(record) => record,
         Err(error) if error.classify() == serde_json::error::Category::Eof => {
@@ -531,6 +455,10 @@ fn parse_session_record(line: &str) -> Result<SessionRecord, &'static str> {
         }
     };
 
+    validate_session_record(value)
+}
+
+pub(super) fn validate_session_record(value: SessionRecord) -> Result<SessionRecord, &'static str> {
     match &value {
         SessionRecord::Message { id, turn_id, .. } if id.is_some() != turn_id.is_some() => {
             Err("invalid_conversation_identity")
@@ -560,7 +488,9 @@ fn source_fingerprint(path: &Path) -> Option<String> {
 pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
     let scan = scan_session_with_lines(path)?;
     match scan.health {
-        StoredSessionHealth::Healthy | StoredSessionHealth::RecoverableTail => Ok(scan.lines),
+        StoredSessionHealth::Healthy
+        | StoredSessionHealth::RecoverableTail
+        | StoredSessionHealth::InspectionLimited => Ok(scan.lines),
         health => Err(session_health_error(
             path,
             health,
@@ -653,19 +583,13 @@ pub(crate) fn open_history_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
 }
 
 pub(crate) fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
-    let scan = scan_session(path)?;
-    if scan.health.blocks_mutation() {
-        return Err(session_health_error(
-            path,
-            scan.health,
-            scan.health_issue.as_ref(),
-        ));
+    let mut meta = None;
+    for record in iter_records(path)? {
+        if let SessionRecord::Meta(value) = record? {
+            meta.get_or_insert(value);
+        }
     }
-    if let Some(SessionRecord::Meta(meta)) = scan
-        .records
-        .into_iter()
-        .find(|record| matches!(record, SessionRecord::Meta(_)))
-    {
+    if let Some(meta) = meta {
         return Ok(meta);
     }
     Err(io::Error::new(
@@ -675,7 +599,7 @@ pub(crate) fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
 }
 
 pub(crate) fn read_transcript(path: &Path) -> io::Result<SessionTranscript> {
-    transcript_from_records(path, read_records(path)?)
+    transcript_from_records(path, iter_records(path)?)
 }
 
 /// Read a transcript but restore only the message log up to the persisted
@@ -685,34 +609,21 @@ pub(crate) fn read_transcript_until(
     path: &Path,
     boundary_message_id: &str,
 ) -> io::Result<SessionTranscript> {
-    let records = read_records(path)?;
-    transcript_from_records(
-        path,
-        truncate_records_at_boundary(records, boundary_message_id)?,
-    )
-}
-
-/// Keep records through the last `conversation.message` whose item id matches
-/// `boundary_message_id`; drop everything after it.
-pub(crate) fn truncate_records_at_boundary(
-    records: Vec<SessionRecord>,
-    boundary_message_id: &str,
-) -> io::Result<Vec<SessionRecord>> {
-    let mut boundary_index = None;
-    for (index, record) in records.iter().enumerate() {
-        if let SessionRecord::Message { id: Some(id), .. } = record
+    let mut boundary = None;
+    for (index, record) in iter_records(path)?.enumerate() {
+        if let SessionRecord::Message { id: Some(id), .. } = record?
             && id.as_str() == boundary_message_id
         {
-            boundary_index = Some(index);
+            boundary = Some(index + 1);
         }
     }
-    let Some(boundary_index) = boundary_index else {
-        return Err(io::Error::new(
+    let count = boundary.ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::NotFound,
             format!("no saved message matches '{boundary_message_id}'"),
-        ));
-    };
-    Ok(records.into_iter().take(boundary_index + 1).collect())
+        )
+    })?;
+    transcript_from_records(path, iter_records(path)?.take(count))
 }
 
 /// Apply a message boundary to an already-loaded transcript by re-reading the
@@ -722,16 +633,12 @@ pub(crate) fn truncate_transcript_at_boundary(
     transcript: &SessionTranscript,
     boundary_message_id: &str,
 ) -> io::Result<SessionTranscript> {
-    let records = read_records(&transcript.path)?;
-    transcript_from_records(
-        &transcript.path,
-        truncate_records_at_boundary(records, boundary_message_id)?,
-    )
+    read_transcript_until(&transcript.path, boundary_message_id)
 }
 
 pub(crate) fn transcript_from_records(
     path: &Path,
-    records: Vec<SessionRecord>,
+    records: impl IntoIterator<Item = io::Result<SessionRecord>>,
 ) -> io::Result<SessionTranscript> {
     let mut meta = None;
     let mut messages = Vec::new();
@@ -749,7 +656,7 @@ pub(crate) fn transcript_from_records(
     let mut semantic_events = Vec::new();
 
     for record in records {
-        match record {
+        match record? {
             SessionRecord::Meta(m) => meta = Some(m),
             SessionRecord::Message { message, .. } => {
                 messages.push(message.into());
@@ -860,8 +767,8 @@ pub(crate) fn transcript_from_records(
 pub(crate) fn read_latest_context_tokens(path: &Path) -> io::Result<Option<u64>> {
     let mut previous_input_tokens = 0;
     let mut latest_context_tokens = None;
-    for record in read_records(path)? {
-        match record {
+    for record in iter_records(path)? {
+        match record? {
             SessionRecord::Usage(usage) => {
                 latest_context_tokens = Some(
                     usage
@@ -1306,15 +1213,10 @@ impl SessionWriter {
             ));
         }
         // Classify the original bytes before any resume path can restore a
-        // compressed file or repair a recoverable plaintext tail. Quarantined
-        // and inspection-limited transcripts remain source-preserving.
-        let scan = scan_session(&path)?;
-        if scan.health.blocks_mutation() {
-            return Err(session_health_error(
-                &path,
-                scan.health,
-                scan.health_issue.as_ref(),
-            ));
+        // compressed file or repair a recoverable plaintext tail. A bounded
+        // catalog inspection does not replace this complete validation.
+        for record in iter_records(&path)? {
+            record?;
         }
         // Appends write plaintext JSONL; raw bytes after a zstd frame would
         // make the whole transcript undecodable, so a compressed session must
@@ -1329,8 +1231,8 @@ impl SessionWriter {
         let event_sequence_cursor = read_transcript(&path)?.next_event_seq;
         let mut conversation_records = Vec::new();
         let mut session_id = None;
-        for record in read_records(&path)? {
-            match record {
+        for record in iter_records(&path)? {
+            match record? {
                 SessionRecord::Meta(meta) => session_id = Some(meta.session_id),
                 SessionRecord::Message {
                     id,
@@ -1599,11 +1501,11 @@ impl SessionWriter {
         if result.is_ok() {
             return Ok(());
         }
-        let exact_record_present = read_records(&self.path).is_ok_and(|records| {
-            records.into_iter().any(|candidate| {
+        let exact_record_present = iter_records(&self.path).is_ok_and(|mut records| {
+            records.any(|candidate| {
                 matches!(
                     candidate,
-                    SessionRecord::ManualCompactionSnapshot(snapshot)
+                    Ok(SessionRecord::ManualCompactionSnapshot(snapshot))
                         if snapshot.snapshot_id == identity.snapshot_id
                             && snapshot.operation_id == identity.operation_id
                 )
@@ -1916,7 +1818,7 @@ mod tests {
             "append probe bypassed the transcript sidecar lock"
         );
 
-        rewrite_records_unlocked(&path, &[SessionRecord::Usage(usage(7, 0, 0, 0.0))])
+        rewrite_records_unlocked(&path, [Ok(SessionRecord::Usage(usage(7, 0, 0, 0.0)))])
             .expect("rewrite transcript while owning lock");
         drop(lock);
         wait_for_append_probe(&mut child, Duration::from_secs(10));
@@ -2776,8 +2678,14 @@ mod tests {
         assert_eq!(scan.health, StoredSessionHealth::InspectionLimited);
         assert_eq!(
             scan.health_issue.as_ref().map(|issue| issue.code.as_str()),
-            Some("record_bytes_limit")
+            Some("inspection_budget")
         );
+        let error = iter_records(path.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("record_bytes_limit"));
     }
 
     #[test]

@@ -1290,6 +1290,84 @@ fn jsonl_ledger_recovers_exact_prepared_and_committed_identity() {
 }
 
 #[test]
+fn jsonl_replay_uses_the_same_byte_snapshot_as_its_commit_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.jsonl");
+    let mut writer = JsonlSurfaceCommitLedger::new(&path, cursor(0));
+    let first = batch(31);
+    let receipt = writer.append_complete_batch(&first).unwrap();
+    writer.checkpoint(&receipt).unwrap();
+    let observer = JsonlSurfaceCommitLedger::new(&path, cursor(0));
+
+    let mut second = batch(33);
+    second.cursor_before = first.cursor_after.clone();
+    second.cursor_after.next_seq = SequenceNumber::new(2);
+    second.cursor_after.source_revision = CursorSourceRevision::Recorded {
+        durable_revision: DurableRevision::try_new(3).unwrap(),
+    };
+    second.commit_class = CommitClass::Recorded {
+        thread_owner_epoch: ThreadOwnerEpoch::new(1),
+        durable_revision: DurableRevision::try_new(3).unwrap(),
+        commit_id: SurfaceCommitId::try_from_bytes(uuid(33)).unwrap(),
+    };
+    let mut events = second.events.as_slice().to_vec();
+    events[0].commit_class = second.commit_class.clone();
+    second.events = NonEmptyVec::try_new(events).unwrap();
+    second.batch_digest = canonical_batch_digest(&second);
+    let receipt = writer.append_complete_batch(&second).unwrap();
+    writer.checkpoint(&receipt).unwrap();
+
+    let stable = observer.recover_batches().unwrap();
+    assert!(stable.committed.as_slice() == [first.clone()]);
+    let fresh = JsonlSurfaceCommitLedger::new(&path, cursor(0))
+        .recover_batches()
+        .unwrap();
+    assert!(fresh.committed.as_slice() == [first, second]);
+}
+
+#[test]
+fn jsonl_replay_preserves_its_snapshot_after_atomic_metadata_rewrite() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rewritten.jsonl");
+    let mut writer = JsonlSurfaceCommitLedger::new(&path, cursor(0));
+    let committed = batch(35);
+    let receipt = writer.append_complete_batch(&committed).unwrap();
+    writer.checkpoint(&receipt).unwrap();
+    let observer = JsonlSurfaceCommitLedger::new(&path, cursor(0));
+    let original = std::fs::read(&path).unwrap();
+
+    orca_platform::fs::atomic_write_with(
+        &path,
+        orca_platform::fs::AtomicWritePolicy::NoFollow,
+        |output| {
+            // A larger metadata record shifts all following byte offsets.
+            serde_json::to_writer(
+                &mut *output,
+                &serde_json::json!({
+                    "type": "plan.state",
+                    "explanation": "x".repeat(original.len()),
+                    "plan": [],
+                }),
+            )?;
+            output.write_all(b"\n")?;
+            output.write_all(&original)
+        },
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let stable = observer.recover_batches().unwrap();
+        assert!(stable.committed.as_slice() == [committed.clone()]);
+    }
+    let fresh = JsonlSurfaceCommitLedger::new(&path, cursor(0))
+        .recover_batches()
+        .unwrap();
+    assert!(fresh.committed.as_slice() == [committed]);
+}
+
+#[test]
 fn jsonl_ledger_indexes_child_thread_bound_source_digest_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("child-thread-bound.jsonl");
