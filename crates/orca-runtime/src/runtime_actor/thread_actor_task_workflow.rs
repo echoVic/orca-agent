@@ -1558,17 +1558,37 @@ impl ThreadActor {
     pub(super) async fn shutdown_background_tasks(
         &mut self,
         reason: surface::SurfaceShutdownReason,
+        command_rx: &mut tokio_mpsc::Receiver<ThreadCommand>,
     ) -> Result<(), RuntimeHostError> {
         let tasks = self.background_controller.begin_shutdown();
         let mut first_error = None;
         for task in tasks {
             let HostBackgroundTask {
-                join,
+                mut join,
                 typed_workflow,
                 typed_provider,
                 ..
             } = task;
-            let _ = join.await;
+            // A cancelled workflow still flushes its final progress before
+            // exiting. Keep acknowledging that fenced ingress while joining.
+            loop {
+                tokio::select! {
+                    _ = &mut join => break,
+                    command = command_rx.recv(), if !command_rx.is_closed() => {
+                        match command {
+                            Some(ThreadCommand::SurfaceCommitWorkflowProgress {
+                                fence, progress, reply,
+                            }) => {
+                                let _ = reply.send(
+                                    self.commit_surface_workflow_progress(fence, &progress),
+                                );
+                            }
+                            Some(command) => Self::reject_thread_command_unavailable(command),
+                            None => {}
+                        }
+                    }
+                }
+            }
             if let Some(typed_workflow) = typed_workflow {
                 if let Err(error) =
                     self.commit_typed_workflow_completion(typed_workflow, Some(reason))
@@ -1585,6 +1605,8 @@ impl ThreadActor {
                 first_error.get_or_insert(error);
             }
         }
+        command_rx.close();
+        Self::drain_closed_thread_commands(command_rx);
         for _ in 0..SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS {
             if !self.background_controller.has_pending_completion() {
                 return Ok(());

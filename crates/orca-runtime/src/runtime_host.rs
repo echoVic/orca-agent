@@ -16432,7 +16432,10 @@ impl ThreadActor {
             .unwrap_or(true)
     }
 
-    async fn close_ephemeral_one_shot(&mut self) -> Result<(), surface::SurfaceClientCommandError> {
+    async fn close_ephemeral_one_shot(
+        &mut self,
+        command_rx: &mut tokio_mpsc::Receiver<ThreadCommand>,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let barrier_id =
             surface::SurfaceSettlementId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -16486,7 +16489,7 @@ impl ThreadActor {
             }
             if result.is_ok() {
                 result = self
-                    .shutdown_background_tasks(reason)
+                    .shutdown_background_tasks(reason, command_rx)
                     .await
                     .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable);
             }
@@ -16859,7 +16862,7 @@ impl ThreadActor {
                 self.try_drain_prompt_queue();
             }
             if self.one_shot_close_ready() {
-                match self.close_ephemeral_one_shot().await {
+                match self.close_ephemeral_one_shot(&mut command_rx).await {
                     Ok(()) => {
                         command_rx.close();
                         Self::drain_closed_thread_commands(&mut command_rx);
@@ -16872,7 +16875,10 @@ impl ThreadActor {
                         command_rx.close();
                         Self::drain_closed_thread_commands(&mut command_rx);
                         let _ = self
-                            .shutdown_background_tasks(surface::SurfaceShutdownReason::ThreadClose)
+                            .shutdown_background_tasks(
+                                surface::SurfaceShutdownReason::ThreadClose,
+                                &mut command_rx,
+                            )
                             .await;
                         break;
                     }
@@ -16920,6 +16926,7 @@ impl ThreadActor {
                             let _ = self
                                 .shutdown_background_tasks(
                                     surface::SurfaceShutdownReason::ThreadClose,
+                                    &mut command_rx,
                                 )
                                 .await;
                             break;
@@ -17092,7 +17099,7 @@ impl ThreadActor {
                                     message: message.clone(),
                                 };
                                 if reason == surface::SurfaceShutdownReason::HostShutdown {
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17112,7 +17119,7 @@ impl ThreadActor {
                             if let Err(error) = typed_shutdown {
                                 self.operation_recovery.terminal_blocked = Some(error.to_string());
                                 if reason == surface::SurfaceShutdownReason::HostShutdown {
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17124,7 +17131,7 @@ impl ThreadActor {
                                 continue;
                             }
                             let background_shutdown =
-                                self.shutdown_background_tasks(reason).await;
+                                self.shutdown_background_tasks(reason, &mut command_rx).await;
                             if let Some(reply) = reply {
                                 let ack = match background_shutdown {
                                     Ok(()) => ThreadShutdownAck::Complete,
@@ -17235,7 +17242,7 @@ impl ThreadActor {
                                     active.generation.cancel.cancel();
                                     Self::drain_closed_thread_commands(&mut command_rx);
                                     let _ = (&mut active.generation.join).await;
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17262,7 +17269,7 @@ impl ThreadActor {
                                     self.abandon_surface_capability_waiters_for_cold_recovery();
                                     Self::drain_closed_thread_commands(&mut command_rx);
                                     let _ = (&mut active.generation.join).await;
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17315,7 +17322,7 @@ impl ThreadActor {
                                 let finish_result =
                                     self.finish_generation(active, generation_result, false);
                                 let background_shutdown =
-                                    self.shutdown_background_tasks(reason).await;
+                                    self.shutdown_background_tasks(reason, &mut command_rx).await;
                                 let shutdown_result = finish_result
                                     .and(background_shutdown)
                                     .and(pause_result);
@@ -17359,7 +17366,7 @@ impl ThreadActor {
                                     active.generation.cancel.cancel();
                                     Self::drain_closed_thread_commands(&mut command_rx);
                                     let _ = (&mut active.generation.join).await;
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17389,7 +17396,7 @@ impl ThreadActor {
                             let result = (&mut active.generation.join).await;
                             let finish_result = self.finish_generation(active, result, false);
                             let background_shutdown =
-                                self.shutdown_background_tasks(reason).await;
+                                self.shutdown_background_tasks(reason, &mut command_rx).await;
                             if let Err(error) = finish_result {
                                 if let Some(reply) = reply.as_ref() {
                                     let _ = reply.send(ThreadShutdownAck::Failed(error));
@@ -17443,6 +17450,7 @@ impl ThreadActor {
                             let _ = self
                                 .shutdown_background_tasks(
                                     surface::SurfaceShutdownReason::ThreadClose,
+                                    &mut command_rx,
                                 )
                                 .await;
                             if let Err(error) = finish_result {
