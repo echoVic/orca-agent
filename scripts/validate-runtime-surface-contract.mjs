@@ -1168,7 +1168,7 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/session_picker_actions.rs:activate_action:user_action.route", 2],
   ["crates/orca-tui/src/session_picker_actions.rs:dispatch_selected_resume:user_action.route", 1],
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
-  ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:user_action.route", 1],
+  ["crates/orca-tui/src/setup_actions.rs:finish_setup:user_action.route", 1],
   ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 14],
   [
     "crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:input_history.record",
@@ -1306,6 +1306,9 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/queued_input_actions.rs:reset_after_running_slash:state.mention_bindings.clear", 1],
   ["crates/orca-tui/src/queued_input_actions.rs:reset_after_running_slash:state.pending_pastes.clear", 1],
   ["crates/orca-tui/src/state_reducer.rs:update:self.announced_subagent_terminals.clear", 1],
+  ["crates/orca-tui/src/state_reducer.rs:update:self.focused_workflow_tasks.clear", 1],
+  ["crates/orca-tui/src/state_reducer.rs:apply_surface_projection_state:self.focused_workflow_tasks.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.focused_workflow_tasks.clear", 1],
   ["crates/orca-tui/src/types.rs:reset_session_projection:self.announced_subagent_terminals.clear", 1],
   [
     "crates/orca-tui/src/workflow_panel.rs:emit_subagent_terminal_notices:self.announced_subagent_terminals.insert",
