@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.24";
+export const releaseVersion = "v0.4.25";
 
 export const releases = [
+  {
+    version: "v0.4.25",
+    date: "2026-09-08",
+    title: "Unified conversation targeting",
+    body: "Makes ConversationTarget the single navigation state source, applies child projections atomically to protect the parent baseline, aligns registry and surface task identity, and classifies subagent relay lifecycle errors into durable health.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.25",
+  },
   {
     version: "v0.4.24",
     date: "2026-09-06",

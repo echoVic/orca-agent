@@ -1305,6 +1305,12 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ],
   ["crates/orca-tui/src/queued_input_actions.rs:reset_after_running_slash:state.mention_bindings.clear", 1],
   ["crates/orca-tui/src/queued_input_actions.rs:reset_after_running_slash:state.pending_pastes.clear", 1],
+  ["crates/orca-tui/src/state_reducer.rs:update:self.announced_subagent_terminals.clear", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.announced_subagent_terminals.clear", 1],
+  [
+    "crates/orca-tui/src/workflow_panel.rs:emit_subagent_terminal_notices:self.announced_subagent_terminals.insert",
+    1,
+  ],
   ["crates/orca-tui/src/session_picker_actions.rs:close_picker:state.session_picker_query.clear", 1],
   ["crates/orca-tui/src/session_picker_actions.rs:close_picker:state.session_picker_sessions.clear", 1],
   ["crates/orca-tui/src/session_picker_actions.rs:open_session_picker:state.session_picker_query.clear", 1],

@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.25":
+        "Unifies TUI navigation on ConversationTarget, applies child projections atomically to protect the parent workflow baseline, aligns registry and surface task identity, and turns subagent relay lifecycle errors into durable health instead of silent drops.",
       "v0.4.24":
         "Aligns the release Windows gate with the isolated, retry-aware nextest suite used by the main Windows workflow.",
       "v0.4.23":
@@ -660,6 +662,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.25":
+        "统一 TUI 导航到 ConversationTarget，聚焦子会话时原子应用子投影以保护父工作流基线，对齐 registry 与 surface 的任务标识，并将 subagent relay 生命周期错误归类为可持久化的健康状态而非静默丢弃。",
       "v0.4.24": "发布流程的 Windows gate 统一使用正式 Windows CI 的隔离与重试 nextest 配置。",
       "v0.4.23": "修复完整 workspace 测试中 Goal terminal checkpoint recovery 的 batch 分类，确保 durable prepared state 可观察。",
       "v0.4.22": "修复 Goal terminal checkpoint recovery 的 prepared batch 保留与冷恢复路径。",
