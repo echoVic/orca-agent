@@ -2892,6 +2892,45 @@ fn workflow_agent(status: SurfaceWorkflowAgentStatus) -> SurfaceWorkflowAgent {
     }
 }
 
+#[test]
+fn workflow_progress_snapshot_replaces_phase_and_agent_projection() {
+    let mut snapshot = snapshot();
+    let mut running = workflow(SurfaceWorkflowStatus::Running);
+    running
+        .phases
+        .push(workflow_phase("phase-1", SurfaceWorkflowStatus::Queued));
+    snapshot.workflows.push(running);
+    let state = SurfaceReducerState::new(snapshot);
+    let fence = SurfaceWorkflowFence {
+        workflow_run_id: SurfaceWorkflowRunId::try_new("manifest-workflow").unwrap(),
+        workflow_revision: WorkflowRevision::try_new(1).unwrap(),
+        parent: None,
+    };
+    let mut completed_phase = workflow_phase("phase-1", SurfaceWorkflowStatus::Completed);
+    completed_phase.completed_at = Some(UnixMillis::new(2));
+    completed_phase.agent_count = 1;
+    let completed_agent = workflow_agent(SurfaceWorkflowAgentStatus::Completed);
+    let batch = batch(
+        &state,
+        8_500,
+        vec![(
+            SurfaceScope::Thread,
+            SurfaceEvent::Workflow(WorkflowPatch::ProgressUpdated {
+                fence,
+                next_revision: WorkflowRevision::try_new(2).unwrap(),
+                phases: vec![completed_phase.clone()],
+                agents: vec![completed_agent.clone()],
+            }),
+        )],
+    );
+
+    let reduced = applied(reduce_batch(SurfaceReduceMode::Live, &state, &batch));
+    let workflow = &reduced.snapshot().workflows[0];
+    assert_eq!(workflow.revision.get(), 2);
+    assert_eq!(workflow.phases, vec![completed_phase]);
+    assert_eq!(workflow.agents, vec![completed_agent]);
+}
+
 fn agent_transition_result(
     source: Option<SurfaceWorkflowAgentStatus>,
     target: SurfaceWorkflowAgentStatus,

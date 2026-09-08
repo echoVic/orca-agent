@@ -928,8 +928,9 @@ fn apply_surface_settings_to_run_config(
             ));
         }
     };
-    config.model =
-        orca_core::model::ModelSelection::from_unchecked(Some(settings.model.as_str().to_string()));
+    config.model = config
+        .model
+        .with_value_unchecked(Some(settings.model.as_str().to_string()));
     Ok(())
 }
 
@@ -1643,6 +1644,7 @@ fn surface_event_belongs_to_operation(
                 | WorkflowPatch::AgentCompleted { fence, .. }
                 | WorkflowPatch::AgentFailed { fence, .. }
                 | WorkflowPatch::AgentCancelled { fence, .. }
+                | WorkflowPatch::ProgressUpdated { fence, .. }
                 | WorkflowPatch::Paused { fence, .. }
                 | WorkflowPatch::Stopping { fence, .. }
                 | WorkflowPatch::Stopped { fence, .. }

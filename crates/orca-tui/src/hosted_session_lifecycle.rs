@@ -82,7 +82,7 @@ pub(crate) fn start_new_hosted_session(
         config,
         preloaded,
         pending_workflow_notifications,
-    );
+    )?;
     Ok(projection)
 }
 
@@ -183,11 +183,27 @@ pub(crate) fn preflight_started_session(
 fn install_hosted_session(
     thread: &mut Option<RuntimeThreadHandle>,
     started: RuntimeThreadHandle,
-    next_config: RunConfig,
+    mut next_config: RunConfig,
     config: &Arc<Mutex<RunConfig>>,
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
-) {
+) -> Result<(), String> {
+    let snapshot = match TuiSurfaceActions::new(started.typed_surface()).read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            reap_hosted_thread(started);
+            return Err(format!("failed to read restored runtime settings: {error}"));
+        }
+    };
+    if let Err(error) = orca_runtime::runtime_host::hydrate_run_config_from_surface_settings(
+        &mut next_config,
+        &snapshot.settings.effective,
+    ) {
+        reap_hosted_thread(started);
+        return Err(format!(
+            "failed to apply restored runtime settings: {error:?}"
+        ));
+    }
     let previous = thread.replace(started);
     *config.lock().unwrap() = next_config;
     *preloaded.lock().unwrap() = None;
@@ -195,6 +211,7 @@ fn install_hosted_session(
     if let Some(previous) = previous {
         reap_hosted_thread(previous);
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,7 +248,7 @@ pub(crate) fn start_forked_hosted_session(
         config,
         preloaded,
         pending_workflow_notifications,
-    );
+    )?;
     Ok((mode, projection))
 }
 
@@ -280,7 +297,7 @@ pub(crate) fn switch_saved_hosted_session(
         config,
         preloaded,
         pending_workflow_notifications,
-    );
+    )?;
     Ok((mode, projection))
 }
 

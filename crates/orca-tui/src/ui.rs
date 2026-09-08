@@ -4827,13 +4827,25 @@ pub(crate) fn composer_click_target(
     ))
 }
 
+/// One selectable action row on the first-run welcome step. The active row is
+/// marked with a caret and a brighter foreground so keyboard focus is visible
+/// without inverting the background.
+fn setup_option_line<'a>(selected: bool, label: &str, key: &str, theme: &Theme) -> Line<'a> {
+    let marker = if selected { "❯ " } else { "  " };
+    let mut style = Style::default().fg(if selected { theme.border } else { theme.muted });
+    if selected {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Line::from(Span::styled(format!("  {marker}[{key}] {label}"), style))
+}
+
 fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme: &Theme) {
     let area = frame.area();
 
     match state.setup_step {
         0 => {
             let width = 78u16.min(area.width.saturating_sub(4));
-            let height = 18u16.min(area.height.saturating_sub(2));
+            let height = 22u16.min(area.height.saturating_sub(2));
             let popup_area = centered_rect(area, width, height);
             let mut content = vec![Line::from(Span::styled(
                 "  Before the first run, review this workspace security boundary.",
@@ -4910,8 +4922,27 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
             }
             content.extend([
                 Line::from(""),
+                setup_option_line(
+                    state.setup_selection == crate::setup_actions::SETUP_TRUST_SELECTION,
+                    "Trust workspace",
+                    "T",
+                    theme,
+                ),
+                setup_option_line(
+                    state.setup_selection == crate::setup_actions::SETUP_UNTRUSTED_SELECTION,
+                    "Continue untrusted",
+                    "U",
+                    theme,
+                ),
+                setup_option_line(
+                    state.setup_selection == crate::setup_actions::SETUP_EXIT_SELECTION,
+                    "Exit",
+                    "E",
+                    theme,
+                ),
+                Line::from(""),
                 Line::from(Span::styled(
-                    "  Press Enter to acknowledge and continue; Esc to exit.",
+                    "  [↑/↓] Move   [Enter] Select   [Esc] Exit",
                     Style::default().fg(Color::DarkGray),
                 )),
             ]);
@@ -10468,6 +10499,38 @@ mod tests {
                 assert!(moves.is_empty(), "{cursor_events:?}");
             }
         }
+    }
+
+    #[test]
+    fn welcome_step_renders_three_selectable_actions_with_focus_marker() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.setup_step = 0;
+        state.setup_selection = crate::setup_actions::SETUP_EXIT_SELECTION;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("backend");
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        // All three actions are visible as selectable rows.
+        assert!(rendered.contains("Trust workspace"), "{rendered}");
+        assert!(rendered.contains("Continue untrusted"), "{rendered}");
+        assert!(rendered.contains("[E] Exit"), "{rendered}");
+        // The focus caret marks the currently selected row (Exit here).
+        assert!(rendered.contains("❯ [E] Exit"), "{rendered}");
     }
 
     #[test]

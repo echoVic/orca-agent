@@ -27,7 +27,9 @@ use crate::hosted_session::{
 use crate::hosted_session_lifecycle::{
     HostedSessionAction, ensure_hosted_thread, handle_hosted_session_action,
 };
-use crate::hosted_settings::{apply_hosted_settings_action, settings_intent_patches};
+use crate::hosted_settings::{
+    apply_hosted_settings_action, settings_intent_patches, synchronize_shared_config_from_surface,
+};
 use crate::hosted_side::{
     HostedSideAction, HostedSideParent, handle_hosted_side_action, hosted_config_for_active,
     shutdown_attached_side_on_controller_exit,
@@ -112,6 +114,10 @@ pub(crate) fn hosted_tui_controller_loop(
                 ensure_hosted_thread(&mut thread, &host, &cfg, &preloaded, &title, &event_tx)
             })
             .and_then(|_| {
+                synchronize_shared_config_from_surface(
+                    thread.as_ref().expect("startup hosted thread"),
+                    &config,
+                )?;
                 emit_typed_history_snapshot(
                     thread.as_ref().expect("startup hosted thread"),
                     &startup_history_mode,

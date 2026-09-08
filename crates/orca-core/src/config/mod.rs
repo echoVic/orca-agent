@@ -464,7 +464,7 @@ impl DelegationSnapshot {
         config.additional_working_directories = self.additional_working_directories.clone();
 
         let model = child_model_override.or_else(|| self.model.clone());
-        if let Ok(model) = ModelSelection::parse(model) {
+        if let Ok(model) = config.model.with_value(model) {
             config.model = model;
         }
     }

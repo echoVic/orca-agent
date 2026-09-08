@@ -22,6 +22,16 @@ model = "deepseek-v4-pro"
 reasoning_effort = "high"
 ~~~
 
+Declare capabilities for a specific provider model under its quoted model ID.
+Explicit declarations override Orca's built-in model metadata:
+
+~~~toml
+model = "provider/multimodal-model"
+
+[models."provider/multimodal-model"]
+supports_images = true
+~~~
+
 ~~~bash
 export ORCA_MODEL="deepseek-v4-pro"
 export ORCA_REASONING_EFFORT="high"

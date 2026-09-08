@@ -112,8 +112,7 @@ impl RendererRuntimeEventOwner {
                 reasoning_effort,
                 approval_mode,
             } => {
-                config.model =
-                    orca_core::model::ModelSelection::from_unchecked(Some(model.clone()));
+                config.model = config.model.with_value_unchecked(Some(model.clone()));
                 config.reasoning_effort = reasoning_effort;
                 config.approval_mode = approval_mode;
                 handle_runtime_event(

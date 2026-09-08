@@ -19,6 +19,15 @@ model = "deepseek-v4-pro"
 reasoning_effort = "high"
 ~~~
 
+模型能力配置按模型 ID 隔离；显式声明会覆盖 Orca 的内置模型元数据：
+
+~~~toml
+model = "provider/multimodal-model"
+
+[models."provider/multimodal-model"]
+supports_images = true
+~~~
+
 ~~~bash
 export ORCA_MODEL="deepseek-v4-pro"
 export ORCA_REASONING_EFFORT="high"

@@ -18,7 +18,6 @@ use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_too
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 pub(crate) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
-pub(crate) const VISION_MODEL: &str = orca_core::model::VISION_MODEL;
 const DEFAULT_CHAT_MAX_TOKENS: u32 = 384_000;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
@@ -382,7 +381,6 @@ async fn request_chat_streaming(
     })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
-    validate_image_model(conversation, model)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let streaming_client = crate::http_client::streaming_client()?;
 
@@ -582,7 +580,6 @@ fn request_chat(
     })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
-    validate_image_model(conversation, model)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
@@ -926,24 +923,6 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
     messages
 }
 
-fn validate_image_model(
-    conversation: &Conversation,
-    model: &str,
-) -> Result<(), DeepSeekRequestError> {
-    let has_images = conversation.messages.iter().any(|message| {
-        matches!(
-            message,
-            Message::User { images, .. } if !images.is_empty()
-        )
-    });
-    if has_images && model != VISION_MODEL {
-        return Err(DeepSeekRequestError::new(format!(
-            "model '{model}' does not support image input; use {VISION_MODEL}"
-        )));
-    }
-    Ok(())
-}
-
 fn inject_summary_messages(summary: &SummaryState, messages: &mut Vec<ApiMessage>) {
     if let Some(baseline) = &summary.baseline {
         messages.push(ApiMessage {
@@ -1055,25 +1034,6 @@ mod tests {
         assert_eq!(value[0]["content"][2]["image_url"]["detail"], "low");
         assert_eq!(value[0]["content"][3]["type"], "file");
         assert_eq!(value[0]["content"][3]["file_id"], "file-api-example");
-    }
-
-    #[test]
-    fn image_input_requires_the_vision_model() {
-        let mut conversation = Conversation::new();
-        conversation.add_user_with_images(
-            "inspect".to_string(),
-            vec![ImageInput {
-                source: ImageSource::Url {
-                    url: "https://example.com/image.png".to_string(),
-                },
-                detail: ImageDetail::High,
-            }],
-        );
-
-        assert!(validate_image_model(&conversation, VISION_MODEL).is_ok());
-        let error = validate_image_model(&conversation, DEFAULT_MODEL)
-            .expect_err("text-only model must reject image input");
-        assert!(error.to_string().contains(VISION_MODEL));
     }
 
     fn make_tc(name: &str, arguments: &str) -> ApiToolCallResponse {

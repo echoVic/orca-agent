@@ -9,6 +9,7 @@ pub mod state;
 pub mod verifier;
 
 pub use draft::WorkflowDraftStore;
+pub(crate) use runner::PreparedWorkflowBackgroundLaunch;
 pub use runner::{
     WorkflowBackgroundLaunch, WorkflowLaunchRequest, WorkflowLaunchResult, WorkflowRunner,
 };

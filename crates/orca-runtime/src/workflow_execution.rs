@@ -20,8 +20,8 @@ use crate::runtime_surface::{
 use crate::tasks::TaskRegistry;
 use crate::workflow::runner::SharedEventBuffer;
 use crate::workflow::{
-    WorkflowBackgroundLaunch, WorkflowDraftStore, WorkflowLaunchRequest, WorkflowLaunchResult,
-    WorkflowRunner,
+    PreparedWorkflowBackgroundLaunch, WorkflowBackgroundLaunch, WorkflowDraftStore,
+    WorkflowLaunchRequest, WorkflowLaunchResult, WorkflowRunner,
 };
 
 const WORKFLOW_STARTUP_HEALTH_CHECK_POLLS: usize = 2;
@@ -78,29 +78,65 @@ fn invalid_workflow_identity(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[cfg(test)]
 pub(crate) fn commit_workflow_started(
     ingress: Option<&dyn RuntimeWorkflowLifecycleIngress>,
     launch: &WorkflowBackgroundLaunch,
     tool_call_id: &str,
     task_registry: &TaskRegistry,
 ) -> io::Result<Option<RuntimeWorkflowIngressReceipt>> {
-    let Some(ingress) = ingress else {
-        return Ok(None);
-    };
     let task = task_registry.get(&launch.task_id).ok_or_else(|| {
         invalid_workflow_identity("workflow task disappeared before typed start commit")
     })?;
+    commit_workflow_started_fields(
+        ingress,
+        &launch.task_id,
+        &launch.run_id,
+        &launch.workflow_name,
+        &launch.phases,
+        task.created_at_ms,
+        tool_call_id,
+    )
+}
+
+fn commit_prepared_workflow_started(
+    ingress: Option<&dyn RuntimeWorkflowLifecycleIngress>,
+    launch: &PreparedWorkflowBackgroundLaunch,
+    tool_call_id: &str,
+) -> io::Result<Option<RuntimeWorkflowIngressReceipt>> {
+    commit_workflow_started_fields(
+        ingress,
+        &launch.task_id,
+        &launch.run_id,
+        &launch.workflow_name,
+        &launch.phases,
+        launch.created_at_ms,
+        tool_call_id,
+    )
+}
+
+fn commit_workflow_started_fields(
+    ingress: Option<&dyn RuntimeWorkflowLifecycleIngress>,
+    task_id: &str,
+    run_id: &str,
+    workflow_name: &str,
+    phases: &[String],
+    created_at_ms: i64,
+    tool_call_id: &str,
+) -> io::Result<Option<RuntimeWorkflowIngressReceipt>> {
+    let Some(ingress) = ingress else {
+        return Ok(None);
+    };
     let started = RuntimeWorkflowStarted {
-        task_id: SurfaceTaskId::try_new(launch.task_id.clone())
+        task_id: SurfaceTaskId::try_new(task_id.to_string())
             .map_err(|_| invalid_workflow_identity("workflow task id is empty"))?,
-        workflow_run_id: SurfaceWorkflowRunId::try_new(launch.run_id.clone())
+        workflow_run_id: SurfaceWorkflowRunId::try_new(run_id.to_string())
             .map_err(|_| invalid_workflow_identity("workflow run id is empty"))?,
         tool_call_id: SurfaceToolCallId::try_new(tool_call_id.to_string())
             .map_err(|_| invalid_workflow_identity("workflow tool call id is empty"))?,
-        name: NonEmptyText::try_new(launch.workflow_name.clone())
+        name: NonEmptyText::try_new(workflow_name.to_string())
             .map_err(|_| invalid_workflow_identity("workflow name is empty"))?,
-        phases: launch
-            .phases
+        phases: phases
             .iter()
             .cloned()
             .map(|phase| {
@@ -108,7 +144,7 @@ pub(crate) fn commit_workflow_started(
                     .map_err(|_| invalid_workflow_identity("workflow phase name is empty"))
             })
             .collect::<io::Result<Vec<_>>>()?,
-        created_at: UnixMillis::new(task.created_at_ms),
+        created_at: UnixMillis::new(created_at_ms),
     };
     ingress.commit_started(&started).map(Some)
 }
@@ -268,23 +304,32 @@ pub(crate) fn execute_workflow_tool(
     let session_dir = task_registry.workflow_session_dir(cwd)?;
     let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
         .with_child_executor(child_executor);
-    let launch = runner.launch_background(WorkflowLaunchRequest::from(input))?;
-    let task_id = launch.task_id.clone();
-    let run_id = launch.run_id.clone();
-    let workflow_name = launch.workflow_name.clone();
-    let mut workflow_lifecycle = RuntimeSessionLifecycle::new(launch.run_id.clone());
+    let prepared = runner.prepare_background(WorkflowLaunchRequest::from(input))?;
+    let task_id = prepared.task_id.clone();
+    let run_id = prepared.run_id.clone();
+    let workflow_name = prepared.workflow_name.clone();
+    let mut workflow_lifecycle = RuntimeSessionLifecycle::new(run_id.clone());
     let workflow_task = workflow_lifecycle
         .start_task(RuntimeTaskKind::Workflow)
         .clone();
     let ingress_receipt =
-        match commit_workflow_started(workflow_ingress, &launch, &tool_request.id, task_registry) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                let _ = task_registry.request_stop(&launch.task_id);
-                let _ = launch.join();
-                return Err(error);
-            }
-        };
+        commit_prepared_workflow_started(workflow_ingress, &prepared, &tool_request.id)?;
+    let runner = runner
+        .with_progress_ingress(workflow_ingress.and_then(|ingress| ingress.progress_ingress()));
+    let launch = match runner.activate_background(prepared.clone()) {
+        Ok(launch) => launch,
+        Err(error) => {
+            runner.abort_prepared_background(prepared, error.to_string());
+            commit_workflow_finished(
+                workflow_ingress,
+                ingress_receipt,
+                RuntimeWorkflowOutcome::Failed {
+                    error: DisplayText::new(error.to_string()),
+                },
+            )?;
+            return Err(error);
+        }
+    };
     if emit_deltas {
         let event = workflow_task.attach_to_event(events.workflow_started(
             &launch.task_id,
@@ -398,29 +443,36 @@ pub(crate) fn execute_workflow_draft_action_tool(
         "run" => {
             let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
                 .with_child_executor(child_executor);
-            let launch = runner.launch_background(WorkflowLaunchRequest::from(WorkflowInput {
-                draft_id: Some(input.draft_id.clone()),
-                args: input.args.clone(),
-                token_budget: input.token_budget,
-                ..Default::default()
-            }))?;
-            let task_id = launch.task_id.clone();
-            let run_id = launch.run_id.clone();
-            let workflow_name = launch.workflow_name.clone();
-            let mut workflow_lifecycle = RuntimeSessionLifecycle::new(launch.run_id.clone());
+            let prepared =
+                runner.prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                    draft_id: Some(input.draft_id.clone()),
+                    args: input.args.clone(),
+                    token_budget: input.token_budget,
+                    ..Default::default()
+                }))?;
+            let task_id = prepared.task_id.clone();
+            let run_id = prepared.run_id.clone();
+            let workflow_name = prepared.workflow_name.clone();
+            let mut workflow_lifecycle = RuntimeSessionLifecycle::new(run_id.clone());
             let workflow_task = workflow_lifecycle
                 .start_task(RuntimeTaskKind::Workflow)
                 .clone();
-            let ingress_receipt = match commit_workflow_started(
-                workflow_ingress,
-                &launch,
-                &tool_request.id,
-                task_registry,
-            ) {
-                Ok(receipt) => receipt,
+            let ingress_receipt =
+                commit_prepared_workflow_started(workflow_ingress, &prepared, &tool_request.id)?;
+            let runner = runner.with_progress_ingress(
+                workflow_ingress.and_then(|ingress| ingress.progress_ingress()),
+            );
+            let launch = match runner.activate_background(prepared.clone()) {
+                Ok(launch) => launch,
                 Err(error) => {
-                    let _ = task_registry.request_stop(&launch.task_id);
-                    let _ = launch.join();
+                    runner.abort_prepared_background(prepared, error.to_string());
+                    commit_workflow_finished(
+                        workflow_ingress,
+                        ingress_receipt,
+                        RuntimeWorkflowOutcome::Failed {
+                            error: DisplayText::new(error.to_string()),
+                        },
+                    )?;
                     return Err(error);
                 }
             };
@@ -765,8 +817,9 @@ mod tests {
     use crate::cost::CostTracker;
     use crate::runtime_surface::{
         RuntimeWorkflowFinished, RuntimeWorkflowIngressReceipt, RuntimeWorkflowLifecycleIngress,
-        RuntimeWorkflowOutcome, RuntimeWorkflowStarted, SurfaceTaskFence, SurfaceWorkflowFence,
-        TaskRevision, WorkflowRevision,
+        RuntimeWorkflowOutcome, RuntimeWorkflowProgress, RuntimeWorkflowProgressIngress,
+        RuntimeWorkflowStarted, SurfaceTaskFence, SurfaceWorkflowFence, TaskRevision,
+        WorkflowRevision,
     };
     use crate::tasks::TaskRegistry;
     use crate::workflow::host::WorkflowHost;
@@ -779,15 +832,16 @@ mod tests {
         execute_workflow_tool, observe_background_workflows,
     };
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     enum RecordedWorkflowIngress {
         Started(RuntimeWorkflowStarted),
+        Progress(RuntimeWorkflowProgress),
         Finished(RuntimeWorkflowFinished),
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Clone, Debug, Default)]
     struct RecordingWorkflowIngress {
-        events: Mutex<Vec<RecordedWorkflowIngress>>,
+        events: Arc<Mutex<Vec<RecordedWorkflowIngress>>>,
     }
 
     impl RecordingWorkflowIngress {
@@ -828,6 +882,20 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(RecordedWorkflowIngress::Finished(finished.clone()));
+            Ok(())
+        }
+
+        fn progress_ingress(&self) -> Option<Arc<dyn RuntimeWorkflowProgressIngress>> {
+            Some(Arc::new(self.clone()))
+        }
+    }
+
+    impl RuntimeWorkflowProgressIngress for RecordingWorkflowIngress {
+        fn commit_progress(&self, progress: &RuntimeWorkflowProgress) -> io::Result<()> {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(RecordedWorkflowIngress::Progress(progress.clone()));
             Ok(())
         }
     }
@@ -1019,7 +1087,7 @@ export const meta = {
             "workflow-completed",
             ToolName::Workflow,
             serde_json::json!({
-                "script": "export const meta = { name: 'typed-completed', description: 'typed completed', phases: ['main'] }; export default 'done';"
+                "script": "export const meta = { name: 'typed-completed', description: 'typed completed', phases: ['main'] }; export default await phase('main', async () => 'done');"
             }),
         );
 
@@ -1051,14 +1119,20 @@ export const meta = {
         assert_eq!(result.status, ToolStatus::Completed);
         let recorded = ingress.events();
         assert!(matches!(
-            recorded.as_slice(),
-            [
-                RecordedWorkflowIngress::Started(_),
-                RecordedWorkflowIngress::Finished(RuntimeWorkflowFinished {
-                    outcome: RuntimeWorkflowOutcome::Completed { .. },
-                    ..
-                })
-            ]
+            recorded.first(),
+            Some(RecordedWorkflowIngress::Started(_))
+        ));
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, RecordedWorkflowIngress::Progress(_)))
+        );
+        assert!(matches!(
+            recorded.last(),
+            Some(RecordedWorkflowIngress::Finished(RuntimeWorkflowFinished {
+                outcome: RuntimeWorkflowOutcome::Completed { .. },
+                ..
+            }))
         ));
     }
 
@@ -1098,15 +1172,17 @@ export const meta = {
         .unwrap();
 
         assert_eq!(result.status, ToolStatus::Failed);
+        let recorded = ingress.events();
         assert!(matches!(
-            ingress.events().as_slice(),
-            [
-                RecordedWorkflowIngress::Started(_),
-                RecordedWorkflowIngress::Finished(RuntimeWorkflowFinished {
-                    outcome: RuntimeWorkflowOutcome::Failed { .. },
-                    ..
-                })
-            ]
+            recorded.first(),
+            Some(RecordedWorkflowIngress::Started(_))
+        ));
+        assert!(matches!(
+            recorded.last(),
+            Some(RecordedWorkflowIngress::Finished(RuntimeWorkflowFinished {
+                outcome: RuntimeWorkflowOutcome::Failed { .. },
+                ..
+            }))
         ));
     }
 

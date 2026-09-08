@@ -91,6 +91,7 @@ impl AppState {
                 if task_id.is_some() && self.conversation_target.task_id().is_none() {
                     self.background_workflow_tasks = self.workflow_panel.tasks().to_vec();
                 }
+                self.focused_workflow_tasks.clear();
                 self.set_conversation_target(match task_id {
                     Some(task_id) => ConversationTarget::subagent(task_id),
                     None => ConversationTarget::Main,
@@ -798,10 +799,14 @@ impl AppState {
     pub(crate) fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
         let mut projection = projection;
         if self.conversation_target().task_id().is_some() {
+            self.focused_workflow_tasks
+                .clone_from(&projection.workflow_tasks);
             projection.workflow_tasks = merge_background_task_snapshots(
                 &self.background_workflow_tasks,
-                &projection.workflow_tasks,
+                &self.focused_workflow_tasks,
             );
+        } else {
+            self.focused_workflow_tasks.clear();
         }
         let mut surface_session = self.surface_session.clone();
         let session_apply = surface_session.apply_projection(&projection);
@@ -1148,7 +1153,7 @@ impl AppState {
     }
 }
 
-fn merge_background_task_snapshots(
+pub(crate) fn merge_background_task_snapshots(
     background: &[orca_core::task_types::BackgroundTaskSummary],
     focused: &[orca_core::task_types::BackgroundTaskSummary],
 ) -> Vec<orca_core::task_types::BackgroundTaskSummary> {

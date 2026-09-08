@@ -2749,11 +2749,25 @@ impl ThreadActor {
             revision: surface::WorkflowRevision::try_new(1).expect("one is valid"),
             name: workflow_name,
             status: surface::SurfaceWorkflowStatus::Running,
-            phases: Vec::new(),
+            phases: prepared
+                .phases
+                .iter()
+                .cloned()
+                .map(|name| surface::SurfaceWorkflowPhase {
+                    name: surface::NonEmptyText::try_new(name)
+                        .expect("prepared workflow phase names are non-empty"),
+                    status: surface::SurfaceWorkflowStatus::Queued,
+                    started_at: None,
+                    completed_at: None,
+                    agent_count: 0,
+                    summary: None,
+                    error: None,
+                })
+                .collect(),
             agents: Vec::new(),
             result: None,
             error: None,
-            parent: None,
+            parent: Some(generation_fence.clone()),
         };
         let final_workflow = surface::SurfaceWorkflow {
             revision: surface::WorkflowRevision::try_new(2).expect("two is valid"),
@@ -2818,7 +2832,7 @@ impl ThreadActor {
                         workflow_run_id: workflow_run_id.clone(),
                         workflow_revision: surface::WorkflowRevision::try_new(1)
                             .expect("one is valid"),
-                        parent: None,
+                        parent: Some(generation_fence.clone()),
                     },
                     next_revision: surface::WorkflowRevision::try_new(2).expect("two is valid"),
                 }),
@@ -2828,7 +2842,7 @@ impl ThreadActor {
                     fence: generation_fence.clone(),
                 },
                 surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationTransferred {
-                    fence: generation_fence,
+                    fence: generation_fence.clone(),
                     background_fence: background_fence.clone(),
                     task_id: Some(task_id.clone()),
                 }),
@@ -2869,6 +2883,11 @@ impl ThreadActor {
             tool_use_id: surface_tool_use_id,
         };
         let returned_workflow = final_workflow;
+        let runner =
+            runner.with_progress_ingress(Some(Arc::new(RuntimeSurfaceWorkflowLifecycleIngress {
+                command_tx: self.handle.command_tx.clone(),
+                fence: generation_fence,
+            })));
         match runner.activate_background(prepared.clone()) {
             Ok(launch) => {
                 let events = self

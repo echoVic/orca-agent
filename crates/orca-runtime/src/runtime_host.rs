@@ -1914,7 +1914,7 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RuntimeSurfaceWorkflowLifecycleIngress {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
@@ -1952,6 +1952,10 @@ impl surface::RuntimeWorkflowLifecycleIngress for RuntimeSurfaceWorkflowLifecycl
             .map_err(|_| surface_semantic_ingress_ack_error())?
     }
 
+    fn progress_ingress(&self) -> Option<Arc<dyn surface::RuntimeWorkflowProgressIngress>> {
+        Some(Arc::new(self.clone()))
+    }
+
     fn subagent_activity_ingress(
         &self,
     ) -> Option<Arc<dyn surface::RuntimeSubagentActivityIngress>> {
@@ -1969,6 +1973,22 @@ impl surface::RuntimeWorkflowLifecycleIngress for RuntimeSurfaceWorkflowLifecycl
                 fence: self.fence.clone(),
                 task_id: task_id.to_string(),
                 attempt_id: attempt_id.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(surface_semantic_ingress_send_error)?;
+        reply_rx
+            .recv()
+            .map_err(|_| surface_semantic_ingress_ack_error())?
+    }
+}
+
+impl surface::RuntimeWorkflowProgressIngress for RuntimeSurfaceWorkflowLifecycleIngress {
+    fn commit_progress(&self, progress: &surface::RuntimeWorkflowProgress) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceCommitWorkflowProgress {
+                fence: self.fence.clone(),
+                progress: progress.clone(),
                 reply: reply_tx,
             })
             .map_err(surface_semantic_ingress_send_error)?;
@@ -4817,6 +4837,11 @@ enum ThreadCommand {
     SurfaceCommitWorkflowFinished {
         fence: surface::SurfaceOperationFence,
         finished: surface::RuntimeWorkflowFinished,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceCommitWorkflowProgress {
+        fence: surface::SurfaceOperationFence,
+        progress: surface::RuntimeWorkflowProgress,
         reply: SyncSender<io::Result<()>>,
     },
     SurfaceCommitSubagentActivity {
@@ -10892,8 +10917,9 @@ fn apply_runtime_settings_patch(
 ) -> Result<(), surface::SurfaceClientCommandError> {
     match patch {
         surface::RuntimeSettingsPatch::SetModel { model } => {
-            config.model =
-                orca_core::model::ModelSelection::from_unchecked(Some(model.as_str().to_string()));
+            config.model = config
+                .model
+                .with_value_unchecked(Some(model.as_str().to_string()));
             settings.model = model.clone();
         }
         surface::RuntimeSettingsPatch::SetReasoning { effort } => {
@@ -11006,7 +11032,7 @@ fn runtime_settings_patch_affects_policy(patch: &surface::RuntimeSettingsPatch) 
     )
 }
 
-fn hydrate_run_config_from_surface_settings(
+pub fn hydrate_run_config_from_surface_settings(
     config: &mut RunConfig,
     settings: &surface::SurfaceRuntimeSettings,
 ) -> Result<(), surface::SurfaceClientCommandError> {
@@ -17565,6 +17591,12 @@ impl ThreadActor {
                         "runtime thread is shutting down",
                     )));
                 }
+                ThreadCommand::SurfaceCommitWorkflowProgress { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
                 ThreadCommand::SurfaceRequestToolApproval { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -18139,6 +18171,14 @@ impl ThreadActor {
                     io::ErrorKind::NotConnected,
                     "runtime generation is not active",
                 )));
+            }
+            ThreadCommand::SurfaceCommitWorkflowProgress {
+                fence,
+                progress,
+                reply,
+            } => {
+                let result = self.commit_surface_workflow_progress(fence, &progress);
+                let _ = reply.send(result);
             }
             ThreadCommand::SurfaceRequestToolApproval { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
@@ -19162,6 +19202,14 @@ impl ThreadActor {
                 reply,
             } => {
                 let result = self.commit_surface_workflow_finished(active, fence, &finished);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCommitWorkflowProgress {
+                fence,
+                progress,
+                reply,
+            } => {
+                let result = self.commit_surface_workflow_progress(fence, &progress);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceRequestToolApproval {

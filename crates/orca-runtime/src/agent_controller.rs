@@ -8,7 +8,6 @@ use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
 use orca_core::event_schema::{EventEnvelope, EventType, RunStatus};
 use orca_core::event_sink::EventObserver;
-use orca_core::model::ModelSelection;
 use orca_core::subagent_types::SubagentType;
 
 use crate::agent_child::ChildAgentActivity;
@@ -176,7 +175,7 @@ impl AgentController {
         child_config.history_mode = HistoryMode::Record;
         child_config.prompt.clear();
         if request.model.is_some() {
-            child_config.model = match ModelSelection::parse(request.model) {
+            child_config.model = match child_config.model.with_value(request.model) {
                 Ok(model) => model,
                 Err(error) => {
                     let message = failure_after_started_message(

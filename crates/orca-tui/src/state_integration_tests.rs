@@ -777,6 +777,84 @@ fn child_projection_reset_preserves_parent_agent_dock() {
 }
 
 #[test]
+fn parent_task_updates_refresh_agent_dock_while_child_is_focused() {
+    let mut state = state();
+    let mut focused_child = workflow_task_summary("child-agent", "focused child");
+    focused_child.task_type = TaskType::Subagent;
+    focused_child.status = TaskStatus::Running;
+    let mut stale_sibling = workflow_task_summary("stale-sibling", "stale sibling");
+    stale_sibling.task_type = TaskType::Subagent;
+    stale_sibling.status = TaskStatus::Running;
+    let removed_sibling = workflow_task_summary("removed-sibling", "removed sibling");
+    state.apply_workflow_tasks_for_test(vec![
+        focused_child.clone(),
+        stale_sibling.clone(),
+        removed_sibling,
+    ]);
+
+    state.update(TuiEvent::ChildFocusChanged {
+        task_id: Some(focused_child.id.clone()),
+    });
+    let mut child_local_task = workflow_task_summary("child-local", "child local task");
+    child_local_task.task_type = TaskType::Subagent;
+    child_local_task.status = TaskStatus::Running;
+    state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+        SurfaceProjectionState {
+            cursor: crate::surface_projection::test_surface_cursor(2),
+            session_id: Some("child-session".to_string()),
+            title: "Child session".to_string(),
+            usage_revision: 1,
+            usage: UsageTotals::default(),
+            context_revision: 1,
+            context_used_tokens: 0,
+            context_limit_tokens: 128_000,
+            workflow_tasks: vec![child_local_task.clone()],
+            current_goal: None,
+            foreground_operation_id: None,
+            recoverable_operation_id: None,
+            goal_presentation: None,
+            session_presentation: None,
+        },
+    )));
+
+    stale_sibling.status = TaskStatus::Completed;
+    stale_sibling.completed_at_ms = Some(2_000);
+    let mut new_sibling = workflow_task_summary("new-sibling", "new sibling");
+    new_sibling.task_type = TaskType::Subagent;
+    new_sibling.status = TaskStatus::Running;
+    state.update(TuiEvent::BackgroundTasksUpdated(vec![
+        focused_child,
+        stale_sibling,
+        new_sibling,
+    ]));
+
+    assert!(
+        state
+            .workflow_tasks()
+            .iter()
+            .any(|task| { task.id == "stale-sibling" && task.status == TaskStatus::Completed })
+    );
+    assert!(
+        state
+            .workflow_tasks()
+            .iter()
+            .any(|task| task.id == "new-sibling")
+    );
+    assert!(
+        state
+            .workflow_tasks()
+            .iter()
+            .any(|task| task.id == child_local_task.id)
+    );
+    assert!(
+        state
+            .workflow_tasks()
+            .iter()
+            .all(|task| task.id != "removed-sibling")
+    );
+}
+
+#[test]
 fn generic_subagent_tool_events_do_not_create_tool_rows() {
     let mut state = state();
 
@@ -5475,9 +5553,6 @@ fn sibling_child_focus_switch_preserves_parent_workflow_tasks() {
         t
     };
     state.apply_workflow_tasks_for_test(vec![child_a_task.clone()]);
-    state.update(TuiEvent::BackgroundTasksUpdated(vec![
-        workflow_task_summary("foreign-child-task", "Foreign child projection"),
-    ]));
 
     assert_eq!(
         state
@@ -5486,7 +5561,7 @@ fn sibling_child_focus_switch_preserves_parent_workflow_tasks() {
             .map(|task| task.id.as_str())
             .collect::<Vec<_>>(),
         vec!["child-a-task"],
-        "an unfenced background update must not mutate the focused child dock"
+        "the focused child projection must remain visible"
     );
 
     // Switch directly to child-b without returning to main.
