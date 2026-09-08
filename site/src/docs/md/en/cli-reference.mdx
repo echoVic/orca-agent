@@ -26,6 +26,7 @@ positional text. The visible root commands are:
 | Command | Purpose |
 | --- | --- |
 | `orca doctor` | Inspect local configuration, credentials, folder trust, and sandbox readiness. |
+| `orca storage` | Inspect session disk usage and preview or apply archive retention. |
 | `orca exec` | Run a non-interactive task and emit text or JSONL events. |
 | `orca workflow` | Run and inspect persisted local workflows. |
 | `orca trust` | Show or update folder trust. |
@@ -60,6 +61,16 @@ camelCase fields such as `schemaVersion` and `folder-trust` check IDs.
 orca doctor
 orca doctor --cwd ./project --format json
 ```
+
+## `orca storage`
+
+```text
+orca storage [--max-bytes BYTES] [--older-than-days DAYS] [--apply]
+```
+
+Without `--apply`, this command only previews usage and candidates. See
+[Storage and retention](session-commands.md#storage-and-retention) for the
+archive policy, image ownership, and backup contract.
 
 ## `orca exec`
 

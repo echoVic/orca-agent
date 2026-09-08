@@ -25,6 +25,7 @@ orca [OPTIONS] COMMAND
 | 命令 | 用途 |
 | --- | --- |
 | `orca doctor` | 检查本地配置、凭据、目录信任和沙箱就绪状态。 |
+| `orca storage` | 检查会话磁盘占用，预览或执行归档清理策略。 |
 | `orca exec` | 非交互执行任务，输出文本或 JSONL 事件。 |
 | `orca workflow` | 执行和检查本地持久化工作流。 |
 | `orca trust` | 查看或更新目录信任。 |
@@ -58,6 +59,15 @@ JSON 是稳定的机器接口，字段使用 camelCase，例如 `schemaVersion`�
 orca doctor
 orca doctor --cwd ./project --format json
 ```
+
+## `orca storage`
+
+```text
+orca storage [--max-bytes BYTES] [--older-than-days DAYS] [--apply]
+```
+
+不带 `--apply` 时只预览占用和候选项。归档策略、图片所有权与备份规则见
+[存储与清理](session-commands.md#存储与清理)。
 
 ## `orca exec`
 
