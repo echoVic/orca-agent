@@ -2102,12 +2102,16 @@ impl WorkflowRunner {
         state.final_summary = Some(STOPPED_SUMMARY.to_string());
         state.error = None;
         self.state.write_state(&state)?;
-        self.refresh_task_progress(&task_id, &state)?;
-        self.write_evidence_for_state(&state, Some(&counters))?;
-        self.tasks
+        let progress_result = self.refresh_task_progress(&task_id, &state);
+        let evidence_result = self.write_evidence_for_state(&state, Some(&counters));
+        let task_stop_result = self
+            .tasks
             .stop(&task_id, STOPPED_SUMMARY.to_string())
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::other);
         let _ = self.state.mark_worker_exited(&run_id);
+        progress_result?;
+        evidence_result?;
+        task_stop_result?;
         let counts = self.state.agent_status_counts(&run_id)?;
 
         Ok(WorkflowLaunchResult {
@@ -3049,6 +3053,85 @@ mod tests {
         runner.abort_prepared_background(prepared.clone(), "surface commit failed".to_string());
         assert!(!runner.state.worker_path(&prepared.run_id).exists());
         assert!(tasks.get(&prepared.task_id).is_none());
+    }
+
+    #[derive(Debug)]
+    struct FailingWorkflowProgressIngress;
+
+    impl RuntimeWorkflowProgressIngress for FailingWorkflowProgressIngress {
+        fn commit_progress(&self, _progress: &RuntimeWorkflowProgress) -> io::Result<()> {
+            Err(io::Error::other("injected progress failure"))
+        }
+    }
+
+    #[test]
+    fn stopped_workflow_finishes_task_and_worker_when_progress_commit_fails() {
+        let temp = tempdir().unwrap();
+        let script_path = temp.path().join("stopped-progress.js");
+        fs::write(
+            &script_path,
+            "export const meta = { name: 'stopped-progress', description: 'stopped progress', phases: [] };\nexport default 'done';",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let tasks = TaskRegistry::new("workflow-stopped-progress".to_string());
+        let runner =
+            WorkflowRunner::new(config, tasks.clone(), temp.path().join("workflow-session"))
+                .with_progress_ingress(Some(Arc::new(FailingWorkflowProgressIngress)));
+        let prepared = runner
+            .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                script_path: Some(script_path.display().to_string()),
+                ..Default::default()
+            }))
+            .expect("prepare stopped workflow");
+        runner
+            .activate_prepared_run(&prepared.prepared)
+            .expect("activate stopped workflow");
+        runner
+            .state
+            .write_worker_record(
+                &prepared.run_id,
+                &WorkflowWorkerRecord {
+                    pid: std::process::id(),
+                    active: true,
+                    started_at_ms: now_ms(),
+                    completed_at_ms: None,
+                },
+            )
+            .expect("write active worker record");
+        let state = runner
+            .state
+            .load_run(&prepared.run_id)
+            .expect("load active workflow state");
+
+        let error = runner
+            .finish_stopped_run(
+                state,
+                prepared.workflow_name.clone(),
+                prepared.prepared.resolved.persisted_path.clone(),
+                prepared.prepared.transcript_dir.clone(),
+                prepared.task_id.clone(),
+                prepared.run_id.clone(),
+                WorkflowExecutionCounters::default(),
+            )
+            .expect_err("progress failure must remain visible");
+
+        assert!(error.to_string().contains("injected progress failure"));
+        assert_eq!(
+            tasks.get(&prepared.task_id).unwrap().status,
+            TaskStatus::Stopped
+        );
+        assert_eq!(
+            runner.state.load_run(&prepared.run_id).unwrap().status,
+            WorkflowRunStatus::Stopped
+        );
+        let worker = runner
+            .state
+            .load_worker_record(&prepared.run_id)
+            .expect("load terminal worker record");
+        assert!(!worker.active);
+        assert!(worker.completed_at_ms.is_some());
     }
 
     #[test]
