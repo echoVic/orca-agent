@@ -11,7 +11,8 @@ pub fn open_nofollow_nonblocking(path: &Path) -> Result<File, PlatformError> {
     platform::open_nonblocking(path)
 }
 
-/// Read without sharing or changing the file handle's sequential cursor.
+/// Read at an explicit offset. Windows also advances the handle's sequential
+/// cursor, so callers must not mix these reads with sequential I/O.
 pub fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
     platform::read_at(file, buffer, offset)
 }

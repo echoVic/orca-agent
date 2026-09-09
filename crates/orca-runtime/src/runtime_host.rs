@@ -8799,14 +8799,16 @@ fn recover_background_approval_routes_on_start(
 
 fn recovered_background_approval_interactions(
     coordinator: &surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
-) -> HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction> {
+) -> Result<
+    HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+    surface::SurfaceLedgerError,
+> {
     let snapshot = coordinator.state().snapshot();
     let mut committed_resolutions = HashMap::new();
-    if let Ok(recovered) = coordinator.ledger().replay_batches() {
+    {
+        let recovered = coordinator.ledger().replay_batches()?;
         for entry in recovered {
-            let Ok((committed, batch)) = entry else {
-                return HashMap::new();
-            };
+            let (committed, batch) = entry?;
             if !committed {
                 continue;
             }
@@ -8833,7 +8835,7 @@ fn recovered_background_approval_interactions(
             }
         }
     }
-    snapshot
+    Ok(snapshot
         .interactions
         .iter()
         .filter_map(|interaction| {
@@ -8883,7 +8885,7 @@ fn recovered_background_approval_interactions(
                 },
             ))
         })
-        .collect()
+        .collect())
 }
 
 fn recovered_background_approval_resolutions(
@@ -10467,8 +10469,17 @@ fn bootstrap_recorded_surface(
     .map_err(|error| RuntimeHostError::ThreadStartFailed {
         message: format!("failed to persist effective typed surface settings: {error}"),
     })?;
-    let terminals = recovered_surface_terminals(&coordinator);
-    let mut interactions = recovered_background_approval_interactions(&coordinator);
+    let terminals = recovered_surface_terminals(&coordinator).map_err(|error| {
+        RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to replay terminal facts: {error:?}"),
+        }
+    })?;
+    let mut interactions =
+        recovered_background_approval_interactions(&coordinator).map_err(|error| {
+            RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to replay background approval facts: {error:?}"),
+            }
+        })?;
     interactions.extend(recovered_tool_approval_interactions);
     interactions.extend(recovered_permission_interactions);
     interactions.extend(recovered_continuation_interactions);
@@ -11205,15 +11216,14 @@ fn persist_surface_settings_metadata(
 
 fn recovered_surface_terminals(
     coordinator: &surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
-) -> HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor> {
+) -> Result<
+    HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
+    surface::SurfaceLedgerError,
+> {
     let mut terminals = HashMap::new();
-    let Ok(recovered) = coordinator.ledger().replay_batches() else {
-        return terminals;
-    };
+    let recovered = coordinator.ledger().replay_batches()?;
     for entry in recovered {
-        let Ok((committed, batch)) = entry else {
-            return HashMap::new();
-        };
+        let (committed, batch) = entry?;
         if !committed {
             continue;
         }
@@ -11236,7 +11246,7 @@ fn recovered_surface_terminals(
             );
         }
     }
-    terminals
+    Ok(terminals)
 }
 
 fn surface_request_text(request: &surface::SurfaceInputRequest) -> String {

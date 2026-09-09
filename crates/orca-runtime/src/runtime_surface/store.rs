@@ -2981,7 +2981,7 @@ impl SurfaceCommitHeader {
 struct SurfaceCommitIndex {
     ordered: Vec<IndexedSurfaceCommit>,
     by_id: BTreeMap<SurfaceCommitId, usize>,
-    snapshot: Option<crate::thread_store::SessionRecordSnapshot>,
+    snapshot: Option<Result<crate::thread_store::SessionRecordSnapshot, SurfaceLedgerError>>,
 }
 
 impl SurfaceCommitIndex {
@@ -3058,7 +3058,7 @@ impl SurfaceCommitIndex {
                 _ => {}
             }
         }
-        index.snapshot = Some(snapshot);
+        index.snapshot = Some(Ok(snapshot));
         Ok(index)
     }
 
@@ -4338,9 +4338,14 @@ impl JsonlSurfaceCommitLedger {
         let records = index
             .snapshot
             .as_ref()
-            .map(|snapshot| snapshot.records())
-            .transpose()
-            .map_err(Self::io_error)?;
+            .map(|snapshot| {
+                snapshot
+                    .as_ref()
+                    .map_err(Clone::clone)?
+                    .records()
+                    .map_err(Self::io_error)
+            })
+            .transpose()?;
         let mut seen = std::collections::BTreeSet::new();
         let mut previous_cursor_after = None;
         let mut has_prepared = false;
@@ -4473,7 +4478,7 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
             .map_err(Self::io_error)?;
         index.insert_prepared(batch);
         index.snapshot = Some(
-            crate::thread_store::SessionRecordSnapshot::open(&self.path).map_err(Self::io_error)?,
+            crate::thread_store::SessionRecordSnapshot::open(&self.path).map_err(Self::io_error),
         );
         let receipt = DurableBatchReceipt {
             commit_id,
@@ -4587,7 +4592,7 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         indexed.committed = true;
         index.snapshot = Some(
-            crate::thread_store::SessionRecordSnapshot::open(&self.path).map_err(Self::io_error)?,
+            crate::thread_store::SessionRecordSnapshot::open(&self.path).map_err(Self::io_error),
         );
         Ok(())
     }

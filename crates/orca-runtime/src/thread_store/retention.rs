@@ -35,6 +35,55 @@ pub struct SessionRetentionReport {
     pub applied: bool,
 }
 
+#[derive(Debug)]
+pub struct SessionRetentionError {
+    pub report: SessionRetentionReport,
+    pub failed_path: PathBuf,
+    pub transcript_removed: bool,
+    source: io::Error,
+}
+
+impl std::fmt::Display for SessionRetentionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for path in &self.report.deleted {
+            writeln!(f, "deleted: {}", path.display())?;
+        }
+        for path in &self.report.skipped {
+            writeln!(f, "skipped: {}", path.display())?;
+        }
+        write!(
+            f,
+            "retention failed at {} (transcript removed: {}): {}",
+            self.failed_path.display(),
+            self.transcript_removed,
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for SessionRetentionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn retention_error(
+    report: &SessionRetentionReport,
+    path: &Path,
+    transcript_removed: bool,
+    source: io::Error,
+) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        SessionRetentionError {
+            report: report.clone(),
+            failed_path: path.to_path_buf(),
+            transcript_removed,
+            source,
+        },
+    )
+}
+
 fn session_bytes(path: &Path) -> io::Result<u64> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -133,7 +182,7 @@ pub fn retain_sessions(
     }
     let mut report = SessionRetentionReport {
         bytes_before,
-        bytes_after: bytes_before,
+        bytes_after: if apply { bytes_before } else { projected_bytes },
         quota_satisfied: false,
         candidates,
         deleted: Vec::new(),
@@ -148,7 +197,8 @@ pub fn retain_sessions(
                 report.skipped.push(candidate.path.clone());
                 continue;
             };
-            let _append = writer::acquire_file_lock(&candidate.path)?;
+            let _append = writer::acquire_file_lock(&candidate.path)
+                .map_err(|error| retention_error(&report, &candidate.path, false, error))?;
             let unchanged = fs::metadata(&candidate.path)
                 .and_then(|meta| meta.modified())
                 .is_ok_and(|time| DateTime::<Utc>::from(time) == candidate.modified_at)
@@ -157,8 +207,10 @@ pub fn retain_sessions(
                 report.skipped.push(candidate.path.clone());
                 continue;
             }
-            fs::remove_file(&candidate.path)?;
-            assets::remove_directory(&candidate.path)?;
+            fs::remove_file(&candidate.path)
+                .map_err(|error| retention_error(&report, &candidate.path, false, error))?;
+            assets::remove_directory(&candidate.path)
+                .map_err(|error| retention_error(&report, &candidate.path, true, error))?;
             let _ = session_index::remove_path(&candidate.path);
             report.bytes_after = report.bytes_after.saturating_sub(candidate.bytes);
             report.deleted.push(candidate.path.clone());

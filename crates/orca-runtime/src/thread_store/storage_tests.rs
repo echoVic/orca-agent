@@ -9,7 +9,9 @@ use super::assets;
 use super::reader::INDEX_BUDGET;
 use super::retention::{SessionRetentionPolicy, retain_sessions};
 use super::types::{SessionRecord, StoredMessage, StoredSessionHealth};
-use super::writer::{MAX_SESSION_LINE_BYTES, read_transcript, scan_session, write_record_line};
+use super::writer::{
+    MAX_SESSION_LINE_BYTES, read_session_meta, read_transcript, scan_session, write_record_line,
+};
 use super::{JsonlThreadStore, SessionWriter};
 
 fn image_message(size: usize) -> Message {
@@ -115,6 +117,21 @@ fn missing_asset_prevents_append_without_changing_transcript() {
         assets::remove_directory(writer.path()).unwrap();
         assert!(SessionWriter::append_to_existing(writer.path().to_path_buf()).is_err());
         assert_eq!(fs::read(writer.path()).unwrap(), before);
+    });
+}
+
+#[test]
+fn reading_session_meta_does_not_hydrate_later_images() {
+    crate::history::with_redirected_orca_home("asset-meta", |home| {
+        let mut writer = SessionWriter::start(home, "mock", None, "metadata only").unwrap();
+        writer.enter_turn(TurnId::new());
+        writer.append_message(&image_message(1024)).unwrap();
+        assets::remove_directory(writer.path()).unwrap();
+        assert_eq!(
+            read_session_meta(writer.path()).unwrap().title,
+            "metadata only"
+        );
+        assert!(read_transcript(writer.path()).is_err());
     });
 }
 
@@ -285,6 +302,19 @@ fn retention_is_opt_in_archived_only_and_accounts_for_images() {
         assert_eq!(preview.candidates.len(), 1);
         assert!(preview.candidates[0].bytes >= 4096);
         assert!(preview.deleted.is_empty());
+        assert_eq!(
+            preview.bytes_after,
+            preview.bytes_before - preview.candidates[0].bytes,
+        );
+        let feasible = retain_sessions(
+            &SessionRetentionPolicy {
+                max_bytes: Some(preview.bytes_after),
+                older_than_days: None,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(feasible.quota_satisfied);
         assert!(archived_path.exists());
         let lease = orca_platform::fs::ExclusiveFileLock::acquire(
             &archived_path.with_extension("surface-owner.lock"),

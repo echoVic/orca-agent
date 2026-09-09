@@ -33,7 +33,9 @@ pub(crate) use projection::{
     message_to_thread_json, messages_to_thread_items, messages_to_thread_turns,
 };
 pub(crate) use reader::SessionRecordSnapshot;
-pub use retention::{SessionRetentionPolicy, SessionRetentionReport, retain_sessions};
+pub use retention::{
+    SessionRetentionError, SessionRetentionPolicy, SessionRetentionReport, retain_sessions,
+};
 pub use session_index::SessionSummaryPage;
 pub(crate) use types::{ManualCompactionDurableSnapshot, SessionRecord, StoredConversationRecord};
 pub use types::{

@@ -360,8 +360,25 @@ pub fn archive_session(selector: &str) -> io::Result<PathBuf> {
     }
     let _owner = super::retention::acquire_idle_owner(&path)?;
     let _lock = acquire_file_lock(&path)?;
-    assets::copy_directory(&path, &archived_path)?;
-    fs::rename(&path, &archived_path)?;
+    if fs::symlink_metadata(&archived_path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "archive already exists",
+        ));
+    }
+    let asset_dir_existed = fs::symlink_metadata(assets::directory(&archived_path)).is_ok();
+    let publish = assets::copy_directory(&path, &archived_path)
+        .and_then(|()| fs::rename(&path, &archived_path));
+    if let Err(error) = publish {
+        if !asset_dir_existed {
+            assets::remove_directory(&archived_path).map_err(|cleanup| {
+                io::Error::other(format!(
+                    "archive failed: {error}; asset cleanup failed: {cleanup}"
+                ))
+            })?;
+        }
+        return Err(error);
+    }
     assets::remove_directory(&path)?;
     #[cfg(not(test))]
     let _ = session_index::move_path(&path, &archived_path, true);
@@ -1114,8 +1131,8 @@ impl ThreadStore for JsonlThreadStore {
         rewrite_records_unlocked(&path, records)?;
         if !patched {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "thread metadata patch did not include any supported fields",
+                io::ErrorKind::InvalidData,
+                "session transcript has no metadata record",
             ));
         }
         let summary = summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))?;

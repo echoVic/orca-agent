@@ -243,10 +243,30 @@ fn encode_record_line(path: &Path, record: &SessionRecord) -> io::Result<Vec<u8>
     let redacted = redact_session_record(record);
     // Validate the hydrated representation too. A small reference envelope
     // must not expand past the reader's allocation bound.
-    let _ = bounded_json_line(&redacted)?;
+    bounded_json_length(&redacted)?;
     let value = serde_json::to_value(redacted).map_err(io::Error::other)?;
     let value = assets::externalize(path, value)?;
     bounded_json_line(&value)
+}
+
+fn bounded_json_length(value: &impl serde::Serialize) -> io::Result<()> {
+    struct Counting(usize);
+    impl Write for Counting {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            if self.0 >= MAX_SESSION_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "record_bytes_limit",
+                ));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(&mut Counting(0), value).map_err(io::Error::other)
 }
 
 fn bounded_json_line(value: &impl serde::Serialize) -> io::Result<Vec<u8>> {
@@ -586,7 +606,8 @@ pub(crate) fn read_session_meta(path: &Path) -> io::Result<SessionMeta> {
     let mut meta = None;
     for record in iter_records(path)? {
         if let SessionRecord::Meta(value) = record? {
-            meta.get_or_insert(value);
+            meta = Some(value);
+            break;
         }
     }
     if let Some(meta) = meta {
