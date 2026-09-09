@@ -1343,6 +1343,12 @@ pub enum WorkflowPatch {
         next_revision: WorkflowRevision,
         agent: SurfaceWorkflowAgent,
     },
+    ProgressUpdated {
+        fence: SurfaceWorkflowFence,
+        next_revision: WorkflowRevision,
+        phases: Vec<SurfaceWorkflowPhase>,
+        agents: Vec<SurfaceWorkflowAgent>,
+    },
     Paused {
         fence: SurfaceWorkflowFence,
         next_revision: WorkflowRevision,

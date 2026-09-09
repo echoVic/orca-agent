@@ -1914,7 +1914,7 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RuntimeSurfaceWorkflowLifecycleIngress {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     fence: surface::SurfaceOperationFence,
@@ -1952,6 +1952,10 @@ impl surface::RuntimeWorkflowLifecycleIngress for RuntimeSurfaceWorkflowLifecycl
             .map_err(|_| surface_semantic_ingress_ack_error())?
     }
 
+    fn progress_ingress(&self) -> Option<Arc<dyn surface::RuntimeWorkflowProgressIngress>> {
+        Some(Arc::new(self.clone()))
+    }
+
     fn subagent_activity_ingress(
         &self,
     ) -> Option<Arc<dyn surface::RuntimeSubagentActivityIngress>> {
@@ -1969,6 +1973,22 @@ impl surface::RuntimeWorkflowLifecycleIngress for RuntimeSurfaceWorkflowLifecycl
                 fence: self.fence.clone(),
                 task_id: task_id.to_string(),
                 attempt_id: attempt_id.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(surface_semantic_ingress_send_error)?;
+        reply_rx
+            .recv()
+            .map_err(|_| surface_semantic_ingress_ack_error())?
+    }
+}
+
+impl surface::RuntimeWorkflowProgressIngress for RuntimeSurfaceWorkflowLifecycleIngress {
+    fn commit_progress(&self, progress: &surface::RuntimeWorkflowProgress) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .try_send(ThreadCommand::SurfaceCommitWorkflowProgress {
+                fence: self.fence.clone(),
+                progress: progress.clone(),
                 reply: reply_tx,
             })
             .map_err(surface_semantic_ingress_send_error)?;
@@ -4817,6 +4837,11 @@ enum ThreadCommand {
     SurfaceCommitWorkflowFinished {
         fence: surface::SurfaceOperationFence,
         finished: surface::RuntimeWorkflowFinished,
+        reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceCommitWorkflowProgress {
+        fence: surface::SurfaceOperationFence,
+        progress: surface::RuntimeWorkflowProgress,
         reply: SyncSender<io::Result<()>>,
     },
     SurfaceCommitSubagentActivity {
@@ -8774,11 +8799,19 @@ fn recover_background_approval_routes_on_start(
 
 fn recovered_background_approval_interactions(
     coordinator: &surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
-) -> HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction> {
+) -> Result<
+    HashMap<surface::SurfaceInteractionId, ResidentSurfaceInteraction>,
+    surface::SurfaceLedgerError,
+> {
     let snapshot = coordinator.state().snapshot();
     let mut committed_resolutions = HashMap::new();
-    if let Ok(recovered) = coordinator.ledger().recover_batches() {
-        for batch in recovered.committed {
+    {
+        let recovered = coordinator.ledger().replay_batches()?;
+        for entry in recovered {
+            let (committed, batch) = entry?;
+            if !committed {
+                continue;
+            }
             for envelope in batch.events.as_slice() {
                 let surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
                     interaction_id,
@@ -8802,7 +8835,7 @@ fn recovered_background_approval_interactions(
             }
         }
     }
-    snapshot
+    Ok(snapshot
         .interactions
         .iter()
         .filter_map(|interaction| {
@@ -8852,7 +8885,7 @@ fn recovered_background_approval_interactions(
                 },
             ))
         })
-        .collect()
+        .collect())
 }
 
 fn recovered_background_approval_resolutions(
@@ -8965,10 +8998,19 @@ struct RecoveredContinuationResolution {
 }
 
 fn recovered_continuation_resolutions_from_batches(
-    batches: &[surface::SurfaceCommitBatch],
-) -> HashMap<surface::SurfaceInteractionId, RecoveredContinuationResolution> {
+    batches: impl IntoIterator<
+        Item = Result<(bool, surface::SurfaceCommitBatch), surface::SurfaceLedgerError>,
+    >,
+) -> Result<
+    HashMap<surface::SurfaceInteractionId, RecoveredContinuationResolution>,
+    surface::SurfaceLedgerError,
+> {
     let mut recovered = HashMap::new();
-    for batch in batches {
+    for entry in batches {
+        let (committed, batch) = entry?;
+        if !committed {
+            continue;
+        }
         for envelope in batch.events.as_slice() {
             match &envelope.event {
                 surface::SurfaceEvent::Interaction(surface::InteractionPatch::Resolved {
@@ -9042,7 +9084,7 @@ fn recovered_continuation_resolutions_from_batches(
             }
         }
     }
-    recovered
+    Ok(recovered)
 }
 
 fn continuation_resolution_requires_dispatch(
@@ -9830,13 +9872,15 @@ fn recover_continuation_turn_owners_on_start(
     let observed_fingerprint =
         cold_recovery_thread_config_fingerprint(config, coordinator.state().snapshot());
     let cold_owner_epoch = coordinator.state().snapshot().thread.owner_epoch;
-    let recovered_batches = coordinator.ledger().recover_batches().map_err(|error| {
+    let recovered_batches = coordinator.ledger().replay_batches().map_err(|error| {
         RuntimeHostError::ThreadStartFailed {
             message: format!("failed to recover continuation answer facts: {error:?}"),
         }
     })?;
-    let recovered_resolutions =
-        recovered_continuation_resolutions_from_batches(&recovered_batches.committed);
+    let recovered_resolutions = recovered_continuation_resolutions_from_batches(recovered_batches)
+        .map_err(|error| RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to replay continuation answer facts: {error:?}"),
+        })?;
     let candidates = coordinator
         .state()
         .snapshot()
@@ -10425,8 +10469,17 @@ fn bootstrap_recorded_surface(
     .map_err(|error| RuntimeHostError::ThreadStartFailed {
         message: format!("failed to persist effective typed surface settings: {error}"),
     })?;
-    let terminals = recovered_surface_terminals(&coordinator);
-    let mut interactions = recovered_background_approval_interactions(&coordinator);
+    let terminals = recovered_surface_terminals(&coordinator).map_err(|error| {
+        RuntimeHostError::ThreadStartFailed {
+            message: format!("failed to replay terminal facts: {error:?}"),
+        }
+    })?;
+    let mut interactions =
+        recovered_background_approval_interactions(&coordinator).map_err(|error| {
+            RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to replay background approval facts: {error:?}"),
+            }
+        })?;
     interactions.extend(recovered_tool_approval_interactions);
     interactions.extend(recovered_permission_interactions);
     interactions.extend(recovered_continuation_interactions);
@@ -10892,8 +10945,9 @@ fn apply_runtime_settings_patch(
 ) -> Result<(), surface::SurfaceClientCommandError> {
     match patch {
         surface::RuntimeSettingsPatch::SetModel { model } => {
-            config.model =
-                orca_core::model::ModelSelection::from_unchecked(Some(model.as_str().to_string()));
+            config.model = config
+                .model
+                .with_value_unchecked(Some(model.as_str().to_string()));
             settings.model = model.clone();
         }
         surface::RuntimeSettingsPatch::SetReasoning { effort } => {
@@ -11006,7 +11060,7 @@ fn runtime_settings_patch_affects_policy(patch: &surface::RuntimeSettingsPatch) 
     )
 }
 
-fn hydrate_run_config_from_surface_settings(
+pub fn hydrate_run_config_from_surface_settings(
     config: &mut RunConfig,
     settings: &surface::SurfaceRuntimeSettings,
 ) -> Result<(), surface::SurfaceClientCommandError> {
@@ -11162,12 +11216,17 @@ fn persist_surface_settings_metadata(
 
 fn recovered_surface_terminals(
     coordinator: &surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
-) -> HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor> {
+) -> Result<
+    HashMap<surface::SurfaceOperationId, surface::OperationTerminalAtCursor>,
+    surface::SurfaceLedgerError,
+> {
     let mut terminals = HashMap::new();
-    let Ok(recovered) = coordinator.ledger().recover_batches() else {
-        return terminals;
-    };
-    for batch in recovered.committed {
+    let recovered = coordinator.ledger().replay_batches()?;
+    for entry in recovered {
+        let (committed, batch) = entry?;
+        if !committed {
+            continue;
+        }
         for envelope in batch.events.as_slice() {
             let surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal { record }) =
                 &envelope.event
@@ -11187,7 +11246,7 @@ fn recovered_surface_terminals(
             );
         }
     }
-    terminals
+    Ok(terminals)
 }
 
 fn surface_request_text(request: &surface::SurfaceInputRequest) -> String {
@@ -16383,7 +16442,10 @@ impl ThreadActor {
             .unwrap_or(true)
     }
 
-    async fn close_ephemeral_one_shot(&mut self) -> Result<(), surface::SurfaceClientCommandError> {
+    async fn close_ephemeral_one_shot(
+        &mut self,
+        command_rx: &mut tokio_mpsc::Receiver<ThreadCommand>,
+    ) -> Result<(), surface::SurfaceClientCommandError> {
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let barrier_id =
             surface::SurfaceSettlementId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -16437,7 +16499,7 @@ impl ThreadActor {
             }
             if result.is_ok() {
                 result = self
-                    .shutdown_background_tasks(reason)
+                    .shutdown_background_tasks(reason, command_rx)
                     .await
                     .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable);
             }
@@ -16810,7 +16872,7 @@ impl ThreadActor {
                 self.try_drain_prompt_queue();
             }
             if self.one_shot_close_ready() {
-                match self.close_ephemeral_one_shot().await {
+                match self.close_ephemeral_one_shot(&mut command_rx).await {
                     Ok(()) => {
                         command_rx.close();
                         Self::drain_closed_thread_commands(&mut command_rx);
@@ -16823,7 +16885,10 @@ impl ThreadActor {
                         command_rx.close();
                         Self::drain_closed_thread_commands(&mut command_rx);
                         let _ = self
-                            .shutdown_background_tasks(surface::SurfaceShutdownReason::ThreadClose)
+                            .shutdown_background_tasks(
+                                surface::SurfaceShutdownReason::ThreadClose,
+                                &mut command_rx,
+                            )
                             .await;
                         break;
                     }
@@ -16871,6 +16936,7 @@ impl ThreadActor {
                             let _ = self
                                 .shutdown_background_tasks(
                                     surface::SurfaceShutdownReason::ThreadClose,
+                                    &mut command_rx,
                                 )
                                 .await;
                             break;
@@ -17043,7 +17109,7 @@ impl ThreadActor {
                                     message: message.clone(),
                                 };
                                 if reason == surface::SurfaceShutdownReason::HostShutdown {
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17063,7 +17129,7 @@ impl ThreadActor {
                             if let Err(error) = typed_shutdown {
                                 self.operation_recovery.terminal_blocked = Some(error.to_string());
                                 if reason == surface::SurfaceShutdownReason::HostShutdown {
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17075,7 +17141,7 @@ impl ThreadActor {
                                 continue;
                             }
                             let background_shutdown =
-                                self.shutdown_background_tasks(reason).await;
+                                self.shutdown_background_tasks(reason, &mut command_rx).await;
                             if let Some(reply) = reply {
                                 let ack = match background_shutdown {
                                     Ok(()) => ThreadShutdownAck::Complete,
@@ -17186,7 +17252,7 @@ impl ThreadActor {
                                     active.generation.cancel.cancel();
                                     Self::drain_closed_thread_commands(&mut command_rx);
                                     let _ = (&mut active.generation.join).await;
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17213,7 +17279,7 @@ impl ThreadActor {
                                     self.abandon_surface_capability_waiters_for_cold_recovery();
                                     Self::drain_closed_thread_commands(&mut command_rx);
                                     let _ = (&mut active.generation.join).await;
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17266,7 +17332,7 @@ impl ThreadActor {
                                 let finish_result =
                                     self.finish_generation(active, generation_result, false);
                                 let background_shutdown =
-                                    self.shutdown_background_tasks(reason).await;
+                                    self.shutdown_background_tasks(reason, &mut command_rx).await;
                                 let shutdown_result = finish_result
                                     .and(background_shutdown)
                                     .and(pause_result);
@@ -17310,7 +17376,7 @@ impl ThreadActor {
                                     active.generation.cancel.cancel();
                                     Self::drain_closed_thread_commands(&mut command_rx);
                                     let _ = (&mut active.generation.join).await;
-                                    let _ = self.shutdown_background_tasks(reason).await;
+                                    let _ = self.shutdown_background_tasks(reason, &mut command_rx).await;
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Failed(error));
                                     }
@@ -17340,7 +17406,7 @@ impl ThreadActor {
                             let result = (&mut active.generation.join).await;
                             let finish_result = self.finish_generation(active, result, false);
                             let background_shutdown =
-                                self.shutdown_background_tasks(reason).await;
+                                self.shutdown_background_tasks(reason, &mut command_rx).await;
                             if let Err(error) = finish_result {
                                 if let Some(reply) = reply.as_ref() {
                                     let _ = reply.send(ThreadShutdownAck::Failed(error));
@@ -17394,6 +17460,7 @@ impl ThreadActor {
                             let _ = self
                                 .shutdown_background_tasks(
                                     surface::SurfaceShutdownReason::ThreadClose,
+                                    &mut command_rx,
                                 )
                                 .await;
                             if let Err(error) = finish_result {
@@ -17560,6 +17627,12 @@ impl ThreadActor {
                     )));
                 }
                 ThreadCommand::SurfaceCommitWorkflowFinished { reply, .. } => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "runtime thread is shutting down",
+                    )));
+                }
+                ThreadCommand::SurfaceCommitWorkflowProgress { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "runtime thread is shutting down",
@@ -18139,6 +18212,14 @@ impl ThreadActor {
                     io::ErrorKind::NotConnected,
                     "runtime generation is not active",
                 )));
+            }
+            ThreadCommand::SurfaceCommitWorkflowProgress {
+                fence,
+                progress,
+                reply,
+            } => {
+                let result = self.commit_surface_workflow_progress(fence, &progress);
+                let _ = reply.send(result);
             }
             ThreadCommand::SurfaceRequestToolApproval { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
@@ -19162,6 +19243,14 @@ impl ThreadActor {
                 reply,
             } => {
                 let result = self.commit_surface_workflow_finished(active, fence, &finished);
+                let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCommitWorkflowProgress {
+                fence,
+                progress,
+                reply,
+            } => {
+                let result = self.commit_surface_workflow_progress(fence, &progress);
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceRequestToolApproval {
@@ -23129,7 +23218,8 @@ mod tests {
             None,
         );
 
-        let recovered = recovered_continuation_resolutions_from_batches(&[resolved]);
+        let recovered =
+            recovered_continuation_resolutions_from_batches([Ok((true, resolved))]).unwrap();
         let recovered = recovered.get(&interaction_id).unwrap();
         assert_eq!(recovered.receipt, receipt);
         assert_eq!(recovered.answer.as_ref(), Some(&answer));
@@ -23186,7 +23276,10 @@ mod tests {
             vec![resolved.clone(), started.clone()],
             vec![resolved, started.clone(), started],
         ] {
-            let recovered = recovered_continuation_resolutions_from_batches(&batches);
+            let recovered = recovered_continuation_resolutions_from_batches(
+                batches.iter().cloned().map(|batch| Ok((true, batch))),
+            )
+            .unwrap();
             assert_eq!(
                 recovered.get(&interaction_id).unwrap().dispatch_state,
                 RecoveredContinuationDispatchState::Started {

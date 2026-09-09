@@ -26,6 +26,10 @@ const ASYNC_SUBAGENT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/subagent_async_worker.rs"
 ));
+const AGENT_CONTROLLER: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/agent_controller.rs"
+));
 const WORKFLOW_RUNNER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/workflow/runner.rs"
@@ -37,6 +41,26 @@ const HOSTED_CONTROLLER: &str = include_str!(concat!(
 const HOSTED_CHILD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../orca-tui/src/hosted_child.rs"
+));
+const HOSTED_SESSION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../orca-tui/src/hosted_session.rs"
+));
+const TUI_PROTOCOL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../orca-tui/src/protocol.rs"
+));
+const TUI_AGENT_WORKSPACE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../orca-tui/src/agent_workspace.rs"
+));
+const TUI_STATE_REDUCER: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../orca-tui/src/state_reducer.rs"
+));
+const TUI_UI: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../orca-tui/src/ui.rs"
 ));
 const SURFACE_IDENTITY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -120,22 +144,18 @@ fn task_transcript_action_is_dispatched_instead_of_dropped() {
 }
 
 #[test]
-fn hosted_child_navigation_does_not_bypass_surface_lifecycle_with_registry_state() {
+fn hosted_child_navigation_requires_a_surface_lifecycle_binding() {
     let focus = balanced_block(HOSTED_CHILD, "fn focus_child");
     let projection = balanced_block(HOSTED_CHILD, "fn project_hosted_child_attached");
     let resolver = balanced_block(HOSTED_CHILD, "fn resolve_child_binding");
     let surface_binding = balanced_block(HOSTED_CHILD, "fn child_binding");
-    let registry_binding = balanced_block(HOSTED_CHILD, "fn registry_child_binding");
 
     assert!(focus.contains("project_hosted_child_attached"));
     assert!(projection.contains("TuiEvent::ChildProjectionReset"));
-    assert!(resolver.contains("surface_task_present"));
-    assert!(
-        !resolver.contains(".or_else"),
-        "a stale or terminal surface task must not fall through to the registry mirror"
-    );
+    assert!(resolver.contains("child_binding"));
     assert!(surface_binding.contains("SurfaceSubagentStatus::Running"));
-    assert!(registry_binding.contains("agent.status.is_active()"));
+    assert!(!HOSTED_CHILD.contains("registry_child_binding"));
+    assert!(!HOSTED_CHILD.contains("agent_registry_snapshot"));
 }
 
 #[test]
@@ -191,11 +211,42 @@ fn synchronous_child_activity_has_one_surface_delivery_boundary() {
 }
 
 #[test]
-fn threaded_registry_identity_uses_the_surface_task_identity() {
-    let worker = balanced_block(SYNC_SUBAGENT, "fn run_threaded_agent_worker");
+fn surface_backed_agent_delivery_is_exclusive_from_the_registry() {
+    assert!(AGENT_CONTROLLER.contains("enum AgentActivityDelivery"));
+    assert!(AGENT_CONTROLLER.contains("Surface(AgentSurfacePublisher)"));
+    assert!(AGENT_CONTROLLER.contains("Registry(Arc<crate::agent_registry::AgentRegistry>)"));
+    let publisher = balanced_block(AGENT_CONTROLLER, "impl AgentEventPublisher");
+    assert!(publisher.contains("let delivery = match surface_activity"));
+    assert!(publisher.contains("AgentActivityDelivery::Surface"));
+    assert!(publisher.contains("AgentActivityDelivery::Registry"));
+}
 
-    assert!(worker.contains("let registry_agent_id = registry_task_id"));
-    assert!(worker.contains("agent_id: registry_agent_id"));
+#[test]
+fn hosted_tui_subagent_views_have_no_registry_input() {
+    assert!(!HOSTED_CONTROLLER.contains("agent_registry_snapshot"));
+    assert!(!HOSTED_CONTROLLER.contains("AgentRegistryUpdated"));
+    assert!(!HOSTED_CHILD.contains("agent_registry_snapshot"));
+    assert!(!TUI_PROTOCOL.contains("AgentRegistryUpdated"));
+    assert!(!TUI_AGENT_WORKSPACE.contains("AgentSummary"));
+    assert!(!TUI_AGENT_WORKSPACE.contains("RegistryAgent"));
+    assert!(!TUI_UI.contains("agent_registry_activity_lines"));
+}
+
+#[test]
+fn subagent_runtime_events_are_not_a_parallel_tui_projection() {
+    let mapper = balanced_block(HOSTED_SESSION, "fn runtime_event_to_tui");
+    let reducer = balanced_block(TUI_STATE_REDUCER, "pub fn update");
+    let projection = balanced_block(
+        TUI_STATE_REDUCER,
+        "pub(crate) fn apply_surface_projection_state",
+    );
+
+    assert!(mapper.contains(
+        "EventType::SubagentStarted | EventType::SubagentProgress | EventType::SubagentCompleted"
+    ));
+    assert!(reducer.contains("TuiEvent::SurfaceProjectionSynced(projection)"));
+    assert!(reducer.contains("self.apply_surface_projection_state(*projection)"));
+    assert!(projection.contains("self.apply_workflow_tasks_update"));
 }
 
 #[test]

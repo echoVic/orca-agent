@@ -720,7 +720,7 @@ where
         )
         && key.modifiers.contains(KeyModifiers::SHIFT)
         && matches!(key.code, KeyCode::Up | KeyCode::Down)
-        && (!state.workflow_tasks().is_empty() || !state.agent_registry.agents.is_empty())
+        && !state.workflow_tasks().is_empty()
     {
         vim_state.cancel_pending_command();
         if key.code == KeyCode::Up {
@@ -755,11 +755,6 @@ where
                 state.begin_task_transcript_request(request.clone());
                 let _ = action_tx.send(UserAction::ReadTaskTranscript(request));
             }
-        } else if let Some(agent) = state.selected_agent_registry() {
-            let _ = action_tx.send(UserAction::FocusChildThread {
-                task_id: agent.agent_id.clone(),
-                expected_revision: state.agent_registry.revision,
-            });
         } else {
             return Ok(KeyEventFlow::Unhandled);
         }

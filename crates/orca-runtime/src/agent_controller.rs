@@ -8,7 +8,6 @@ use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::Message;
 use orca_core::event_schema::{EventEnvelope, EventType, RunStatus};
 use orca_core::event_sink::EventObserver;
-use orca_core::model::ModelSelection;
 use orca_core::subagent_types::SubagentType;
 
 use crate::agent_child::ChildAgentActivity;
@@ -33,11 +32,9 @@ pub(crate) struct AgentThreadPolicy {
     pub(crate) depth: u32,
 }
 
-/// Optional bridge that mirrors a sync child's activity onto the parent
-/// thread's runtime surface as a `SurfaceSubagent`, so the surface (not the
-/// registry) is the live UI source. Only supplied for sync children, whose
-/// generation-owned ingress stays valid for the duration of the parent turn;
-/// async children outlive that generation and remain on the registry rail.
+/// Delivery boundary for a sync child's activity on the parent thread's
+/// runtime surface. Only supplied while the generation-owned ingress remains
+/// valid; callers without a surface use the standalone registry rail instead.
 #[derive(Clone)]
 pub(crate) struct AgentSurfaceActivity {
     pub(crate) emitter: Arc<ChildAgentActivityEmitter>,
@@ -178,7 +175,7 @@ impl AgentController {
         child_config.history_mode = HistoryMode::Record;
         child_config.prompt.clear();
         if request.model.is_some() {
-            child_config.model = match ModelSelection::parse(request.model) {
+            child_config.model = match child_config.model.with_value(request.model) {
                 Ok(model) => model,
                 Err(error) => {
                     let message = failure_after_started_message(
@@ -350,8 +347,7 @@ fn failure_after_started_message(
 }
 
 struct AgentEventPublisher {
-    surface_activity: Option<AgentSurfacePublisher>,
-    registry: Arc<crate::agent_registry::AgentRegistry>,
+    delivery: AgentActivityDelivery,
     root_thread_id: String,
     parent_thread_id: String,
     agent_id: String,
@@ -361,6 +357,11 @@ struct AgentEventPublisher {
     thread_id: String,
     attempt_id: String,
     next_sequence: Mutex<u64>,
+}
+
+enum AgentActivityDelivery {
+    Surface(AgentSurfacePublisher),
+    Registry(Arc<crate::agent_registry::AgentRegistry>),
 }
 
 impl AgentEventPublisher {
@@ -375,9 +376,14 @@ impl AgentEventPublisher {
         batch_id: String,
         batch_size: u32,
     ) -> Self {
+        let delivery = match surface_activity {
+            Some(surface_activity) => {
+                AgentActivityDelivery::Surface(AgentSurfacePublisher::new(surface_activity))
+            }
+            None => AgentActivityDelivery::Registry(registry),
+        };
         Self {
-            surface_activity: surface_activity.map(AgentSurfacePublisher::new),
-            registry,
+            delivery,
             root_thread_id,
             parent_thread_id,
             attempt_id: format!("attempt-{}", uuid::Uuid::now_v7()),
@@ -391,6 +397,9 @@ impl AgentEventPublisher {
     }
 
     fn publish_spawned(&self, thread_id: &str) -> io::Result<()> {
+        if matches!(&self.delivery, AgentActivityDelivery::Surface(_)) {
+            return Ok(());
+        }
         self.append_registry_event(
             thread_id,
             orca_core::agent_event::AgentEvent::Spawned {
@@ -407,6 +416,9 @@ impl AgentEventPublisher {
         thread_id: &str,
         event: orca_core::agent_event::AgentEvent,
     ) -> io::Result<()> {
+        let AgentActivityDelivery::Registry(registry) = &self.delivery else {
+            return Ok(());
+        };
         let mut sequence = self
             .next_sequence
             .lock()
@@ -422,7 +434,7 @@ impl AgentEventPublisher {
             chrono::Utc::now().timestamp_millis(),
             event,
         );
-        let result = self.registry.append(envelope);
+        let result = registry.append(envelope);
         if result.is_ok() {
             *sequence = sequence.saturating_add(1);
         }
@@ -436,9 +448,9 @@ impl AgentEventPublisher {
         error: Option<String>,
         usage: orca_core::cost_types::UsageTotals,
     ) -> io::Result<()> {
-        self.surface_activity.as_ref().map_or(Ok(()), |publisher| {
-            publisher.completed(status, output.as_deref(), error.as_deref(), usage.clone())
-        })?;
+        if let AgentActivityDelivery::Surface(publisher) = &self.delivery {
+            return publisher.completed(status, output.as_deref(), error.as_deref(), usage);
+        }
         let registry_usage = orca_core::agent_event::AgentUsage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
@@ -463,17 +475,18 @@ impl AgentEventPublisher {
     }
 
     fn publish_surface_bound(&self, thread_id: &str) -> io::Result<()> {
-        self.surface_activity
-            .as_ref()
-            .map_or(Ok(()), |publisher| publisher.child_thread_bound(thread_id))
+        match &self.delivery {
+            AgentActivityDelivery::Surface(publisher) => publisher.child_thread_bound(thread_id),
+            AgentActivityDelivery::Registry(_) => Ok(()),
+        }
     }
 }
 
 impl EventObserver for AgentEventPublisher {
     fn observe(&self, event: &EventEnvelope) -> io::Result<()> {
-        self.surface_activity
-            .as_ref()
-            .map_or(Ok(()), |surface_activity| surface_activity.observe(event))?;
+        if let AgentActivityDelivery::Surface(surface_activity) = &self.delivery {
+            return surface_activity.observe(event);
+        }
         let activity = match event.event_type {
             EventType::TurnStarted => Some(orca_core::agent_event::AgentActivity::Thinking),
             EventType::ToolCallRequested => Some(orca_core::agent_event::AgentActivity::Tool {
@@ -499,9 +512,9 @@ impl EventObserver for AgentEventPublisher {
     }
 }
 
-/// Preserve child output as a canonical registry delta instead of sending it
-/// to an unobservable sink. The event observer remains responsible for
-/// structured lifecycle facts; this writer covers the operation writer bytes.
+/// Preserve standalone child output as a canonical registry delta. A
+/// surface-backed publisher ignores these bytes because structured surface
+/// events and the terminal payload are its sole presentation path.
 struct AgentOutputWriter {
     publisher: Arc<AgentEventPublisher>,
 }
@@ -829,10 +842,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn threaded_sync_surface_publisher_emits_ordered_child_facts_through_parent_ingress() {
-        let ingress = Arc::new(RecordingActivityIngress::default());
-        let activity = AgentSurfaceActivity {
+    fn surface_activity(ingress: Arc<RecordingActivityIngress>) -> AgentSurfaceActivity {
+        AgentSurfaceActivity {
             emitter: Arc::new(ChildAgentActivityEmitter::new(
                 SubagentActivityIdentity {
                     task_id: SurfaceTaskId::try_new("threaded-sync-task").expect("task id"),
@@ -842,14 +853,18 @@ mod tests {
                     turn_id: orca_core::thread_identity::TurnId::new(),
                     owner: ingress.owner(),
                 },
-                Arc::new(RuntimeSubagentActivitySink {
-                    ingress: ingress.clone(),
-                }),
+                Arc::new(RuntimeSubagentActivitySink { ingress }),
             )),
             description: "inspect the threaded child".to_string(),
             batch_id: "batch-threaded".to_string(),
             batch_size: 1,
-        };
+        }
+    }
+
+    #[test]
+    fn threaded_sync_surface_publisher_emits_ordered_child_facts_through_parent_ingress() {
+        let ingress = Arc::new(RecordingActivityIngress::default());
+        let activity = surface_activity(ingress.clone());
         let publisher = AgentSurfacePublisher::new(activity);
 
         publisher
@@ -939,7 +954,54 @@ mod tests {
     }
 
     #[test]
-    fn registry_agent_identity_matches_the_surface_task_identity() {
+    fn surface_backed_publisher_does_not_write_the_agent_registry() {
+        let ingress = Arc::new(RecordingActivityIngress::default());
+        let registry = Arc::new(crate::agent_registry::AgentRegistry::in_memory());
+        let publisher = AgentEventPublisher::new(
+            Some(surface_activity(ingress.clone())),
+            registry.clone(),
+            "root-thread".to_string(),
+            "parent-thread".to_string(),
+            "task-child".to_string(),
+            "inspect".to_string(),
+            "child-thread".to_string(),
+            "batch".to_string(),
+            1,
+        );
+
+        publisher
+            .publish_spawned("child-thread")
+            .expect("surface delivery should accept spawn");
+        publisher
+            .observe(&event(
+                EventType::TurnStarted,
+                serde_json::json!({ "turn": 1 }),
+            ))
+            .expect("surface delivery should publish activity");
+        publisher
+            .publish_surface_terminal(
+                RunStatus::Success,
+                Some("done".to_string()),
+                None,
+                Default::default(),
+            )
+            .expect("surface delivery should publish terminal");
+
+        assert!(registry.snapshot("root-thread").agents.is_empty());
+        let events = ingress.events.lock().expect("recorded events");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].payload,
+            SubagentActivityPayload::PhaseChanged { turn: Some(1), .. }
+        ));
+        assert!(matches!(
+            events[1].payload,
+            SubagentActivityPayload::Completed { .. }
+        ));
+    }
+
+    #[test]
+    fn standalone_publisher_uses_the_agent_registry() {
         let registry = Arc::new(crate::agent_registry::AgentRegistry::in_memory());
         let publisher = AgentEventPublisher::new(
             None,

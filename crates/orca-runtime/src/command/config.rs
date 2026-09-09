@@ -55,7 +55,7 @@ pub fn assemble_run_config(
     request: RunConfigRequest,
     file: FileConfig,
 ) -> Result<RunConfig, String> {
-    let model = ModelSelection::parse(file.model.clone())?;
+    let model = ModelSelection::parse_with_models(file.model.clone(), file.models.clone())?;
     let desktop_notifications = match request.desktop_notifications {
         DesktopNotifications::FromConfig => file.desktop_notifications,
         DesktopNotifications::Disabled => false,
@@ -122,11 +122,13 @@ pub fn assemble_run_config(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use orca_core::approval_types::ApprovalMode;
     use orca_core::config::file::{ConfigOverrides, FileConfig};
     use orca_core::config::{HistoryMode, OutputFormat, ProviderKind};
+    use orca_core::model::ModelDefinition;
 
     use super::*;
 
@@ -137,6 +139,30 @@ mod tests {
         let config = assemble_run_config(request, FileConfig::default()).unwrap();
 
         assert_eq!(config.approval_mode, ApprovalMode::AutoEdit);
+    }
+
+    #[test]
+    fn assembles_per_model_capabilities() {
+        let model = "deepseek-v4.1-flash-expires-on-0910";
+        let file = FileConfig {
+            model: Some(model.to_string()),
+            models: BTreeMap::from([(
+                model.to_string(),
+                ModelDefinition {
+                    supports_images: Some(true),
+                },
+            )]),
+            ..FileConfig::default()
+        };
+
+        let config = assemble_run_config(
+            RunConfigRequest::new("0.3.4", PathBuf::from("/workspace")),
+            file,
+        )
+        .unwrap();
+
+        assert_eq!(config.model.as_deref(), Some(model));
+        assert!(config.model.supports_images(model));
     }
 
     #[test]

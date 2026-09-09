@@ -24,6 +24,7 @@ use std::io;
 
 use crate::attachment_routing::send_attached_event;
 use crate::composer_images::ComposerImageState;
+use crate::hosted_settings::settings_updated_from_surface;
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::protocol::SessionAttachmentId;
 use crate::protocol::{
@@ -298,6 +299,9 @@ fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
             diff: string("diff").map(str::to_string),
             kind: string("kind").map(str::to_string),
         }),
+        // Subagent presentation is reduced once through the runtime surface and
+        // reaches the TUI as SurfaceProjectionSynced. Mapping these raw events
+        // would create a second ordering domain for the same dock state.
         EventType::SubagentStarted | EventType::SubagentProgress | EventType::SubagentCompleted => {
             None
         }
@@ -414,6 +418,14 @@ pub(crate) fn announce_runtime_ready(
     let actions = TuiSurfaceActions::new(thread.typed_surface());
     match actions.read_snapshot() {
         Ok(snapshot) => {
+            match settings_updated_from_surface(&snapshot.settings.effective) {
+                Ok(event) => {
+                    let _ = event_tx.send(event);
+                }
+                Err(error) => {
+                    let _ = event_tx.send(TuiEvent::OperationRejected(error));
+                }
+            }
             let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(
                 SurfaceProjectionState::from_surface_snapshot(&snapshot),
             )));

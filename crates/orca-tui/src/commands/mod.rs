@@ -340,7 +340,7 @@ fn parse_goal(args: String) -> Option<GoalSlashCommand> {
 }
 
 pub fn available_models() -> &'static [&'static str] {
-    orca_core::model::allowed_models()
+    orca_core::model::preset_models()
 }
 
 pub fn validate_model(model: &str) -> Result<(), String> {
@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_supported_models() {
+    fn exposes_presets_and_accepts_custom_models() {
         assert_eq!(
             available_models(),
             &[
@@ -722,8 +722,10 @@ mod tests {
         assert!(validate_model("deepseek-v4-flash").is_ok());
         assert!(validate_model("deepseek-v4-flash-vision-exp").is_ok());
         assert!(validate_model("deepseek-v4-pro").is_ok());
-        assert!(validate_model("deepseek-reasoner").is_err());
-        assert!(validate_model("bogus-model").is_err());
+        assert!(validate_model("deepseek-v4.1-flash-expires-on-0910").is_ok());
+        assert!(validate_model("vendor/private-model:2026-09").is_ok());
+        assert!(validate_model("").is_err());
+        assert!(validate_model(" model").is_err());
     }
 
     #[test]

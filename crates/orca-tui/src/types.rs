@@ -407,6 +407,7 @@ pub struct AppState {
     /// session. Checked when a new approval arrives so the dialog is skipped.
     pub approval_allowlist: std::collections::HashSet<String>,
     pub setup_step: u8,
+    pub setup_selection: u8,
     /// Runtime-owned first-run disclosure state. The TUI may render and
     /// acknowledge it, but never mutates folder trust as a side effect.
     pub(crate) first_run: Option<FirstRunState>,
@@ -440,7 +441,10 @@ pub struct AppState {
     /// visible. Child projections are merged into this list for the agent
     /// dock instead of replacing sibling activity.
     pub(crate) background_workflow_tasks: Vec<BackgroundTaskSummary>,
-    pub(crate) agent_registry: orca_core::agent_event::AgentRegistrySnapshot,
+    /// Latest task snapshot from the focused child surface. This remains
+    /// separate from the parent baseline so either attachment can refresh
+    /// without resurrecting stale tasks from the other.
+    pub(crate) focused_workflow_tasks: Vec<BackgroundTaskSummary>,
     pub recovery_prompt_visible: bool,
     pub recovery_prompt_selected: usize,
     pub panel_mode: PanelMode,
@@ -643,6 +647,7 @@ impl AppState {
             interaction: InteractionState::default(),
             approval_allowlist: std::collections::HashSet::new(),
             setup_step: 0,
+            setup_selection: 0,
             first_run: None,
             first_run_error: None,
             show_shortcuts: false,
@@ -671,8 +676,8 @@ impl AppState {
             surface_operation: SurfaceOperationProjectionState::default(),
             surface_workflow_tasks: SurfaceWorkflowTaskProjectionState::default(),
             background_workflow_tasks: Vec::new(),
+            focused_workflow_tasks: Vec::new(),
             conversation_target: ConversationTarget::Main,
-            agent_registry: orca_core::agent_event::AgentRegistrySnapshot::default(),
             recovery_prompt_visible: false,
             recovery_prompt_selected: 0,
             panel_mode: PanelMode::Conversation,
@@ -995,7 +1000,7 @@ impl AppState {
         self.surface_operation.reset();
         self.surface_workflow_tasks.reset();
         self.background_workflow_tasks.clear();
-        self.agent_registry = orca_core::agent_event::AgentRegistrySnapshot::default();
+        self.focused_workflow_tasks.clear();
         self.recovery_prompt_visible = false;
         self.recovery_prompt_selected = 0;
         self.surface_metrics.reset();

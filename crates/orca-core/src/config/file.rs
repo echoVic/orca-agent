@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use crate::config::{
     MAX_WORKFLOW_AGENT_RETRIES, ModelRuntimeConfig, PermissionProfileConfig, ReasoningEffort,
     ThemeName, ToolConfig, WorkflowConfig, WorkflowTeamConfig,
 };
+use crate::model::ModelDefinition;
 use crate::subagent_config::SubagentConfig;
 
 pub const ORCA_HOME_ENV: &str = "ORCA_HOME";
@@ -24,6 +25,8 @@ pub const AUTH_FILE: &str = "auth.json";
 #[serde(from = "RawFileConfig")]
 pub struct FileConfig {
     pub model: Option<String>,
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelDefinition>,
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -65,6 +68,8 @@ pub struct FileConfig {
 #[derive(Clone, Debug, Deserialize)]
 struct RawFileConfig {
     pub model: Option<String>,
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelDefinition>,
     pub mode: Option<ApprovalMode>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -114,6 +119,7 @@ impl Default for FileConfig {
     fn default() -> Self {
         Self {
             model: None,
+            models: BTreeMap::new(),
             mode: None,
             api_key: None,
             base_url: None,
@@ -149,6 +155,7 @@ impl From<RawFileConfig> for FileConfig {
 
         Self {
             model: raw.model,
+            models: raw.models,
             mode: raw.mode,
             api_key: raw.api_key,
             base_url: raw.base_url,
@@ -1006,6 +1013,24 @@ soft_compact_token_limit = 64000
         assert_eq!(config.model_runtime.context_window, Some(128_000));
         assert_eq!(config.model_runtime.auto_compact_token_limit, Some(96_000));
         assert_eq!(config.model_runtime.soft_compact_token_limit, Some(64_000));
+    }
+
+    #[test]
+    fn parse_per_model_capabilities() {
+        let toml = r#"
+model = "deepseek-v4.1-flash-expires-on-0910"
+
+[models."deepseek-v4.1-flash-expires-on-0910"]
+supports_images = true
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config
+                .models
+                .get("deepseek-v4.1-flash-expires-on-0910")
+                .and_then(|model| model.supports_images),
+            Some(true)
+        );
     }
 
     #[test]

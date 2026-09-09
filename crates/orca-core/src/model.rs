@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::subagent_types::SubagentType;
@@ -7,9 +9,16 @@ pub const VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
 pub const PRO_MODEL: &str = "deepseek-v4-pro";
 pub const AUTO_MODEL: &str = "auto";
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelDefinition {
+    #[serde(default)]
+    pub supports_images: Option<bool>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelSelection {
     value: Option<String>,
+    models: BTreeMap<String, ModelDefinition>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,14 +59,41 @@ pub struct ModelRouteContext<'a> {
 
 impl ModelSelection {
     pub fn parse(value: Option<String>) -> Result<Self, String> {
+        Self::parse_with_models(value, BTreeMap::new())
+    }
+
+    pub fn parse_with_models(
+        value: Option<String>,
+        models: BTreeMap<String, ModelDefinition>,
+    ) -> Result<Self, String> {
         if let Some(model) = value.as_deref() {
             validate_model(model)?;
         }
-        Ok(Self { value })
+        for model in models.keys() {
+            validate_model(model)?;
+        }
+        Ok(Self { value, models })
     }
 
     pub fn from_unchecked(value: Option<String>) -> Self {
-        Self { value }
+        Self {
+            value,
+            models: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_value(&self, value: Option<String>) -> Result<Self, String> {
+        if let Some(model) = value.as_deref() {
+            validate_model(model)?;
+        }
+        Ok(self.with_value_unchecked(value))
+    }
+
+    pub fn with_value_unchecked(&self, value: Option<String>) -> Self {
+        Self {
+            value,
+            models: self.models.clone(),
+        }
     }
 
     pub fn as_option(&self) -> Option<String> {
@@ -82,8 +118,16 @@ impl ModelSelection {
     pub fn with_subagent_override(&self, model: Option<String>) -> Self {
         match model.as_deref() {
             Some(AUTO_MODEL) | None => self.clone(),
-            Some(_) => Self { value: model },
+            Some(_) => self.with_value_unchecked(model),
         }
+    }
+
+    pub fn supports_images(&self, model: &str) -> bool {
+        self.models
+            .get(model)
+            .and_then(|definition| definition.supports_images)
+            .or_else(|| builtin_model_definition(model).supports_images)
+            .unwrap_or(false)
     }
 
     pub fn route(&self, context: ModelRouteContext<'_>) -> ModelRouteDecision {
@@ -94,15 +138,13 @@ impl ModelSelection {
             )
         } else {
             match self.value.as_deref() {
-                Some(FLASH_MODEL) => (FLASH_MODEL.to_string(), ModelRouteReason::Explicit),
-                Some(PRO_MODEL) => (PRO_MODEL.to_string(), ModelRouteReason::Explicit),
-                Some(VISION_MODEL) => (VISION_MODEL.to_string(), ModelRouteReason::Explicit),
-                _ => (PRO_MODEL.to_string(), ModelRouteReason::DefaultPro),
+                Some(AUTO_MODEL) | None => (PRO_MODEL.to_string(), ModelRouteReason::DefaultPro),
+                Some(model) => (model.to_string(), ModelRouteReason::Explicit),
             }
         };
         let image_route = if !context.has_images {
             ImageRouteDecision::None
-        } else if actual_model == VISION_MODEL {
+        } else if self.supports_images(&actual_model) {
             ImageRouteDecision::Direct
         } else {
             ImageRouteDecision::DescribeThenContinue
@@ -116,6 +158,15 @@ impl ModelSelection {
     }
 }
 
+pub fn builtin_model_definition(model: &str) -> ModelDefinition {
+    let supports_images = match model {
+        VISION_MODEL => Some(true),
+        AUTO_MODEL | FLASH_MODEL | PRO_MODEL => Some(false),
+        _ => None,
+    };
+    ModelDefinition { supports_images }
+}
+
 /// Model used for auxiliary/background tasks (compaction, memory extraction).
 /// Always returns the cheapest model to minimize cost on utility work.
 pub fn auxiliary_model() -> &'static str {
@@ -123,25 +174,28 @@ pub fn auxiliary_model() -> &'static str {
 }
 
 pub fn validate_model(model: &str) -> Result<(), String> {
-    match model {
-        AUTO_MODEL | FLASH_MODEL | VISION_MODEL | PRO_MODEL => Ok(()),
-        other => Err(format!(
-            "unsupported model '{other}'. Allowed models: auto, {FLASH_MODEL}, {VISION_MODEL}, {PRO_MODEL}"
-        )),
+    if model.is_empty() {
+        return Err("model must not be empty".to_string());
     }
+    if model.trim() != model {
+        return Err("model must not have leading or trailing whitespace".to_string());
+    }
+    if model.chars().any(char::is_control) {
+        return Err("model must not contain control characters".to_string());
+    }
+    Ok(())
 }
 
-pub fn allowed_models() -> &'static [&'static str] {
+/// Stable first-party presets shown by interactive model selectors.
+///
+/// Other provider model IDs remain valid and can be supplied through config,
+/// environment variables, CLI flags, or slash commands.
+pub fn preset_models() -> &'static [&'static str] {
     &[AUTO_MODEL, FLASH_MODEL, VISION_MODEL, PRO_MODEL]
 }
 
-pub fn max_context_tokens(model: Option<&str>) -> usize {
-    match model {
-        Some(FLASH_MODEL) | Some(VISION_MODEL) | Some(PRO_MODEL) | Some(AUTO_MODEL) | None => {
-            1_000_000
-        }
-        Some(_) => 1_000_000,
-    }
+pub fn max_context_tokens(_model: Option<&str>) -> usize {
+    1_000_000
 }
 
 #[cfg(test)]
@@ -202,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn images_route_directly_only_for_the_vision_model() {
+    fn images_use_builtin_model_capabilities_by_default() {
         let mut ctx = context();
         ctx.has_images = true;
 
@@ -222,6 +276,59 @@ mod tests {
     }
 
     #[test]
+    fn configured_model_capabilities_control_image_routing() {
+        let custom_model = "deepseek-v4.1-flash-expires-on-0910";
+        let mut models = BTreeMap::new();
+        models.insert(
+            custom_model.to_string(),
+            ModelDefinition {
+                supports_images: Some(true),
+            },
+        );
+        models.insert(
+            VISION_MODEL.to_string(),
+            ModelDefinition {
+                supports_images: Some(false),
+            },
+        );
+        let mut ctx = context();
+        ctx.has_images = true;
+
+        let custom =
+            ModelSelection::parse_with_models(Some(custom_model.to_string()), models.clone())
+                .unwrap()
+                .route(ctx.clone());
+        assert_eq!(custom.image_route, ImageRouteDecision::Direct);
+
+        let overridden_builtin =
+            ModelSelection::parse_with_models(Some(VISION_MODEL.to_string()), models)
+                .unwrap()
+                .route(ctx);
+        assert_eq!(
+            overridden_builtin.image_route,
+            ImageRouteDecision::DescribeThenContinue
+        );
+    }
+
+    #[test]
+    fn changing_selection_preserves_model_definitions() {
+        let custom_model = "vendor/multimodal";
+        let mut models = BTreeMap::new();
+        models.insert(
+            custom_model.to_string(),
+            ModelDefinition {
+                supports_images: Some(true),
+            },
+        );
+        let selection = ModelSelection::parse_with_models(None, models)
+            .unwrap()
+            .with_value(Some(custom_model.to_string()))
+            .unwrap();
+
+        assert!(selection.supports_images(custom_model));
+    }
+
+    #[test]
     fn auto_subagent_override_preserves_parent_router() {
         let selection = ModelSelection::parse(None).unwrap();
         assert_eq!(
@@ -238,12 +345,30 @@ mod tests {
     }
 
     #[test]
-    fn only_active_models_are_supported() {
+    fn preset_models_are_stable() {
         assert_eq!(
-            allowed_models(),
+            preset_models(),
             &[AUTO_MODEL, FLASH_MODEL, VISION_MODEL, PRO_MODEL]
         );
-        assert!(validate_model("deepseek-reasoner").is_err());
+    }
+
+    #[test]
+    fn explicit_custom_model_is_not_rerouted() {
+        let custom_model = "deepseek-v4.1-flash-expires-on-0910";
+        let selection = ModelSelection::parse(Some(custom_model.to_string())).unwrap();
+        let decision = selection.route(context());
+        assert_eq!(decision.actual_model, custom_model);
+        assert_eq!(decision.reason, ModelRouteReason::Explicit);
+    }
+
+    #[test]
+    fn model_validation_accepts_provider_ids_and_rejects_malformed_values() {
+        assert!(validate_model("deepseek-reasoner").is_ok());
+        assert!(validate_model("vendor/private-model:2026-09").is_ok());
+        assert!(validate_model("").is_err());
+        assert!(validate_model(" model").is_err());
+        assert!(validate_model("model ").is_err());
+        assert!(validate_model("model\nname").is_err());
     }
 
     #[test]
@@ -252,6 +377,7 @@ mod tests {
         assert_eq!(max_context_tokens(Some(VISION_MODEL)), 1_000_000);
         assert_eq!(max_context_tokens(Some(PRO_MODEL)), 1_000_000);
         assert_eq!(max_context_tokens(Some(AUTO_MODEL)), 1_000_000);
+        assert_eq!(max_context_tokens(Some("vendor/private-model")), 1_000_000);
         assert_eq!(max_context_tokens(None), 1_000_000);
     }
 }

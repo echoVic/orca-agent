@@ -58,12 +58,6 @@ pub(crate) fn handle_agent_workspace_key(
                 }
                 Some(AgentWorkspaceRow::BackgroundTask { .. })
                 | Some(AgentWorkspaceRow::WorkflowAgent { .. }) => None,
-                Some(AgentWorkspaceRow::RegistryAgent { agent }) => {
-                    Some(UserAction::FocusChildThread {
-                        task_id: agent.agent_id.clone(),
-                        expected_revision: state.agent_registry.revision,
-                    })
-                }
                 None => None,
             };
             if let Some(action) = action {
@@ -99,8 +93,7 @@ pub(crate) fn handle_agent_workspace_key(
                 {
                     Some(task.id.clone())
                 }
-                Some(AgentWorkspaceRow::RegistryAgent { .. })
-                | Some(AgentWorkspaceRow::WorkflowAgent { .. })
+                Some(AgentWorkspaceRow::WorkflowAgent { .. })
                 | Some(AgentWorkspaceRow::Subagent { .. })
                 | Some(AgentWorkspaceRow::BackgroundTask { .. }) => None,
                 None => None,
@@ -127,8 +120,7 @@ pub(crate) fn handle_agent_workspace_key(
                         }
                     })
                 }
-                AgentWorkspaceRow::RegistryAgent { .. }
-                | AgentWorkspaceRow::BackgroundTask { .. }
+                AgentWorkspaceRow::BackgroundTask { .. }
                 | AgentWorkspaceRow::WorkflowAgent { .. }
                 | AgentWorkspaceRow::Subagent { .. } => None,
             });

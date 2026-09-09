@@ -2504,6 +2504,201 @@ impl ThreadActor {
         Ok(receipt)
     }
 
+    pub(super) fn commit_surface_workflow_progress(
+        &mut self,
+        fence: surface::SurfaceOperationFence,
+        progress: &surface::RuntimeWorkflowProgress,
+    ) -> io::Result<()> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.task_id == progress.task_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workflow task missing"))?;
+        let workflow = snapshot
+            .workflows
+            .iter()
+            .find(|workflow| workflow.workflow_run_id == progress.workflow_run_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workflow missing"))?;
+        if task.workflow_run_id.as_ref() != Some(&progress.workflow_run_id)
+            || workflow.task_id != progress.task_id
+            || workflow.parent.as_ref() != Some(&fence)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workflow progress identity is stale",
+            ));
+        }
+        if !matches!(
+            workflow.status,
+            surface::SurfaceWorkflowStatus::Running | surface::SurfaceWorkflowStatus::AsyncLaunched
+        ) {
+            return Ok(());
+        }
+
+        let occurred_at = surface::UnixMillis::new(chrono::Utc::now().timestamp_millis());
+        let mut phases = workflow.phases.clone();
+        for phase in &progress.phases {
+            let status = match phase.status {
+                orca_core::workflow_types::WorkflowRunStatus::Queued => {
+                    surface::SurfaceWorkflowStatus::Queued
+                }
+                orca_core::workflow_types::WorkflowRunStatus::Running => {
+                    surface::SurfaceWorkflowStatus::Running
+                }
+                orca_core::workflow_types::WorkflowRunStatus::Paused => {
+                    surface::SurfaceWorkflowStatus::Paused
+                }
+                orca_core::workflow_types::WorkflowRunStatus::Stopping => {
+                    surface::SurfaceWorkflowStatus::Stopping
+                }
+                orca_core::workflow_types::WorkflowRunStatus::Stopped => {
+                    surface::SurfaceWorkflowStatus::Stopped
+                }
+                orca_core::workflow_types::WorkflowRunStatus::Completed => {
+                    surface::SurfaceWorkflowStatus::Completed
+                }
+                orca_core::workflow_types::WorkflowRunStatus::Failed => {
+                    surface::SurfaceWorkflowStatus::Failed
+                }
+                orca_core::workflow_types::WorkflowRunStatus::Cancelled => {
+                    surface::SurfaceWorkflowStatus::Cancelled
+                }
+                orca_core::workflow_types::WorkflowRunStatus::AsyncLaunched => {
+                    surface::SurfaceWorkflowStatus::AsyncLaunched
+                }
+            };
+            let existing = workflow
+                .phases
+                .iter()
+                .find(|candidate| candidate.name.as_str() == phase.name);
+            let started_at = existing.and_then(|phase| phase.started_at).or_else(|| {
+                (status != surface::SurfaceWorkflowStatus::Queued).then_some(occurred_at)
+            });
+            let completed_at = existing.and_then(|phase| phase.completed_at).or_else(|| {
+                matches!(
+                    status,
+                    surface::SurfaceWorkflowStatus::Stopped
+                        | surface::SurfaceWorkflowStatus::Completed
+                        | surface::SurfaceWorkflowStatus::Failed
+                        | surface::SurfaceWorkflowStatus::Cancelled
+                )
+                .then_some(occurred_at)
+            });
+            let projected = surface::SurfaceWorkflowPhase {
+                name: surface::NonEmptyText::try_new(phase.name.clone())
+                    .map_err(|_| io::Error::other("workflow phase name is empty"))?,
+                status,
+                started_at,
+                completed_at,
+                agent_count: phase.agent_count,
+                summary: phase.fallback.clone().map(surface::DisplayText::new),
+                error: phase.error.clone().map(surface::DisplayText::new),
+            };
+            if let Some(existing) = phases
+                .iter_mut()
+                .find(|candidate| candidate.name == projected.name)
+            {
+                *existing = projected;
+            } else {
+                phases.push(projected);
+            }
+        }
+        let updated_agents = progress
+            .agents
+            .iter()
+            .map(|agent| {
+                let phase = progress
+                    .phases
+                    .iter()
+                    .find(|phase| agent.phase.as_deref() == Some(phase.name.as_str()))
+                    .or_else(|| {
+                        progress.phases.iter().find(|phase| {
+                            agent.call_path == phase.name
+                                || agent.call_path.starts_with(&format!("{}.", phase.name))
+                                || agent.call_path.starts_with(&format!("{}/", phase.name))
+                        })
+                    })
+                    .or_else(|| {
+                        progress.phases.iter().find(|phase| {
+                            phase.status == orca_core::workflow_types::WorkflowRunStatus::Running
+                        })
+                    })
+                    .or_else(|| progress.phases.first())
+                    .map(|phase| phase.name.clone())
+                    .unwrap_or_else(|| "workflow".to_string());
+                Ok(surface::SurfaceWorkflowAgent {
+                    agent_id: surface::SurfaceSubagentId::try_new(agent.call_id.clone())
+                        .map_err(|_| io::Error::other("workflow agent id is empty"))?,
+                    phase: surface::NonEmptyText::try_new(phase)
+                        .map_err(|_| io::Error::other("workflow agent phase is empty"))?,
+                    status: match agent.status {
+                        orca_core::workflow_types::WorkflowAgentStatus::Pending => {
+                            surface::SurfaceWorkflowAgentStatus::Pending
+                        }
+                        orca_core::workflow_types::WorkflowAgentStatus::Running => {
+                            surface::SurfaceWorkflowAgentStatus::Running
+                        }
+                        orca_core::workflow_types::WorkflowAgentStatus::Cached => {
+                            surface::SurfaceWorkflowAgentStatus::Cached
+                        }
+                        orca_core::workflow_types::WorkflowAgentStatus::Completed => {
+                            surface::SurfaceWorkflowAgentStatus::Completed
+                        }
+                        orca_core::workflow_types::WorkflowAgentStatus::Failed => {
+                            surface::SurfaceWorkflowAgentStatus::Failed
+                        }
+                        orca_core::workflow_types::WorkflowAgentStatus::Cancelled => {
+                            surface::SurfaceWorkflowAgentStatus::Cancelled
+                        }
+                    },
+                    attempt: agent.attempt,
+                    output: agent.output.clone().map(surface::DisplayText::new),
+                    error: agent.error.clone().map(surface::DisplayText::new),
+                    usage: agent.usage.map(surface_usage_totals),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut agents = workflow.agents.clone();
+        for agent in updated_agents {
+            if let Some(existing) = agents.iter_mut().find(|existing| {
+                existing.agent_id == agent.agent_id && existing.attempt == agent.attempt
+            }) {
+                *existing = agent;
+            } else {
+                agents.push(agent);
+            }
+        }
+        let next_revision = surface::WorkflowRevision::try_new(
+            workflow
+                .revision
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("workflow revision exhausted"))?,
+        )
+        .map_err(|_| io::Error::other("workflow revision is invalid"))?;
+        let batch = self.surface_event_batch_with_commit_id(
+            vec![(
+                surface::SurfaceScope::Thread,
+                surface::SurfaceEvent::Workflow(surface::WorkflowPatch::ProgressUpdated {
+                    fence: surface::SurfaceWorkflowFence {
+                        workflow_run_id: workflow.workflow_run_id.clone(),
+                        workflow_revision: workflow.revision,
+                        parent: workflow.parent.clone(),
+                    },
+                    next_revision,
+                    phases,
+                    agents,
+                }),
+            )],
+            None,
+        );
+        self.commit_surface_actor_batch_with_retry(&batch)
+            .map_err(|error| {
+                io::Error::other(format!("failed to commit workflow progress: {error:?}"))
+            })
+    }
+
     pub(super) fn commit_surface_workflow_finished(
         &mut self,
         active: &ActiveOperation,
@@ -2553,7 +2748,6 @@ impl ThreadActor {
             )
             || finished.receipt.workflow.parent.as_ref() != Some(&fence)
             || workflow.parent.as_ref() != Some(&fence)
-            || workflow.revision != finished.receipt.workflow.workflow_revision
             || task.revision != finished.receipt.task.task_revision
             || task.parent_operation.as_ref() != Some(&fence.operation_id)
             || task.workflow_run_id.as_ref() != Some(&workflow.workflow_run_id)
@@ -2589,7 +2783,11 @@ impl ThreadActor {
                 .ok_or_else(|| io::Error::other("workflow result revision exhausted"))?,
         )
         .map_err(|_| io::Error::other("workflow result revision is invalid"))?;
-        let workflow_fence = finished.receipt.workflow.clone();
+        let workflow_fence = surface::SurfaceWorkflowFence {
+            workflow_run_id: workflow.workflow_run_id.clone(),
+            workflow_revision: workflow.revision,
+            parent: workflow.parent.clone(),
+        };
         let (task_status, task_result, task_error, workflow_terminal, result_status, content) =
             match &finished.outcome {
                 surface::RuntimeWorkflowOutcome::Completed { status_line } => (

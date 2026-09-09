@@ -2749,11 +2749,27 @@ impl ThreadActor {
             revision: surface::WorkflowRevision::try_new(1).expect("one is valid"),
             name: workflow_name,
             status: surface::SurfaceWorkflowStatus::Running,
-            phases: Vec::new(),
+            phases: prepared
+                .phases
+                .iter()
+                .cloned()
+                .map(|name| {
+                    Ok(surface::SurfaceWorkflowPhase {
+                        name: surface::NonEmptyText::try_new(name)
+                            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                        status: surface::SurfaceWorkflowStatus::Queued,
+                        started_at: None,
+                        completed_at: None,
+                        agent_count: 0,
+                        summary: None,
+                        error: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, surface::SurfaceClientCommandError>>()?,
             agents: Vec::new(),
             result: None,
             error: None,
-            parent: None,
+            parent: Some(generation_fence.clone()),
         };
         let final_workflow = surface::SurfaceWorkflow {
             revision: surface::WorkflowRevision::try_new(2).expect("two is valid"),
@@ -2818,7 +2834,7 @@ impl ThreadActor {
                         workflow_run_id: workflow_run_id.clone(),
                         workflow_revision: surface::WorkflowRevision::try_new(1)
                             .expect("one is valid"),
-                        parent: None,
+                        parent: Some(generation_fence.clone()),
                     },
                     next_revision: surface::WorkflowRevision::try_new(2).expect("two is valid"),
                 }),
@@ -2828,7 +2844,7 @@ impl ThreadActor {
                     fence: generation_fence.clone(),
                 },
                 surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationTransferred {
-                    fence: generation_fence,
+                    fence: generation_fence.clone(),
                     background_fence: background_fence.clone(),
                     task_id: Some(task_id.clone()),
                 }),
@@ -2869,6 +2885,11 @@ impl ThreadActor {
             tool_use_id: surface_tool_use_id,
         };
         let returned_workflow = final_workflow;
+        let runner =
+            runner.with_progress_ingress(Some(Arc::new(RuntimeSurfaceWorkflowLifecycleIngress {
+                command_tx: self.handle.command_tx.clone(),
+                fence: generation_fence,
+            })));
         match runner.activate_background(prepared.clone()) {
             Ok(launch) => {
                 let events = self
@@ -3105,16 +3126,11 @@ impl ThreadActor {
                 },
             }));
         }
-        let recovered = self
+        let launch_batch = self
             .resident_surface
             .coordinator
             .ledger()
-            .recover_batches()
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let launch_batch = recovered
-            .committed
-            .iter()
-            .find(|batch| {
+            .find_committed_batch(|batch| {
                 batch.events.as_slice().iter().any(|envelope| {
                     matches!(
                         &envelope.event,
@@ -3124,7 +3140,7 @@ impl ThreadActor {
                     )
                 })
             })
-            .cloned()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         if launch_batch.events.as_slice().len() != 7 {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -3228,16 +3244,11 @@ impl ThreadActor {
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
-        let recovered = self
+        let admitted_batch = self
             .resident_surface
             .coordinator
             .ledger()
-            .recover_batches()
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let admitted_batch = recovered
-            .committed
-            .iter()
-            .find(|batch| {
+            .find_committed_batch(|batch| {
                 batch.events.as_slice().iter().any(|envelope| {
                     matches!(
                         &envelope.event,
@@ -3247,7 +3258,7 @@ impl ThreadActor {
                     )
                 })
             })
-            .cloned()
+            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         self.resident_surface
             .interactions

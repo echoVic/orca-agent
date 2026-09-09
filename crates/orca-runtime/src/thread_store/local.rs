@@ -14,11 +14,13 @@ use orca_core::tool_types::truncate_output;
 use super::LiveThread;
 #[cfg(not(test))]
 use super::ORCA_HOME_ENV;
+use super::assets;
 use super::pagination::{page_thread_items, page_thread_turns, page_vec};
 use super::projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     is_surface_coordinator_record, normalized_stored_messages, stored_message_to_thread_json,
 };
+use super::reader::iter_records;
 use super::session_index::{self, SessionSummaryPage};
 use super::types::{
     SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection,
@@ -29,8 +31,8 @@ use super::types::{
 };
 use super::writer::{
     acquire_file_lock, conversation_record_from_semantic_event, open_regular_history_file,
-    read_history_lines, read_records, read_session_meta, read_transcript, read_transcript_until,
-    rewrite_records_unlocked, scan_session, session_health_error, write_durable_record,
+    read_history_lines, read_session_meta, read_transcript, read_transcript_until,
+    rewrite_records_unlocked, scan_session, write_durable_record,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -155,8 +157,8 @@ impl JsonlThreadStore {
             return Ok(None);
         }
         let mut found = None;
-        for record in read_records(path)? {
-            match record {
+        for record in iter_records(path)? {
+            match record? {
                 SessionRecord::SurfaceShutdownBarrier {
                     barrier_id,
                     plan_digest,
@@ -179,11 +181,11 @@ impl JsonlThreadStore {
             return Ok(None);
         }
         let mut found = None;
-        for record in read_records(path)? {
+        for record in iter_records(path)? {
             if let SessionRecord::SurfaceFinalizeIntent {
                 finalize_intent_id,
                 expected_settlements,
-            } = record
+            } = record?
                 && &finalize_intent_id == requested_id
             {
                 found = Some(expected_settlements);
@@ -192,6 +194,7 @@ impl JsonlThreadStore {
         Ok(found)
     }
 
+    #[cfg(test)]
     pub(crate) fn load_surface_commit_batches(
         &self,
         path: &Path,
@@ -201,8 +204,8 @@ impl JsonlThreadStore {
         }
         let mut batches = Vec::<(bool, crate::runtime_surface::StoredSurfaceCommitBatchV1)>::new();
         let mut batch_indices = HashMap::<String, usize>::new();
-        for record in read_records(path)? {
-            match record {
+        for record in iter_records(path)? {
+            match record? {
                 SessionRecord::SurfaceCommitPrepared {
                     commit_id,
                     batch: Some(batch),
@@ -284,6 +287,31 @@ impl JsonlThreadStore {
     pub fn compress_session(&self, selector: &str) -> io::Result<PathBuf> {
         compress_session(selector)
     }
+
+    /// Export portable JSONL with image bytes included. Raw transcript copies
+    /// must instead travel with their sibling `.jsonl.assets` directory.
+    pub fn export_session(&self, selector: &str, target: &Path) -> io::Result<()> {
+        let path = resolve_session_path(selector, true)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session not found"))?;
+        if path == target {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "export target must differ from source",
+            ));
+        }
+        let _lock = acquire_file_lock(&path)?;
+        orca_platform::fs::atomic_write_with(
+            target,
+            orca_platform::fs::AtomicWritePolicy::NoFollow,
+            |output| {
+                for record in iter_records(&path)? {
+                    super::writer::write_record_line(&mut *output, &record?)?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(io::Error::other)
+    }
 }
 
 pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
@@ -301,7 +329,10 @@ pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
             format!("no saved session matches '{selector}'"),
         )
     })?;
+    let _owner = super::retention::acquire_idle_owner(&path)?;
+    let _lock = acquire_file_lock(&path)?;
     fs::remove_file(&path)?;
+    assets::remove_directory(&path)?;
     #[cfg(not(test))]
     let _ = session_index::remove_path(&path);
     Ok(path)
@@ -327,7 +358,28 @@ pub fn archive_session(selector: &str) -> io::Result<PathBuf> {
     if let Some(parent) = archived_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::rename(&path, &archived_path)?;
+    let _owner = super::retention::acquire_idle_owner(&path)?;
+    let _lock = acquire_file_lock(&path)?;
+    if fs::symlink_metadata(&archived_path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "archive already exists",
+        ));
+    }
+    let asset_dir_existed = fs::symlink_metadata(assets::directory(&archived_path)).is_ok();
+    let publish = assets::copy_directory(&path, &archived_path)
+        .and_then(|()| fs::rename(&path, &archived_path));
+    if let Err(error) = publish {
+        if !asset_dir_existed {
+            assets::remove_directory(&archived_path).map_err(|cleanup| {
+                io::Error::other(format!(
+                    "archive failed: {error}; asset cleanup failed: {cleanup}"
+                ))
+            })?;
+        }
+        return Err(error);
+    }
+    assets::remove_directory(&path)?;
     #[cfg(not(test))]
     let _ = session_index::move_path(&path, &archived_path, true);
     Ok(archived_path)
@@ -361,16 +413,20 @@ pub fn compress_session(selector: &str) -> io::Result<PathBuf> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         return Ok(path);
     }
-    let scan = scan_session(&path)?;
-    if scan.health != StoredSessionHealth::Healthy {
-        return Err(session_health_error(
+    let compressed_path = path.with_extension("jsonl.zst");
+    let _owner = super::retention::acquire_idle_owner(&path)?;
+    let _lock = acquire_file_lock(&path)?;
+    let mut records = iter_records(&path)?;
+    for record in records.by_ref() {
+        record?;
+    }
+    if records.health != StoredSessionHealth::Healthy {
+        return Err(super::writer::session_health_error(
             &path,
-            scan.health,
-            scan.health_issue.as_ref(),
+            records.health,
+            records.issue.as_ref(),
         ));
     }
-    let compressed_path = path.with_extension("jsonl.zst");
-    let _lock = acquire_file_lock(&path)?;
     let result = (|| {
         let input = open_regular_history_file(&path)?;
         let output = File::create(&compressed_path)?;
@@ -398,10 +454,11 @@ pub(crate) fn load_thread_records(
             format!("no saved session matches '{thread_id}'"),
         )
     })?;
-    let records = read_records(&path)?;
+    let records = iter_records(&path)?;
     let mut meta = None;
     let mut conversation_records = Vec::new();
     for record in records {
+        let record = record?;
         if is_surface_coordinator_record(&record) {
             continue;
         }
@@ -828,10 +885,15 @@ fn push_search_hit(
     line: String,
     hits: &mut Vec<SearchHit>,
 ) {
-    if let Ok(meta) = read_session_meta(path) {
+    // A bounded index scan may be incomplete without making its prefix
+    // unusable for search or turning a large transcript into a corrupt one.
+    if let Ok(summary) = summarize_session_with_archive_flag(path, archived) {
+        if summary.health == StoredSessionHealth::Quarantined {
+            return;
+        }
         hits.push(SearchHit {
-            session_id: meta.session_id,
-            title: meta.title,
+            session_id: summary.session_id,
+            title: summary.title,
             archived,
             path: path.to_path_buf(),
             line_number,
@@ -911,7 +973,12 @@ pub(crate) fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) 
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
-        if file_type.is_dir() {
+        if file_type.is_dir()
+            && !entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".jsonl.assets")
+        {
             collect_session_files(&path, on_file)?;
         } else if file_type.is_file() && is_history_file(&path) {
             on_file(&path);
@@ -999,6 +1066,20 @@ impl ThreadStore for JsonlThreadStore {
         thread_id: &str,
         patch: ThreadMetadataPatch,
     ) -> io::Result<SessionSummary> {
+        if patch.title.is_none()
+            && patch.approval_mode.is_none()
+            && patch.active_permission_profile.is_none()
+            && patch.runtime_workspace_roots.is_none()
+            && patch.permission_rules.is_none()
+            && patch.additional_working_directories.is_none()
+            && patch.metadata_writable_directories.is_none()
+            && patch.network_domain_permissions.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "thread metadata patch did not include any supported fields",
+            ));
+        }
         let path = find_session_path(thread_id, true)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1006,52 +1087,54 @@ impl ThreadStore for JsonlThreadStore {
             )
         })?;
         let _lock = acquire_file_lock(&path)?;
-        let mut records = read_records(&path)?;
+        let records = iter_records(&path)?;
         let mut patched = false;
-        for record in &mut records {
-            if let SessionRecord::Meta(meta) = record {
-                if let Some(title) = patch.title {
-                    meta.title = title;
+        let records = records.map(|record| {
+            let mut record = record?;
+            if !patched && let SessionRecord::Meta(meta) = &mut record {
+                if let Some(title) = &patch.title {
+                    meta.title = title.clone();
                     patched = true;
                 }
                 if let Some(approval_mode) = patch.approval_mode {
                     meta.approval_mode = Some(approval_mode);
                     patched = true;
                 }
-                if let Some(active_permission_profile) = patch.active_permission_profile {
-                    meta.active_permission_profile = Some(active_permission_profile);
+                if let Some(active_permission_profile) = &patch.active_permission_profile {
+                    meta.active_permission_profile = Some(active_permission_profile.clone());
                     patched = true;
                 }
-                if let Some(runtime_workspace_roots) = patch.runtime_workspace_roots {
-                    meta.runtime_workspace_roots = runtime_workspace_roots;
+                if let Some(runtime_workspace_roots) = &patch.runtime_workspace_roots {
+                    meta.runtime_workspace_roots = runtime_workspace_roots.clone();
                     patched = true;
                 }
-                if let Some(permission_rules) = patch.permission_rules {
-                    meta.permission_rules = permission_rules;
+                if let Some(permission_rules) = &patch.permission_rules {
+                    meta.permission_rules = permission_rules.clone();
                     patched = true;
                 }
-                if let Some(additional_working_directories) = patch.additional_working_directories {
-                    meta.additional_working_directories = additional_working_directories;
+                if let Some(additional_working_directories) = &patch.additional_working_directories
+                {
+                    meta.additional_working_directories = additional_working_directories.clone();
                     patched = true;
                 }
-                if let Some(metadata_writable_directories) = patch.metadata_writable_directories {
-                    meta.metadata_writable_directories = metadata_writable_directories;
+                if let Some(metadata_writable_directories) = &patch.metadata_writable_directories {
+                    meta.metadata_writable_directories = metadata_writable_directories.clone();
                     patched = true;
                 }
-                if let Some(network_domain_permissions) = patch.network_domain_permissions {
-                    meta.network_domain_permissions = network_domain_permissions;
+                if let Some(network_domain_permissions) = &patch.network_domain_permissions {
+                    meta.network_domain_permissions = network_domain_permissions.clone();
                     patched = true;
                 }
-                break;
             }
-        }
+            Ok(record)
+        });
+        rewrite_records_unlocked(&path, records)?;
         if !patched {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "thread metadata patch did not include any supported fields",
+                io::ErrorKind::InvalidData,
+                "session transcript has no metadata record",
             ));
         }
-        rewrite_records_unlocked(&path, &records)?;
         let summary = summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))?;
         #[cfg(not(test))]
         let _ = session_index::upsert_summary(&summary);

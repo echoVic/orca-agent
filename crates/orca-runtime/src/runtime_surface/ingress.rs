@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use orca_core::plan_types::UpdatePlanArgs;
 use orca_core::provider_types::ProviderStep;
+use orca_core::task_types::WorkflowPhaseTaskSummary;
 use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::tool_types::ToolResult;
+use orca_core::workflow_types::WorkflowAgentStatus;
 
 use crate::child_agent_types::SubagentActivityEvent;
 use crate::model_response::RuntimeModelResponse;
@@ -45,6 +47,30 @@ pub struct RuntimeWorkflowFinished {
     pub completed_at: UnixMillis,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeWorkflowProgress {
+    pub task_id: SurfaceTaskId,
+    pub workflow_run_id: SurfaceWorkflowRunId,
+    pub phases: Vec<WorkflowPhaseTaskSummary>,
+    pub agents: Vec<RuntimeWorkflowAgentProgress>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeWorkflowAgentProgress {
+    pub call_id: String,
+    pub call_path: String,
+    pub phase: Option<String>,
+    pub status: WorkflowAgentStatus,
+    pub attempt: u32,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub usage: Option<orca_core::cost_types::UsageTotals>,
+}
+
+pub trait RuntimeWorkflowProgressIngress: Send + Sync + std::fmt::Debug {
+    fn commit_progress(&self, progress: &RuntimeWorkflowProgress) -> io::Result<()>;
+}
+
 #[allow(private_interfaces)]
 pub trait RuntimeWorkflowLifecycleIngress: Send + Sync + std::fmt::Debug {
     fn commit_started(
@@ -52,6 +78,10 @@ pub trait RuntimeWorkflowLifecycleIngress: Send + Sync + std::fmt::Debug {
         started: &RuntimeWorkflowStarted,
     ) -> io::Result<RuntimeWorkflowIngressReceipt>;
     fn commit_finished(&self, finished: &RuntimeWorkflowFinished) -> io::Result<()>;
+
+    fn progress_ingress(&self) -> Option<Arc<dyn RuntimeWorkflowProgressIngress>> {
+        None
+    }
 
     #[doc(hidden)]
     fn subagent_activity_ingress(&self) -> Option<Arc<dyn RuntimeSubagentActivityIngress>> {

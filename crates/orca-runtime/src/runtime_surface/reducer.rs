@@ -8610,6 +8610,40 @@ fn apply_workflow_patch(
             workflow.revision = *next_revision;
             Ok(())
         }
+        WorkflowPatch::ProgressUpdated {
+            fence,
+            next_revision,
+            phases,
+            agents,
+        } => {
+            let workflow = workflow_for_fence_mut(snapshot, envelope, fence, *next_revision)?;
+            if !matches!(
+                workflow.status,
+                SurfaceWorkflowStatus::Running | SurfaceWorkflowStatus::AsyncLaunched
+            ) || phases.iter().enumerate().any(|(index, phase)| {
+                phases[..index]
+                    .iter()
+                    .any(|candidate| candidate.name == phase.name)
+            }) || agents.iter().enumerate().any(|(index, agent)| {
+                agents[..index].iter().any(|candidate| {
+                    candidate.agent_id == agent.agent_id && candidate.attempt == agent.attempt
+                })
+            }) || workflow.agents.iter().any(|existing| {
+                !agents.iter().any(|candidate| {
+                    candidate.agent_id == existing.agent_id && candidate.attempt == existing.attempt
+                })
+            }) {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "workflow progress snapshot is not valid",
+                ));
+            }
+            workflow.phases.clone_from(phases);
+            workflow.agents.clone_from(agents);
+            workflow.revision = *next_revision;
+            Ok(())
+        }
         WorkflowPatch::ResultReady {
             fence,
             next_revision,

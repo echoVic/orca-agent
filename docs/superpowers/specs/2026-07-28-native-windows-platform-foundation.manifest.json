@@ -62,6 +62,13 @@
   ],
   "deferred_boundaries": [
     [
+      "thread-store-assets-unix-symlink-fixture",
+      "crates/orca-runtime/src/thread_store/storage_tests.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "thread-store-session-index-unix-fixture",
       "crates/orca-runtime/src/thread_store/local.rs",
       "unix_std_api",

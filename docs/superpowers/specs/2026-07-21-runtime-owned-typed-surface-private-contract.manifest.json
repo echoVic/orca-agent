@@ -96,6 +96,7 @@
       "AgentCompleted",
       "AgentFailed",
       "AgentCancelled",
+      "ProgressUpdated",
       "Paused",
       "Stopping",
       "Stopped",
@@ -13186,10 +13187,13 @@
     "ingress": [
       "RuntimeProviderResponseIngress",
       "RuntimeSubagentActivityIngress",
+      "RuntimeWorkflowAgentProgress",
       "RuntimeWorkflowFinished",
       "RuntimeWorkflowIngressReceipt",
       "RuntimeWorkflowLifecycleIngress",
       "RuntimeWorkflowOutcome",
+      "RuntimeWorkflowProgress",
+      "RuntimeWorkflowProgressIngress",
       "RuntimeWorkflowStarted"
     ],
     "interaction": [

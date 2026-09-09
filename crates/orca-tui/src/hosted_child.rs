@@ -584,13 +584,7 @@ fn focus_child(
             return;
         }
     };
-    let binding = match resolve_child_binding(
-        &parent_snapshot,
-        host,
-        parent_thread.thread_id(),
-        &task_id,
-        expected_revision,
-    ) {
+    let binding = match resolve_child_binding(&parent_snapshot, &task_id, expected_revision) {
         Ok(binding) => binding,
         Err(error) => {
             reject(event_tx, &error);
@@ -632,19 +626,14 @@ fn focus_child(
             return;
         }
     };
-    let current_binding = match resolve_child_binding(
-        &current_snapshot,
-        host,
-        parent_thread.thread_id(),
-        &task_id,
-        expected_revision,
-    ) {
-        Ok(binding) => binding,
-        Err(error) => {
-            reject(event_tx, &format!("child focus became stale: {error}"));
-            return;
-        }
-    };
+    let current_binding =
+        match resolve_child_binding(&current_snapshot, &task_id, expected_revision) {
+            Ok(binding) => binding,
+            Err(error) => {
+                reject(event_tx, &format!("child focus became stale: {error}"));
+                return;
+            }
+        };
     if current_binding.child_thread_id != binding.child_thread_id {
         reject(
             event_tx,
@@ -831,20 +820,10 @@ struct ChildBinding {
 
 fn resolve_child_binding(
     snapshot: &SurfaceSnapshot,
-    host: &RuntimeHostHandle,
-    root_thread_id: &str,
     task_id: &str,
     expected_revision: u64,
 ) -> Result<ChildBinding, String> {
-    let surface_task_present = snapshot
-        .tasks
-        .iter()
-        .any(|task| task.task_id.as_str() == task_id);
-    if surface_task_present {
-        child_binding(snapshot, task_id, expected_revision)
-    } else {
-        registry_child_binding(host, root_thread_id, task_id, expected_revision)
-    }
+    child_binding(snapshot, task_id, expected_revision)
 }
 
 fn child_binding(
@@ -882,31 +861,6 @@ fn child_binding(
         .ok_or_else(|| "the selected child has no live conversation".to_string())?;
     Ok(ChildBinding {
         child_thread_id: uuid::Uuid::from_bytes(*child_thread_id.as_bytes()).to_string(),
-    })
-}
-
-fn registry_child_binding(
-    host: &RuntimeHostHandle,
-    root_thread_id: &str,
-    agent_id: &str,
-    expected_revision: u64,
-) -> Result<ChildBinding, String> {
-    let snapshot = host.agent_registry_snapshot(root_thread_id);
-    if snapshot.revision < expected_revision {
-        return Err(format!(
-            "the selected child agent is stale (expected revision {expected_revision})"
-        ));
-    }
-    let agent = snapshot
-        .agents
-        .iter()
-        .find(|agent| agent.agent_id == agent_id && agent.status.is_active())
-        .ok_or_else(|| "the selected child agent is no longer present".to_string())?;
-    if agent.parent_thread_id != root_thread_id {
-        return Err("the selected child is not owned by this conversation".to_string());
-    }
-    Ok(ChildBinding {
-        child_thread_id: agent.thread_id.clone(),
     })
 }
 

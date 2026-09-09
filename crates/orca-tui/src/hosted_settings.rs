@@ -63,6 +63,61 @@ pub(crate) fn surface_approval_mode(
     }
 }
 
+pub(crate) fn settings_updated_from_surface(
+    settings: &orca_runtime::surface::SurfaceRuntimeSettings,
+) -> Result<TuiEvent, String> {
+    let reasoning_effort = match settings.reasoning_effort {
+        orca_runtime::surface::SurfaceReasoningEffort::Low => {
+            orca_core::config::ReasoningEffort::Low
+        }
+        orca_runtime::surface::SurfaceReasoningEffort::High => {
+            orca_core::config::ReasoningEffort::High
+        }
+        orca_runtime::surface::SurfaceReasoningEffort::Max => {
+            orca_core::config::ReasoningEffort::Max
+        }
+        orca_runtime::surface::SurfaceReasoningEffort::Medium => {
+            return Err("runtime returned an unsupported reasoning effort".to_string());
+        }
+    };
+    let approval_mode = match settings.approval_mode {
+        orca_runtime::surface::SurfaceApprovalMode::Suggest => {
+            orca_core::approval_types::ApprovalMode::Suggest
+        }
+        orca_runtime::surface::SurfaceApprovalMode::AutoEdit => {
+            orca_core::approval_types::ApprovalMode::AutoEdit
+        }
+        orca_runtime::surface::SurfaceApprovalMode::FullAuto => {
+            orca_core::approval_types::ApprovalMode::FullAuto
+        }
+        orca_runtime::surface::SurfaceApprovalMode::Plan => {
+            orca_core::approval_types::ApprovalMode::Plan
+        }
+    };
+    Ok(TuiEvent::SettingsUpdated {
+        model: settings.model.as_str().to_string(),
+        reasoning_effort,
+        approval_mode,
+    })
+}
+
+pub(crate) fn synchronize_shared_config_from_surface(
+    thread: &RuntimeThreadHandle,
+    config: &Arc<Mutex<RunConfig>>,
+) -> Result<(), String> {
+    let snapshot = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface())
+        .read_snapshot()
+        .map_err(|error| format!("failed to read runtime settings: {error}"))?;
+    let mut config = config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    orca_runtime::runtime_host::hydrate_run_config_from_surface_settings(
+        &mut config,
+        &snapshot.settings.effective,
+    )
+    .map_err(|error| format!("failed to apply runtime settings: {error:?}"))
+}
+
 pub(crate) fn apply_hosted_settings_action(
     thread: Option<&RuntimeThreadHandle>,
     config: &Arc<Mutex<RunConfig>>,
@@ -85,40 +140,23 @@ pub(crate) fn apply_hosted_settings_action(
                 return false;
             }
         };
-        let model = settings.effective.model.as_str().to_string();
-        let reasoning_effort = match settings.effective.reasoning_effort {
-            orca_runtime::surface::SurfaceReasoningEffort::Low => {
-                orca_core::config::ReasoningEffort::Low
-            }
-            orca_runtime::surface::SurfaceReasoningEffort::High => {
-                orca_core::config::ReasoningEffort::High
-            }
-            orca_runtime::surface::SurfaceReasoningEffort::Max => {
-                orca_core::config::ReasoningEffort::Max
-            }
-            orca_runtime::surface::SurfaceReasoningEffort::Medium => {
-                let _ = event_tx.send(TuiEvent::OperationRejected(
-                    "runtime returned an unsupported reasoning effort".to_string(),
-                ));
+        let settings_event = match settings_updated_from_surface(&settings.effective) {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = event_tx.send(TuiEvent::OperationRejected(error));
                 return false;
             }
         };
-        let approval_mode = match settings.effective.approval_mode {
-            orca_runtime::surface::SurfaceApprovalMode::Suggest => {
-                orca_core::approval_types::ApprovalMode::Suggest
-            }
-            orca_runtime::surface::SurfaceApprovalMode::AutoEdit => {
-                orca_core::approval_types::ApprovalMode::AutoEdit
-            }
-            orca_runtime::surface::SurfaceApprovalMode::FullAuto => {
-                orca_core::approval_types::ApprovalMode::FullAuto
-            }
-            orca_runtime::surface::SurfaceApprovalMode::Plan => {
-                orca_core::approval_types::ApprovalMode::Plan
-            }
+        let TuiEvent::SettingsUpdated {
+            model,
+            reasoning_effort,
+            approval_mode,
+        } = settings_event
+        else {
+            unreachable!("surface settings helper always returns SettingsUpdated");
         };
         if let Ok(mut cfg) = config.lock() {
-            cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(model.clone()));
+            cfg.model = cfg.model.with_value_unchecked(Some(model.clone()));
             cfg.reasoning_effort = reasoning_effort;
             cfg.approval_mode = approval_mode;
         }
@@ -136,9 +174,9 @@ pub(crate) fn apply_hosted_settings_action(
     for patch in patches {
         match patch {
             orca_runtime::surface::RuntimeSettingsPatch::SetModel { model } => {
-                cfg.model = orca_core::model::ModelSelection::from_unchecked(Some(
-                    model.as_str().to_string(),
-                ));
+                cfg.model = cfg
+                    .model
+                    .with_value_unchecked(Some(model.as_str().to_string()));
             }
             orca_runtime::surface::RuntimeSettingsPatch::SetReasoning { effort } => {
                 cfg.reasoning_effort = match effort {

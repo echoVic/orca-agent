@@ -29,6 +29,8 @@ pub struct WorkflowAgentCacheRecord {
 pub struct WorkflowAgentRecord {
     pub call_id: String,
     pub call_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     pub prompt: String,
     pub opts: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +82,8 @@ impl CachedWorkflowAgentRecord {
 struct WorkflowAgentRecordOnDisk {
     call_id: String,
     call_path: String,
+    #[serde(default)]
+    phase: Option<String>,
     prompt: String,
     opts: Value,
     #[serde(default)]
@@ -115,6 +119,8 @@ struct WorkflowAgentRecordOnDisk {
 struct WorkflowAgentRecordOnDiskWritable {
     call_id: String,
     call_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
     prompt: String,
     opts: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -292,6 +298,7 @@ impl WorkflowStateStore {
                     WorkflowEvidenceAgent {
                         call_id: entry.record.call_id,
                         call_path: entry.record.call_path,
+                        phase: entry.record.phase,
                         team: entry
                             .record
                             .team
@@ -550,40 +557,44 @@ impl WorkflowStateStore {
     }
 
     pub fn agent_summaries(&self, run_id: &str) -> io::Result<Vec<WorkflowAgentTaskSummary>> {
+        let records = self.agent_records(run_id)?;
+        Ok(records
+            .into_iter()
+            .map(|record| WorkflowAgentTaskSummary {
+                call_id: record.call_id,
+                call_path: record.call_path,
+                team: record.team.or_else(|| workflow_agent_team(&record.opts)),
+                status: record.status,
+                attempt: record.attempt,
+                max_attempts: record.max_attempts,
+                previous_errors: record.previous_errors,
+                error: record.error,
+                transcript_path: record.transcript_path,
+                started_at_ms: record.started_at_ms,
+                completed_at_ms: record.completed_at_ms,
+                usage: record.usage,
+                continuation: record.continuation,
+            })
+            .collect())
+    }
+
+    pub(crate) fn agent_records(&self, run_id: &str) -> io::Result<Vec<WorkflowAgentRecord>> {
         let path = self.run_dir(run_id).join("agent-cache.json");
         if !path.exists() {
             return Ok(Vec::new());
         }
 
         let cache = read_agent_cache(&path)?;
-        let mut summaries = cache
+        let mut records = cache
             .values()
-            .map(|entry| WorkflowAgentTaskSummary {
-                call_id: entry.record.call_id.clone(),
-                call_path: entry.record.call_path.clone(),
-                team: entry
-                    .record
-                    .team
-                    .clone()
-                    .or_else(|| workflow_agent_team(&entry.record.opts)),
-                status: entry.record.status,
-                attempt: entry.record.attempt,
-                max_attempts: entry.record.max_attempts,
-                previous_errors: entry.record.previous_errors.clone(),
-                error: entry.record.error.clone(),
-                transcript_path: entry.record.transcript_path.clone(),
-                started_at_ms: entry.record.started_at_ms,
-                completed_at_ms: entry.record.completed_at_ms,
-                usage: entry.record.usage,
-                continuation: entry.record.continuation.clone(),
-            })
+            .map(|entry| entry.record.clone())
             .collect::<Vec<_>>();
-        summaries.sort_by(|left, right| {
+        records.sort_by(|left, right| {
             left.call_path
                 .cmp(&right.call_path)
                 .then_with(|| left.call_id.cmp(&right.call_id))
         });
-        Ok(summaries)
+        Ok(records)
     }
 }
 
@@ -723,6 +734,7 @@ impl IntoWorkflowAgentRecord for WorkflowAgentCacheRecord {
         WorkflowAgentRecord {
             call_id: self.call_path.clone(),
             call_path: self.call_path,
+            phase: None,
             prompt: String::new(),
             opts: Value::Null,
             team: None,
@@ -824,6 +836,7 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
                         record: WorkflowAgentRecord {
                             call_id: record.call_id,
                             call_path: record.call_path,
+                            phase: record.phase,
                             prompt: record.prompt,
                             opts: record.opts,
                             team: record.team,
@@ -874,6 +887,7 @@ fn write_agent_cache(
                 WorkflowAgentRecordOnDiskWritable {
                     call_id: entry.record.call_id.clone(),
                     call_path: entry.record.call_path.clone(),
+                    phase: entry.record.phase.clone(),
                     prompt: entry.record.prompt.clone(),
                     opts: entry.record.opts.clone(),
                     team: entry

@@ -232,10 +232,6 @@ pub enum TuiEvent {
     /// Task state from an inactive attachment. It updates the agent dock but
     /// must not replace the visible child conversation transcript.
     BackgroundTasksUpdated(Vec<orca_core::task_types::BackgroundTaskSummary>),
-    /// Canonical agent-controller projection used by the conversation dock.
-    /// The TUI receives this through the runtime host and never opens the
-    /// agent journal itself.
-    AgentRegistryUpdated(orca_core::agent_event::AgentRegistrySnapshot),
     TaskStatusUpdated(orca_core::task_types::BackgroundTaskSummary),
     BackgroundTaskOutputAttached {
         task_id: String,

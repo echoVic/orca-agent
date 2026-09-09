@@ -3,9 +3,13 @@
   "package": "@blade-ai/orca",
   "website": "https://orcaagent.dev",
   "commands": {
-    "root": ["doctor", "exec", "workflow", "trust"],
+    "root": ["doctor", "storage", "exec", "workflow", "trust"],
     "doctor": {
       "options": ["--cwd", "--format"],
+      "subcommands": []
+    },
+    "storage": {
+      "options": ["--max-bytes", "--older-than-days", "--apply"],
       "subcommands": []
     },
     "exec": {

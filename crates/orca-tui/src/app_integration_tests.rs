@@ -963,7 +963,7 @@ fn test_task_surface() -> (
 }
 
 #[test]
-fn runtime_ready_emits_only_attachment_and_snapshot_projection() {
+fn runtime_ready_emits_attachment_queue_settings_and_snapshot_projection() {
     with_orca_home(|home| {
         let mut config = test_config(HistoryMode::Record);
         config.cwd = Some(home.to_path_buf());
@@ -978,7 +978,7 @@ fn runtime_ready_emits_only_attachment_and_snapshot_projection() {
         announce_runtime_ready(&thread, &event_tx, &control);
 
         let events = event_rx.try_iter().collect::<Vec<_>>();
-        assert_eq!(events.len(), 3, "runtime-ready events: {events:?}");
+        assert_eq!(events.len(), 4, "runtime-ready events: {events:?}");
         assert!(
             matches!(events[0], TuiEvent::MentionRuntimeReady(_)),
             "first runtime-ready event: {:?}",
@@ -990,9 +990,14 @@ fn runtime_ready_emits_only_attachment_and_snapshot_projection() {
             events[1]
         );
         assert!(
-            matches!(events[2], TuiEvent::SurfaceProjectionSynced(_)),
+            matches!(events[2], TuiEvent::SettingsUpdated { .. }),
             "third runtime-ready event: {:?}",
             events[2]
+        );
+        assert!(
+            matches!(events[3], TuiEvent::SurfaceProjectionSynced(_)),
+            "fourth runtime-ready event: {:?}",
+            events[3]
         );
 
         thread.shutdown().expect("runtime thread shutdown");
@@ -1092,6 +1097,26 @@ fn hosted_tui_saved_workflow_routes_through_runtime_host() {
                         .any(|task| task.name.as_deref() == Some("runtime-owned"))
             )),
             "saved workflow should publish a typed task projection: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection.workflow_tasks.iter().any(|task| {
+                        task.name.as_deref() == Some("runtime-owned")
+                            && task.phase_count == Some(1)
+                            && task.workflow_phases.iter().any(|phase| {
+                                phase.name == "main"
+                                    && phase.status
+                                        == orca_core::workflow_types::WorkflowRunStatus::Completed
+                            })
+                            && task.workflow_agents.iter().any(|agent| {
+                                agent.status
+                                    == orca_core::workflow_types::WorkflowAgentStatus::Completed
+                            })
+                    })
+            )),
+            "saved workflow should project live phase and agent state: {events:?}"
         );
         assert!(
             events
@@ -3480,6 +3505,73 @@ fn picker_resume_requires_authoritative_session_reset() {
 }
 
 #[test]
+fn picker_resume_restores_runtime_settings_before_next_submit() {
+    with_orca_home(|_| {
+        let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+        harness.send(UserAction::Submit("seed settings session".to_string()));
+        let source_id =
+            match harness.recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_))) {
+                TuiEvent::MentionRuntimeReady(thread) => {
+                    thread.session_id().expect("source session id").to_string()
+                }
+                _ => unreachable!(),
+            };
+        harness.recv_until(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success"),
+        );
+        harness.send(UserAction::SetModel(
+            orca_core::model::FLASH_MODEL.to_string(),
+        ));
+        harness.recv_until(|event| {
+            matches!(
+                event,
+                TuiEvent::SettingsUpdated { model, .. }
+                    if model == orca_core::model::FLASH_MODEL
+            )
+        });
+
+        harness.send(UserAction::NewSession);
+        harness.recv_until(|event| matches!(event, TuiEvent::NewSessionStarted));
+        harness.send(UserAction::SetModel(
+            orca_core::model::PRO_MODEL.to_string(),
+        ));
+        harness.recv_until(|event| {
+            matches!(
+                event,
+                TuiEvent::SettingsUpdated { model, .. }
+                    if model == orca_core::model::PRO_MODEL
+            )
+        });
+
+        harness.send(UserAction::ResumeSavedSession {
+            session_id: source_id.clone(),
+        });
+        harness.recv_until(|event| {
+            matches!(
+                event,
+                TuiEvent::SessionProjectionReset(projection)
+                    if projection.session_id.as_deref() == Some(source_id.as_str())
+            )
+        });
+
+        assert_eq!(
+            harness
+                .config
+                .lock()
+                .expect("shared TUI config")
+                .model
+                .display_name(),
+            orca_core::model::FLASH_MODEL
+        );
+        harness.send(UserAction::Submit("continue restored session".to_string()));
+        harness.recv_until(
+            |event| matches!(event, TuiEvent::SessionCompleted { status } if status == "success"),
+        );
+        harness.shutdown();
+    });
+}
+
+#[test]
 fn hosted_tui_rename_updates_durable_title_and_projection_event() {
     with_orca_home(|_| {
         let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
@@ -5494,7 +5586,7 @@ fn workflow_notification_submit_bypasses_user_file_mention_expansion() {
 
         let mut saw_history_echo = false;
         let mut unexpected_error = None;
-        for _ in 0..10 {
+        loop {
             match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                 TuiEvent::MessageDelta(text) if text.contains("Mock history users:") => {
                     saw_history_echo = true;
@@ -5504,6 +5596,7 @@ fn workflow_notification_submit_bypasses_user_file_mention_expansion() {
                     unexpected_error = Some(message);
                     break;
                 }
+                TuiEvent::SessionCompleted { .. } => break,
                 _ => {}
             }
         }

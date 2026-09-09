@@ -388,6 +388,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
             WorkflowAgentRecord {
                 call_id: "call-scan".to_string(),
                 call_path: "phases.scan:1".to_string(),
+                phase: Some("scan".to_string()),
                 prompt: "inspect repo".to_string(),
                 opts: json!({ "team": "research" }),
                 team: Some("research".to_string()),
@@ -419,6 +420,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
             WorkflowAgentRecord {
                 call_id: "call-review".to_string(),
                 call_path: "phases.review:1".to_string(),
+                phase: Some("review".to_string()),
                 prompt: "review repo".to_string(),
                 opts: json!({ "team": "review" }),
                 team: Some("review".to_string()),
@@ -476,6 +478,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
         .find(|agent| agent.call_id == "call-scan")
         .expect("scan agent evidence");
     assert_eq!(scan.call_path, "phases.scan:1");
+    assert_eq!(scan.phase.as_deref(), Some("scan"));
     assert_eq!(scan.team.as_deref(), Some("research"));
     assert_eq!(scan.status, WorkflowAgentStatus::Completed);
     assert_eq!(scan.attempt, 1);
@@ -487,6 +490,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
         .iter()
         .find(|agent| agent.call_id == "call-review")
         .expect("review agent evidence");
+    assert_eq!(review.phase.as_deref(), Some("review"));
     assert_eq!(review.previous_errors, vec!["transient timeout"]);
     assert_eq!(review.error.as_deref(), Some("review failed"));
 }
@@ -535,6 +539,7 @@ fn workflow_verifier_reports_proven_and_completed_with_failures_from_artifacts()
             WorkflowAgentRecord {
                 call_id: "agent-1".to_string(),
                 call_path: "scan:1".to_string(),
+                phase: Some("scan".to_string()),
                 prompt: "inspect repo".to_string(),
                 opts: json!({}),
                 team: None,
@@ -641,6 +646,7 @@ fn workflow_verifier_rejects_missing_declared_evidence_contract() {
             WorkflowAgentRecord {
                 call_id: "agent-1".to_string(),
                 call_path: "scan:1".to_string(),
+                phase: Some("scan".to_string()),
                 prompt: "scan".to_string(),
                 opts: json!({}),
                 team: None,
@@ -706,6 +712,7 @@ fn workflow_verifier_rejects_missing_declared_evidence_contract() {
             WorkflowAgentRecord {
                 call_id: "agent-1".to_string(),
                 call_path: "scan:1".to_string(),
+                phase: Some("scan".to_string()),
                 prompt: "scan".to_string(),
                 opts: json!({}),
                 team: None,
@@ -800,6 +807,7 @@ fn workflow_verifier_rejects_read_only_contract_when_mutation_tool_completes() {
             WorkflowAgentRecord {
                 call_id: "agent-1".to_string(),
                 call_path: "scan:1".to_string(),
+                phase: Some("scan".to_string()),
                 prompt: "scan".to_string(),
                 opts: json!({}),
                 team: None,
@@ -887,6 +895,7 @@ fn workflow_report_is_bound_to_evidence() {
                 WorkflowAgentRecord {
                     call_id: format!("call-{index}"),
                     call_path: format!("root:{index}"),
+                    phase: Some("root".to_string()),
                     prompt: format!("agent {index}"),
                     opts: json!({}),
                     team: None,
@@ -1379,6 +1388,7 @@ fn state_store_preserves_current_json_looking_string_outputs() {
                 WorkflowAgentRecord {
                     call_id: format!("call-{index}"),
                     call_path: "phases.scan".to_string(),
+                    phase: Some("scan".to_string()),
                     prompt: "inspect repo".to_string(),
                     opts: json!(null),
                     team: None,
@@ -1470,6 +1480,7 @@ fn state_store_preserves_missing_output_field_when_appending_completed_record() 
             WorkflowAgentRecord {
                 call_id: "call-2".to_string(),
                 call_path: "phases.scan".to_string(),
+                phase: Some("scan".to_string()),
                 prompt: "inspect repo again".to_string(),
                 opts: json!(null),
                 team: None,

@@ -48,6 +48,10 @@ use crate::runtime_subagent_call::{
     build_checkpoint_observer, commit_continuation_write_with_retry, continuation_error,
     continuation_footer,
 };
+use crate::runtime_surface::{
+    RuntimeWorkflowAgentProgress, RuntimeWorkflowProgress, RuntimeWorkflowProgressIngress,
+    SurfaceTaskId, SurfaceWorkflowRunId,
+};
 use crate::schema_validation::validate_json_schema_subset;
 use crate::tasks::{TaskRecord, TaskRegistry};
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
@@ -167,6 +171,7 @@ pub struct WorkflowRunner {
     session_dir: PathBuf,
     state: WorkflowStateStore,
     child_executor: ChildAgentExecutor<SharedEventBuffer>,
+    progress_ingress: Option<Arc<dyn RuntimeWorkflowProgressIngress>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -556,6 +561,7 @@ impl WorkflowRunner {
             session_dir,
             state,
             child_executor: execute_child_agent_loop,
+            progress_ingress: None,
         }
     }
 
@@ -564,6 +570,14 @@ impl WorkflowRunner {
         child_executor: ChildAgentExecutor<SharedEventBuffer>,
     ) -> Self {
         self.child_executor = child_executor;
+        self
+    }
+
+    pub(crate) fn with_progress_ingress(
+        mut self,
+        progress_ingress: Option<Arc<dyn RuntimeWorkflowProgressIngress>>,
+    ) -> Self {
+        self.progress_ingress = progress_ingress;
         self
     }
 
@@ -1226,6 +1240,7 @@ impl WorkflowRunner {
                         WorkflowAgentRecord {
                             call_id: call.call_id.clone(),
                             call_path: call.call_path.clone(),
+                            phase: call.phase.clone(),
                             prompt: call.prompt.clone(),
                             opts: call.opts.clone(),
                             team: workflow_agent_team(&call.opts),
@@ -1260,6 +1275,7 @@ impl WorkflowRunner {
                     WorkflowAgentRecord {
                         call_id: call.call_id.clone(),
                         call_path: call.call_path.clone(),
+                        phase: call.phase.clone(),
                         prompt: call.prompt.clone(),
                         opts: call.opts.clone(),
                         team: workflow_agent_team(&call.opts),
@@ -1354,6 +1370,7 @@ impl WorkflowRunner {
                 WorkflowAgentRecord {
                     call_id: call.call_id.clone(),
                     call_path: call.call_path.clone(),
+                    phase: call.phase.clone(),
                     prompt: call.prompt.clone(),
                     opts: call.opts.clone(),
                     team: workflow_agent_team(&call.opts),
@@ -1433,6 +1450,7 @@ impl WorkflowRunner {
                             WorkflowAgentRecord {
                                 call_id: call.call_id.clone(),
                                 call_path: call.call_path.clone(),
+                                phase: call.phase.clone(),
                                 prompt: call.prompt.clone(),
                                 opts: call.opts.clone(),
                                 team: workflow_agent_team(&call.opts),
@@ -1466,6 +1484,7 @@ impl WorkflowRunner {
                         WorkflowAgentRecord {
                             call_id: call.call_id.clone(),
                             call_path: call.call_path.clone(),
+                            phase: call.phase.clone(),
                             prompt: call.prompt.clone(),
                             opts: call.opts.clone(),
                             team: workflow_agent_team(&call.opts),
@@ -1518,6 +1537,7 @@ impl WorkflowRunner {
                         WorkflowAgentRecord {
                             call_id: call.call_id.clone(),
                             call_path: call.call_path.clone(),
+                            phase: call.phase.clone(),
                             prompt: call.prompt.clone(),
                             opts: call.opts.clone(),
                             team: workflow_agent_team(&call.opts),
@@ -1599,6 +1619,7 @@ impl WorkflowRunner {
             WorkflowAgentRecord {
                 call_id: call.call_id.clone(),
                 call_path: call.call_path.clone(),
+                phase: call.phase.clone(),
                 prompt: call.prompt.clone(),
                 opts: call.opts.clone(),
                 team: workflow_agent_team(&call.opts),
@@ -2081,11 +2102,16 @@ impl WorkflowRunner {
         state.final_summary = Some(STOPPED_SUMMARY.to_string());
         state.error = None;
         self.state.write_state(&state)?;
-        self.write_evidence_for_state(&state, Some(&counters))?;
-        self.tasks
+        let progress_result = self.refresh_task_progress(&task_id, &state);
+        let evidence_result = self.write_evidence_for_state(&state, Some(&counters));
+        let task_stop_result = self
+            .tasks
             .stop(&task_id, STOPPED_SUMMARY.to_string())
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::other);
         let _ = self.state.mark_worker_exited(&run_id);
+        progress_result?;
+        evidence_result?;
+        task_stop_result?;
         let counts = self.state.agent_status_counts(&run_id)?;
 
         Ok(WorkflowLaunchResult {
@@ -2149,14 +2175,17 @@ impl WorkflowRunner {
                 })
                 .count(),
         };
+        let phases = workflow_phase_summaries(state);
+        let agent_records = self.state.agent_records(&state.run_id)?;
+        let agents = self.state.agent_summaries(&state.run_id)?;
         self.tasks
             .update_workflow_progress(task_id, progress)
             .map_err(io::Error::other)?;
         self.tasks
-            .update_workflow_phases(task_id, workflow_phase_summaries(state))
+            .update_workflow_phases(task_id, phases.clone())
             .map_err(io::Error::other)?;
         self.tasks
-            .update_workflow_agents(task_id, self.state.agent_summaries(&state.run_id)?)
+            .update_workflow_agents(task_id, agents.clone())
             .map_err(io::Error::other)?;
         self.tasks
             .update_workflow_result_summary(
@@ -2164,7 +2193,33 @@ impl WorkflowRunner {
                 state.final_summary.clone(),
                 workflow_failure_count(state, &self.state.agent_status_counts(&state.run_id)?),
             )
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        if let Some(ingress) = self.progress_ingress.as_ref() {
+            ingress.commit_progress(&RuntimeWorkflowProgress {
+                task_id: SurfaceTaskId::try_new(task_id.to_string())
+                    .map_err(|error| io::Error::other(error.to_string()))?,
+                workflow_run_id: SurfaceWorkflowRunId::try_new(state.run_id.clone())
+                    .map_err(|error| io::Error::other(error.to_string()))?,
+                phases,
+                agents: agent_records
+                    .into_iter()
+                    .map(|agent| {
+                        let output = agent.output.as_ref().map(result_to_summary);
+                        RuntimeWorkflowAgentProgress {
+                            call_id: agent.call_id,
+                            call_path: agent.call_path,
+                            phase: agent.phase,
+                            status: agent.status,
+                            attempt: agent.attempt,
+                            output,
+                            error: agent.error,
+                            usage: agent.usage,
+                        }
+                    })
+                    .collect(),
+            })?;
+        }
+        Ok(())
     }
 
     fn write_evidence_for_state(
@@ -3000,6 +3055,85 @@ mod tests {
         assert!(tasks.get(&prepared.task_id).is_none());
     }
 
+    #[derive(Debug)]
+    struct FailingWorkflowProgressIngress;
+
+    impl RuntimeWorkflowProgressIngress for FailingWorkflowProgressIngress {
+        fn commit_progress(&self, _progress: &RuntimeWorkflowProgress) -> io::Result<()> {
+            Err(io::Error::other("injected progress failure"))
+        }
+    }
+
+    #[test]
+    fn stopped_workflow_finishes_task_and_worker_when_progress_commit_fails() {
+        let temp = tempdir().unwrap();
+        let script_path = temp.path().join("stopped-progress.js");
+        fs::write(
+            &script_path,
+            "export const meta = { name: 'stopped-progress', description: 'stopped progress', phases: [] };\nexport default 'done';",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let tasks = TaskRegistry::new("workflow-stopped-progress".to_string());
+        let runner =
+            WorkflowRunner::new(config, tasks.clone(), temp.path().join("workflow-session"))
+                .with_progress_ingress(Some(Arc::new(FailingWorkflowProgressIngress)));
+        let prepared = runner
+            .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                script_path: Some(script_path.display().to_string()),
+                ..Default::default()
+            }))
+            .expect("prepare stopped workflow");
+        runner
+            .activate_prepared_run(&prepared.prepared)
+            .expect("activate stopped workflow");
+        runner
+            .state
+            .write_worker_record(
+                &prepared.run_id,
+                &WorkflowWorkerRecord {
+                    pid: std::process::id(),
+                    active: true,
+                    started_at_ms: now_ms(),
+                    completed_at_ms: None,
+                },
+            )
+            .expect("write active worker record");
+        let state = runner
+            .state
+            .load_run(&prepared.run_id)
+            .expect("load active workflow state");
+
+        let error = runner
+            .finish_stopped_run(
+                state,
+                prepared.workflow_name.clone(),
+                prepared.prepared.resolved.persisted_path.clone(),
+                prepared.prepared.transcript_dir.clone(),
+                prepared.task_id.clone(),
+                prepared.run_id.clone(),
+                WorkflowExecutionCounters::default(),
+            )
+            .expect_err("progress failure must remain visible");
+
+        assert!(error.to_string().contains("injected progress failure"));
+        assert_eq!(
+            tasks.get(&prepared.task_id).unwrap().status,
+            TaskStatus::Stopped
+        );
+        assert_eq!(
+            runner.state.load_run(&prepared.run_id).unwrap().status,
+            WorkflowRunStatus::Stopped
+        );
+        let worker = runner
+            .state
+            .load_worker_record(&prepared.run_id)
+            .expect("load terminal worker record");
+        assert!(!worker.active);
+        assert!(worker.completed_at_ms.is_some());
+    }
+
     #[test]
     fn resumed_background_workflow_reports_prior_token_spend() {
         let temp = tempdir().unwrap();
@@ -3030,6 +3164,7 @@ mod tests {
                 WorkflowAgentRecord {
                     call_id: "source-call".to_string(),
                     call_path: "main.agent".to_string(),
+                    phase: Some("main".to_string()),
                     prompt: "source".to_string(),
                     opts: Value::Null,
                     team: None,
