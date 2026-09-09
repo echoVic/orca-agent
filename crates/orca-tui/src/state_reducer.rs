@@ -798,16 +798,6 @@ impl AppState {
 
     pub(crate) fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
         let mut projection = projection;
-        if self.conversation_target().task_id().is_some() {
-            self.focused_workflow_tasks
-                .clone_from(&projection.workflow_tasks);
-            projection.workflow_tasks = merge_background_task_snapshots(
-                &self.background_workflow_tasks,
-                &self.focused_workflow_tasks,
-            );
-        } else {
-            self.focused_workflow_tasks.clear();
-        }
         let mut surface_session = self.surface_session.clone();
         let session_apply = surface_session.apply_projection(&projection);
         let mut surface_operation = self.surface_operation.clone();
@@ -822,6 +812,16 @@ impl AppState {
                 .rejects_usage_revision(projection.usage_revision)
         {
             return;
+        }
+        if self.conversation_target().task_id().is_some() {
+            self.focused_workflow_tasks
+                .clone_from(&projection.workflow_tasks);
+            projection.workflow_tasks = merge_background_task_snapshots(
+                &self.background_workflow_tasks,
+                &self.focused_workflow_tasks,
+            );
+        } else {
+            self.focused_workflow_tasks.clear();
         }
         self.surface_session = surface_session;
         self.surface_operation = surface_operation;

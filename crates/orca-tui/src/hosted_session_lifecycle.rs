@@ -590,7 +590,7 @@ pub(crate) fn resume_latest_active_goal_hosted(
     preloaded: &Arc<Mutex<Option<history::SessionTranscript>>>,
     event_tx: &mpsc::Sender<TuiEvent>,
     control: &TuiSurfaceTaskControl,
-    _pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
+    pending_workflow_notifications: &bridge::PendingWorkflowNotifications,
 ) {
     if matches!(config.lock().unwrap().history_mode, HistoryMode::Disabled) {
         send_goal_history_error(event_tx);
@@ -648,17 +648,20 @@ pub(crate) fn resume_latest_active_goal_hosted(
             return;
         }
     };
-    if let Some(previous) = thread.take() {
-        reap_hosted_thread(previous);
-    }
     notify_recovered_background_approvals_for_tui(
         &TuiSurfaceActions::new(resumed.typed_surface()),
         event_tx,
     );
-    *thread = Some(resumed);
-    *preloaded.lock().unwrap() = None;
-    if let Ok(mut shared) = config.lock() {
-        shared.history_mode = cfg.history_mode.clone();
+    if let Err(error) = install_hosted_session(
+        thread,
+        resumed,
+        cfg,
+        config,
+        preloaded,
+        pending_workflow_notifications,
+    ) {
+        let _ = event_tx.send(TuiEvent::Error(error));
+        return;
     }
     if let Some(runtime_thread) = thread.as_ref() {
         let actions = TuiSurfaceActions::new(runtime_thread.typed_surface());

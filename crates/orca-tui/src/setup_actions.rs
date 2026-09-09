@@ -90,21 +90,29 @@ pub(crate) fn handle_setup_key(
                 if state.setup_selection == SETUP_EXIT_SELECTION {
                     return Ok(SetupFlow::Exit(0));
                 }
-                if state.setup_selection == SETUP_TRUST_SELECTION {
+                if matches!(
+                    state.setup_selection,
+                    SETUP_TRUST_SELECTION | SETUP_UNTRUSTED_SELECTION
+                ) {
+                    let trusted = state.setup_selection == SETUP_TRUST_SELECTION;
                     let Some(first_run) = state.first_run.as_mut() else {
                         return Ok(SetupFlow::Continue);
                     };
                     if let Err(error) = folder_trust::set_trust_with_config_dir(
                         &first_run.workspace,
                         &first_run.config_dir,
-                        TrustLevel::Trusted,
+                        if trusted {
+                            TrustLevel::Trusted
+                        } else {
+                            TrustLevel::Untrusted
+                        },
                     ) {
                         state.push_message(ChatMessage::Error(format!(
-                            "failed to trust workspace: {error}"
+                            "failed to persist workspace trust: {error}"
                         )));
                         return Ok(SetupFlow::Continue);
                     }
-                    first_run.workspace_trusted = true;
+                    first_run.workspace_trusted = trusted;
                 }
                 let Some(first_run) = state.first_run.as_mut() else {
                     state.push_message(ChatMessage::Error(
@@ -279,6 +287,26 @@ mod tests {
         let mut state = welcome_state();
         dispatch(&mut state, KeyCode::Char('e'));
         assert_eq!(state.setup_selection, SETUP_EXIT_SELECTION);
+    }
+
+    #[test]
+    fn enter_persists_untrusted_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(workspace.path().to_path_buf());
+        folder_trust::set_trust_with_config_dir(workspace.path(), home.path(), TrustLevel::Trusted)
+            .unwrap();
+        let mut state = welcome_state();
+        state.first_run =
+            Some(orca_runtime::onboarding::inspect_first_run_in(&config, home.path()).unwrap());
+        state.setup_selection = SETUP_UNTRUSTED_SELECTION;
+        dispatch(&mut state, KeyCode::Enter);
+        assert!(!state.first_run.as_ref().unwrap().workspace_trusted);
+        assert_eq!(
+            folder_trust::trust_level_with_config_dir(workspace.path(), home.path()),
+            Some(TrustLevel::Untrusted),
+        );
     }
 
     #[test]

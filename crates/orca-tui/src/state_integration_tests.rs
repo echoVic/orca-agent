@@ -1472,6 +1472,9 @@ fn surface_operation_projection_fences_conflicts_and_resets() {
 #[test]
 fn workflow_task_projection_fences_contradictory_equal_cursor() {
     let mut state = state();
+    state.update(TuiEvent::ChildFocusChanged {
+        task_id: Some("child".into()),
+    });
     let projection = |tasks| SurfaceProjectionState {
         cursor: crate::surface_projection::test_surface_cursor(1),
         session_id: Some("workflow-task-session".to_string()),
@@ -1497,6 +1500,7 @@ fn workflow_task_projection_fences_contradictory_equal_cursor() {
     state.update(TuiEvent::SurfaceProjectionSynced(Box::new(contradictory)));
 
     assert_eq!(state.workflow_tasks(), accepted.workflow_tasks);
+    assert_eq!(state.focused_workflow_tasks, accepted.workflow_tasks);
 }
 
 #[test]
