@@ -298,6 +298,7 @@ impl WorkflowStateStore {
                     WorkflowEvidenceAgent {
                         call_id: entry.record.call_id,
                         call_path: entry.record.call_path,
+                        phase: entry.record.phase,
                         team: entry
                             .record
                             .team

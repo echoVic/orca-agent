@@ -2604,7 +2604,7 @@ impl ThreadActor {
                 phases.push(projected);
             }
         }
-        let agents = progress
+        let updated_agents = progress
             .agents
             .iter()
             .map(|agent| {
@@ -2659,6 +2659,16 @@ impl ThreadActor {
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let mut agents = workflow.agents.clone();
+        for agent in updated_agents {
+            if let Some(existing) = agents.iter_mut().find(|existing| {
+                existing.agent_id == agent.agent_id && existing.attempt == agent.attempt
+            }) {
+                *existing = agent;
+            } else {
+                agents.push(agent);
+            }
+        }
         let next_revision = surface::WorkflowRevision::try_new(
             workflow
                 .revision

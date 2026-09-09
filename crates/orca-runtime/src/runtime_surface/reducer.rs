@@ -8628,6 +8628,10 @@ fn apply_workflow_patch(
                 agents[..index].iter().any(|candidate| {
                     candidate.agent_id == agent.agent_id && candidate.attempt == agent.attempt
                 })
+            }) || workflow.agents.iter().any(|existing| {
+                !agents.iter().any(|candidate| {
+                    candidate.agent_id == existing.agent_id && candidate.attempt == existing.attempt
+                })
             }) {
                 return Err(event_error(
                     envelope,

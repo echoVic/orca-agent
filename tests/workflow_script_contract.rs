@@ -478,6 +478,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
         .find(|agent| agent.call_id == "call-scan")
         .expect("scan agent evidence");
     assert_eq!(scan.call_path, "phases.scan:1");
+    assert_eq!(scan.phase.as_deref(), Some("scan"));
     assert_eq!(scan.team.as_deref(), Some("research"));
     assert_eq!(scan.status, WorkflowAgentStatus::Completed);
     assert_eq!(scan.attempt, 1);
@@ -489,6 +490,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
         .iter()
         .find(|agent| agent.call_id == "call-review")
         .expect("review agent evidence");
+    assert_eq!(review.phase.as_deref(), Some("review"));
     assert_eq!(review.previous_errors, vec!["transient timeout"]);
     assert_eq!(review.error.as_deref(), Some("review failed"));
 }

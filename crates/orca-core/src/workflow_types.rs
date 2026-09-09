@@ -312,6 +312,8 @@ pub struct WorkflowEvidenceAgent {
     pub call_id: String,
     pub call_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub barrier: Option<String>,

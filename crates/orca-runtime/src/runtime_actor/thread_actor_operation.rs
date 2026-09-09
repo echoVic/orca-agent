@@ -2753,17 +2753,19 @@ impl ThreadActor {
                 .phases
                 .iter()
                 .cloned()
-                .map(|name| surface::SurfaceWorkflowPhase {
-                    name: surface::NonEmptyText::try_new(name)
-                        .expect("prepared workflow phase names are non-empty"),
-                    status: surface::SurfaceWorkflowStatus::Queued,
-                    started_at: None,
-                    completed_at: None,
-                    agent_count: 0,
-                    summary: None,
-                    error: None,
+                .map(|name| {
+                    Ok(surface::SurfaceWorkflowPhase {
+                        name: surface::NonEmptyText::try_new(name)
+                            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+                        status: surface::SurfaceWorkflowStatus::Queued,
+                        started_at: None,
+                        completed_at: None,
+                        agent_count: 0,
+                        summary: None,
+                        error: None,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, surface::SurfaceClientCommandError>>()?,
             agents: Vec::new(),
             result: None,
             error: None,

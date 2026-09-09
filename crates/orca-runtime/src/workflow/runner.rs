@@ -2102,6 +2102,7 @@ impl WorkflowRunner {
         state.final_summary = Some(STOPPED_SUMMARY.to_string());
         state.error = None;
         self.state.write_state(&state)?;
+        self.refresh_task_progress(&task_id, &state)?;
         self.write_evidence_for_state(&state, Some(&counters))?;
         self.tasks
             .stop(&task_id, STOPPED_SUMMARY.to_string())
