@@ -1778,22 +1778,15 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         response: &crate::model_response::RuntimeModelResponse,
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.command_tx
-            .try_send(ThreadCommand::SurfaceCommitProviderResponse {
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::SurfaceCommitProviderResponse {
                 fence: self.fence.clone(),
                 response: response.clone(),
                 reply: reply_tx,
-            })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "runtime semantic ingress mailbox is full",
-                ),
-                TrySendError::Closed(_) => io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "runtime semantic ingress actor is unavailable",
-                ),
-            })?;
+            },
+        )
+        .map_err(surface_semantic_ingress_send_error)?;
         reply_rx.recv().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1808,14 +1801,16 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         message: &str,
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.command_tx
-            .try_send(ThreadCommand::SurfaceCommitProviderFailure {
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::SurfaceCommitProviderFailure {
                 fence: self.fence.clone(),
                 identity: identity.clone(),
                 message: message.to_string(),
                 reply: reply_tx,
-            })
-            .map_err(surface_semantic_ingress_send_error)?;
+            },
+        )
+        .map_err(surface_semantic_ingress_send_error)?;
         reply_rx
             .recv()
             .map_err(|_| surface_semantic_ingress_ack_error())?
@@ -1827,14 +1822,16 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         message: &str,
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.command_tx
-            .try_send(ThreadCommand::SurfaceCommitProviderAttemptFailure {
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::SurfaceCommitProviderAttemptFailure {
                 fence: self.fence.clone(),
                 identity: identity.clone(),
                 message: message.to_string(),
                 reply: reply_tx,
-            })
-            .map_err(surface_semantic_ingress_send_error)?;
+            },
+        )
+        .map_err(surface_semantic_ingress_send_error)?;
         reply_rx
             .recv()
             .map_err(|_| surface_semantic_ingress_ack_error())?
@@ -1853,44 +1850,30 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         steps: &[ProviderStep],
     ) -> io::Result<()> {
-        self.command_tx
-            .try_send(ThreadCommand::SurfaceCommitProviderStep {
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::SurfaceCommitProviderStep {
                 fence: self.fence.clone(),
                 identity: identity.clone(),
                 steps: steps.to_vec(),
                 reply: None,
-            })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "runtime semantic ingress mailbox is full",
-                ),
-                TrySendError::Closed(_) => io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "runtime semantic ingress actor is unavailable",
-                ),
-            })?;
+            },
+        )
+        .map_err(surface_semantic_ingress_send_error)?;
         Ok(())
     }
 
     fn commit_tool_results(&self, results: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.command_tx
-            .try_send(ThreadCommand::SurfaceCommitToolResults {
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::SurfaceCommitToolResults {
                 fence: self.fence.clone(),
                 results: results.to_vec(),
                 reply: reply_tx,
-            })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "runtime semantic ingress mailbox is full",
-                ),
-                TrySendError::Closed(_) => io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "runtime semantic ingress actor is unavailable",
-                ),
-            })?;
+            },
+        )
+        .map_err(surface_semantic_ingress_send_error)?;
         reply_rx.recv().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1901,13 +1884,15 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
 
     fn commit_plan_update(&self, update: &orca_core::plan_types::UpdatePlanArgs) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.command_tx
-            .try_send(ThreadCommand::SurfaceCommitPlanUpdate {
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::SurfaceCommitPlanUpdate {
                 fence: self.fence.clone(),
                 update: update.clone(),
                 reply: reply_tx,
-            })
-            .map_err(surface_semantic_ingress_send_error)?;
+            },
+        )
+        .map_err(surface_semantic_ingress_send_error)?;
         reply_rx
             .recv()
             .map_err(|_| surface_semantic_ingress_ack_error())?
@@ -34805,6 +34790,56 @@ mod tests {
         assert!(command_rx.try_recv().is_err());
         assert_eq!(capability_change_rx.try_recv(), Ok(()));
         assert!(capability_change_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn provider_step_ingress_backpressures_through_full_mailbox() {
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(1);
+        let fence = recovery_matrix_fence();
+        let (prefill_reply_tx, _prefill_reply_rx) = mpsc::sync_channel(1);
+        command_tx
+            .blocking_send(ThreadCommand::SurfaceActorTestProbe {
+                operation_id: fence.operation_id.clone(),
+                reply: prefill_reply_tx,
+            })
+            .expect("fill runtime command mailbox");
+
+        let ingress = RuntimeSurfaceProviderResponseIngress {
+            command_tx,
+            fence: fence.clone(),
+        };
+        let identity = ModelResponseIdentity::new(orca_core::thread_identity::TurnId::new());
+        let send_thread = std::thread::spawn(move || {
+            surface::RuntimeProviderResponseIngress::commit_provider_steps(
+                &ingress,
+                &identity,
+                &[ProviderStep::MessageDelta("delta".to_string())],
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !send_thread.is_finished(),
+            "provider delta must wait while the actor mailbox is full"
+        );
+        assert!(matches!(
+            command_rx.blocking_recv(),
+            Some(ThreadCommand::SurfaceActorTestProbe { .. })
+        ));
+        send_thread
+            .join()
+            .expect("provider sender joins")
+            .expect("provider delta is delivered after capacity returns");
+        assert!(matches!(
+            command_rx.blocking_recv(),
+            Some(ThreadCommand::SurfaceCommitProviderStep {
+                fence: delivered_fence,
+                steps,
+                reply: None,
+                ..
+            }) if delivered_fence == fence
+                && matches!(steps.as_slice(), [ProviderStep::MessageDelta(text)] if text == "delta")
+        ));
     }
 
     #[test]

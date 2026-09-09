@@ -5635,6 +5635,22 @@ impl ThreadActor {
                         },
                     )
                 }
+                (OperationOutcome::ExecutionFailed { message, .. }, _) => {
+                    let message = surface_safe_diagnostic(
+                        message,
+                        "foreground operation failed with an invalid diagnostic",
+                    );
+                    (
+                        surface::GenerationStopReason::ExecutionFailed {
+                            class: surface::GenerationExecutionFailureClass::RuntimeInvariant,
+                            message: message.clone(),
+                        },
+                        surface::OperationTerminal::Failed {
+                            class: surface::FailureClass::RuntimeInvariant,
+                            message,
+                        },
+                    )
+                }
                 (OperationOutcome::Panicked { message }, _) => (
                     surface::GenerationStopReason::Panicked {
                         message: surface::SafeDiagnosticText::try_new(message.clone())
