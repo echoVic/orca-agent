@@ -251,6 +251,10 @@ pub struct ToolConfig {
     pub output_truncation: ToolOutputTruncation,
     #[serde(default = "default_shell_timeout_secs")]
     pub shell_timeout_secs: u64,
+    /// Runtime-captured host evidence. It is never loaded from or persisted to
+    /// user configuration.
+    #[serde(skip)]
+    pub shell_enforcement_decision: Option<crate::capability::SandboxEnforcementDecision>,
 }
 
 impl Default for ToolConfig {
@@ -259,6 +263,7 @@ impl Default for ToolConfig {
             max_read_parallel: DEFAULT_MAX_READ_PARALLEL_TOOLS,
             output_truncation: ToolOutputTruncation::default(),
             shell_timeout_secs: default_shell_timeout_secs(),
+            shell_enforcement_decision: None,
         }
     }
 }
@@ -932,7 +937,26 @@ mod tests {
     use crate::approval_rules::PermissionRule;
     use crate::approval_types::ApprovalMode;
     use crate::approval_types::Decision;
+    use crate::capability::{EnforcementState, SandboxEnforcementDecision};
     use crate::model::{AUTO_MODEL, FLASH_MODEL, ModelSelection};
+
+    #[test]
+    fn tool_config_never_serializes_or_restores_runtime_enforcement_evidence() {
+        let tools = ToolConfig {
+            shell_enforcement_decision: Some(SandboxEnforcementDecision::new(
+                EnforcementState::Enforced,
+                "test-sandbox",
+                Vec::new(),
+            )),
+            ..ToolConfig::default()
+        };
+
+        let encoded = serde_json::to_value(&tools).expect("serialize tool config");
+        assert!(encoded.get("shell_enforcement_decision").is_none());
+
+        let decoded: ToolConfig = serde_json::from_value(encoded).expect("deserialize tool config");
+        assert!(decoded.shell_enforcement_decision.is_none());
+    }
 
     #[test]
     fn theme_name_defaults_to_auto_and_round_trips_all_values() {

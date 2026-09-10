@@ -29,7 +29,7 @@ use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
 use crate::tool_invocation::{
     apply_pre_tool_outcome_with_external, prepare_tool_invocation_with_external,
-    validate_tool_invocation_with_external,
+    validate_shell_readiness, validate_tool_invocation_with_external,
 };
 use crate::tool_turn::ToolTurnOutcome;
 use crate::workflow::ipc::WorkflowIpcContext;
@@ -358,6 +358,14 @@ fn execute_subagent_batch(
             mcp_registry,
             &[],
         );
+        if let Err(error) = validate_shell_readiness(&invocation, config) {
+            let result = error.into_result();
+            if emit_deltas {
+                emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
+            }
+            results[idx] = Some((RunStatus::Failed, result));
+            continue;
+        }
         if let Err(error) = validate_tool_invocation_with_external(&invocation, mcp_registry, &[]) {
             let result = error.into_result();
             if emit_deltas {
@@ -422,6 +430,14 @@ fn execute_subagent_batch(
                 continue;
             }
         };
+        if let Err(error) = validate_shell_readiness(&invocation, config) {
+            let result = error.into_result();
+            if emit_deltas {
+                emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
+            }
+            results[idx] = Some((RunStatus::Failed, result));
+            continue;
+        }
 
         let effective = invocation.effective;
         let request = subagent::with_delegation_snapshot(

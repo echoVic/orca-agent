@@ -1,6 +1,7 @@
 use std::io;
 
 use crate::agent_child::{ChildAgentRequest, ChildAgentResult, ChildAgentRuntime};
+use crate::agent_common;
 use crate::child_agent_loop_setup::try_prepare_child_agent_conversation;
 use crate::cost::CostTracker;
 use crate::lifecycle::{
@@ -96,6 +97,14 @@ pub(crate) fn run_agent_loop(
         turn_deps.instructions,
         config.approval_mode,
         turn_deps.memory,
+    );
+    let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
+    let shell_context = shell_readiness.model_context(config.approval_mode);
+    prepared_conversation.parts_mut().0.replace_mode_context(
+        agent_common::mode_context_with_shell_readiness(
+            config.approval_mode,
+            shell_context.as_deref(),
+        ),
     );
 
     let mut legacy_lifecycle = RuntimeSessionLifecycle::new(events.run_id().to_string());

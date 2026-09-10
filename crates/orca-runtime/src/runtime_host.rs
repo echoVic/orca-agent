@@ -5380,15 +5380,13 @@ async fn run_host_supervisor(
                 let session_id = thread.session().session_id().map(str::to_string);
                 let task_registry = thread.session().task_registry().clone();
                 let mcp_registry = thread.session().mcp_registry().clone();
-                let startup_warnings = Arc::new(
-                    thread
-                        .session()
-                        .mcp_registry()
-                        .errors()
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>(),
-                );
+                let mut startup_warnings = thread
+                    .session()
+                    .mcp_registry()
+                    .errors()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
                 if actors.contains_key(&thread_id) {
                     let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
                         message: format!("duplicate runtime thread id: {thread_id}"),
@@ -5432,6 +5430,13 @@ async fn run_host_supervisor(
                         continue;
                     }
                 }
+                if let Some(warning) =
+                    crate::shell_readiness::ShellReadiness::for_config(&actor_config)
+                        .startup_warning()
+                {
+                    startup_warnings.push(warning);
+                }
+                let startup_warnings = Arc::new(startup_warnings);
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
                     session_id,
@@ -24783,7 +24788,16 @@ mod tests {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             subagents: SubagentConfig::default(),
-            tools: ToolConfig::default(),
+            tools: ToolConfig {
+                shell_enforcement_decision: Some(
+                    orca_core::capability::SandboxEnforcementDecision::new(
+                        orca_core::capability::EnforcementState::Enforced,
+                        "test-sandbox",
+                        Vec::new(),
+                    ),
+                ),
+                ..ToolConfig::default()
+            },
             workflows: WorkflowConfig::default(),
             theme: ThemeName::default(),
             vim_mode: false,

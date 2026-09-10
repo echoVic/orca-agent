@@ -91,6 +91,20 @@ pub fn mode_context(approval_mode: ApprovalMode) -> Option<String> {
     (approval_mode == ApprovalMode::Plan).then(|| PLAN_MODE_INSTRUCTIONS.to_string())
 }
 
+pub(crate) fn mode_context_with_shell_readiness(
+    approval_mode: ApprovalMode,
+    shell_context: Option<&str>,
+) -> Option<String> {
+    let mut sections = Vec::new();
+    if approval_mode == ApprovalMode::Plan {
+        sections.push(PLAN_MODE_INSTRUCTIONS);
+    }
+    if let Some(shell_context) = shell_context.filter(|context| !context.trim().is_empty()) {
+        sections.push(shell_context);
+    }
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
+
 pub fn explicit_skill_context(cwd: &Path, prompt: &str) -> Option<String> {
     match skills::explicit_skill_prompt_block(cwd, prompt) {
         Ok(block) => block,
@@ -229,6 +243,22 @@ mod tests {
         assert!(prompt.contains("exactly one `<proposed_plan>` block"));
         assert!(prompt.contains("Do not ask whether to proceed in prose"));
         assert!(prompt.contains("concrete implementation steps with file paths"));
+    }
+
+    #[test]
+    fn mode_context_combines_plan_and_shell_unavailability() {
+        let context = mode_context_with_shell_readiness(
+            ApprovalMode::Plan,
+            Some("Shell process launch is unavailable."),
+        )
+        .expect("combined mode context");
+
+        assert!(context.contains("read-only planning mode"));
+        assert!(context.contains("Shell process launch is unavailable."));
+        assert!(
+            mode_context_with_shell_readiness(ApprovalMode::AutoEdit, None).is_none(),
+            "auto-edit without a runtime warning should not add mode context"
+        );
     }
 
     #[test]

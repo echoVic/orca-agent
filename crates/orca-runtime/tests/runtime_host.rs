@@ -726,7 +726,16 @@ fn test_config(cwd: PathBuf) -> RunConfig {
         additional_working_directories: Vec::new(),
         budget: Default::default(),
         subagents: SubagentConfig::default(),
-        tools: ToolConfig::default(),
+        tools: ToolConfig {
+            shell_enforcement_decision: Some(
+                orca_core::capability::SandboxEnforcementDecision::new(
+                    orca_core::capability::EnforcementState::Enforced,
+                    "test-sandbox",
+                    Vec::new(),
+                ),
+            ),
+            ..ToolConfig::default()
+        },
         workflows: WorkflowConfig::default(),
         theme: ThemeName::default(),
         vim_mode: false,
@@ -1685,8 +1694,12 @@ fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry
 
     assert_eq!(thread.thread_id(), "actor-resume-session");
     assert!(
-        thread.startup_warnings().is_empty(),
-        "the injected registry must bypass config-time MCP startup"
+        thread
+            .startup_warnings()
+            .iter()
+            .all(|warning| !warning.contains("must-not-start")),
+        "the injected registry must bypass config-time MCP startup: {:?}",
+        thread.startup_warnings()
     );
     let snapshot = thread.snapshot().expect("read resumed snapshot");
     assert_eq!(snapshot.usage_totals(), baseline);

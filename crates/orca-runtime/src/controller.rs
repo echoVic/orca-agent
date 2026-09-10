@@ -1937,7 +1937,16 @@ mod tests {
             hooks: Vec::new(),
             external_tools: Vec::new(),
             subagents,
-            tools: Default::default(),
+            tools: orca_core::config::ToolConfig {
+                shell_enforcement_decision: Some(
+                    orca_core::capability::SandboxEnforcementDecision::new(
+                        orca_core::capability::EnforcementState::Enforced,
+                        "test-sandbox",
+                        Vec::new(),
+                    ),
+                ),
+                ..Default::default()
+            },
             workflows: Default::default(),
             theme: orca_core::config::ThemeName::Dark,
             vim_mode: false,
@@ -2109,14 +2118,18 @@ mod tests {
                 Vec::new(),
             )
             .expect("implementation turn");
-        assert!(
-            thread
-                .session()
-                .conversation()
-                .internal_context
-                .get(orca_core::conversation::MODE_CONTEXT_FRAGMENT_ID)
-                .is_none()
-        );
+        let mode_context = thread
+            .session()
+            .conversation()
+            .internal_context
+            .get(orca_core::conversation::MODE_CONTEXT_FRAGMENT_ID);
+        if crate::shell_readiness_warning(&config).is_some() {
+            let mode_context = mode_context.expect("shell readiness context");
+            assert!(mode_context.content.contains("Shell availability"));
+            assert!(!mode_context.content.contains("<proposed_plan>"));
+        } else {
+            assert!(mode_context.is_none());
+        }
     }
 
     fn assert_controller_failure_persists_error(use_event_factory: bool) {

@@ -125,18 +125,23 @@ pub(crate) fn provider_config_for_agent_loop(
     tool_policy: AgentToolPolicyContext<'_>,
     mcp_registry: &McpRegistry,
 ) -> ProviderConfig {
+    let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
+    let mut tools_override = provider_tool_schema_override(
+        subagent_depth,
+        subagent_type,
+        tool_policy,
+        mcp_registry,
+        &config.external_tools,
+    );
+    if let Some(tools) = tools_override.as_mut() {
+        omit_unavailable_shell_launch_tools(tools, &shell_readiness);
+    }
     let mut provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.as_option(),
         reasoning_effort: config.reasoning_effort,
-        tools_override: provider_tool_schema_override(
-            subagent_depth,
-            subagent_type,
-            tool_policy,
-            mcp_registry,
-            &config.external_tools,
-        ),
+        tools_override,
         mcp_registry: Some(mcp_registry.clone()),
         external_tools: config.external_tools.clone(),
     };
@@ -154,6 +159,13 @@ pub(crate) fn provider_config_for_agent_loop(
         );
     }
     provider_config
+}
+
+fn omit_unavailable_shell_launch_tools(
+    tools: &mut Vec<ProviderToolDefinition>,
+    readiness: &crate::shell_readiness::ShellReadiness,
+) {
+    tools.retain(|tool| !readiness.blocks_tool_name(&tool.name));
 }
 
 pub(crate) fn tool_requests_from_provider_steps(steps: &[ProviderStep]) -> Vec<ToolRequest> {
@@ -300,6 +312,7 @@ pub fn validate_tool_invocation(
                 .unwrap_or_else(|| "custom agent tool is not allowed".into()),
         });
     }
+    validate_shell_readiness(invocation, config)?;
     orca_tools::validate_with_mcp_and_external(
         &invocation.effective,
         Some(mcp_registry),
@@ -309,6 +322,28 @@ pub fn validate_tool_invocation(
         request: invocation.effective.clone(),
         message: format!("tool arguments failed schema validation: {error}"),
     })
+}
+
+pub(crate) fn validate_shell_readiness(
+    invocation: &ToolInvocation,
+    config: &RunConfig,
+) -> Result<(), ToolExecutionFailure> {
+    let readiness = crate::shell_readiness::ShellReadiness::for_config(config);
+    unavailable_shell_tool_failure(invocation, &readiness).map_or(Ok(()), Err)
+}
+
+fn unavailable_shell_tool_failure(
+    invocation: &ToolInvocation,
+    readiness: &crate::shell_readiness::ShellReadiness,
+) -> Option<ToolExecutionFailure> {
+    readiness
+        .blocks_tool(&invocation.effective.name)
+        .then(|| ToolExecutionFailure {
+            request: invocation.effective.clone(),
+            message: readiness
+                .failure_message()
+                .expect("blocked shell readiness has a failure message"),
+        })
 }
 
 pub fn validate_tool_invocation_with_external(
@@ -394,9 +429,11 @@ mod tests {
     use crate::hooks::HookOutcome;
 
     use super::{
-        AgentToolPolicyContext, ProviderToolDefinition, apply_pre_tool_outcome,
-        approval_request_for_invocation, prepare_tool_invocation, provider_config_for_agent_loop,
-        provider_tool_schema_override, tool_requests_from_provider_steps, validate_tool_invocation,
+        AgentToolPolicyContext, ProviderToolDefinition, ToolInvocation, apply_pre_tool_outcome,
+        approval_request_for_invocation, omit_unavailable_shell_launch_tools,
+        prepare_tool_invocation, provider_config_for_agent_loop, provider_tool_schema_override,
+        tool_requests_from_provider_steps, unavailable_shell_tool_failure,
+        validate_tool_invocation,
     };
 
     fn config_with_external(external_tools: Vec<ExternalToolConfig>) -> RunConfig {
@@ -430,7 +467,16 @@ mod tests {
                 max_depth: 1,
                 ..SubagentConfig::default()
             },
-            tools: ToolConfig::default(),
+            tools: ToolConfig {
+                shell_enforcement_decision: Some(
+                    orca_core::capability::SandboxEnforcementDecision::new(
+                        orca_core::capability::EnforcementState::Enforced,
+                        "test-sandbox",
+                        Vec::new(),
+                    ),
+                ),
+                ..ToolConfig::default()
+            },
             external_tools,
             vim_mode: false,
             vim_insert_escape: None,
@@ -530,6 +576,67 @@ mod tests {
         assert!(!names.contains(&"get_goal"));
         assert!(!names.contains(&"create_goal"));
         assert!(!names.contains(&"update_goal"));
+    }
+
+    #[test]
+    fn unavailable_shell_omits_only_new_process_tools_from_provider_catalog() {
+        let registry = McpRegistry::default();
+        let original = provider_tool_schema_override(
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::unrestricted(),
+            &registry,
+            &[],
+        )
+        .expect("root tool schema");
+        let mut tools = original.clone();
+        let readiness = crate::shell_readiness::ShellReadiness::Blocked {
+            detail: "seatbelt probe terminated by signal 6".to_string(),
+            remediation: "repair sandbox support".to_string(),
+        };
+
+        omit_unavailable_shell_launch_tools(&mut tools, &readiness);
+
+        let names = schema_names(&tools);
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"exec_command"));
+        assert!(names.contains(&"write_stdin"));
+        assert!(names.contains(&"edit"));
+        assert!(names.contains(&"read_file"));
+
+        let mut restored = original;
+        omit_unavailable_shell_launch_tools(
+            &mut restored,
+            &crate::shell_readiness::ShellReadiness::Available,
+        );
+        let restored_names = schema_names(&restored);
+        assert!(restored_names.contains(&"bash"));
+        assert!(restored_names.contains(&"exec_command"));
+    }
+
+    #[test]
+    fn unavailable_shell_rejects_a_stale_launch_request_before_dispatch() {
+        let request = request(
+            ToolName::ExecCommand,
+            ActionKind::Shell,
+            Some("cargo test"),
+            Some(r#"{"cmd":"cargo test"}"#),
+        );
+        let invocation = ToolInvocation {
+            requested: request.clone(),
+            effective: request,
+            action: Some(ActionKind::Shell),
+        };
+        let readiness = crate::shell_readiness::ShellReadiness::Blocked {
+            detail: "seatbelt probe terminated by signal 6".to_string(),
+            remediation: "repair sandbox support".to_string(),
+        };
+
+        let failure = unavailable_shell_tool_failure(&invocation, &readiness)
+            .expect("stale shell invocation must fail");
+
+        assert_eq!(failure.request.name, ToolName::ExecCommand);
+        assert!(failure.message.contains("signal 6"));
     }
 
     #[test]
@@ -647,6 +754,27 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(!names.contains(&"bash"));
         assert!(!names.contains(&"subagent"));
+    }
+
+    #[test]
+    fn full_auto_provider_catalog_restores_new_shell_process_tools() {
+        let registry = McpRegistry::default();
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+
+        let provider = provider_config_for_agent_loop(
+            &config,
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::unrestricted(),
+            &registry,
+        );
+        let definitions = provider.tools_override.expect("tool override");
+        let names = schema_names(&definitions);
+
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"exec_command"));
+        assert!(names.contains(&"write_stdin"));
     }
 
     #[test]
@@ -822,7 +950,8 @@ mod tests {
 
     #[test]
     fn hook_modified_target_keeps_shared_validation_path() {
-        let config = config_with_external(Vec::new());
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
         let registry = McpRegistry::default();
         let request = request(
             ToolName::Bash,
