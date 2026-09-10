@@ -157,7 +157,7 @@ mod tests {
             panic!("expected settings action");
         };
         let settings = decode_settings_intent(&intent).expect("settings intent");
-        assert_eq!(settings.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(settings.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(settings.reasoning_effort, Some(ReasoningEffort::Low));
         assert_eq!(settings.approval_mode, Some(ApprovalMode::AutoEdit));
         assert!(state.config_dialog.is_none());

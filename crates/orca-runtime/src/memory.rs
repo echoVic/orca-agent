@@ -1665,7 +1665,7 @@ mod tests {
                 turn_id: "turn-job",
                 session_id: "session-job",
                 extractor_provider: "mock",
-                extractor_model: "deepseek-v4-flash",
+                extractor_model: "deepseek-flash",
                 extractor_prompt_version: 1,
             },
             &cancel,
@@ -1709,14 +1709,14 @@ mod tests {
                 turn_id: "turn-malformed-job",
                 session_id: "session-malformed-job",
                 extractor_provider: "mock",
-                extractor_model: "deepseek-v4-flash",
+                extractor_model: "deepseek-flash",
                 extractor_prompt_version: AUTO_MEMORY_EXTRACTOR_PROMPT_VERSION,
             },
             &cancel,
         )
         .unwrap()
         .expect("job path");
-        let claimed = jobs::claim_next(dir.path(), "mock", "deepseek-v4-flash", &cancel)
+        let claimed = jobs::claim_next(dir.path(), "mock", "deepseek-flash", &cancel)
             .unwrap()
             .expect("claimed job");
         let run_config = config();
@@ -1771,14 +1771,14 @@ mod tests {
                 turn_id: "turn-silent-provider",
                 session_id: "session-silent-provider",
                 extractor_provider: "mock",
-                extractor_model: "deepseek-v4-flash",
+                extractor_model: "deepseek-flash",
                 extractor_prompt_version: AUTO_MEMORY_EXTRACTOR_PROMPT_VERSION,
             },
             &cancel,
         )
         .unwrap()
         .expect("job path");
-        let claimed = jobs::claim_next(dir.path(), "mock", "deepseek-v4-flash", &cancel)
+        let claimed = jobs::claim_next(dir.path(), "mock", "deepseek-flash", &cancel)
             .unwrap()
             .expect("claim");
         let before = read_job_for_test(&path).unwrap();
@@ -1816,7 +1816,7 @@ mod tests {
                 turn_id: "turn-cancelled-job",
                 session_id: "session-cancelled-job",
                 extractor_provider: "mock",
-                extractor_model: "deepseek-v4-flash",
+                extractor_model: "deepseek-flash",
                 extractor_prompt_version: 1,
             },
             &cancel,

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use orca_provider::tool_schema::{ProviderToolDefinition, deepseek_tools_schema};
 use serde_json::{Value, json};
 
-const MODEL: &str = "deepseek-v4-flash";
+const MODEL: &str = "deepseek-flash";
 const SYSTEM_PROMPT: &str = "You are Orca, a terminal coding agent. When given a multi-step task you MUST record the plan by calling the update_plan tool before writing any prose.";
 const USER_PROMPT: &str = "Task: add a /health endpoint to the API server. Record a 3-step plan now via update_plan: 'Design the endpoint contract' (in_progress), 'Implement the handler' (pending), 'Write integration tests' (pending). Call the tool, do not answer in prose.";
 

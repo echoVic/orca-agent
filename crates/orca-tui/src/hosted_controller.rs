@@ -577,6 +577,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     .map(settings_intent_patches)
                     .map(Ok)
                     .unwrap_or_else(|| {
+                        let model = orca_core::model::canonical_model_name(&model).to_string();
                         orca_runtime::surface::NonEmptyText::try_new(model).map(|model| {
                             vec![orca_runtime::surface::RuntimeSettingsPatch::SetModel { model }]
                         })

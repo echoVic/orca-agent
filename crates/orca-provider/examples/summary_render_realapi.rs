@@ -24,7 +24,7 @@ use orca_provider::{ProviderConfig, call};
 // Mirrors the production summary request in context.rs so the prompt sent here
 // is byte-identical to what `request_summary` would send for the same delta.
 const SUMMARY_SYSTEM_PROMPT: &str = "Summarize old agent conversation context for future continuation. Preserve user goals, decisions, file paths, tool results, blockers, and exact constraints. Be concise and factual.";
-const AUX_MODEL: &str = "deepseek-v4-flash";
+const AUX_MODEL: &str = "deepseek-flash";
 
 fn tool(content: String) -> Message {
     Message::Tool {

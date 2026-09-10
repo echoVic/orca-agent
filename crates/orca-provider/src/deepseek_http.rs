@@ -7,6 +7,7 @@ use orca_core::conversation::{
     Conversation, ImageDetail, ImageInput, ImageSource, Message, RawToolCall, SummaryState,
     assistant_message_has_payload, normalize_tool_boundaries,
 };
+use orca_core::model::{FLASH_MODEL, canonical_model_name};
 use orca_core::provider_types::{
     ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse, ProviderStep, Usage,
 };
@@ -17,7 +18,7 @@ use crate::context::render_internal_context;
 use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
-pub(crate) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+pub(crate) const DEFAULT_MODEL: &str = FLASH_MODEL;
 const DEFAULT_CHAT_MAX_TOKENS: u32 = 384_000;
 const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
@@ -461,7 +462,7 @@ async fn request_chat_streaming_with_budget(
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
     })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
-    let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    let model = canonical_model_name(config.model.as_deref().unwrap_or(DEFAULT_MODEL));
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let streaming_client = crate::http_client::streaming_client()?;
 
@@ -682,7 +683,7 @@ fn request_chat(
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
     })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
-    let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    let model = canonical_model_name(config.model.as_deref().unwrap_or(DEFAULT_MODEL));
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
@@ -1876,7 +1877,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some(orca_core::model::LEGACY_FLASH_MODEL.to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -1898,6 +1899,8 @@ mod tests {
         assert_eq!(bodies.len(), 2);
         let first: Value = serde_json::from_str(&bodies[0]).expect("first request json");
         let retry: Value = serde_json::from_str(&bodies[1]).expect("retry request json");
+        assert_eq!(first["model"], FLASH_MODEL);
+        assert_eq!(retry["model"], FLASH_MODEL);
         assert_eq!(first["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
         assert_eq!(retry["max_tokens"], DEFAULT_CHAT_MAX_TOKENS);
         assert_eq!(
@@ -1925,7 +1928,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -1960,7 +1963,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -1992,7 +1995,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2048,7 +2051,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2131,7 +2134,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2172,7 +2175,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2209,7 +2212,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2237,7 +2240,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2297,7 +2300,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2400,13 +2403,13 @@ mod tests {
         let missing_reasoning = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_missing_reasoning\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
                                  data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
                                  data: [DONE]\n\n";
-        let (base_url, _bodies) = spawn_streaming_response_sequence_server(vec![missing_reasoning]);
+        let (base_url, bodies) = spawn_streaming_response_sequence_server(vec![missing_reasoning]);
         let mut conversation = Conversation::new();
         conversation.add_user("read the file".to_string());
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some(orca_core::model::LEGACY_VISION_MODEL.to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: None,
             mcp_registry: None,
@@ -2418,6 +2421,9 @@ mod tests {
             .await
             .expect("tool calls without server-provided reasoning remain executable");
 
+        let requests = bodies.lock().expect("lock captured bodies");
+        let request: Value = serde_json::from_str(&requests[0]).expect("request json");
+        assert_eq!(request["model"], FLASH_MODEL);
         assert!(response.steps.iter().any(|step| matches!(
             step,
             ProviderStep::ToolCall(request) if request.id == "call_missing_reasoning"
@@ -2519,7 +2525,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2592,7 +2598,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2681,7 +2687,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,
@@ -2772,7 +2778,7 @@ mod tests {
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
             base_url: Some(base_url),
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             reasoning_effort: orca_core::config::ReasoningEffort::default(),
             tools_override: Some(Vec::new()),
             mcp_registry: None,

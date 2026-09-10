@@ -3,6 +3,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use orca_core::conversation::Conversation;
+use orca_core::model::canonical_model_name;
 
 use crate::ProviderConfig;
 use crate::deepseek_http::{
@@ -124,7 +125,7 @@ fn scope_sha256(config: &ProviderConfig) -> serde_json::Result<String> {
         .as_deref()
         .unwrap_or(DEFAULT_BASE_URL)
         .trim_end_matches('/');
-    let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    let model = canonical_model_name(config.model.as_deref().unwrap_or(DEFAULT_MODEL));
     hash_json(
         SCOPE_DOMAIN,
         &json!({

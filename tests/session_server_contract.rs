@@ -9874,7 +9874,7 @@ fn server_mode_filters_thread_list_by_codex_metadata_fields() {
             .start_writer_from_meta(store.create_meta(
                 &alpha_cwd,
                 "deepseek",
-                Some("deepseek-v4-flash".to_string()),
+                Some("deepseek-flash".to_string()),
                 "server filter parent",
             ))
             .expect("parent writer");
@@ -9901,7 +9901,7 @@ fn server_mode_filters_thread_list_by_codex_metadata_fields() {
         let archived_meta = store.create_meta(
             &beta_cwd,
             "deepseek",
-            Some("deepseek-v4-flash".to_string()),
+            Some("deepseek-flash".to_string()),
             "server filter archived",
         );
         let archived_id = archived_meta.session_id.clone();

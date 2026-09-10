@@ -424,7 +424,7 @@ function runHistoryReplay(args) {
       session_id: "history-replay-e2e",
       cwd: repoRoot,
       provider: "deepseek",
-      model: "deepseek-v4-flash",
+      model: "deepseek-flash",
       title: "History replay validity e2e",
       created_at: "2026-07-11T00:00:00Z",
     },

@@ -3262,7 +3262,7 @@ mod tests {
             request.allowed_tools.as_ref().unwrap(),
             &vec!["read_file".to_string()]
         );
-        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-flash"));
         assert!(
             definition
                 .system_prompt
@@ -3352,7 +3352,7 @@ mod tests {
         let agents = home.path().join("agents");
         std::fs::create_dir_all(&agents).unwrap();
         let path = agents.join("audit.md");
-        std::fs::write(&path, "---\nname: audit\ndescription: Inspect source\nextends: code_reviewer\ntools: [read_file, grep, bash]\nmodel: deepseek-v4-flash\n---\nOriginal immutable instructions.\n").unwrap();
+        std::fs::write(&path, "---\nname: audit\ndescription: Inspect source\nextends: code_reviewer\ntools: [read_file, grep, bash]\nmodel: deepseek-flash\n---\nOriginal immutable instructions.\n").unwrap();
         let mut config = config(SubagentConfig::default());
         config.subagents.inherited_tools = Some(vec!["read_file".into(), "subagent".into()]);
         let registry =

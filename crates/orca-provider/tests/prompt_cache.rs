@@ -9,7 +9,7 @@ fn config(tools: Vec<ProviderToolDefinition>) -> ProviderConfig {
     ProviderConfig {
         api_key: None,
         base_url: Some("https://api.deepseek.com/".to_string()),
-        model: Some("deepseek-v4-flash".to_string()),
+        model: Some("deepseek-flash".to_string()),
         reasoning_effort: ReasoningEffort::High,
         tools_override: Some(tools),
         mcp_registry: None,
@@ -80,6 +80,28 @@ fn checkpoint_rejects_changed_tools() {
             .matches_deepseek_prefix(&extended, &config(vec![tool("zeta")]))
             .expect("compare prefix")
     );
+}
+
+#[test]
+fn retired_flash_aliases_share_the_canonical_cache_scope() {
+    let conversation = conversation("known private system prompt");
+    let canonical = config(vec![tool("alpha")]);
+    let checkpoint =
+        checkpoint_for_deepseek_request(&conversation, &canonical).expect("checkpoint");
+
+    for alias in [
+        orca_core::model::LEGACY_FLASH_MODEL,
+        orca_core::model::LEGACY_VISION_MODEL,
+    ] {
+        let mut legacy = canonical.clone();
+        legacy.model = Some(alias.to_string());
+        assert!(
+            checkpoint
+                .matches_deepseek_prefix(&conversation, &legacy)
+                .expect("compare alias cache scope"),
+            "alias {alias} should share the canonical Flash cache scope"
+        );
+    }
 }
 
 #[test]

@@ -13,7 +13,7 @@ Environment variables:
     ORCA_BIN        Path to orca binary (default: "orca")
     ORCA_API_KEY    DeepSeek API key
     ORCA_BASE_URL   API base URL (default: https://api.deepseek.com)
-    ORCA_MODEL      Model name (default: deepseek-v4-flash)
+    ORCA_MODEL      Model name (default: deepseek-flash)
 """
 
 import json

@@ -116,7 +116,7 @@ impl ScriptedEndpoint {
                 let chunk = json!({
                     "id": "recovery-fixture",
                     "object": "chat.completion.chunk",
-                    "model": "deepseek-v4-flash",
+                    "model": "deepseek-flash",
                     "choices": [{"index": 0, "delta": response.delta, "finish_reason": finish}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
                 });
@@ -314,7 +314,7 @@ fn run_cli(home: &Path, cwd: &Path, endpoint: &str, extra: &[&str]) -> Output {
             "--mode",
             "full-auto",
             "--model",
-            "deepseek-v4-flash",
+            "deepseek-flash",
             "--base-url",
             endpoint,
             "--output-format",
@@ -499,7 +499,7 @@ fn recovery_contract(initial_mode: &str) {
     .unwrap();
     let definition = home.path().join("agents/contract-proof.md");
     fs::write(&definition, format!(
-        "---\nname: contract-proof\ndescription: Verify immutable configuration\ntools: []\nmodel: deepseek-v4-flash\n---\nAlways answer with exactly {TOKEN}.\n"
+        "---\nname: contract-proof\ndescription: Verify immutable configuration\ntools: []\nmodel: deepseek-flash\n---\nAlways answer with exactly {TOKEN}.\n"
     )).unwrap();
     let mut endpoint = ScriptedEndpoint::start(home.path());
     endpoint.enqueue_mode(None, false, initial_mode);

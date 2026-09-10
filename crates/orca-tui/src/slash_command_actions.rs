@@ -107,7 +107,9 @@ fn dispatch_slash_command(
         }
         SlashCommand::Model(Some(model)) => match commands::validate_model(&model) {
             Ok(()) => {
-                pending_settings_action = Some(UserAction::SetModel(model));
+                pending_settings_action = Some(UserAction::SetModel(
+                    orca_core::model::canonical_model_name(&model).to_string(),
+                ));
             }
             Err(error) => state.push_message(ChatMessage::Error(error)),
         },
@@ -468,7 +470,9 @@ pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
     }
     let model = match fields[0] {
         "-" => None,
-        model if orca_core::model::validate_model(model).is_ok() => Some(model.to_string()),
+        model if orca_core::model::validate_model(model).is_ok() => {
+            Some(orca_core::model::canonical_model_name(model).to_string())
+        }
         _ => return None,
     };
     let reasoning_effort = match fields[1] {
@@ -515,7 +519,7 @@ mod tests {
     #[test]
     fn low_reasoning_effort_round_trips_through_settings_intent() {
         let encoded = encode_settings_intent(
-            Some("deepseek-v4-flash"),
+            Some("deepseek-flash"),
             Some(orca_core::config::ReasoningEffort::Low),
             None,
         );
@@ -526,6 +530,21 @@ mod tests {
             decoded.reasoning_effort,
             Some(orca_core::config::ReasoningEffort::Low)
         );
+    }
+
+    #[test]
+    fn retired_model_aliases_decode_to_canonical_flash() {
+        for alias in [
+            orca_core::model::LEGACY_FLASH_MODEL,
+            orca_core::model::LEGACY_VISION_MODEL,
+        ] {
+            let encoded = encode_settings_intent(Some(alias), None, None);
+            let decoded = decode_settings_intent(&encoded).expect("decode model alias");
+            assert_eq!(
+                decoded.model.as_deref(),
+                Some(orca_core::model::FLASH_MODEL)
+            );
+        }
     }
 
     #[test]

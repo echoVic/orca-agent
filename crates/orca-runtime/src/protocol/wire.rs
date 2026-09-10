@@ -2055,7 +2055,7 @@ mod tests {
     #[test]
     fn submission_decodes_thread_list_filter_wire_shape() {
         let submission = Submission::decode(
-            r#"{"id":"list-threads","method":"thread/list","params":{"cwd":["/tmp/a","/tmp/b"],"modelProviders":["deepseek","openai"],"model":"deepseek-v4-flash","parentThreadId":"parent-1","archived":false}}"#,
+            r#"{"id":"list-threads","method":"thread/list","params":{"cwd":["/tmp/a","/tmp/b"],"modelProviders":["deepseek","openai"],"model":"deepseek-flash","parentThreadId":"parent-1","archived":false}}"#,
         )
         .expect("submission");
 
@@ -2070,7 +2070,7 @@ mod tests {
                 filters: ThreadListFilters {
                     archived: false,
                     model_providers: Some(vec!["deepseek".to_string(), "openai".to_string()]),
-                    model_names: Some(vec!["deepseek-v4-flash".to_string()]),
+                    model_names: Some(vec!["deepseek-flash".to_string()]),
                     cwd_filters: vec!["/tmp/a".to_string(), "/tmp/b".to_string()],
                     relation: Some(ThreadRelationFilter::DirectChildrenOf(
                         "parent-1".to_string()

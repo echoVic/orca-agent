@@ -2998,6 +2998,7 @@ impl Agent for OrcaAcpAgent {
         let model = args.model_id.to_string();
         orca_core::model::validate_model(&model)
             .map_err(|message| Error::invalid_params().data(message))?;
+        let model = orca_core::model::canonical_model_name(&model).to_string();
         self.session_settings(
             &args.session_id,
             Some(crate::surface::RuntimeSettingsPatch::SetModel {
@@ -3032,6 +3033,7 @@ impl Agent for OrcaAcpAgent {
             "model" => {
                 orca_core::model::validate_model(&value)
                     .map_err(|message| Error::invalid_params().data(message))?;
+                let value = orca_core::model::canonical_model_name(&value).to_string();
                 crate::surface::RuntimeSettingsPatch::SetModel {
                     model: NonEmptyText::try_new(value).map_err(Error::into_internal_error)?,
                 }

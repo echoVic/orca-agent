@@ -10936,10 +10936,14 @@ fn apply_runtime_settings_patch(
 ) -> Result<(), surface::SurfaceClientCommandError> {
     match patch {
         surface::RuntimeSettingsPatch::SetModel { model } => {
+            let model = surface::NonEmptyText::try_new(
+                orca_core::model::canonical_model_name(model.as_str()).to_string(),
+            )
+            .expect("canonical model names remain non-empty");
             config.model = config
                 .model
                 .with_value_unchecked(Some(model.as_str().to_string()));
-            settings.model = model.clone();
+            settings.model = model;
         }
         surface::RuntimeSettingsPatch::SetReasoning { effort } => {
             config.reasoning_effort = match effort {
@@ -30742,7 +30746,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_settings_update_commits_cas_and_survives_restart_before_next_turn() {
+    fn typed_settings_update_canonicalizes_alias_and_survives_restart_before_next_turn() {
         let cwd = tempfile::tempdir().unwrap();
         let (observed_tx, observed_rx) = mpsc::sync_channel(1);
         let host = RuntimeHost::start_with_executor(Arc::new(SettingsConfigExecutor {
@@ -30763,13 +30767,19 @@ mod tests {
                     surface_request_id(),
                     previous_revision,
                     surface::NonEmptyVec::try_new(vec![surface::RuntimeSettingsPatch::SetModel {
-                        model: surface::NonEmptyText::try_new("deepseek-v4-pro").unwrap(),
+                        model: surface::NonEmptyText::try_new(
+                            orca_core::model::LEGACY_VISION_MODEL,
+                        )
+                        .unwrap(),
                     }])
                     .unwrap(),
                 )
                 .expect("commit runtime model settings"),
         );
-        assert_eq!(updated.settings.effective.model.as_str(), "deepseek-v4-pro");
+        assert_eq!(
+            updated.settings.effective.model.as_str(),
+            orca_core::model::FLASH_MODEL
+        );
         assert_eq!(
             updated.settings.thread_revision.get(),
             previous_revision.get() + 1
@@ -30791,7 +30801,7 @@ mod tests {
         let current = fresh_surface_attachment(&surface);
         assert_eq!(
             current.baseline.snapshot.settings.effective.model.as_str(),
-            "deepseek-v4-pro"
+            orca_core::model::FLASH_MODEL
         );
         assert_eq!(
             current.baseline.snapshot.settings.effective.approval_mode,
@@ -30828,7 +30838,7 @@ mod tests {
         ));
         assert_eq!(
             observed_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
-            "deepseek-v4-pro"
+            orca_core::model::FLASH_MODEL
         );
         let thread_id = thread.thread_id().to_string();
         thread.shutdown().expect("shutdown settings thread");
@@ -30844,7 +30854,7 @@ mod tests {
         let resumed = fresh_surface_attachment(&resumed_thread.surface());
         assert_eq!(
             resumed.baseline.snapshot.settings.effective.model.as_str(),
-            "deepseek-v4-pro"
+            orca_core::model::FLASH_MODEL
         );
         resumed_thread
             .shutdown()
@@ -37706,7 +37716,7 @@ mod tests {
         settle_suspended_operation(
             &handle,
             Some(&response),
-            Some("deepseek-v4-flash"),
+            Some("deepseek-flash"),
             RunStatus::Success,
             None,
         )
@@ -37769,7 +37779,7 @@ mod tests {
         settle_suspended_operation(
             &handle,
             Some(&response),
-            Some("deepseek-v4-flash"),
+            Some("deepseek-flash"),
             RunStatus::Success,
             None,
         )

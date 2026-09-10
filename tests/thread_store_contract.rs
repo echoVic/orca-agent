@@ -23,7 +23,7 @@ fn session_store_thread_store_appends_live_thread_items() {
             .create_live_thread(
                 home,
                 "mock",
-                Some("deepseek-v4-flash".to_string()),
+                Some("deepseek-flash".to_string()),
                 "thread store prompt",
             )
             .expect("create live thread");
@@ -70,7 +70,7 @@ fn session_store_persists_thread_permission_profile() {
             .create_live_thread_with_permissions(
                 home,
                 "mock",
-                Some("deepseek-v4-flash".to_string()),
+                Some("deepseek-flash".to_string()),
                 "permission profile prompt",
                 Some(ActivePermissionProfile::new(
                     "locked-down",
@@ -435,7 +435,7 @@ fn session_store_filters_thread_list_by_metadata_archival_and_relation() {
             .create_live_thread(
                 &alpha_cwd,
                 "deepseek",
-                Some("deepseek-v4-flash".to_string()),
+                Some("deepseek-flash".to_string()),
                 "parent relation thread",
             )
             .expect("create parent");
@@ -473,7 +473,7 @@ fn session_store_filters_thread_list_by_metadata_archival_and_relation() {
         let archived_meta = store.create_meta(
             &beta_cwd,
             "deepseek",
-            Some("deepseek-v4-flash".to_string()),
+            Some("deepseek-flash".to_string()),
             "archived beta thread",
         );
         let archived_id = archived_meta.session_id.clone();
@@ -513,7 +513,7 @@ fn session_store_filters_thread_list_by_metadata_archival_and_relation() {
                 10,
                 ThreadListFilters {
                     model_providers: Some(vec!["deepseek".to_string()]),
-                    model_names: Some(vec!["deepseek-v4-flash".to_string()]),
+                    model_names: Some(vec!["deepseek-flash".to_string()]),
                     ..ThreadListFilters::active()
                 },
                 ThreadSortKey::CreatedAt,

@@ -1990,7 +1990,7 @@ mod tests {
     fn turn_opening_injects_pending_cost_soft_landing_once() {
         let mut lifecycle = RuntimeSessionLifecycle::new("cost-soft-landing".to_string());
         let mut actor = RuntimeTaskActor::new(&mut lifecycle);
-        let mut cost_tracker = CostTracker::new(Some("deepseek-v4-flash"));
+        let mut cost_tracker = CostTracker::new(Some("deepseek-flash"));
         actor
             .record_usage(
                 Usage {

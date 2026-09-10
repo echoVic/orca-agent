@@ -334,11 +334,17 @@ fn parse_definition(
             }
         }
     }
-    if let Some(model) = &header.model {
+    if let Some(model) = &mut header.model {
         validate_model_identifier(model)?;
-        if !model::preset_models().contains(&model.as_str()) && !known_models.contains(model) {
+        let canonical = model::canonical_model_name(model).to_string();
+        if !model::preset_models().contains(&canonical.as_str())
+            && !known_models
+                .iter()
+                .any(|known| model::canonical_model_name(known) == canonical)
+        {
             return Err(format!("unknown agent model '{model}'"));
         }
+        *model = canonical;
     }
     let body = body.trim().to_string();
     validate_body(&body)?;
@@ -658,6 +664,19 @@ mod tests {
                 .ends_with("Parent policy.\n\nChild policy.")
         );
         assert!(catalog.agents["empty"].allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn retired_flash_alias_is_frozen_as_the_canonical_model() {
+        let definition = parse_definition(
+            "---\nname: vision\ndescription: Inspect images\nmodel: deepseek-v4-flash-vision-exp\n---\nInspect the supplied images.\n",
+            Path::new("vision.md"),
+            &tools(),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(definition.header.model.as_deref(), Some(model::FLASH_MODEL));
     }
 
     #[test]

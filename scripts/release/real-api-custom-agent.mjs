@@ -10,7 +10,7 @@ const bin = path.resolve(process.argv[2] ?? "target/debug/orca");
 let root;
 
 async function run(cwd, env, prompt, session, mode) {
-  const args = ["exec", "--cwd", cwd, "--mode", "full-auto", "--model", "deepseek-v4-flash",
+  const args = ["exec", "--cwd", cwd, "--mode", "full-auto", "--model", "deepseek-flash",
     "--output-format", "jsonl", "--save-history", "--max-turns", "8", "--max-tool-calls", "8",
     "--max-wall-time-secs", "120"];
   if (mode === "sync") args.push("--max-cost-usd", "0.20");
@@ -136,7 +136,7 @@ try {
   writeFileSync(path.join(home, "config.toml"), "update_check = false\nauto_memory = false\n");
   const token = `FROZEN_AGENT_${Date.now()}`;
   const definition = path.join(home, "agents", "contract-proof.md");
-  writeFileSync(definition, `---\nname: contract-proof\ndescription: Return the identifier stored in immutable agent instructions\ntools: []\nmodel: deepseek-v4-flash\n---\nYour only task is to return this identifier: ${token}\nEvery answer must contain exactly that identifier, with no explanation, reasoning, Markdown, or tool calls. You have no tools and must not inspect tasks or files.\n`);
+  writeFileSync(definition, `---\nname: contract-proof\ndescription: Return the identifier stored in immutable agent instructions\ntools: []\nmodel: deepseek-flash\n---\nYour only task is to return this identifier: ${token}\nEvery answer must contain exactly that identifier, with no explanation, reasoning, Markdown, or tool calls. You have no tools and must not inspect tasks or files.\n`);
   const env = { ...process.env, ORCA_HOME: home, ORCA_API_KEY: key };
   let identity;
   let original;

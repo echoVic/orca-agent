@@ -991,7 +991,7 @@ mod tests {
             let mut parent = history::SessionWriter::start(
                 home,
                 "deepseek",
-                Some("deepseek-v4-flash".to_string()),
+                Some("deepseek-flash".to_string()),
                 "parent",
             )
             .expect("parent writer");
@@ -1030,7 +1030,7 @@ mod tests {
             let meta = store.create_fork_meta(
                 home,
                 "deepseek",
-                Some("deepseek-v4-flash".to_string()),
+                Some("deepseek-flash".to_string()),
                 "child",
                 parent_id,
             );

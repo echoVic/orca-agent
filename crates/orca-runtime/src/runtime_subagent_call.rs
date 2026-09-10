@@ -24,7 +24,7 @@ use crate::agent_continuation::{
     AgentTerminal, ChildAgentCoordinator, ChildConversationSnapshot, ContinuationCompatibility,
     ContinuationLease, ContinuationProjection, ContinuationRevision, CreateContinuationInput,
     PreparedContinuation, ResumeContinuationInput, WorktreeBinding,
-    compute_continuation_compatibility_hash,
+    compute_resumable_model_compatibility,
 };
 use crate::agent_controller::{
     AgentController, AgentLaunchRequest, AgentRunMode, AgentSurfaceActivity,
@@ -1092,7 +1092,8 @@ fn run_subagent_worker(
     let child_cwd = worktree_execution.cwd().to_path_buf();
     let worktree_binding = worktree_execution.binding();
     let effective_cwd = child_cwd.display().to_string();
-    let compatibility_hash = match compute_continuation_compatibility_hash(
+    let (compatibility_model, compatibility_hash) = match compute_resumable_model_compatibility(
+        source.as_ref(),
         &subagent_type,
         effective_model.as_deref(),
         isolation,
@@ -1103,7 +1104,7 @@ fn run_subagent_worker(
         &child_config.external_tools,
         frozen_agent.as_ref(),
     ) {
-        Ok(hash) => hash,
+        Ok(compatibility) => compatibility,
         Err(error) => {
             let worktree = worktree_execution.finish();
             return sync_setup_failure_with_worktree(
@@ -1123,7 +1124,7 @@ fn run_subagent_worker(
         subagent_type: serialized_subagent_type(&subagent_type)
             .unwrap_or_else(|| "general".to_string()),
         frozen_agent,
-        model: effective_model.clone(),
+        model: compatibility_model,
         isolation,
         effective_cwd,
         worktree: worktree_binding,
@@ -1695,7 +1696,13 @@ pub(crate) fn validate_resume_overrides(
                 .to_string(),
         );
     }
-    if arguments.contains_key("model") && requested_model != source.compatibility.model.as_deref() {
+    let requested_model = requested_model.map(orca_core::model::canonical_model_name);
+    let source_model = source
+        .compatibility
+        .model
+        .as_deref()
+        .map(orca_core::model::canonical_model_name);
+    if arguments.contains_key("model") && requested_model != source_model {
         return Err(
             "continuation_incompatible: explicit model conflicts with the source continuation"
                 .to_string(),
@@ -2365,6 +2372,8 @@ mod tests {
     use crate::agent_continuation::{AgentAttemptId, ToolBoundary};
     use crate::runtime_surface::RuntimeSubagentActivityIngress;
     use crate::runtime_surface::TaskRevision;
+    use orca_core::approval_types::ActionKind;
+    use orca_core::tool_types::ToolName;
 
     #[derive(Debug, Default)]
     struct RecordingActivityIngress {
@@ -2540,5 +2549,62 @@ mod tests {
         .expect("revision conflict retry");
 
         assert!(second.revision > first.revision);
+    }
+
+    #[test]
+    fn resume_model_compatibility_treats_retired_flash_alias_as_canonical() {
+        let registry = TaskRegistry::new("legacy-model-resume".to_string());
+        let task = registry.create_subagent("resume legacy model".to_string(), None);
+        let coordinator =
+            ChildAgentCoordinator::with_owner_id(registry, "legacy-model-owner".to_string())
+                .expect("coordinator");
+        let source = coordinator
+            .create(CreateContinuationInput {
+                continuation_id: Some(AgentContinuationId::new()),
+                parent_task_id: None,
+                task_id: task.id,
+                prompt_id: AgentPromptId::new(),
+                compatibility: ContinuationCompatibility {
+                    subagent_type: "general".to_string(),
+                    frozen_agent: None,
+                    model: Some(orca_core::model::LEGACY_FLASH_MODEL.to_string()),
+                    isolation: SubagentIsolation::None,
+                    effective_cwd: std::env::temp_dir().display().to_string(),
+                    worktree: None,
+                    compatibility_hash: crate::runtime_surface::Sha256Digest::new([4; 32]),
+                },
+            })
+            .expect("prepared continuation");
+        let tool_request = ToolRequest {
+            id: "resume-legacy-model".to_string(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({ "model": orca_core::model::FLASH_MODEL }).to_string(),
+            ),
+        };
+
+        assert!(
+            validate_resume_overrides(
+                &tool_request,
+                &SubagentType::General,
+                Some(orca_core::model::FLASH_MODEL),
+                SubagentIsolation::None,
+                &source,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_resume_overrides(
+                &tool_request,
+                &SubagentType::General,
+                Some(orca_core::model::PRO_MODEL),
+                SubagentIsolation::None,
+                &source,
+            )
+            .unwrap_err()
+            .contains("explicit model conflicts")
+        );
     }
 }

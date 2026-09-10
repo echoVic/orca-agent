@@ -1001,7 +1001,7 @@ mod tests {
             execution_profile: crate::capability::ExecutionProfile::Workspace,
             provider: ProviderKind::DeepSeekFixture,
             verifier: None,
-            model: ModelSelection::from_unchecked(Some("deepseek-v4-flash".to_string())),
+            model: ModelSelection::from_unchecked(Some("deepseek-flash".to_string())),
             model_runtime: ModelRuntimeConfig {
                 context_window: Some(128_000),
                 auto_compact_token_limit: Some(96_000),
@@ -1038,7 +1038,7 @@ mod tests {
 
         let shown = format_config_show(&config);
 
-        assert!(shown.contains("model = \"deepseek-v4-flash\""));
+        assert!(shown.contains("model = \"deepseek-flash\""));
         assert!(shown.contains("reasoning_effort = \"max\""));
         assert!(shown.contains("model_context_window = \"128000\""));
         assert!(shown.contains("model_auto_compact_token_limit = \"96000\""));

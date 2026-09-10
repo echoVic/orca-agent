@@ -158,7 +158,7 @@ async function main() {
   writeFileSync(path.join(home, "config.toml"), "update_check = false\nauto_memory = false\n", { mode: 0o600 });
   const env = { ...process.env, ORCA_HOME: home, ORCA_API_KEY: key };
   const socket = path.join(root, "daemon.sock");
-  const daemonArgs = ["--model", "deepseek-v4-flash", "daemon", "--cwd", cwd, "--socket", socket];
+  const daemonArgs = ["--model", "deepseek-flash", "daemon", "--cwd", cwd, "--socket", socket];
   let daemon = start(daemonArgs, env);
   await waitDaemon(daemon, socket);
 

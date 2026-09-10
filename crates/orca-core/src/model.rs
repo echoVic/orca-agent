@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::subagent_types::SubagentType;
 
-pub const FLASH_MODEL: &str = "deepseek-v4-flash";
-pub const VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
+pub const FLASH_MODEL: &str = "deepseek-flash";
+pub const LEGACY_FLASH_MODEL: &str = "deepseek-v4-flash";
+pub const LEGACY_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
+/// Model used for image understanding. DeepSeek-V4.1-Flash is multimodal.
+pub const VISION_MODEL: &str = FLASH_MODEL;
 pub const PRO_MODEL: &str = "deepseek-v4-pro";
 pub const AUTO_MODEL: &str = "auto";
 
@@ -69,15 +72,29 @@ impl ModelSelection {
         if let Some(model) = value.as_deref() {
             validate_model(model)?;
         }
-        for model in models.keys() {
-            validate_model(model)?;
+        let value = value.map(|model| canonical_model_name(&model).to_string());
+        let mut canonical_models = BTreeMap::new();
+        for (model, definition) in models {
+            validate_model(&model)?;
+            let canonical = canonical_model_name(&model).to_string();
+            if let Some(existing) = canonical_models.get(&canonical)
+                && existing != &definition
+            {
+                return Err(format!(
+                    "conflicting model definitions for aliases of '{canonical}'"
+                ));
+            }
+            canonical_models.insert(canonical, definition);
         }
-        Ok(Self { value, models })
+        Ok(Self {
+            value,
+            models: canonical_models,
+        })
     }
 
     pub fn from_unchecked(value: Option<String>) -> Self {
         Self {
-            value,
+            value: value.map(|model| canonical_model_name(&model).to_string()),
             models: BTreeMap::new(),
         }
     }
@@ -91,7 +108,7 @@ impl ModelSelection {
 
     pub fn with_value_unchecked(&self, value: Option<String>) -> Self {
         Self {
-            value,
+            value: value.map(|model| canonical_model_name(&model).to_string()),
             models: self.models.clone(),
         }
     }
@@ -123,6 +140,7 @@ impl ModelSelection {
     }
 
     pub fn supports_images(&self, model: &str) -> bool {
+        let model = canonical_model_name(model);
         self.models
             .get(model)
             .and_then(|definition| definition.supports_images)
@@ -133,7 +151,7 @@ impl ModelSelection {
     pub fn route(&self, context: ModelRouteContext<'_>) -> ModelRouteDecision {
         let (actual_model, reason) = if let Some(override_model) = context.subagent_model {
             (
-                override_model.to_string(),
+                canonical_model_name(override_model).to_string(),
                 ModelRouteReason::SubagentOverride,
             )
         } else {
@@ -159,9 +177,9 @@ impl ModelSelection {
 }
 
 pub fn builtin_model_definition(model: &str) -> ModelDefinition {
-    let supports_images = match model {
-        VISION_MODEL => Some(true),
-        AUTO_MODEL | FLASH_MODEL | PRO_MODEL => Some(false),
+    let supports_images = match canonical_model_name(model) {
+        FLASH_MODEL => Some(true),
+        AUTO_MODEL | PRO_MODEL => Some(false),
         _ => None,
     };
     ModelDefinition { supports_images }
@@ -186,12 +204,24 @@ pub fn validate_model(model: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve retired first-party names to the current API model identifier.
+///
+/// DeepSeek still accepts the aliases at the API boundary, but normalizing
+/// here keeps persisted settings, cache identities, usage accounting, and UI
+/// state on one canonical model name.
+pub fn canonical_model_name(model: &str) -> &str {
+    match model {
+        LEGACY_FLASH_MODEL | LEGACY_VISION_MODEL => FLASH_MODEL,
+        _ => model,
+    }
+}
+
 /// Stable first-party presets shown by interactive model selectors.
 ///
 /// Other provider model IDs remain valid and can be supplied through config,
 /// environment variables, CLI flags, or slash commands.
 pub fn preset_models() -> &'static [&'static str] {
-    &[AUTO_MODEL, FLASH_MODEL, VISION_MODEL, PRO_MODEL]
+    &[AUTO_MODEL, FLASH_MODEL, PRO_MODEL]
 }
 
 pub fn max_context_tokens(_model: Option<&str>) -> usize {
@@ -235,11 +265,21 @@ mod tests {
     }
 
     #[test]
-    fn explicit_vision_stays_vision() {
-        let selection = ModelSelection::parse(Some(VISION_MODEL.to_string())).unwrap();
+    fn legacy_vision_alias_routes_to_canonical_flash() {
+        let selection = ModelSelection::parse(Some(LEGACY_VISION_MODEL.to_string())).unwrap();
         let decision = selection.route(context());
-        assert_eq!(decision.actual_model, VISION_MODEL);
+        assert_eq!(selection.display_name(), FLASH_MODEL);
+        assert_eq!(decision.requested_model.as_deref(), Some(FLASH_MODEL));
+        assert_eq!(decision.actual_model, FLASH_MODEL);
         assert_eq!(decision.reason, ModelRouteReason::Explicit);
+    }
+
+    #[test]
+    fn legacy_flash_alias_routes_to_canonical_flash() {
+        let selection = ModelSelection::parse(Some(LEGACY_FLASH_MODEL.to_string())).unwrap();
+        let decision = selection.route(context());
+        assert_eq!(selection.display_name(), FLASH_MODEL);
+        assert_eq!(decision.actual_model, FLASH_MODEL);
     }
 
     #[test]
@@ -269,10 +309,10 @@ mod tests {
             .route(ctx.clone());
         assert_eq!(pro.image_route, ImageRouteDecision::DescribeThenContinue);
 
-        let vision = ModelSelection::parse(Some(VISION_MODEL.to_string()))
+        let flash = ModelSelection::parse(Some(FLASH_MODEL.to_string()))
             .unwrap()
             .route(ctx);
-        assert_eq!(vision.image_route, ImageRouteDecision::Direct);
+        assert_eq!(flash.image_route, ImageRouteDecision::Direct);
     }
 
     #[test]
@@ -286,7 +326,7 @@ mod tests {
             },
         );
         models.insert(
-            VISION_MODEL.to_string(),
+            FLASH_MODEL.to_string(),
             ModelDefinition {
                 supports_images: Some(false),
             },
@@ -301,7 +341,7 @@ mod tests {
         assert_eq!(custom.image_route, ImageRouteDecision::Direct);
 
         let overridden_builtin =
-            ModelSelection::parse_with_models(Some(VISION_MODEL.to_string()), models)
+            ModelSelection::parse_with_models(Some(LEGACY_VISION_MODEL.to_string()), models)
                 .unwrap()
                 .route(ctx);
         assert_eq!(
@@ -346,9 +386,43 @@ mod tests {
 
     #[test]
     fn preset_models_are_stable() {
-        assert_eq!(
-            preset_models(),
-            &[AUTO_MODEL, FLASH_MODEL, VISION_MODEL, PRO_MODEL]
+        assert_eq!(preset_models(), &[AUTO_MODEL, FLASH_MODEL, PRO_MODEL]);
+        assert!(!preset_models().contains(&LEGACY_FLASH_MODEL));
+        assert!(!preset_models().contains(&LEGACY_VISION_MODEL));
+    }
+
+    #[test]
+    fn alias_model_definitions_are_canonicalized_and_conflicts_fail_closed() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            LEGACY_VISION_MODEL.to_string(),
+            ModelDefinition {
+                supports_images: Some(false),
+            },
+        );
+        let selection =
+            ModelSelection::parse_with_models(Some(LEGACY_FLASH_MODEL.to_string()), models)
+                .unwrap();
+        assert_eq!(selection.display_name(), FLASH_MODEL);
+        assert!(!selection.supports_images(FLASH_MODEL));
+
+        let mut conflicting = BTreeMap::new();
+        conflicting.insert(
+            LEGACY_FLASH_MODEL.to_string(),
+            ModelDefinition {
+                supports_images: Some(false),
+            },
+        );
+        conflicting.insert(
+            FLASH_MODEL.to_string(),
+            ModelDefinition {
+                supports_images: Some(true),
+            },
+        );
+        assert!(
+            ModelSelection::parse_with_models(None, conflicting)
+                .unwrap_err()
+                .contains("conflicting model definitions")
         );
     }
 
@@ -372,9 +446,10 @@ mod tests {
     }
 
     #[test]
-    fn v4_models_use_one_million_token_context_window() {
+    fn deepseek_models_use_one_million_token_context_window() {
         assert_eq!(max_context_tokens(Some(FLASH_MODEL)), 1_000_000);
-        assert_eq!(max_context_tokens(Some(VISION_MODEL)), 1_000_000);
+        assert_eq!(max_context_tokens(Some(LEGACY_FLASH_MODEL)), 1_000_000);
+        assert_eq!(max_context_tokens(Some(LEGACY_VISION_MODEL)), 1_000_000);
         assert_eq!(max_context_tokens(Some(PRO_MODEL)), 1_000_000);
         assert_eq!(max_context_tokens(Some(AUTO_MODEL)), 1_000_000);
         assert_eq!(max_context_tokens(Some("vendor/private-model")), 1_000_000);

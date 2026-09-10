@@ -27,7 +27,7 @@ use orca_provider::tool_schema::{
 use orca_provider::{ProviderConfig, call};
 use serde_json::Value;
 
-const MODEL: &str = "deepseek-v4-flash";
+const MODEL: &str = "deepseek-flash";
 const DEFAULT_URL: &str = "https://api.deepseek.com";
 const BETA_URL: &str = "https://api.deepseek.com/beta";
 const SYSTEM_PROMPT: &str = "You are Orca, a terminal coding agent. When given a multi-step task you MUST record the plan by calling the update_plan tool before writing any prose.";

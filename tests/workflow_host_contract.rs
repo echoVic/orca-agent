@@ -602,7 +602,7 @@ fn host_executes_top_level_phase_task_definitions() {
     let script = temp.path().join("workflow.js");
     fs::write(
         &script,
-        "export const meta = { name: 'dsl-test', description: 'DSL test' };\nexport const phases = [{ name: 'scan', tasks: [{ type: 'agent', description: 'scan repo', prompt: 'inspect repo', model: 'deepseek-v4-flash' }] }, { name: 'review', tasks: [{ type: 'agent', description: 'review scan', prompt: 'review previous output' }] }];",
+        "export const meta = { name: 'dsl-test', description: 'DSL test' };\nexport const phases = [{ name: 'scan', tasks: [{ type: 'agent', description: 'scan repo', prompt: 'inspect repo', model: 'deepseek-flash' }] }, { name: 'review', tasks: [{ type: 'agent', description: 'review scan', prompt: 'review previous output' }] }];",
     )
     .unwrap();
 

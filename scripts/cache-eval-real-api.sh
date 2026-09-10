@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ORCA_BIN="${ORCA_BIN:-$ROOT_DIR/target/debug/orca}"
-ORCA_MODEL="${ORCA_MODEL:-deepseek-v4-flash}"
+ORCA_MODEL="${ORCA_MODEL:-deepseek-flash}"
 ORCA_EVAL_LIMIT="${ORCA_EVAL_LIMIT:-18000}"
 ORCA_EVAL_ROWS="${ORCA_EVAL_ROWS:-700}"
 ORCA_EVAL_APPROVAL_MODE="${ORCA_EVAL_APPROVAL_MODE:-plan}"

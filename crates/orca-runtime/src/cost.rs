@@ -1,4 +1,5 @@
 use orca_core::cost_types::UsageTotals;
+use orca_core::model::{PRO_MODEL, canonical_model_name};
 use orca_core::provider_types::Usage;
 
 pub(crate) fn usd_to_micros(usd: f64) -> u64 {
@@ -75,13 +76,13 @@ impl CostTracker {
 
 impl ModelPricing {
     fn for_model(model: Option<&str>) -> Self {
-        match model.unwrap_or("") {
-            m if m.contains("v4-pro") => Self {
+        match canonical_model_name(model.unwrap_or("")) {
+            model if model == PRO_MODEL || model.contains("v4-pro") => Self {
                 input_per_million: 0.435,
                 output_per_million: 0.87,
                 cache_per_million: 0.044,
             },
-            // V4-Flash is the default and the low-cost option when the model is omitted.
+            // Flash is the default and the low-cost option when the model is omitted.
             _ => Self {
                 input_per_million: 0.14,
                 output_per_million: 0.28,
@@ -107,7 +108,7 @@ mod tests {
 
     #[test]
     fn accumulates_tokens_and_cost() {
-        let mut tracker = CostTracker::new(Some("deepseek-v4-flash"));
+        let mut tracker = CostTracker::new(Some(orca_core::model::FLASH_MODEL));
 
         let totals = tracker.add_usage(Usage {
             input_tokens: 120,
@@ -121,21 +122,21 @@ mod tests {
         // total_tokens = input + output (cache is subset of input)
         assert_eq!(totals.total_tokens(), 150);
         assert!(totals.estimated_cost_usd > 0.0);
-        // V4-Flash: (120-10)*0.14 + 10*0.014 + 30*0.28 = 110*0.14 + 0.14 + 8.4 = 15.4+0.14+8.4 = 23.94 per million
+        // Flash: (120-10)*0.14 + 10*0.014 + 30*0.28 = 23.94 per million.
         let expected = (110.0 * 0.14 + 10.0 * 0.014 + 30.0 * 0.28) / 1_000_000.0;
         assert!((totals.estimated_cost_usd - expected).abs() < 1e-12);
     }
 
     #[test]
     fn merge_accumulates_from_child_tracker() {
-        let mut parent = CostTracker::new(Some("deepseek-v4-flash"));
+        let mut parent = CostTracker::new(Some(orca_core::model::FLASH_MODEL));
         parent.add_usage(Usage {
             input_tokens: 100,
             output_tokens: 50,
             cache_tokens: 20,
         });
 
-        let mut child = CostTracker::new(Some("deepseek-v4-flash"));
+        let mut child = CostTracker::new(Some(orca_core::model::LEGACY_VISION_MODEL));
         child.add_usage(Usage {
             input_tokens: 200,
             output_tokens: 80,
@@ -152,6 +153,40 @@ mod tests {
         assert_eq!(parent.totals.cache_tokens, 50);
         assert!(
             (parent.totals.estimated_cost_usd - (parent_cost_before + child_cost)).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn retired_flash_aliases_use_canonical_flash_pricing() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_tokens: 100_000,
+        };
+        let mut canonical = CostTracker::new(Some(orca_core::model::FLASH_MODEL));
+        let mut legacy_text = CostTracker::new(Some(orca_core::model::LEGACY_FLASH_MODEL));
+        let mut legacy_vision = CostTracker::new(Some(orca_core::model::LEGACY_VISION_MODEL));
+
+        assert_eq!(
+            canonical.add_usage(usage).estimated_cost_usd,
+            legacy_text.add_usage(usage).estimated_cost_usd
+        );
+        assert_eq!(
+            canonical.totals().estimated_cost_usd,
+            legacy_vision.add_usage(usage).estimated_cost_usd
+        );
+    }
+
+    #[test]
+    fn experimental_pro_names_keep_pro_pricing() {
+        let usage = Usage {
+            input_tokens: 900_000,
+            output_tokens: 100_000,
+            cache_tokens: 200_000,
+        };
+        assert_eq!(
+            ModelPricing::for_model(Some("deepseek-v4-pro-exp")).estimate(usage),
+            ModelPricing::for_model(Some(PRO_MODEL)).estimate(usage)
         );
     }
 

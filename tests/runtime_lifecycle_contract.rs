@@ -289,7 +289,7 @@ fn task_actor_routes_model_turn_and_updates_cost_model() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
     let mut actor = RuntimeTaskActor::new(&mut lifecycle);
-    let mut cost_tracker = CostTracker::new(Some("deepseek-v4-flash"));
+    let mut cost_tracker = CostTracker::new(Some("deepseek-flash"));
     let provider_config = ProviderConfig {
         api_key: None,
         base_url: None,

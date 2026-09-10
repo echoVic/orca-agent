@@ -1179,6 +1179,97 @@ pub(crate) fn compute_continuation_compatibility_hash(
         })
 }
 
+/// Computes the compatibility identity for a new or resumed lineage.
+///
+/// New lineages always persist canonical model names. A lineage created before
+/// a model rename keeps its immutable legacy identity only when recomputing the
+/// complete legacy payload proves that no policy, tool, or workspace input
+/// changed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_resumable_model_compatibility(
+    source: Option<&PreparedContinuation>,
+    subagent_type: &SubagentType,
+    model: Option<&str>,
+    isolation: SubagentIsolation,
+    effective_cwd: &str,
+    worktree: Option<&WorktreeBinding>,
+    delegation: &DelegationSnapshot,
+    mcp_registry: &McpRegistry,
+    external_tools: &[ExternalToolConfig],
+    frozen_agent: Option<&FrozenAgentConfig>,
+) -> Result<(Option<String>, Sha256Digest), AgentContinuationError> {
+    let canonical_model = model
+        .map(orca_core::model::canonical_model_name)
+        .map(str::to_string);
+    let mut canonical_delegation = delegation.clone();
+    canonical_delegation.model = canonical_delegation
+        .model
+        .as_deref()
+        .map(orca_core::model::canonical_model_name)
+        .map(str::to_string);
+    let canonical_hash = compute_continuation_compatibility_hash(
+        subagent_type,
+        canonical_model.as_deref(),
+        isolation,
+        effective_cwd,
+        worktree,
+        &canonical_delegation,
+        mcp_registry,
+        external_tools,
+        frozen_agent,
+    )?;
+    let Some(source) = source else {
+        return Ok((canonical_model, canonical_hash));
+    };
+    let source_model = source.compatibility.model.as_deref();
+    if source_model.map(orca_core::model::canonical_model_name) != canonical_model.as_deref()
+        || source_model == canonical_model.as_deref()
+    {
+        return Ok((canonical_model, canonical_hash));
+    }
+
+    let mut legacy_delegations = vec![canonical_delegation.clone()];
+    if canonical_delegation
+        .model
+        .as_deref()
+        .map(orca_core::model::canonical_model_name)
+        == Some(orca_core::model::FLASH_MODEL)
+    {
+        for model in [
+            orca_core::model::LEGACY_FLASH_MODEL,
+            orca_core::model::LEGACY_VISION_MODEL,
+        ] {
+            if canonical_delegation.model.as_deref() != Some(model) {
+                let mut legacy = canonical_delegation.clone();
+                legacy.model = Some(model.to_string());
+                legacy_delegations.push(legacy);
+            }
+        }
+    }
+
+    for legacy_delegation in legacy_delegations {
+        let legacy_hash = compute_continuation_compatibility_hash(
+            subagent_type,
+            source_model,
+            isolation,
+            effective_cwd,
+            worktree,
+            &legacy_delegation,
+            mcp_registry,
+            external_tools,
+            frozen_agent,
+        )?;
+        if legacy_hash == source.compatibility.compatibility_hash {
+            return Ok((
+                source.compatibility.model.clone(),
+                source.compatibility.compatibility_hash,
+            ));
+        }
+    }
+
+    Ok((canonical_model, canonical_hash))
+}
+
 fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
     fn write_value(
         output: &mut Vec<u8>,
@@ -3805,6 +3896,84 @@ mod tests {
         let restored: AgentContinuationRecord = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(restored.frozen_agent, None);
         assert_eq!(serde_json::to_value(restored).unwrap(), json);
+    }
+
+    #[test]
+    fn retired_flash_alias_resume_preserves_verified_legacy_identity() {
+        let mut legacy_delegation = DelegationSnapshot {
+            model: Some(orca_core::model::LEGACY_FLASH_MODEL.to_string()),
+            ..DelegationSnapshot::default()
+        };
+        let legacy_hash = compute_continuation_compatibility_hash(
+            &SubagentType::General,
+            Some(orca_core::model::LEGACY_VISION_MODEL),
+            SubagentIsolation::None,
+            "/workspace",
+            None,
+            &legacy_delegation,
+            &McpRegistry::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let source = PreparedContinuation {
+            continuation_id: AgentContinuationId::new(),
+            attempt_id: AgentAttemptId::new(),
+            prompt_id: AgentPromptId::new(),
+            compatibility: ContinuationCompatibility {
+                subagent_type: "general".to_string(),
+                frozen_agent: None,
+                model: Some(orca_core::model::LEGACY_VISION_MODEL.to_string()),
+                isolation: SubagentIsolation::None,
+                effective_cwd: "/workspace".to_string(),
+                worktree: None,
+                compatibility_hash: legacy_hash,
+            },
+            checkpoint: None,
+            revision: ContinuationRevision::ZERO,
+            source_task_id: "task-source".to_string(),
+            latest_task_id: "task-current".to_string(),
+            parent_task_id: None,
+            terminal: None,
+        };
+        legacy_delegation.model = Some(orca_core::model::FLASH_MODEL.to_string());
+
+        let (model, hash) = compute_resumable_model_compatibility(
+            Some(&source),
+            &SubagentType::General,
+            Some(orca_core::model::FLASH_MODEL),
+            SubagentIsolation::None,
+            "/workspace",
+            None,
+            &legacy_delegation,
+            &McpRegistry::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model.as_deref(),
+            Some(orca_core::model::LEGACY_VISION_MODEL)
+        );
+        assert_eq!(hash, legacy_hash);
+
+        legacy_delegation.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+        let (model, hash) = compute_resumable_model_compatibility(
+            Some(&source),
+            &SubagentType::General,
+            Some(orca_core::model::FLASH_MODEL),
+            SubagentIsolation::None,
+            "/workspace",
+            None,
+            &legacy_delegation,
+            &McpRegistry::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(model.as_deref(), Some(orca_core::model::FLASH_MODEL));
+        assert_ne!(hash, legacy_hash);
     }
 
     fn prepared_continuation(

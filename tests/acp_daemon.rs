@@ -442,7 +442,10 @@ fn shared_load_and_settings_reject_workspace_scope_and_policy_escalation() {
     let response = owner.request(
         5,
         "session/set_model",
-        json!({"sessionId":session,"modelId":"deepseek-v4-flash"}),
+        json!({
+            "sessionId": session,
+            "modelId": orca_core::model::LEGACY_VISION_MODEL,
+        }),
     );
     assert!(response.get("result").is_some(), "{response}");
     let response = owner.request(
@@ -461,7 +464,7 @@ fn shared_load_and_settings_reject_workspace_scope_and_policy_escalation() {
     assert!(
         options
             .iter()
-            .any(|option| option["id"] == "model" && option["currentValue"] == "deepseek-v4-flash")
+            .any(|option| option["id"] == "model" && option["currentValue"] == "deepseek-flash")
     );
     drop(attacker);
     drop(owner);

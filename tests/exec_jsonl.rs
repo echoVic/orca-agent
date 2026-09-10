@@ -338,7 +338,7 @@ fn exec_auto_model_routes_any_prompt_to_pro() {
 }
 
 #[test]
-fn exec_explicit_model_disables_auto_route() {
+fn exec_retired_flash_alias_routes_as_canonical_flash() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -360,8 +360,8 @@ fn exec_explicit_model_disables_auto_route() {
         .iter()
         .find(|event| event["type"] == "model.routed")
         .expect("model routed event");
-    assert_eq!(routed["payload"]["requested_model"], "deepseek-v4-flash");
-    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-flash");
+    assert_eq!(routed["payload"]["requested_model"], "deepseek-flash");
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-flash");
     assert_eq!(routed["payload"]["reason"], "explicit");
 }
 
@@ -373,7 +373,7 @@ fn exec_config_layers_respect_project_env_and_cli_precedence() {
     std::fs::write(
         home.path().join("config.toml"),
         r#"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 mode = "suggest"
 "#,
     )
@@ -389,7 +389,7 @@ mode = "auto-edit"
 
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
-        .env("ORCA_MODEL", "deepseek-v4-flash")
+        .env("ORCA_MODEL", "deepseek-flash")
         .env("ORCA_MODE", "full-auto")
         .args([
             "exec",

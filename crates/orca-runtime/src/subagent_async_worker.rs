@@ -31,11 +31,13 @@ use orca_core::tool_types;
 use crate::agent_child::{
     ChildAgentExecutor, ChildAgentRequest, ChildAgentRuntime, ChildAgentRuntimeContext,
 };
+#[cfg(test)]
+use crate::agent_continuation::compute_continuation_compatibility_hash;
 use crate::agent_continuation::{
     AgentContinuationId, AgentPromptId, AgentTerminal, ChildAgentCoordinator,
     ContinuationCompatibility, ContinuationLease, ContinuationProjection, ContinuationRevision,
     CreateContinuationInput, PreparedContinuation, ResumeContinuationInput, WorktreeBinding,
-    compute_continuation_compatibility_hash,
+    compute_resumable_model_compatibility,
 };
 use crate::agent_loop::execute_child_agent_loop;
 use crate::child_agent_types::{
@@ -955,18 +957,20 @@ pub(crate) fn launch_async_subagent(
             repo_root: worktree.repo_root.display().to_string(),
             path: worktree.path.display().to_string(),
         });
-    let compatibility_hash = match compute_continuation_compatibility_hash(
+    let effective_cwd = launch_worktree.child_cwd.display().to_string();
+    let (compatibility_model, compatibility_hash) = match compute_resumable_model_compatibility(
+        source.as_ref(),
         &request.subagent_type,
         request.model.as_deref(),
         request.isolation,
-        &launch_worktree.child_cwd.display().to_string(),
+        &effective_cwd,
         worktree_binding.as_ref(),
         &delegation,
         &mcp_registry,
         &child_config.external_tools,
         request.frozen_agent.as_ref(),
     ) {
-        Ok(hash) => hash,
+        Ok(compatibility) => compatibility,
         Err(error) => {
             let worktree = launch_worktree.finish_fresh();
             let mut error = continuation_error("failed to compute async compatibility", &error);
@@ -983,9 +987,9 @@ pub(crate) fn launch_async_subagent(
         subagent_type: serialized_subagent_type(&request.subagent_type)
             .unwrap_or_else(|| "general".to_string()),
         frozen_agent: request.frozen_agent.clone(),
-        model: request.model.clone(),
+        model: compatibility_model,
         isolation: request.isolation,
-        effective_cwd: launch_worktree.child_cwd.display().to_string(),
+        effective_cwd,
         worktree: worktree_binding,
         compatibility_hash,
     };
@@ -1687,7 +1691,7 @@ mod tests {
             request.allowed_tools.as_ref().unwrap(),
             &vec!["read_file".to_string()]
         );
-        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-flash"));
         let mut setup = crate::child_agent_loop_setup::try_prepare_child_agent_loop(
             config,
             request,
@@ -1727,7 +1731,7 @@ mod tests {
         let _home = crate::history::redirect_test_orca_home(home.path());
         std::fs::create_dir(home.path().join("agents")).unwrap();
         let definition_path = home.path().join("agents/audit.md");
-        std::fs::write(&definition_path, "---\nname: audit\ndescription: Inspect files\ntools: [read_file]\nmodel: deepseek-v4-flash\n---\nFrozen worker instructions.\n").unwrap();
+        std::fs::write(&definition_path, "---\nname: audit\ndescription: Inspect files\ntools: [read_file]\nmodel: deepseek-flash\n---\nFrozen worker instructions.\n").unwrap();
         let config = async_test_config(cwd.path().to_path_buf());
         let mut request = subagent::create_subagent_request(&ToolRequest {
             id: "custom-async".into(), name: ToolName::Subagent, action: ActionKind::Agent,

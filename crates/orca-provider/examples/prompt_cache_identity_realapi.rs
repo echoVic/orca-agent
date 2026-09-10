@@ -36,7 +36,7 @@ fn main() {
     let config = ProviderConfig {
         api_key: Some(api_key),
         base_url: None,
-        model: Some("deepseek-v4-flash".to_string()),
+        model: Some("deepseek-flash".to_string()),
         reasoning_effort: orca_core::config::ReasoningEffort::Max,
         tools_override: Some(Vec::new()),
         mcp_registry: None,

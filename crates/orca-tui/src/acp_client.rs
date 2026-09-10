@@ -1071,7 +1071,10 @@ async fn control_request(
                     None => {
                         orca_core::model::validate_model(&value)
                             .map_err(|error| error.to_string())?;
-                        (value, None)
+                        (
+                            orca_core::model::canonical_model_name(&value).to_string(),
+                            None,
+                        )
                     }
                 };
                 agent
@@ -2518,6 +2521,7 @@ mod tests {
                 peer.send(json!({"jsonrpc": "2.0", "id": reasoning["id"], "result": {"configOptions": []}})).await;
                 let denied = peer.recv().await;
                 assert_eq!(denied["method"], "session/set_model");
+                assert_eq!(denied["params"]["modelId"], orca_core::model::FLASH_MODEL);
                 peer.send(json!({"jsonrpc": "2.0", "id": denied["id"],
                     "error": agent_client_protocol::Error::invalid_request().data("settings lease denied")
                 })).await;
@@ -2530,7 +2534,7 @@ mod tests {
             control_request(connection.agent.as_ref(), SessionId::new(SESSION),
                 UserAction::SetModel(intent)).await.unwrap();
             let error = control_request(connection.agent.as_ref(), SessionId::new(SESSION),
-                UserAction::SetModel("deepseek-v4-pro".into())).await.unwrap_err();
+                UserAction::SetModel(orca_core::model::LEGACY_FLASH_MODEL.into())).await.unwrap_err();
             assert!(error.contains("settings lease denied"));
             let mut renderer = Renderer::new();
             renderer.state.enter_running();

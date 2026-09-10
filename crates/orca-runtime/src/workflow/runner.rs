@@ -34,7 +34,7 @@ use crate::agent_continuation::{
     AgentContinuationError, AgentContinuationId, AgentPromptId, AgentTerminal,
     ChildAgentCoordinator, ContinuationCompatibility, ContinuationProjection,
     CreateContinuationInput, PreparedContinuation, ResumeContinuationInput, WorktreeBinding,
-    compute_continuation_compatibility_hash,
+    compute_resumable_model_compatibility,
 };
 use crate::agent_loop::execute_child_agent_loop;
 use crate::child_agent_types::{ChildAgentCompatibilityIdentity, ChildAgentContinuationStart};
@@ -1763,18 +1763,20 @@ impl WorkflowRunner {
         let (workflow_child_config, mcp_registry) =
             Self::workflow_child_runtime_parts(&self.config, &self.delegation);
         let effective_model = workflow_child_config.model.as_option();
-        let compatibility_hash = match compute_continuation_compatibility_hash(
+        let effective_cwd = child_cwd.display().to_string();
+        let (compatibility_model, compatibility_hash) = match compute_resumable_model_compatibility(
+            source.as_ref(),
             &SubagentType::General,
             effective_model.as_deref(),
             isolation,
-            &child_cwd.display().to_string(),
+            &effective_cwd,
             worktree_binding.as_ref(),
             &self.delegation,
             &mcp_registry,
             &workflow_child_config.external_tools,
             None,
         ) {
-            Ok(hash) => hash,
+            Ok(compatibility) => compatibility,
             Err(error) => {
                 let mut message =
                     continuation_error("failed to compute workflow compatibility", &error);
@@ -1787,9 +1789,9 @@ impl WorkflowRunner {
         let compatibility = ContinuationCompatibility {
             subagent_type: "general".to_string(),
             frozen_agent: None,
-            model: effective_model,
+            model: compatibility_model,
             isolation,
-            effective_cwd: child_cwd.display().to_string(),
+            effective_cwd,
             worktree: worktree_binding,
             compatibility_hash,
         };
@@ -2952,7 +2954,7 @@ mod tests {
                 "/captured-extra",
                 "workflow",
             ));
-        config.model = ModelSelection::parse(Some("deepseek-v4-flash".to_string())).unwrap();
+        config.model = ModelSelection::parse(Some("deepseek-flash".to_string())).unwrap();
         let delegation = DelegationSnapshot::from_config(&config);
 
         config.approval_mode = ApprovalMode::FullAuto;
@@ -2975,7 +2977,7 @@ mod tests {
         );
         assert_eq!(child_config.permission_rules.rules.len(), 1);
         assert_eq!(child_config.additional_working_directories.len(), 1);
-        assert_eq!(child_config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(child_config.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(child_config.output_format, OutputFormat::Jsonl);
     }
 

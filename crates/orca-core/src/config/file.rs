@@ -650,11 +650,11 @@ mod tests {
     #[test]
     fn parse_full_config() {
         let toml = r#"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 base_url = "https://custom.api.com"
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(config.base_url.as_deref(), Some("https://custom.api.com"));
     }
 
@@ -909,9 +909,9 @@ extends = ":read-only"
 
     #[test]
     fn parse_partial_config() {
-        let toml = r#"model = "deepseek-v4-flash""#;
+        let toml = r#"model = "deepseek-flash""#;
         let config: FileConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-flash"));
         assert!(config.api_key.is_none());
         assert!(config.base_url.is_none());
     }
@@ -1347,7 +1347,7 @@ shell_timeout_secs = 77
         std::fs::write(
             &project_path,
             r#"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 mode = "full-auto"
 api_key = "sk-project"
 base_url = "https://project.example"
@@ -1373,7 +1373,7 @@ decision = "allow"
 
         let config = load_layered_config_from_paths(&user_path, &project_dir);
 
-        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(
             config.mode,
             Some(crate::approval_types::ApprovalMode::Suggest)
@@ -1412,7 +1412,7 @@ enabled = false
         std::fs::write(
             project_dir.join(".orca/config.toml"),
             r#"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 mode = "full-auto"
 
 [[permissions.rules]]
@@ -1443,7 +1443,7 @@ enabled = true
 
         let config = load_layered_config_from_paths(&user_path, &project_dir);
 
-        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(
             config.mode,
             Some(crate::approval_types::ApprovalMode::Suggest)
@@ -1477,7 +1477,7 @@ decision = "deny"
         std::fs::write(
             project_dir.join(".orca/config.toml"),
             r#"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 
 [[permissions.rules]]
 tool = "bash"
@@ -1497,7 +1497,7 @@ decision = "allow"
     #[test]
     fn env_and_cli_layers_override_files_in_priority_order() {
         let base = FileConfig {
-            model: Some("deepseek-v4-flash".to_string()),
+            model: Some("deepseek-flash".to_string()),
             mode: Some(crate::approval_types::ApprovalMode::Suggest),
             api_key: Some("sk-file".to_string()),
             ..Default::default()

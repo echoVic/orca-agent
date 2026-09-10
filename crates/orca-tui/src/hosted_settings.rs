@@ -15,7 +15,9 @@ pub(crate) fn settings_intent_patches(
 ) -> Vec<orca_runtime::surface::RuntimeSettingsPatch> {
     let mut patches = Vec::new();
     if let Some(model) = intent.model
-        && let Ok(model) = orca_runtime::surface::NonEmptyText::try_new(model)
+        && let Ok(model) = orca_runtime::surface::NonEmptyText::try_new(
+            orca_core::model::canonical_model_name(&model).to_string(),
+        )
     {
         patches.push(orca_runtime::surface::RuntimeSettingsPatch::SetModel { model });
     }
@@ -236,7 +238,7 @@ mod tests {
     #[test]
     fn settings_intent_preserves_model_reasoning_approval_patch_order() {
         let patches = super::settings_intent_patches(SettingsIntent {
-            model: Some("deepseek-chat".to_string()),
+            model: Some(orca_core::model::LEGACY_VISION_MODEL.to_string()),
             reasoning_effort: Some(ReasoningEffort::High),
             approval_mode: Some(ApprovalMode::Plan),
         });
@@ -251,7 +253,7 @@ mod tests {
                 RuntimeSettingsPatch::SetApprovalMode {
                     mode: SurfaceApprovalMode::Plan
                 }
-            ] if model.as_str() == "deepseek-chat"
+            ] if model.as_str() == orca_core::model::FLASH_MODEL
         ));
     }
 
@@ -286,7 +288,8 @@ mod tests {
             &event_tx,
             vec![
                 RuntimeSettingsPatch::SetModel {
-                    model: NonEmptyText::try_new("deepseek-chat").expect("model"),
+                    model: NonEmptyText::try_new(orca_core::model::LEGACY_FLASH_MODEL)
+                        .expect("model"),
                 },
                 RuntimeSettingsPatch::SetReasoning {
                     effort: SurfaceReasoningEffort::Low,
@@ -298,7 +301,7 @@ mod tests {
         ));
 
         let config = config.lock().expect("config");
-        assert_eq!(config.model.display_name(), "deepseek-chat");
+        assert_eq!(config.model.display_name(), orca_core::model::FLASH_MODEL);
         assert_eq!(config.reasoning_effort, ReasoningEffort::Low);
         assert_eq!(config.approval_mode, ApprovalMode::FullAuto);
         drop(config);
@@ -308,7 +311,7 @@ mod tests {
                 model,
                 reasoning_effort: ReasoningEffort::Low,
                 approval_mode: ApprovalMode::FullAuto,
-            }) if model == "deepseek-chat"
+            }) if model == orca_core::model::FLASH_MODEL
         ));
         assert!(event_rx.try_recv().is_err());
     }

@@ -99,7 +99,7 @@ fn run() -> Result<(), String> {
         base_url: std::env::var("ORCA_BASE_URL")
             .ok()
             .or_else(|| std::env::var("DEEPSEEK_BASE_URL").ok()),
-        model: Some("deepseek-v4-flash".to_string()),
+        model: Some("deepseek-flash".to_string()),
         reasoning_effort: ReasoningEffort::Max,
         tools_override: Some(Vec::new()),
         mcp_registry: None,

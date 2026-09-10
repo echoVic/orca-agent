@@ -99,7 +99,7 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         env = {
             "DEEPSEEK_API_KEY": _load_api_key(),
             "ORCA_BASE_URL": os.environ.get("ORCA_BASE_URL", "https://api.deepseek.com"),
-            "ORCA_MODEL": os.environ.get("ORCA_MODEL", "deepseek-v4-flash"),
+            "ORCA_MODEL": os.environ.get("ORCA_MODEL", "deepseek-flash"),
         }
 
         budget_flags = []

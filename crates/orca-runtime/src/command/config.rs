@@ -166,6 +166,23 @@ mod tests {
     }
 
     #[test]
+    fn assembles_retired_flash_alias_as_canonical_flash() {
+        let file = FileConfig {
+            model: Some(orca_core::model::LEGACY_VISION_MODEL.to_string()),
+            ..FileConfig::default()
+        };
+
+        let config = assemble_run_config(
+            RunConfigRequest::new("0.3.4", PathBuf::from("/workspace")),
+            file,
+        )
+        .expect("assemble config");
+
+        assert_eq!(config.model.as_deref(), Some(orca_core::model::FLASH_MODEL));
+        assert!(config.model.supports_images(orca_core::model::FLASH_MODEL));
+    }
+
+    #[test]
     fn assembles_shared_run_config_without_losing_launch_fields() {
         let file = FileConfig {
             mode: Some(ApprovalMode::Plan),
