@@ -103,13 +103,16 @@ impl OutputArchive {
         }
         prepare_directory(root)?;
         let root = fs::canonicalize(root)?;
-        let directory = open_directory(&root)?;
+        let directory = open_directory(&root)
+            .map_err(|error| io_context("open task output archive directory", error))?;
         let lock_path = root.join("owner.lock");
-        let owner_file = private_file(&lock_path)?;
+        let owner_file = private_file(&lock_path)
+            .map_err(|error| io_context("open task output archive owner file", error))?;
         let owner = ExclusiveFileLock::try_acquire_file(&lock_path, owner_file)
             .map_err(|error| io::Error::other(format!("task output archive owner: {error}")))?;
         let path = root.join(DATABASE);
-        let database = private_file(&path)?;
+        let database = private_file(&path)
+            .map_err(|error| io_context("open task output archive database", error))?;
         check_sidecars(&root)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -695,16 +698,22 @@ fn private_file(path: &Path) -> io::Result<File> {
 
 fn open_directory(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x02000000 | 0x00200000);
+        // Directory handles require backup semantics. Requesting only
+        // FILE_READ_ATTRIBUTES avoids GENERIC_READ failures on runner volumes.
+        options
+            .access_mode(0x0000_0080)
+            .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+            .custom_flags(0x0200_0000 | 0x0020_0000);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     options.open(path)
 }
@@ -779,6 +788,10 @@ fn check_sidecars(root: &Path) -> io::Result<()> {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn io_context(operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
 
 fn missing() -> io::Error {
