@@ -7,10 +7,10 @@ terminal-output pages, file-defined agents, and shared ACP daemon sessions.
 Product contracts are maintained in [the compaction report](2026-09-09-cache-aware-compaction.md),
 [ADR 0006](../architecture/adr/0006-unified-exec-terminal-service.md),
 [subagents](../subagents.md), and [ACP sessions](../acp-daemon.md).
-No provider abstraction or worktree was created. Changes are split into logical
-commits on local branch `feat/deepseek-agent-capabilities`; no remote push or
-release was performed. The initial user commits `028746cb` and `33c165c5`
-remain intact.
+No provider abstraction or worktree was created. Changes were split into logical
+commits, fast-forwarded into local `main`, and the merged feature branch was
+removed. No remote push or release was performed. The initial user commits
+`028746cb` and `33c165c5` remain intact.
 
 ## Verification Environment
 
@@ -232,8 +232,8 @@ contracts exercise production processes and are recorded separately above.
 All three feature requirements have passing targeted and real-provider
 acceptance. Final provider, ACP and parent-restart checks passed again after
 lint cleanup. The known broad gate failures prevent treating this report as
-release approval. Changes are committed locally and unpublished at version
-0.4.26.
+release approval. Changes are committed on local `main` and unpublished at
+version 0.4.26.
 All registered temporary test roots and the coordinator state were removed
 after the commands settled. The user's original Orca process, configuration,
 sessions and commits were preserved.
