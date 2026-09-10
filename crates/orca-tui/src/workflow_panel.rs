@@ -570,10 +570,12 @@ impl AppState {
     pub(crate) fn apply_background_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         if self.conversation_target().task_id().is_some() {
             self.background_workflow_tasks = tasks.clone();
-            self.apply_workflow_tasks_update(crate::state_reducer::merge_background_task_snapshots(
-                &tasks,
-                &self.focused_workflow_tasks,
-            ));
+            self.apply_workflow_tasks_update(
+                crate::state_reducer::merge_background_task_snapshots(
+                    &tasks,
+                    &self.focused_workflow_tasks,
+                ),
+            );
             return;
         }
         self.background_workflow_tasks = tasks.clone();

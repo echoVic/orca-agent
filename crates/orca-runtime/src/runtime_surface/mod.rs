@@ -154,8 +154,8 @@ pub use identity::{
 };
 
 pub use ingress::{
-    RuntimeProviderResponseIngress, RuntimeSubagentActivityIngress, RuntimeWorkflowFinished,
-    RuntimeWorkflowAgentProgress, RuntimeWorkflowIngressReceipt, RuntimeWorkflowLifecycleIngress,
+    RuntimeProviderResponseIngress, RuntimeSubagentActivityIngress, RuntimeWorkflowAgentProgress,
+    RuntimeWorkflowFinished, RuntimeWorkflowIngressReceipt, RuntimeWorkflowLifecycleIngress,
     RuntimeWorkflowOutcome, RuntimeWorkflowProgress, RuntimeWorkflowProgressIngress,
     RuntimeWorkflowStarted,
 };
