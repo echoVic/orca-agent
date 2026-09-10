@@ -1271,8 +1271,9 @@ fn submission_rejection_removes_optimistic_user_and_returns_idle() {
     assert_eq!(state.status, AppStatus::Idle);
     assert!(matches!(
         state.transcript.messages.as_slice(),
-        [ChatMessage::Assistant(before), ChatMessage::Error(error)]
-            if before == "before" && error == "bound file is no longer available"
+        [ChatMessage::Assistant(before), ChatMessage::Diagnostic(diagnostic)]
+            if before == "before"
+                && diagnostic.detail() == "bound file is no longer available"
     ));
     assert!(state.mention_bindings.is_empty());
     assert_eq!(state.running_started_at, None);
@@ -1292,7 +1293,8 @@ fn generic_error_does_not_end_a_running_turn() {
     assert!(state.running_started_at.is_some());
     assert!(matches!(
         state.transcript.messages.last(),
-        Some(ChatMessage::Error(message)) if message == "recoverable runtime error"
+        Some(ChatMessage::Diagnostic(diagnostic))
+            if diagnostic.detail() == "recoverable runtime error"
     ));
 }
 
@@ -1312,8 +1314,56 @@ fn failed_terminal_keeps_runtime_error_visible_and_returns_idle() {
     assert_eq!(state.running_started_at, None);
     assert!(matches!(
         state.transcript.messages.last(),
-        Some(ChatMessage::Error(message))
-            if message == "DeepSeek provider error: 503 Service Unavailable"
+        Some(ChatMessage::Diagnostic(diagnostic))
+            if diagnostic.code() == "provider.failed"
+                && diagnostic.detail() == "DeepSeek provider error: 503 Service Unavailable"
+    ));
+    assert_eq!(
+        state
+            .transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, ChatMessage::Diagnostic(_)))
+            .count(),
+        1,
+        "terminal fallback must not duplicate an earlier diagnostic"
+    );
+}
+
+#[test]
+fn failed_terminal_without_an_error_explains_the_missing_diagnostic() {
+    let mut state = state();
+    state.push_message(ChatMessage::User("run it".to_string()));
+    state.enter_running();
+
+    state.update(TuiEvent::SessionCompleted {
+        status: "failed".to_string(),
+    });
+
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::Diagnostic(diagnostic))
+            if diagnostic.code() == "runtime.missing_diagnostic"
+                && diagnostic.detail().contains("without an accompanying cause")
+                && diagnostic.action().is_some()
+    ));
+}
+
+#[test]
+fn cancelled_terminal_without_an_error_explains_the_stop() {
+    let mut state = state();
+    state.push_message(ChatMessage::User("run it".to_string()));
+    state.enter_running();
+
+    state.update(TuiEvent::SessionCompleted {
+        status: "cancelled".to_string(),
+    });
+
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::Diagnostic(diagnostic))
+            if diagnostic.code() == "operation.cancelled"
+                && diagnostic.level() == crate::diagnostics::DiagnosticLevel::Info
     ));
 }
 
@@ -1330,7 +1380,8 @@ fn operation_rejection_reports_error_and_returns_idle() {
     assert_eq!(state.running_started_at, None);
     assert!(matches!(
         state.transcript.messages.last(),
-        Some(ChatMessage::Error(message)) if message == "operation could not start"
+        Some(ChatMessage::Diagnostic(diagnostic))
+            if diagnostic.detail() == "operation could not start"
     ));
 }
 
@@ -2416,7 +2467,7 @@ fn clearing_receiving_progress_preserves_finalized_prefix_boundaries() {
     }
     assert!(matches!(
         state.transcript.messages[1],
-        ChatMessage::Error(_)
+        ChatMessage::Diagnostic(_)
     ));
 }
 

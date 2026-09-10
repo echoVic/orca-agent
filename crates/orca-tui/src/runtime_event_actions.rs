@@ -330,9 +330,11 @@ mod tests {
         assert_eq!(state.pending_pastes, pending_pastes);
         assert!(state.user_input_dialog.is_none());
         assert!(!vim.has_pending_command_for_test());
-        assert!(state.transcript.messages.iter().any(
-            |message| matches!(message, ChatMessage::Error(text) if text == "runtime unavailable")
-        ));
+        assert!(state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Diagnostic(diagnostic)
+                if diagnostic.detail() == "runtime unavailable"
+        )));
     }
 
     #[test]
@@ -435,11 +437,10 @@ mod tests {
         assert!(state.interaction.pending_submission.is_none());
         assert!(state.interaction.pending_input.is_none());
         assert_eq!(textarea_text(&textarea), "");
-        assert!(
-            !state.transcript.messages.iter().any(
-                |message| matches!(message, ChatMessage::Error(text) if text == "late failure")
-            )
-        );
+        assert!(!state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Diagnostic(diagnostic) if diagnostic.detail() == "late failure"
+        )));
     }
 
     #[test]
@@ -485,9 +486,10 @@ mod tests {
             Some(crate::protocol::PendingTuiInput::UserInput(actual)) if actual == &new_key
         ));
         assert!(state.interaction.pending_submission.is_none());
-        assert!(!state.transcript.messages.iter().any(
-            |message| matches!(message, ChatMessage::Error(text) if text == "late old failure")
-        ));
+        assert!(!state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Diagnostic(diagnostic) if diagnostic.detail() == "late old failure"
+        )));
     }
 
     #[test]
@@ -522,9 +524,10 @@ mod tests {
         );
 
         assert_eq!(state.status, AppStatus::Idle);
-        assert!(state.transcript.messages.iter().any(
-            |message| matches!(message, ChatMessage::Error(text) if text == "approval failed")
-        ));
+        assert!(state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Diagnostic(diagnostic) if diagnostic.detail() == "approval failed"
+        )));
     }
 
     fn notification_message(event: &TuiEvent, state: &AppState) -> Option<TerminalNotification> {

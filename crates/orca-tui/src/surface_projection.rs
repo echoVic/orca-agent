@@ -1465,10 +1465,10 @@ impl TuiSurfaceProjection {
             .and_then(|record| operation_terminal_status(&record.terminal))
     }
 
-    pub(crate) fn terminal_error_for_operation(
+    pub(crate) fn terminal_diagnostic_for_operation(
         &self,
         operation_id: &SurfaceOperationId,
-    ) -> Option<String> {
+    ) -> Option<crate::diagnostics::TuiDiagnostic> {
         let snapshot = self.reducer_state.as_ref()?.snapshot();
         snapshot
             .foreground_operation
@@ -1477,7 +1477,9 @@ impl TuiSurfaceProjection {
             .chain(snapshot.operation_history.iter())
             .find(|operation| &operation.operation_id == operation_id)
             .and_then(|operation| operation.terminal.as_ref())
-            .and_then(|record| operation_terminal_error(&record.terminal))
+            .and_then(|record| {
+                crate::diagnostics::TuiDiagnostic::from_surface_terminal(&record.terminal)
+            })
     }
 
     pub(crate) fn background_task_summary_for_operation(
@@ -1945,8 +1947,8 @@ fn tool_result_status(kind: SurfaceToolResultKind) -> &'static str {
 
 pub(crate) fn operation_terminal_events(terminal: &OperationTerminal) -> Vec<TuiEvent> {
     let mut events = Vec::with_capacity(2);
-    if let Some(message) = operation_terminal_error(terminal) {
-        events.push(TuiEvent::Error(message));
+    if let Some(diagnostic) = crate::diagnostics::TuiDiagnostic::from_surface_terminal(terminal) {
+        events.push(TuiEvent::Diagnostic(diagnostic));
     }
     if let Some(status) = operation_terminal_status(terminal) {
         events.push(TuiEvent::SessionCompleted {
@@ -1956,34 +1958,33 @@ pub(crate) fn operation_terminal_events(terminal: &OperationTerminal) -> Vec<Tui
     events
 }
 
-fn operation_terminal_error(terminal: &OperationTerminal) -> Option<String> {
-    match terminal {
-        OperationTerminal::Failed { message, .. }
-        | OperationTerminal::Panicked { message }
-        | OperationTerminal::JoinFailed { message } => {
-            let message = message.as_str();
-            Some(if message.is_empty() {
-                "Operation failed.".to_string()
-            } else {
-                message.to_string()
-            })
-        }
-        OperationTerminal::AbortedByRuntimeRestart { .. } => {
-            Some("Operation aborted because the runtime restarted.".to_string())
-        }
-        OperationTerminal::BudgetExhausted { .. } => {
-            Some("Operation stopped because its budget was exhausted.".to_string())
-        }
-        OperationTerminal::NotAdmitted { .. } => {
-            Some("Operation could not be admitted by the runtime.".to_string())
-        }
-        OperationTerminal::Succeeded { .. }
-        | OperationTerminal::Cancelled { .. }
-        | OperationTerminal::Shutdown { .. } => None,
+pub(crate) fn latest_terminal_diagnostic(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+) -> Option<crate::diagnostics::TuiDiagnostic> {
+    if snapshot
+        .foreground_operation
+        .as_ref()
+        .is_some_and(|operation| operation.terminal.is_none())
+    {
+        return None;
     }
+    snapshot
+        .foreground_operation
+        .as_ref()
+        .and_then(|operation| operation.terminal.as_ref())
+        .or_else(|| {
+            snapshot
+                .operation_history
+                .iter()
+                .rev()
+                .find_map(|operation| operation.terminal.as_ref())
+        })
+        .and_then(|record| {
+            crate::diagnostics::TuiDiagnostic::from_surface_terminal(&record.terminal)
+        })
 }
 
-fn operation_terminal_status(terminal: &OperationTerminal) -> Option<&'static str> {
+pub(crate) fn operation_terminal_status(terminal: &OperationTerminal) -> Option<&'static str> {
     match terminal {
         OperationTerminal::Succeeded { .. } => Some("success"),
         OperationTerminal::Cancelled { .. } => Some("cancelled"),
@@ -3275,8 +3276,9 @@ mod tests {
 
         assert!(matches!(
             events.as_slice(),
-            [TuiEvent::Error(message), TuiEvent::SessionCompleted { status }]
-                if message == "DeepSeek provider error: 503 Service Unavailable"
+            [TuiEvent::Diagnostic(diagnostic), TuiEvent::SessionCompleted { status }]
+                if diagnostic.code() == "provider.failed"
+                    && diagnostic.detail() == "DeepSeek provider error: 503 Service Unavailable"
                     && status == "failed"
         ));
     }

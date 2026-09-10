@@ -461,6 +461,9 @@ pub(crate) fn hosted_projection_batch_from_snapshot(
     {
         messages = attach_history_images(messages, &transcript.messages);
     }
+    if let Some(diagnostic) = crate::surface_projection::latest_terminal_diagnostic(snapshot) {
+        messages.push(ChatMessage::Diagnostic(diagnostic));
+    }
     (projection, messages)
 }
 

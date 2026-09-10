@@ -23,6 +23,7 @@ mod composer_images;
 mod composer_input_actions;
 mod composer_textarea;
 mod config_dialog_actions;
+mod diagnostics;
 pub mod diff;
 mod diff_highlight;
 mod display_text;

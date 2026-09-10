@@ -87,18 +87,53 @@ fn state(
     phase: &str,
     active: bool,
 ) -> Result<(), ()> {
+    state_with_terminal(sender, id, phase, active, None)
+}
+
+fn state_with_terminal(
+    sender: &AcpNotificationSender,
+    id: &SessionId,
+    phase: &str,
+    active: bool,
+    terminal: Option<&crate::surface::OperationTerminal>,
+) -> Result<(), ()> {
     if matches!(sender, AcpNotificationSender::Standard(_)) {
         return Ok(());
+    }
+    let mut projection = json!({"version": 1, "phase": phase, "active": active});
+    if let Some(terminal) = terminal {
+        projection["terminal"] =
+            serde_json::to_value(terminal).expect("surface terminal serializes");
+        let outcome = super::agent::terminal_to_stop_reason(terminal);
+        projection["stopReason"] =
+            serde_json::to_value(outcome.as_ref().ok()).expect("ACP stop reason serializes");
+        projection["error"] =
+            serde_json::to_value(outcome.err()).expect("ACP terminal error serializes");
     }
     sender.send(
         SessionNotification::new(
             id.clone(),
             SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new()),
         )
-        .meta(metadata(
-            json!({"version": 1, "phase": phase, "active": active}),
-        )),
+        .meta(metadata(projection)),
     )
+}
+
+fn latest_terminal(
+    snapshot: &crate::surface::SurfaceSnapshot,
+) -> Option<&crate::surface::OperationTerminal> {
+    snapshot
+        .foreground_operation
+        .as_ref()
+        .and_then(|operation| operation.terminal.as_ref())
+        .or_else(|| {
+            snapshot
+                .operation_history
+                .iter()
+                .rev()
+                .find_map(|operation| operation.terminal.as_ref())
+        })
+        .map(|record| &record.terminal)
 }
 
 impl Observer {
@@ -163,7 +198,12 @@ impl Observer {
                         streams.insert(stream.stream_id.clone(), stream.clone());
                     }
                 }
-                if state(&sender, &id, "ready", active).is_err() {
+                let restored_terminal = if active {
+                    None
+                } else {
+                    latest_terminal(snapshot)
+                };
+                if state_with_terminal(&sender, &id, "ready", active, restored_terminal).is_err() {
                     let _ = ready_tx.send(Err("observer disconnected"));
                     return;
                 }
@@ -256,22 +296,12 @@ impl Observer {
                                 if matches!(sender, AcpNotificationSender::Standard(_)) {
                                     Ok(())
                                 } else {
-                                    let outcome =
-                                        super::agent::terminal_to_stop_reason(&record.terminal);
-                                    sender.send(
-                                        SessionNotification::new(
-                                            id.clone(),
-                                            SessionUpdate::SessionInfoUpdate(
-                                                SessionInfoUpdate::new(),
-                                            ),
-                                        )
-                                        .meta(metadata(
-                                            json!({
-                                                "version": 1, "phase": "terminal", "active": false,
-                                                "stopReason": outcome.as_ref().ok(),
-                                                "error": outcome.err(),
-                                            }),
-                                        )),
+                                    state_with_terminal(
+                                        &sender,
+                                        &id,
+                                        "terminal",
+                                        false,
+                                        Some(&record.terminal),
                                     )
                                 }
                             }

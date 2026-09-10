@@ -24,6 +24,7 @@ use orca_runtime::history::{SessionSummary, StoredSessionHealth};
 use orca_runtime::surface::{TaskTranscriptItem, TaskTranscriptToolStatus};
 
 use crate::agent_workspace::AgentWorkspaceRow;
+use crate::diagnostics::{DiagnosticContext, DiagnosticLevel, TuiDiagnostic};
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::protocol::TaskTranscriptResult;
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
@@ -771,10 +772,11 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
 
     if let Some(error) = state.session_picker_error.as_deref() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            error,
-            Style::default().fg(theme.error),
-        )));
+        append_diagnostic_lines(
+            &mut lines,
+            &TuiDiagnostic::from_message(DiagnosticContext::Operation, error),
+            theme,
+        );
     }
 
     match &state.session_picker_phase {
@@ -2626,11 +2628,14 @@ fn append_message_lines(
             append_archived_plan_lines(lines, explanation.as_deref(), plan, width, theme);
         }
         ChatMessage::Error(text) => {
-            lines.push(Line::from(Span::styled(
-                format!("ERROR: {text}"),
-                Style::default().fg(theme.error),
-            )));
-            lines.push(Line::from(""));
+            append_diagnostic_lines(
+                lines,
+                &TuiDiagnostic::from_message(DiagnosticContext::Runtime, text),
+                theme,
+            );
+        }
+        ChatMessage::Diagnostic(diagnostic) => {
+            append_diagnostic_lines(lines, diagnostic, theme);
         }
         ChatMessage::System(text) => {
             lines.push(Line::from(Span::styled(
@@ -2639,6 +2644,52 @@ fn append_message_lines(
             )));
             lines.push(Line::from(""));
         }
+    }
+}
+
+fn append_diagnostic_lines(
+    lines: &mut Vec<Line<'static>>,
+    diagnostic: &TuiDiagnostic,
+    theme: &Theme,
+) {
+    let accent = match diagnostic.level() {
+        DiagnosticLevel::Error => theme.error,
+        DiagnosticLevel::Warning => theme.warning,
+        DiagnosticLevel::Info => theme.muted,
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            diagnostic.level().label(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" [{}]: {}", diagnostic.code(), diagnostic.title()),
+            Style::default().fg(accent),
+        ),
+    ]));
+    append_labeled_diagnostic_text(lines, "Cause", diagnostic.detail(), theme);
+    if let Some(action) = diagnostic.action() {
+        append_labeled_diagnostic_text(lines, "Next", action, theme);
+    }
+    lines.push(Line::from(""));
+}
+
+fn append_labeled_diagnostic_text(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    text: &str,
+    theme: &Theme,
+) {
+    for (index, line) in text.lines().enumerate() {
+        let label = if index == 0 {
+            format!("  {label}: ")
+        } else {
+            "         ".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(label, Style::default().fg(theme.muted)),
+            Span::styled(line.to_string(), Style::default().fg(theme.text)),
+        ]));
     }
 }
 
@@ -5690,6 +5741,33 @@ mod tests {
 
     fn rendered_text(lines: &[Line<'static>]) -> Vec<String> {
         lines.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn errors_render_cause_next_step_and_stable_diagnostic_code() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let lines = build_lines_for_message(
+            &ChatMessage::Error("DeepSeek provider error: 429 rate limit exceeded".to_string()),
+            &theme,
+            100,
+            0,
+            false,
+            None,
+        );
+        let rendered = rendered_text(&lines);
+
+        assert_eq!(
+            rendered,
+            [
+                "ERROR [provider.rate_limit]: Provider limit reached",
+                "  Cause: DeepSeek provider error: 429 rate limit exceeded",
+                "  Next: Wait before retrying and check the provider account quota if the error persists.",
+                "",
+            ]
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.error));
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme.muted));
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme.text));
     }
 
     const REFINED_TOOL_DIFF: &str = "\

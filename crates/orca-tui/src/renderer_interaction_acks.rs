@@ -138,6 +138,7 @@ mod tests {
             .iter()
             .filter_map(|message| match message {
                 ChatMessage::Error(message) => Some(message.as_str()),
+                ChatMessage::Diagnostic(diagnostic) => Some(diagnostic.detail()),
                 _ => None,
             })
             .collect();
@@ -176,8 +177,17 @@ mod tests {
             Some(PendingTuiInput::UserInput(actual)) if actual == &key
         ));
         assert_eq!(textarea_text(&fixture.textarea), "exact answer");
-        assert!(fixture.state.transcript.messages.iter().any(
-            |message| matches!(message, ChatMessage::Error(text) if text == "runtime unavailable")
-        ));
+        assert!(
+            fixture
+                .state
+                .transcript
+                .messages
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    ChatMessage::Diagnostic(diagnostic)
+                        if diagnostic.detail() == "runtime unavailable"
+                ))
+        );
     }
 }

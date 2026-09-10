@@ -6,6 +6,7 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::conversation::ConversationTarget;
 use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
 
+use crate::diagnostics::{DiagnosticContext, TuiDiagnostic};
 use crate::display_text::truncate_to_display_width;
 use crate::protocol::{
     PendingTuiInput, PendingWorkflowNotification, TuiEvent, TuiMcpElicitationMode,
@@ -107,6 +108,7 @@ impl AppState {
                 self.task_transcript = None;
                 self.agent_dock_selected_task_id = None;
                 self.set_conversation_target(ConversationTarget::Main);
+                self.turn_diagnostic_seen = false;
                 self.announced_subagent_batches.clear();
                 self.announced_subagent_terminals.clear();
             }
@@ -586,7 +588,10 @@ impl AppState {
                 self.mention_bindings.clear();
                 self.atomic_skill_tokens.clear();
                 self.clear_receiving_tool_progress();
-                self.push_message(ChatMessage::Error(message));
+                self.push_message(ChatMessage::Diagnostic(TuiDiagnostic::from_message(
+                    DiagnosticContext::Input,
+                    message,
+                )));
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::OperationRejected(message) => {
@@ -594,13 +599,24 @@ impl AppState {
                 self.user_input_dialog = None;
                 self.reset_assistant_stream();
                 self.clear_receiving_tool_progress();
-                self.push_message(ChatMessage::Error(message));
+                self.push_message(ChatMessage::Diagnostic(TuiDiagnostic::from_message(
+                    DiagnosticContext::Operation,
+                    message,
+                )));
                 self.set_status(AppStatus::Idle);
+            }
+            TuiEvent::Diagnostic(diagnostic) => {
+                self.finish_assistant_stream();
+                self.clear_receiving_tool_progress();
+                self.push_message(ChatMessage::Diagnostic(diagnostic));
             }
             TuiEvent::Error(msg) => {
                 self.finish_assistant_stream();
                 self.clear_receiving_tool_progress();
-                self.push_message(ChatMessage::Error(msg));
+                self.push_message(ChatMessage::Diagnostic(TuiDiagnostic::from_message(
+                    DiagnosticContext::Runtime,
+                    msg,
+                )));
             }
             TuiEvent::StartupWarning(msg) => {
                 self.finish_assistant_stream();
@@ -650,6 +666,11 @@ impl AppState {
             }
             TuiEvent::SessionCompleted { status } => {
                 let was_backgrounded = self.suppress_background_main_session_output;
+                let fallback_diagnostic = if self.current_turn_has_diagnostic() {
+                    None
+                } else {
+                    TuiDiagnostic::from_completion_status(&status)
+                };
                 self.suppress_background_main_session_output = false;
                 self.approval_dialog = None;
                 self.interaction.pending_input = None;
@@ -670,6 +691,9 @@ impl AppState {
                     self.push_message(ChatMessage::System(format!(
                         "Background session completed: {status}"
                     )));
+                }
+                if let Some(diagnostic) = fallback_diagnostic {
+                    self.push_message(ChatMessage::Diagnostic(diagnostic));
                 }
                 self.finalize_turn();
                 self.set_status(AppStatus::Idle);

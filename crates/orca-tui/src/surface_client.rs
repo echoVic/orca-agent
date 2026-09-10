@@ -934,7 +934,7 @@ pub(crate) fn foreground_task(
     projection.focus_operation(operation_id.clone());
     let delivery_watermark = controller.surface_delivery_watermark(&operation_id);
     let terminal_status = projection.terminal_status_for_operation(&operation_id);
-    let terminal_error = projection.terminal_error_for_operation(&operation_id);
+    let terminal_diagnostic = projection.terminal_diagnostic_for_operation(&operation_id);
     if terminal_status.is_some() && controller.surface_terminal_was_delivered(&operation_id) {
         return Err(format!(
             "surface task '{task_id}' terminal output was already delivered"
@@ -996,8 +996,8 @@ pub(crate) fn foreground_task(
             projection.delivery_watermark(&operation_id),
         );
         controller.remember_surface_terminal_delivery(operation_id);
-        if let Some(message) = terminal_error {
-            let _ = event_tx.send(TuiEvent::Error(message));
+        if let Some(diagnostic) = terminal_diagnostic {
+            let _ = event_tx.send(TuiEvent::Diagnostic(diagnostic));
         }
         let _ = event_tx.send(TuiEvent::SessionCompleted {
             status: status.to_string(),

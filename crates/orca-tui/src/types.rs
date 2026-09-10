@@ -25,6 +25,7 @@ use orca_runtime::surface::SurfaceOperationId;
 
 use crate::agent_workspace::AgentWorkspaceState;
 use crate::composer_images::{ComposerImageAttachment, ComposerImageState};
+use crate::diagnostics::{DiagnosticContext, TuiDiagnostic};
 use crate::edit_highlight::EditHighlightState;
 #[cfg(test)]
 use crate::edit_highlight::parsed_diff_structure_matches_target;
@@ -457,6 +458,7 @@ pub struct AppState {
     pub(crate) task_transcript: Option<TaskTranscriptViewState>,
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
+    pub(crate) turn_diagnostic_seen: bool,
     pub tick: u64,
     pub(crate) edit_highlights: EditHighlightState,
 }
@@ -603,7 +605,10 @@ impl AppState {
         self.user_input_dialog = submission.user_input_dialog;
         self.reset_assistant_stream();
         self.clear_receiving_tool_progress();
-        self.push_message(ChatMessage::Error(message));
+        self.push_message(ChatMessage::Diagnostic(TuiDiagnostic::from_message(
+            DiagnosticContext::Interaction,
+            message,
+        )));
         self.set_status(AppStatus::WaitingUserInput);
         Some(submission.visible_text)
     }
@@ -691,6 +696,7 @@ impl AppState {
             task_transcript: None,
             pending_workflow_notifications: VecDeque::new(),
             suppress_background_main_session_output: false,
+            turn_diagnostic_seen: false,
             tick: 0,
             viewport: ViewportState::default(),
             edit_highlights: EditHighlightState::default(),
@@ -922,6 +928,9 @@ impl AppState {
 
     pub(crate) fn push_message(&mut self, message: ChatMessage) {
         self.reconcile_message_tracking();
+        if matches!(&message, ChatMessage::Diagnostic(_) | ChatMessage::Error(_)) {
+            self.turn_diagnostic_seen = true;
+        }
         if let ChatMessage::ToolCall { id, .. } = &message {
             let reused_tool_id = self.tool_call_message_index(id).is_some();
             self.remove_applied_highlights_for_tool_id(id);
@@ -948,6 +957,10 @@ impl AppState {
         }
     }
 
+    pub(crate) fn current_turn_has_diagnostic(&self) -> bool {
+        self.turn_diagnostic_seen
+    }
+
     pub(crate) fn push_user_message_with_images(
         &mut self,
         text: String,
@@ -967,6 +980,13 @@ impl AppState {
         self.reset_assistant_stream();
         self.reset_queued_user_messages();
         self.transcript.messages = messages.into_iter().collect();
+        self.turn_diagnostic_seen = self
+            .transcript
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| !matches!(message, ChatMessage::User(_)))
+            .any(|message| matches!(message, ChatMessage::Diagnostic(_) | ChatMessage::Error(_)));
         self.clear_applied_edit_highlights();
         self.clear_pending_edit_highlights();
         self.reset_message_tracking();
@@ -981,6 +1001,7 @@ impl AppState {
         self.reset_queued_user_messages();
         self.transcript.search.reset();
         self.transcript.messages.clear();
+        self.turn_diagnostic_seen = false;
         self.transcript.message_revisions.clear();
         self.transcript.tool_call_indices.clear();
         self.transcript.render_cache.clear();
@@ -1203,6 +1224,7 @@ impl AppState {
         self.config_dialog = None;
         if self.running_started_at.is_none() {
             self.running_started_at = Some(Instant::now());
+            self.turn_diagnostic_seen = false;
         }
         self.status = AppStatus::Running;
     }
@@ -1367,7 +1389,8 @@ impl AppState {
     /// - A `Reasoning`/`Assistant`/`ProposedPlan` block grows via streaming deltas only
     ///   while it is the last message, so it is settled once a newer message follows it,
     ///   or once the turn ends (`turn_ended`).
-    /// - Everything else (`User`/`Error`/`System`/`PlanUpdate`) is immutable on arrival.
+    /// - Everything else (`User`/`Diagnostic`/`Error`/`System`/`PlanUpdate`) is immutable on
+    ///   arrival.
     fn message_is_settled(&self, index: usize, turn_ended: bool) -> bool {
         if index < self.transcript.finalized_count {
             return true;
@@ -1383,6 +1406,7 @@ impl AppState {
             ChatMessage::AssistantChunk { .. }
             | ChatMessage::User(_)
             | ChatMessage::Image(_)
+            | ChatMessage::Diagnostic(_)
             | ChatMessage::Error(_)
             | ChatMessage::System(_)
             | ChatMessage::PlanUpdate { .. } => true,

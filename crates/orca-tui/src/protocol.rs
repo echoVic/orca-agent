@@ -15,6 +15,7 @@ use orca_runtime::surface::{
 
 use crate::clipboard_image::ImagePasteRequest;
 use crate::composer_images::ComposerImageAttachment;
+use crate::diagnostics::TuiDiagnostic;
 use crate::transcript_state::ChatMessage;
 use crate::types::SideParentStatus;
 
@@ -331,6 +332,7 @@ pub enum TuiEvent {
         message: String,
     },
     OperationRejected(String),
+    Diagnostic(TuiDiagnostic),
     Error(String),
     CompactionStarted,
     SessionCompleted {

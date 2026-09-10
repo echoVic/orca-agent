@@ -9,6 +9,7 @@ use orca_core::plan_types::PlanItem;
 use orca_core::proposed_plan::ProposedPlanStreamParser;
 
 use crate::composer_images::TuiImage;
+use crate::diagnostics::TuiDiagnostic;
 use crate::streaming_markdown::StreamingMarkdownAssembler;
 use crate::transcript_search::TranscriptSearchState;
 use crate::transcript_view::TranscriptRenderCache;
@@ -38,6 +39,7 @@ pub enum ChatMessage {
         explanation: Option<String>,
         plan: Vec<PlanItem>,
     },
+    Diagnostic(TuiDiagnostic),
     Error(String),
     System(String),
 }

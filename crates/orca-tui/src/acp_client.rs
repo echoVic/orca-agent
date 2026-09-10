@@ -64,6 +64,7 @@ struct ProjectionMeta {
     active: Option<bool>,
     stop_reason: Option<StopReason>,
     error: Option<agent_client_protocol::Error>,
+    terminal: Option<orca_runtime::surface::OperationTerminal>,
     usage: Option<orca_runtime::surface::UsageTotals>,
 }
 
@@ -127,6 +128,7 @@ struct Projection {
     dirty: bool,
     active: bool,
     terminal_seen: bool,
+    terminal_diagnostic_seen: bool,
     metrics: AcpMetricsSnapshot,
     metrics_dirty: bool,
     settings: Settings,
@@ -628,6 +630,7 @@ impl Client for TuiClient {
             if let Some(active) = meta.active {
                 if projection.ready && active && (!projection.active || phase == "ready") {
                     projection.terminal_seen = false;
+                    projection.terminal_diagnostic_seen = false;
                     lifecycle = Some(TuiEvent::TurnStarted {
                         turn: 1,
                         task: None,
@@ -638,11 +641,24 @@ impl Client for TuiClient {
                     && !projection.terminal_seen
                 {
                     projection.terminal_seen = true;
-                    let status = if let Some(error) = &meta.error {
+                    let status = if let Some(terminal) = &meta.terminal {
+                        if let Some(diagnostic) =
+                            crate::diagnostics::TuiDiagnostic::from_surface_terminal(terminal)
+                        {
+                            projection
+                                .messages
+                                .push(ChatMessage::Diagnostic(diagnostic));
+                            projection.dirty = true;
+                            projection.terminal_diagnostic_seen = true;
+                        }
+                        crate::surface_projection::operation_terminal_status(terminal)
+                            .unwrap_or("failed")
+                    } else if let Some(error) = &meta.error {
                         projection
                             .messages
                             .push(ChatMessage::Error(error.to_string()));
                         projection.dirty = true;
+                        projection.terminal_diagnostic_seen = true;
                         "failed"
                     } else {
                         meta.stop_reason.as_ref().map_or("success", stop_status)
@@ -911,6 +927,20 @@ fn finish_prompt(
                 false,
                 "ACP prompt failed; permission delivery is unconfirmed",
             );
+            let (terminal_seen, terminal_diagnostic_seen) = {
+                let projection = client.projection.borrow();
+                (
+                    projection.terminal_seen,
+                    projection.terminal_diagnostic_seen,
+                )
+            };
+            if terminal_seen {
+                if !terminal_diagnostic_seen {
+                    client.record_error(message);
+                    client.flush();
+                }
+                return;
+            }
             client.finish_turn("failed");
             client.reject_submission(submission, message);
         }
@@ -1857,6 +1887,17 @@ mod tests {
                     row, ChatMessage::Error(error) if error.contains("provider unavailable")
                 ))
         );
+        assert_eq!(
+            renderer
+                .state
+                .transcript
+                .messages
+                .iter()
+                .filter(|row| { matches!(row, ChatMessage::Error(_) | ChatMessage::Diagnostic(_)) })
+                .count(),
+            1,
+            "status fallback must not duplicate the projected ACP error"
+        );
         client
             .session_notification(text("answer", 0, "partial answer"))
             .await
@@ -1870,6 +1911,82 @@ mod tests {
                 .messages
                 .iter()
                 .any(|row| matches!(row, ChatMessage::Error(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_metadata_preserves_failure_class_and_action() {
+        let (client, events, _) = client();
+        let mut renderer = Renderer::new();
+        client
+            .session_notification(phase("ready", true))
+            .await
+            .unwrap();
+        let terminal = orca_runtime::surface::OperationTerminal::Failed {
+            class: orca_runtime::surface::FailureClass::Provider,
+            message: orca_runtime::surface::SafeDiagnosticText::try_new(
+                "DeepSeek returned 503 Service Unavailable",
+            )
+            .unwrap(),
+        };
+        client
+            .session_notification(note(
+                SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new()),
+                json!({
+                    "version": 1,
+                    "phase": "terminal",
+                    "active": false,
+                    "terminal": terminal,
+                }),
+            ))
+            .await
+            .unwrap();
+
+        renderer.drain(&events);
+
+        assert_eq!(renderer.state.status, crate::types::AppStatus::Idle);
+        let diagnostics = renderer
+            .state
+            .transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Diagnostic(diagnostic) => Some(diagnostic),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code(), "provider.failed");
+        assert!(diagnostics[0].detail().contains("503 Service Unavailable"));
+        assert!(diagnostics[0].action().is_some());
+    }
+
+    #[test]
+    fn confirmed_terminal_error_does_not_restore_or_duplicate_the_prompt() {
+        let (client, events, _) = client();
+        {
+            let mut projection = client.projection.borrow_mut();
+            projection.terminal_seen = true;
+            projection.terminal_diagnostic_seen = true;
+        }
+
+        finish_prompt(
+            &client,
+            Submission::text("already delivered".to_string()),
+            Ok(Err(
+                agent_client_protocol::Error::internal_error().data("exact terminal cause")
+            )),
+        );
+
+        assert!(
+            events.try_iter().all(|event| !matches!(
+                event,
+                TuiEvent::SubmissionRejected { .. }
+                    | TuiEvent::Error(_)
+                    | TuiEvent::Diagnostic(_)
+                    | TuiEvent::SessionCompleted { .. }
+            )),
+            "a confirmed terminal already owns the visible outcome"
         );
     }
 

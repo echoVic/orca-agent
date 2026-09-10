@@ -2873,13 +2873,15 @@ fn hosted_tui_provider_failure_surfaces_diagnostic_before_terminal() {
 
         harness.send(UserAction::Submit("mock_provider_error".to_string()));
         let error = harness.recv_until_timeout(Duration::from_secs(30), |event| {
-            matches!(event, TuiEvent::Error(_))
+            matches!(event, TuiEvent::Diagnostic(_))
         });
         assert!(matches!(
             error,
-            TuiEvent::Error(message)
-                if message == "mock provider error: api_key=<redacted>"
-                    && !message.contains("super-secret")
+            TuiEvent::Diagnostic(diagnostic)
+                if diagnostic.code() == "provider.failed"
+                    && diagnostic.detail() == "mock provider error: api_key=<redacted>"
+                    && !diagnostic.detail().contains("super-secret")
+                    && diagnostic.action().is_some()
         ));
 
         let terminal = harness.recv_until_timeout(Duration::from_secs(30), |event| {
