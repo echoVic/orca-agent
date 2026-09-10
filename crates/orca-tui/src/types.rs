@@ -451,6 +451,7 @@ pub struct AppState {
     pub(crate) workflow_panel: WorkflowPanelState,
     pub(crate) agent_workspace: AgentWorkspaceState,
     pub(crate) agent_dock_selected_task_id: Option<String>,
+    pub(crate) announced_startup_warnings: std::collections::HashSet<String>,
     pub(crate) announced_subagent_batches: std::collections::HashSet<String>,
     pub(crate) announced_subagent_terminals: std::collections::HashSet<String>,
     pub(crate) task_transcript: Option<TaskTranscriptViewState>,
@@ -684,6 +685,7 @@ impl AppState {
             workflow_panel: WorkflowPanelState::default(),
             agent_workspace: AgentWorkspaceState::default(),
             agent_dock_selected_task_id: None,
+            announced_startup_warnings: std::collections::HashSet::new(),
             announced_subagent_batches: std::collections::HashSet::new(),
             announced_subagent_terminals: std::collections::HashSet::new(),
             task_transcript: None,
@@ -1030,6 +1032,7 @@ impl AppState {
         self.reset_workflow_panel();
         self.agent_dock_selected_task_id = None;
         self.set_conversation_target(ConversationTarget::Main);
+        self.announced_startup_warnings.clear();
         self.announced_subagent_batches.clear();
         self.announced_subagent_terminals.clear();
         self.pending_workflow_notifications.clear();

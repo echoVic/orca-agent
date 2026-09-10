@@ -429,6 +429,9 @@ pub(crate) fn announce_runtime_ready(
             let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(
                 SurfaceProjectionState::from_surface_snapshot(&snapshot),
             )));
+            for warning in thread.startup_warnings() {
+                let _ = event_tx.send(TuiEvent::StartupWarning(warning.clone()));
+            }
         }
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(format!(

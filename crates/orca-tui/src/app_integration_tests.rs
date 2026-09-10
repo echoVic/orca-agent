@@ -583,7 +583,16 @@ fn test_config(history_mode: HistoryMode) -> RunConfig {
         additional_working_directories: Vec::new(),
         budget: Default::default(),
         subagents: Default::default(),
-        tools: ToolConfig::default(),
+        tools: ToolConfig {
+            shell_enforcement_decision: Some(
+                orca_core::capability::SandboxEnforcementDecision::new(
+                    orca_core::capability::EnforcementState::Enforced,
+                    "test-sandbox",
+                    Vec::new(),
+                ),
+            ),
+            ..ToolConfig::default()
+        },
         workflows: WorkflowConfig::default(),
         theme: ThemeName::Dark,
         vim_mode: false,
@@ -974,11 +983,16 @@ fn runtime_ready_emits_attachment_queue_settings_and_snapshot_projection() {
             .expect("runtime thread");
         let (event_tx, event_rx) = mpsc::unbounded();
         let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+        let startup_warnings = thread.startup_warnings().to_vec();
 
         announce_runtime_ready(&thread, &event_tx, &control);
 
         let events = event_rx.try_iter().collect::<Vec<_>>();
-        assert_eq!(events.len(), 4, "runtime-ready events: {events:?}");
+        assert_eq!(
+            events.len(),
+            4 + startup_warnings.len(),
+            "runtime-ready events: {events:?}"
+        );
         assert!(
             matches!(events[0], TuiEvent::MentionRuntimeReady(_)),
             "first runtime-ready event: {:?}",
@@ -999,6 +1013,12 @@ fn runtime_ready_emits_attachment_queue_settings_and_snapshot_projection() {
             "fourth runtime-ready event: {:?}",
             events[3]
         );
+        for (event, warning) in events[4..].iter().zip(&startup_warnings) {
+            assert!(
+                matches!(event, TuiEvent::StartupWarning(actual) if actual == warning),
+                "startup warning event: {event:?}"
+            );
+        }
 
         thread.shutdown().expect("runtime thread shutdown");
         control.shutdown();

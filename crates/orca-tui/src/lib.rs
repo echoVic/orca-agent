@@ -204,7 +204,16 @@ pub(crate) mod test_support {
             additional_working_directories: Vec::new(),
             budget: Default::default(),
             subagents: Default::default(),
-            tools: ToolConfig::default(),
+            tools: ToolConfig {
+                shell_enforcement_decision: Some(
+                    orca_core::capability::SandboxEnforcementDecision::new(
+                        orca_core::capability::EnforcementState::Enforced,
+                        "test-sandbox",
+                        Vec::new(),
+                    ),
+                ),
+                ..ToolConfig::default()
+            },
             workflows: WorkflowConfig::default(),
             theme: ThemeName::Dark,
             vim_mode: false,

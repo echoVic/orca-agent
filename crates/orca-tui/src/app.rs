@@ -247,6 +247,7 @@ fn run_tui_inner(
     let agent_workflow_notifications = pending_workflow_notifications.clone();
     let agent_controller = TuiSurfaceTaskControl::new();
 
+    let local_runtime = remote.is_none();
     let runtime = if let Some(remote) = remote {
         TuiAgentRuntime::spawn_acp(remote, workspace_root.clone(), action_rx, event_tx.clone())
     } else {
@@ -299,7 +300,8 @@ fn run_tui_inner(
         make_textarea(&vim_state, pending_terminal_session.theme())
     };
     let mut renderer_runtime =
-        RendererRuntimeEventOwner::new(mention_search, pending_initial_prompt);
+        RendererRuntimeEventOwner::new(mention_search, pending_initial_prompt)
+            .with_local_shell_readiness(local_runtime);
 
     let renderer_result = match pending_terminal_session.activate() {
         Ok(terminal_session) => terminal_session.run(

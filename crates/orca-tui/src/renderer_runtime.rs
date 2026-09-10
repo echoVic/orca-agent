@@ -27,6 +27,7 @@ use crate::workspace_config::mention_search_roots;
 pub(crate) struct RendererRuntimeEventOwner {
     mention_search: MentionSearchManager,
     pending_initial_prompt: Option<String>,
+    local_shell_readiness: bool,
 }
 
 impl RendererRuntimeEventOwner {
@@ -37,7 +38,13 @@ impl RendererRuntimeEventOwner {
         Self {
             mention_search,
             pending_initial_prompt,
+            local_shell_readiness: true,
         }
+    }
+
+    pub(crate) fn with_local_shell_readiness(mut self, enabled: bool) -> Self {
+        self.local_shell_readiness = enabled;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -129,6 +136,20 @@ impl RendererRuntimeEventOwner {
                     theme,
                     presentation,
                 );
+                if self.local_shell_readiness
+                    && let Some(warning) = orca_runtime::shell_readiness_warning(config)
+                {
+                    handle_runtime_event(
+                        TuiEvent::StartupWarning(warning),
+                        state,
+                        action_tx,
+                        pending_workflow_notifications,
+                        textarea,
+                        vim_state,
+                        theme,
+                        presentation,
+                    );
+                }
             }
             tui_event => {
                 handle_runtime_event(

@@ -310,6 +310,7 @@ pub enum TuiEvent {
         notice: String,
     },
     SavedSessionActionFailed(String),
+    StartupWarning(String),
     Notice(String),
     MentionSearchDirty {
         generation: orca_file_search::SessionGeneration,

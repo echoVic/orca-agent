@@ -602,6 +602,12 @@ impl AppState {
                 self.clear_receiving_tool_progress();
                 self.push_message(ChatMessage::Error(msg));
             }
+            TuiEvent::StartupWarning(msg) => {
+                self.finish_assistant_stream();
+                if self.announced_startup_warnings.insert(msg.clone()) {
+                    self.push_message(ChatMessage::System(msg));
+                }
+            }
             TuiEvent::Notice(msg) => {
                 self.finish_assistant_stream();
                 self.push_message(ChatMessage::System(msg));

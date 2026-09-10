@@ -25,7 +25,10 @@ use orca_core::cancel::OperationIdAllocator;
 use orca_core::config::ReasoningEffort;
 use orca_core::conversation::{ImageDetail, ImageInput, ImageSource};
 use orca_core::plan_types::{PlanItem, PlanStatus};
-use orca_runtime::acp::{PROJECTION_META, client::Connection};
+use orca_runtime::acp::{
+    PROJECTION_META,
+    client::{Connection, readiness_warnings},
+};
 use orca_runtime::mentions::MentionBindings;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
 
@@ -127,6 +130,7 @@ struct Projection {
     metrics: AcpMetricsSnapshot,
     metrics_dirty: bool,
     settings: Settings,
+    pending_startup_warnings: Vec<String>,
 }
 
 impl Projection {
@@ -676,7 +680,10 @@ impl Client for TuiClient {
             SessionUpdate::Plan(plan) => projection.plan(plan),
             SessionUpdate::UsageUpdate(update) => projection.usage(update, &meta),
             SessionUpdate::ConfigOptionUpdate(update) => {
-                projection.settings.update(update.config_options)
+                projection
+                    .pending_startup_warnings
+                    .extend(readiness_warnings(update.meta.as_ref()));
+                projection.settings.update(update.config_options);
             }
             SessionUpdate::CurrentModeUpdate(update) => {
                 projection.settings.mode = approval_mode(&update.current_mode_id.to_string());
@@ -688,10 +695,18 @@ impl Client for TuiClient {
         {
             let _ = self.events.send(event);
         }
+        let startup_warnings = if projection.ready {
+            std::mem::take(&mut projection.pending_startup_warnings)
+        } else {
+            Vec::new()
+        };
         drop(projection);
         if let Some(event) = lifecycle {
             self.flush();
             let _ = self.events.send(event);
+        }
+        for warning in startup_warnings {
+            let _ = self.events.send(TuiEvent::StartupWarning(warning));
         }
         Ok(())
     }
@@ -1083,7 +1098,7 @@ pub(crate) fn run(
             ]));
             let attached = while_detached(async {
                 let connection = Connection::connect(&options.socket, client.clone(), capabilities).await?;
-                let id = connection.attach(&cwd, &selector).await?;
+                let attached = connection.attach_with_metadata(&cwd, &selector).await?;
                 tokio::time::timeout(CONTROL_TIMEOUT, async {
                     while !client.projection.borrow().ready {
                         if connection.is_closed() || client.reload.get() {
@@ -1093,9 +1108,9 @@ pub(crate) fn run(
                     }
                     Ok(())
                 }).await??;
-                Ok((connection, id))
+                Ok((connection, attached))
             }, &client, &actions, &stop).await;
-            let (connection, id) = match attached {
+            let (connection, attached) = match attached {
                 Ok(attached) => attached,
                 Err(error) => {
                     client.disconnect(&mut None);
@@ -1119,6 +1134,10 @@ pub(crate) fn run(
                     continue;
                 }
             };
+            for warning in attached.startup_warnings {
+                let _ = events.send(TuiEvent::StartupWarning(warning));
+            }
+            let id = attached.session_id;
             selector = id.to_string();
             *client.session.borrow_mut() = Some(id.clone());
             client.flush();
@@ -1681,9 +1700,17 @@ mod tests {
         client
             .session_notification(SessionNotification::new(
                 SESSION,
-                SessionUpdate::ConfigOptionUpdate(agent_client_protocol::ConfigOptionUpdate::new(
-                    options,
-                )),
+                SessionUpdate::ConfigOptionUpdate(
+                    agent_client_protocol::ConfigOptionUpdate::new(options).meta(
+                        serde_json::Map::from_iter([(
+                            orca_runtime::acp::READINESS_META.to_string(),
+                            json!({
+                                "version": 1,
+                                "startupWarnings": ["shell unavailable"],
+                            }),
+                        )]),
+                    ),
+                ),
             ))
             .await
             .unwrap();
@@ -1717,6 +1744,9 @@ mod tests {
         assert_eq!(renderer.state.usage().cache_tokens, 6000);
         assert_eq!(renderer.state.usage().estimated_cost_usd, 0.125);
         assert_eq!(renderer.state.status, crate::types::AppStatus::Running);
+        assert!(renderer.state.transcript.messages.iter().any(
+            |message| matches!(message, ChatMessage::System(text) if text == "shell unavailable")
+        ));
         assert!(
             renderer
                 .state

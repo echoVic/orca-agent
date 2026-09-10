@@ -111,6 +111,7 @@ impl Observer {
         id: SessionId,
         sender: AcpNotificationSender,
         mode_ceiling: orca_core::approval_types::ApprovalMode,
+        readiness_config: orca_core::config::RunConfig,
     ) -> Result<Self, Error> {
         let stop = Arc::new(DeliveryState::default());
         let stopped = stop.clone();
@@ -147,7 +148,13 @@ impl Observer {
                 let mut context = snapshot.context.clone();
                 let mut usage = snapshot.usage.thread_total.clone();
                 let _ = emit_usage(&sender, &id, &context, &usage);
-                let _ = emit_settings(&sender, &id, &snapshot.settings.effective, mode_ceiling);
+                let _ = emit_settings(
+                    &sender,
+                    &id,
+                    &snapshot.settings.effective,
+                    mode_ceiling,
+                    &readiness_config,
+                );
                 let mut streams =
                     HashMap::<crate::surface::SurfaceStreamId, SurfaceAssistantStream>::new();
                 for stream in &snapshot.assistant_streams {
@@ -284,7 +291,13 @@ impl Observer {
                                 crate::runtime_surface::SettingsPatch::Committed {
                                     snapshot, ..
                                 },
-                            ) => emit_settings(&sender, &id, &snapshot.effective, mode_ceiling),
+                            ) => emit_settings(
+                                &sender,
+                                &id,
+                                &snapshot.effective,
+                                mode_ceiling,
+                                &readiness_config,
+                            ),
                             _ => {
                                 emit_surface_event(&id, &sender, &envelope.event, &mut tools);
                                 Ok(())
@@ -385,12 +398,17 @@ fn emit_settings(
     id: &SessionId,
     settings: &crate::surface::SurfaceRuntimeSettings,
     ceiling: orca_core::approval_types::ApprovalMode,
+    readiness_config: &orca_core::config::RunConfig,
 ) -> Result<(), ()> {
+    let warnings = super::agent::settings_startup_warnings(readiness_config, settings);
     sender.send(SessionNotification::new(
         id.clone(),
-        SessionUpdate::ConfigOptionUpdate(agent_client_protocol::ConfigOptionUpdate::new(
-            super::settings::options(settings, ceiling),
-        )),
+        SessionUpdate::ConfigOptionUpdate(
+            agent_client_protocol::ConfigOptionUpdate::new(super::settings::options(
+                settings, ceiling,
+            ))
+            .meta(super::agent::startup_warnings_meta(&warnings)),
+        ),
     ))?;
     sender.send(SessionNotification::new(
         id.clone(),

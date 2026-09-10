@@ -58,6 +58,30 @@ const ACP_MAX_IMAGE_COUNT: usize = 600;
 const ACP_MAX_INLINE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const ACP_MAX_IMAGE_URL_BYTES: usize = 8_192;
 const ORCA_ACP_INTERACTION_EXTENSION_VERSION: u32 = 1;
+
+pub(super) fn startup_warnings_meta(
+    warnings: &[String],
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    (!warnings.is_empty()).then(|| {
+        serde_json::Map::from_iter([(
+            super::READINESS_META.to_string(),
+            serde_json::json!({
+                "version": 1,
+                "startupWarnings": warnings,
+            }),
+        )])
+    })
+}
+
+pub(super) fn settings_startup_warnings(
+    base_config: &RunConfig,
+    settings: &crate::surface::SurfaceRuntimeSettings,
+) -> Vec<String> {
+    crate::shell_readiness::ShellReadiness::for_surface_settings(base_config, settings)
+        .startup_warning()
+        .into_iter()
+        .collect()
+}
 pub(crate) const ORCA_ACP_INTERACTION_CAPABILITIES_META_KEY: &str =
     "orca.dev/interactionCapabilities";
 pub(crate) const ORCA_ACP_USER_INPUT_METHOD: &str = "orca.dev/session/request_user_input";
@@ -1055,6 +1079,7 @@ impl OrcaAcpAgent {
         if self.state.borrow().sessions.len() >= 4 {
             return Err(Error::invalid_request().data("ACP connection attachment limit reached"));
         }
+        let readiness_config = config.clone();
         let (id, shared, surface) = self
             .shared
             .as_ref()
@@ -1076,6 +1101,7 @@ impl OrcaAcpAgent {
                 AcpNotificationSender::Standard(Box::new(self.note_tx.clone()))
             },
             self.base_config.approval_mode,
+            readiness_config,
         )
         .await?;
         self.state.borrow_mut().sessions.insert(
@@ -2843,9 +2869,11 @@ impl Agent for OrcaAcpAgent {
         let config = self
             .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
             .map_err(|message| Error::invalid_params().data(message))?;
+        let readiness_config = config.clone();
         if self.is_shared() {
             let id = self.open_shared_session(config, None).await?;
             let settings = self.session_settings(&id, None).await?;
+            let startup_warnings = settings_startup_warnings(&readiness_config, &settings);
             return Ok(NewSessionResponse::new(id)
                 .models(super::settings::models(&settings))
                 .modes(super::settings::modes(
@@ -2855,7 +2883,8 @@ impl Agent for OrcaAcpAgent {
                 .config_options(super::settings::options(
                     &settings,
                     self.base_config.approval_mode,
-                )));
+                ))
+                .meta(startup_warnings_meta(&startup_warnings)));
         }
         let surface_host = self.surface_host.clone();
         let thread =
@@ -2883,7 +2912,9 @@ impl Agent for OrcaAcpAgent {
                 _observer: None,
             },
         );
-        Ok(NewSessionResponse::new(session_id))
+        let settings = self.session_settings(&session_id, None).await?;
+        let startup_warnings = settings_startup_warnings(&readiness_config, &settings);
+        Ok(NewSessionResponse::new(session_id).meta(startup_warnings_meta(&startup_warnings)))
     }
 
     async fn load_session(&self, args: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
@@ -2895,9 +2926,11 @@ impl Agent for OrcaAcpAgent {
         let config = self
             .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
             .map_err(|message| Error::invalid_params().data(message))?;
+        let readiness_config = config.clone();
         if self.is_shared() {
             let id = self.open_shared_session(config, Some(selector)).await?;
             let settings = self.session_settings(&id, None).await?;
+            let startup_warnings = settings_startup_warnings(&readiness_config, &settings);
             return Ok(LoadSessionResponse::new()
                 .models(super::settings::models(&settings))
                 .modes(super::settings::modes(
@@ -2907,7 +2940,8 @@ impl Agent for OrcaAcpAgent {
                 .config_options(super::settings::options(
                     &settings,
                     self.base_config.approval_mode,
-                )));
+                ))
+                .meta(startup_warnings_meta(&startup_warnings)));
         }
         let surface_host = self.surface_host.clone();
         let thread = tokio::task::spawn_blocking(move || {
@@ -2947,7 +2981,9 @@ impl Agent for OrcaAcpAgent {
                 _observer: None,
             },
         );
-        Ok(LoadSessionResponse::new())
+        let settings = self.session_settings(&args.session_id, None).await?;
+        let startup_warnings = settings_startup_warnings(&readiness_config, &settings);
+        Ok(LoadSessionResponse::new().meta(startup_warnings_meta(&startup_warnings)))
     }
 
     async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
@@ -2978,8 +3014,10 @@ impl Agent for OrcaAcpAgent {
     ) -> Result<agent_client_protocol::SetSessionModeResponse, Error> {
         let patch =
             super::settings::mode_patch(&args.mode_id.to_string(), self.base_config.approval_mode)?;
-        self.session_settings(&args.session_id, Some(patch)).await?;
-        Ok(agent_client_protocol::SetSessionModeResponse::new())
+        let settings = self.session_settings(&args.session_id, Some(patch)).await?;
+        let warnings = settings_startup_warnings(&self.base_config, &settings);
+        Ok(agent_client_protocol::SetSessionModeResponse::new()
+            .meta(startup_warnings_meta(&warnings)))
     }
 
     async fn set_session_config_option(
@@ -3010,9 +3048,14 @@ impl Agent for OrcaAcpAgent {
             _ => return Err(Error::invalid_params().data("unknown config option")),
         };
         let settings = self.session_settings(&args.session_id, Some(patch)).await?;
-        Ok(agent_client_protocol::SetSessionConfigOptionResponse::new(
-            super::settings::options(&settings, self.base_config.approval_mode),
-        ))
+        let warnings = settings_startup_warnings(&self.base_config, &settings);
+        Ok(
+            agent_client_protocol::SetSessionConfigOptionResponse::new(super::settings::options(
+                &settings,
+                self.base_config.approval_mode,
+            ))
+            .meta(startup_warnings_meta(&warnings)),
+        )
     }
 
     async fn list_sessions(
@@ -3157,6 +3200,19 @@ mod tests {
 
     fn test_absolute_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn startup_warning_meta_is_typed_and_omitted_when_empty() {
+        assert!(startup_warnings_meta(&[]).is_none());
+
+        let meta =
+            startup_warnings_meta(&["shell unavailable".to_string()]).expect("readiness metadata");
+        assert_eq!(
+            meta[crate::acp::READINESS_META]["startupWarnings"],
+            serde_json::json!(["shell unavailable"])
+        );
+        assert_eq!(meta[crate::acp::READINESS_META]["version"], 1);
     }
 
     struct CompleteImmediatelyExecutor;

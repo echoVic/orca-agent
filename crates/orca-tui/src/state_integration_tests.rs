@@ -53,6 +53,31 @@ fn state() -> AppState {
     )
 }
 
+#[test]
+fn startup_warnings_are_announced_once_per_session() {
+    let mut state = state();
+    let warning = "Shell unavailable in auto-edit mode".to_string();
+
+    state.update(TuiEvent::StartupWarning(warning.clone()));
+    state.update(TuiEvent::StartupWarning(warning.clone()));
+
+    assert_eq!(
+        state
+            .transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, ChatMessage::System(text) if text == &warning))
+            .count(),
+        1
+    );
+
+    state.reset_session_projection();
+    state.update(TuiEvent::StartupWarning(warning.clone()));
+    assert!(
+        matches!(state.transcript.messages.as_slice(), [ChatMessage::System(text)] if text == &warning)
+    );
+}
+
 fn queued(text: &str) -> crate::queued_input::QueuedUserMessage {
     crate::queued_input::QueuedUserMessage::from_composer(
         text.to_string(),

@@ -1197,6 +1197,14 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
   ["crates/orca-tui/src/acp_client.rs:image:self.indices.insert", 1],
   ["crates/orca-tui/src/acp_client.rs:request_permission:self.pending.borrow_mut().insert", 1],
   ["crates/orca-tui/src/acp_client.rs:run:client.respond", 1],
+  [
+    "crates/orca-tui/src/state_reducer.rs:update:self.announced_startup_warnings.insert",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/types.rs:reset_session_projection:self.announced_startup_warnings.clear",
+    1,
+  ],
   ["crates/orca-tui/src/hosted_child.rs:return_to_parent:child_focus.event_bridge.stop", 1],
   ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],

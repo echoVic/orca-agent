@@ -17,6 +17,8 @@ mod transport;
 pub use agent::OrcaAcpAgent;
 pub use observer::PROJECTION_META;
 
+pub const READINESS_META: &str = "orca.dev/readiness";
+
 use orca_core::config::RunConfig;
 
 use crate::surface::RuntimeSurfaceHostHandle;
