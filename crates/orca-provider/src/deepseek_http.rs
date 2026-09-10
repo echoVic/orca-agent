@@ -191,6 +191,32 @@ pub(crate) struct ApiMessage {
     pub(crate) tool_call_id: Option<String>,
 }
 
+impl ApiMessage {
+    pub(crate) fn estimated_tokens(&self, counter: &impl crate::context::TokenCounter) -> usize {
+        let mut tokens = 4 + self
+            .content
+            .as_deref()
+            .map_or(0, |text| counter.count_text(text));
+        tokens += self
+            .images
+            .iter()
+            .map(crate::context::image_tokens)
+            .sum::<usize>();
+        tokens += self
+            .reasoning_content
+            .as_deref()
+            .map_or(0, |text| counter.count_text(text));
+        if let Some(calls) = &self.tool_calls {
+            for call in calls {
+                tokens += 8
+                    + counter.count_text(&call.function.name)
+                    + counter.count_text(&call.function.arguments);
+            }
+        }
+        tokens
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ApiContentBlock {
@@ -376,6 +402,61 @@ async fn request_chat_streaming(
     cancel: &CancelToken,
     on_step: &mut impl FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, DeepSeekRequestError> {
+    request_chat_streaming_with_budget(conversation, config, cancel, on_step, None).await
+}
+
+/// Runs a bounded auxiliary completion through the production serializer, SSE
+/// parser and cancellation path, with one HTTP attempt and thinking disabled.
+/// Callers must supply a tool-free config. No tool/empty-response recovery loop.
+pub fn call_summary(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    max_tokens: u32,
+    cancel: Option<&CancelToken>,
+) -> ProviderResponse {
+    let default_cancel = CancelToken::new();
+    let cancel = cancel.unwrap_or(&default_cancel);
+    let result = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let mut config = config.clone();
+                config.tools_override = Some(vec![]);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| DeepSeekRequestError::new(error.to_string()))?;
+                runtime.block_on(request_chat_streaming_with_budget(
+                    conversation,
+                    &config,
+                    cancel,
+                    &mut |_| {},
+                    Some(max_tokens.clamp(1, 2_048)),
+                ))
+            })
+            .join()
+    });
+    match result.unwrap_or_else(|_| Err(DeepSeekRequestError::new("summary worker panicked"))) {
+        Ok(response) => response,
+        Err(error) => {
+            let (error, usage) = error.into_provider_error();
+            ProviderResponse {
+                steps: vec![ProviderStep::Error(error)],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                usage,
+            }
+        }
+    }
+}
+
+async fn request_chat_streaming_with_budget(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: &CancelToken,
+    on_step: &mut impl FnMut(&ProviderStep),
+    summary_budget: Option<u32>,
+) -> Result<ProviderResponse, DeepSeekRequestError> {
     let api_key = config.api_key.as_deref().ok_or_else(|| {
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
     })?;
@@ -393,14 +474,20 @@ async fn request_chat_streaming(
     let mut request = ChatRequest {
         model: model.to_string(),
         messages,
-        thinking: ThinkingConfig::default(),
+        thinking: if summary_budget.is_some() {
+            ThinkingConfig {
+                thinking_type: "disabled",
+            }
+        } else {
+            ThinkingConfig::default()
+        },
         stream: true,
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),
         tools: Some(primary_tools),
-        max_tokens: Some(DEFAULT_CHAT_MAX_TOKENS),
-        reasoning_effort: Some(config.reasoning_effort),
+        max_tokens: Some(summary_budget.unwrap_or(DEFAULT_CHAT_MAX_TOKENS)),
+        reasoning_effort: summary_budget.is_none().then_some(config.reasoning_effort),
     };
 
     let mut empty_response_retries = 0;
@@ -408,17 +495,32 @@ async fn request_chat_streaming(
     let mut suppress_retry_reasoning = false;
     let mut accumulated_usage = None;
     loop {
-        let response = match crate::http_client::execute_streaming_with_retry(
-            &streaming_client,
-            |client| client.post(&url).bearer_auth(api_key).json(&request),
-            cancel,
-        )
-        .await
-        {
+        let response_result = if summary_budget.is_some() {
+            crate::http_client::execute_streaming_once(
+                streaming_client
+                    .post(&url)
+                    .bearer_auth(api_key)
+                    .json(&request),
+                cancel,
+            )
+            .await
+        } else {
+            crate::http_client::execute_streaming_with_retry(
+                &streaming_client,
+                |client| client.post(&url).bearer_auth(api_key).json(&request),
+                cancel,
+            )
+            .await
+        };
+        let response = match response_result {
             Ok(response) => response,
             // Strict mode is Beta; if the server rejects the strict schema, retry
             // once with the plain tool list rather than failing the whole turn.
-            Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
+            Err(error)
+                if summary_budget.is_none()
+                    && strict_applied
+                    && is_strict_schema_rejection(&error) =>
+            {
                 request.tools = Some(tools.clone());
                 crate::http_client::execute_streaming_with_retry(
                     &streaming_client,
@@ -461,6 +563,7 @@ async fn request_chat_streaming(
             Ok(result) => result,
             Err(error)
                 if !emitted_step
+                    && summary_budget.is_none()
                     && stream_integrity_retries < STREAM_INTEGRITY_RETRIES
                     && crate::streaming::is_stream_integrity_error(&error) =>
             {
@@ -536,7 +639,7 @@ async fn request_chat_streaming(
                 .iter()
                 .any(|step| matches!(step, ProviderStep::Error(_)))
         {
-            if empty_response_retries < EMPTY_RESPONSE_RETRIES {
+            if summary_budget.is_none() && empty_response_retries < EMPTY_RESPONSE_RETRIES {
                 empty_response_retries += 1;
                 suppress_retry_reasoning = emitted_reasoning;
                 add_empty_response_recovery_instruction(&mut request);
@@ -789,7 +892,6 @@ fn replayable_reasoning_content(
 
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
     let mut messages: Vec<ApiMessage> = Vec::new();
-    let mut first_system_done = false;
     let needs_normalization = conversation.messages.iter().any(|message| {
         matches!(message, Message::Tool { .. })
             || matches!(
@@ -817,6 +919,10 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
         &conversation.messages
     };
 
+    let prefix_len = source_messages
+        .iter()
+        .take_while(|message| matches!(message, Message::System { .. }))
+        .count();
     for msg in source_messages {
         let api_msg = match msg {
             Message::System { content, .. } => {
@@ -828,12 +934,6 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                     tool_calls: None,
                     tool_call_id: None,
                 };
-                if !first_system_done {
-                    first_system_done = true;
-                    messages.push(result);
-                    inject_summary_messages(&conversation.summary, &mut messages);
-                    continue;
-                }
                 result
             }
             Message::User {
@@ -897,28 +997,22 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
         messages.push(api_msg);
     }
 
-    if !first_system_done && !conversation.summary.is_empty() {
-        inject_summary_messages(&conversation.summary, &mut messages);
-    }
+    let mut injected = vec![];
+    inject_summary_messages(&conversation.summary, &mut injected);
 
     if let Some(overlay) = render_internal_context(conversation) {
-        let insert_at = messages
-            .iter()
-            .position(|message| message.role == "system")
-            .map(|index| index.saturating_add(1))
-            .unwrap_or_default();
-        messages.insert(
-            insert_at,
-            ApiMessage {
-                role: "system".to_string(),
-                content: Some(overlay),
-                images: Vec::new(),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        );
+        injected.push(ApiMessage {
+            role: "system".to_string(),
+            content: Some(overlay),
+            images: Vec::new(),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
     }
+    // Keep every leading instruction message immutable; changing overlay state
+    // must not invalidate an otherwise unchanged summary prefix.
+    messages.splice(prefix_len..prefix_len, injected);
 
     messages
 }

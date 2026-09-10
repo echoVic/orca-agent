@@ -26,6 +26,51 @@ pub struct PromptCacheCheckpoint {
     pub tool_count: u32,
 }
 
+/// Deterministic lower bound for reusable *leading* messages, not provider KV
+/// hits. The first changed message invalidates every message after it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PrefixReuseMetrics {
+    pub before_tokens_est: usize,
+    pub after_tokens_est: usize,
+    pub unchanged_prefix_messages: usize,
+    pub unchanged_prefix_bytes: usize,
+    pub unchanged_prefix_tokens_est: usize,
+}
+
+pub fn measure_deepseek_prefix_reuse(
+    before: &Conversation,
+    before_config: &ProviderConfig,
+    after: &Conversation,
+    after_config: &ProviderConfig,
+) -> serde_json::Result<PrefixReuseMetrics> {
+    let mut metrics = PrefixReuseMetrics {
+        before_tokens_est: crate::context::wire_equivalent_tokens(before, before_config),
+        after_tokens_est: crate::context::wire_equivalent_tokens(after, after_config),
+        unchanged_prefix_messages: 0,
+        unchanged_prefix_bytes: 0,
+        unchanged_prefix_tokens_est: 0,
+    };
+    if scope_sha256(before_config)? != scope_sha256(after_config)?
+        || deepseek_primary_request_tools(before_config)
+            != deepseek_primary_request_tools(after_config)
+    {
+        return Ok(metrics);
+    }
+    let before = conversation_to_api_messages(before);
+    let after = conversation_to_api_messages(after);
+    for (before, after) in before.iter().zip(&after) {
+        let serialized = serde_json::to_vec(before)?;
+        if serialized != serde_json::to_vec(after)? {
+            break;
+        }
+        metrics.unchanged_prefix_messages += 1;
+        metrics.unchanged_prefix_bytes += serialized.len();
+        metrics.unchanged_prefix_tokens_est +=
+            before.estimated_tokens(&crate::context::DefaultTokenCounter);
+    }
+    Ok(metrics)
+}
+
 impl PromptCacheCheckpoint {
     /// Checks whether a later request keeps this checkpoint's exact lowered
     /// message prefix and its primary preflight scope and tool payload.

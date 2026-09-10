@@ -68,6 +68,14 @@ fn cache_path(key: &str) -> Option<PathBuf> {
 }
 
 fn cache_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        thread_local! {
+            static ROOT: tempfile::TempDir = tempfile::tempdir().expect("isolated summary cache");
+        }
+        Some(ROOT.with(|root| root.path().join(CACHE_SUBDIR)))
+    }
+    #[cfg(not(test))]
     std::env::var_os(ORCA_HOME_ENV)
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".orca")))

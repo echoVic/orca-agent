@@ -129,6 +129,31 @@ pub async fn execute_streaming_with_retry(
     }
 }
 
+pub(crate) async fn execute_streaming_once(
+    request: RequestBuilder,
+    cancel: &CancelToken,
+) -> Result<Response, String> {
+    let response = send_streaming_request(
+        request.timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS)),
+        cancel,
+    )
+    .await?
+    .map_err(|error| format!("request failed after 1 attempt: {error}"))?;
+    let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        if std::env::var_os("ORCA_SUMMARY_DEBUG").is_some() {
+            eprintln!(
+                "orca.remote_summary_http_failure status={}",
+                status.as_u16()
+            );
+        }
+        // Error bodies can contain request data; summary fallback needs only
+        // the status and must never echo credentials or prompt content.
+        return Err(format!("request error ({status})"));
+    }
+    Ok(response)
+}
+
 async fn send_streaming_request(
     request: RequestBuilder,
     cancel: &CancelToken,

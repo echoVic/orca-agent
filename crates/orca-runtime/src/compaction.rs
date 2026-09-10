@@ -203,11 +203,7 @@ impl RuntimeCompactionOutcome {
         }
     }
 
-    pub(crate) fn should_persist_summary_state(&self, emit_deltas: bool) -> bool {
-        if !emit_deltas {
-            return false;
-        }
-
+    pub(crate) fn should_persist_summary_state(&self, _emit_deltas: bool) -> bool {
         match (self.trigger(), self.strategy()) {
             (
                 RuntimeCompactionTrigger::SoftLimit
@@ -542,11 +538,27 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     ) -> io::Result<RuntimeCompactionOutcome> {
         let before_messages = conversation.messages.len();
         let task = RuntimeCompactionTask::start(trigger, before_messages);
+        // An API rejection is authoritative even when the approximate local
+        // tokenizer thinks the prompt fits. Force one real reduction attempt.
+        let mut recovery_config;
+        let context_config = if trigger == RuntimeCompactionTrigger::PromptTooLong {
+            recovery_config = self.context_config.clone();
+            let measured = context::wire_equivalent_tokens(conversation, self.provider_config);
+            recovery_config.soft_compact_token_limit = Some(
+                self.context_config
+                    .soft_limit()
+                    .min(measured.saturating_sub(1))
+                    .max(1),
+            );
+            &recovery_config
+        } else {
+            self.context_config
+        };
         let compaction = if let Some(cancel) = self.cancel {
             context::compact_with_summary_cancellable(
                 self.provider,
                 conversation,
-                self.context_config,
+                context_config,
                 self.provider_config,
                 cancel,
             )
@@ -554,29 +566,33 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             context::compact_with_summary(
                 self.provider,
                 conversation,
-                self.context_config,
+                context_config,
                 self.provider_config,
             )
         };
-        *conversation = compaction.conversation;
-        let after_messages = conversation.messages.len();
+        let after_messages = compaction.conversation.messages.len();
         let outcome = task.finish(after_messages, &compaction.kind);
         let details = outcome.details();
         if outcome.should_persist_summary_state(self.turn_context.emit_deltas)
             && let Some(writer) = self.history_writer.as_deref_mut()
         {
-            writer.append_compaction(details.before_messages, details.after_messages)?;
-            if details.strategy == RuntimeCompactionStrategy::RemoteSummary
-                && let context::CompactionKind::RemoteSummary(summary) = compaction.kind
-            {
-                writer.append_summary_state(
-                    details.before_messages,
-                    details.after_messages,
-                    summary,
-                    &conversation.summary,
-                )?;
-            }
+            // Count-only replay cannot reconstruct suffix rewrites, images or
+            // pinned turns. Reuse the existing atomic context snapshot record.
+            let identity = crate::session::ManualCompactionPersistenceIdentity {
+                operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .expect("generated UUID is v7"),
+                snapshot_id: uuid::Uuid::now_v7().to_string(),
+            };
+            writer.append_manual_compaction_snapshot(
+                &identity,
+                details.before_messages,
+                details.strategy.as_str(),
+                &compaction.conversation,
+            )?;
         }
+        *conversation = compaction.conversation;
         Ok(outcome)
     }
 
@@ -645,7 +661,8 @@ mod tests {
                 && String::from_utf8_lossy(&self.output).contains("\"type\":\"context.compacted\"")
             {
                 let history = fs::read_to_string(&self.history_path)?;
-                self.completed_before_persistence = !history.contains("\"context.collapsed\"");
+                self.completed_before_persistence =
+                    !history.contains("\"context.manual_compaction_snapshot\"");
                 fs::write(&self.completed_marker, "completed")?;
             }
             Ok(bytes.len())
@@ -708,7 +725,7 @@ mod tests {
             RuntimeCompactionStrategy::LocalTruncation
         );
         assert!(outcome.should_persist_summary_state(true));
-        assert!(!outcome.should_persist_summary_state(false));
+        assert!(outcome.should_persist_summary_state(false));
     }
 
     #[test]
@@ -955,6 +972,171 @@ mod tests {
         assert_eq!(
             event_types,
             vec!["context.compaction.started", "context.compacted"]
+        );
+    }
+
+    #[test]
+    fn automatic_compaction_recovers_exact_rewrites_without_event_output() {
+        use orca_core::conversation::{Message, RawToolCall};
+        crate::history::with_redirected_orca_home("automatic-context-recovery", |home| {
+            let temp = tempfile::tempdir().unwrap();
+            let sessions = home.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let path = sessions.join("session-context-recovery.jsonl");
+            let meta =
+                crate::history::create_meta(temp.path(), "mock", None, "compaction recovery");
+            let mut record = serde_json::to_value(meta).unwrap();
+            record["type"] = serde_json::json!("session.meta");
+            fs::write(&path, format!("{record}\n")).unwrap();
+            let mut writer = SessionWriter::append_to_existing(path.clone()).unwrap();
+            let mut conversation = Conversation::new();
+            conversation.add_system("immutable instructions".to_string());
+            for index in 0..6 {
+                conversation.add_user(format!("inspect {index}"));
+                conversation.add_assistant(
+                    None,
+                    None,
+                    vec![RawToolCall {
+                        id: format!("call-{index}"),
+                        function_name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                );
+                conversation.add_tool_result(format!("call-{index}"), "output ".repeat(1_000));
+            }
+            conversation.add_user("current request".to_string());
+            for message in &conversation.messages {
+                writer.append_legacy_message(message).unwrap();
+            }
+            let provider = ProviderConfig {
+                api_key: None,
+                base_url: None,
+                model: None,
+                reasoning_effort: Default::default(),
+                tools_override: Some(vec![]),
+                mcp_registry: None,
+                external_tools: vec![],
+            };
+            let tokens = context::wire_equivalent_tokens(&conversation, &provider);
+            let config = context::ContextConfig {
+                max_tokens: tokens + 100,
+                compaction_threshold: 1.0,
+                reserved_for_response: 0,
+                auto_compact_token_limit: Some(tokens + 100),
+                soft_compact_token_limit: Some(tokens - 50),
+            };
+            let hooks = HookRunner::default();
+            let mut events = EventFactory::new("context-recovery".to_string());
+            let mut output = vec![];
+            let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+            let subagent = SubagentType::General;
+            let before = conversation.messages.len();
+            RuntimeCompactionStep::new(
+                orca_core::config::ProviderKind::Mock,
+                &config,
+                &provider,
+                RuntimeTurnContext::new(temp.path(), "", 0, false, &subagent),
+                &hooks,
+                &mut events,
+                &mut sink,
+                Some(&mut writer),
+            )
+            .compact_if_needed(&mut conversation)
+            .unwrap();
+            assert_eq!(conversation.messages.len(), before);
+            assert!(conversation.messages.iter().any(|message| matches!(message,
+            Message::Tool { content, .. } if content.starts_with("[tool output micro-compact]"))));
+            assert!(output.is_empty());
+            let transcript = crate::thread_store::JsonlThreadStore::new()
+                .load_session("context-recovery")
+                .unwrap();
+            let recovered = crate::history::resume_conversation(
+                &transcript,
+                "immutable instructions".to_string(),
+            );
+            let before_checkpoint = orca_provider::prompt_cache::checkpoint_for_deepseek_request(
+                &conversation,
+                &provider,
+            )
+            .unwrap();
+            assert!(
+                before_checkpoint
+                    .matches_deepseek_prefix(&recovered, &provider)
+                    .unwrap()
+            );
+            let again = context::compact_with_summary(
+                orca_core::config::ProviderKind::Mock,
+                &recovered,
+                &config,
+                &provider,
+            );
+            assert!(
+                before_checkpoint
+                    .matches_deepseek_prefix(&again.conversation, &provider)
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn automatic_compaction_snapshot_failure_keeps_live_conversation_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("context.jsonl");
+        let meta = crate::history::create_meta(temp.path(), "mock", None, "compaction failure");
+        let mut record = serde_json::to_value(meta).unwrap();
+        record["type"] = serde_json::json!("session.meta");
+        fs::write(&path, format!("{record}\n")).unwrap();
+        let mut writer = SessionWriter::append_to_existing(path.clone()).unwrap();
+        SessionWriter::inject_manual_compaction_snapshot_failure_once(path);
+        let mut conversation = Conversation::new();
+        conversation.add_system("system".to_string());
+        conversation.add_user("old evidence ".repeat(700));
+        conversation.add_user("current request".to_string());
+        let config = context::ContextConfig {
+            max_tokens: 500,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(500),
+            soft_compact_token_limit: Some(300),
+        };
+        let provider = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: Default::default(),
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+        };
+        let before =
+            orca_provider::prompt_cache::checkpoint_for_deepseek_request(&conversation, &provider)
+                .unwrap();
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("context-failure".to_string());
+        let mut output = vec![];
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let subagent = SubagentType::General;
+        let result = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider,
+            RuntimeTurnContext::new(temp.path(), "", 0, true, &subagent),
+            &hooks,
+            &mut events,
+            &mut sink,
+            Some(&mut writer),
+        )
+        .compact_if_needed(&mut conversation);
+        assert!(result.is_err());
+        assert!(
+            before
+                .matches_deepseek_prefix(&conversation, &provider)
+                .unwrap()
+        );
+        assert!(
+            !String::from_utf8(output)
+                .unwrap()
+                .contains("\"type\":\"context.compacted\"")
         );
     }
 }
