@@ -685,6 +685,11 @@ fn check_components(path: &Path) -> io::Result<()> {
             return Err(invalid("task output root cannot contain parent traversal"));
         }
         current.push(component);
+        // A Windows drive prefix such as `D:` is drive-relative until the
+        // following root component is appended, so it cannot be inspected yet.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(meta) if is_link(&meta) => {
                 // macOS exposes its system temp directories through these aliases.
