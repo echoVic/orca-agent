@@ -108,3 +108,12 @@ including the selected backend, executable, termination status, stderr, and
 startup error. This evidence explains why enforcement is unavailable but is not
 a `SandboxDenialReceipt`, carries no authority, and cannot authorize an
 unsandboxed retry.
+
+When the active shell policy requires OS enforcement and no backend is
+available, the runtime advertises the degradation once at session startup,
+removes new-process shell tools from the model catalog, and rejects stale shell
+launch calls before dispatch. Dedicated file tools and control of already
+running terminal sessions remain available. Changing folder trust does not
+alter this decision; restoring shell execution requires repairing the backend
+or an explicit user-selected trusted-host policy. `full-auto` selects that
+policy only when no stricter permission profile is active.

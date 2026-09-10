@@ -60,7 +60,11 @@ bubblewrap, Landlock, seccomp, or Windows AppContainer.
 If `orca doctor` reports that sandbox enforcement is unavailable, follow the
 reported backend, probe failure, and remediation for the host environment. Do
 not trust the folder to work around enforcement, and do not treat unavailable
-enforcement as permission to run without a sandbox.
+enforcement as permission to run without a sandbox. In restricted modes, Orca
+keeps dedicated file and search tools available but removes new shell launch
+tools from the agent's tool catalog. Repair the sandbox backend, or explicitly
+select a trusted-host policy only when direct host execution is intended.
+`full-auto` does so only when no stricter permission profile is active.
 
 ## Start an interactive session
 

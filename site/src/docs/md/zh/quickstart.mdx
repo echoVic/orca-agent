@@ -55,7 +55,10 @@ Seatbelt、bubblewrap、Landlock、seccomp 或 Windows AppContainer。
 
 如果 `orca doctor` 报告沙箱不可用，请按报告中的 backend、probe 失败原因和 remediation
 处理宿主环境。不要通过信任目录来尝试修复 enforcement，也不要把 unavailable 当成
-允许无沙箱执行。
+允许无沙箱执行。在受限模式下，Orca 会保留专用文件和搜索工具，但从 Agent 的工具
+目录中移除启动新 shell 的工具。请修复 sandbox backend；只有明确需要无沙箱宿主机
+执行时，才由用户主动选择 trusted-host policy。仅当没有更严格的 permission profile
+生效时，`full-auto` 才会选择该 policy。
 
 ## 启动交互式会话
 
