@@ -9,6 +9,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(windows))]
 use orca_core::capability::{EnforcementState, SandboxEnforcementDecision};
 use orca_core::config::file::{self, ConfigOverrides, FileConfig};
 use orca_core::config::folder_trust::{self, TrustLevel};
@@ -319,30 +320,28 @@ fn check_folder_trust(cwd: &Path) -> DiagnosticCheck {
     }
 }
 
+#[cfg(windows)]
 fn check_sandbox(cwd: &Path) -> DiagnosticCheck {
-    #[cfg(windows)]
-    {
-        let Some(home) = folder_trust::config_dir() else {
-            return fail_check(
-                "sandbox",
-                "cannot resolve the Windows sandbox capability directory",
-                Some("set ORCA_HOME and run the Windows sandbox setup helper"),
-            );
-        };
-        let store = orca_windows_sandbox::CapabilityStore::new(home.join("windows-capabilities"));
-        return match store
-            .verify_setup_for_workspace(cwd, orca_windows_sandbox::SETUP_HELPER_VERSION)
-        {
-            Ok(_) => pass_check("sandbox", "Windows AppContainer capability setup is valid"),
-            Err(error) => fail_check(
-                "sandbox",
-                format!("Windows sandbox setup is not ready: {error}"),
-                Some("run the Windows installer with -SetupSandbox from this workspace"),
-            ),
-        };
+    let Some(home) = folder_trust::config_dir() else {
+        return fail_check(
+            "sandbox",
+            "cannot resolve the Windows sandbox capability directory",
+            Some("set ORCA_HOME and run the Windows sandbox setup helper"),
+        );
+    };
+    let store = orca_windows_sandbox::CapabilityStore::new(home.join("windows-capabilities"));
+    match store.verify_setup_for_workspace(cwd, orca_windows_sandbox::SETUP_HELPER_VERSION) {
+        Ok(_) => pass_check("sandbox", "Windows AppContainer capability setup is valid"),
+        Err(error) => fail_check(
+            "sandbox",
+            format!("Windows sandbox setup is not ready: {error}"),
+            Some("run the Windows installer with -SetupSandbox from this workspace"),
+        ),
     }
-    #[cfg(not(windows))]
-    let _ = cwd;
+}
+
+#[cfg(not(windows))]
+fn check_sandbox(_cwd: &Path) -> DiagnosticCheck {
     sandbox_check_from_decision(orca_tools::sandbox::enforcement_decision())
 }
 
