@@ -27,6 +27,8 @@ shlex = { workspace = true }
 url = { workspace = true }
 supports-color = { workspace = true }
 tokio = { workspace = true }
+agent-client-protocol = { workspace = true }
+async-trait = { workspace = true }
 uuid = { workspace = true }
 pulldown-cmark = { workspace = true }
 unicode-segmentation = { workspace = true }
