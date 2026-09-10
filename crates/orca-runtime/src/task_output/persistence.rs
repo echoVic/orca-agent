@@ -46,6 +46,7 @@ pub(crate) struct ArchivedShell {
 pub(super) struct OutputArchive {
     connection: Connection,
     root: PathBuf,
+    #[cfg(unix)]
     directory: File,
     database: File,
     _owner: ExclusiveFileLock,
@@ -103,6 +104,7 @@ impl OutputArchive {
         }
         prepare_directory(root)?;
         let root = fs::canonicalize(root)?;
+        #[cfg(unix)]
         let directory = open_directory(&root)
             .map_err(|error| io_context("open task output archive directory", error))?;
         let lock_path = root.join("owner.lock");
@@ -197,6 +199,7 @@ impl OutputArchive {
         let archive = Self {
             connection,
             root,
+            #[cfg(unix)]
             directory,
             database,
             _owner: owner,
@@ -240,6 +243,7 @@ impl OutputArchive {
             )));
         }
         check_components(&self.root)?;
+        #[cfg(unix)]
         verify_identity(&self.root, &self.directory, true)?;
         verify_identity(&self.root.join(DATABASE), &self.database, false)?;
         verify_identity(&self.root.join("owner.lock"), self._owner.file(), false)?;
@@ -696,25 +700,14 @@ fn private_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+#[cfg(unix)]
 fn open_directory(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let mut options = OpenOptions::new();
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Directory handles require backup semantics. Requesting only
-        // FILE_READ_ATTRIBUTES avoids GENERIC_READ failures on runner volumes.
-        options
-            .access_mode(0x0000_0080)
-            .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
-            .custom_flags(0x0200_0000 | 0x0020_0000);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     options.open(path)
 }
 
