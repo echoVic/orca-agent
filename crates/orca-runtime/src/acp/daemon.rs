@@ -225,14 +225,14 @@ mod unix {
             .build()?;
         let local = tokio::task::LocalSet::new();
         local.block_on(&runtime, async move {
-            let endpoint = Endpoint::bind(socket)?;
-            let host = crate::runtime_host::RuntimeHost::start().map_err(io::Error::other)?;
-            let shared = super::super::shared::SharedSessions::default();
-            let mut clients = JoinSet::new();
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             let mut interrupt =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let endpoint = Endpoint::bind(socket)?;
+            let host = crate::runtime_host::RuntimeHost::start().map_err(io::Error::other)?;
+            let shared = super::super::shared::SharedSessions::default();
+            let mut clients = JoinSet::new();
             eprintln!("orca: ACP daemon listening on {}", endpoint.path.display());
             loop {
                 tokio::select! {
