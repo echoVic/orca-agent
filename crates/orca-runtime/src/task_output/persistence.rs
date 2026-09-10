@@ -48,7 +48,10 @@ pub(super) struct OutputArchive {
     root: PathBuf,
     #[cfg(unix)]
     directory: File,
+    #[cfg(unix)]
     database: File,
+    #[cfg(windows)]
+    _database: File,
     _owner: ExclusiveFileLock,
     limits: ArchiveLimits,
     write_failure: Option<String>,
@@ -76,13 +79,16 @@ impl OutputArchive {
             .lock()
             .map_err(poisoned)?;
         cache.retain(|_, archive| archive.strong_count() != 0);
-        prepare_directory(root)?;
-        let root = fs::canonicalize(root)?;
+        prepare_directory(root)
+            .map_err(|error| io_context("prepare task output archive directory", error))?;
+        let root = fs::canonicalize(root)
+            .map_err(|error| io_context("canonicalize task output archive directory", error))?;
         if let Some(archive) = cache.get(&root).and_then(Weak::upgrade) {
             archive
                 .lock()
                 .map_err(poisoned)?
-                .verify_session(session_id)?;
+                .verify_session(session_id)
+                .map_err(|error| io_context("verify cached task output archive", error))?;
             return Ok(archive);
         }
         let archive = Arc::new(Mutex::new(Self::open_exclusive(
@@ -102,8 +108,10 @@ impl OutputArchive {
         {
             return Err(invalid("archive limits must be positive"));
         }
-        prepare_directory(root)?;
-        let root = fs::canonicalize(root)?;
+        prepare_directory(root)
+            .map_err(|error| io_context("prepare task output archive directory", error))?;
+        let root = fs::canonicalize(root)
+            .map_err(|error| io_context("canonicalize task output archive directory", error))?;
         #[cfg(unix)]
         let directory = open_directory(&root)
             .map_err(|error| io_context("open task output archive directory", error))?;
@@ -115,7 +123,8 @@ impl OutputArchive {
         let path = root.join(DATABASE);
         let database = private_file(&path)
             .map_err(|error| io_context("open task output archive database", error))?;
-        check_sidecars(&root)?;
+        check_sidecars(&root)
+            .map_err(|error| io_context("verify task output archive sidecars", error))?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
@@ -201,12 +210,17 @@ impl OutputArchive {
             root,
             #[cfg(unix)]
             directory,
+            #[cfg(unix)]
             database,
+            #[cfg(windows)]
+            _database: database,
             _owner: owner,
             limits,
             write_failure: None,
         };
-        archive.verify_session(session_id)?;
+        archive
+            .verify_session(session_id)
+            .map_err(|error| io_context("initialize task output archive", error))?;
         archive
             .connection
             .execute(
@@ -242,12 +256,26 @@ impl OutputArchive {
                 "task output archive unavailable after write failure: {error}"
             )));
         }
-        check_components(&self.root)?;
+        check_components(&self.root)
+            .map_err(|error| io_context("validate task output archive path", error))?;
         #[cfg(unix)]
-        verify_identity(&self.root, &self.directory, true)?;
-        verify_identity(&self.root.join(DATABASE), &self.database, false)?;
-        verify_identity(&self.root.join("owner.lock"), self._owner.file(), false)?;
+        {
+            verify_identity(&self.root, &self.directory, true)
+                .map_err(|error| io_context("verify task output archive directory", error))?;
+            verify_identity(&self.root.join(DATABASE), &self.database, false)
+                .map_err(|error| io_context("verify task output archive database", error))?;
+            verify_identity(&self.root.join("owner.lock"), self._owner.file(), false)
+                .map_err(|error| io_context("verify task output archive owner file", error))?;
+        }
+        #[cfg(windows)]
+        {
+            verify_named_path(&self.root.join(DATABASE), false)
+                .map_err(|error| io_context("verify task output archive database", error))?;
+            verify_named_path(&self.root.join("owner.lock"), false)
+                .map_err(|error| io_context("verify task output archive owner file", error))?;
+        }
         check_sidecars(&self.root)
+            .map_err(|error| io_context("verify task output archive sidecars", error))
     }
 
     pub(super) fn register(
@@ -762,6 +790,11 @@ fn verify_identity(path: &Path, file: &File, directory: bool) -> io::Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn verify_named_path(path: &Path, directory: bool) -> io::Result<()> {
+    check_private(&fs::symlink_metadata(path)?, directory)
 }
 
 fn check_sidecars(root: &Path) -> io::Result<()> {
