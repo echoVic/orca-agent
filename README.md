@@ -82,9 +82,10 @@ Orca prints the exact `orca --resume <SESSION_ID>` command for the session.
 Use `/plan` for read-only planning, `/goal` for a persistent objective, and
 `/tasks` for the unified workspace containing subagents, background commands,
 monitors, and workflow children. `/agents` is an alias for `/tasks`, while
-`/workflows` keeps the workflow-specific run tree. Use `/trust` to manage the
-current folder's sandbox permissions. Automatic project memory is enabled for
-recorded sessions by default; use `/remember` for explicit user or project
+`/workflows` keeps the workflow-specific run tree. Use `/trust` to control
+whether Orca loads project-provided configuration and instructions; it does not
+enable or bypass OS sandbox enforcement. Automatic project memory is enabled
+for recorded sessions by default; use `/remember` for explicit user or project
 facts. See [Memory](docs/memory.md) for capture, recall, storage, privacy, and
 deletion.
 

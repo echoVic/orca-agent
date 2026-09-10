@@ -47,6 +47,16 @@ orca doctor --cwd ./my-project --format json
 JSON 报告不会包含 API 密钥。只有警告时正常退出；必要检查失败时以状态码 `1` 退出，
 并附上修复建议。
 
+### 目录信任与沙箱不可用
+
+目录信任和 OS 沙箱 enforcement 是两条独立的安全轴。`/trust` 只允许 Orca 加载该目录
+提供的项目配置、instructions、skills、agents 和 workflows；它不会安装、启用或绕过
+Seatbelt、bubblewrap、Landlock、seccomp 或 Windows AppContainer。
+
+如果 `orca doctor` 报告沙箱不可用，请按报告中的 backend、probe 失败原因和 remediation
+处理宿主环境。不要通过信任目录来尝试修复 enforcement，也不要把 unavailable 当成
+允许无沙箱执行。
+
 ## 启动交互式会话
 
 ```bash

@@ -50,6 +50,18 @@ orca doctor --cwd ./my-project --format json
 The JSON report never contains the API key. Warnings exit successfully; a
 failed required check exits with status `1` and includes remediation.
 
+### Folder trust and unavailable sandboxes
+
+Folder trust and OS sandbox enforcement are independent security boundaries.
+`/trust` only allows Orca to load project-provided configuration, instructions,
+skills, agents, and workflows. It does not install, enable, or bypass Seatbelt,
+bubblewrap, Landlock, seccomp, or Windows AppContainer.
+
+If `orca doctor` reports that sandbox enforcement is unavailable, follow the
+reported backend, probe failure, and remediation for the host environment. Do
+not trust the folder to work around enforcement, and do not treat unavailable
+enforcement as permission to run without a sandbox.
+
 ## Start an interactive session
 
 ```bash

@@ -102,3 +102,9 @@ instead of being treated as a normal host. Landlock roots are opened as
 descriptor-backed `PathBeneath` rules and failures are fatal rather than
 silently dropped. Windows AppContainer/ConPTY adapters obtain broker
 authorization before native handle-based spawning.
+
+Backend availability decisions retain bounded diagnostic probe evidence,
+including the selected backend, executable, termination status, stderr, and
+startup error. This evidence explains why enforcement is unavailable but is not
+a `SandboxDenialReceipt`, carries no authority, and cannot authorize an
+unsandboxed retry.
