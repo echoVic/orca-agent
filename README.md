@@ -61,6 +61,12 @@ orca --resume [SESSION_ID]                # resume a saved conversation
 orca --fork SESSION_ID                    # fork a saved conversation
 ```
 
+Development builds also provide opt-in [shared ACP sessions](docs/acp-daemon.md)
+on Unix (`orca daemon`, `orca attach`, and `orca acp-bridge`),
+[file-defined subagents](docs/subagents.md), and
+[persistent terminal output pages](docs/architecture/adr/0006-unified-exec-terminal-service.md).
+These additions are not part of the published v0.4.26 package.
+
 On Windows PowerShell, set the key with `$env:DEEPSEEK_API_KEY = "sk-..."`;
 the `orca` commands are the same.
 

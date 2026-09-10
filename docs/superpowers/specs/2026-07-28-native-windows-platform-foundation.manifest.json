@@ -30,6 +30,30 @@
   ],
   "foundation_exceptions": [
     [
+      "acp-daemon-private-unix-endpoint",
+      "crates/orca-runtime/src/acp/daemon.rs",
+      "unix_std_api",
+      2
+    ],
+    [
+      "acp-daemon-nofollow-flags",
+      "crates/orca-runtime/src/acp/daemon.rs",
+      "unix_libc_process",
+      3
+    ],
+    [
+      "task-output-private-unix-artifacts",
+      "crates/orca-runtime/src/task_output/persistence.rs",
+      "unix_std_api",
+      6
+    ],
+    [
+      "task-output-nofollow-flags",
+      "crates/orca-runtime/src/task_output/persistence.rs",
+      "unix_libc_process",
+      2
+    ],
+    [
       "tui-clipboard-image-private-unix-permissions",
       "crates/orca-tui/src/clipboard_image.rs",
       "unix_std_api",
@@ -61,6 +85,41 @@
     ]
   ],
   "deferred_boundaries": [
+    [
+      "acp-tui-client-socket-permissions-fixture",
+      "crates/orca-tui/src/acp_client.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "acp-daemon-process-fixture",
+      "tests/acp_daemon.rs",
+      "unix_std_api",
+      4,
+      "windows-test-portability"
+    ],
+    [
+      "acp-daemon-process-termination-fixture",
+      "tests/acp_daemon.rs",
+      "unix_libc_process",
+      2,
+      "windows-test-portability"
+    ],
+    [
+      "agent-definition-symlink-fixture",
+      "crates/orca-core/src/agent_definition.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "task-output-store-symlink-fixture",
+      "crates/orca-runtime/tests/task_output_store.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
     [
       "thread-store-assets-unix-symlink-fixture",
       "crates/orca-runtime/src/thread_store/storage_tests.rs",

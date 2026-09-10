@@ -3,7 +3,16 @@
 > Goal: evolve Orca into a production-grade DeepSeek-native agent runtime.
 > Reference implementations: Codex CLI, Claude Code, and the current Orca codebase.
 
-Last updated: 2026-08-29
+Last updated: 2026-09-09
+
+The unpublished DeepSeek-native capability slice extends the existing remote
+summary path with [cache-aware hierarchical compaction](reports/2026-09-09-cache-aware-compaction.md),
+adds [file-defined subagents](subagents.md), and introduces opt-in
+[local shared ACP sessions](acp-daemon.md). Persistent output offset polling is
+specified in [ADR 0006](architecture/adr/0006-unified-exec-terminal-service.md).
+Implementation evidence and remaining verification work are tracked in
+[the delivery plan](superpowers/plans/2026-09-09-deepseek-agent-capabilities.md);
+these changes have not been released as a new patch version.
 
 The v0.4.0 release adds complete image input across every model selection: TUI
 clipboard images, dragged or pasted image paths and `file://` URLs, `@file`
@@ -1695,8 +1704,10 @@ working baseline used to prioritize the next patch releases.
 | File discovery | `glob` remains model-facing; interactive discovery now uses multi-root streaming `orca-file-search` with browse/fuzzy modes, exclude/Git-ignore controls, owned cancellation, million-path acceptance gates, and Codex-compatible app-server sessions | Claude `Glob`, Codex file search | Implemented |
 | Mention system | Files, Skills, Plugins, MCP Resources, and Resource Templates share one typed candidate model in TUI and thread-bound app-server search; visible tokens carry hidden atomic targets that survive preceding edits, invalidate on overlap, and expand against the selected root/registry | Codex atomic structured input and unified mentions; Claude resource/file typeahead | Implemented |
 | Shell execution | A thread-owned `TerminalService` exposes model-facing `exec_command` and `write_stdin` with retained session/task ids, optional PTY, raw control-character input, bounded incremental output, active permission-profile sandboxing, and immediate `task_stop` process-tree termination. A bounded-mailbox, single-owner supervisor actively reaps natural exits and registry stop requests without another poll, releases per-session resources, joins on shutdown, and injects exactly-once bounded completion notifications before the next model turn unless the terminal was already observed. Synchronous `bash` and JSONL server shell adapters remain compatible over the same low-level shell-session manager | Codex `exec_command` streaming/exit watcher; Grok Build exit watcher and completion notification | Implemented |
-| Context management | BPE token counting, local compaction, persisted collapse/summary records, and a stable `ContextWindowId` per model-visible epoch | Multi-level local/remote compaction | Partial |
-| Tool output control | Runtime task output uses a bounded, UTF-8-safe `TaskOutputStore` for shell and command/exec output, preserves cumulative streaming caps, and evicts terminal process output. v0.2.24 additionally caps ordinary child stdout/stderr at 1 MiB per stream before final tool-result truncation, preserves omission metadata, and bounds regular-file reads, exact edits, and committed TUI diff previews at admission | Codex bounded exec replay plus package 3 disk-backed task output and offset polling | Partial; v0.2.24 published, persistent offset polling remains open |
+| Context management | BPE estimates, cache-aware suffix reduction, bounded hierarchical DeepSeek summaries, image admission budgets, complete-turn retention and atomic durable snapshot recovery; unchanged leading instructions are preserved | Multi-level local/remote compaction | Implemented, unpublished; estimated prefix reuse and actual API usage are reported separately |
+| Tool output control | Bounded UTF-8 memory tails plus session-scoped disk output archives, explicit idempotent `write_stdin.output_offset`, absolute cursors and omission metadata, process-restart reads, and bounded per-task/session/chunk retention | Codex bounded exec replay plus disk-backed task output and offset polling | Implemented, unpublished; original shell/process state is not resumed |
+| Custom agents | User/trusted-project Markdown and parsed YAML definitions, model-visible catalog, inherited tool intersection and immutable definition/delegation snapshots across sync/detached execution and continuation | Claude/Grok declarative agents | Implemented, unpublished; parent-restart recovery verified across sync/async mode changes |
+| Shared ACP sessions | Opt-in workspace-bound Unix daemon, standard stdio bridge, headless/TUI attach, connection-scoped permissions, single active mutation, observer replay and reconnect without prompt resubmission | ACP-native shared runtime | Implemented, unpublished; TUI and real-provider acceptance passed; no Windows daemon yet |
 | Model metadata | `ModelSelection`, DeepSeek defaults, typed direct-vs-analysis image routing, and `deepseek-v4-flash-vision-exp` visual preprocessing for `auto`, Pro, and Flash | Codex `models-manager` with model capability metadata | Partial |
 | MCP | stdio/SSE config surface, tool routing, read-only resource list/read/template tools, unified Mention discovery, same-registry Resource expansion, and v0.2.24 timeout/cancel/error/drop cleanup with bounded stdio response framing and process reaping | Codex MCP client/server ecosystem | Partial; resource/tool/Mention integration and lifecycle hardening seeded |
 | Hooks | Lifecycle hooks with JSON stdout actions; structured outputs that declare `action` now validate supported actions and required string fields | Codex hooks runtime and schema validation | Implemented; schema docs/validation improved |
