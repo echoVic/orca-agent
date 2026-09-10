@@ -114,7 +114,9 @@ Only opted-in clients receive `session/update.params._meta["orca.dev/projection"
 - `phase: "reset"`: replace the local transcript replica; snapshot chunks follow.
 - `phase: "ready"`: snapshot delivery is flushed; `active` reflects current work.
 - `phase: "active"` or `"terminal"`: observer turn state. A terminal may include
-  standard `stopReason` or `error`.
+  standard `stopReason` or `error`; Orca projection clients also receive the
+  typed `terminal` value so failure class, budget, cancellation, and shutdown
+  reasons survive transport.
 - `phase: "reload_required"`: abandon the replica and reconnect/load.
 - `usage`: cumulative surface input/output/cache token counts and
   `estimated_cost_usd_micros`. Standard SDK `usage_update` still carries context

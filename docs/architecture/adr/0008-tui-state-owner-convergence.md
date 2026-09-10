@@ -15,6 +15,7 @@ Use `AppState` as a composition root and give each independently invariant domai
 | Owner | Responsibility |
 | --- | --- |
 | `protocol.rs` | `TuiEvent`, `UserAction`, interaction keys/responses, lifecycle and attachment values |
+| `diagnostics.rs` | TUI diagnostic classification, bounded detail, stable diagnostic codes, and actionable recovery guidance |
 | `state_reducer.rs` | `AppState::update` and event dispatch/reducer helpers |
 | `transcript_state.rs` | messages, revisions, render caches, search, stream assembly, finalization and flush watermarks |
 | `interaction_state.rs` | pending user-input/MCP projections and staged acknowledgement payloads |
@@ -28,6 +29,22 @@ The aggregate owns composition and cross-owner transitions. Definitions are not 
 - The compiler makes owner fields and protocol definitions explicit without introducing a second runtime state machine.
 - Cross-owner integration tests remain necessary for lifecycle and projection ordering, but they are no longer the default home for local invariants.
 - The source layout is intentionally a breaking internal refactor for contributors; runtime wire formats and persistence formats are unchanged.
+
+## Diagnostic Contract
+
+- A typed runtime terminal is the authoritative source for failure class,
+  cancellation reason, admission rejection, shutdown reason, and exhausted
+  budget. TUI and ACP adapters must preserve that terminal instead of reducing
+  it to a status string.
+- Every displayed diagnostic contains a stable code, a concise title, the
+  original bounded cause, and a concrete next action when recovery is possible.
+- Legacy string-only errors may be classified for presentation, but that
+  classification is not authority and must not change runtime behavior.
+- Every non-success session terminal must leave a visible diagnostic. A
+  synthesized fallback is permitted only when no diagnostic was observed for
+  the current turn.
+- Diagnostics already present in a snapshot or event stream suppress the
+  terminal fallback, so reconnect and replay do not duplicate errors.
 
 ## Verification
 
