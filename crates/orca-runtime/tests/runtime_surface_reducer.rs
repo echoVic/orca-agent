@@ -6061,6 +6061,7 @@ fn exercise_operation_generation_invariant(
                 fence: generation.fence.clone(),
                 ordinal,
                 task_id: SurfaceTaskId::try_new(format!("manifest-turn-{ordinal}")).unwrap(),
+                admitted_main_task_id: None,
                 task_status: SurfaceTaskRunningStatus::Running,
             };
             let positive = batch(
@@ -7133,6 +7134,7 @@ fn remaining_operation_control_and_execution_facts_are_reducible() {
         fence: active_generation.fence.clone(),
         ordinal: 0,
         task_id: SurfaceTaskId::try_new("main-turn").unwrap(),
+        admitted_main_task_id: None,
         task_status: SurfaceTaskRunningStatus::Running,
     };
     let execution_facts = batch(

@@ -4169,6 +4169,22 @@ impl ThreadActor {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
 
+        // Record the registry root under the admitted generation before execution.
+        // StartTurn consumes this same task; the loop task remains a separate ID.
+        let main_session_task = if goal_identity.is_none() {
+            let registry = self
+                .state
+                .as_ref()
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?
+                .thread
+                .session()
+                .task_registry()
+                .clone();
+            let task = registry.create_main_session(resolved_input.canonical_text.as_str().into());
+            Some((registry, task.id))
+        } else {
+            None
+        };
         let legacy_task_id = format!("typed-user-turn-{}", uuid::Uuid::now_v7());
         let loop_started_batch = self.surface_operation_batch(
             &operation_id,
@@ -4177,8 +4193,12 @@ impl ThreadActor {
                     turn_id: logical_turn_id.clone(),
                     fence: fence.clone(),
                     ordinal: 0,
-                    task_id: surface::SurfaceTaskId::try_new(legacy_task_id.clone())
+                    task_id: surface::SurfaceTaskId::try_new(legacy_task_id)
                         .expect("generated task id is non-empty"),
+                    admitted_main_task_id: main_session_task.as_ref().map(|(_, task_id)| {
+                        surface::SurfaceTaskId::try_new(task_id.clone())
+                            .expect("generated main task id is non-empty")
+                    }),
                     task_status: surface::SurfaceTaskRunningStatus::Running,
                 },
             }],
@@ -4189,6 +4209,12 @@ impl ThreadActor {
             .commit_generation_batch(fence.clone(), &loop_started_batch)
         {
             eprintln!("orca: typed surface agent-loop start commit failed: {error:?}");
+            if let Some((registry, task_id)) = &main_session_task {
+                let _ = registry.fail(
+                    task_id,
+                    "typed surface agent-loop start commit failed".into(),
+                );
+            }
             if let Err(repair_error) = self.repair_surface_admission_failure(
                 &fence,
                 "typed surface agent-loop start commit failed",
@@ -4292,6 +4318,9 @@ impl ThreadActor {
                         cancel,
                     }))
             });
+        if let Some((_, task_id)) = &main_session_task {
+            hosted_request = hosted_request.with_task_id(task_id.clone());
+        }
         if goal_identity.is_some() {
             let goal_identity = goal_identity.as_ref().expect("guarded Goal identity");
             let goal_turn_origin = match goal_identity.outer_turn_origin {
@@ -4340,6 +4369,12 @@ impl ThreadActor {
         let start_result = match start_rx.recv() {
             Ok(result) => result,
             Err(_) => {
+                if let Some((registry, task_id)) = &main_session_task {
+                    let _ = registry.fail(
+                        task_id,
+                        "typed surface runtime start reply was dropped".into(),
+                    );
+                }
                 if let Err(repair_error) = self.repair_surface_admission_failure(
                     &fence,
                     "typed surface runtime start reply was dropped",
@@ -4354,6 +4389,12 @@ impl ThreadActor {
         };
         if let Err(error) = start_result {
             eprintln!("orca: typed surface runtime start failed: {error}");
+            if let Some((registry, task_id)) = &main_session_task {
+                let _ = registry.fail(
+                    task_id,
+                    format!("typed surface runtime start failed: {error}"),
+                );
+            }
             if let Err(repair_error) =
                 self.repair_surface_admission_failure(&fence, "typed surface runtime start failed")
             {
@@ -6988,6 +7029,7 @@ impl ThreadActor {
                     ordinal: 0,
                     task_id: surface::SurfaceTaskId::try_new(legacy_task_id.clone())
                         .expect("generated task id is non-empty"),
+                    admitted_main_task_id: None,
                     task_status: surface::SurfaceTaskRunningStatus::Running,
                 },
             }],

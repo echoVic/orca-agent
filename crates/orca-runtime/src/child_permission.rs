@@ -593,6 +593,7 @@ mod tests {
                 prompt_id: AgentPromptId::new(),
                 compatibility: ContinuationCompatibility {
                     subagent_type: "general".to_string(),
+                    frozen_agent: None,
                     model: Some("test-model".to_string()),
                     isolation: SubagentIsolation::None,
                     effective_cwd: std::env::temp_dir().display().to_string(),

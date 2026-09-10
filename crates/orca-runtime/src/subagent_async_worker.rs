@@ -283,7 +283,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         child_executor,
     } = context;
     let AsyncSubagentWorkerInput {
-        config,
+        mut config,
         cwd,
         child_cwd,
         task_session_id,
@@ -333,6 +333,13 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 1;
         }
     };
+    if let Err(error) = restore_worker_agent(&mut config, &request, &prepared) {
+        let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+        let mut error = error;
+        append_worktree_outcome(&mut error, worktree.as_ref());
+        let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, None);
+        return 1;
+    }
     let detached_binding = match task_registry.detached_subagent_binding(&agent_id) {
         Ok(Some(binding)) => binding,
         Ok(None) => {
@@ -741,6 +748,27 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
     1
 }
 
+fn restore_worker_agent(
+    config: &mut RunConfig,
+    request: &subagent::SubagentRequest,
+    prepared: &PreparedContinuation,
+) -> Result<(), String> {
+    if request.frozen_agent != prepared.compatibility.frozen_agent {
+        return Err("custom agent launch snapshot does not match the durable continuation".into());
+    }
+    if request.frozen_agent.is_some()
+        && (request.subagent_type.identifier() != prepared.compatibility.subagent_type
+            || request.model != prepared.compatibility.model)
+    {
+        return Err("custom agent launch identity does not match the durable continuation".into());
+    }
+    subagent::apply_frozen_agent(
+        config,
+        &request.subagent_type,
+        prepared.compatibility.frozen_agent.as_ref(),
+    )
+}
+
 pub(crate) fn launch_async_subagent(
     context: AsyncSubagentLaunchContext<'_>,
 ) -> AsyncSubagentLaunchOutput {
@@ -870,12 +898,43 @@ pub(crate) fn launch_async_subagent(
         .as_ref()
         .map(|source| source.compatibility.isolation)
         .unwrap_or(request.isolation);
+    let mcp_registry = orca_mcp::initialize_registry(&config.mcp_servers);
+    let freeze_result = if let Some(source) = &source {
+        subagent::restore_frozen_agent(config, source).map(|frozen| {
+            request.frozen_agent = frozen;
+        })
+    } else {
+        subagent::freeze_agent_request(config, cwd, &mcp_registry, &mut request)
+    };
+    if let Err(error) = freeze_result {
+        let _ = task_registry.fail(&agent_id, error.clone());
+        return async_launch_output(
+            task_registry,
+            &agent_id,
+            tool_types::ToolResult::failed_before_start(tool_request, error, None),
+        );
+    }
+    if let Some(frozen) = &request.frozen_agent {
+        request.delegation = Some(frozen.delegation.clone());
+    }
     let delegation = request
         .delegation
         .clone()
         .unwrap_or_else(|| orca_core::config::DelegationSnapshot::from_config(config));
     let mut child_config = config.clone();
     delegation.apply_to(&mut child_config, request.model.clone());
+    if let Err(error) = subagent::apply_frozen_agent(
+        &mut child_config,
+        &request.subagent_type,
+        request.frozen_agent.as_ref(),
+    ) {
+        let _ = task_registry.fail(&agent_id, error.clone());
+        return async_launch_output(
+            task_registry,
+            &agent_id,
+            tool_types::ToolResult::failed_before_start(tool_request, error, None),
+        );
+    }
     request.model = child_config.model.as_option();
     let launch_worktree =
         match prepare_async_launch_worktree(source.as_ref(), request.isolation, cwd) {
@@ -889,7 +948,6 @@ pub(crate) fn launch_async_subagent(
                 );
             }
         };
-    let mcp_registry = orca_mcp::initialize_registry(&child_config.mcp_servers);
     let worktree_binding = launch_worktree
         .worker
         .as_ref()
@@ -906,6 +964,7 @@ pub(crate) fn launch_async_subagent(
         &delegation,
         &mcp_registry,
         &child_config.external_tools,
+        request.frozen_agent.as_ref(),
     ) {
         Ok(hash) => hash,
         Err(error) => {
@@ -923,6 +982,7 @@ pub(crate) fn launch_async_subagent(
     let compatibility = ContinuationCompatibility {
         subagent_type: serialized_subagent_type(&request.subagent_type)
             .unwrap_or_else(|| "general".to_string()),
+        frozen_agent: request.frozen_agent.clone(),
         model: request.model.clone(),
         isolation: request.isolation,
         effective_cwd: launch_worktree.child_cwd.display().to_string(),
@@ -931,16 +991,19 @@ pub(crate) fn launch_async_subagent(
     };
     let prompt_id = AgentPromptId::new();
     let prepared = match source.as_ref() {
-        Some(_) => coordinator.prepare_resume(ResumeContinuationInput {
-            selector: request
-                .resume_from
-                .clone()
-                .expect("resolved async resume source has selector"),
-            parent_task_id: root_task_id.map(str::to_string),
-            task_id: agent_id.clone(),
-            prompt_id,
-            compatibility,
-        }),
+        Some(_) => coordinator.prepare_resume_with_parent_fence(
+            ResumeContinuationInput {
+                selector: request
+                    .resume_from
+                    .clone()
+                    .expect("resolved async resume source has selector"),
+                parent_task_id: root_task_id.map(str::to_string),
+                task_id: agent_id.clone(),
+                prompt_id,
+                compatibility,
+            },
+            parent_fence.as_ref(),
+        ),
         None => coordinator.create(CreateContinuationInput {
             continuation_id: Some(AgentContinuationId::new()),
             parent_task_id: root_task_id.map(str::to_string),
@@ -1582,6 +1645,197 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn custom_agent_detached_worker_process_entry() {
+        let Some(fixture) = std::env::var_os("ORCA_CUSTOM_AGENT_WORKER_FIXTURE") else {
+            return;
+        };
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+        let cwd = PathBuf::from(data["cwd"].as_str().unwrap());
+        let request = serde_json::from_value(data["request"].clone()).unwrap();
+        let key: [u8; 32] = serde_json::from_value(data["key"].clone()).unwrap();
+        let code = run_async_subagent_worker_with_executor(AsyncSubagentWorkerContext {
+            input: AsyncSubagentWorkerInput {
+                config: async_test_config(cwd.clone()),
+                cwd: cwd.clone(),
+                child_cwd: cwd,
+                task_session_id: data["session"].as_str().unwrap().to_string(),
+                agent_id: data["task"].as_str().unwrap().to_string(),
+                request,
+                child_depth: 1,
+                worktree: None,
+                permission_response_public_key: key,
+                child_turn_id: TurnId::new(),
+                activity_start_precommitted: false,
+            },
+            child_executor: inspect_frozen_worker,
+        });
+        assert_eq!(code, 0, "detached worker failed");
+    }
+
+    fn inspect_frozen_worker(
+        config: &RunConfig,
+        request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, io::Sink>,
+        _cost: &mut crate::cost::CostTracker,
+    ) -> io::Result<crate::agent_child::ChildAgentResult> {
+        let definition = config.subagents.effective_definition.as_ref().unwrap();
+        assert_eq!(definition.system_prompt, "Frozen worker instructions.");
+        assert_eq!(
+            request.allowed_tools.as_ref().unwrap(),
+            &vec!["read_file".to_string()]
+        );
+        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        let mut setup = crate::child_agent_loop_setup::try_prepare_child_agent_loop(
+            config,
+            request,
+            runtime.cwd,
+            runtime.instructions,
+            runtime.memory,
+        )
+        .unwrap();
+        assert!(matches!(&setup.conversation.messages[0],
+            orca_core::conversation::Message::System { content, .. }
+                if content.contains("Frozen worker instructions.")));
+        setup
+            .conversation
+            .add_assistant(Some("worker checkpoint".into()), None, Vec::new());
+        runtime
+            .checkpoint_observer
+            .unwrap()
+            .checkpoint(crate::child_agent_types::ChildAgentCheckpointObservation {
+                conversation: &setup.conversation,
+                turn: 1,
+                usage: Default::default(),
+                last_tool_boundary: None,
+            })
+            .unwrap();
+        Ok(crate::agent_child::ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("worker checkpoint".into()),
+            error: None,
+            budget_usage: None,
+        })
+    }
+
+    #[test]
+    fn custom_agent_detached_process_uses_persisted_definition_after_file_deletion() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        std::fs::create_dir(home.path().join("agents")).unwrap();
+        let definition_path = home.path().join("agents/audit.md");
+        std::fs::write(&definition_path, "---\nname: audit\ndescription: Inspect files\ntools: [read_file]\nmodel: deepseek-v4-flash\n---\nFrozen worker instructions.\n").unwrap();
+        let config = async_test_config(cwd.path().to_path_buf());
+        let mut request = subagent::create_subagent_request(&ToolRequest {
+            id: "custom-async".into(), name: ToolName::Subagent, action: ActionKind::Agent,
+            target: None, raw_arguments: Some(serde_json::json!({
+                "description": "Inspect", "prompt": "Inspect files", "subagent_type": "audit", "mode": "async"
+            }).to_string()),
+        });
+        subagent::freeze_agent_request(
+            &config,
+            cwd.path(),
+            &orca_mcp::McpRegistry::default(),
+            &mut request,
+        )
+        .unwrap();
+        let session = format!("custom-detached-{}", uuid::Uuid::now_v7());
+        let registry = TaskRegistry::new_for_cwd(session.clone(), cwd.path());
+        assert!(!registry.is_process_local());
+        let task = registry.create_subagent("Inspect".into(), Some("audit".into()));
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let frozen = request.frozen_agent.clone().unwrap();
+        let effective_cwd = cwd.path().display().to_string();
+        let compatibility_hash = compute_continuation_compatibility_hash(
+            &request.subagent_type,
+            request.model.as_deref(),
+            request.isolation,
+            &effective_cwd,
+            None,
+            &frozen.delegation,
+            &orca_mcp::McpRegistry::default(),
+            &[],
+            Some(&frozen),
+        )
+        .unwrap();
+        let prepared = coordinator
+            .create(CreateContinuationInput {
+                continuation_id: None,
+                parent_task_id: None,
+                task_id: task.id.clone(),
+                prompt_id: AgentPromptId::new(),
+                compatibility: ContinuationCompatibility {
+                    subagent_type: "audit".into(),
+                    frozen_agent: Some(frozen),
+                    model: request.model.clone(),
+                    isolation: SubagentIsolation::None,
+                    effective_cwd,
+                    worktree: None,
+                    compatibility_hash,
+                },
+            })
+            .unwrap();
+        let binding = registry
+            .register_detached_subagent_binding(
+                &task.id,
+                &task.id,
+                prepared.attempt_id,
+                TaskRevision::try_new(1).unwrap(),
+                Some(crate::runtime_surface::SurfaceOperationFence {
+                    thread_id: crate::runtime_surface::SurfaceThreadId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    thread_owner_epoch: crate::runtime_surface::ThreadOwnerEpoch::new(1),
+                    operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    generation_id: crate::runtime_surface::SurfaceGenerationId::new(1),
+                }),
+            )
+            .unwrap();
+        let fixture = home.path().join("worker-fixture.json");
+        std::fs::write(&fixture, serde_json::to_vec(&serde_json::json!({
+            "cwd": cwd.path(), "request": request, "key": binding.permission_response_public_key,
+            "session": session, "task": task.id,
+        })).unwrap()).unwrap();
+        std::fs::remove_file(definition_path).unwrap();
+        registry.mark_worker_spawned(&task.id, 0).unwrap();
+        let child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subagent_async_worker::tests::custom_agent_detached_worker_process_entry",
+                "--nocapture",
+            ])
+            .env("ORCA_HOME", home.path())
+            .env("ORCA_CUSTOM_AGENT_WORKER_FIXTURE", &fixture)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        registry.mark_worker_spawned(&task.id, child.id()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let restored = coordinator.prepared(&task.id).unwrap();
+        assert_eq!(
+            restored.compatibility.frozen_agent,
+            prepared.compatibility.frozen_agent
+        );
+        assert!(restored.checkpoint.is_some());
+        assert!(matches!(
+            restored.terminal,
+            Some(AgentTerminal::Completed { .. })
+        ));
+    }
 
     #[test]
     fn inherited_async_worktree_is_preserved() {

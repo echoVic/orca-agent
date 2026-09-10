@@ -53,12 +53,39 @@ where
     F: FnMut(&RunConfig, &ChildAgentRequest, &mut CostTracker) -> io::Result<ChildAgentResult>,
 {
     let mut child_config = config.clone();
+    let mut request = request.clone();
+    if let SubagentType::Custom(name) = &request.subagent_type {
+        let definition = child_config.subagents.effective_definition.as_ref();
+        let error = match definition {
+            Some(definition) if &definition.name == name => definition.validate().err(),
+            _ => Some("custom agent requires a matching frozen definition".to_string()),
+        };
+        if let Some(error) = error {
+            return (
+                ChildAgentResult {
+                    status: RunStatus::Failed,
+                    final_message: None,
+                    error: Some(error),
+                    budget_usage: None,
+                },
+                CostTracker::new(child_config.model.as_deref()),
+            );
+        }
+        let definition = definition.expect("validated frozen definition");
+        let mut allowed = definition.allowed_tools.clone();
+        if let Some(ceiling) = &request.allowed_tools {
+            allowed.retain(|tool| ceiling.contains(tool));
+        }
+        request.allowed_tools = Some(allowed);
+        request.tool_policy_label = Some(format!("custom agent '{name}'"));
+        request.model = definition.model.clone();
+    }
     child_config.model = child_config
         .model
         .with_subagent_override(request.model.clone());
     let mut child_cost_tracker = CostTracker::new(child_config.model.as_deref());
     let result =
-        executor(&child_config, request, &mut child_cost_tracker).unwrap_or_else(|error| {
+        executor(&child_config, &request, &mut child_cost_tracker).unwrap_or_else(|error| {
             ChildAgentResult {
                 status: RunStatus::Failed,
                 final_message: None,

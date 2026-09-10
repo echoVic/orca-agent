@@ -816,8 +816,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     },
                     "subagent_type": {
                         "type": "string",
-                        "enum": ["general", "code_reviewer", "test_writer", "debugger", "documenter"],
-                        "description": "Optional specialized agent type that restricts tools and provides focused expertise"
+                        "description": "Built-in type (general, code_reviewer, test_writer, debugger, documenter) or an ASCII custom identifier from the available agent catalog. Unknown or invalid custom agents fail closed. Omit when resuming to inherit the frozen source definition."
                     },
                     "model": {
                         "type": "string",

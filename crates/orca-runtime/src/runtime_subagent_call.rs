@@ -326,12 +326,23 @@ impl RuntimeSubagentBatch {
     pub(crate) fn admit(
         &mut self,
         index: usize,
-        invocation: RuntimeSubagentInvocation,
+        mut invocation: RuntimeSubagentInvocation,
         publish_started: impl FnOnce(&RuntimeTaskLifecycle) -> io::Result<()>,
     ) -> RuntimeSubagentAdmission {
         if self.cancel.is_cancelled() {
             return RuntimeSubagentAdmission {
                 immediate: Some((index, cancelled_before_start(invocation))),
+                event_error: None,
+            };
+        }
+        if let Err(error) = crate::subagent::freeze_agent_request(
+            &invocation.config,
+            &invocation.cwd,
+            &invocation.mcp_registry,
+            &mut invocation.request,
+        ) {
+            return RuntimeSubagentAdmission {
+                immediate: Some((index, failed_before_start(invocation, error))),
                 event_error: None,
             };
         }
@@ -891,8 +902,19 @@ fn run_subagent_worker(
     started_task: RuntimeTaskLifecycle,
     cancel: CancelToken,
 ) -> RuntimeSubagentCallOutput {
+    let resumes_custom = invocation
+        .request
+        .resume_from
+        .as_deref()
+        .is_some_and(|selector| {
+            ChildAgentCoordinator::new(invocation.task_registry.clone())
+                .and_then(|coordinator| coordinator.prepared(selector))
+                .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
+        });
     if invocation.agent_controller.is_some()
         && invocation.request.isolation == SubagentIsolation::None
+        && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
+        && !resumes_custom
     {
         return run_threaded_agent_worker(invocation, lifecycle, started_task, cancel);
     }
@@ -926,6 +948,7 @@ fn run_subagent_worker(
         schema,
         resume_from,
         delegation,
+        frozen_agent,
     } = request;
     let delegation = delegation.unwrap_or_else(|| DelegationSnapshot::from_config(&config));
     let coordinator_result = ChildAgentCoordinator::new(task_registry.clone());
@@ -1023,6 +1046,32 @@ fn run_subagent_worker(
         .unwrap_or(requested_isolation);
     let mut child_config = config.clone();
     delegation.apply_to(&mut child_config, model.clone());
+    let frozen_agent = match source.as_ref() {
+        Some(source) => crate::subagent::restore_frozen_agent(&config, source),
+        None => Ok(frozen_agent),
+    };
+    let frozen_agent = match frozen_agent.and_then(|frozen| {
+        crate::subagent::apply_frozen_agent(&mut child_config, &subagent_type, frozen.as_ref())?;
+        Ok(frozen)
+    }) {
+        Ok(frozen) => frozen,
+        Err(error) => {
+            return sync_setup_failure(
+                tool_request,
+                description,
+                lifecycle,
+                started_task,
+                &config,
+                &task_registry,
+                &registry_task_id,
+                error,
+            );
+        }
+    };
+    let delegation = frozen_agent
+        .as_ref()
+        .map(|frozen| frozen.delegation.clone())
+        .unwrap_or(delegation);
     let effective_model = child_config.model.as_option();
 
     let worktree_execution = match prepare_sync_worktree(source.as_ref(), isolation, &cwd) {
@@ -1052,6 +1101,7 @@ fn run_subagent_worker(
         &delegation,
         &mcp_registry,
         &child_config.external_tools,
+        frozen_agent.as_ref(),
     ) {
         Ok(hash) => hash,
         Err(error) => {
@@ -1072,6 +1122,7 @@ fn run_subagent_worker(
     let compatibility = ContinuationCompatibility {
         subagent_type: serialized_subagent_type(&subagent_type)
             .unwrap_or_else(|| "general".to_string()),
+        frozen_agent,
         model: effective_model.clone(),
         isolation,
         effective_cwd,
@@ -1079,6 +1130,9 @@ fn run_subagent_worker(
         compatibility_hash,
     };
     let prompt_id = AgentPromptId::new();
+    let parent_fence = activity_ingress
+        .as_ref()
+        .and_then(|ingress| ingress.parent_fence());
     let prepared = match source.as_ref() {
         Some(_) => {
             let input = ResumeContinuationInput {
@@ -1089,8 +1143,10 @@ fn run_subagent_worker(
                 compatibility,
             };
             coordinator
-                .prepare_resume(input.clone())
-                .or_else(|_| coordinator.prepare_resume(input))
+                .prepare_resume_with_parent_fence(input.clone(), parent_fence.as_ref())
+                .or_else(|_| {
+                    coordinator.prepare_resume_with_parent_fence(input, parent_fence.as_ref())
+                })
         }
         None => {
             let input = CreateContinuationInput {
@@ -1845,8 +1901,11 @@ fn finalize_started_sync_subagent_with_revision(
     let projection = match projection {
         Ok(projection) => projection,
         Err(error) => {
-            let message =
+            let mut message =
                 continuation_error("failed to commit child continuation terminal", &error);
+            if let Some(child_error) = output.event_error.as_deref() {
+                message.push_str(&format!("\n\nChild error: {child_error}"));
+            }
             let footer_projection = coordinator.projection(lease.continuation_id.as_str()).ok();
             output.result = ToolResult::indeterminate_after_start(&output.tool_request, &message);
             output.status = RunStatus::Failed;
@@ -2443,6 +2502,7 @@ mod tests {
                 prompt_id: AgentPromptId::new(),
                 compatibility: ContinuationCompatibility {
                     subagent_type: "general".to_string(),
+                    frozen_agent: None,
                     model: None,
                     isolation: SubagentIsolation::None,
                     effective_cwd: std::env::temp_dir().display().to_string(),

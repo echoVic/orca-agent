@@ -1772,6 +1772,7 @@ impl WorkflowRunner {
             &self.delegation,
             &mcp_registry,
             &workflow_child_config.external_tools,
+            None,
         ) {
             Ok(hash) => hash,
             Err(error) => {
@@ -1785,6 +1786,7 @@ impl WorkflowRunner {
         };
         let compatibility = ContinuationCompatibility {
             subagent_type: "general".to_string(),
+            frozen_agent: None,
             model: effective_model,
             isolation,
             effective_cwd: child_cwd.display().to_string(),

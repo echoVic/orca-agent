@@ -3,6 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "agent_definition.rs"]
+pub mod agent_definition;
+
 /// 专用子代理类型
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +31,21 @@ impl Default for SubagentType {
 }
 
 impl SubagentType {
+    pub fn is_builtin_name(name: &str) -> bool {
+        !matches!(Self::from_str(name), Self::Custom(_))
+    }
+
+    pub fn identifier(&self) -> &str {
+        match self {
+            Self::General => "general",
+            Self::CodeReviewer => "code_reviewer",
+            Self::TestWriter => "test_writer",
+            Self::Debugger => "debugger",
+            Self::Documenter => "documenter",
+            Self::Custom(name) => name,
+        }
+    }
+
     /// 获取该类型的系统提示后缀
     pub fn system_prompt_suffix(&self) -> &'static str {
         match self {
@@ -64,16 +82,8 @@ impl SubagentType {
             ],
             Self::Debugger => vec!["read_file", "list_files", "grep", "bash", "write_file"],
             Self::Documenter => vec!["read_file", "list_files", "grep", "edit", "write_file"],
-            Self::Custom(_) => vec![
-                "read_file",
-                "list_files",
-                "grep",
-                "bash",
-                "edit",
-                "write_file",
-                "git_status",
-                "web_search",
-            ],
+            // Custom agents require a resolved definition and an explicit runtime policy.
+            Self::Custom(_) => vec![],
         }
     }
 

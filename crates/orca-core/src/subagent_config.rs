@@ -1,7 +1,17 @@
-use serde::Deserialize;
+use crate::config::DelegationSnapshot;
+use crate::subagent_types::agent_definition::EffectiveAgentDefinition;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_SUBAGENT_DEPTH: u32 = 2;
 pub const DEFAULT_MAX_PARALLEL_SUBAGENTS: usize = 6;
+
+/// Persisted with the launch and continuation, never reconstructed from agent files.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenAgentConfig {
+    pub definition: EffectiveAgentDefinition,
+    pub delegation: DelegationSnapshot,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct SubagentConfig {
@@ -11,6 +21,12 @@ pub struct SubagentConfig {
     pub max_parallel: usize,
     #[serde(default = "default_stream_progress")]
     pub stream_progress: bool,
+    /// Runtime-owned snapshot; project/user config files cannot inject this field.
+    #[serde(skip)]
+    pub effective_definition: Option<EffectiveAgentDefinition>,
+    /// Admitting turn's tool policy, carried only to child admission.
+    #[serde(skip)]
+    pub inherited_tools: Option<Vec<String>>,
 }
 
 impl Default for SubagentConfig {
@@ -19,6 +35,8 @@ impl Default for SubagentConfig {
             max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             max_parallel: DEFAULT_MAX_PARALLEL_SUBAGENTS,
             stream_progress: true,
+            effective_definition: None,
+            inherited_tools: None,
         }
     }
 }
@@ -62,6 +80,8 @@ mod tests {
             max_depth: 3,
             max_parallel: 0,
             stream_progress: true,
+            effective_definition: None,
+            inherited_tools: None,
         }
         .normalized();
         assert_eq!(config.max_depth, 3);

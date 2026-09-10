@@ -6,6 +6,33 @@ use serde_json::Value;
 
 use crate::registry::ToolRegistry;
 
+/// Advertise only resolved definitions; bodies and filesystem paths stay out of the catalog.
+pub fn apply_subagent_catalog(
+    description: &mut String,
+    input_schema: &mut Value,
+    catalog: &orca_core::subagent_types::agent_definition::AgentCatalog,
+) {
+    let mut names = vec![
+        "general",
+        "code_reviewer",
+        "test_writer",
+        "debugger",
+        "documenter",
+    ];
+    names.extend(catalog.agents.keys().map(String::as_str));
+    input_schema["properties"]["subagent_type"]["enum"] = serde_json::json!(names);
+    if !catalog.agents.is_empty() {
+        description.push_str("\nAvailable custom agents (identifier: description):");
+        for agent in catalog.agents.values() {
+            description.push_str(&format!("\n{}: {}", agent.name, agent.description));
+        }
+    }
+    if !catalog.diagnostics.is_empty() {
+        description
+            .push_str("\nSome agent definitions were invalid or ambiguous and were excluded.");
+    }
+}
+
 const GOAL_TOOL_NAMES: &[&str] = &["get_goal", "create_goal", "update_goal"];
 const STRICT_MODE_TOOL_NAMES: &[&str] = &["glob", "update_goal", "update_plan"];
 

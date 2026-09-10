@@ -1,6 +1,11 @@
-use orca_core::config::DelegationSnapshot;
+use std::path::Path;
+
+use orca_core::config::{DelegationSnapshot, RunConfig};
+use orca_core::subagent_config::FrozenAgentConfig;
 use orca_core::subagent_types::SubagentType;
+use orca_core::subagent_types::agent_definition::{AgentCatalog, validate_name};
 use orca_core::tool_types::ToolRequest;
+use orca_mcp::McpRegistry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,6 +22,8 @@ pub struct SubagentRequest {
     pub resume_from: Option<String>,
     #[serde(default)]
     pub delegation: Option<DelegationSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_agent: Option<FrozenAgentConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -81,6 +88,7 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         schema,
         resume_from,
         delegation: None,
+        frozen_agent: None,
     }
 }
 
@@ -90,6 +98,165 @@ pub fn with_delegation_snapshot(
 ) -> SubagentRequest {
     request.delegation = Some(snapshot);
     request
+}
+
+pub(crate) fn discover_agents(config: &RunConfig, cwd: &Path, mcp: &McpRegistry) -> AgentCatalog {
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp),
+        &config.external_tools,
+    );
+    let tools = registry
+        .model_visible_tools()
+        .flat_map(|tool| {
+            std::iter::once(tool.name().to_string()).chain(
+                tool.spec()
+                    .aliases
+                    .iter()
+                    .map(|alias| alias.as_str().to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let models = config.model.as_option().into_iter().collect::<Vec<_>>();
+    AgentCatalog::discover(cwd, &tools, &models)
+}
+
+/// Called on the admitting thread, before detached/threaded execution can observe changed files.
+pub(crate) fn freeze_agent_request(
+    config: &RunConfig,
+    cwd: &Path,
+    mcp: &McpRegistry,
+    request: &mut SubagentRequest,
+) -> Result<(), String> {
+    let SubagentType::Custom(name) = &request.subagent_type else {
+        return Ok(());
+    };
+    if request.resume_from.is_some() {
+        return Ok(()); // Resume obtains its snapshot exclusively from the continuation.
+    }
+    validate_name(name)?;
+    let catalog = discover_agents(config, cwd, mcp);
+    let mut definition = catalog.agents.get(name).cloned().ok_or_else(|| {
+        let diagnostics = catalog
+            .diagnostics
+            .iter()
+            .map(|entry| format!("{}: {}", entry.path.display(), entry.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "unknown or invalid custom agent '{name}'{suffix}",
+            suffix = if diagnostics.is_empty() {
+                String::new()
+            } else {
+                format!(": {diagnostics}")
+            }
+        )
+    })?;
+    if let Some(parent) = &config.subagents.effective_definition {
+        definition.narrow_tools(&parent.allowed_tools);
+    }
+    if let Some(ceiling) = &config.subagents.inherited_tools {
+        definition.narrow_tools(&canonical_tool_ceiling(ceiling, config, mcp));
+    }
+    let mut delegation = DelegationSnapshot::from_config(config);
+    // Preserve the actual execution profile, including caller-imposed restrictions.
+    delegation.execution_profile = config.execution_profile;
+    request.model = request.model.clone().or_else(|| definition.model.clone());
+    definition.model = config
+        .model
+        .with_subagent_override(request.model.clone())
+        .as_option();
+    request.model = definition.model.clone();
+    request.delegation = Some(delegation.clone());
+    request.frozen_agent = Some(FrozenAgentConfig {
+        definition,
+        delegation,
+    });
+    Ok(())
+}
+
+/// Applies only immutable launch material; this function never performs discovery.
+pub(crate) fn apply_frozen_agent(
+    config: &mut RunConfig,
+    subagent_type: &SubagentType,
+    frozen: Option<&FrozenAgentConfig>,
+) -> Result<(), String> {
+    match (subagent_type, frozen) {
+        (SubagentType::Custom(name), Some(frozen)) if name == &frozen.definition.name => {
+            frozen.definition.validate()?;
+            frozen
+                .delegation
+                .apply_to(config, frozen.definition.model.clone());
+            config.subagents.effective_definition = Some(frozen.definition.clone());
+            Ok(())
+        }
+        (SubagentType::Custom(_), _) => {
+            Err("custom agent requires a matching frozen definition".into())
+        }
+        (_, Some(_)) => Err("built-in agent cannot carry a custom definition".into()),
+        (_, None) => {
+            config.subagents.effective_definition = None;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn restore_frozen_agent(
+    config: &RunConfig,
+    source: &crate::agent_continuation::PreparedContinuation,
+) -> Result<Option<FrozenAgentConfig>, String> {
+    let frozen = source.compatibility.frozen_agent.clone();
+    if let Some(frozen) = &frozen {
+        let mut current = DelegationSnapshot::from_config(config);
+        current.execution_profile = config.execution_profile;
+        if current != frozen.delegation {
+            return Err(
+                "continuation_incompatible: custom agent parent permissions or model changed"
+                    .into(),
+            );
+        }
+        if config
+            .subagents
+            .inherited_tools
+            .as_ref()
+            .is_some_and(|ceiling| {
+                let ceiling = canonical_tool_ceiling(ceiling, config, &McpRegistry::default());
+                frozen
+                    .definition
+                    .allowed_tools
+                    .iter()
+                    .any(|tool| !ceiling.contains(tool))
+            })
+        {
+            return Err(
+                "continuation_incompatible: custom agent parent tool policy narrowed".into(),
+            );
+        }
+    } else if matches!(
+        SubagentType::from_str(&source.compatibility.subagent_type),
+        SubagentType::Custom(_)
+    ) {
+        return Err("continuation_incompatible: custom agent has no frozen definition".into());
+    }
+    Ok(frozen)
+}
+
+fn canonical_tool_ceiling(
+    ceiling: &[String],
+    config: &RunConfig,
+    mcp: &McpRegistry,
+) -> Vec<String> {
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp),
+        &config.external_tools,
+    );
+    ceiling
+        .iter()
+        .filter_map(|tool| {
+            registry
+                .resolve(tool)
+                .map(|resolved| resolved.tool.name().to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]

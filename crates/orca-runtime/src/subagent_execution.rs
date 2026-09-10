@@ -647,7 +647,17 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         .as_ref()
         .and_then(|ingress| ingress.parent_fence())
         .is_some();
-    if request.mode == SubagentMode::Async && (agent_controller.is_none() || has_parent_fence) {
+    let custom_agent = matches!(
+        request.subagent_type,
+        orca_core::subagent_types::SubagentType::Custom(_)
+    ) || request.resume_from.as_deref().is_some_and(|selector| {
+        crate::agent_continuation::ChildAgentCoordinator::new(task_registry.clone())
+            .and_then(|coordinator| coordinator.prepared(selector))
+            .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
+    });
+    if request.mode == SubagentMode::Async
+        && (agent_controller.is_none() || has_parent_fence || custom_agent)
+    {
         let launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config,
             cwd,
@@ -3217,6 +3227,248 @@ mod tests {
         assert!(error.starts_with("Subagent status: Cancelled\n\nchild turn cancelled"));
         assert!(error.contains("[agent_continuation]"));
         assert!(error.contains("resume_from="));
+    }
+
+    fn frozen_custom_child_executor<W: io::Write>(
+        config: &RunConfig,
+        request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, W>,
+        _cost: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        let definition = config
+            .subagents
+            .effective_definition
+            .as_ref()
+            .expect("frozen definition");
+        assert_eq!(definition.name, "audit");
+        assert_eq!(definition.allowed_tools, vec!["read_file"]);
+        assert_eq!(
+            request.allowed_tools.as_ref().unwrap(),
+            &vec!["read_file".to_string()]
+        );
+        assert_eq!(config.model.as_deref(), Some("deepseek-v4-flash"));
+        assert!(
+            definition
+                .system_prompt
+                .ends_with("Original immutable instructions.")
+        );
+        let setup = crate::child_agent_loop_setup::try_prepare_child_agent_loop(
+            config,
+            request,
+            runtime.cwd,
+            runtime.instructions,
+            runtime.memory,
+        )
+        .expect("child setup");
+        let mut conversation = setup.conversation;
+        assert!(matches!(&conversation.messages[0],
+            orca_core::conversation::Message::System { content, .. }
+                if content.contains("Original immutable instructions.")));
+        if request.continuation.is_some() {
+            assert!(conversation.messages.iter().any(|message| matches!(message,
+                orca_core::conversation::Message::Assistant { content: Some(text), .. }
+                    if text == "checkpoint response")));
+        }
+        conversation.add_assistant(Some("checkpoint response".into()), None, Vec::new());
+        runtime
+            .checkpoint_observer
+            .expect("durable checkpoint sink")
+            .checkpoint(crate::child_agent_types::ChildAgentCheckpointObservation {
+                conversation: &conversation,
+                turn: 1,
+                usage: Default::default(),
+                last_tool_boundary: None,
+            })
+            .expect("commit checkpoint");
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("checkpoint response".into()),
+            error: None,
+            budget_usage: None,
+        })
+    }
+
+    fn execute_custom_fixture(
+        config: &RunConfig,
+        cwd: &std::path::Path,
+        registry: &TaskRegistry,
+        arguments: serde_json::Value,
+    ) -> tool_types::ToolResult {
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(arguments.to_string()),
+            ..subagent_request("custom-fixture")
+        };
+        let mut events = EventFactory::new("custom-fixture".into());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut cost = CostTracker::new(None);
+        let mut error = None;
+        super::execute_subagent_tool(
+            config,
+            cwd,
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &HookRunner::default(),
+            false,
+            &mut cost,
+            &CancelToken::new(),
+            registry,
+            None,
+            None,
+            frozen_custom_child_executor::<io::Sink>,
+            &mut error,
+            None,
+        )
+        .expect("custom fixture call")
+        .0
+    }
+
+    #[test]
+    fn custom_agent_discovery_launch_and_restart_resume_freeze_changed_and_deleted_files() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let agents = home.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let path = agents.join("audit.md");
+        std::fs::write(&path, "---\nname: audit\ndescription: Inspect source\nextends: code_reviewer\ntools: [read_file, grep, bash]\nmodel: deepseek-v4-flash\n---\nOriginal immutable instructions.\n").unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.subagents.inherited_tools = Some(vec!["read_file".into(), "subagent".into()]);
+        let registry =
+            TaskRegistry::new_persistent("custom-resume".into(), storage.path().to_path_buf())
+                .unwrap();
+        let result = execute_custom_fixture(
+            &config,
+            cwd.path(),
+            &registry,
+            serde_json::json!({
+                "description": "inspect", "prompt": "First request", "subagent_type": "audit"
+            }),
+        );
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        let task_id = registry.list()[0].id.clone();
+        let coordinator =
+            crate::agent_continuation::ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let frozen = coordinator.prepared(&task_id).unwrap();
+        assert!(frozen.compatibility.frozen_agent.is_some());
+        assert_eq!(
+            frozen.compatibility.isolation,
+            crate::subagent::SubagentIsolation::None
+        );
+        let selector = frozen.continuation_id.to_string();
+        drop(coordinator);
+        drop(registry);
+
+        for delete in [false, true] {
+            if delete {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, "---\nname: audit\ndescription: Changed\ntools: [bash]\nmodel: deepseek-v4-pro\n---\nChanged instructions.\n").unwrap();
+            }
+            let registry =
+                TaskRegistry::new_persistent("custom-resume".into(), storage.path().to_path_buf())
+                    .unwrap();
+            let result = execute_custom_fixture(
+                &config,
+                cwd.path(),
+                &registry,
+                serde_json::json!({
+                    "description": "continue", "prompt": "Continue the same conversation", "resume_from": selector
+                }),
+            );
+            assert_eq!(
+                result.status,
+                tool_types::ToolStatus::Completed,
+                "{:?}",
+                result.error
+            );
+            let coordinator =
+                crate::agent_continuation::ChildAgentCoordinator::new(registry).unwrap();
+            assert_eq!(
+                coordinator.prepared(&selector).unwrap().compatibility,
+                frozen.compatibility
+            );
+        }
+
+        let registry =
+            TaskRegistry::new_persistent("custom-resume".into(), storage.path().to_path_buf())
+                .unwrap();
+        let result = execute_custom_fixture(
+            &config,
+            cwd.path(),
+            &registry,
+            serde_json::json!({
+                "description": "conflict", "prompt": "Continue", "resume_from": selector,
+                "model": "deepseek-v4-pro"
+            }),
+        );
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("explicit model conflicts")
+        );
+        config.subagents.inherited_tools = Some(Vec::new());
+        let result = execute_custom_fixture(
+            &config,
+            cwd.path(),
+            &registry,
+            serde_json::json!({
+                "description": "narrowed", "prompt": "Continue", "resume_from": selector
+            }),
+        );
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("parent tool policy narrowed")
+        );
+    }
+
+    #[test]
+    fn custom_agent_unknown_or_untrusted_is_rejected_before_execution() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let directory = cwd.path().join(".orca/agents");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("audit.md"),
+            "---\nname: audit\ndescription: Inspect\n---\nUntrusted.",
+        )
+        .unwrap();
+        let config = config(SubagentConfig::default());
+        let registry = TaskRegistry::new("custom-untrusted".into());
+        for name in ["audit", "unknown", "../escape"] {
+            let result = execute_custom_fixture(
+                &config,
+                cwd.path(),
+                &registry,
+                serde_json::json!({
+                    "description": "inspect", "prompt": "Inspect", "subagent_type": name
+                }),
+            );
+            assert_eq!(result.status, tool_types::ToolStatus::Failed);
+            assert_eq!(
+                result.terminal().started,
+                tool_types::ToolInvocationStarted::No
+            );
+        }
+        assert!(registry.list().is_empty());
     }
 
     fn receipt_child_executor<W: io::Write>(

@@ -125,7 +125,7 @@ pub(crate) fn provider_config_for_agent_loop(
     tool_policy: AgentToolPolicyContext<'_>,
     mcp_registry: &McpRegistry,
 ) -> ProviderConfig {
-    ProviderConfig {
+    let mut provider_config = ProviderConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
         model: config.model.as_option(),
@@ -139,7 +139,21 @@ pub(crate) fn provider_config_for_agent_loop(
         ),
         mcp_registry: Some(mcp_registry.clone()),
         external_tools: config.external_tools.clone(),
+    };
+    if let Some(tool) = provider_config
+        .tools_override
+        .as_mut()
+        .and_then(|tools| tools.iter_mut().find(|tool| tool.name == "subagent"))
+        && let Some(cwd) = config.cwd.clone().or_else(|| std::env::current_dir().ok())
+    {
+        let catalog = crate::subagent::discover_agents(config, &cwd, mcp_registry);
+        orca_tools::schema::apply_subagent_catalog(
+            &mut tool.description,
+            &mut tool.input_schema,
+            &catalog,
+        );
     }
+    provider_config
 }
 
 pub(crate) fn tool_requests_from_provider_steps(steps: &[ProviderStep]) -> Vec<ToolRequest> {
@@ -269,6 +283,23 @@ pub fn validate_tool_invocation(
     mcp_registry: &McpRegistry,
     config: &RunConfig,
 ) -> Result<(), ToolExecutionFailure> {
+    if let Some(definition) = &config.subagents.effective_definition
+        && let Some(failure) = child_tool_policy_failure(
+            &invocation.effective,
+            Some(&definition.allowed_tools),
+            Some("frozen custom agent policy"),
+            mcp_registry,
+            &config.external_tools,
+        )
+    {
+        return Err(ToolExecutionFailure {
+            request: invocation.effective.clone(),
+            message: failure
+                .error
+                .clone()
+                .unwrap_or_else(|| "custom agent tool is not allowed".into()),
+        });
+    }
     orca_tools::validate_with_mcp_and_external(
         &invocation.effective,
         Some(mcp_registry),
@@ -427,6 +458,58 @@ mod tests {
 
     fn schema_names(tools: &[ProviderToolDefinition]) -> Vec<&str> {
         tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    #[test]
+    fn custom_agent_catalog_is_model_visible_and_policy_rejects_mutations() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        std::fs::create_dir(home.path().join("agents")).unwrap();
+        std::fs::write(home.path().join("agents/audit.md"),
+            "---\nname: audit\ndescription: Review safely\ntools: [read_file]\n---\nPrivate agent instructions.\n").unwrap();
+        let mut config = config_with_external(Vec::new());
+        config.cwd = Some(cwd.path().to_path_buf());
+        let mcp = McpRegistry::default();
+        let provider = provider_config_for_agent_loop(
+            &config,
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::unrestricted(),
+            &mcp,
+        );
+        let definitions = provider.tools_override.unwrap();
+        let subagent = definitions
+            .iter()
+            .find(|tool| tool.name == "subagent")
+            .unwrap();
+        assert!(subagent.description.contains("audit: Review safely"));
+        assert!(!subagent.description.contains("Private agent instructions."));
+        assert!(
+            subagent.input_schema["properties"]["subagent_type"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("audit"))
+        );
+        let catalog = crate::subagent::discover_agents(&config, cwd.path(), &mcp);
+        config.subagents.effective_definition = Some(catalog.agents["audit"].clone());
+        let write = request(
+            ToolName::Bash,
+            ActionKind::Shell,
+            Some("echo mutation"),
+            Some(r#"{"command":"echo mutation"}"#),
+        );
+        let invocation = prepare_tool_invocation(&write, 1, &mcp, &config);
+        let failure = validate_tool_invocation(&invocation, &mcp, &config).unwrap_err();
+        assert!(failure.message.contains("disallows tool 'bash'"));
+        let read = request(
+            ToolName::ReadFile,
+            ActionKind::Read,
+            Some("source.rs"),
+            Some(r#"{"path":"source.rs"}"#),
+        );
+        let invocation = prepare_tool_invocation(&read, 1, &mcp, &config);
+        assert!(validate_tool_invocation(&invocation, &mcp, &config).is_ok());
     }
 
     #[test]

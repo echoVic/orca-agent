@@ -728,6 +728,10 @@ pub struct SurfaceAgentLoopTurn {
     pub fence: SurfaceOperationFence,
     pub ordinal: u32,
     pub task_id: SurfaceTaskId,
+    /// Canonical main-session root allocated by the actor for this generation.
+    /// The loop task identity may be synthetic and is not ownership evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_main_task_id: Option<SurfaceTaskId>,
     pub task_status: SurfaceTaskRunningStatus,
 }
 

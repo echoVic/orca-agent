@@ -15485,6 +15485,7 @@ fn prepare_goal_surface_continuation_worker(
             ordinal: 0,
             task_id: surface::SurfaceTaskId::try_new(legacy_task_id.clone())
                 .expect("generated task id is non-empty"),
+            admitted_main_task_id: None,
             task_status: surface::SurfaceTaskRunningStatus::Running,
         },
     }];

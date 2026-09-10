@@ -29,6 +29,7 @@ use orca_core::conversation::{
     repaired_missing_tool_result,
 };
 use orca_core::external_config::ExternalToolConfig;
+use orca_core::subagent_config::FrozenAgentConfig;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource};
 use orca_mcp::McpRegistry;
@@ -1042,7 +1043,8 @@ pub(crate) struct AgentContinuationRecord {
     pub(crate) continuation_id: AgentContinuationId,
     /// Parent session that exclusively owns this lineage.
     pub(crate) parent_session_id: String,
-    /// Parent task, when the lineage was launched from another task.
+    /// Parent task for the current attempt. The original owner remains bound
+    /// by source_task_id and its committed parent generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent_task_id: Option<String>,
     /// Task that first created the lineage.
@@ -1051,6 +1053,8 @@ pub(crate) struct AgentContinuationRecord {
     pub(crate) latest_task_id: String,
     /// Stable child-agent type identity.
     pub(crate) subagent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) frozen_agent: Option<FrozenAgentConfig>,
     /// Fixed or inherited model identity used for compatibility checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
@@ -1092,6 +1096,7 @@ pub(crate) struct AgentContinuationRecord {
 pub(crate) struct ContinuationCompatibility {
     /// Stable child-agent type identity.
     pub(crate) subagent_type: String,
+    pub(crate) frozen_agent: Option<FrozenAgentConfig>,
     /// Effective model identity after runtime inheritance is resolved.
     pub(crate) model: Option<String>,
     /// Isolation policy used by the child agent.
@@ -1118,6 +1123,7 @@ pub(crate) fn compute_continuation_compatibility_hash(
     delegation: &DelegationSnapshot,
     mcp_registry: &McpRegistry,
     external_tools: &[ExternalToolConfig],
+    frozen_agent: Option<&FrozenAgentConfig>,
 ) -> Result<Sha256Digest, AgentContinuationError> {
     let mut mcp_tools = mcp_registry.tools().iter().collect::<Vec<_>>();
     mcp_tools.sort_by(|left, right| {
@@ -1148,7 +1154,7 @@ pub(crate) fn compute_continuation_compatibility_hash(
         .into_iter()
         .map(|(_, identity)| identity)
         .collect::<Vec<_>>();
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "schema_version": 1,
         "subagent_type": subagent_type,
         "model": model,
@@ -1159,6 +1165,13 @@ pub(crate) fn compute_continuation_compatibility_hash(
         "mcp_tools": mcp_tools,
         "external_tools": external_tools,
     });
+    if let Some(frozen_agent) = frozen_agent {
+        payload["frozen_agent"] = serde_json::to_value(frozen_agent).map_err(|error| {
+            AgentContinuationError::Persistence {
+                message: error.to_string(),
+            }
+        })?;
+    }
     canonical_json_bytes(&payload)
         .map(Sha256Digest::digest)
         .map_err(|_| AgentContinuationError::Persistence {
@@ -1229,7 +1242,7 @@ pub(crate) struct CreateContinuationInput {
 pub(crate) struct ResumeContinuationInput {
     /// Continuation UUIDv7 or compatibility task/agent selector.
     pub(crate) selector: String,
-    /// Parent task that must still own this child lineage.
+    /// Parent task for the new attempt; changes require recorded ownership proof.
     pub(crate) parent_task_id: Option<String>,
     /// Task associated with the newly prepared attempt.
     pub(crate) task_id: String,
@@ -1258,7 +1271,7 @@ pub(crate) struct PreparedContinuation {
     pub(crate) source_task_id: String,
     /// Task currently bound to this attempt.
     pub(crate) latest_task_id: String,
-    /// Parent task binding retained across attempts.
+    /// Parent task bound to the current attempt.
     pub(crate) parent_task_id: Option<String>,
     /// Existing terminal returned for an idempotent duplicate prompt.
     pub(crate) terminal: Option<AgentTerminal>,
@@ -1272,6 +1285,7 @@ impl From<&AgentContinuationRecord> for PreparedContinuation {
             prompt_id: record.current_attempt.prompt_id.clone(),
             compatibility: ContinuationCompatibility {
                 subagent_type: record.subagent_type.clone(),
+                frozen_agent: record.frozen_agent.clone(),
                 model: record.model.clone(),
                 isolation: record.isolation,
                 effective_cwd: record.effective_cwd.clone(),
@@ -2418,6 +2432,7 @@ impl ChildAgentCoordinator {
                 && record.latest_task_id == input.task_id
                 && record.current_attempt.prompt_id == input.prompt_id
                 && record.subagent_type == input.compatibility.subagent_type
+                && record.frozen_agent == input.compatibility.frozen_agent
                 && record.model == input.compatibility.model
                 && record.isolation == input.compatibility.isolation
                 && record.effective_cwd == input.compatibility.effective_cwd
@@ -2439,6 +2454,7 @@ impl ChildAgentCoordinator {
             source_task_id: input.task_id.clone(),
             latest_task_id: input.task_id,
             subagent_type: input.compatibility.subagent_type,
+            frozen_agent: input.compatibility.frozen_agent,
             model: input.compatibility.model,
             isolation: input.compatibility.isolation,
             effective_cwd: input.compatibility.effective_cwd,
@@ -2516,6 +2532,16 @@ impl ChildAgentCoordinator {
         &self,
         input: ResumeContinuationInput,
     ) -> Result<PreparedContinuation, AgentContinuationError> {
+        self.prepare_resume_with_parent_fence(input, None)
+    }
+
+    /// A new hosted foreground turn has a new task-tree root. Only recorded
+    /// same-thread ownership evidence may authorize moving an attempt to it.
+    pub(crate) fn prepare_resume_with_parent_fence(
+        &self,
+        input: ResumeContinuationInput,
+        parent_fence: Option<&crate::runtime_surface::SurfaceOperationFence>,
+    ) -> Result<PreparedContinuation, AgentContinuationError> {
         validate_task_binding(&input.parent_task_id, &input.task_id)?;
         validate_compatibility_shape(&input.compatibility)?;
         let continuation_id = self.resolve_selector(&input.selector)?;
@@ -2523,7 +2549,14 @@ impl ChildAgentCoordinator {
             .store
             .load_record(&continuation_id)?
             .ok_or(AgentContinuationError::NotFound)?;
-        validate_resume_request(&record, &input)?;
+        let mut validation_input = input.clone();
+        if record.parent_task_id != input.parent_task_id {
+            self.validate_recorded_parent_recovery(&record, &input, parent_fence)?;
+            // Retain the exact old binding in the CAS validation below. The
+            // authorized new root is installed only with the new attempt.
+            validation_input.parent_task_id = record.parent_task_id.clone();
+        }
+        validate_resume_request(&record, &validation_input)?;
 
         if record.current_attempt.prompt_id == input.prompt_id {
             self.install_projection(&record)?;
@@ -2534,21 +2567,15 @@ impl ChildAgentCoordinator {
         reject_live_owner(&record, now_ms)?;
         ensure_record_resumable(&record)?;
         let expected_revision = record.revision;
+        let previous = PreparedContinuation::from(&record);
         let prompt_id = input.prompt_id;
         let task_id = input.task_id;
-        let compatibility = input.compatibility;
         let parent_task_id = input.parent_task_id;
         let (_, committed) =
             self.store
                 .mutate_record(&continuation_id, expected_revision, move |record| {
-                    let request = ResumeContinuationInput {
-                        selector: record.continuation_id.as_str().to_string(),
-                        parent_task_id: parent_task_id.clone(),
-                        task_id: task_id.clone(),
-                        prompt_id: prompt_id.clone(),
-                        compatibility: compatibility.clone(),
-                    };
-                    validate_resume_request(record, &request)?;
+                    validate_prepared_identity(record, &previous)?;
+                    validate_resume_request(record, &validation_input)?;
                     reject_live_owner(record, now_ms)?;
                     let checkpoint = ensure_record_resumable(record)?.clone();
                     match record.status {
@@ -2576,6 +2603,7 @@ impl ChildAgentCoordinator {
                         completed_at_ms: None,
                     };
                     record.latest_task_id = task_id;
+                    record.parent_task_id = parent_task_id;
                     record.active_tool_boundary = None;
                     record.terminal = None;
                     record.updated_at_ms = now_ms;
@@ -2583,6 +2611,212 @@ impl ChildAgentCoordinator {
                 })?;
         self.install_projection(&committed)?;
         Ok(PreparedContinuation::from(&committed))
+    }
+
+    fn validate_recorded_parent_recovery(
+        &self,
+        record: &AgentContinuationRecord,
+        input: &ResumeContinuationInput,
+        parent_fence: Option<&crate::runtime_surface::SurfaceOperationFence>,
+    ) -> Result<(), AgentContinuationError> {
+        use crate::runtime_surface::{
+            CommitClass, JsonlSurfaceCommitLedger, OperationPatch, SubagentPatch, SurfaceEvent,
+            SurfaceSubagentOwner, SurfaceTaskType, TaskPatch,
+        };
+        let mismatch = || AgentContinuationError::TaskBindingMismatch {
+            expected: task_binding_label(record.parent_task_id.as_deref()),
+            actual: task_binding_label(input.parent_task_id.as_deref()),
+        };
+        let fence = parent_fence.ok_or_else(mismatch)?;
+        let session_uuid =
+            uuid::Uuid::parse_str(&record.parent_session_id).map_err(|_| mismatch())?;
+        if record.frozen_agent.is_none()
+            || record.parent_task_id.is_none()
+            || input.parent_task_id.is_none()
+            || fence.thread_id.as_bytes() != session_uuid.as_bytes()
+            || self.task_registry.session_id() != record.parent_session_id
+        {
+            return Err(mismatch());
+        }
+        let transcript = crate::history::SessionStore::new()
+            .load_session(&record.parent_session_id)
+            .map_err(|_| mismatch())?;
+        if transcript.meta.session_id != record.parent_session_id {
+            return Err(mismatch());
+        }
+        let snapshot = crate::thread_store::SessionRecordSnapshot::open(&transcript.path)
+            .map_err(|_| mismatch())?;
+        let mut initial_cursor = None;
+        for entry in snapshot.records().map_err(|_| mismatch())? {
+            if let crate::thread_store::SessionRecord::SurfaceCommitPrepared {
+                batch: Some(batch),
+                ..
+            } = entry.map_err(|_| mismatch())?
+            {
+                initial_cursor = Some(batch.into_live().map_err(|_| mismatch())?.cursor_before);
+                break;
+            }
+        }
+        let ledger =
+            JsonlSurfaceCommitLedger::new(transcript.path, initial_cursor.ok_or_else(mismatch)?);
+        let mut admitted_parents = Vec::new();
+        let mut children = HashMap::new();
+        let mut current_generation_live = false;
+        let mut owner_epoch = None;
+        for entry in ledger.replay_batches().map_err(|_| mismatch())? {
+            let (committed, batch) = entry.map_err(|_| mismatch())?;
+            if !committed {
+                continue;
+            }
+            if batch.cursor_before.thread_id != fence.thread_id {
+                return Err(mismatch());
+            }
+            let CommitClass::Recorded {
+                thread_owner_epoch, ..
+            } = batch.commit_class
+            else {
+                return Err(mismatch());
+            };
+            owner_epoch = Some(thread_owner_epoch);
+            for envelope in batch.events.as_slice() {
+                match &envelope.event {
+                    SurfaceEvent::Operation(OperationPatch::AgentLoopTurnStarted { turn }) => {
+                        if let Some(task_id) = &turn.admitted_main_task_id {
+                            if turn.ordinal != 0
+                                || admitted_parents
+                                    .iter()
+                                    .any(|(owner, _)| owner == &turn.fence)
+                            {
+                                return Err(mismatch());
+                            }
+                            admitted_parents.push((turn.fence.clone(), task_id.clone()));
+                        }
+                    }
+                    SurfaceEvent::Operation(OperationPatch::GenerationStarted {
+                        fence: started,
+                        ..
+                    }) if started == fence => current_generation_live = true,
+                    SurfaceEvent::Operation(
+                        OperationPatch::GenerationStopped { fence: stopped, .. }
+                        | OperationPatch::GenerationTransferred { fence: stopped, .. },
+                    ) if stopped == fence => current_generation_live = false,
+                    SurfaceEvent::Subagent(SubagentPatch::Started { subagent, .. }) => {
+                        let child = subagent.as_subagent();
+                        if child.task_id.as_str() == record.source_task_id
+                            || child.task_id.as_str() == record.latest_task_id
+                        {
+                            let mut tasks = batch.events.as_slice().iter().filter_map(|entry| {
+                                match &entry.event {
+                                    SurfaceEvent::Task(TaskPatch::Upserted {
+                                        expected_revision: None,
+                                        task,
+                                    }) if task.task_id == child.task_id => Some(task),
+                                    _ => None,
+                                }
+                            });
+                            let task = tasks.next().ok_or_else(mismatch)?;
+                            if tasks.next().is_some()
+                                || task.revision.get() != 1
+                                || task.task_type != SurfaceTaskType::Subagent
+                                || task.subagent_id.as_ref() != Some(&child.subagent_id)
+                                || children
+                                    .insert(child.task_id.clone(), (child.clone(), task.clone()))
+                                    .is_some()
+                            {
+                                return Err(mismatch());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let admitted_parent = |owner: &crate::runtime_surface::SurfaceOperationFence| {
+            admitted_parents
+                .iter()
+                .find(|(fence, _)| fence == owner)
+                .map(|(_, task_id)| task_id.as_str())
+        };
+        if !current_generation_live
+            || owner_epoch != Some(fence.thread_owner_epoch)
+            || admitted_parent(fence) != input.parent_task_id.as_deref()
+        {
+            return Err(mismatch());
+        }
+        // The actor admits the canonical registry root under a generation fence
+        // before starting the runner. The separate loop task ID may be synthetic.
+        // Registry lookups only corroborate this ledger evidence, never grant it.
+        for task_id in [&record.source_task_id, &record.latest_task_id] {
+            let (child, admitted_task) = children
+                .values()
+                .find(|(child, _)| child.task_id.as_str() == task_id)
+                .ok_or_else(mismatch)?;
+            let owner = match &child.owner {
+                SurfaceSubagentOwner::Generation { fence: owner } => owner,
+                SurfaceSubagentOwner::DetachedTask { owner } => {
+                    if owner.task_id != child.task_id
+                        || owner.task_revision.get() != 1
+                        || owner.attempt_id != child.source.attempt_id
+                    {
+                        return Err(mismatch());
+                    }
+                    // The same committed batch records the detached child's
+                    // admitting operation. Never infer it from a registry ID.
+                    let mut parents = admitted_parents.iter().filter(|(parent, _)| {
+                        Some(&parent.operation_id) == admitted_task.parent_operation.as_ref()
+                    });
+                    let (parent, _) = parents.next().ok_or_else(mismatch)?;
+                    if parents.next().is_some() {
+                        return Err(mismatch());
+                    }
+                    if task_id == &record.latest_task_id {
+                        let binding = self
+                            .task_registry
+                            .detached_subagent_binding(task_id)
+                            .map_err(|_| mismatch())?
+                            .ok_or_else(mismatch)?;
+                        if binding.task_id != owner.task_id.as_str()
+                            || binding.subagent_id != child.subagent_id.as_str()
+                            || binding.task_revision != owner.task_revision
+                            || binding.attempt_id.as_str() != owner.attempt_id.as_str()
+                            || binding.authority_digest != owner.authority_digest
+                            || binding.parent_fence.as_ref() != Some(parent)
+                            || binding.parent_task_id != record.parent_task_id
+                        {
+                            return Err(mismatch());
+                        }
+                    }
+                    parent
+                }
+            };
+            let continuation = child.continuation.as_ref().ok_or_else(mismatch)?;
+            let task = self.task_registry.get(task_id).ok_or_else(mismatch)?;
+            // Detached admission precedes worker acquisition; sync admission
+            // follows acquisition. Both must identify the original attempt.
+            let source_revision = match child.owner {
+                SurfaceSubagentOwner::Generation { .. } => 1,
+                SurfaceSubagentOwner::DetachedTask { .. } => 0,
+            };
+            if owner.thread_id != fence.thread_id
+                || admitted_task.parent_operation.as_ref() != Some(&owner.operation_id)
+                || child.revision.get() != 1
+                || child.source.source_sequence != 1
+                || child.source.attempt_id.as_str() != continuation.attempt_id.as_str()
+                || continuation.continuation_id.as_str() != record.continuation_id.as_str()
+                || continuation.revision > record.revision.get()
+                || (task_id == &record.source_task_id && continuation.revision != source_revision)
+                || task.task_type != orca_core::task_types::TaskType::Subagent
+                || task.parent_task_id.is_none()
+                || admitted_parent(owner) != task.parent_task_id.as_deref()
+                || (task_id == &record.latest_task_id
+                    && (task.parent_task_id != record.parent_task_id
+                        || continuation.attempt_id.as_str()
+                            != record.current_attempt.attempt_id.as_str()))
+            {
+                return Err(mismatch());
+            }
+        }
+        Ok(())
     }
 
     /// Acquires a Prepared attempt for this coordinator owner, or returns its still-valid existing lease on an idempotent retry; it advances status, lease epoch, expiry, revision, and task projection exactly once.
@@ -2940,6 +3174,13 @@ fn validate_task_binding(
 fn validate_compatibility_shape(
     compatibility: &ContinuationCompatibility,
 ) -> Result<(), AgentContinuationError> {
+    if let Some(frozen) = &compatibility.frozen_agent
+        && (frozen.definition.name != compatibility.subagent_type
+            || frozen.definition.model != compatibility.model
+            || frozen.definition.validate().is_err())
+    {
+        return Err(AgentContinuationError::CompatibilityMismatch);
+    }
     if compatibility.subagent_type.trim().is_empty()
         || compatibility.effective_cwd.trim().is_empty()
         || compatibility
@@ -2979,6 +3220,7 @@ fn validate_resume_request(
     }
     let compatibility = &input.compatibility;
     if record.subagent_type != compatibility.subagent_type
+        || record.frozen_agent != compatibility.frozen_agent
         || record.model != compatibility.model
         || record.isolation != compatibility.isolation
         || Path::new(&record.effective_cwd) != Path::new(&compatibility.effective_cwd)
@@ -3016,11 +3258,13 @@ fn validate_prepared_identity(
     }
     if record.current_attempt.prompt_id != prepared.prompt_id
         || record.subagent_type != prepared.compatibility.subagent_type
+        || record.frozen_agent != prepared.compatibility.frozen_agent
         || record.model != prepared.compatibility.model
         || record.isolation != prepared.compatibility.isolation
         || record.effective_cwd != prepared.compatibility.effective_cwd
         || record.worktree != prepared.compatibility.worktree
         || record.compatibility_hash != prepared.compatibility.compatibility_hash
+        || record.source_task_id != prepared.source_task_id
         || record.latest_task_id != prepared.latest_task_id
         || record.parent_task_id != prepared.parent_task_id
     {
@@ -3521,6 +3765,48 @@ mod tests {
     use super::*;
     use orca_core::conversation::Conversation;
 
+    #[test]
+    fn custom_agent_snapshot_does_not_change_legacy_builtin_hash_or_record_shape() {
+        let delegation = DelegationSnapshot::default();
+        let expected_payload = serde_json::json!({
+            "schema_version": 1,
+            "subagent_type": SubagentType::General,
+            "model": null,
+            "isolation": SubagentIsolation::None,
+            "effective_cwd": "/workspace",
+            "worktree": null,
+            "delegation": delegation,
+            "mcp_tools": [],
+            "external_tools": [],
+        });
+        let expected = Sha256Digest::digest(canonical_json_bytes(&expected_payload).unwrap());
+        let actual = compute_continuation_compatibility_hash(
+            &SubagentType::General,
+            None,
+            SubagentIsolation::None,
+            "/workspace",
+            None,
+            &delegation,
+            &McpRegistry::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        let (registry, _, prepared, _) = prepared_continuation("legacy-agent-record-shape");
+        let record = registry
+            .continuation_store()
+            .unwrap()
+            .load_record(&prepared.continuation_id)
+            .unwrap()
+            .unwrap();
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("frozen_agent").is_none());
+        let restored: AgentContinuationRecord = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.frozen_agent, None);
+        assert_eq!(serde_json::to_value(restored).unwrap(), json);
+    }
+
     fn prepared_continuation(
         session: &str,
     ) -> (
@@ -3546,6 +3832,7 @@ mod tests {
                 prompt_id: AgentPromptId::new(),
                 compatibility: ContinuationCompatibility {
                     subagent_type: "general".to_string(),
+                    frozen_agent: None,
                     model: Some("test-model".to_string()),
                     isolation: SubagentIsolation::None,
                     effective_cwd: std::env::temp_dir().display().to_string(),
@@ -3578,6 +3865,119 @@ mod tests {
         };
         checkpoint.digest = checkpoint.computed_digest().expect("checkpoint digest");
         checkpoint
+    }
+
+    #[test]
+    fn custom_parent_recovery_requires_recorded_ownership_not_only_matching_session() {
+        use crate::runtime_surface::{
+            SurfaceGenerationId, SurfaceOperationFence, SurfaceOperationId, SurfaceThreadId,
+            ThreadOwnerEpoch,
+        };
+        use orca_core::subagent_types::agent_definition::EffectiveAgentDefinition;
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let session = uuid::Uuid::new_v4();
+        let registry = TaskRegistry::new(session.to_string());
+        let parent = registry.create_main_session("original parent".into());
+        let current = registry.create_main_session("another parent turn".into());
+        let task = registry.create_subagent_with_parent(
+            "original child".into(),
+            Some("audit".into()),
+            Some(parent.id.clone()),
+        );
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let compatibility = ContinuationCompatibility {
+            subagent_type: "audit".into(),
+            frozen_agent: Some(FrozenAgentConfig {
+                definition: EffectiveAgentDefinition {
+                    name: "audit".into(),
+                    description: "Audit".into(),
+                    system_prompt: "Original instructions.".into(),
+                    allowed_tools: Vec::new(),
+                    model: None,
+                },
+                delegation: DelegationSnapshot::default(),
+            }),
+            model: None,
+            isolation: SubagentIsolation::None,
+            effective_cwd: home.path().display().to_string(),
+            worktree: None,
+            compatibility_hash: Sha256Digest::new([4; 32]),
+        };
+        let prepared = coordinator
+            .create(CreateContinuationInput {
+                continuation_id: None,
+                parent_task_id: Some(parent.id.clone()),
+                task_id: task.id,
+                prompt_id: AgentPromptId::new(),
+                compatibility: compatibility.clone(),
+            })
+            .unwrap();
+        let lease = coordinator.acquire(&prepared).unwrap();
+        let checkpoint = coordinator
+            .commit_checkpoint(
+                &lease,
+                lease.revision,
+                checkpoint(lease.attempt_id.clone(), 0, 0),
+            )
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &lease,
+                checkpoint.revision,
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+        let before = coordinator
+            .store
+            .load_record(&prepared.continuation_id)
+            .unwrap()
+            .unwrap();
+        let next = registry.create_subagent_with_parent(
+            "resumed child".into(),
+            Some("audit".into()),
+            Some(current.id.clone()),
+        );
+        let input = ResumeContinuationInput {
+            selector: prepared.continuation_id.to_string(),
+            parent_task_id: Some(current.id),
+            task_id: next.id,
+            prompt_id: AgentPromptId::new(),
+            compatibility,
+        };
+        let fence = SurfaceOperationFence {
+            thread_id: SurfaceThreadId::try_from_bytes(*session.as_bytes()).unwrap(),
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            operation_id: SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                .unwrap(),
+            generation_id: SurfaceGenerationId::new(1),
+        };
+        let wrong_thread = SurfaceOperationFence {
+            thread_id: SurfaceThreadId::try_from_bytes(*uuid::Uuid::new_v4().as_bytes()).unwrap(),
+            ..fence.clone()
+        };
+        for evidence in [None, Some(&wrong_thread), Some(&fence)] {
+            assert!(matches!(
+                coordinator.prepare_resume_with_parent_fence(input.clone(), evidence),
+                Err(AgentContinuationError::TaskBindingMismatch { .. })
+            ));
+            assert_eq!(
+                coordinator
+                    .store
+                    .load_record(&prepared.continuation_id)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+        }
+        let mut exact_parent = input;
+        exact_parent.parent_task_id = Some(parent.id);
+        exact_parent.compatibility.compatibility_hash = Sha256Digest::new([5; 32]);
+        assert_eq!(
+            coordinator.prepare_resume(exact_parent).unwrap_err(),
+            AgentContinuationError::CompatibilityMismatch
+        );
     }
 
     #[test]

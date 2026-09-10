@@ -314,6 +314,12 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let config = step_snapshot.config;
     let cwd = step_snapshot.turn_context.cwd;
     let tool_policy = step_snapshot.tool_policy;
+    let delegation_config = tool_policy.allowed_tools().map(|allowed| {
+        let mut config = config.clone();
+        config.subagents.inherited_tools = Some(allowed.to_vec());
+        config
+    });
+    let config = delegation_config.as_ref().unwrap_or(config);
     let subagent_depth = step_snapshot.turn_context.subagent_depth;
     let root_task_id = step_snapshot.turn_context.root_task_id;
     let emit_deltas = step_snapshot.turn_context.emit_deltas;
