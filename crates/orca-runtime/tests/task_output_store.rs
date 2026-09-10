@@ -431,3 +431,148 @@ fn shell_session_reports_when_retained_output_omits_prefix() {
 
     assert_eq!(output.stdout, "[6 bytes of earlier output omitted]\nlast\n");
 }
+
+#[test]
+fn persistent_shell_archives_large_live_output_and_reopens_after_completion() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let root = cwd.path().join("tasks");
+    let registry = TaskRegistry::new_persistent("large-process".to_string(), root.clone()).unwrap();
+    let mut manager = RuntimeShellSessionManager::new(registry);
+    let started = Instant::now();
+    let handle = manager
+        .spawn(ShellSessionCommand {
+            command: platform_shell_script(
+                "head -c 9437184 /dev/zero | tr '\\000' x; printf err >&2",
+                "[Console]::Out.Write(('x' * 9437184)); [Console]::Error.Write('err')",
+            ),
+            argv: None,
+            cwd: cwd.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: Vec::new(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: BTreeMap::new(),
+            description: "large durable output".to_string(),
+            terminal: ShellTerminalMode::pipe(),
+            sandbox: ShellSandboxMode::DangerFullAccess,
+        })
+        .unwrap();
+    let output = manager.wait(&handle.id, Duration::from_secs(30)).unwrap();
+    assert_eq!(output.status, orca_core::task_types::TaskStatus::Completed);
+    assert!(output.stdout.len() <= 8 * 1024 * 1024 + 100);
+    assert_eq!(manager.output_store().size(&handle.task_id), 0);
+    drop(manager);
+
+    let registry = TaskRegistry::new_persistent("large-process".to_string(), root).unwrap();
+    let manager = RuntimeShellSessionManager::new(registry);
+    let store = manager.output_store();
+    let mut offset = 0;
+    let mut stdout_bytes = 0;
+    let mut stderr = String::new();
+    loop {
+        let page = store
+            .read_delta(&handle.task_id, offset, 64 * 1024)
+            .unwrap();
+        assert!(page.stdout.bytes().all(|byte| byte == b'x'));
+        assert_eq!(page.omitted_prefix_bytes, 0);
+        stdout_bytes += page.stdout.len();
+        stderr.push_str(&page.stderr);
+        assert!(page.next_offset > offset || page.next_offset == page.bytes_total);
+        offset = page.next_offset;
+        if offset == page.bytes_total {
+            break;
+        }
+    }
+    assert_eq!(stdout_bytes, 9 * 1024 * 1024);
+    assert_eq!(stderr, "err");
+    assert_eq!(offset, stdout_bytes + 3);
+    let elapsed = started.elapsed();
+    println!(
+        "durable 9 MiB process capture + reopen/read: {elapsed:?}, {:.2} MiB/s",
+        9.0 / elapsed.as_secs_f64()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_shell_rejects_unsafe_archive_before_starting_process() {
+    let cwd = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = cwd.path().join("tasks");
+    let registry = TaskRegistry::new_persistent("unsafe-output".to_string(), root.clone()).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("unsafe-output/output")).unwrap();
+    let mut manager = RuntimeShellSessionManager::new(registry);
+    let error = manager
+        .spawn(ShellSessionCommand {
+            command: "printf launched > marker".to_string(),
+            argv: None,
+            cwd: cwd.path().to_path_buf(),
+            additional_readable_directories: Vec::new(),
+            additional_working_directories: Vec::new(),
+            denied_working_directories: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            env: BTreeMap::new(),
+            description: "must not launch".to_string(),
+            terminal: ShellTerminalMode::pipe(),
+            sandbox: ShellSandboxMode::DangerFullAccess,
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("symlink"));
+    assert!(!cwd.path().join("marker").exists());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn shell_task_registry_override_owns_archive_even_with_same_session_id() {
+    let cwd = tempfile::tempdir().unwrap();
+    let original_root = cwd.path().join("original");
+    let override_root = cwd.path().join("override");
+    let original =
+        TaskRegistry::new_persistent("same-id".to_string(), original_root.clone()).unwrap();
+    let override_registry =
+        TaskRegistry::new_persistent("same-id".to_string(), override_root.clone()).unwrap();
+    let mut manager = RuntimeShellSessionManager::new(original);
+    let handle = manager
+        .spawn_with_task_registry(
+            ShellSessionCommand {
+                command: platform_shell_script("printf scoped", "[Console]::Out.Write('scoped')"),
+                argv: None,
+                cwd: cwd.path().to_path_buf(),
+                additional_readable_directories: Vec::new(),
+                additional_working_directories: Vec::new(),
+                denied_working_directories: Vec::new(),
+                allowed_unix_socket_roots: Vec::new(),
+                env: BTreeMap::new(),
+                description: "scoped override".to_string(),
+                terminal: ShellTerminalMode::pipe(),
+                sandbox: ShellSandboxMode::DangerFullAccess,
+            },
+            override_registry,
+        )
+        .unwrap();
+    assert_eq!(
+        manager
+            .wait(&handle.id, Duration::from_secs(5))
+            .unwrap()
+            .stdout,
+        "scoped"
+    );
+    assert!(
+        manager
+            .output_store()
+            .read_delta(&handle.task_id, 0, 10)
+            .is_err()
+    );
+    drop(manager);
+    let reopened = RuntimeShellSessionManager::new(
+        TaskRegistry::new_persistent("same-id".to_string(), override_root).unwrap(),
+    );
+    assert_eq!(
+        reopened
+            .output_store()
+            .read_delta(&handle.task_id, 0, 10)
+            .unwrap()
+            .combined,
+        "scoped"
+    );
+}

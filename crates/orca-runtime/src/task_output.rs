@@ -2,7 +2,12 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+mod persistence;
+pub(crate) use persistence::ArchivedShell;
+use persistence::OutputArchive;
+
 pub const DEFAULT_TASK_OUTPUT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RETAINED_CHUNKS: usize = 32 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct TaskOutputStore {
@@ -34,6 +39,8 @@ struct TaskOutputBuffer {
 struct TaskOutputStoreInner {
     max_retained_bytes: usize,
     buffers: HashMap<String, TaskOutputBuffer>,
+    archive: Option<Arc<Mutex<OutputArchive>>>,
+    archive_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,8 +66,90 @@ impl TaskOutputStore {
             inner: Arc::new(Mutex::new(TaskOutputStoreInner {
                 max_retained_bytes,
                 buffers: HashMap::new(),
+                archive: None,
+                archive_error: None,
             })),
         }
+    }
+
+    pub(crate) fn for_tasks(tasks: &crate::tasks::TaskRegistry) -> Self {
+        let store = Self::new();
+        let archive = tasks.output_storage_root().and_then(|root| {
+            root.map(|root| OutputArchive::open(&root, tasks.session_id()))
+                .transpose()
+        });
+        let mut inner = store.inner.lock().expect("task output store poisoned");
+        match archive {
+            Ok(archive) => inner.archive = archive,
+            Err(error) => inner.archive_error = Some(error.to_string()),
+        }
+        drop(inner);
+        store
+    }
+
+    pub(crate) fn register_shell(
+        &self,
+        shell_id: &str,
+        task_id: &str,
+        requested_pty: bool,
+        effective_pty: bool,
+    ) -> io::Result<()> {
+        let mut inner = self.inner.lock().expect("task output store poisoned");
+        inner.check_archive()?;
+        if let Some(archive) = &inner.archive {
+            archive.lock().expect("output archive poisoned").register(
+                shell_id,
+                task_id,
+                requested_pty,
+                effective_pty,
+            )?;
+        }
+        inner.buffers.entry(task_id.to_string()).or_default();
+        Ok(())
+    }
+
+    pub(crate) fn archived_shell(&self, shell_id: &str) -> io::Result<ArchivedShell> {
+        let inner = self.inner.lock().expect("task output store poisoned");
+        inner.check_archive()?;
+        let archive = inner.archive.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no persistent output archive for this session",
+            )
+        })?;
+        archive
+            .lock()
+            .expect("output archive poisoned")
+            .shell(shell_id)
+    }
+
+    pub(crate) fn finish_shell(
+        &self,
+        task_id: &str,
+        state: &str,
+        exit_code: Option<i32>,
+    ) -> io::Result<()> {
+        let inner = self.inner.lock().expect("task output store poisoned");
+        inner.check_archive()?;
+        if let Some(archive) = &inner.archive {
+            archive
+                .lock()
+                .expect("output archive poisoned")
+                .finish(task_id, state, exit_code)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_cursor(&self, shell_id: &str, cursor: usize) -> io::Result<()> {
+        let inner = self.inner.lock().expect("task output store poisoned");
+        inner.check_archive()?;
+        if let Some(archive) = &inner.archive {
+            archive
+                .lock()
+                .expect("output archive poisoned")
+                .set_cursor(shell_id, cursor)?;
+        }
+        Ok(())
     }
 
     pub fn append_stdout(&self, task_id: &str, content: &str) -> io::Result<()> {
@@ -82,6 +171,7 @@ impl TaskOutputStore {
     }
 
     pub fn remove(&self, task_id: &str) -> bool {
+        // Process cleanup evicts the cache, not the session-owned archive.
         self.inner
             .lock()
             .expect("task output store poisoned")
@@ -97,17 +187,39 @@ impl TaskOutputStore {
         max_bytes: usize,
     ) -> io::Result<TaskOutputRead> {
         let inner = self.inner.lock().expect("task output store poisoned");
-        let Some(buffer) = inner.buffers.get(task_id) else {
-            return Ok(TaskOutputRead::empty(from_offset));
-        };
-        let retained_start = buffer.retained_start();
-        let start = from_offset.max(retained_start);
-        let end = start.saturating_add(max_bytes).min(buffer.bytes_total);
-        Ok(buffer.read_range(start, end, start.saturating_sub(from_offset)))
+        inner.check_archive()?;
+        if let Some(archive) = &inner.archive {
+            return archive.lock().expect("output archive poisoned").read(
+                task_id,
+                from_offset,
+                max_bytes,
+            );
+        }
+        inner.read_cached(task_id, from_offset, max_bytes)
+    }
+
+    pub(crate) fn read_cached(&self, task_id: &str) -> io::Result<TaskOutputRead> {
+        self.read_cached_delta(task_id, 0, DEFAULT_TASK_OUTPUT_RETAINED_BYTES)
+    }
+
+    pub(crate) fn read_cached_delta(
+        &self,
+        task_id: &str,
+        from: usize,
+        max_bytes: usize,
+    ) -> io::Result<TaskOutputRead> {
+        let inner = self.inner.lock().expect("task output store poisoned");
+        inner.check_archive()?;
+        inner.read_cached(task_id, from, max_bytes.min(inner.max_retained_bytes))
     }
 
     pub fn tail(&self, task_id: &str, max_bytes: usize) -> io::Result<TaskOutputRead> {
         let inner = self.inner.lock().expect("task output store poisoned");
+        inner.check_archive()?;
+        if let Some(archive) = &inner.archive {
+            let archive = archive.lock().expect("output archive poisoned");
+            return archive.tail(task_id, max_bytes);
+        }
         let Some(buffer) = inner.buffers.get(task_id) else {
             return Ok(TaskOutputRead::empty(0));
         };
@@ -122,11 +234,91 @@ impl TaskOutputStore {
             return Ok(());
         }
         let mut inner = self.inner.lock().expect("task output store poisoned");
+        inner.check_archive()?;
+        if let Some(archive) = inner.archive.clone()
+            && let Err(error) = archive
+                .lock()
+                .expect("output archive poisoned")
+                .append(task_id, stream, content)
+        {
+            inner.archive_error = Some(format!("task output persistence failed: {error}"));
+            return Err(error);
+        }
         let max_retained_bytes = inner.max_retained_bytes;
         let buffer = inner.buffers.entry(task_id.to_string()).or_default();
-        buffer.append(stream, content);
-        buffer.trim_to_budget(max_retained_bytes);
+        let mut remaining = content;
+        while !remaining.is_empty() {
+            let end = utf8_ceil(remaining, remaining.len().min(8192));
+            buffer.append(stream, &remaining[..end]);
+            buffer.trim_to_budget(max_retained_bytes);
+            remaining = &remaining[end..];
+        }
+        if inner.archive.is_some() {
+            let retained = inner
+                .buffers
+                .values()
+                .map(|buffer| buffer.bytes_total - buffer.retained_start())
+                .sum::<usize>();
+            let mut excess = retained.saturating_sub(DEFAULT_TASK_OUTPUT_RETAINED_BYTES);
+            for buffer in inner.buffers.values_mut() {
+                if excess == 0 {
+                    break;
+                }
+                let retained = buffer.bytes_total - buffer.retained_start();
+                let target = retained.saturating_sub(excess);
+                buffer.trim_to_budget(target);
+                excess = excess
+                    .saturating_sub(retained - (buffer.bytes_total - buffer.retained_start()));
+            }
+            let mut excess_chunks = inner
+                .buffers
+                .values()
+                .map(|buffer| buffer.chunks.len())
+                .sum::<usize>()
+                .saturating_sub(MAX_RETAINED_CHUNKS);
+            for buffer in inner.buffers.values_mut() {
+                if excess_chunks == 0 {
+                    break;
+                }
+                let remove = excess_chunks.min(buffer.chunks.len());
+                let start = buffer
+                    .chunks
+                    .get(remove)
+                    .map_or(buffer.bytes_total, |chunk| chunk.start);
+                buffer.trim_to_budget(buffer.bytes_total - start);
+                excess_chunks -= remove;
+            }
+        }
         Ok(())
+    }
+}
+
+impl TaskOutputStoreInner {
+    fn check_archive(&self) -> io::Result<()> {
+        if let Some(error) = &self.archive_error {
+            return Err(io::Error::other(error.clone()));
+        }
+        Ok(())
+    }
+
+    fn read_cached(
+        &self,
+        task_id: &str,
+        from_offset: usize,
+        max_bytes: usize,
+    ) -> io::Result<TaskOutputRead> {
+        let Some(buffer) = self.buffers.get(task_id) else {
+            return Ok(TaskOutputRead::empty(from_offset));
+        };
+        if from_offset > buffer.bytes_total {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output_offset exceeds output_bytes_total",
+            ));
+        }
+        let start = from_offset.max(buffer.retained_start());
+        let end = start.saturating_add(max_bytes).min(buffer.bytes_total);
+        Ok(buffer.read_range(start, end, start.saturating_sub(from_offset)))
     }
 }
 
@@ -244,7 +436,11 @@ impl TaskOutputBuffer {
     }
 
     fn trim_to_budget(&mut self, max_retained_bytes: usize) {
-        let retained_start = self.bytes_total.saturating_sub(max_retained_bytes);
+        let mut retained_start = self.bytes_total.saturating_sub(max_retained_bytes);
+        if self.chunks.len() > MAX_RETAINED_CHUNKS {
+            retained_start =
+                retained_start.max(self.chunks[self.chunks.len() - MAX_RETAINED_CHUNKS].start);
+        }
         while let Some(chunk) = self.chunks.first_mut() {
             let chunk_end = chunk.start + chunk.content.len();
             if chunk_end <= retained_start {
@@ -281,6 +477,11 @@ impl TaskOutputBuffer {
             chunk.content = chunk.content[local_start..].to_string();
             chunk.start += local_start;
             break;
+        }
+        if self.chunks.is_empty()
+            || self.chunks.capacity() > self.chunks.len().saturating_mul(2).max(64)
+        {
+            self.chunks.shrink_to_fit();
         }
     }
 
@@ -344,5 +545,112 @@ mod tests {
         assert_eq!(output.stdout, "first-third");
         assert_eq!(output.stderr, "-second");
         assert_eq!(output.combined, "first-second-third");
+    }
+
+    #[test]
+    fn persistent_store_keeps_output_before_memory_eviction_and_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks = crate::tasks::TaskRegistry::new_persistent(
+            "output-large".to_string(),
+            temp.path().join("tasks"),
+        )
+        .unwrap();
+        let total = DEFAULT_TASK_OUTPUT_RETAINED_BYTES + 8192;
+        {
+            let store = TaskOutputStore::for_tasks(&tasks);
+            store
+                .register_shell("shell-large", "task-large", false, false)
+                .unwrap();
+            let chunk = "x".repeat(8192);
+            for _ in 0..total / chunk.len() {
+                store.append_stdout("task-large", &chunk).unwrap();
+            }
+            let cached = store.read_cached("task-large").unwrap();
+            assert_eq!(cached.omitted_prefix_bytes, 8192);
+            assert_eq!(
+                store.read_delta("task-large", 0, 5).unwrap().combined,
+                "xxxxx"
+            );
+            store.finish_shell("task-large", "exited", Some(0)).unwrap();
+            store.remove("task-large");
+            assert_eq!(store.size("task-large"), 0);
+            assert_eq!(
+                store
+                    .read_delta("task-large", 0, 5)
+                    .unwrap()
+                    .omitted_prefix_bytes,
+                0
+            );
+        }
+        let reopened = TaskOutputStore::for_tasks(&tasks);
+        assert_eq!(
+            reopened.archived_shell("shell-large").unwrap().state,
+            "exited"
+        );
+        let last = reopened.read_delta("task-large", total - 5, 5).unwrap();
+        assert_eq!(last.combined, "xxxxx");
+        assert_eq!(last.next_offset, total);
+    }
+
+    #[test]
+    fn stores_are_session_scoped_and_write_failures_are_observable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let one =
+            crate::tasks::TaskRegistry::new_persistent("one".to_string(), root.clone()).unwrap();
+        let two = crate::tasks::TaskRegistry::new_persistent("two".to_string(), root).unwrap();
+        let store = TaskOutputStore::for_tasks(&one);
+        store
+            .register_shell("shell-one", "task-one", false, false)
+            .unwrap();
+        store.append_stdout("task-one", "secret").unwrap();
+        let other = TaskOutputStore::for_tasks(&two);
+        assert!(other.archived_shell("shell-one").is_err());
+        assert!(other.read_delta("task-one", 0, 10).is_err());
+        std::fs::remove_file(
+            one.output_storage_root()
+                .unwrap()
+                .unwrap()
+                .join("archive.sqlite3"),
+        )
+        .unwrap();
+        assert!(store.append_stdout("task-one", "lost").is_err());
+        assert!(store.read_delta("task-one", 0, 10).is_err());
+        assert!(store.read_cached("task-one").is_err());
+    }
+
+    #[test]
+    fn store_reopening_in_process_does_not_interrupt_live_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks = crate::tasks::TaskRegistry::new_persistent(
+            "live".to_string(),
+            temp.path().join("tasks"),
+        )
+        .unwrap();
+        let first = TaskOutputStore::for_tasks(&tasks);
+        first
+            .register_shell("shell-one", "task-one", false, false)
+            .unwrap();
+        let second = TaskOutputStore::for_tasks(&tasks);
+        assert_eq!(second.archived_shell("shell-one").unwrap().state, "running");
+        first.append_stdout("task-one", "shared").unwrap();
+        assert_eq!(
+            second.read_delta("task-one", 0, 10).unwrap().combined,
+            "shared"
+        );
+    }
+
+    #[test]
+    fn output_storage_rejects_ambiguous_raw_session_ids() {
+        for id in ["", ".", "..", "../other", "a/b", "a\\b"] {
+            let tasks = crate::tasks::TaskRegistry::new(id.to_string());
+            let store = TaskOutputStore::for_tasks(&tasks);
+            assert!(
+                store
+                    .register_shell("shell-one", "task-one", false, false)
+                    .is_err(),
+                "{id}"
+            );
+        }
     }
 }

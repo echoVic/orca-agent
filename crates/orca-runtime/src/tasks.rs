@@ -1454,6 +1454,28 @@ impl TaskRegistry {
         &self.session_id
     }
 
+    /// Output is owned by this task session, never by a caller-supplied task path.
+    pub(crate) fn output_storage_root(&self) -> io::Result<Option<PathBuf>> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(io::Error::other(format!(
+                "persistent task output is unavailable: {error}"
+            )));
+        }
+        if safe_path_component(&self.session_id) != self.session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "task output requires an unambiguous session id",
+            ));
+        }
+        match &self.persistence {
+            Some(persistence) => Ok(Some(persistence.root.join(&self.session_id).join("output"))),
+            None if self.is_process_local() => Ok(None),
+            None => Err(io::Error::other(
+                "persistent task output root is unavailable",
+            )),
+        }
+    }
+
     pub(crate) fn continuation_store(&self) -> Result<AgentContinuationStore, String> {
         if let Some(error) = self.persistent_open_error.as_deref() {
             return Err(format!("persistent task registry is unavailable: {error}"));

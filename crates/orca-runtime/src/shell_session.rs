@@ -206,6 +206,7 @@ pub struct ShellSessionSnapshot {
 pub struct RuntimeShellSessionManager {
     tasks: TaskRegistry,
     output_store: TaskOutputStore,
+    foreign_output_stores: HashMap<String, TaskOutputStore>,
     sessions: HashMap<String, ShellSession>,
 }
 
@@ -260,13 +261,15 @@ struct ShellExitStatus {
 
 impl RuntimeShellSessionManager {
     pub fn new(tasks: TaskRegistry) -> Self {
-        Self::with_output_store(tasks, TaskOutputStore::new())
+        let output_store = TaskOutputStore::for_tasks(&tasks);
+        Self::with_output_store(tasks, output_store)
     }
 
     pub fn with_output_store(tasks: TaskRegistry, output_store: TaskOutputStore) -> Self {
         Self {
             tasks,
             output_store,
+            foreign_output_stores: HashMap::new(),
             sessions: HashMap::new(),
         }
     }
@@ -317,71 +320,217 @@ impl RuntimeShellSessionManager {
         metadata_writable_directories: Vec<PathBuf>,
         tasks: TaskRegistry,
     ) -> io::Result<ShellSessionHandle> {
+        let storage_root = tasks.output_storage_root()?;
+        let foreign_scope = tasks.session_id() != self.tasks.session_id()
+            || self.tasks.output_storage_root().ok() != Some(storage_root);
         let requested_terminal = command.terminal;
         let description = command.description.clone();
         let task = tasks.create_shell(description.clone(), command.command.clone());
         tasks.mark_running(&task.id).map_err(io::Error::other)?;
-        let shell = ShellResolver::for_current_host()
-            .resolve_from_environment()
-            .map_err(io::Error::other)?;
-        // An argv request is launched directly by the native adapter on
-        // Windows; it does not depend on the user's configured shell
-        // dialect. Shell eligibility checks must only inspect shell-script
-        // requests, otherwise a PowerShell 5.1 installation would reject
-        // safe commands such as `node -e ...` before the AppContainer starts.
-        if command.argv.is_none() {
-            ensure_shell_sandbox_supported(shell.kind(), command.sandbox)?;
+        let id = format!("shell-{}", Uuid::new_v4());
+        let task_output = if foreign_scope {
+            TaskOutputStore::for_tasks(&tasks)
+        } else {
+            self.output_store.clone()
+        };
+        if let Err(error) = task_output.register_shell(
+            &id,
+            &task.id,
+            requested_terminal.is_pty(),
+            requested_terminal.is_pty(),
+        ) {
+            let _ = tasks.fail(&task.id, format!("failed to archive shell output: {error}"));
+            return Err(error);
         }
-        let uses_seatbelt = cfg!(target_os = "macos")
-            && !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess);
-        let capability =
-            shell_effective_capability(&command, &task.id, &metadata_writable_directories)?;
-        let enforcement = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
-            EnforcementState::Advisory
-        } else if cfg!(target_os = "windows") {
-            // The Windows branch below uses the native AppContainer/Job
-            // adapter rather than the generic command builder.
-            EnforcementState::Enforced
-        } else {
-            orca_tools::sandbox::enforcement_state()
-        };
-        let execution_profile = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
-            orca_core::capability::ExecutionProfile::TrustedHost
-        } else {
-            orca_core::capability::ExecutionProfile::Workspace
-        };
-        let broker = ExecutionBroker::with_backend_and_ceiling(
-            enforcement,
-            shell_backend_name(),
-            shell_capability_ceiling(&command, &metadata_writable_directories),
-        )
-        .with_profile(execution_profile);
+        let cleanup_tasks = tasks.clone();
+        let task_id = task.id.clone();
+        let result = (|| {
+            let shell = ShellResolver::for_current_host()
+                .resolve_from_environment()
+                .map_err(io::Error::other)?;
+            // An argv request is launched directly by the native adapter on
+            // Windows; it does not depend on the user's configured shell
+            // dialect. Shell eligibility checks must only inspect shell-script
+            // requests, otherwise a PowerShell 5.1 installation would reject
+            // safe commands such as `node -e ...` before the AppContainer starts.
+            if command.argv.is_none() {
+                ensure_shell_sandbox_supported(shell.kind(), command.sandbox)?;
+            }
+            let uses_seatbelt = cfg!(target_os = "macos")
+                && !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess);
+            let capability =
+                shell_effective_capability(&command, &task.id, &metadata_writable_directories)?;
+            let enforcement = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
+                EnforcementState::Advisory
+            } else if cfg!(target_os = "windows") {
+                // The Windows branch below uses the native AppContainer/Job
+                // adapter rather than the generic command builder.
+                EnforcementState::Enforced
+            } else {
+                orca_tools::sandbox::enforcement_state()
+            };
+            let execution_profile = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess)
+            {
+                orca_core::capability::ExecutionProfile::TrustedHost
+            } else {
+                orca_core::capability::ExecutionProfile::Workspace
+            };
+            let broker = ExecutionBroker::with_backend_and_ceiling(
+                enforcement,
+                shell_backend_name(),
+                shell_capability_ceiling(&command, &metadata_writable_directories),
+            )
+            .with_profile(execution_profile);
 
-        #[cfg(windows)]
-        if !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
-            let restricted = spawn_windows_sandbox(
-                &command,
-                &metadata_writable_directories,
-                &shell,
-                &broker,
-                &capability,
-            );
-            let (
-                child,
-                process_job,
-                stdin,
-                stdout_reader,
-                stderr_reader,
-                effective_terminal,
-                capability_receipt,
-            ) = match restricted {
-                Ok(value) => value,
-                Err(error) => {
+            #[cfg(windows)]
+            if !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
+                let restricted = spawn_windows_sandbox(
+                    &command,
+                    &metadata_writable_directories,
+                    &shell,
+                    &broker,
+                    &capability,
+                );
+                let (
+                    child,
+                    process_job,
+                    stdin,
+                    stdout_reader,
+                    stderr_reader,
+                    effective_terminal,
+                    capability_receipt,
+                ) = match restricted {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
+                        return Err(error);
+                    }
+                };
+                let output_store = task_output.clone();
+                let reader_stop = Arc::new(AtomicBool::new(false));
+                let stdout_handle = Some(spawn_output_reader(
+                    stdout_reader,
+                    output_store.clone(),
+                    task.id.clone(),
+                    ShellOutputStream::Stdout,
+                    Arc::clone(&reader_stop),
+                    false,
+                ));
+                let stderr_handle = stderr_reader.map(|reader| {
+                    spawn_output_reader(
+                        reader,
+                        output_store.clone(),
+                        task.id.clone(),
+                        ShellOutputStream::Stderr,
+                        Arc::clone(&reader_stop),
+                        false,
+                    )
+                });
+                if let Err(error) = tasks.mark_worker_spawned(&task.id, child.id()?) {
+                    cleanup_failed_shell_start(
+                        child,
+                        process_job,
+                        stdin,
+                        reader_stop,
+                        stdout_handle,
+                        stderr_handle,
+                    );
+                    let error = io::Error::other(error);
                     let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
                     return Err(error);
                 }
+                self.sessions.insert(
+                    id.clone(),
+                    ShellSession {
+                        tasks,
+                        task_id: task.id.clone(),
+                        command: command.command.clone(),
+                        description,
+                        child,
+                        process_job,
+                        stdin,
+                        output_store,
+                        stdout_handle,
+                        stderr_handle,
+                        reader_stop,
+                        requested_terminal,
+                        effective_terminal,
+                        capability_receipt: capability_receipt.clone(),
+                    },
+                );
+                return Ok(ShellSessionHandle {
+                    id,
+                    task_id: task.id,
+                    requested_terminal,
+                    effective_terminal,
+                    capability_receipt,
+                });
+            }
+
+            let mut process = match command.sandbox {
+                ShellSandboxMode::WorkspaceWrite {
+                    network_access,
+                    exclude_tmpdir_env_var,
+                    exclude_slash_tmp,
+                } => orca_tools::sandbox::workspace_write_bash_command(
+                    orca_tools::sandbox::WorkspaceWriteSandboxCommandContext {
+                        command: &command.command,
+                        cwd: &command.cwd,
+                        readable_roots: &command.additional_readable_directories,
+                        additional_roots: &command.additional_working_directories,
+                        metadata_writable_roots: &metadata_writable_directories,
+                        denied_roots: &command.denied_working_directories,
+                        network_access,
+                        exclude_tmpdir_env_var,
+                        exclude_slash_tmp,
+                        allowed_unix_socket_roots: &command.allowed_unix_socket_roots,
+                    },
+                ),
+                ShellSandboxMode::ReadOnly {
+                    network_access,
+                    allow_global_read,
+                } => orca_tools::sandbox::read_only_bash_command(
+                    orca_tools::sandbox::ReadOnlySandboxCommandContext {
+                        command: &command.command,
+                        cwd: &command.cwd,
+                        readable_roots: &command.additional_readable_directories,
+                        additional_roots: &command.additional_working_directories,
+                        metadata_writable_roots: &metadata_writable_directories,
+                        denied_roots: &command.denied_working_directories,
+                        network_access,
+                        allow_global_read,
+                        allowed_unix_socket_roots: &command.allowed_unix_socket_roots,
+                    },
+                ),
+                ShellSandboxMode::DangerFullAccess => session_command(&shell, &command),
             };
-            let output_store = self.output_store.clone();
+            process.env_remove("ORCA_API_KEY");
+            for (key, value) in &command.env {
+                match value {
+                    Some(value) => {
+                        process.env(key, value);
+                    }
+                    None => {
+                        process.env_remove(key);
+                    }
+                }
+            }
+            if uses_seatbelt {
+                process.env("ORCA_SANDBOX", "seatbelt");
+            }
+            let stdio = configure_shell_stdio(&mut process, requested_terminal)?;
+            let effective_terminal = stdio.effective_terminal();
+            let initialized =
+                spawn_configured_shell_with_broker(process, stdio, &broker, capability);
+            let (child, process_job, stdin, stdout_reader, stderr_reader, capability_receipt) =
+                match initialized {
+                    Ok(initialized) => initialized,
+                    Err(error) => {
+                        let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
+                        return Err(error);
+                    }
+                };
+            let output_store = task_output.clone();
             let reader_stop = Arc::new(AtomicBool::new(false));
             let stdout_handle = Some(spawn_output_reader(
                 stdout_reader,
@@ -389,7 +538,7 @@ impl RuntimeShellSessionManager {
                 task.id.clone(),
                 ShellOutputStream::Stdout,
                 Arc::clone(&reader_stop),
-                false,
+                cfg!(unix) && effective_terminal.is_pty(),
             ));
             let stderr_handle = stderr_reader.map(|reader| {
                 spawn_output_reader(
@@ -398,7 +547,7 @@ impl RuntimeShellSessionManager {
                     task.id.clone(),
                     ShellOutputStream::Stderr,
                     Arc::clone(&reader_stop),
-                    false,
+                    cfg!(unix) && effective_terminal.is_pty(),
                 )
             });
             if let Err(error) = tasks.mark_worker_spawned(&task.id, child.id()?) {
@@ -414,7 +563,6 @@ impl RuntimeShellSessionManager {
                 let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
                 return Err(error);
             }
-            let id = format!("shell-{}", Uuid::new_v4());
             self.sessions.insert(
                 id.clone(),
                 ShellSession {
@@ -422,9 +570,9 @@ impl RuntimeShellSessionManager {
                     task_id: task.id.clone(),
                     command: command.command.clone(),
                     description,
+                    stdin,
                     child,
                     process_job,
-                    stdin,
                     output_store,
                     stdout_handle,
                     stderr_handle,
@@ -434,138 +582,23 @@ impl RuntimeShellSessionManager {
                     capability_receipt: capability_receipt.clone(),
                 },
             );
-            return Ok(ShellSessionHandle {
+
+            Ok(ShellSessionHandle {
                 id,
                 task_id: task.id,
                 requested_terminal,
                 effective_terminal,
                 capability_receipt,
-            });
+            })
+        })();
+        if let Err(error) = &result {
+            let _ = cleanup_tasks.fail(&task_id, format!("failed to run shell: {error}"));
+            let _ = task_output.finish_shell(&task_id, "interrupted", None);
+            task_output.remove(&task_id);
+        } else if foreign_scope {
+            self.foreign_output_stores.insert(task_id, task_output);
         }
-
-        let mut process = match command.sandbox {
-            ShellSandboxMode::WorkspaceWrite {
-                network_access,
-                exclude_tmpdir_env_var,
-                exclude_slash_tmp,
-            } => orca_tools::sandbox::workspace_write_bash_command(
-                orca_tools::sandbox::WorkspaceWriteSandboxCommandContext {
-                    command: &command.command,
-                    cwd: &command.cwd,
-                    readable_roots: &command.additional_readable_directories,
-                    additional_roots: &command.additional_working_directories,
-                    metadata_writable_roots: &metadata_writable_directories,
-                    denied_roots: &command.denied_working_directories,
-                    network_access,
-                    exclude_tmpdir_env_var,
-                    exclude_slash_tmp,
-                    allowed_unix_socket_roots: &command.allowed_unix_socket_roots,
-                },
-            ),
-            ShellSandboxMode::ReadOnly {
-                network_access,
-                allow_global_read,
-            } => orca_tools::sandbox::read_only_bash_command(
-                orca_tools::sandbox::ReadOnlySandboxCommandContext {
-                    command: &command.command,
-                    cwd: &command.cwd,
-                    readable_roots: &command.additional_readable_directories,
-                    additional_roots: &command.additional_working_directories,
-                    metadata_writable_roots: &metadata_writable_directories,
-                    denied_roots: &command.denied_working_directories,
-                    network_access,
-                    allow_global_read,
-                    allowed_unix_socket_roots: &command.allowed_unix_socket_roots,
-                },
-            ),
-            ShellSandboxMode::DangerFullAccess => session_command(&shell, &command),
-        };
-        process.env_remove("ORCA_API_KEY");
-        for (key, value) in &command.env {
-            match value {
-                Some(value) => {
-                    process.env(key, value);
-                }
-                None => {
-                    process.env_remove(key);
-                }
-            }
-        }
-        if uses_seatbelt {
-            process.env("ORCA_SANDBOX", "seatbelt");
-        }
-        let stdio = configure_shell_stdio(&mut process, requested_terminal)?;
-        let effective_terminal = stdio.effective_terminal();
-        let initialized = spawn_configured_shell_with_broker(process, stdio, &broker, capability);
-        let (child, process_job, stdin, stdout_reader, stderr_reader, capability_receipt) =
-            match initialized {
-                Ok(initialized) => initialized,
-                Err(error) => {
-                    let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
-                    return Err(error);
-                }
-            };
-        let output_store = self.output_store.clone();
-        let reader_stop = Arc::new(AtomicBool::new(false));
-        let stdout_handle = Some(spawn_output_reader(
-            stdout_reader,
-            output_store.clone(),
-            task.id.clone(),
-            ShellOutputStream::Stdout,
-            Arc::clone(&reader_stop),
-            cfg!(unix) && effective_terminal.is_pty(),
-        ));
-        let stderr_handle = stderr_reader.map(|reader| {
-            spawn_output_reader(
-                reader,
-                output_store.clone(),
-                task.id.clone(),
-                ShellOutputStream::Stderr,
-                Arc::clone(&reader_stop),
-                cfg!(unix) && effective_terminal.is_pty(),
-            )
-        });
-        if let Err(error) = tasks.mark_worker_spawned(&task.id, child.id()?) {
-            cleanup_failed_shell_start(
-                child,
-                process_job,
-                stdin,
-                reader_stop,
-                stdout_handle,
-                stderr_handle,
-            );
-            let error = io::Error::other(error);
-            let _ = tasks.fail(&task.id, format!("failed to run shell: {error}"));
-            return Err(error);
-        }
-        let id = format!("shell-{}", Uuid::new_v4());
-        self.sessions.insert(
-            id.clone(),
-            ShellSession {
-                tasks,
-                task_id: task.id.clone(),
-                command: command.command.clone(),
-                description,
-                stdin,
-                child,
-                process_job,
-                output_store,
-                stdout_handle,
-                stderr_handle,
-                reader_stop,
-                requested_terminal,
-                effective_terminal,
-                capability_receipt: capability_receipt.clone(),
-            },
-        );
-
-        Ok(ShellSessionHandle {
-            id,
-            task_id: task.id,
-            requested_terminal,
-            effective_terminal,
-            capability_receipt,
-        })
+        result
     }
 
     pub fn write_stdin(&mut self, id: &str, input: &str) -> io::Result<()> {
@@ -728,12 +761,12 @@ impl RuntimeShellSessionManager {
                 return self.finish_terminal_session(id, status, remove_completed_output);
             }
             if session.output_size() > 0 || Instant::now() >= deadline {
-                return Ok(session.output(
+                return session.output(
                     id,
                     TaskStatus::Running,
                     None,
                     ShellSessionTermination::Running,
-                ));
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -745,12 +778,20 @@ impl RuntimeShellSessionManager {
         from_offset: usize,
         max_bytes: usize,
     ) -> io::Result<TaskOutputRead> {
-        self.output_store
-            .read_delta(task_id, from_offset, max_bytes)
+        self.store_for_task(task_id)
+            .read_cached_delta(task_id, from_offset, max_bytes)
     }
 
-    pub(crate) fn remove_output(&self, task_id: &str) -> bool {
-        self.output_store.remove(task_id)
+    fn store_for_task(&self, task_id: &str) -> &TaskOutputStore {
+        self.foreign_output_stores
+            .get(task_id)
+            .unwrap_or(&self.output_store)
+    }
+
+    pub(crate) fn remove_output(&mut self, task_id: &str) -> bool {
+        let removed = self.store_for_task(task_id).remove(task_id);
+        self.foreign_output_stores.remove(task_id);
+        removed
     }
 
     pub fn wait(&mut self, id: &str, timeout: Duration) -> io::Result<ShellSessionOutput> {
@@ -806,9 +847,9 @@ impl RuntimeShellSessionManager {
             },
             process_exit_code(status),
             ShellSessionTermination::Exited,
-        );
+        )?;
         Self::record_terminal_output(&tasks, &output)?;
-        self.output_store.remove(&output.task_id);
+        self.remove_output(&output.task_id);
         Ok(output)
     }
 
@@ -818,9 +859,7 @@ impl RuntimeShellSessionManager {
         from_offset: usize,
         on_output: &mut dyn FnMut(&str),
     ) -> io::Result<usize> {
-        let output = self
-            .output_store
-            .read_delta(task_id, from_offset, usize::MAX)?;
+        let output = self.read_output_delta(task_id, from_offset, usize::MAX)?;
         if !output.combined.is_empty() {
             on_output(&output.combined);
         }
@@ -858,10 +897,10 @@ impl RuntimeShellSessionManager {
                 },
                 process_exit_code(status),
                 ShellSessionTermination::Exited,
-            );
+            )?;
             Self::record_terminal_output(&tasks, &output)?;
             if remove_completed_output {
-                self.output_store.remove(&output.task_id);
+                self.remove_output(&output.task_id);
             }
             return Ok(output);
         }
@@ -873,12 +912,12 @@ impl RuntimeShellSessionManager {
             TaskStatus::Stopped,
             process_exit_code(status),
             termination,
-        );
+        )?;
         tasks
             .stop(&output.task_id, output.stdout.clone())
             .map_err(io::Error::other)?;
         if remove_completed_output {
-            self.output_store.remove(&output.task_id);
+            self.remove_output(&output.task_id);
         }
         Ok(output)
     }
@@ -908,10 +947,10 @@ impl RuntimeShellSessionManager {
             },
             process_exit_code(status),
             ShellSessionTermination::Exited,
-        );
+        )?;
         Self::record_terminal_output(&tasks, &output)?;
         if remove_completed_output {
-            self.output_store.remove(&output.task_id);
+            self.remove_output(&output.task_id);
         }
         Ok(output)
     }
@@ -1210,27 +1249,35 @@ impl ShellSession {
         status: TaskStatus,
         exit_code: Option<i32>,
         termination: ShellSessionTermination,
-    ) -> ShellSessionOutput {
-        let output = self
-            .output_store
-            .read_delta(&self.task_id, 0, usize::MAX)
-            .unwrap_or_else(|_| TaskOutputRead {
-                stdout: String::new(),
-                stderr: String::new(),
-                combined: String::new(),
-                next_offset: 0,
-                bytes_read: 0,
-                bytes_total: self.output_size(),
-                omitted_prefix_bytes: 0,
-                stdout_prefix_bytes: 0,
-                stderr_prefix_bytes: 0,
-            });
+    ) -> io::Result<ShellSessionOutput> {
+        let result = (|| {
+            if termination != ShellSessionTermination::Running {
+                self.output_store.finish_shell(
+                    &self.task_id,
+                    match termination {
+                        ShellSessionTermination::Running => unreachable!(),
+                        ShellSessionTermination::Exited => "exited",
+                        ShellSessionTermination::Cancelled => "cancelled",
+                        ShellSessionTermination::TimedOut => "timed_out",
+                    },
+                    exit_code,
+                )?;
+            }
+            self.output_store.read_cached(&self.task_id)
+        })();
+        let output = result.map_err(|error| {
+            let _ = self.tasks.fail(
+                &self.task_id,
+                format!("shell output archive unavailable: {error}"),
+            );
+            error
+        })?;
         let (stdout, stderr) = shell_output_text_with_omitted_prefix(
             output.stdout,
             output.stderr,
             output.omitted_prefix_bytes,
         );
-        ShellSessionOutput {
+        Ok(ShellSessionOutput {
             id: id.to_string(),
             task_id: self.task_id.clone(),
             stdout,
@@ -1240,7 +1287,7 @@ impl ShellSession {
             termination,
             requested_terminal: self.requested_terminal,
             effective_terminal: self.effective_terminal,
-        }
+        })
     }
 
     fn output_size(&self) -> usize {

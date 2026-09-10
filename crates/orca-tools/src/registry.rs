@@ -660,7 +660,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         cooperative_builtin_spec(
             "write_stdin",
-            "Write characters to a running exec_command session, or poll it by omitting chars. Control characters such as Ctrl-U may be sent with their Unicode escape.",
+            "Write characters to a running exec_command session, or poll it by omitting chars. Set output_offset for an idempotent archived byte-offset page, including after completion or restart. Control characters such as Ctrl-U may be sent with their Unicode escape.",
             json!({
                 "type": "object",
                 "properties": {
@@ -671,6 +671,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "chars": {
                         "type": "string",
                         "description": "Characters to write. Omit to poll without writing."
+                    },
+                    "output_offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Read one archived page at this byte offset without advancing the automatic cursor. Use 0 to start and next_output_offset to continue. Cannot be combined with nonempty chars; yield_time_ms is ignored. Retention may omit an earlier prefix; offsets beyond output_bytes_total are invalid."
                     },
                     "yield_time_ms": {
                         "type": "integer",

@@ -2,7 +2,7 @@
 
 - Status: Accepted; released in v0.3.23
 - Date: 2026-08-17
-- Updated: 2026-08-18 (background supervisor and completion notifications)
+- Updated: 2026-09-09 (durable output and explicit offset polling)
 - Scope: model-facing shell execution, interactive stdin, PTY, task control
 
 ## Context
@@ -27,7 +27,8 @@ model tools:
 - `exec_command` starts a command and returns a `session_id` and `task_id`. If
   the command has not completed by `yield_time_ms`, it remains running.
 - `write_stdin` writes characters to the retained session or polls it when
-  `chars` is omitted.
+  `chars` is omitted. Optional `output_offset` reads one archived page without
+  consuming the automatic cursor.
 
 The service is stored in the runtime thread's typed extension store. Every
 turn in the same thread resolves the same service instance. A dedicated
@@ -68,6 +69,57 @@ a read-only concurrent tool, and may carry raw terminal control characters.
 thread-owned terminal service to terminate the matching process tree
 immediately. Unread output is preserved until the terminal result is polled.
 
+## Durable Output
+
+Recorded task registries own an `output/` directory inside their existing
+`tasks/<session>/` storage directory. The SQLite archive stores a shell-session
+to task mapping, terminal mode, terminal outcome, automatic cursor, absolute
+byte counts, per-stream prefix counts, and ordered UTF-8 output chunks. It is
+primary output storage, not a derived index that can be silently rebuilt.
+Process-local registries retain their existing memory-only lifecycle.
+
+Shell readers commit each observed chunk before publishing it to the bounded
+memory tail. SQLite uses FULL synchronization and DELETE journaling. Terminal
+outcomes are committed only after both output readers have joined. This covers
+`exec_command`, `bash`, and server shell/command adapters; the latter keep their
+existing bounded snapshot wire behavior. A persistence failure is latched and
+reported as an error rather than a successful empty output. This guarantee
+starts at the reader's committed chunk, not at bytes still in an OS pipe.
+
+Limits are 32 MiB retained per task, 128 MiB per session, 256 task metadata
+rows, and 32,768 chunk rows. Appends and reads operate on at most 8 KiB chunks
+(plus up to three UTF-8 boundary bytes). Per-task trimming rounds the retained
+start up to a UTF-8 boundary; session pressure removes oldest chunks. Older
+completed task entries expire when new tasks need metadata capacity. A full
+set of active tasks rejects a new launch. Absolute offsets never reset.
+Expired task entries return an explicit missing/expired error.
+
+The memory tail is bounded to 8 MiB and 32,768 chunks per store, SQLite's cache
+to 2 MiB, and each archive read to 256 KiB plus UTF-8 rounding. The database
+page ceiling includes metadata overhead (about 274 MiB at default limits);
+DELETE journals are bounded by the database's pages and FULL auto-vacuum
+reclaims deleted pages. The terminal service retains at most 256 completed
+session objects for ten minutes; freeing an object or observing EOF only
+evicts memory, not the archive. Deleting the owning task-session directory
+also deletes its archive. There is no separate global archive directory.
+
+Roots must be absolute and session IDs must be unambiguous single components.
+Reads accept a shell ID, never a filename or arbitrary task path. The archive
+verifies its recorded session ID and rejects linked roots, linked database or
+journal files, and replaced files. Unix output directories/files require
+current-user ownership and private 0700/0600 permissions; hard-linked files
+are rejected. Windows rejects reparse points and inherits the task store ACL.
+The fixed macOS `/tmp` and `/var` system aliases are resolved before SQLite's
+no-follow open. Explicit reads use the registered `write_stdin` transport
+through the existing tool authorization path.
+
+A process-exclusive file lock prevents a second host from taking over an
+active archive. Managers within one host share that owner. After the owner
+exits, a new instance reopens the mapping without scanning all output into
+memory; any remaining `running` archive metadata becomes `interrupted`, with
+no exit code. Completed status and the automatic cursor survive reopening.
+This does not claim that OS processes or stdin survive a runtime host restart.
+
 ## Result Contract
 
 Both tools return JSON containing:
@@ -77,6 +129,33 @@ Both tools return JSON containing:
 - bounded incremental output;
 - output cursor and truncation metadata;
 - requested and effective terminal modes.
+
+Offset polling example:
+
+```json
+{"session_id":"shell-<id>","output_offset":0,"max_output_tokens":2000}
+```
+
+Use `next_output_offset` for the next page. Offsets address the combined
+stdout/stderr stream in reader-observed order, measured in bytes of normalized
+UTF-8 text (invalid process bytes become replacement characters).
+`output_offset` echoes the request; `output_bytes_total` is the current total.
+The start and page end round up inside a UTF-8 code point, matching the existing
+reader contract. A page may exceed its byte budget by at most three bytes.
+
+Repeated offsets return the same bytes while those bytes remain retained,
+independently of other reads. Live totals/status may change and retention may
+advance the available prefix. `omitted_prefix_bytes` counts unavailable bytes
+between the requested offset and retained start. `truncated` means omitted
+prefix or additional available bytes. `eof` means a terminal process outcome
+and a cursor at the current total; an empty live poll is not EOF. Offset equal
+to the total is valid; future, negative, fractional, and overflowing offsets
+are invalid. Missing, corrupt, or inaccessible archives produce errors.
+
+Explicit-offset reads are immediate (`yield_time_ms` is ignored), do not
+acknowledge background notifications, and cannot be combined with nonempty
+`chars`. Omitting the offset preserves automatic-cursor polling, stdin writes,
+and completion acknowledgement.
 
 A non-zero command exit is represented inside this JSON. The tool transport
 itself completes successfully when Orca observed the process result, allowing
@@ -114,4 +193,10 @@ The focused contract tests cover:
 - isolated output across concurrent sessions;
 - supervisor shutdown and descendant process cleanup;
 - next-turn completion notification injection;
-- model-visible registry and target normalization.
+- model-visible registry and target normalization;
+- initial/next/repeated explicit pages, EOF and invalid cursors;
+- UTF-8 boundaries, task/session byte caps and metadata row caps;
+- completed and interrupted restart recovery in a new host process;
+- missing archives, symlinks, private modes and cross-session isolation;
+- automatic-cursor independence and rejection before stdin side effects;
+- a real 9 MiB process capture, bounded paging, and reopen throughput.

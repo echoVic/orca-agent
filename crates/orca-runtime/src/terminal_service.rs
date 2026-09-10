@@ -25,6 +25,7 @@ const TERMINAL_COMMAND_CAPACITY: usize = 32;
 const COMPLETION_QUEUE_CAPACITY: usize = 64;
 const COMPLETION_OUTPUT_MAX_BYTES: usize = 8 * 1024;
 const COMPLETED_SESSION_RETENTION: Duration = Duration::from_secs(10 * 60);
+const MAX_COMPLETED_SESSIONS: usize = 256;
 
 pub(crate) struct TerminalService {
     sender: SyncSender<TerminalCommand>,
@@ -53,7 +54,7 @@ struct TerminalSessionState {
 #[derive(Clone, Copy)]
 struct TerminalState {
     status: TaskStatus,
-    termination: ShellSessionTermination,
+    termination: &'static str,
     exit_code: Option<i32>,
 }
 
@@ -72,6 +73,7 @@ enum TerminalCommand {
     Poll {
         session_id: String,
         max_output_bytes: usize,
+        output_offset: Option<usize>,
         response: SyncSender<io::Result<TerminalServiceOutput>>,
     },
     MarkBackground {
@@ -110,8 +112,10 @@ pub(crate) struct TerminalServiceOutput {
     pub(crate) exit_code: Option<i32>,
     pub(crate) truncated: bool,
     pub(crate) omitted_prefix_bytes: usize,
+    pub(crate) output_offset: usize,
     pub(crate) next_output_offset: usize,
     pub(crate) output_bytes_total: usize,
+    pub(crate) eof: bool,
     pub(crate) requested_terminal: &'static str,
     pub(crate) effective_terminal: &'static str,
 }
@@ -212,6 +216,36 @@ impl TerminalService {
         max_output_bytes: usize,
         should_cancel: impl Fn() -> bool,
     ) -> io::Result<TerminalServiceOutput> {
+        self.write_stdin_with_offset(
+            session_id,
+            chars,
+            None,
+            yield_time,
+            max_output_bytes,
+            should_cancel,
+        )
+    }
+
+    pub(crate) fn write_stdin_with_offset(
+        &self,
+        session_id: &str,
+        chars: Option<&str>,
+        output_offset: Option<usize>,
+        yield_time: Duration,
+        max_output_bytes: usize,
+        should_cancel: impl Fn() -> bool,
+    ) -> io::Result<TerminalServiceOutput> {
+        if let Some(offset) = output_offset {
+            if chars.is_some_and(|chars| !chars.is_empty()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "output_offset cannot be combined with nonempty chars",
+                ));
+            }
+            // An explicit read is a single, repeatable page, not an advancing
+            // long poll. It neither writes stdin nor consumes the shared cursor.
+            return self.poll_once(session_id, max_output_bytes, Some(offset));
+        }
         if let Some(chars) = chars.filter(|chars| !chars.is_empty()) {
             let (response, receiver) = mpsc::sync_channel(1);
             self.send(TerminalCommand::Write {
@@ -264,7 +298,7 @@ impl TerminalService {
         let mut aggregate: Option<TerminalServiceOutput> = None;
         let mut remaining_output_bytes = max_output_bytes.max(1);
         loop {
-            let output = self.poll_once(session_id, remaining_output_bytes)?;
+            let output = self.poll_once(session_id, remaining_output_bytes, None)?;
             let observed_output = output.output.len();
             let status = output.status;
             merge_terminal_output(&mut aggregate, output);
@@ -290,11 +324,13 @@ impl TerminalService {
         &self,
         session_id: &str,
         max_output_bytes: usize,
+        output_offset: Option<usize>,
     ) -> io::Result<TerminalServiceOutput> {
         let (response, receiver) = mpsc::sync_channel(1);
         self.send(TerminalCommand::Poll {
             session_id: session_id.to_string(),
             max_output_bytes,
+            output_offset,
             response,
         })?;
         receive_response(receiver, "terminal poll")?
@@ -368,9 +404,10 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
             Ok(TerminalCommand::Poll {
                 session_id,
                 max_output_bytes,
+                output_offset,
                 response,
             }) => {
-                let result = state.poll(&session_id, max_output_bytes);
+                let result = state.poll(&session_id, max_output_bytes, output_offset);
                 let _ = response.send(result);
             }
             Ok(TerminalCommand::MarkBackground { session_id }) => {
@@ -420,48 +457,77 @@ impl TerminalServiceState {
         &mut self,
         session_id: &str,
         max_output_bytes: usize,
+        output_offset: Option<usize>,
     ) -> io::Result<TerminalServiceOutput> {
         self.reap()?;
-        let (task_id, cursor, requested_terminal, effective_terminal, terminal) = {
-            let session = self.sessions.get(session_id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("unknown terminal session: {session_id}"),
+        let (task_id, cursor, requested_terminal, effective_terminal, terminal) =
+            if let Some(session) = self.sessions.get(session_id) {
+                (
+                    session.task_id.clone(),
+                    session.cursor,
+                    session.requested_terminal,
+                    session.effective_terminal,
+                    session.terminal,
                 )
-            })?;
-            (
-                session.task_id.clone(),
-                session.cursor,
-                session.requested_terminal,
-                session.effective_terminal,
-                session.terminal,
-            )
-        };
-        let output = self
-            .manager
-            .read_output_delta(&task_id, cursor, max_output_bytes.max(1))?;
+            } else {
+                let archived = self.manager.output_store().archived_shell(session_id)?;
+                let terminal = TerminalState::from_archive(&archived)?;
+                (
+                    archived.task_id,
+                    archived.cursor,
+                    if archived.requested_pty {
+                        ShellTerminalMode::pty(None, None)
+                    } else {
+                        ShellTerminalMode::pipe()
+                    },
+                    if archived.effective_pty {
+                        ShellTerminalMode::pty(None, None)
+                    } else {
+                        ShellTerminalMode::pipe()
+                    },
+                    Some(terminal),
+                )
+            };
+        let cursor = output_offset.unwrap_or(cursor);
+        let output =
+            self.manager
+                .output_store()
+                .read_delta(&task_id, cursor, max_output_bytes.max(1))?;
         let terminal = terminal.unwrap_or_else(TerminalState::running);
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session.cursor = output.next_offset;
-        }
-        if terminal.status != TaskStatus::Running {
-            self.observe_completion(session_id);
-        }
-        if terminal.status != TaskStatus::Running && output.next_offset >= output.bytes_total {
-            self.sessions.remove(session_id);
-            self.manager.remove_output(&task_id);
+        if output_offset.is_none() {
+            if output.next_offset != cursor {
+                self.manager
+                    .output_store()
+                    .set_cursor(session_id, output.next_offset)?;
+            }
+            if let Some(session) = self.sessions.get_mut(session_id) {
+                session.cursor = output.next_offset;
+            }
+            if terminal.status != TaskStatus::Running {
+                self.observe_completion(session_id);
+            }
+            if terminal.status != TaskStatus::Running && output.next_offset >= output.bytes_total {
+                self.sessions.remove(session_id);
+                self.manager.remove_output(&task_id);
+            }
         }
         Ok(TerminalServiceOutput {
             session_id: session_id.to_string(),
             task_id,
-            status: task_status_label(terminal.status),
-            termination: termination_label(terminal.termination),
+            status: if terminal.termination == "interrupted" {
+                "interrupted"
+            } else {
+                task_status_label(terminal.status)
+            },
+            termination: terminal.termination,
             output: output.combined,
             exit_code: terminal.exit_code,
             truncated: output.omitted_prefix_bytes > 0 || output.next_offset < output.bytes_total,
             omitted_prefix_bytes: output.omitted_prefix_bytes,
+            output_offset: cursor,
             next_output_offset: output.next_offset,
             output_bytes_total: output.bytes_total,
+            eof: terminal.status != TaskStatus::Running && output.next_offset >= output.bytes_total,
             requested_terminal: requested_terminal.as_str(),
             effective_terminal: effective_terminal.as_str(),
         })
@@ -520,10 +586,10 @@ impl TerminalServiceState {
             return;
         }
         let task_id = session.task_id.clone();
-        let output = self
-            .manager
-            .read_output_delta(&task_id, 0, COMPLETION_OUTPUT_MAX_BYTES)
-            .ok();
+        let output =
+            self.manager
+                .output_store()
+                .read_delta(&task_id, 0, COMPLETION_OUTPUT_MAX_BYTES);
         let completion = TerminalCompletion {
             session_id: session_id.to_string(),
             task_id,
@@ -531,9 +597,9 @@ impl TerminalServiceState {
             output: output
                 .as_ref()
                 .map(|output| output.combined.clone())
-                .unwrap_or_default(),
+                .unwrap_or_else(|error| format!("[task output archive unavailable: {error}]")),
             exit_code: terminal.exit_code,
-            truncated: output.as_ref().is_some_and(|output| {
+            truncated: output.as_ref().map_or(true, |output| {
                 output.omitted_prefix_bytes > 0 || output.next_offset < output.bytes_total
             }),
         };
@@ -555,19 +621,22 @@ impl TerminalServiceState {
     }
 
     fn cleanup_completed(&mut self) {
-        let expired = self
+        let mut completed = self
             .sessions
             .iter()
             .filter_map(|(session_id, session)| {
                 session
                     .completed_at
-                    .filter(|completed_at| completed_at.elapsed() >= COMPLETED_SESSION_RETENTION)
-                    .map(|_| (session_id.clone(), session.task_id.clone()))
+                    .map(|at| (at, session_id.clone(), session.task_id.clone()))
             })
             .collect::<Vec<_>>();
-        for (session_id, task_id) in expired {
-            self.sessions.remove(&session_id);
-            self.manager.remove_output(&task_id);
+        completed.sort_by_key(|(at, _, _)| *at);
+        let excess = completed.len().saturating_sub(MAX_COMPLETED_SESSIONS);
+        for (index, (at, session_id, task_id)) in completed.into_iter().enumerate() {
+            if index < excess || at.elapsed() >= COMPLETED_SESSION_RETENTION {
+                self.sessions.remove(&session_id);
+                self.manager.remove_output(&task_id);
+            }
         }
     }
 }
@@ -590,6 +659,7 @@ fn merge_terminal_output(
         .saturating_add(next.omitted_prefix_bytes);
     current.next_output_offset = next.next_output_offset;
     current.output_bytes_total = next.output_bytes_total;
+    current.eof = next.eof;
     current.requested_terminal = next.requested_terminal;
     current.effective_terminal = next.effective_terminal;
 }
@@ -618,7 +688,7 @@ impl TerminalState {
     fn running() -> Self {
         Self {
             status: TaskStatus::Running,
-            termination: ShellSessionTermination::Running,
+            termination: "running",
             exit_code: None,
         }
     }
@@ -626,9 +696,37 @@ impl TerminalState {
     fn from_output(output: &ShellSessionOutput) -> Self {
         Self {
             status: output.status,
-            termination: output.termination,
+            termination: termination_label(output.termination),
             exit_code: output.exit_code,
         }
+    }
+
+    fn from_archive(output: &crate::task_output::ArchivedShell) -> io::Result<Self> {
+        let (status, termination) = match output.state.as_str() {
+            "running" => (TaskStatus::Running, "running"),
+            "exited" => (
+                if output.exit_code == Some(0) {
+                    TaskStatus::Completed
+                } else {
+                    TaskStatus::Failed
+                },
+                "exited",
+            ),
+            "cancelled" => (TaskStatus::Stopped, "cancelled"),
+            "timed_out" => (TaskStatus::Stopped, "timed_out"),
+            "interrupted" => (TaskStatus::Failed, "interrupted"),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid archived terminal state",
+                ));
+            }
+        };
+        Ok(Self {
+            status,
+            termination,
+            exit_code: output.exit_code,
+        })
     }
 }
 
@@ -757,8 +855,11 @@ mod tests {
     use super::*;
 
     fn service(cwd: &Path) -> (TerminalService, TaskRegistry) {
-        let registry =
-            TaskRegistry::new_for_cwd(format!("terminal-test-{}", uuid::Uuid::new_v4()), cwd);
+        let registry = TaskRegistry::new_persistent(
+            format!("terminal-test-{}", uuid::Uuid::new_v4()),
+            cwd.join("tasks"),
+        )
+        .expect("isolated task registry");
         (TerminalService::new(registry.clone()), registry)
     }
 
@@ -1116,6 +1217,213 @@ mod tests {
         assert!(
             !marker.exists(),
             "background child survived service shutdown"
+        );
+    }
+
+    fn explicit_page(
+        service: &TerminalService,
+        id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> TerminalServiceOutput {
+        service
+            .write_stdin_with_offset(id, None, Some(offset), Duration::ZERO, limit, || false)
+            .unwrap()
+    }
+
+    #[test]
+    fn explicit_pages_replay_after_eof_and_service_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let overlay = TurnPermissionOverlay::default();
+        let (service, registry) = service(temp.path());
+        let command = if cfg!(windows) {
+            "[Console]::Out.Write('abcdef')"
+        } else {
+            "printf abcdef"
+        };
+        let started = service
+            .exec(
+                request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+                Duration::from_secs(2),
+                2,
+                || false,
+            )
+            .unwrap();
+        wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
+        let first = explicit_page(&service, &started.session_id, 0, 2);
+        assert_eq!(first.output, "ab");
+        assert_eq!(first.next_output_offset, 2);
+        assert!(!first.eof);
+        assert_eq!(first, explicit_page(&service, &started.session_id, 0, 2));
+        let next = explicit_page(&service, &started.session_id, first.next_output_offset, 2);
+        assert_eq!(next.output, "cd");
+        let automatic = service
+            .write_stdin(&started.session_id, None, Duration::ZERO, 99, || false)
+            .unwrap();
+        assert_eq!(
+            automatic.output, "cdef",
+            "explicit reads must not consume the automatic cursor"
+        );
+        assert!(automatic.eof);
+        assert_eq!(
+            explicit_page(&service, &started.session_id, 0, 6).output,
+            "abcdef"
+        );
+        let eof = explicit_page(&service, &started.session_id, 6, 10);
+        assert!(eof.eof && eof.output.is_empty());
+        assert_eq!(eof, explicit_page(&service, &started.session_id, 6, 10));
+        assert_eq!(
+            service
+                .write_stdin_with_offset(
+                    &started.session_id,
+                    None,
+                    Some(7),
+                    Duration::ZERO,
+                    5,
+                    || false
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        drop(service);
+        let reopened_registry = TaskRegistry::new_persistent(
+            registry.session_id().to_string(),
+            temp.path().join("tasks"),
+        )
+        .unwrap();
+        let reopened = TerminalService::new(reopened_registry);
+        assert_eq!(first, explicit_page(&reopened, &started.session_id, 0, 2));
+        assert!(
+            reopened
+                .write_stdin(&started.session_id, None, Duration::ZERO, 99, || false)
+                .unwrap()
+                .output
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .write_stdin(
+                    &started.session_id,
+                    Some("input"),
+                    Duration::ZERO,
+                    99,
+                    || false
+                )
+                .is_err()
+        );
+        let foreign = TerminalService::new(
+            TaskRegistry::new_persistent("foreign".to_string(), temp.path().join("tasks")).unwrap(),
+        );
+        assert!(
+            foreign
+                .write_stdin_with_offset(
+                    &started.session_id,
+                    None,
+                    Some(0),
+                    Duration::ZERO,
+                    99,
+                    || false
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn live_offset_reads_cannot_write_or_advance_stdin_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let overlay = TurnPermissionOverlay::default();
+        let (service, registry) = service(temp.path());
+        let command = if cfg!(windows) {
+            "[Console]::Out.Write('seed'); [Console]::Out.Flush(); $line = [Console]::In.ReadLine(); [Console]::Out.Write(\":$line\")"
+        } else {
+            "printf seed; read line; printf ':%s' \"$line\""
+        };
+        let started = service
+            .exec(
+                request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+                Duration::from_secs(1),
+                99,
+                || false,
+            )
+            .unwrap();
+        assert_eq!(started.status, "running");
+        assert_eq!(started.output, "seed");
+        assert_eq!(
+            explicit_page(&service, &started.session_id, 0, 2).output,
+            "se"
+        );
+        let invalid = service
+            .write_stdin_with_offset(
+                &started.session_id,
+                Some("wrong\n"),
+                Some(0),
+                Duration::ZERO,
+                99,
+                || false,
+            )
+            .unwrap_err();
+        assert_eq!(invalid.kind(), io::ErrorKind::InvalidInput);
+        let idle = service
+            .write_stdin(&started.session_id, None, Duration::ZERO, 99, || false)
+            .unwrap();
+        assert_eq!(idle.next_output_offset, 4);
+        assert!(idle.output.is_empty());
+        service
+            .write_stdin(
+                &started.session_id,
+                Some("hello\n"),
+                Duration::from_secs(2),
+                99,
+                || false,
+            )
+            .unwrap();
+        wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
+        let output = explicit_page(&service, &started.session_id, 0, 99);
+        assert_eq!(output.output, "seed:hello");
+        assert!(output.eof);
+    }
+
+    #[test]
+    fn recovered_running_output_is_interrupted_and_missing_archive_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("recover".to_string(), temp.path().join("tasks")).unwrap();
+        {
+            let store = crate::task_output::TaskOutputStore::for_tasks(&registry);
+            store
+                .register_shell("shell-recovered", "task-recovered", false, false)
+                .unwrap();
+            store
+                .append_stdout("task-recovered", "before-restart")
+                .unwrap();
+        }
+        let service = TerminalService::new(registry.clone());
+        let page = explicit_page(&service, "shell-recovered", 0, 99);
+        assert_eq!(page.status, "interrupted");
+        assert_eq!(page.termination, "interrupted");
+        assert!(page.eof);
+        assert_eq!(page.output, "before-restart");
+        assert_eq!(page.exit_code, None);
+        std::fs::remove_file(
+            registry
+                .output_storage_root()
+                .unwrap()
+                .unwrap()
+                .join("archive.sqlite3"),
+        )
+        .unwrap();
+        assert!(
+            service
+                .write_stdin_with_offset(
+                    "shell-recovered",
+                    None,
+                    Some(0),
+                    Duration::ZERO,
+                    99,
+                    || false
+                )
+                .is_err()
         );
     }
 

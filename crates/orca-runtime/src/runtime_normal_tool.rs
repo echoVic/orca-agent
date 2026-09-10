@@ -36,6 +36,8 @@ struct WriteStdinArgs {
     #[serde(default)]
     chars: Option<String>,
     #[serde(default)]
+    output_offset: Option<usize>,
+    #[serde(default)]
     yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
@@ -142,6 +144,12 @@ fn write_stdin(
     if args.session_id.trim().is_empty() {
         return ToolResult::invalid_input(&invocation.request, "session_id must not be empty");
     }
+    if args.output_offset.is_some() && args.chars.as_ref().is_some_and(|chars| !chars.is_empty()) {
+        return ToolResult::invalid_input(
+            &invocation.request,
+            "output_offset cannot be combined with nonempty chars",
+        );
+    }
     let Some(service) = invocation.terminal_service.as_ref() else {
         return ToolResult::failed_before_start(
             &invocation.request,
@@ -154,13 +162,24 @@ fn write_stdin(
     } else {
         DEFAULT_POLL_YIELD_TIME_MS
     };
-    let output = service.write_stdin(
-        &args.session_id,
-        args.chars.as_deref(),
-        yield_time(args.yield_time_ms, default_yield_time),
-        max_output_bytes(args.max_output_tokens),
-        || context.cancel.is_cancelled(),
-    );
+    let output = if args.output_offset.is_some() {
+        service.write_stdin_with_offset(
+            &args.session_id,
+            args.chars.as_deref(),
+            args.output_offset,
+            yield_time(args.yield_time_ms, default_yield_time),
+            max_output_bytes(args.max_output_tokens),
+            || context.cancel.is_cancelled(),
+        )
+    } else {
+        service.write_stdin(
+            &args.session_id,
+            args.chars.as_deref(),
+            yield_time(args.yield_time_ms, default_yield_time),
+            max_output_bytes(args.max_output_tokens),
+            || context.cancel.is_cancelled(),
+        )
+    };
     terminal_output_result(invocation, output)
 }
 
@@ -194,7 +213,7 @@ fn resolve_workdir(base: &Path, workdir: Option<&Path>) -> Result<PathBuf, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_workdir;
+    use super::{WriteStdinArgs, resolve_workdir};
 
     #[test]
     fn rejects_absolute_workdir_outside_base_workspace() {
@@ -207,6 +226,26 @@ mod tests {
         let result = resolve_workdir(&base, Some(&outside));
 
         assert!(result.is_err(), "outside workdir must be rejected");
+    }
+
+    #[test]
+    fn output_offset_deserialization_rejects_invalid_cursors() {
+        for cursor in ["-1", "1.5", "\"0\"", "18446744073709551616"] {
+            let raw = format!(r#"{{"session_id":"shell-one","output_offset":{cursor}}}"#);
+            assert!(
+                serde_json::from_str::<WriteStdinArgs>(&raw).is_err(),
+                "{raw}"
+            );
+        }
+        for cursor in [0, 1, 1_000_000] {
+            let args: WriteStdinArgs = serde_json::from_value(serde_json::json!({
+                "session_id": "shell-one", "output_offset": cursor,
+            }))
+            .unwrap();
+            assert_eq!(args.output_offset, Some(cursor));
+        }
+        let legacy: WriteStdinArgs = serde_json::from_str(r#"{"session_id":"shell-one"}"#).unwrap();
+        assert_eq!(legacy.output_offset, None);
     }
 }
 
