@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.27":
+        "Adds cache-aware context compaction, durable terminal output paging, file-defined Agents, shared ACP sessions, actionable sandbox and TUI diagnostics, and canonical DeepSeek-V4.1-Flash routing with compatibility aliases.",
       "v0.4.26":
         "Makes multimodal history durable with deduplicated image assets, 64 MiB records, streaming recovery, and opt-in archive retention. Adds per-model image capabilities, simplifies workspace trust setup, and keeps workflow progress and shutdown recovery consistent.",
       "v0.4.25":
@@ -664,6 +666,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.27":
+        "新增缓存感知上下文压缩、持久化终端输出分页、文件化 Agent、共享 ACP 会话、可操作的沙箱与 TUI 诊断，并将 DeepSeek-V4.1-Flash 统一为规范模型名，同时兼容旧名称。",
       "v0.4.26":
         "图片按内容寻址去重存储，单记录上限提升至 64 MiB，会话流式恢复不再受总大小限制，并提供独立归档清理策略。支持按模型配置图片能力，精简工作区信任设置，保持工作流进度与关闭恢复一致。",
       "v0.4.25":

@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.26";
+export const releaseVersion = "v0.4.27";
 
 export const releases = [
+  {
+    version: "v0.4.27",
+    date: "2026-09-10",
+    title: "DeepSeek-native agent workflows",
+    body: "Adds cache-aware context management, durable terminal output, file-defined Agents, shared ACP sessions, actionable sandbox and TUI diagnostics, and the canonical deepseek-flash model with compatibility aliases.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.27",
+  },
   {
     version: "v0.4.26",
     date: "2026-09-09",

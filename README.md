@@ -65,7 +65,7 @@ Development builds also provide opt-in [shared ACP sessions](docs/acp-daemon.md)
 on Unix (`orca daemon`, `orca attach`, and `orca acp-bridge`),
 [file-defined subagents](docs/subagents.md), and
 [persistent terminal output pages](docs/architecture/adr/0006-unified-exec-terminal-service.md).
-These additions are not part of the published v0.4.26 package.
+These additions are available in v0.4.27 and later.
 
 On Windows PowerShell, set the key with `$env:DEEPSEEK_API_KEY = "sk-..."`;
 the `orca` commands are the same.
