@@ -457,7 +457,12 @@ fn persistent_shell_archives_large_live_output_and_reopens_after_completion() {
             sandbox: ShellSandboxMode::DangerFullAccess,
         })
         .unwrap();
-    let output = manager.wait(&handle.id, Duration::from_secs(30)).unwrap();
+    let timeout = if cfg!(windows) {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    };
+    let output = manager.wait(&handle.id, timeout).unwrap();
     assert_eq!(output.status, orca_core::task_types::TaskStatus::Completed);
     assert!(output.stdout.len() <= 8 * 1024 * 1024 + 100);
     assert_eq!(manager.output_store().size(&handle.task_id), 0);

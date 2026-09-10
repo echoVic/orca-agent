@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn stores_are_session_scoped_and_write_failures_are_observable() {
+    fn stores_are_session_scoped_and_live_storage_tampering_is_safe() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("tasks");
         let one =
@@ -607,16 +607,26 @@ mod tests {
         let other = TaskOutputStore::for_tasks(&two);
         assert!(other.archived_shell("shell-one").is_err());
         assert!(other.read_delta("task-one", 0, 10).is_err());
-        std::fs::remove_file(
-            one.output_storage_root()
-                .unwrap()
-                .unwrap()
-                .join("archive.sqlite3"),
-        )
-        .unwrap();
-        assert!(store.append_stdout("task-one", "lost").is_err());
-        assert!(store.read_delta("task-one", 0, 10).is_err());
-        assert!(store.read_cached("task-one").is_err());
+        let database = one
+            .output_storage_root()
+            .unwrap()
+            .unwrap()
+            .join("archive.sqlite3");
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(database).unwrap();
+            assert!(store.append_stdout("task-one", "lost").is_err());
+            assert!(store.read_delta("task-one", 0, 10).is_err());
+            assert!(store.read_cached("task-one").is_err());
+        }
+        #[cfg(windows)]
+        {
+            assert!(std::fs::remove_file(database).is_err());
+            assert_eq!(
+                store.read_delta("task-one", 0, 10).unwrap().combined,
+                "secret"
+            );
+        }
     }
 
     #[test]

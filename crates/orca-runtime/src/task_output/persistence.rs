@@ -1148,6 +1148,7 @@ mod tests {
         std::process::exit(0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn archive_missing_database_is_not_an_empty_success() {
         let temp = tempfile::tempdir().unwrap();
@@ -1159,6 +1160,17 @@ mod tests {
             archive.read("task-one", 0, 10).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archive_database_cannot_be_removed_while_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("output");
+        let mut archive = archive(&root, ArchiveLimits::default());
+        register(&mut archive, "one");
+        assert!(fs::remove_file(root.join(DATABASE)).is_err());
+        assert_eq!(archive.read("task-one", 0, 10).unwrap().bytes_total, 0);
     }
 
     #[test]

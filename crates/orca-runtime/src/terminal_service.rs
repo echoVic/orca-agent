@@ -1385,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_running_output_is_interrupted_and_missing_archive_errors() {
+    fn recovered_running_output_is_interrupted_and_storage_tampering_is_safe() {
         let temp = tempfile::tempdir().unwrap();
         let registry =
             TaskRegistry::new_persistent("recover".to_string(), temp.path().join("tasks")).unwrap();
@@ -1405,26 +1405,35 @@ mod tests {
         assert!(page.eof);
         assert_eq!(page.output, "before-restart");
         assert_eq!(page.exit_code, None);
-        std::fs::remove_file(
-            registry
-                .output_storage_root()
-                .unwrap()
-                .unwrap()
-                .join("archive.sqlite3"),
-        )
-        .unwrap();
-        assert!(
-            service
-                .write_stdin_with_offset(
-                    "shell-recovered",
-                    None,
-                    Some(0),
-                    Duration::ZERO,
-                    99,
-                    || false
-                )
-                .is_err()
-        );
+        let database = registry
+            .output_storage_root()
+            .unwrap()
+            .unwrap()
+            .join("archive.sqlite3");
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(database).unwrap();
+            assert!(
+                service
+                    .write_stdin_with_offset(
+                        "shell-recovered",
+                        None,
+                        Some(0),
+                        Duration::ZERO,
+                        99,
+                        || false
+                    )
+                    .is_err()
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert!(std::fs::remove_file(database).is_err());
+            assert_eq!(
+                explicit_page(&service, "shell-recovered", 0, 99).output,
+                "before-restart"
+            );
+        }
     }
 
     fn wait_for_status(registry: &TaskRegistry, task_id: &str, expected: TaskStatus) {
