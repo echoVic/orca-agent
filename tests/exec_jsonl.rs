@@ -283,7 +283,9 @@ command = {}
 
 #[test]
 fn exec_auto_model_defaults_to_pro() {
+    let home = TempDir::new().expect("temporary ORCA_HOME");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", home.path())
         .args([
             "exec",
             "--output-format",
