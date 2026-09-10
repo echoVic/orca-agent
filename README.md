@@ -137,14 +137,17 @@ then defaults. Run `orca --help` or `orca exec --help` for the full command
 surface. User configuration lives at `~/.orca/config.toml`; trusted projects
 can also provide `.orca/config.toml`, `AGENTS.md`, rules, skills, and workflows.
 
-DeepSeek V4 thinking is enabled explicitly. Set `reasoning_effort` to `low`,
+DeepSeek thinking is enabled explicitly. Set `reasoning_effort` to `low`,
 `high`, or `max` (the default) in `config.toml`, or use
-`ORCA_REASONING_EFFORT`. `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`,
-and `deepseek-v4-pro` use a 1M-token context window and allow up to 384K output
-tokens. JPEG, PNG, GIF, and WebP inputs are accepted from ACP clients and the
-TUI with every model selection. The vision model consumes images directly;
-`auto`, Pro, and Flash use a task-aware vision analysis before continuing with
-the selected coding model. In the TUI, use `Ctrl+V` to attach the current
+`ORCA_REASONING_EFFORT`. `deepseek-flash` (DeepSeek-V4.1-Flash) and
+`deepseek-v4-pro` use a 1M-token context window and allow up to 384K output
+tokens. The retired `deepseek-v4-flash` and
+`deepseek-v4-flash-vision-exp` names remain accepted and normalize to
+`deepseek-flash`, including Flash pricing. JPEG, PNG, GIF, and WebP inputs are
+accepted from ACP clients and the TUI with every model selection. Explicit
+Flash selections consume images directly; `auto` and Pro use Flash for
+task-aware visual analysis before continuing with the selected coding model.
+In the TUI, use `Ctrl+V` to attach the current
 clipboard image (`Alt+V` is also available on Windows), drag or paste image
 paths and `file://` URLs, or select an image through `@file`. Each attachment
 appears as an atomic `[Image #N]` item that can be deleted, cleared, queued,

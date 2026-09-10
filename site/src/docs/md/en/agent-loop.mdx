@@ -82,8 +82,8 @@ Orca sends the assembled context to the DeepSeek API with:
 - **Temperature** — controls output randomness
 - **Reasoning effort** — thinking depth (`low`, `medium`, `high`)
 - **Tool schema** — the set of available tools (file edit, shell, grep, glob, etc.)
-- **Image blocks** — sent directly to `deepseek-v4-flash-vision-exp`, or
-  converted into task-aware visual context before `auto`, Pro, or Flash runs
+- **Image blocks** — sent directly to an explicit `deepseek-flash` selection,
+  or converted by Flash into task-aware visual context before `auto` or Pro runs
 
 The model responds with a stream of:
 - **Reasoning tokens** — internal chain-of-thought (not shown to user by default)

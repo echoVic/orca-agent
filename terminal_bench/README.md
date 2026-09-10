@@ -46,7 +46,7 @@ The API key is read from `~/.orca/auth.json` (`DEEPSEEK_API_KEY` field). Falls b
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ORCA_BASE_URL` | `https://api.deepseek.com` | API endpoint |
-| `ORCA_MODEL` | `deepseek-v4-flash` | Model to use |
+| `ORCA_MODEL` | `deepseek-flash` | Model to use |
 
 ## Why musl?
 

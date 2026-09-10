@@ -83,8 +83,8 @@ Orca 使用以下参数将组装好的上下文发送到 DeepSeek API：
 - **温度**——控制输出随机性
 - **推理努力**——思考深度（`low`、`medium`、`high`）
 - **工具模式**——可用工具集（文件编辑、Shell、grep、glob 等）
-- **图片块**——选择 `deepseek-v4-flash-vision-exp` 时直接发送；选择
-  `auto`、Pro 或 Flash 时先转换为与任务相关的视觉上下文
+- **图片块**——显式选择 `deepseek-flash` 时直接发送；选择 `auto` 或
+  Pro 时先由 Flash 转换为与任务相关的视觉上下文
 
 模型的响应流包括：
 - **推理 token**——内部链式思考（默认不向用户显示）

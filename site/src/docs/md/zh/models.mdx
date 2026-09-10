@@ -4,11 +4,17 @@
 
 ~~~bash
 orca --model deepseek-v4-pro "解释当前架构"
-orca exec --model deepseek-v4-flash "修复导入顺序" \
+orca exec --model deepseek-flash "修复导入顺序" \
   --verifier "cargo fmt --check"
 ~~~
 
 支持哪些模型名和 endpoint 行为取决于所选提供商。示例模型名不代表每个 endpoint 都支持它。启动任务前运行 orca doctor，检查本地实际生效的模型和 endpoint 配置。
+
+对于 DeepSeek，`deepseek-flash` 是规范的 Flash 预设，当前对应
+DeepSeek-V4.1-Flash，支持图像理解并采用 Flash 价格。旧名称
+`deepseek-v4-flash` 和 `deepseek-v4-flash-vision-exp` 仍可作为兼容
+输入，但 Orca 会在路由、持久化、缓存标识和成本估算前将二者归一化为
+`deepseek-flash`，交互式选择器不再将其展示为独立模型。
 
 ## 持久化选择
 
@@ -41,7 +47,7 @@ export ORCA_REASONING_EFFORT="high"
 
 ~~~bash
 orca exec \
-  --model deepseek-v4-flash \
+  --model deepseek-flash \
   --max-turns 15 \
   --max-cost-usd 2 \
   --verifier "cargo test -p parser" \

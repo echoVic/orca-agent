@@ -4,7 +4,7 @@ Select a provider model with --model for an interactive or headless run:
 
 ~~~bash
 orca --model deepseek-v4-pro "Explain the current architecture"
-orca exec --model deepseek-v4-flash "Fix the import ordering" \
+orca exec --model deepseek-flash "Fix the import ordering" \
   --verifier "cargo fmt --check"
 ~~~
 
@@ -12,6 +12,14 @@ The supported model names and endpoint behavior come from the selected
 provider. Do not treat an example model name as a promise that every endpoint
 supports it. Run orca doctor to inspect the effective local model and endpoint
 configuration before launching a task.
+
+For DeepSeek, `deepseek-flash` is the canonical Flash preset and currently
+targets DeepSeek-V4.1-Flash. It supports image understanding and uses the Flash
+price tier. The retired `deepseek-v4-flash` and
+`deepseek-v4-flash-vision-exp` names remain valid compatibility inputs, but
+Orca normalizes both to `deepseek-flash` before routing, persistence, cache
+identity, and cost estimation. They are not shown as separate models in the
+interactive selector.
 
 ## Persistent selection
 
@@ -49,7 +57,7 @@ verifier result. Execution budgets are separate from model selection:
 
 ~~~bash
 orca exec \
-  --model deepseek-v4-flash \
+  --model deepseek-flash \
   --max-turns 15 \
   --max-cost-usd 2 \
   --verifier "cargo test -p parser" \

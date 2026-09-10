@@ -101,12 +101,14 @@ Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
 或 `orca exec --help` 查看完整命令。用户配置位于 `~/.orca/config.toml`；
 受信任的项目还可以提供 `.orca/config.toml`、`AGENTS.md`、规则、Skills 和工作流。
 
-Orca 会显式开启 DeepSeek V4 思考模式。可以在 `config.toml` 中将
+Orca 会显式开启 DeepSeek 思考模式。可以在 `config.toml` 中将
 `reasoning_effort` 设为 `low`、`high` 或 `max`（默认），也可以使用
-`ORCA_REASONING_EFFORT`。`deepseek-v4-flash` 和 `deepseek-v4-pro` 均采用
-100 万 token 上下文，并允许最多 384K 输出 token。Orca 继续使用 Chat
-Completions，并按 DeepSeek 要求在工具调用轮次完整回传服务端返回的
-`reasoning_content`。
+`ORCA_REASONING_EFFORT`。`deepseek-flash`（DeepSeek-V4.1-Flash）和
+`deepseek-v4-pro` 均采用 100 万 token 上下文，并允许最多 384K 输出
+token。旧名称 `deepseek-v4-flash` 和 `deepseek-v4-flash-vision-exp`
+仍可作为兼容输入，Orca 会将其归一化为 `deepseek-flash`，并统一采用
+Flash 计费和图片能力。Orca 继续使用 Chat Completions，并按 DeepSeek
+要求在工具调用轮次完整回传服务端返回的 `reasoning_content`。
 
 更多文档：
 

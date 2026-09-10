@@ -19,7 +19,7 @@
 - ✅ 错误隔离和传播
 - ✅ TUI专用渲染
 - ✅ 支持批量并行执行（默认 `max_parallel = 6`）
-- ✅ 支持模型覆盖（`auto` / `deepseek-v4-flash` / `deepseek-v4-pro`）
+- ✅ 支持模型覆盖（`auto` / `deepseek-flash` / `deepseek-v4-pro`）
 - ✅ 支持 async 模式：headless/`exec` 使用 worker-backed 持久 task handle，TUI 使用 session-local handle
 - ✅ 支持 `subagent_status` 查询 current/persisted async 状态、结果、错误、生命周期时间戳和 usage
 - ✅ 支持 `isolation: "worktree"`，干净 worktree 自动清理，脏 worktree 保留供审查
@@ -198,7 +198,7 @@ pub enum SubagentStatus {
 **设计**:
 ```rust
 pub struct SubagentConfig {
-    pub model: Option<String>,      // "deepseek-v4-flash" | "deepseek-v4-pro"
+    pub model: Option<String>,      // "deepseek-flash" | "deepseek-v4-pro"
     pub max_turns: Option<u32>,     // 覆盖默认的128轮
     pub temperature: Option<f32>,   // 温度参数
 }
