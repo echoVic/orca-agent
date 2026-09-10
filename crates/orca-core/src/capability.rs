@@ -24,6 +24,67 @@ pub enum EnforcementState {
     Unavailable,
 }
 
+/// Diagnostic outcome of probing one concrete sandbox backend. Probe evidence
+/// is descriptive only and must never authorize a retry or capability grant.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxProbeStatus {
+    Available,
+    BackendMissing,
+    ProbeDenied,
+    ProbeFailed,
+    UnsupportedPlatform,
+}
+
+/// Bounded, serializable evidence from one sandbox backend probe.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxProbeEvidence {
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<PathBuf>,
+    pub status: SandboxProbeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_error: Option<String>,
+}
+
+impl SandboxProbeEvidence {
+    pub fn available(&self) -> bool {
+        self.status == SandboxProbeStatus::Available
+    }
+}
+
+/// One immutable platform decision supplied to the dependency-inverted
+/// execution broker by the concrete sandbox adapter.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxEnforcementDecision {
+    pub state: EnforcementState,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<SandboxProbeEvidence>,
+}
+
+impl SandboxEnforcementDecision {
+    pub fn new(
+        state: EnforcementState,
+        backend: impl Into<String>,
+        probes: Vec<SandboxProbeEvidence>,
+    ) -> Self {
+        Self {
+            state,
+            backend: backend.into(),
+            probes,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionProfile {
@@ -533,7 +594,8 @@ mod tests {
     use super::{
         CapabilityCeiling, CapabilityProcessClass, CapabilityReceipt, CapabilityRequest,
         CapabilitySet, EffectiveCapability, EnforcementState, ExecutionProfile,
-        SandboxDenialReceipt, SandboxDenialSource,
+        SandboxDenialReceipt, SandboxDenialSource, SandboxEnforcementDecision,
+        SandboxProbeEvidence, SandboxProbeStatus,
     };
     use crate::approval_types::ApprovalMode;
 
@@ -598,6 +660,29 @@ mod tests {
 
         assert_eq!(decoded, receipt);
         assert_eq!(decoded.source, SandboxDenialSource::Kernel);
+    }
+
+    #[test]
+    fn sandbox_probe_evidence_round_trips_without_becoming_authority() {
+        let decision = SandboxEnforcementDecision::new(
+            EnforcementState::Unavailable,
+            "seatbelt",
+            vec![SandboxProbeEvidence {
+                backend: "seatbelt".to_string(),
+                executable: Some("/usr/bin/sandbox-exec".into()),
+                status: SandboxProbeStatus::ProbeDenied,
+                exit_code: None,
+                signal: Some(6),
+                stderr: Some("bounded diagnostic".to_string()),
+                io_error: None,
+            }],
+        );
+
+        let encoded = serde_json::to_string(&decision).unwrap();
+        let decoded: SandboxEnforcementDecision = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, decision);
+        assert!(!encoded.contains("requestId"));
+        assert!(!encoded.contains("deniedPath"));
     }
 
     #[test]

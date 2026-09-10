@@ -72,7 +72,7 @@ fn run_with_timeout(command: &str, timeout: Duration) -> VerificationResult {
         .map_err(|error| match error {
             LaunchError::Cwd(error) => error,
             LaunchError::Spawn(error) => error,
-            LaunchError::EnforcementUnavailable
+            LaunchError::EnforcementUnavailable { .. }
             | LaunchError::EnforcementAdvisory
             | LaunchError::UntrustedProcessClass
             | LaunchError::CapabilityCeilingExceeded

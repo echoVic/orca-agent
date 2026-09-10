@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use orca_core::capability::EnforcementState;
+use orca_core::capability::{EnforcementState, SandboxEnforcementDecision};
 use orca_core::config::file::{self, ConfigOverrides, FileConfig};
 use orca_core::config::folder_trust::{self, TrustLevel};
 use orca_platform::host::HostPlatform;
@@ -343,19 +343,36 @@ fn check_sandbox(cwd: &Path) -> DiagnosticCheck {
     }
     #[cfg(not(windows))]
     let _ = cwd;
-    match orca_tools::sandbox::enforcement_state() {
-        EnforcementState::Enforced => {
-            pass_check("sandbox", "OS-enforced restricted backend available")
-        }
+    sandbox_check_from_decision(orca_tools::sandbox::enforcement_decision())
+}
+
+#[cfg(not(windows))]
+fn sandbox_check_from_decision(decision: SandboxEnforcementDecision) -> DiagnosticCheck {
+    match decision.state {
+        EnforcementState::Enforced => pass_check(
+            "sandbox",
+            format!(
+                "OS-enforced restricted backend available: {}",
+                decision.backend
+            ),
+        ),
         EnforcementState::Advisory => warn_check(
             "sandbox",
-            "restricted backend is advisory on this host",
+            format!(
+                "restricted backend is advisory on this host: {}",
+                decision.backend
+            ),
             Some("use a host with an OS-enforced sandbox for restricted runs"),
         ),
         EnforcementState::Unavailable => fail_check(
             "sandbox",
-            "no OS-enforced restricted backend is available",
-            Some("install/enable the platform sandbox backend before running restricted tools"),
+            orca_tools::sandbox::enforcement_unavailable_message(
+                &decision.backend,
+                &decision.probes,
+            ),
+            Some(&orca_tools::sandbox::enforcement_unavailable_remediation(
+                &decision.probes,
+            )),
         ),
     }
 }
@@ -402,6 +419,35 @@ fn fail_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unavailable_sandbox_check_includes_probe_evidence_and_trust_boundary() {
+        let decision = SandboxEnforcementDecision::new(
+            EnforcementState::Unavailable,
+            "seatbelt",
+            vec![orca_core::capability::SandboxProbeEvidence {
+                backend: "seatbelt".to_string(),
+                executable: Some("/usr/bin/sandbox-exec".into()),
+                status: orca_core::capability::SandboxProbeStatus::ProbeDenied,
+                exit_code: None,
+                signal: Some(6),
+                stderr: None,
+                io_error: None,
+            }],
+        );
+
+        let check = sandbox_check_from_decision(decision);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("backend=seatbelt"));
+        assert!(check.detail.contains("signal 6"));
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("/trust does not change that boundary"))
+        );
+    }
 
     #[test]
     fn report_serialization_redacts_credential_values() {

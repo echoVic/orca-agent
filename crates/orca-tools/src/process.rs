@@ -14,7 +14,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 
 use orca_core::capability::{
-    CapabilityProcessClass, CapabilityReceipt, CapabilitySet, EffectiveCapability, EnforcementState,
+    CapabilityProcessClass, CapabilityReceipt, CapabilitySet, EffectiveCapability,
+    EnforcementState, SandboxEnforcementDecision,
 };
 use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::retained_output::{
@@ -67,6 +68,44 @@ pub fn spawn_with_capability_profile(
 ) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
     let request_id = request_id.into();
     let broker = ExecutionBroker::with_backend(enforcement, backend).with_profile(profile);
+    spawn_with_broker(
+        command,
+        request_id,
+        cwd,
+        process_class,
+        capabilities,
+        broker,
+    )
+}
+
+pub fn spawn_with_enforcement_decision_profile(
+    command: Command,
+    request_id: impl Into<String>,
+    cwd: &Path,
+    process_class: CapabilityProcessClass,
+    capabilities: CapabilitySet,
+    decision: SandboxEnforcementDecision,
+    profile: orca_core::capability::ExecutionProfile,
+) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
+    let broker = ExecutionBroker::with_enforcement_decision(decision).with_profile(profile);
+    spawn_with_broker(
+        command,
+        request_id.into(),
+        cwd,
+        process_class,
+        capabilities,
+        broker,
+    )
+}
+
+fn spawn_with_broker(
+    command: Command,
+    request_id: String,
+    cwd: &Path,
+    process_class: CapabilityProcessClass,
+    capabilities: CapabilitySet,
+    broker: ExecutionBroker,
+) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
     let launched = if process_class == CapabilityProcessClass::UserTrustedIntegration {
         broker.launch_user_trusted(command, request_id, cwd.to_path_buf(), capabilities)
     } else {
@@ -94,9 +133,9 @@ pub fn spawn_with_capability_profile(
         .map_err(|error| match error {
             LaunchError::Cwd(error) => error,
             LaunchError::Spawn(error) => error,
-            LaunchError::EnforcementUnavailable => io::Error::new(
+            LaunchError::EnforcementUnavailable { backend, evidence } => io::Error::new(
                 io::ErrorKind::Unsupported,
-                "process sandbox enforcement is unavailable",
+                crate::sandbox::enforcement_unavailable_message(&backend, &evidence),
             ),
             LaunchError::EnforcementAdvisory => io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -634,9 +673,45 @@ fn finish_bounded_line<T, F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_core::capability::{SandboxProbeEvidence, SandboxProbeStatus};
     use orca_platform::host::{Architecture, HostPlatform, OperatingSystem};
     use orca_platform::shell::ShellResolver;
     use std::path::PathBuf;
+
+    #[test]
+    fn unavailable_sandbox_error_includes_backend_and_probe_reason() {
+        let cwd = tempfile::tempdir().unwrap();
+        let decision = SandboxEnforcementDecision::new(
+            EnforcementState::Unavailable,
+            "seatbelt",
+            vec![SandboxProbeEvidence {
+                backend: "seatbelt".to_string(),
+                executable: Some("/usr/bin/sandbox-exec".into()),
+                status: SandboxProbeStatus::ProbeDenied,
+                exit_code: Some(1),
+                signal: None,
+                stderr: Some("operation not permitted".to_string()),
+                io_error: None,
+            }],
+        );
+
+        let error = spawn_with_enforcement_decision_profile(
+            Command::new("true"),
+            "probe-message",
+            cwd.path(),
+            CapabilityProcessClass::SandboxedTool,
+            CapabilitySet::read_only(),
+            decision,
+            orca_core::capability::ExecutionProfile::Workspace,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(message.contains("backend=seatbelt"));
+        assert!(message.contains("seatbelt probe exited 1"));
+        assert!(message.contains("operation not permitted"));
+    }
 
     #[test]
     fn shell_command_uses_the_resolved_windows_dialect() {

@@ -23,9 +23,18 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
+use orca_core::capability::{
+    EnforcementState, SandboxEnforcementDecision, SandboxProbeEvidence, SandboxProbeStatus,
+};
+
 use crate::sandbox::bwrap::{
     LinuxReadScope, LinuxSandboxPolicy, build_bwrap_argv, effective_read_only_roots,
 };
+
+const BWRAP_BACKEND: &str = "bwrap";
+const LANDLOCK_BACKEND: &str = "landlock";
+const SECCOMP_BACKEND: &str = "seccomp";
+const LINUX_BACKEND_SET: &str = "bwrap+landlock+seccomp";
 
 /// Resolved, canonicalized sandbox request shared by both backends.
 pub(crate) struct LinuxSandboxRequest {
@@ -60,20 +69,84 @@ pub fn platform_default_read_roots() -> Vec<PathBuf> {
 /// Keep this result stable for the process so receipts do not change midway
 /// through a run.
 pub fn enforced_available(cwd: &Path) -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        if bwrap_enforced_available(cwd) {
-            return true;
-        }
+    enforcement_decision(cwd).state == EnforcementState::Enforced
+}
 
-        #[cfg(target_os = "linux")]
-        {
-            return linux_landlock::probe_landlock_supported().is_ok()
-                && linux_landlock::build_seccomp_filter(false).is_ok();
-        }
-        #[allow(unreachable_code)]
-        false
-    })
+pub fn enforcement_evidence(cwd: &Path) -> &'static [SandboxProbeEvidence] {
+    &enforcement_decision(cwd).probes
+}
+
+pub fn enforcement_decision(cwd: &Path) -> &'static SandboxEnforcementDecision {
+    static DECISION: OnceLock<SandboxEnforcementDecision> = OnceLock::new();
+    DECISION.get_or_init(|| probe_enforcement(cwd))
+}
+
+fn probe_enforcement(cwd: &Path) -> SandboxEnforcementDecision {
+    let bwrap = probe_bwrap(cwd);
+    if bwrap.available() {
+        return SandboxEnforcementDecision::new(
+            EnforcementState::Enforced,
+            BWRAP_BACKEND,
+            vec![bwrap],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let landlock = result_probe_evidence(
+            LANDLOCK_BACKEND,
+            linux_landlock::probe_landlock_supported().map_err(|error| error.to_string()),
+            SandboxProbeStatus::ProbeDenied,
+        );
+        let seccomp = result_probe_evidence(
+            SECCOMP_BACKEND,
+            linux_landlock::build_seccomp_filter(false)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            SandboxProbeStatus::ProbeFailed,
+        );
+        return fallback_enforcement_decision(bwrap, landlock, seccomp);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let unsupported = |backend: &str| SandboxProbeEvidence {
+            backend: backend.to_string(),
+            executable: None,
+            status: SandboxProbeStatus::UnsupportedPlatform,
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: None,
+        };
+        SandboxEnforcementDecision::new(
+            EnforcementState::Unavailable,
+            LINUX_BACKEND_SET,
+            vec![
+                bwrap,
+                unsupported(LANDLOCK_BACKEND),
+                unsupported(SECCOMP_BACKEND),
+            ],
+        )
+    }
+}
+
+fn fallback_enforcement_decision(
+    bwrap: SandboxProbeEvidence,
+    landlock: SandboxProbeEvidence,
+    seccomp: SandboxProbeEvidence,
+) -> SandboxEnforcementDecision {
+    let state = if landlock.available() && seccomp.available() {
+        EnforcementState::Enforced
+    } else {
+        EnforcementState::Unavailable
+    };
+    let backend = if state == EnforcementState::Enforced {
+        "landlock+seccomp"
+    } else {
+        LINUX_BACKEND_SET
+    };
+    SandboxEnforcementDecision::new(state, backend, vec![bwrap, landlock, seccomp])
 }
 
 /// Probe bubblewrap once and reuse the result for both capability reporting
@@ -81,33 +154,67 @@ pub fn enforced_available(cwd: &Path) -> bool {
 /// bwrap network/user-namespace setup from being reported as Landlock-ready
 /// while the launcher still chooses bwrap on the next request.
 fn bwrap_enforced_available(cwd: &Path) -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let Some(bwrap) = bwrap_path(cwd) else {
-            return false;
+    let decision = enforcement_decision(cwd);
+    decision.state == EnforcementState::Enforced && decision.backend == BWRAP_BACKEND
+}
+
+fn probe_bwrap(cwd: &Path) -> SandboxProbeEvidence {
+    let Some(bwrap) = bwrap_path(cwd) else {
+        return SandboxProbeEvidence {
+            backend: BWRAP_BACKEND.to_string(),
+            executable: Some(PathBuf::from("bwrap")),
+            status: SandboxProbeStatus::BackendMissing,
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: None,
         };
-        let request = LinuxSandboxRequest {
-            command: "true".to_string(),
-            policy: LinuxSandboxPolicy {
-                cwd: cwd.to_path_buf(),
-                read_scope: LinuxReadScope::Global,
-                readable_roots: Vec::new(),
-                writable_roots: Vec::new(),
-                metadata_protection_roots: Vec::new(),
-                metadata_writable_roots: Vec::new(),
-                read_only_roots: Vec::new(),
-                denied_roots: Vec::new(),
-                allowed_unix_socket_roots: Vec::new(),
-                network_access: false,
-            },
-            strict: true,
-        };
-        bwrap_command(bwrap, &request)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    })
+    };
+    let request = LinuxSandboxRequest {
+        command: "true".to_string(),
+        policy: LinuxSandboxPolicy {
+            cwd: cwd.to_path_buf(),
+            read_scope: LinuxReadScope::Global,
+            readable_roots: Vec::new(),
+            writable_roots: Vec::new(),
+            metadata_protection_roots: Vec::new(),
+            metadata_writable_roots: Vec::new(),
+            read_only_roots: Vec::new(),
+            denied_roots: Vec::new(),
+            allowed_unix_socket_roots: Vec::new(),
+            network_access: false,
+        },
+        strict: true,
+    };
+    let output = bwrap_command(bwrap.clone(), &request).output();
+    super::command_probe_evidence(BWRAP_BACKEND, Some(bwrap), output)
+}
+
+fn result_probe_evidence(
+    backend: &str,
+    result: Result<(), String>,
+    failure_status: SandboxProbeStatus,
+) -> SandboxProbeEvidence {
+    match result {
+        Ok(()) => SandboxProbeEvidence {
+            backend: backend.to_string(),
+            executable: None,
+            status: SandboxProbeStatus::Available,
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: None,
+        },
+        Err(error) => SandboxProbeEvidence {
+            backend: backend.to_string(),
+            executable: None,
+            status: failure_status,
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: Some(error),
+        },
+    }
 }
 
 /// Build a `Command` that runs `request.command` under the strongest available
@@ -558,6 +665,59 @@ mod linux_landlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn probe(backend: &str, status: SandboxProbeStatus) -> SandboxProbeEvidence {
+        SandboxProbeEvidence {
+            backend: backend.to_string(),
+            executable: None,
+            status,
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: None,
+        }
+    }
+
+    #[test]
+    fn fallback_decision_preserves_failed_bwrap_and_selects_landlock_seccomp() {
+        let decision = fallback_enforcement_decision(
+            probe(BWRAP_BACKEND, SandboxProbeStatus::BackendMissing),
+            probe(LANDLOCK_BACKEND, SandboxProbeStatus::Available),
+            probe(SECCOMP_BACKEND, SandboxProbeStatus::Available),
+        );
+
+        assert_eq!(decision.state, EnforcementState::Enforced);
+        assert_eq!(decision.backend, "landlock+seccomp");
+        assert_eq!(decision.probes.len(), 3);
+        assert_eq!(
+            decision.probes[0].status,
+            SandboxProbeStatus::BackendMissing
+        );
+    }
+
+    #[test]
+    fn fallback_decision_reports_each_failed_backend() {
+        let decision = fallback_enforcement_decision(
+            probe(BWRAP_BACKEND, SandboxProbeStatus::ProbeDenied),
+            probe(LANDLOCK_BACKEND, SandboxProbeStatus::ProbeDenied),
+            probe(SECCOMP_BACKEND, SandboxProbeStatus::ProbeFailed),
+        );
+
+        assert_eq!(decision.state, EnforcementState::Unavailable);
+        assert_eq!(decision.backend, LINUX_BACKEND_SET);
+        assert_eq!(
+            decision
+                .probes
+                .iter()
+                .map(|probe| probe.status)
+                .collect::<Vec<_>>(),
+            vec![
+                SandboxProbeStatus::ProbeDenied,
+                SandboxProbeStatus::ProbeDenied,
+                SandboxProbeStatus::ProbeFailed,
+            ]
+        );
+    }
 
     #[test]
     fn strict_mode_without_backend_fails_closed() {

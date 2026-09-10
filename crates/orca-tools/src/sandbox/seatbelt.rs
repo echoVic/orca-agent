@@ -1,12 +1,14 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
+
+use orca_core::capability::{EnforcementState, SandboxEnforcementDecision, SandboxProbeEvidence};
 
 use crate::sandbox::{ReadOnlySandboxCommandContext, WorkspaceWriteSandboxCommandContext};
 
 static SEATBELT_AVAILABLE: OnceLock<bool> = OnceLock::new();
-static SEATBELT_ENFORCED_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static SEATBELT_ENFORCEMENT: OnceLock<SandboxEnforcementDecision> = OnceLock::new();
 
 /// Absolute path to the macOS Seatbelt binary. Invoking it by absolute path
 /// (rather than resolving `sandbox-exec` via `PATH`) prevents a spoofed
@@ -265,19 +267,36 @@ pub fn available() -> bool {
 /// binary probe is insufficient in privileged/container runtimes where the
 /// kernel refuses to install a sandbox profile.
 pub fn enforced_available() -> bool {
-    *SEATBELT_ENFORCED_AVAILABLE.get_or_init(|| {
-        Command::new(SEATBELT_EXECUTABLE)
-            .arg("-p")
-            .arg(
-                "(version 1) (deny default) (allow process*) (allow sysctl-read) (allow file-read* (literal \"/dev/null\"))",
-            )
-            .arg("true")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    })
+    enforcement_decision().state == EnforcementState::Enforced
+}
+
+pub fn enforcement_evidence() -> &'static SandboxProbeEvidence {
+    enforcement_decision()
+        .probes
+        .first()
+        .expect("Seatbelt enforcement always records one probe")
+}
+
+pub fn enforcement_decision() -> &'static SandboxEnforcementDecision {
+    SEATBELT_ENFORCEMENT.get_or_init(|| probe_enforcement(Path::new(SEATBELT_EXECUTABLE)))
+}
+
+fn probe_enforcement(executable: &Path) -> SandboxEnforcementDecision {
+    let output = Command::new(executable)
+        .arg("-p")
+        .arg(
+            "(version 1) (deny default) (allow process*) (allow sysctl-read) (allow file-read* (literal \"/dev/null\"))",
+        )
+        .arg("true")
+        .output();
+    let evidence =
+        super::command_probe_evidence("seatbelt", Some(executable.to_path_buf()), output);
+    let state = if evidence.available() {
+        EnforcementState::Enforced
+    } else {
+        EnforcementState::Unavailable
+    };
+    SandboxEnforcementDecision::new(state, "seatbelt", vec![evidence])
 }
 
 pub fn platform_default_read_roots() -> Vec<PathBuf> {

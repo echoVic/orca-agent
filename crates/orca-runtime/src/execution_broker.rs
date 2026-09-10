@@ -29,7 +29,7 @@ mod tests {
         let error = broker
             .launch(Command::new("true"), capability)
             .expect_err("unavailable backend must reject launch");
-        assert!(matches!(error, LaunchError::EnforcementUnavailable));
+        assert!(matches!(error, LaunchError::EnforcementUnavailable { .. }));
     }
 
     #[test]

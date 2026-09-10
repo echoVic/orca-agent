@@ -506,10 +506,10 @@
       "windows-sandbox-plan"
     ],
     [
-      "sandbox-metadata-test-symlink",
+      "sandbox-unix-api",
       "crates/orca-tools/src/sandbox/mod.rs",
       "unix_std_api",
-      1,
+      2,
       "windows-sandbox-plan"
     ]
   ]

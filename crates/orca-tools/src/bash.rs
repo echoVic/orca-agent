@@ -203,14 +203,13 @@ fn execute_command_with_policy_or_cancel_with_profile(
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (child, process_job, _receipt) = match process::spawn_with_capability_profile(
+    let (child, process_job, _receipt) = match process::spawn_with_enforcement_decision_profile(
         process_command,
         format!("tool:bash:{}", request.id),
         cwd,
         orca_core::capability::CapabilityProcessClass::SandboxedTool,
         orca_core::capability::CapabilitySet::workspace_write(),
-        sandbox::enforcement_state(),
-        "tool-sandbox",
+        sandbox::enforcement_decision(),
         execution_profile,
     ) {
         Ok(spawned) => spawned,
@@ -411,14 +410,14 @@ pub fn execute_streaming_command_or_cancel(
         .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (mut child, process_job, _receipt) = match process::spawn_with_capability(
+    let (mut child, process_job, _receipt) = match process::spawn_with_enforcement_decision_profile(
         command,
         format!("tool:bash-stream:{}", request.id),
         cwd,
         orca_core::capability::CapabilityProcessClass::SandboxedTool,
         orca_core::capability::CapabilitySet::workspace_write(),
-        sandbox::enforcement_state(),
-        "tool-sandbox",
+        sandbox::enforcement_decision(),
+        orca_core::capability::ExecutionProfile::Workspace,
     ) {
         Ok(spawned) => spawned,
         Err(error) => {

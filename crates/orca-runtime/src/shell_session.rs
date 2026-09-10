@@ -27,7 +27,7 @@ use orca_windows_sandbox::{
 };
 use uuid::Uuid;
 
-use crate::execution_broker::ExecutionBroker;
+use crate::execution_broker::{ExecutionBroker, LaunchError};
 use crate::task_output::{TaskOutputRead, TaskOutputStore};
 use crate::tasks::TaskRegistry;
 use orca_core::capability::{
@@ -360,26 +360,33 @@ impl RuntimeShellSessionManager {
                 && !matches!(command.sandbox, ShellSandboxMode::DangerFullAccess);
             let capability =
                 shell_effective_capability(&command, &task.id, &metadata_writable_directories)?;
-            let enforcement = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
-                EnforcementState::Advisory
-            } else if cfg!(target_os = "windows") {
-                // The Windows branch below uses the native AppContainer/Job
-                // adapter rather than the generic command builder.
-                EnforcementState::Enforced
-            } else {
-                orca_tools::sandbox::enforcement_state()
-            };
             let execution_profile = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess)
             {
                 orca_core::capability::ExecutionProfile::TrustedHost
             } else {
                 orca_core::capability::ExecutionProfile::Workspace
             };
-            let broker = ExecutionBroker::with_backend_and_ceiling(
-                enforcement,
-                shell_backend_name(),
-                shell_capability_ceiling(&command, &metadata_writable_directories),
-            )
+            let ceiling = shell_capability_ceiling(&command, &metadata_writable_directories);
+            let broker = if matches!(command.sandbox, ShellSandboxMode::DangerFullAccess) {
+                ExecutionBroker::with_backend_and_ceiling(
+                    EnforcementState::Advisory,
+                    "trusted-host",
+                    ceiling,
+                )
+            } else if cfg!(target_os = "windows") {
+                // The Windows branch below uses the native AppContainer/Job
+                // adapter rather than the generic command builder.
+                ExecutionBroker::with_backend_and_ceiling(
+                    EnforcementState::Enforced,
+                    "windows-sandbox",
+                    ceiling,
+                )
+            } else {
+                ExecutionBroker::with_enforcement_decision_and_ceiling(
+                    orca_tools::sandbox::enforcement_decision(),
+                    ceiling,
+                )
+            }
             .with_profile(execution_profile);
 
             #[cfg(windows)]
@@ -1611,30 +1618,6 @@ fn configure_shell_stdio(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn shell_backend_name() -> &'static str {
-    "seatbelt"
-}
-
-#[cfg(target_os = "linux")]
-fn shell_backend_name() -> &'static str {
-    "bwrap+landlock+seccomp"
-}
-
-#[cfg(target_os = "windows")]
-fn shell_backend_name() -> &'static str {
-    "windows-sandbox"
-}
-
-#[cfg(all(
-    not(target_os = "macos"),
-    not(target_os = "linux"),
-    not(target_os = "windows")
-))]
-fn shell_backend_name() -> &'static str {
-    "platform-process"
-}
-
 fn shell_effective_capability(
     command: &ShellSessionCommand,
     request_id: &str,
@@ -1794,7 +1777,7 @@ fn spawn_configured_shell_with_broker(
     } else {
         broker.launch(process, capability)
     }
-    .map_err(|error| io::Error::other(format!("execution broker launch failed: {error:?}")))?;
+    .map_err(shell_launch_error)?;
     let receipt = launched.receipt.clone();
     let (child, process_job) = (launched.child, launched.process_job);
     let mut child = SpawnedShellChild::new(ShellChild::Process(child));
@@ -1807,6 +1790,16 @@ fn spawn_configured_shell_with_broker(
         stderr_reader,
         receipt,
     ))
+}
+
+fn shell_launch_error(error: LaunchError) -> io::Error {
+    match error {
+        LaunchError::EnforcementUnavailable { backend, evidence } => io::Error::other(format!(
+            "execution broker launch failed: {}",
+            orca_tools::sandbox::enforcement_unavailable_message(&backend, &evidence)
+        )),
+        error => io::Error::other(format!("execution broker launch failed: {error:?}")),
+    }
 }
 
 fn resolve_terminal_support(
@@ -2175,6 +2168,27 @@ mod tests {
     #[test]
     fn shell_spawn_surface_requires_execution_broker() {
         let _ = spawn_configured_shell_with_broker;
+    }
+
+    #[test]
+    fn unavailable_shell_launch_error_keeps_probe_evidence() {
+        let error = shell_launch_error(LaunchError::EnforcementUnavailable {
+            backend: "seatbelt".to_string(),
+            evidence: vec![orca_core::capability::SandboxProbeEvidence {
+                backend: "seatbelt".to_string(),
+                executable: Some("/usr/bin/sandbox-exec".into()),
+                status: orca_core::capability::SandboxProbeStatus::ProbeDenied,
+                exit_code: None,
+                signal: Some(6),
+                stderr: None,
+                io_error: None,
+            }],
+        });
+
+        let message = error.to_string();
+        assert!(message.contains("execution broker launch failed"));
+        assert!(message.contains("backend=seatbelt"));
+        assert!(message.contains("signal 6"));
     }
 
     #[test]

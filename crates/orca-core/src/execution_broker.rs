@@ -5,12 +5,16 @@ use std::process::{Child, Command};
 use crate::capability::{
     CapabilityCeiling, CapabilityProcessClass, CapabilityReceipt, EffectiveCapability,
     EnforcementState, ExecutionProfile, SandboxDenialReceipt, SandboxDenialSource,
+    SandboxEnforcementDecision, SandboxProbeEvidence,
 };
 use orca_platform::process::ProcessJob;
 
 #[derive(Debug)]
 pub enum LaunchError {
-    EnforcementUnavailable,
+    EnforcementUnavailable {
+        backend: String,
+        evidence: Vec<SandboxProbeEvidence>,
+    },
     EnforcementAdvisory,
     UntrustedProcessClass,
     CapabilityCeilingExceeded,
@@ -36,6 +40,7 @@ pub struct ExecutionBroker {
     enforcement: EnforcementState,
     profile: ExecutionProfile,
     backend: String,
+    enforcement_evidence: Vec<SandboxProbeEvidence>,
     ceiling: CapabilityCeiling,
 }
 
@@ -49,6 +54,7 @@ impl ExecutionBroker {
             enforcement,
             profile: ExecutionProfile::Workspace,
             backend: backend.into(),
+            enforcement_evidence: Vec::new(),
             ceiling: CapabilityCeiling::from(crate::capability::CapabilitySet::all()),
         }
     }
@@ -62,6 +68,30 @@ impl ExecutionBroker {
             enforcement,
             profile: ExecutionProfile::Workspace,
             backend: backend.into(),
+            enforcement_evidence: Vec::new(),
+            ceiling,
+        }
+    }
+
+    pub fn with_enforcement_decision(decision: SandboxEnforcementDecision) -> Self {
+        Self {
+            enforcement: decision.state,
+            profile: ExecutionProfile::Workspace,
+            backend: decision.backend,
+            enforcement_evidence: decision.probes,
+            ceiling: CapabilityCeiling::from(crate::capability::CapabilitySet::all()),
+        }
+    }
+
+    pub fn with_enforcement_decision_and_ceiling(
+        decision: SandboxEnforcementDecision,
+        ceiling: CapabilityCeiling,
+    ) -> Self {
+        Self {
+            enforcement: decision.state,
+            profile: ExecutionProfile::Workspace,
+            backend: decision.backend,
+            enforcement_evidence: decision.probes,
             ceiling,
         }
     }
@@ -201,7 +231,10 @@ impl ExecutionBroker {
             EnforcementState::Enforced => {}
             EnforcementState::Unavailable => {
                 if capability.process_class != CapabilityProcessClass::UserTrustedIntegration {
-                    return Err(LaunchError::EnforcementUnavailable);
+                    return Err(LaunchError::EnforcementUnavailable {
+                        backend: self.backend.clone(),
+                        evidence: self.enforcement_evidence.clone(),
+                    });
                 }
             }
             EnforcementState::Advisory => {
@@ -296,6 +329,7 @@ mod tests {
     use crate::capability::{
         CapabilityCeiling, CapabilityProcessClass, CapabilityRequest, CapabilitySet,
         EffectiveCapability, EnforcementState, ExecutionProfile, SandboxDenialSource,
+        SandboxEnforcementDecision, SandboxProbeEvidence, SandboxProbeStatus,
     };
 
     fn read_only_capability(id: &str) -> EffectiveCapability {
@@ -318,7 +352,41 @@ mod tests {
         let error = broker
             .launch(Command::new("true"), read_only_capability("broker-1"))
             .expect_err("unavailable backend must reject launch");
-        assert!(matches!(error, LaunchError::EnforcementUnavailable));
+        assert!(matches!(error, LaunchError::EnforcementUnavailable { .. }));
+    }
+
+    #[test]
+    fn unavailable_backend_error_preserves_injected_probe_evidence() {
+        let evidence = SandboxProbeEvidence {
+            backend: "seatbelt".to_string(),
+            executable: Some("/usr/bin/sandbox-exec".into()),
+            status: SandboxProbeStatus::ProbeDenied,
+            exit_code: None,
+            signal: Some(6),
+            stderr: None,
+            io_error: None,
+        };
+        let broker = ExecutionBroker::with_enforcement_decision(SandboxEnforcementDecision::new(
+            EnforcementState::Unavailable,
+            "seatbelt",
+            vec![evidence.clone()],
+        ));
+
+        let error = broker
+            .launch(
+                Command::new("true"),
+                read_only_capability("broker-evidence"),
+            )
+            .expect_err("unavailable backend must reject launch");
+        let LaunchError::EnforcementUnavailable {
+            backend,
+            evidence: actual,
+        } = error
+        else {
+            panic!("unexpected launch error: {error:?}");
+        };
+        assert_eq!(backend, "seatbelt");
+        assert_eq!(actual, vec![evidence]);
     }
 
     #[test]
@@ -330,7 +398,7 @@ mod tests {
                 Command::new("true"),
                 read_only_capability("workspace-unavailable")
             ),
-            Err(LaunchError::EnforcementUnavailable)
+            Err(LaunchError::EnforcementUnavailable { .. })
         ));
 
         let trusted = ExecutionBroker::new(EnforcementState::Unavailable)

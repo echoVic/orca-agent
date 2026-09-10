@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+
+use orca_core::capability::{
+    EnforcementState, SandboxEnforcementDecision, SandboxProbeEvidence, SandboxProbeStatus,
+};
 
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
@@ -13,6 +17,7 @@ pub mod bwrap;
 pub mod linux;
 
 const PROTECTED_METADATA_DIRS: [&str; 3] = [".git", ".agents", ".codex"];
+const MAX_PROBE_DIAGNOSTIC_BYTES: usize = 4096;
 
 pub fn is_protected_metadata_root(path: &Path) -> bool {
     path.file_name()
@@ -152,36 +157,304 @@ pub fn platform_default_read_roots() -> Vec<PathBuf> {
 /// non-dangerous profile on the current host. A command that cannot be
 /// enforced must be rejected by the broker instead of being mislabeled as a
 /// successful sandbox launch.
-pub fn enforcement_state() -> orca_core::capability::EnforcementState {
-    #[cfg(target_os = "macos")]
+pub fn enforcement_decision() -> SandboxEnforcementDecision {
+    platform_enforcement_decision()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_enforcement_decision() -> SandboxEnforcementDecision {
+    seatbelt::enforcement_decision().clone()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_enforcement_decision() -> SandboxEnforcementDecision {
+    linux::enforcement_decision(std::path::Path::new(".")).clone()
+}
+
+#[cfg(target_os = "windows")]
+fn platform_enforcement_decision() -> SandboxEnforcementDecision {
+    // The Windows runtime owns the AppContainer/Job launch path; these generic
+    // builders intentionally return an error command.
+    SandboxEnforcementDecision::new(
+        EnforcementState::Unavailable,
+        "windows-sandbox-adapter",
+        vec![SandboxProbeEvidence {
+            backend: "windows-sandbox-adapter".to_string(),
+            executable: None,
+            status: SandboxProbeStatus::UnsupportedPlatform,
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: None,
+        }],
+    )
+}
+
+#[cfg(all(
+    not(target_os = "macos"),
+    not(target_os = "linux"),
+    not(target_os = "windows")
+))]
+fn platform_enforcement_decision() -> SandboxEnforcementDecision {
+    SandboxEnforcementDecision::new(
+        EnforcementState::Unavailable,
+        "unsupported-platform",
+        vec![SandboxProbeEvidence {
+            backend: "unsupported-platform".to_string(),
+            executable: None,
+            status: SandboxProbeStatus::UnsupportedPlatform,
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: None,
+        }],
+    )
+}
+
+pub fn enforcement_state() -> EnforcementState {
+    enforcement_decision().state
+}
+
+pub fn enforcement_evidence() -> Vec<SandboxProbeEvidence> {
+    enforcement_decision().probes
+}
+
+pub fn enforcement_unavailable_message(backend: &str, evidence: &[SandboxProbeEvidence]) -> String {
+    let details = if evidence.is_empty() {
+        format!("{backend} did not provide probe evidence")
+    } else {
+        evidence
+            .iter()
+            .map(format_probe_evidence)
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    format!("no OS-enforced sandbox backend on this host: {details} (backend={backend})")
+}
+
+pub fn enforcement_unavailable_remediation(evidence: &[SandboxProbeEvidence]) -> String {
+    if evidence
+        .iter()
+        .any(|probe| probe.status == SandboxProbeStatus::BackendMissing)
     {
-        return if seatbelt::enforced_available() {
-            orca_core::capability::EnforcementState::Enforced
+        return "install or enable the missing platform sandbox backend; folder trust does not install sandbox support".to_string();
+    }
+    if evidence
+        .iter()
+        .any(|probe| probe.status == SandboxProbeStatus::ProbeDenied)
+    {
+        return "run Orca on a host that permits OS sandbox enforcement; a parent sandbox or container may forbid nested profiles, and /trust does not change that boundary".to_string();
+    }
+    if evidence
+        .iter()
+        .any(|probe| probe.status == SandboxProbeStatus::ProbeFailed)
+    {
+        return "inspect the backend executable and OS error; /trust only controls project configuration and cannot repair sandbox startup".to_string();
+    }
+    "use a platform with a supported OS sandbox backend; /trust does not enable kernel enforcement"
+        .to_string()
+}
+
+pub(crate) fn command_probe_evidence(
+    backend: impl Into<String>,
+    executable: Option<PathBuf>,
+    output: std::io::Result<Output>,
+) -> SandboxProbeEvidence {
+    let backend = backend.into();
+    match output {
+        Ok(output) => completed_probe_evidence(
+            backend,
+            executable,
+            output.status.success(),
+            output.status.code(),
+            exit_signal(&output.status),
+            &output.stderr,
+        ),
+        Err(error) => SandboxProbeEvidence {
+            backend,
+            executable,
+            status: if error.kind() == std::io::ErrorKind::NotFound {
+                SandboxProbeStatus::BackendMissing
+            } else {
+                SandboxProbeStatus::ProbeFailed
+            },
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: Some(error.to_string()),
+        },
+    }
+}
+
+fn completed_probe_evidence(
+    backend: String,
+    executable: Option<PathBuf>,
+    success: bool,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    stderr: &[u8],
+) -> SandboxProbeEvidence {
+    SandboxProbeEvidence {
+        backend,
+        executable,
+        status: if success {
+            SandboxProbeStatus::Available
         } else {
-            orca_core::capability::EnforcementState::Unavailable
+            SandboxProbeStatus::ProbeDenied
+        },
+        exit_code,
+        signal,
+        stderr: bounded_probe_text(stderr),
+        io_error: None,
+    }
+}
+
+fn format_probe_evidence(evidence: &SandboxProbeEvidence) -> String {
+    let executable = evidence
+        .executable
+        .as_deref()
+        .map(|path| format!(" at {}", path.display()))
+        .unwrap_or_default();
+    let mut detail = match evidence.status {
+        SandboxProbeStatus::Available => {
+            format!("{} probe succeeded{executable}", evidence.backend)
+        }
+        SandboxProbeStatus::BackendMissing => {
+            format!("{} backend is missing{executable}", evidence.backend)
+        }
+        SandboxProbeStatus::ProbeDenied => {
+            let termination = match (evidence.exit_code, evidence.signal) {
+                (Some(code), _) => format!("exited {code}"),
+                (None, Some(signal)) => format!("terminated by signal {signal}"),
+                (None, None) => "terminated unsuccessfully".to_string(),
+            };
+            format!("{} probe {termination}{executable}", evidence.backend)
+        }
+        SandboxProbeStatus::ProbeFailed => {
+            format!("{} probe could not start{executable}", evidence.backend)
+        }
+        SandboxProbeStatus::UnsupportedPlatform => {
+            format!("{} is unsupported on this platform", evidence.backend)
+        }
+    };
+    if let Some(stderr) = evidence.stderr.as_deref() {
+        detail.push_str(&format!(": {stderr}"));
+    } else if let Some(error) = evidence.io_error.as_deref() {
+        detail.push_str(&format!(": {error}"));
+    }
+    detail
+}
+
+fn bounded_probe_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let mut result = text
+        .chars()
+        .map(|character| {
+            if character.is_control() && !matches!(character, '\n' | '\t') {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if result.len() > MAX_PROBE_DIAGNOSTIC_BYTES {
+        let mut boundary = MAX_PROBE_DIAGNOSTIC_BYTES;
+        while !result.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        result.truncate(boundary);
+        result.push_str("...");
+    }
+    let result = result.trim().to_string();
+    (!result.is_empty()).then_some(result)
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(test)]
+mod enforcement_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_probe_preserves_backend_status_and_stderr() {
+        let evidence = completed_probe_evidence(
+            "seatbelt".to_string(),
+            Some(PathBuf::from("/usr/bin/sandbox-exec")),
+            false,
+            Some(7),
+            None,
+            b"profile rejected",
+        );
+
+        assert_eq!(evidence.status, SandboxProbeStatus::ProbeDenied);
+        assert_eq!(evidence.exit_code, Some(7));
+        assert_eq!(evidence.signal, None);
+        assert_eq!(evidence.stderr.as_deref(), Some("profile rejected"));
+        let message = enforcement_unavailable_message("seatbelt", std::slice::from_ref(&evidence));
+        assert!(message.contains("backend=seatbelt"));
+        assert!(message.contains("seatbelt probe exited 7"));
+        assert!(message.contains("profile rejected"));
+    }
+
+    #[test]
+    fn missing_probe_executable_has_a_distinct_reason() {
+        let evidence = command_probe_evidence(
+            "bwrap",
+            Some(PathBuf::from("bwrap")),
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
+        );
+
+        assert_eq!(evidence.status, SandboxProbeStatus::BackendMissing);
+        assert!(
+            enforcement_unavailable_remediation(std::slice::from_ref(&evidence))
+                .contains("folder trust does not install sandbox support")
+        );
+    }
+
+    #[test]
+    fn probe_start_failure_and_unsupported_platform_remain_distinct() {
+        let failed = command_probe_evidence(
+            "seatbelt",
+            Some(PathBuf::from("/usr/bin/sandbox-exec")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "launch blocked",
+            )),
+        );
+        assert_eq!(failed.status, SandboxProbeStatus::ProbeFailed);
+        assert_eq!(failed.io_error.as_deref(), Some("launch blocked"));
+
+        let unsupported = SandboxProbeEvidence {
+            backend: "platform-process".to_string(),
+            executable: None,
+            status: SandboxProbeStatus::UnsupportedPlatform,
+            exit_code: None,
+            signal: None,
+            stderr: None,
+            io_error: None,
         };
+        assert!(
+            enforcement_unavailable_message("platform-process", std::slice::from_ref(&unsupported))
+                .contains("unsupported on this platform")
+        );
     }
-    #[cfg(target_os = "linux")]
-    {
-        return if linux::enforced_available(std::path::Path::new(".")) {
-            orca_core::capability::EnforcementState::Enforced
-        } else {
-            orca_core::capability::EnforcementState::Unavailable
-        };
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // The Windows runtime owns the AppContainer/Job launch path; these
-        // generic builders intentionally return an error command.
-        return orca_core::capability::EnforcementState::Unavailable;
-    }
-    #[cfg(all(
-        not(target_os = "macos"),
-        not(target_os = "linux"),
-        not(target_os = "windows")
-    ))]
-    {
-        orca_core::capability::EnforcementState::Unavailable
+
+    #[test]
+    fn compatibility_state_matches_the_typed_decision() {
+        assert_eq!(enforcement_state(), enforcement_decision().state);
+        assert_eq!(enforcement_evidence(), enforcement_decision().probes);
     }
 }
 

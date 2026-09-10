@@ -1694,20 +1694,17 @@ fn command_capability_receipt(request: &JsonlCommandExecPermissionRequest) -> Va
             orca_core::capability::CapabilitySet::workspace_write(),
         ),
     };
-    let enforcement = match &request.options.sandbox_policy {
-        protocol::CommandSandboxPolicy::ExternalSandbox { .. } => "unavailable",
-        protocol::CommandSandboxPolicy::DangerFullAccess => "advisory",
-        _ => match orca_tools::sandbox::enforcement_state() {
-            orca_core::capability::EnforcementState::Enforced => "enforced",
-            orca_core::capability::EnforcementState::Advisory => "advisory",
-            orca_core::capability::EnforcementState::Unavailable => "unavailable",
-        },
+    let (enforcement, backend) = command_sandbox_enforcement(&request.options.sandbox_policy);
+    let enforcement = match enforcement {
+        orca_core::capability::EnforcementState::Enforced => "enforced",
+        orca_core::capability::EnforcementState::Advisory => "advisory",
+        orca_core::capability::EnforcementState::Unavailable => "unavailable",
     };
     json!({
         "requestId": &request.event_id,
         "processClass": "sandboxed-tool",
         "enforcement": enforcement,
-        "backend": "execution-broker",
+        "backend": backend,
         "capabilities": serde_json::to_value(capabilities).unwrap_or(Value::Null),
         "readRoots": &request.runtime_workspace_roots,
         "writeRoots": write_roots,
@@ -1716,6 +1713,35 @@ fn command_capability_receipt(request: &JsonlCommandExecPermissionRequest) -> Va
         "network": network,
         "networkTargets": [],
     })
+}
+
+fn command_sandbox_enforcement(
+    policy: &protocol::CommandSandboxPolicy,
+) -> (orca_core::capability::EnforcementState, String) {
+    match policy {
+        protocol::CommandSandboxPolicy::ExternalSandbox { .. } => (
+            orca_core::capability::EnforcementState::Unavailable,
+            "external-sandbox".to_string(),
+        ),
+        protocol::CommandSandboxPolicy::DangerFullAccess => (
+            orca_core::capability::EnforcementState::Advisory,
+            "trusted-host".to_string(),
+        ),
+        _ => {
+            #[cfg(windows)]
+            {
+                (
+                    orca_core::capability::EnforcementState::Enforced,
+                    "windows-sandbox".to_string(),
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                let decision = orca_tools::sandbox::enforcement_decision();
+                (decision.state, decision.backend)
+            }
+        }
+    }
 }
 
 fn append_sandbox_diagnostic_to_stderr(stderr: &mut String, diagnostic: &SandboxDenialDiagnostic) {
@@ -2714,6 +2740,45 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     const EOF_EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn command_sandbox_enforcement_reports_the_selected_backend() {
+        let (danger_state, danger_backend) =
+            command_sandbox_enforcement(&protocol::CommandSandboxPolicy::DangerFullAccess);
+        assert_eq!(
+            danger_state,
+            orca_core::capability::EnforcementState::Advisory
+        );
+        assert_eq!(danger_backend, "trusted-host");
+
+        let (external_state, external_backend) =
+            command_sandbox_enforcement(&protocol::CommandSandboxPolicy::ExternalSandbox {
+                network_access: protocol::NetworkAccess::Restricted,
+            });
+        assert_eq!(
+            external_state,
+            orca_core::capability::EnforcementState::Unavailable
+        );
+        assert_eq!(external_backend, "external-sandbox");
+
+        let (restricted_state, restricted_backend) =
+            command_sandbox_enforcement(&protocol::CommandSandboxPolicy::Default);
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                restricted_state,
+                orca_core::capability::EnforcementState::Enforced
+            );
+            assert_eq!(restricted_backend, "windows-sandbox");
+        }
+        #[cfg(not(windows))]
+        {
+            let decision = orca_tools::sandbox::enforcement_decision();
+            assert_eq!(restricted_state, decision.state);
+            assert_eq!(restricted_backend, decision.backend);
+            assert_ne!(restricted_backend, "execution-broker");
+        }
+    }
 
     fn emit_runtime_event<W: Write>(writer: &mut W, event: EventDraft) {
         let mut sink = EventSink::new(writer, OutputFormat::Jsonl);
