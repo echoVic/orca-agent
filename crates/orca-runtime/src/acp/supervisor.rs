@@ -189,6 +189,29 @@ where
     run_connection_inner(surface_host, config, reader, writer, None, None).await
 }
 
+pub(super) async fn run_shared_connection<R, W>(
+    surface_host: RuntimeSurfaceHostHandle,
+    config: RunConfig,
+    reader: R,
+    writer: W,
+    shared: super::shared::SharedSessions,
+) -> Result<(), RpcFacadeError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    run_connection_impl(
+        surface_host,
+        config,
+        reader,
+        writer,
+        None,
+        None,
+        Some(shared),
+    )
+    .await
+}
+
 async fn run_connection_inner<R, W>(
     surface_host: RuntimeSurfaceHostHandle,
     config: RunConfig,
@@ -196,6 +219,32 @@ async fn run_connection_inner<R, W>(
     writer: W,
     write_response_observer: Option<Arc<Notify>>,
     write_written_observer: Option<Arc<Notify>>,
+) -> Result<(), RpcFacadeError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    run_connection_impl(
+        surface_host,
+        config,
+        reader,
+        writer,
+        write_response_observer,
+        write_written_observer,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_connection_impl<R, W>(
+    surface_host: RuntimeSurfaceHostHandle,
+    config: RunConfig,
+    reader: R,
+    writer: W,
+    write_response_observer: Option<Arc<Notify>>,
+    write_written_observer: Option<Arc<Notify>>,
+    shared: Option<super::shared::SharedSessions>,
 ) -> Result<(), RpcFacadeError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -211,10 +260,12 @@ where
         terminal_observation_rx,
         terminal_cleanup_rx,
     ) = AcpClientBridge::new_with_capability_lanes();
-    let agent = Rc::new(
-        OrcaAcpAgent::new_supervised(surface_host, config, notification_tx)
-            .with_client_bridge(Arc::clone(&client_bridge)),
-    );
+    let mut agent = OrcaAcpAgent::new_supervised(surface_host, config, notification_tx)
+        .with_client_bridge(Arc::clone(&client_bridge));
+    if let Some(shared) = shared {
+        agent = agent.with_shared_sessions(shared);
+    }
+    let agent = Rc::new(agent);
     let facade_slot = Rc::new(RefCell::new(None::<RpcFacadeHandle>));
     let interaction_routes = Rc::new(InteractionRoutes::default());
     let read_text_file_routes = Rc::new(ReadTextFileRoutes::default());
@@ -477,6 +528,44 @@ fn handle_inbound(
                 };
                 Ok(response_completion(facade, request_id, result))
             }
+            "session/list" => {
+                let result = match decode::<agent_client_protocol::ListSessionsRequest>(params) {
+                    Ok(args) => Agent::list_sessions(agent.as_ref(), args).await,
+                    Err(error) => {
+                        Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
+                    }
+                };
+                Ok(response_completion(facade, request_id, result))
+            }
+            "session/set_model" => {
+                let result = match decode::<agent_client_protocol::SetSessionModelRequest>(params) {
+                    Ok(args) => Agent::set_session_model(agent.as_ref(), args).await,
+                    Err(error) => {
+                        Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
+                    }
+                };
+                Ok(response_completion(facade, request_id, result))
+            }
+            "session/set_mode" => {
+                let result = match decode::<agent_client_protocol::SetSessionModeRequest>(params) {
+                    Ok(args) => Agent::set_session_mode(agent.as_ref(), args).await,
+                    Err(error) => {
+                        Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
+                    }
+                };
+                Ok(response_completion(facade, request_id, result))
+            }
+            "session/set_config_option" => {
+                let result =
+                    match decode::<agent_client_protocol::SetSessionConfigOptionRequest>(params) {
+                        Ok(args) => Agent::set_session_config_option(agent.as_ref(), args).await,
+                        Err(error) => {
+                            Err(agent_client_protocol::Error::invalid_params()
+                                .data(error.to_string()))
+                        }
+                    };
+                Ok(response_completion(facade, request_id, result))
+            }
             "session/prompt" => {
                 let result = match decode::<PromptRequest>(params) {
                     Ok(args) => {
@@ -495,6 +584,19 @@ fn handle_inbound(
                         .data(format!("invalid ACP prompt: {error}"))),
                 };
                 match result {
+                    Ok(admitted) if agent.is_shared() => {
+                        // The daemon, not the transport's handler future, owns
+                        // completion. Dropping this wait must not drop the turn.
+                        let turn = tokio::task::spawn_local(async move {
+                            agent.complete_prompt(admitted).await
+                        });
+                        Ok(Box::pin(async move {
+                            let result = turn.await.unwrap_or_else(|error| {
+                                Err(agent_client_protocol::Error::into_internal_error(error))
+                            });
+                            let _ = send_response(&facade, request_id, result).await;
+                        }) as LocalHandlerCompletion)
+                    }
                     Ok(admitted) => Ok(Box::pin(async move {
                         let result = agent.complete_prompt(admitted).await;
                         let _ = send_response(&facade, request_id, result).await;
@@ -4136,6 +4238,362 @@ mod tests {
                 written_before_response,
                 "read request reached the client before WrittenAwaitingResponse was durable"
             );
+        });
+    }
+
+    #[test]
+    fn shared_connections_scope_read_text_file_responses_and_fail_closed() {
+        use crate::surface::{SurfaceCapabilityCallState, SurfaceEvent, ToolPatch};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Completion {
+            OwnerResponse,
+            Cancel,
+            Disconnect,
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async {
+            for completion in [
+                Completion::OwnerResponse,
+                Completion::Cancel,
+                Completion::Disconnect,
+            ] {
+                let (content_tx, content_rx) = std::sync::mpsc::sync_channel(1);
+                let host =
+                    RuntimeHost::start_with_executor(Arc::new(ReadTextFileExecutor { content_tx }))
+                        .unwrap();
+                let cwd = tempfile::tempdir().unwrap();
+                let config = test_config(cwd.path().canonicalize().unwrap());
+                let shared = super::super::shared::SharedSessions::default();
+                let (owner, server) = tokio::io::duplex(64 * 1024);
+                let (owner_read, mut owner_write) = tokio::io::split(owner);
+                let (server_read, server_write) = tokio::io::split(server);
+                let mut owner_connection = tokio::task::spawn_local(run_shared_connection(
+                    host.surface_handle(),
+                    config.clone(),
+                    server_read,
+                    server_write,
+                    shared.clone(),
+                ));
+                let mut owner_read = BufReader::new(owner_read);
+                let (observer, server) = tokio::io::duplex(64 * 1024);
+                let (observer_read, mut observer_write) = tokio::io::split(observer);
+                let (server_read, server_write) = tokio::io::split(server);
+                let mut observer_connection = tokio::task::spawn_local(run_shared_connection(
+                    host.surface_handle(),
+                    config.clone(),
+                    server_read,
+                    server_write,
+                    shared,
+                ));
+                let mut observer_read = BufReader::new(observer_read);
+                for writer in [&mut owner_write, &mut observer_write] {
+                    write_request(
+                        writer,
+                        1,
+                        "initialize",
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::new()
+                                .fs(FileSystemCapabilities::new().read_text_file(true))
+                                .meta(super::super::observer::metadata(json!({"version": 1}))),
+                        ),
+                    )
+                    .await;
+                }
+                for reader in [&mut owner_read, &mut observer_read] {
+                    let initialized = read_response(reader, 1).await;
+                    assert_eq!(initialized["result"]["protocolVersion"], 1);
+                }
+
+                // Session creation does not confer ownership of a later client's turn.
+                write_request(
+                    &mut observer_write,
+                    2,
+                    "session/new",
+                    NewSessionRequest::new(config.cwd.clone().unwrap()),
+                )
+                .await;
+                let created = read_response(&mut observer_read, 2).await;
+                let session_id = created["result"]["sessionId"]
+                    .as_str()
+                    .expect("shared session id")
+                    .to_string();
+                write_request(
+                    &mut owner_write,
+                    2,
+                    "session/load",
+                    LoadSessionRequest::new(
+                        SessionId::new(session_id.clone()),
+                        config.cwd.clone().unwrap(),
+                    ),
+                )
+                .await;
+                let loaded = read_response(&mut owner_read, 2).await;
+                assert!(loaded.get("result").is_some(), "{loaded}");
+                let transcript_path = crate::thread_store::find_session_path(&session_id, true)
+                    .unwrap()
+                    .expect("recording shared ACP session path");
+                let read_call_states = || {
+                    persisted_surface_events(&transcript_path)
+                        .into_iter()
+                        .filter_map(|event| match event {
+                            SurfaceEvent::Tool(ToolPatch::CapabilityCallChanged { call })
+                                if call.kind == SurfaceCapabilityCallKind::ReadTextFile =>
+                            {
+                                Some(call.state)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let assert_observer_frame = |frame: &Value| {
+                    assert_ne!(
+                        frame["method"], "fs/read_text_file",
+                        "{completion:?}: reverse request leaked to observer: {frame}"
+                    );
+                    assert_ne!(
+                        frame["id"], 3,
+                        "{completion:?}: prompt response leaked to observer: {frame}"
+                    );
+                };
+                write_request(
+                    &mut owner_write,
+                    3,
+                    "session/prompt",
+                    PromptRequest::new(
+                        SessionId::new(session_id.clone()),
+                        vec![ContentBlock::from("read notes".to_string())],
+                    ),
+                )
+                .await;
+                let read_request = loop {
+                    let frame = read_value(&mut owner_read).await;
+                    assert_ne!(
+                        frame["id"], 3,
+                        "prompt ended before reverse request: {frame}"
+                    );
+                    if frame["method"] == "fs/read_text_file" {
+                        break frame;
+                    }
+                };
+                assert_eq!(read_request["params"]["sessionId"], session_id);
+                assert_eq!(
+                    read_request["params"]["path"],
+                    test_absolute_path("orca-acp-notes.txt")
+                        .display()
+                        .to_string()
+                );
+                assert_eq!(read_request["params"]["line"], 2);
+                assert_eq!(read_request["params"]["limit"], 3);
+                let read_id = read_request["id"]
+                    .as_i64()
+                    .expect("numeric reverse request id");
+                write_raw_response(
+                    &mut observer_write,
+                    read_id,
+                    json!({"content": "spoofed observer content"}),
+                )
+                .await;
+
+                // Round-trip both connections before inspecting the outstanding runtime call.
+                write_request(
+                    &mut observer_write,
+                    4,
+                    "session/list",
+                    json!({"cwd": config.cwd}),
+                )
+                .await;
+                loop {
+                    let frame = read_value(&mut observer_read).await;
+                    assert_observer_frame(&frame);
+                    if frame["id"] == 4 {
+                        assert!(frame.get("result").is_some(), "{frame}");
+                        break;
+                    }
+                }
+                write_request(
+                    &mut owner_write,
+                    4,
+                    "session/list",
+                    json!({"cwd": config.cwd}),
+                )
+                .await;
+                loop {
+                    let frame = read_value(&mut owner_read).await;
+                    assert_ne!(
+                        frame["id"], 3,
+                        "observer completed the owner's prompt: {frame}"
+                    );
+                    if frame["id"] == 4 {
+                        assert!(frame.get("result").is_some(), "{frame}");
+                        break;
+                    }
+                }
+                assert_eq!(
+                    content_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "{completion:?}: observer supplied content to the runtime"
+                );
+                assert_eq!(
+                    read_call_states().last(),
+                    Some(&SurfaceCapabilityCallState::WrittenAwaitingResponse),
+                    "{completion:?}: observer settled the outstanding capability"
+                );
+
+                match completion {
+                    Completion::OwnerResponse => {
+                        write_raw_response(
+                            &mut owner_write,
+                            read_id,
+                            json!({"content": "owner-supplied content"}),
+                        )
+                        .await;
+                        let prompt = read_response(&mut owner_read, 3).await;
+                        assert_eq!(prompt["result"]["stopReason"], "end_turn", "{prompt}");
+                        assert_eq!(
+                            content_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
+                            "owner-supplied content"
+                        );
+                    }
+                    Completion::Cancel => {
+                        write_notification(
+                            &mut owner_write,
+                            "session/cancel",
+                            CancelNotification::new(SessionId::new(session_id.clone())),
+                        )
+                        .await;
+                        let prompt = read_response(&mut owner_read, 3).await;
+                        assert_eq!(prompt["result"]["stopReason"], "cancelled", "{prompt}");
+                        write_raw_response(
+                            &mut owner_write,
+                            read_id,
+                            json!({"content": "late owner content"}),
+                        )
+                        .await;
+                        write_request(
+                            &mut owner_write,
+                            5,
+                            "session/list",
+                            json!({"cwd": config.cwd}),
+                        )
+                        .await;
+                        let barrier = read_response(&mut owner_read, 5).await;
+                        assert!(barrier.get("result").is_some(), "{barrier}");
+                    }
+                    Completion::Disconnect => {}
+                }
+                owner_write.shutdown().await.unwrap();
+                drop(owner_write);
+                drop(owner_read);
+
+                let terminal = loop {
+                    let frame = read_value(&mut observer_read).await;
+                    assert_observer_frame(&frame);
+                    if frame["params"]["_meta"]["orca.dev/projection"]["phase"] == "terminal" {
+                        break frame;
+                    }
+                };
+                assert_eq!(terminal["params"]["sessionId"], session_id);
+                let outcome = &terminal["params"]["_meta"]["orca.dev/projection"];
+                match completion {
+                    Completion::OwnerResponse => assert_eq!(outcome["stopReason"], "end_turn"),
+                    Completion::Cancel => assert_eq!(outcome["stopReason"], "cancelled"),
+                    Completion::Disconnect => assert!(
+                        outcome["error"]
+                            .as_str()
+                            .is_some_and(|error| !error.is_empty()),
+                        "owner disconnect must fail the pending read: {terminal}"
+                    ),
+                }
+                write_raw_response(
+                    &mut observer_write,
+                    read_id,
+                    json!({"content": "late observer content"}),
+                )
+                .await;
+                write_request(
+                    &mut observer_write,
+                    5,
+                    "session/list",
+                    json!({"cwd": config.cwd}),
+                )
+                .await;
+                loop {
+                    let frame = read_value(&mut observer_read).await;
+                    assert_observer_frame(&frame);
+                    if frame["id"] == 5 {
+                        assert!(frame.get("result").is_some(), "{frame}");
+                        break;
+                    }
+                }
+                let states = read_call_states();
+                if matches!(completion, Completion::OwnerResponse) {
+                    assert!(matches!(
+                        states.last(),
+                        Some(SurfaceCapabilityCallState::Completed { .. })
+                    ));
+                } else {
+                    assert!(
+                        matches!(
+                            states.last(),
+                            Some(SurfaceCapabilityCallState::ObservationUnavailable { .. })
+                        ),
+                        "{completion:?}: {states:?}"
+                    );
+                    assert!(
+                        !states.iter().any(|state| matches!(
+                            state,
+                            SurfaceCapabilityCallState::Completed { .. }
+                        )),
+                        "{completion:?}: interrupted read accepted content"
+                    );
+                }
+                assert_eq!(
+                    content_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty),
+                    "{completion:?}: late response supplied content"
+                );
+                observer_write.shutdown().await.unwrap();
+                for (is_owner, connection) in [
+                    (true, &mut owner_connection),
+                    (false, &mut observer_connection),
+                ] {
+                    let result = tokio::time::timeout(TEST_TIMEOUT, &mut *connection).await;
+                    if result.is_err() {
+                        connection.abort();
+                        let _ = connection.await;
+                        panic!("{completion:?}: shared connection shutdown timed out");
+                    }
+                    let result = result
+                        .expect("bounded connection shutdown")
+                        .expect("shared connection task");
+                    if is_owner && matches!(completion, Completion::Disconnect) {
+                        assert!(
+                            matches!(
+                                result,
+                                Ok(())
+                                    | Err(RpcFacadeError::Write {
+                                        kind: io::ErrorKind::BrokenPipe,
+                                        ..
+                                    })
+                                    | Err(RpcFacadeError::Flush {
+                                        kind: io::ErrorKind::BrokenPipe,
+                                        ..
+                                    })
+                            ),
+                            "unexpected owner disconnect error: {result:?}"
+                        );
+                    } else {
+                        result.expect("clean shared connection");
+                    }
+                }
+                host.shutdown().unwrap();
+            }
         });
     }
 

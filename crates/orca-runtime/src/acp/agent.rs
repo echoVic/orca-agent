@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
@@ -67,6 +67,8 @@ pub(crate) const ORCA_ACP_MCP_ELICITATION_METHOD: &str = "orca.dev/session/reque
 pub(crate) enum AcpNotificationSender {
     Buffered(mpsc::Sender<SessionNotification>),
     Acknowledged(mpsc::Sender<AcpNotificationDelivery>),
+    Silent,
+    Standard(Box<AcpNotificationSender>),
 }
 
 pub(crate) struct AcpNotificationDelivery {
@@ -75,8 +77,14 @@ pub(crate) struct AcpNotificationDelivery {
 }
 
 impl AcpNotificationSender {
-    fn send(&self, notification: SessionNotification) -> Result<(), ()> {
+    pub(super) fn send(&self, notification: SessionNotification) -> Result<(), ()> {
         match self {
+            Self::Silent => Ok(()),
+            Self::Standard(sender) => {
+                let mut notification = notification;
+                notification.meta = None;
+                sender.send(notification)
+            }
             Self::Buffered(sender) => sender.blocking_send(notification).map_err(|_| ()),
             Self::Acknowledged(sender) => {
                 let (acknowledgement, receipt) = std_mpsc::sync_channel(1);
@@ -98,6 +106,8 @@ struct SessionEntry {
     surface: RuntimeSurfaceHandle,
     prompt_binding: Option<AcpPromptBinding>,
     next_prompt_seq: u64,
+    shared: Option<super::shared::SharedThread>,
+    _observer: Option<super::observer::Observer>,
 }
 
 enum AcpPromptBinding {
@@ -115,6 +125,7 @@ enum AcpPromptBinding {
 struct AgentState {
     sessions: HashMap<SessionId, SessionEntry>,
     client_capabilities: Option<AcpClientCapabilityProfile>,
+    projection_extension: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -279,6 +290,7 @@ pub struct OrcaAcpAgent {
     note_tx: AcpNotificationSender,
     state: Rc<RefCell<AgentState>>,
     client_bridge: Option<Arc<AcpClientBridge>>,
+    shared: Option<super::shared::SharedSessions>,
 }
 
 pub(crate) struct AcpClientBridge {
@@ -803,6 +815,7 @@ impl OrcaAcpAgent {
             note_tx: AcpNotificationSender::Buffered(note_tx),
             state: Rc::new(RefCell::new(AgentState::default())),
             client_bridge: None,
+            shared: None,
         }
     }
 
@@ -817,6 +830,7 @@ impl OrcaAcpAgent {
             note_tx: AcpNotificationSender::Acknowledged(note_tx),
             state: Rc::new(RefCell::new(AgentState::default())),
             client_bridge: None,
+            shared: None,
         }
     }
 
@@ -825,11 +839,25 @@ impl OrcaAcpAgent {
         self
     }
 
+    pub(super) fn with_shared_sessions(mut self, shared: super::shared::SharedSessions) -> Self {
+        self.shared = Some(shared);
+        self
+    }
+
+    pub(super) fn is_shared(&self) -> bool {
+        self.shared.is_some()
+    }
+
     pub(crate) fn prompt_queue(
         &self,
         session_id: &SessionId,
         action: crate::prompt_queue::PromptQueueAction,
     ) -> Result<crate::prompt_queue::PromptQueueSnapshot, Error> {
+        if self.is_shared() {
+            return Err(
+                Error::method_not_found().data("queue control is unavailable on daemon ACP")
+            );
+        }
         let state = self.state.borrow();
         let entry = state
             .sessions
@@ -850,6 +878,14 @@ impl OrcaAcpAgent {
         mcp_servers: Vec<McpServer>,
         additional_directories: Vec<PathBuf>,
     ) -> Result<RunConfig, String> {
+        if self.is_shared() {
+            super::shared::validate_workspace(&self.base_config, &cwd)?;
+            if !mcp_servers.is_empty() || !additional_directories.is_empty() {
+                return Err(
+                    "daemon attachments cannot supply MCP servers or additional roots".into(),
+                );
+            }
+        }
         let mut config = build_acp_session_config(
             self.base_config.clone(),
             cwd,
@@ -870,7 +906,7 @@ impl OrcaAcpAgent {
     ) -> Result<AdmittedAcpPrompt, Error> {
         let client_capabilities = self.negotiated_client_capabilities()?;
         let ready = Rc::new(Notify::new());
-        let (surface, inbound_seq) = {
+        let (surface, inbound_seq, lease) = {
             let mut state = self.state.borrow_mut();
             let entry = state
                 .sessions
@@ -879,6 +915,11 @@ impl OrcaAcpAgent {
             if entry.prompt_binding.is_some() {
                 return Err(Error::invalid_params().data("session already has an active prompt"));
             }
+            let lease = entry
+                .shared
+                .as_ref()
+                .map(|shared| super::shared::TurnLease::acquire(&shared.busy))
+                .transpose()?;
             let sequence = match inbound_seq {
                 Some(sequence) => sequence,
                 None => {
@@ -893,7 +934,7 @@ impl OrcaAcpAgent {
             entry.prompt_binding = Some(AcpPromptBinding::Decoded {
                 ready: ready.clone(),
             });
-            (entry.surface.clone(), sequence)
+            (entry.surface.clone(), sequence, lease)
         };
         if let Some(bridge) = self.client_bridge.as_ref() {
             bridge.begin_session(&args.session_id);
@@ -908,14 +949,16 @@ impl OrcaAcpAgent {
         let session_id = args.session_id.clone();
         let client_bridge = self.client_bridge.clone();
         let prepared = match tokio::task::spawn_blocking(move || {
-            prepare_surface_prompt(
+            let mut prepared = prepare_surface_prompt(
                 &surface,
                 &session_id,
                 input,
                 inbound_seq,
                 client_capabilities,
                 client_bridge,
-            )
+            )?;
+            prepared._turn_lease = lease;
+            Ok::<_, AcpPromptPrepareError>(prepared)
         })
         .await
         {
@@ -954,8 +997,24 @@ impl OrcaAcpAgent {
         &self,
         admitted: AdmittedAcpPrompt,
     ) -> Result<PromptResponse, Error> {
-        let note_tx = self.note_tx.clone();
+        let note_tx = if self.is_shared() {
+            AcpNotificationSender::Silent
+        } else {
+            self.note_tx.clone()
+        };
         let session_id = admitted.session_id.clone();
+        let operation_id = admitted.prepared.operation_id.clone();
+        let delivery = self
+            .state
+            .borrow()
+            .sessions
+            .get(&session_id)
+            .and_then(|entry| {
+                entry
+                    ._observer
+                    .as_ref()
+                    .map(super::observer::Observer::delivery)
+            });
         let result = tokio::task::spawn_blocking(move || {
             drain_surface_prompt(admitted.prepared, session_id, note_tx)
         })
@@ -965,6 +1024,9 @@ impl OrcaAcpAgent {
         let result = result
             .map_err(Error::into_internal_error)?
             .map_err(|message| Error::internal_error().data(message))?;
+        if let Some(delivery) = delivery {
+            delivery.wait_terminal(&operation_id).await?;
+        }
         Ok(PromptResponse::new(result))
     }
 
@@ -983,6 +1045,79 @@ impl OrcaAcpAgent {
             }
         }
         ready.notify_waiters();
+    }
+
+    async fn open_shared_session(
+        &self,
+        config: RunConfig,
+        selector: Option<String>,
+    ) -> Result<SessionId, Error> {
+        if self.state.borrow().sessions.len() >= 4 {
+            return Err(Error::invalid_request().data("ACP connection attachment limit reached"));
+        }
+        let (id, shared, surface) = self
+            .shared
+            .as_ref()
+            .expect("shared agent")
+            .open(self.surface_host.clone(), config, selector)
+            .await?;
+        let session_id = SessionId::new(id);
+        if self.state.borrow().sessions.contains_key(&session_id) {
+            return Err(
+                Error::invalid_request().data("session already attached; reconnect to reload")
+            );
+        }
+        let observer = super::observer::Observer::start(
+            surface.clone(),
+            session_id.clone(),
+            if self.state.borrow().projection_extension {
+                self.note_tx.clone()
+            } else {
+                AcpNotificationSender::Standard(Box::new(self.note_tx.clone()))
+            },
+            self.base_config.approval_mode,
+        )
+        .await?;
+        self.state.borrow_mut().sessions.insert(
+            session_id.clone(),
+            SessionEntry {
+                thread: shared.thread.clone(),
+                surface,
+                prompt_binding: None,
+                next_prompt_seq: 1,
+                shared: Some(shared),
+                _observer: Some(observer),
+            },
+        );
+        Ok(session_id)
+    }
+
+    async fn session_settings(
+        &self,
+        id: &SessionId,
+        patch: Option<crate::surface::RuntimeSettingsPatch>,
+    ) -> Result<crate::surface::SurfaceRuntimeSettings, Error> {
+        self.negotiated_client_capabilities()?;
+        let (surface, lease) = {
+            let state = self.state.borrow();
+            let entry = state.sessions.get(id).ok_or_else(Error::invalid_params)?;
+            let lease = if patch.is_some() {
+                let shared = entry.shared.as_ref().ok_or_else(Error::method_not_found)?;
+                Some(super::shared::TurnLease::acquire(&shared.busy)?)
+            } else {
+                None
+            };
+            (entry.surface.clone(), lease)
+        };
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            if let Some(patch) = patch {
+                super::settings::change(&surface, Some(patch))?;
+            }
+            super::settings::read(&surface)
+        })
+        .await
+        .map_err(Error::into_internal_error)?
     }
 }
 
@@ -1167,10 +1302,11 @@ struct PreparedSurfacePrompt {
     client_bridge: Option<Arc<AcpClientBridge>>,
     tool_outputs: HashMap<String, ToolOutputAccumulator>,
     detached: bool,
+    _turn_lease: Option<super::shared::TurnLease>,
 }
 
 #[derive(Default)]
-struct ToolOutputAccumulator {
+pub(super) struct ToolOutputAccumulator {
     text: String,
     next_offset: u64,
 }
@@ -1409,7 +1545,21 @@ fn replay_surface_snapshot(
         }
     };
     let cleanup = SurfaceAttachmentGuard::new(surface, attachment.client.clone());
-    for item in attachment.baseline.snapshot.items.iter() {
+    replay_snapshot(
+        &attachment.baseline.snapshot,
+        session_id,
+        &AcpNotificationSender::Standard(Box::new(note_tx.clone())),
+    );
+    drop(cleanup);
+    Ok(())
+}
+
+pub(super) fn replay_snapshot(
+    snapshot: &crate::runtime_surface::SurfaceSnapshot,
+    session_id: &SessionId,
+    note_tx: &AcpNotificationSender,
+) {
+    for item in snapshot.items.iter() {
         let update = match item {
             SurfaceItem::UserMessage { input, .. } => replay_user_update(input),
             SurfaceItem::AssistantMessage { text, .. } => Some(SessionUpdate::AgentMessageChunk(
@@ -1427,17 +1577,26 @@ fn replay_surface_snapshot(
             SurfaceItem::SystemMessage { .. } => None,
         };
         if let Some(update) = update {
-            let _ = note_tx.send(SessionNotification::new(session_id.clone(), update));
+            let _ = note_tx.send(
+                SessionNotification::new(session_id.clone(), update)
+                    .meta(super::observer::item_meta(item, 0)),
+            );
+        }
+        if let SurfaceItem::UserMessage {
+            id,
+            input: crate::surface::SurfaceUserInputState::Resolved { fact },
+            ..
+        } = item
+        {
+            let _ = super::observer::emit_user_images(note_tx, session_id, id.as_str(), fact);
         }
     }
-    let known_tool_ids = attachment
-        .baseline
-        .snapshot
+    let known_tool_ids = snapshot
         .tools
         .iter()
         .map(|tool| tool.request.tool_call_id.clone())
         .collect::<HashSet<_>>();
-    for tool in attachment.baseline.snapshot.tools.iter() {
+    for tool in snapshot.tools.iter() {
         let call = ToolCall::new(
             ToolCallId::new(tool.request.tool_call_id.as_str().to_string()),
             tool_call_title(&tool.request),
@@ -1480,7 +1639,7 @@ fn replay_surface_snapshot(
             ));
         }
     }
-    for item in attachment.baseline.snapshot.items.iter() {
+    for item in snapshot.items.iter() {
         let SurfaceItem::ToolResultMessage {
             tool_call_id,
             content,
@@ -1506,9 +1665,7 @@ fn replay_surface_snapshot(
         ));
     }
     let plan = Plan::new(
-        attachment
-            .baseline
-            .snapshot
+        snapshot
             .plan
             .items
             .iter()
@@ -1533,11 +1690,9 @@ fn replay_surface_snapshot(
         session_id.clone(),
         SessionUpdate::Plan(plan),
     ));
-    cleanup.disarm();
-    Ok(())
 }
 
-fn replay_user_update(
+pub(super) fn replay_user_update(
     input: &crate::runtime_surface::SurfaceUserInputState,
 ) -> Option<SessionUpdate> {
     let text = match input {
@@ -1789,6 +1944,7 @@ fn prepare_surface_prompt(
         client_bridge,
         tool_outputs: HashMap::new(),
         detached: false,
+        _turn_lease: None,
     })
 }
 
@@ -2405,7 +2561,7 @@ fn reconcile_operation_snapshot(
     }
 }
 
-fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<StopReason, String> {
+pub(super) fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<StopReason, String> {
     match terminal {
         OperationTerminal::Succeeded { .. } => Ok(StopReason::EndTurn),
         OperationTerminal::Cancelled { .. } => Ok(StopReason::Cancelled),
@@ -2442,7 +2598,7 @@ fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<StopReason, S
     }
 }
 
-fn emit_surface_event(
+pub(super) fn emit_surface_event(
     session_id: &SessionId,
     note_tx: &AcpNotificationSender,
     event: &SurfaceEvent,
@@ -2644,22 +2800,35 @@ impl Agent for OrcaAcpAgent {
             }
             state.client_capabilities =
                 Some(AcpClientCapabilityProfile::from(&args.client_capabilities));
+            state.projection_extension = self.is_shared()
+                && args
+                    .client_capabilities
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get(super::observer::PROJECTION_META))
+                    .is_some_and(|value| value["version"].as_u64() == Some(1));
         }
-        Ok(
-            InitializeResponse::new(ProtocolVersion::V1)
-                .agent_capabilities(
-                    AgentCapabilities::new()
-                        .load_session(true)
-                        .mcp_capabilities(McpCapabilities::new().sse(true))
-                        .session_capabilities(SessionCapabilities::new().additional_directories(
-                            SessionAdditionalDirectoriesCapabilities::new(),
-                        )),
-                )
-                .agent_info(
-                    Implementation::new("orca", self.base_config.app_version.clone())
-                        .title("Orca".to_string()),
-                ),
-        )
+        let mut session_capabilities =
+            SessionCapabilities::new().list(agent_client_protocol::SessionListCapabilities::new());
+        if !self.is_shared() {
+            session_capabilities = session_capabilities
+                .additional_directories(SessionAdditionalDirectoriesCapabilities::new());
+        }
+        Ok(InitializeResponse::new(ProtocolVersion::V1)
+            .agent_capabilities(
+                AgentCapabilities::new()
+                    .load_session(true)
+                    .mcp_capabilities(McpCapabilities::new().sse(true))
+                    .session_capabilities(session_capabilities),
+            )
+            .meta(
+                self.is_shared()
+                    .then(|| super::observer::metadata(serde_json::json!({"version": 1}))),
+            )
+            .agent_info(
+                Implementation::new("orca", self.base_config.app_version.clone())
+                    .title("Orca".to_string()),
+            ))
     }
 
     async fn authenticate(
@@ -2674,6 +2843,20 @@ impl Agent for OrcaAcpAgent {
         let config = self
             .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
             .map_err(|message| Error::invalid_params().data(message))?;
+        if self.is_shared() {
+            let id = self.open_shared_session(config, None).await?;
+            let settings = self.session_settings(&id, None).await?;
+            return Ok(NewSessionResponse::new(id)
+                .models(super::settings::models(&settings))
+                .modes(super::settings::modes(
+                    &settings,
+                    self.base_config.approval_mode,
+                ))
+                .config_options(super::settings::options(
+                    &settings,
+                    self.base_config.approval_mode,
+                )));
+        }
         let surface_host = self.surface_host.clone();
         let thread =
             tokio::task::spawn_blocking(move || surface_host.start_thread(config, "ACP session"))
@@ -2696,6 +2879,8 @@ impl Agent for OrcaAcpAgent {
                 surface,
                 prompt_binding: None,
                 next_prompt_seq: 1,
+                shared: None,
+                _observer: None,
             },
         );
         Ok(NewSessionResponse::new(session_id))
@@ -2710,6 +2895,20 @@ impl Agent for OrcaAcpAgent {
         let config = self
             .build_session_config(args.cwd, args.mcp_servers, args.additional_directories)
             .map_err(|message| Error::invalid_params().data(message))?;
+        if self.is_shared() {
+            let id = self.open_shared_session(config, Some(selector)).await?;
+            let settings = self.session_settings(&id, None).await?;
+            return Ok(LoadSessionResponse::new()
+                .models(super::settings::models(&settings))
+                .modes(super::settings::modes(
+                    &settings,
+                    self.base_config.approval_mode,
+                ))
+                .config_options(super::settings::options(
+                    &settings,
+                    self.base_config.approval_mode,
+                )));
+        }
         let surface_host = self.surface_host.clone();
         let thread = tokio::task::spawn_blocking(move || {
             surface_host.load_recorded_thread(config, "ACP session", &selector)
@@ -2744,6 +2943,8 @@ impl Agent for OrcaAcpAgent {
                 surface,
                 prompt_binding: None,
                 next_prompt_seq: 1,
+                shared: None,
+                _observer: None,
             },
         );
         Ok(LoadSessionResponse::new())
@@ -2752,6 +2953,120 @@ impl Agent for OrcaAcpAgent {
     async fn prompt(&self, args: PromptRequest) -> Result<PromptResponse, Error> {
         let admitted = self.admit_prompt(args, None).await?;
         self.complete_prompt(admitted).await
+    }
+
+    async fn set_session_model(
+        &self,
+        args: agent_client_protocol::SetSessionModelRequest,
+    ) -> Result<agent_client_protocol::SetSessionModelResponse, Error> {
+        let model = args.model_id.to_string();
+        orca_core::model::validate_model(&model)
+            .map_err(|message| Error::invalid_params().data(message))?;
+        self.session_settings(
+            &args.session_id,
+            Some(crate::surface::RuntimeSettingsPatch::SetModel {
+                model: NonEmptyText::try_new(model).map_err(Error::into_internal_error)?,
+            }),
+        )
+        .await?;
+        Ok(agent_client_protocol::SetSessionModelResponse::new())
+    }
+
+    async fn set_session_mode(
+        &self,
+        args: agent_client_protocol::SetSessionModeRequest,
+    ) -> Result<agent_client_protocol::SetSessionModeResponse, Error> {
+        let patch =
+            super::settings::mode_patch(&args.mode_id.to_string(), self.base_config.approval_mode)?;
+        self.session_settings(&args.session_id, Some(patch)).await?;
+        Ok(agent_client_protocol::SetSessionModeResponse::new())
+    }
+
+    async fn set_session_config_option(
+        &self,
+        args: agent_client_protocol::SetSessionConfigOptionRequest,
+    ) -> Result<agent_client_protocol::SetSessionConfigOptionResponse, Error> {
+        let agent_client_protocol::SessionConfigOptionValue::ValueId { value } = args.value else {
+            return Err(Error::invalid_params().data("setting requires a select value"));
+        };
+        let value = value.to_string();
+        let patch = match args.config_id.to_string().as_str() {
+            "model" => {
+                orca_core::model::validate_model(&value)
+                    .map_err(|message| Error::invalid_params().data(message))?;
+                crate::surface::RuntimeSettingsPatch::SetModel {
+                    model: NonEmptyText::try_new(value).map_err(Error::into_internal_error)?,
+                }
+            }
+            "mode" => super::settings::mode_patch(&value, self.base_config.approval_mode)?,
+            "reasoning" => crate::surface::RuntimeSettingsPatch::SetReasoning {
+                effort: match value.as_str() {
+                    "low" => crate::surface::SurfaceReasoningEffort::Low,
+                    "high" => crate::surface::SurfaceReasoningEffort::High,
+                    "max" => crate::surface::SurfaceReasoningEffort::Max,
+                    _ => return Err(Error::invalid_params().data("unknown reasoning effort")),
+                },
+            },
+            _ => return Err(Error::invalid_params().data("unknown config option")),
+        };
+        let settings = self.session_settings(&args.session_id, Some(patch)).await?;
+        Ok(agent_client_protocol::SetSessionConfigOptionResponse::new(
+            super::settings::options(&settings, self.base_config.approval_mode),
+        ))
+    }
+
+    async fn list_sessions(
+        &self,
+        args: agent_client_protocol::ListSessionsRequest,
+    ) -> Result<agent_client_protocol::ListSessionsResponse, Error> {
+        self.negotiated_client_capabilities()?;
+        let cwd = args.cwd.or_else(|| {
+            self.is_shared()
+                .then(|| self.base_config.cwd.clone())
+                .flatten()
+        });
+        if self.is_shared() {
+            super::shared::validate_workspace(
+                &self.base_config,
+                cwd.as_deref().ok_or_else(Error::invalid_params)?,
+            )
+            .map_err(|message| Error::invalid_params().data(message))?;
+        }
+        if !args.additional_directories.is_empty() {
+            return Err(
+                Error::invalid_params().data("additional directory filtering is unsupported")
+            );
+        }
+        let offset = args
+            .cursor
+            .as_deref()
+            .map(str::parse::<usize>)
+            .transpose()
+            .map_err(|_| Error::invalid_params().data("invalid session list cursor"))?
+            .unwrap_or(0);
+        let page = tokio::task::spawn_blocking(move || {
+            RuntimeSurfaceHostHandle::list_saved_session_page(offset, 100, None)
+        })
+        .await
+        .map_err(Error::into_internal_error)?
+        .map_err(Error::into_internal_error)?;
+        let sessions = page
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                cwd.as_ref()
+                    .is_none_or(|cwd| Path::new(&session.cwd) == cwd)
+            })
+            .map(|session| {
+                agent_client_protocol::SessionInfo::new(
+                    SessionId::new(session.session_id),
+                    PathBuf::from(session.cwd),
+                )
+                .title(session.title)
+            })
+            .collect();
+        Ok(agent_client_protocol::ListSessionsResponse::new(sessions)
+            .next_cursor(page.next_offset.map(|offset| offset.to_string())))
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {

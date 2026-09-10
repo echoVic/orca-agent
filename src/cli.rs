@@ -68,9 +68,47 @@ enum Command {
     Workflow(WorkflowArgs),
     /// Inspect or update folder trust.
     Trust(TrustArgs),
+    /// Serve shared ACP sessions on a restricted local socket (Unix).
+    Daemon(DaemonArgs),
+    /// Bridge standard ACP stdio to a running local daemon (Unix).
+    AcpBridge(AcpBridgeArgs),
+    /// Attach the TUI or a headless prompt to a daemon-owned session (Unix).
+    Attach(AttachArgs),
     /// Execute a persisted async subagent task.
     #[command(hide = true)]
     SubagentWorker(SubagentWorkerArgs),
+}
+
+#[derive(Debug, Parser)]
+struct DaemonArgs {
+    /// Local Unix socket; defaults to ORCA_HOME/acp/daemon.sock.
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    /// The only workspace accepted by this daemon.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AcpBridgeArgs {
+    /// Local Unix socket; defaults to ORCA_HOME/acp/daemon.sock.
+    #[arg(long)]
+    socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AttachArgs {
+    /// Exact session ID, or 'new' to create a daemon-owned session.
+    session: String,
+    /// Local Unix socket; defaults to ORCA_HOME/acp/daemon.sock.
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    /// Workspace, which must match the daemon.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Run a non-interactive prompt instead of opening the TUI; permission requests are denied.
+    #[arg(long = "exec", value_name = "PROMPT")]
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -650,6 +688,74 @@ pub fn run() -> i32 {
     }
 
     match cli.command {
+        Some(Command::AcpBridge(args)) => local_result(
+            resolve_socket(args.socket)
+                .and_then(|socket| orca_runtime::acp::daemon::bridge(&socket)),
+        ),
+        Some(Command::Daemon(args)) => {
+            let config = orca_runtime::command::launch::prepare_interactive(
+                orca_runtime::command::launch::InteractiveLaunchRequest {
+                    app_version: env!("CARGO_PKG_VERSION").into(),
+                    resume: None,
+                    fork: None,
+                    continue_latest: false,
+                    session_picker: false,
+                    cwd: args.cwd.or(cli.cwd),
+                    model: cli.model,
+                    mode: cli.mode,
+                    api_key: cli.api_key,
+                    base_url: cli.base_url,
+                    provider: cli.provider,
+                    prompt: Vec::new(),
+                },
+            );
+            local_result(config.map_err(std::io::Error::other).and_then(|config| {
+                resolve_socket(args.socket)
+                    .and_then(|socket| orca_runtime::acp::daemon::run(config, socket))
+            }))
+        }
+        Some(Command::Attach(args)) => {
+            let cwd = args
+                .cwd
+                .or(cli.cwd)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let cwd = match cwd.canonicalize() {
+                Ok(cwd) => cwd,
+                Err(error) => return local_result(Err(error)),
+            };
+            let socket = match resolve_socket(args.socket) {
+                Ok(socket) => socket,
+                Err(error) => return local_result(Err(error)),
+            };
+            if let Some(prompt) = args.prompt {
+                return local_result(orca_runtime::acp::client::run_headless(
+                    &socket,
+                    &cwd,
+                    &args.session,
+                    prompt,
+                ));
+            }
+            let config = orca_runtime::command::launch::prepare_interactive(
+                orca_runtime::command::launch::InteractiveLaunchRequest {
+                    app_version: env!("CARGO_PKG_VERSION").into(),
+                    resume: None,
+                    fork: None,
+                    continue_latest: false,
+                    session_picker: false,
+                    cwd: Some(cwd),
+                    model: cli.model,
+                    mode: None,
+                    api_key: None,
+                    base_url: None,
+                    provider: cli.provider,
+                    prompt: Vec::new(),
+                },
+            );
+            match config {
+                Ok(config) => orca_tui::cli::run_attached(config, socket, args.session),
+                Err(error) => local_result(Err(std::io::Error::other(error))),
+            }
+        }
         Some(Command::Storage(args)) => {
             let policy = orca_runtime::thread_store::SessionRetentionPolicy {
                 max_bytes: args.max_bytes,
@@ -731,6 +837,22 @@ pub fn run() -> i32 {
                     1
                 }
             }
+        }
+    }
+}
+
+fn resolve_socket(socket: Option<PathBuf>) -> std::io::Result<PathBuf> {
+    socket
+        .map(Ok)
+        .unwrap_or_else(orca_runtime::acp::daemon::default_socket_path)
+}
+
+fn local_result(result: std::io::Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("orca: {error}");
+            1
         }
     }
 }

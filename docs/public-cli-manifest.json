@@ -3,7 +3,7 @@
   "package": "@blade-ai/orca",
   "website": "https://orcaagent.dev",
   "commands": {
-    "root": ["doctor", "storage", "exec", "workflow", "trust"],
+    "root": ["doctor", "storage", "exec", "workflow", "trust", "daemon", "acp-bridge", "attach"],
     "doctor": {
       "options": ["--cwd", "--format"],
       "subcommands": []
@@ -51,6 +51,18 @@
     },
     "trust": {
       "options": ["--cwd"],
+      "subcommands": []
+    },
+    "daemon": {
+      "options": ["--socket", "--cwd"],
+      "subcommands": []
+    },
+    "acp-bridge": {
+      "options": ["--socket"],
+      "subcommands": []
+    },
+    "attach": {
+      "options": ["--socket", "--cwd", "--exec"],
       "subcommands": []
     }
   }

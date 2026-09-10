@@ -73,6 +73,16 @@ assert.deepEqual(parseRuntimeSurfacePublicExports("pub use host::RuntimeHost;"),
   host: ["RuntimeHost"],
 });
 assert.deepEqual(
+  parseRuntimeSurfacePublicExports("pub use commands::{SurfaceCommand, AdmissionOutput};"),
+  { commands: ["AdmissionOutput", "SurfaceCommand"] },
+  "export inventory is independent of Rust import formatting",
+);
+expectFailure(
+  "normalizing export order must not hide duplicate identifiers",
+  () => parseRuntimeSurfacePublicExports("pub use host::{RuntimeHost, RuntimeHost};"),
+  /duplicate/,
+);
+assert.deepEqual(
   parseSurfaceFacadeExports(
     "pub mod surface { pub use crate::runtime_surface::{SurfaceCursor, SurfaceEvent}; }",
   ),

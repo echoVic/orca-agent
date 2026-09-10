@@ -157,6 +157,13 @@ impl AppState {
                 self.session_picker_phase = SessionPickerPhase::Browsing;
                 self.set_status(AppStatus::SessionPicker);
             }
+            TuiEvent::AcpTranscriptSynced { messages } => {
+                self.replace_messages(messages);
+                self.transcript.finalized_count = self.transcript.messages.len();
+            }
+            TuiEvent::AcpMetricsUpdated(metrics) => {
+                self.surface_metrics.apply_acp_metrics(metrics);
+            }
             TuiEvent::HistoryLoaded {
                 messages,
                 plan,

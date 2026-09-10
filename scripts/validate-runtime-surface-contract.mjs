@@ -1193,6 +1193,10 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
 const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
+  ["crates/orca-tui/src/acp_client.rs:text:self.indices.insert", 1],
+  ["crates/orca-tui/src/acp_client.rs:image:self.indices.insert", 1],
+  ["crates/orca-tui/src/acp_client.rs:request_permission:self.pending.borrow_mut().insert", 1],
+  ["crates/orca-tui/src/acp_client.rs:run:client.respond", 1],
   ["crates/orca-tui/src/hosted_child.rs:return_to_parent:child_focus.event_bridge.stop", 1],
   ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],
@@ -3046,7 +3050,7 @@ export function parseRuntimeSurfacePublicExports(source) {
       }
     }
     assertUnique(names, `runtime-surface ${moduleName} public exports`);
-    exportsByModule[moduleName] = names;
+    exportsByModule[moduleName] = names.sort();
   }
   return exportsByModule;
 }

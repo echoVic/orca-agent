@@ -3488,6 +3488,7 @@ impl RuntimeThreadHandle {
                 surface::SurfaceCapability::ReadSnapshot,
                 surface::SurfaceCapability::SubmitOperation,
                 surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageThreadSettings,
                 surface::SurfaceCapability::RespondGrantedInteraction,
                 surface::SurfaceCapability::RepairThread,
             ]))

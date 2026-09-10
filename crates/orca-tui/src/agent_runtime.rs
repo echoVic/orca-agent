@@ -11,12 +11,42 @@ use crate::protocol::{TuiEvent, UserAction};
 
 pub(crate) struct TuiAgentRuntime {
     controller: TuiSurfaceTaskControl,
-    dispatcher: TuiActionDispatcher,
+    dispatcher: Option<TuiActionDispatcher>,
     agent: Option<JoinHandle<()>>,
     host: Option<RuntimeHost>,
+    remote_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    remote_ack_rx: Option<Receiver<InteractionResponseAck>>,
 }
 
 impl TuiAgentRuntime {
+    pub(crate) fn spawn_acp(
+        options: crate::acp_client::AttachOptions,
+        cwd: std::path::PathBuf,
+        actions: Receiver<UserAction>,
+        events: Sender<TuiEvent>,
+    ) -> io::Result<Self> {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let remote_stop = stop.clone();
+        let (acks, remote_ack_rx) = crossbeam_channel::bounded(256);
+        let agent = thread::Builder::new()
+            .name("orca-tui-acp".into())
+            .spawn(move || {
+                if let Err(error) =
+                    crate::acp_client::run(options, cwd, actions, events.clone(), acks, stop)
+                {
+                    let _ = events.send(TuiEvent::Error(error.to_string()));
+                }
+            })?;
+        Ok(Self {
+            controller: TuiSurfaceTaskControl::new(),
+            dispatcher: None,
+            agent: Some(agent),
+            host: None,
+            remote_stop: Some(remote_stop),
+            remote_ack_rx: Some(remote_ack_rx),
+        })
+    }
+
     pub(crate) fn spawn_hosted(
         action_rx: Receiver<UserAction>,
         event_tx: Sender<TuiEvent>,
@@ -71,9 +101,11 @@ impl TuiAgentRuntime {
         };
         Ok(Self {
             controller: control,
-            dispatcher,
+            dispatcher: Some(dispatcher),
             agent: Some(agent),
             host: Some(host),
+            remote_stop: None,
+            remote_ack_rx: None,
         })
     }
 
@@ -83,12 +115,25 @@ impl TuiAgentRuntime {
     }
 
     pub(crate) fn interaction_ack_receiver(&self) -> Receiver<InteractionResponseAck> {
-        self.dispatcher.interaction_ack_receiver()
+        if let Some(receiver) = &self.remote_ack_rx {
+            receiver.clone()
+        } else {
+            self.dispatcher
+                .as_ref()
+                .expect("hosted dispatcher")
+                .interaction_ack_receiver()
+        }
     }
 
     pub(crate) fn shutdown(&mut self) -> io::Result<()> {
+        if let Some(stop) = &self.remote_stop {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        }
         let Some(agent) = self.agent.take() else {
-            let dispatcher_result = self.dispatcher.shutdown();
+            let dispatcher_result = self
+                .dispatcher
+                .as_mut()
+                .map_or(Ok(()), TuiActionDispatcher::shutdown);
             let host_result = self
                 .host
                 .take()
@@ -97,7 +142,10 @@ impl TuiAgentRuntime {
             return dispatcher_result.and(host_result);
         };
         self.controller.shutdown();
-        let dispatcher_result = self.dispatcher.shutdown();
+        let dispatcher_result = self
+            .dispatcher
+            .as_mut()
+            .map_or(Ok(()), TuiActionDispatcher::shutdown);
 
         let agent_result = agent
             .join()

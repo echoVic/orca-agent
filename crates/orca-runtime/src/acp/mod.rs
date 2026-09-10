@@ -4,12 +4,18 @@
 //! runtime-owned typed surface used by the TUI.
 
 mod agent;
+pub mod client;
+pub mod daemon;
+mod observer;
 #[allow(dead_code)]
 pub(crate) mod rpc_facade;
+mod settings;
+mod shared;
 mod supervisor;
 mod transport;
 
 pub use agent::OrcaAcpAgent;
+pub use observer::PROJECTION_META;
 
 use orca_core::config::RunConfig;
 

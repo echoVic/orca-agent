@@ -126,7 +126,18 @@ use crate::workspace_config::{mention_search_roots, syntax_workspace_root};
 use crate::workspace_status;
 
 pub fn run_tui(config: RunConfig) -> i32 {
-    match run_tui_inner(config) {
+    run_tui_backend(config, None)
+}
+
+pub(crate) fn run_tui_attached(
+    config: RunConfig,
+    options: crate::acp_client::AttachOptions,
+) -> i32 {
+    run_tui_backend(config, Some(options))
+}
+
+fn run_tui_backend(config: RunConfig, remote: Option<crate::acp_client::AttachOptions>) -> i32 {
+    match run_tui_inner(config, remote) {
         Ok(exit) => {
             if let Some(hint) = exit_resume_hint(exit.session_id.as_deref()) {
                 let _ = io::stdout().lock().write_all(hint.as_bytes());
@@ -140,7 +151,10 @@ pub fn run_tui(config: RunConfig) -> i32 {
     }
 }
 
-fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
+fn run_tui_inner(
+    mut config: RunConfig,
+    remote: Option<crate::acp_client::AttachOptions>,
+) -> io::Result<TuiExit> {
     let pending_terminal_session =
         PendingTerminalSession::start(config.theme, config.terminal_notifications)?;
 
@@ -170,7 +184,7 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let first_run_error = first_run_result.err().map(|error| error.to_string());
     let needs_disclosure =
         first_run_error.is_some() || first_run.as_ref().is_none_or(|state| !state.acknowledged);
-    let needs_setup = config.api_key.is_none() || needs_disclosure;
+    let needs_setup = remote.is_none() && (config.api_key.is_none() || needs_disclosure);
     let should_show_picker = config.show_session_picker
         && !needs_setup
         && config.prompt.trim().is_empty()
@@ -233,23 +247,28 @@ fn run_tui_inner(mut config: RunConfig) -> io::Result<TuiExit> {
     let agent_workflow_notifications = pending_workflow_notifications.clone();
     let agent_controller = TuiSurfaceTaskControl::new();
 
-    let mut agent_runtime = match TuiAgentRuntime::spawn_hosted(
-        action_rx,
-        event_tx.clone(),
-        MAX_SUPERVISED_TUI_TASKS,
-        agent_controller,
-        move |agent_controller, command_rx, host| {
-            hosted_tui_controller_loop(
-                agent_config,
-                agent_preloaded,
-                agent_event_tx,
-                command_rx,
-                agent_controller,
-                agent_workflow_notifications,
-                host,
-            );
-        },
-    ) {
+    let runtime = if let Some(remote) = remote {
+        TuiAgentRuntime::spawn_acp(remote, workspace_root.clone(), action_rx, event_tx.clone())
+    } else {
+        TuiAgentRuntime::spawn_hosted(
+            action_rx,
+            event_tx.clone(),
+            MAX_SUPERVISED_TUI_TASKS,
+            agent_controller,
+            move |agent_controller, command_rx, host| {
+                hosted_tui_controller_loop(
+                    agent_config,
+                    agent_preloaded,
+                    agent_event_tx,
+                    command_rx,
+                    agent_controller,
+                    agent_workflow_notifications,
+                    host,
+                );
+            },
+        )
+    };
+    let mut agent_runtime = match runtime {
         Ok(runtime) => runtime,
         Err(error) => {
             return pending_terminal_session.fail_after_agent_startup(error);

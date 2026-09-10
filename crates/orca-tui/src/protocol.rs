@@ -162,6 +162,15 @@ pub struct AttachedTuiEvent {
     pub(crate) event: TuiEvent,
 }
 
+/// Ordered ACP usage/context snapshot, without inventing runtime revisions.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AcpMetricsSnapshot {
+    pub usage: orca_core::cost_types::UsageTotals,
+    pub context_used_tokens: usize,
+    pub context_limit_tokens: usize,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
@@ -280,6 +289,11 @@ pub enum TuiEvent {
         plan: Option<(Option<String>, Vec<PlanItem>)>,
         label: String,
     },
+    /// Authoritative ACP replica replacement; preserves live interaction state.
+    AcpTranscriptSynced {
+        messages: Vec<ChatMessage>,
+    },
+    AcpMetricsUpdated(AcpMetricsSnapshot),
     NewSessionStarted,
     SessionProjectionReset(Box<crate::surface_projection::SurfaceProjectionState>),
     /// A focused child recovered its subscription from a fresh snapshot. The

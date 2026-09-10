@@ -1,5 +1,6 @@
 #![deny(deprecated)]
 
+mod acp_client;
 mod action_dispatcher;
 mod agent_runtime;
 mod agent_workspace;

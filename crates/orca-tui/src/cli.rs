@@ -65,6 +65,22 @@ pub fn run(config: RunConfig) -> i32 {
     crate::app::run_tui(config)
 }
 
+/// Attach the normal renderer to a daemon-owned ACP session. No runtime host,
+/// provider credentials, or session writer is created in this process.
+pub fn run_attached(config: RunConfig, socket: std::path::PathBuf, session: String) -> i32 {
+    #[cfg(not(unix))]
+    {
+        let _ = (config, socket, session);
+        eprintln!("orca: local ACP attachment requires Unix; standalone TUI remains available");
+        1
+    }
+    #[cfg(unix)]
+    {
+        crate::stdio_guard::clear_stdio_nonblocking();
+        crate::app::run_tui_attached(config, crate::acp_client::AttachOptions { socket, session })
+    }
+}
+
 fn prompt_for_update(info: &UpdateInfo) -> io::Result<UpdatePromptChoice> {
     let mut stdout = io::stdout();
     let mut highlighted = UpdatePromptChoice::UpdateNow;

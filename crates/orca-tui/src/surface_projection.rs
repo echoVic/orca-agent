@@ -440,6 +440,14 @@ impl SurfaceMetricsState {
         }
     }
 
+    pub(crate) fn apply_acp_metrics(&mut self, metrics: crate::protocol::AcpMetricsSnapshot) {
+        self.usage = metrics.usage;
+        self.context_used_tokens = metrics.context_used_tokens;
+        self.context_limit_tokens = metrics.context_limit_tokens;
+        self.usage_revision = None;
+        self.context_revision = None;
+    }
+
     pub(crate) fn usage(&self) -> &UsageTotals {
         &self.usage
     }
