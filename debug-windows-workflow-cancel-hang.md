@@ -22,6 +22,8 @@
 - Replacing the nested agent call with a workflow-host timer did not remove the first-attempt timeout.
 - Focused run `34655357956` reproduced at stage 14: foreground terminal completed, workflow terminal did not.
 - Focused run `34656018054` reproduced at stage 15: TaskRegistry was terminal, but the workflow surface terminal was not published.
+- Focused run `34656698367` showed workflow-host cancellation, child termination,
+  agent-worker join, and both pipe-reader joins all completing before stage 15.
 
 ## Diagnostic Stage Codes
 | Stage | Next blocking boundary |
@@ -44,6 +46,6 @@
 | 17 | Shut down runtime host |
 
 ## Verification Conclusion
-The durable control retry and worker stop request succeed. The remaining hang
-is between workflow TaskRegistry terminalization and surface completion
-publication. Instrument workflow-host child and reader cleanup next.
+The durable control retry, worker stop request, and workflow-host process
+cleanup succeed. The remaining hang is between the background handle's final
+completion notification and the actor's workflow terminal commit.

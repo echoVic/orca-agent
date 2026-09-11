@@ -21628,7 +21628,13 @@ fn run_workflow_background_task(
         thread::sleep(WORKFLOW_BACKGROUND_POLL_INTERVAL);
     }
 
+    if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+        eprintln!("[workflow-cancel-diagnostic] background-handle-finished");
+    }
     let joined = handle.join();
+    if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+        eprintln!("[workflow-cancel-diagnostic] background-handle-joined");
+    }
     emit_workflow_task_status(
         context.observer.as_deref(),
         &mut events,
@@ -21699,6 +21705,9 @@ fn run_workflow_background_task(
                 ),
             );
         }
+    }
+    if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+        eprintln!("[workflow-cancel-diagnostic] background-task-finished");
     }
 }
 

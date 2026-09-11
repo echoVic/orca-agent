@@ -202,7 +202,13 @@ impl ThreadActor {
                         ),
                     );
                 }
+                if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                    eprintln!("[workflow-cancel-diagnostic] before-completion-notify");
+                }
                 let _ = completion_tx.send(completion_task_id);
+                if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                    eprintln!("[workflow-cancel-diagnostic] after-completion-notify");
+                }
             });
             self.background_controller
                 .admit_task(
@@ -349,17 +355,32 @@ impl ThreadActor {
 
     pub(super) async fn reap_background_task(&mut self, task_id: &str) {
         if let Some(task) = self.background_controller.begin_completion(task_id) {
+            if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                eprintln!("[workflow-cancel-diagnostic] actor-begin-reap");
+            }
             let HostBackgroundTask {
                 join,
                 typed_workflow,
                 typed_provider,
                 ..
             } = task;
+            if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                eprintln!("[workflow-cancel-diagnostic] actor-before-background-join");
+            }
             let _ = join.await;
-            if let Some(typed_workflow) = typed_workflow
-                && let Err(error) = self.commit_typed_workflow_completion(typed_workflow, None)
-            {
-                self.operation_recovery.terminal_blocked = Some(error.to_string());
+            if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                eprintln!("[workflow-cancel-diagnostic] actor-after-background-join");
+            }
+            if let Some(typed_workflow) = typed_workflow {
+                if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                    eprintln!("[workflow-cancel-diagnostic] actor-before-workflow-completion");
+                }
+                if let Err(error) = self.commit_typed_workflow_completion(typed_workflow, None) {
+                    self.operation_recovery.terminal_blocked = Some(error.to_string());
+                }
+                if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                    eprintln!("[workflow-cancel-diagnostic] actor-after-workflow-completion");
+                }
             }
             if let Some(typed_provider) = typed_provider
                 && let Err(error) = self.commit_typed_provider_completion(typed_provider, None)
