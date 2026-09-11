@@ -62,6 +62,10 @@ filter = "package(=orca-runtime) & test(=runtime_host::tests::surface_goal_termi
 threads-required = 2
 
 [[profile.ci.overrides]]
+filter = "package(=orca-runtime) & test(=runtime_host::tests::workflow_cancel_checkpoint_failure_retries_exact_batch_before_signalling_worker)"
+threads-required = 2
+
+[[profile.ci.overrides]]
 filter = "package(=orca-runtime) & binary(=runtime_host) & test(/^(operation_panic_has_one_terminal_and_actor_reclaims_thread_state|panicking_goal_run_settles_outer_turn_and_fails_closed_to_paused|runtime_host_launches_saved_workflow_without_blocking_the_next_turn)$/)"
 threads-required = 2
 
