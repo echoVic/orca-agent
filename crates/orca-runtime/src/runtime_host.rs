@@ -11012,11 +11012,13 @@ fn apply_runtime_settings_patch(
                             .as_ref()
                             .map(|value| value.as_str().to_string()),
                     });
-            if config.approval_mode == ApprovalMode::FullAuto
+            config.execution_profile = if config.approval_mode == ApprovalMode::FullAuto
                 && config.active_permission_profile.is_some()
             {
-                config.execution_profile = orca_core::capability::ExecutionProfile::Workspace;
-            }
+                orca_core::capability::ExecutionProfile::Workspace
+            } else {
+                orca_core::capability::ExecutionProfile::for_approval_mode(config.approval_mode)
+            };
             settings.active_permission_profile = profile.clone();
         }
         surface::RuntimeSettingsPatch::ReplacePermissionRules { rules } => {
@@ -31227,6 +31229,62 @@ mod tests {
             surface::WaitOperationTerminalResult::Terminal { value }
                 if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
         ));
+        let current = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::ManageThreadSettings,
+            ]),
+        );
+        let profiled = committed_surface_value(
+            current
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    current.baseline.snapshot.settings.thread_revision,
+                    surface::NonEmptyVec::try_new(vec![
+                        surface::RuntimeSettingsPatch::SetActivePermissionProfile {
+                            profile: Some(surface::SurfaceActivePermissionProfile {
+                                id: surface::NonEmptyText::try_new("legacy-restrictive").unwrap(),
+                                extends: None,
+                            }),
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .expect("apply explicit profile"),
+        );
+        assert!(matches!(
+            current.client.update_settings(
+                surface_request_id(),
+                profiled.settings.thread_revision,
+                surface::NonEmptyVec::try_new(vec![
+                    surface::RuntimeSettingsPatch::SetActivePermissionProfile { profile: None },
+                ])
+                .unwrap(),
+            ),
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        ));
+        let cleared = committed_surface_value(
+            current
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    profiled.settings.thread_revision,
+                    surface::NonEmptyVec::try_new(vec![
+                        surface::RuntimeSettingsPatch::EnableFullAccess,
+                    ])
+                    .unwrap(),
+                )
+                .expect("confirmed full access clears explicit profile"),
+        );
+        assert!(
+            cleared
+                .settings
+                .effective
+                .active_permission_profile
+                .is_none()
+        );
         thread.shutdown().expect("shutdown dynamic policy thread");
         host.shutdown().expect("shutdown dynamic policy host");
     }

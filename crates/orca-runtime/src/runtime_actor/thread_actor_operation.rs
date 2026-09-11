@@ -3438,6 +3438,14 @@ impl ThreadActor {
         for patch in patches.as_slice() {
             apply_runtime_settings_patch(&mut next_config, &mut next_settings.effective, patch)?;
         }
+        if !confirmed_full_access
+            && current.effective.approval_mode == surface::SurfaceApprovalMode::FullAuto
+            && current.effective.active_permission_profile.is_some()
+            && next_settings.effective.approval_mode == surface::SurfaceApprovalMode::FullAuto
+            && next_settings.effective.active_permission_profile.is_none()
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
         let interaction_permission_update_authorized = self
             .resident_surface
             .interactions
