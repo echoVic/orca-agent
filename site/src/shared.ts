@@ -4,15 +4,15 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.28";
+export const releaseVersion = "v0.4.29";
 
 export const releases = [
   {
-    version: "v0.4.28",
+    version: "v0.4.29",
     date: "2026-09-11",
     title: "Inline questions and live Full Access",
-    body: "Adds structured inline questionnaires, persistent model and reasoning preferences, and confirmed Full Access transitions that apply to the active task's next tool call without widening work already in flight.",
-    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.28",
+    body: "Adds structured inline questionnaires, persistent model and reasoning preferences, and confirmed Full Access transitions that apply to the active task's next tool call without widening work already in flight. The release gate now isolates its multi-process workflow cancellation contract for deterministic publication.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.29",
   },
   {
     version: "v0.4.27",

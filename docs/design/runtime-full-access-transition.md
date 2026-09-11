@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented for v0.4.28.
+Implemented for v0.4.29.
 
 ## Contract
 
