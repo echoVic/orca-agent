@@ -1121,6 +1121,9 @@ pub enum RuntimeSettingsPatch {
     SetApprovalMode {
         mode: SurfaceApprovalMode,
     },
+    /// User-confirmed session Full Access. This is intentionally distinct
+    /// from a generic mode patch because it widens host execution authority.
+    EnableFullAccess,
     SetCwd {
         cwd: CanonicalPath,
     },

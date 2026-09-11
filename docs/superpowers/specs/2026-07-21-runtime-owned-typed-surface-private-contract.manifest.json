@@ -4368,8 +4368,8 @@
       ],
       "runtime_mutation",
       "UserAction::ImplementApprovedPlan { prompt, approval_mode }",
-      "UpdateRuntimeSettings(SetApprovalMode)+ReserveOperation+AdmitReserved",
-      "UpdateRuntimeSettings(SetApprovalMode)+ReserveOperation+AdmitReserved",
+      "UpdateRuntimeSettings(SetApprovalMode|EnableFullAccess)+ReserveOperation+AdmitReserved",
+      "UpdateRuntimeSettings(SetApprovalMode|EnableFullAccess)+ReserveOperation+AdmitReserved",
       [
         "UpdateRuntimeSettings",
         "SubmitOperation",
@@ -5039,13 +5039,29 @@
       ],
       "settings_mutation",
       "direct_runconfig_shared_config_without_user_action",
-      "UpdateRuntimeSettings(SetApprovalMode)",
+      "UpdateRuntimeSettings(SetApprovalMode|EnableFullAccess)",
       [
         "SurfaceBoundCaller",
         "ThreadOwnerEpoch"
       ],
       "typed command result consumer",
       "delete_direct_mutation"
+    ],
+    [
+      "full_access.confirmation",
+      [
+        "crates/orca-tui/src/full_access_confirmation_actions.rs:11-75"
+      ],
+      "settings_mutation",
+      "pending_user_confirmation_without_runtime_mutation",
+      "UpdateRuntimeSettings(EnableFullAccess)",
+      [
+        "SurfaceBoundCaller",
+        "ThreadOwnerEpoch",
+        "SettingsRevision"
+      ],
+      "typed command result consumer",
+      "retain_explicit_authority_widening_boundary"
     ],
     [
       "slash.config",
@@ -5055,7 +5071,7 @@
       ],
       "settings_mutation",
       "dialog_local_draft_without_user_action",
-      "UpdateRuntimeSettings(SetModel+SetReasoning+SetApprovalMode)",
+      "UpdateRuntimeSettings(SetModel+SetReasoning+SetApprovalMode|EnableFullAccess)",
       [
         "SurfaceBoundCaller",
         "ThreadOwnerEpoch"
@@ -5265,6 +5281,22 @@
       ],
       "typed command result consumer",
       "delete_local_allowlist_authority"
+    ],
+    [
+      "interaction.user_input_submission",
+      [
+        "crates/orca-tui/src/idle_submit_actions.rs:194-224"
+      ],
+      "interaction_mutation",
+      "staged_questionnaire_response_with_submission_ack",
+      "RespondInteraction(UserQuestionnaire)",
+      [
+        "SurfaceBoundCaller",
+        "ThreadOwnerEpoch",
+        "InteractionRevision"
+      ],
+      "typed interaction response acknowledgement",
+      "retain_typed_acknowledged_submission"
     ],
     [
       "background_approval_reconstruction",
@@ -9761,6 +9793,7 @@
       "SetModel",
       "SetReasoning",
       "SetApprovalMode",
+      "EnableFullAccess",
       "SetCwd",
       "SetWorkspaceRoots",
       "SetActivePermissionProfile",
@@ -10244,7 +10277,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "183a03dd09a05fc6423cfef7aeb89956015503875a07f1188c823d918738bda5",
+    "private_contract_sha256": "64e3306ebf861e3cf4f7e33dc11dd5a35e0646edfba046629471256c9519bdbe",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",
@@ -13241,6 +13274,11 @@
       "SurfaceToolAction",
       "SurfaceToolRequest",
       "SurfaceUserInputDecision",
+      "SurfaceUserInputOption",
+      "SurfaceUserInputQuestion",
+      "SurfaceUserInputQuestionAnswer",
+      "SurfaceUserInputQuestionnaire",
+      "SurfaceUserInputResponse",
       "ValidatedInteractionResponse"
     ],
     "operation": [

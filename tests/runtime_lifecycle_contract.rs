@@ -20,12 +20,13 @@ use orca_provider::ProviderConfig;
 use orca_runtime::cost::CostTracker;
 use orca_runtime::hooks::HookRunner;
 use orca_runtime::lifecycle::{
-    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimePermissionRequest,
-    RuntimePermissionRequestHandler, RuntimePermissionResponse, RuntimeSessionLifecycle,
-    RuntimeSpecialToolDispatch, RuntimeSubagentStatusLookup, RuntimeSubagentStatusRecord,
-    RuntimeTaskActor, RuntimeTaskKind, RuntimeTaskStatus, RuntimeToolActorContext,
-    RuntimeTurnRunner, RuntimeUserInputHandler, RuntimeUserInputRequest,
-    RuntimeWorkflowDraftRequest, RuntimeWorkflowIpc, TurnPermissionOverlay,
+    RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimeInteractionToolDispatch,
+    RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
+    RuntimeSessionLifecycle, RuntimeSpecialToolDispatch, RuntimeSubagentStatusLookup,
+    RuntimeSubagentStatusRecord, RuntimeTaskActor, RuntimeTaskKind, RuntimeTaskStatus,
+    RuntimeToolActorContext, RuntimeTurnRunner, RuntimeUserInputAnswer, RuntimeUserInputHandler,
+    RuntimeUserInputRequest, RuntimeUserInputResponse, RuntimeWorkflowDraftRequest,
+    RuntimeWorkflowIpc, TurnPermissionOverlay,
 };
 use orca_runtime::protocol::{
     PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
@@ -658,14 +659,17 @@ fn tool_actor_context_routes_canonical_user_question_through_handler() {
         fn request_user_input(
             &self,
             request: &RuntimeUserInputRequest,
-        ) -> std::io::Result<Option<String>> {
-            assert_eq!(request.id, "ask:question:1");
-            assert_eq!(request.question, "Confirm: Continue?");
-            assert_eq!(
-                request.choices,
-                vec!["yes - Continue".to_string(), "no - Stop".to_string()]
-            );
-            Ok(Some("yes".to_string()))
+        ) -> std::io::Result<Option<RuntimeUserInputResponse>> {
+            assert_eq!(request.id, "ask");
+            assert_eq!(request.questions[0].header, "Confirm");
+            assert_eq!(request.questions[0].question, "Continue?");
+            assert_eq!(request.questions[0].options[0].label, "yes");
+            Ok(Some(RuntimeUserInputResponse::Submitted {
+                answers: vec![RuntimeUserInputAnswer {
+                    question_id: request.questions[0].id.clone(),
+                    answers: vec!["yes".to_string()],
+                }],
+            }))
         }
     }
 
@@ -700,8 +704,8 @@ fn tool_actor_context_cancelled_user_input_returns_cancelled_result() {
         fn request_user_input(
             &self,
             request: &RuntimeUserInputRequest,
-        ) -> std::io::Result<Option<String>> {
-            assert_eq!(request.id, "ask:question:1");
+        ) -> std::io::Result<Option<RuntimeUserInputResponse>> {
+            assert_eq!(request.id, "ask");
             Ok(None)
         }
     }
@@ -741,7 +745,7 @@ fn tool_actor_context_maps_invalid_ask_user_question_to_invalid_input_result() {
         fn request_user_input(
             &self,
             _request: &RuntimeUserInputRequest,
-        ) -> std::io::Result<Option<String>> {
+        ) -> std::io::Result<Option<RuntimeUserInputResponse>> {
             panic!("invalid questionnaire must not reach the interaction handler")
         }
     }
@@ -785,17 +789,17 @@ fn tool_actor_context_routes_ask_user_question_through_typed_handler() {
         fn request_user_input(
             &self,
             request: &RuntimeUserInputRequest,
-        ) -> std::io::Result<Option<String>> {
-            assert_eq!(request.id, "ask-structured:question:1");
-            assert_eq!(request.question, "Runtime: Which path?");
-            assert_eq!(
-                request.choices,
-                vec![
-                    "Reuse - Use the runtime broker".to_string(),
-                    "New - Create another path".to_string()
-                ]
-            );
-            Ok(Some("Reuse".to_string()))
+        ) -> std::io::Result<Option<RuntimeUserInputResponse>> {
+            assert_eq!(request.id, "ask-structured");
+            assert_eq!(request.questions[0].header, "Runtime");
+            assert_eq!(request.questions[0].question, "Which path?");
+            assert_eq!(request.questions[0].options[0].label, "Reuse");
+            Ok(Some(RuntimeUserInputResponse::Submitted {
+                answers: vec![RuntimeUserInputAnswer {
+                    question_id: request.questions[0].id.clone(),
+                    answers: vec!["Reuse".to_string()],
+                }],
+            }))
         }
     }
 
@@ -1757,7 +1761,7 @@ fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
     );
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::RequestPermissions), false),
-        RuntimeSpecialToolDispatch::RequestPermissions
+        RuntimeSpecialToolDispatch::Interaction(RuntimeInteractionToolDispatch::Permission)
     );
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::RequestUserInput), false),
@@ -1765,7 +1769,7 @@ fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
     );
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::AskUserQuestion), false),
-        RuntimeSpecialToolDispatch::RequestUserInput
+        RuntimeSpecialToolDispatch::Interaction(RuntimeInteractionToolDispatch::UserInput)
     );
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::WorkflowReadMessages), false),

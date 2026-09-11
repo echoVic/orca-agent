@@ -31,6 +31,7 @@ mod edit_highlight;
 mod edit_highlight_worker;
 mod exit_policy;
 mod frame_scheduler;
+mod full_access_confirmation_actions;
 mod global_actions;
 mod goal_materialization;
 mod hosted_child;

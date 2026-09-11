@@ -41,6 +41,7 @@ use crate::lifecycle::{
 };
 use crate::provider_stream::{RuntimeProviderSuspension, RuntimeProviderSuspensionControl};
 use crate::runtime_conversation_bootstrap::AgentConversationContext;
+use crate::runtime_execution_policy::RuntimeExecutionPolicyHandle;
 use crate::runtime_host::{
     HeadlessInteractionCheckpoint, HeadlessOperationHandle, HeadlessSurfaceSession, RuntimeHost,
     RuntimeHostError, RuntimeThreadStartRequest,
@@ -318,6 +319,7 @@ pub struct ThreadTurnRequest {
     options: ControllerRunOptions,
     emit_session_completed: bool,
     steer_handle: Option<ThreadSteerHandle>,
+    execution_policy: Option<RuntimeExecutionPolicyHandle>,
     approval_handler: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler>>,
@@ -764,6 +766,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             loop_context
         }
         .with_owned_permission_handler(request.permission_handler_arc())
+        .with_execution_policy(request.execution_policy())
         .with_provider_suspension_control(request.provider_suspension_control())
         .with_provider_response_ingress(request.provider_response_ingress())
         .with_workflow_lifecycle_ingress(request.workflow_lifecycle_ingress())
@@ -1034,6 +1037,7 @@ impl ThreadTurnRequest {
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
             steer_handle: None,
+            execution_policy: None,
             approval_handler: None,
             permission_handler: None,
             user_input_handler: None,
@@ -1143,6 +1147,15 @@ impl ThreadTurnRequest {
     pub fn with_steer_handle(mut self, handle: ThreadSteerHandle) -> Self {
         self.steer_handle = Some(handle);
         self
+    }
+
+    pub(crate) fn with_execution_policy(mut self, policy: RuntimeExecutionPolicyHandle) -> Self {
+        self.execution_policy = Some(policy);
+        self
+    }
+
+    pub(crate) fn execution_policy(&self) -> Option<&RuntimeExecutionPolicyHandle> {
+        self.execution_policy.as_ref()
     }
 
     pub fn with_permission_handler(
@@ -1525,7 +1538,8 @@ fn headless_answer_matches(
             SurfaceInteractionRequest::PermissionRequest { .. },
             SurfaceClientInteractionAnswer::PermissionRequest { .. }
         ) | (
-            SurfaceInteractionRequest::UserInput { .. },
+            SurfaceInteractionRequest::UserInput { .. }
+                | SurfaceInteractionRequest::UserQuestionnaire { .. },
             SurfaceClientInteractionAnswer::UserInput { .. }
         ) | (
             SurfaceInteractionRequest::McpElicitation { .. },
@@ -1552,7 +1566,8 @@ fn fail_closed_headless_answer(
                 },
             })
         }
-        SurfaceInteractionRequest::UserInput { .. } => {
+        SurfaceInteractionRequest::UserInput { .. }
+        | SurfaceInteractionRequest::UserQuestionnaire { .. } => {
             Ok(SurfaceClientInteractionAnswer::UserInput {
                 decision: SurfaceUserInputDecision::Cancel,
             })
@@ -2709,10 +2724,18 @@ mod tests {
             fn request_user_input(
                 &self,
                 request: &RuntimeUserInputRequest,
-            ) -> io::Result<Option<String>> {
-                assert_eq!(request.question, "Confirm: Continue?");
-                assert_eq!(request.choices, ["yes - Continue", "no - Stop"]);
-                Ok(Some("yes".to_string()))
+            ) -> io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>> {
+                assert_eq!(request.questions[0].header, "Confirm");
+                assert_eq!(request.questions[0].question, "Continue?");
+                assert_eq!(request.questions[0].options[0].label, "yes");
+                Ok(Some(
+                    crate::lifecycle::RuntimeUserInputResponse::Submitted {
+                        answers: vec![crate::lifecycle::RuntimeUserInputAnswer {
+                            question_id: request.questions[0].id.clone(),
+                            answers: vec!["yes".to_string()],
+                        }],
+                    },
+                ))
             }
         }
 

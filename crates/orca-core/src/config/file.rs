@@ -558,6 +558,56 @@ fn save_api_key_checked_to_dir(dir: &Path, api_key: &str) -> io::Result<PathBuf>
     Ok(path)
 }
 
+/// Persist the user's model and reasoning-effort choices to the user-owned
+/// config file, preserving every other key plus comments and formatting.
+/// `None` fields leave the existing value untouched. Model values must already
+/// be canonical. An existing file that cannot be parsed is rejected instead of
+/// being overwritten, so a broken hand-written config is never silently
+/// destroyed.
+pub fn persist_user_model_settings(
+    model: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> io::Result<PathBuf> {
+    let dir = config_dir()
+        .ok_or_else(|| io::Error::other("could not resolve the Orca configuration directory"))?;
+    persist_user_model_settings_to_dir(&dir, model, reasoning_effort)
+}
+
+fn persist_user_model_settings_to_dir(
+    dir: &Path,
+    model: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> io::Result<PathBuf> {
+    let path = dir.join(USER_CONFIG_FILE);
+    if model.is_none() && reasoning_effort.is_none() {
+        return Ok(path);
+    }
+    fs::create_dir_all(dir)?;
+    let mut document = match fs::read_to_string(&path) {
+        Ok(content) => content.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            io::Error::other(format!(
+                "{}: existing config cannot be parsed; fix or remove it before persisting settings ({error})",
+                path.display()
+            ))
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(error) => return Err(error),
+    };
+    if let Some(model) = model {
+        document["model"] = toml_edit::value(model);
+    }
+    if let Some(effort) = reasoning_effort {
+        document["reasoning_effort"] = toml_edit::value(effort.as_str());
+    }
+    orca_platform::fs::atomic_write(
+        &path,
+        document.to_string().as_bytes(),
+        orca_platform::fs::AtomicWritePolicy::NoFollow,
+    )
+    .map_err(|error| io::Error::other(format!("replacing {}: {error}", path.display())))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1607,5 +1657,164 @@ workflowKeywordTriggerEnabled = true
 
         assert!(!workflows.enabled);
         assert!(!workflows.keyword_trigger_enabled);
+    }
+
+    #[test]
+    fn persist_user_model_settings_writes_values_preserving_other_keys() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, temp.path());
+        }
+
+        let path = temp.path().join(USER_CONFIG_FILE);
+        fs::write(
+            &path,
+            "theme = \"mocha\"\nmodel = \"deepseek-flash\"\nreasoning_effort = \"low\"\n",
+        )
+        .unwrap();
+
+        let written =
+            persist_user_model_settings(Some("deepseek-v4-pro"), Some(ReasoningEffort::High))
+                .unwrap();
+        assert_eq!(written, path);
+
+        let parsed: Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["model"].as_str(), Some("deepseek-v4-pro"));
+        assert_eq!(parsed["reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(parsed["theme"].as_str(), Some("mocha"));
+        unsafe {
+            std::env::remove_var(ORCA_HOME_ENV);
+        }
+    }
+
+    #[test]
+    fn persist_user_model_settings_preserves_comments_and_formatting() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, temp.path());
+        }
+
+        let path = temp.path().join(USER_CONFIG_FILE);
+        let original = concat!(
+            "# model selection\n",
+            "model = \"deepseek-flash\"\n\n",
+            "# keep this comment\n",
+            "theme = \"mocha\"\n",
+        );
+        fs::write(&path, original).unwrap();
+
+        persist_user_model_settings(Some("deepseek-v4-pro"), Some(ReasoningEffort::Max)).unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(
+            updated.contains("# model selection"),
+            "leading comments lost: {updated:?}"
+        );
+        assert!(
+            updated.contains("model = \"deepseek-v4-pro\""),
+            "model missing from {updated:?}"
+        );
+        assert!(
+            updated.contains("# keep this comment"),
+            "unrelated comments lost: {updated:?}"
+        );
+        assert!(
+            updated.contains("theme = \"mocha\""),
+            "unrelated keys lost: {updated:?}"
+        );
+        unsafe {
+            std::env::remove_var(ORCA_HOME_ENV);
+        }
+    }
+
+    #[test]
+    fn persist_user_model_settings_creates_config_when_missing() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, temp.path());
+        }
+
+        let written =
+            persist_user_model_settings(Some("deepseek-flash"), Some(ReasoningEffort::Low))
+                .unwrap();
+        assert_eq!(written, temp.path().join(USER_CONFIG_FILE));
+
+        let parsed: Value =
+            toml::from_str(&fs::read_to_string(&written).unwrap()).expect("valid TOML");
+        assert_eq!(parsed["model"].as_str(), Some("deepseek-flash"));
+        assert_eq!(parsed["reasoning_effort"].as_str(), Some("low"));
+        unsafe {
+            std::env::remove_var(ORCA_HOME_ENV);
+        }
+    }
+
+    #[test]
+    fn persist_user_model_settings_rejects_unparseable_existing_config() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, temp.path());
+        }
+
+        let path = temp.path().join(USER_CONFIG_FILE);
+        let broken = "model = [\n";
+        fs::write(&path, broken).unwrap();
+
+        let error = persist_user_model_settings(Some("deepseek-flash"), None)
+            .err()
+            .expect("unparseable config must be rejected");
+        assert!(
+            error.to_string().contains("cannot be parsed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+        unsafe {
+            std::env::remove_var(ORCA_HOME_ENV);
+        }
+    }
+
+    #[test]
+    fn persist_user_model_settings_leaves_fields_untouched_when_none() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, temp.path());
+        }
+
+        let path = temp.path().join(USER_CONFIG_FILE);
+        fs::write(
+            &path,
+            "model = \"deepseek-flash\"\nreasoning_effort = \"low\"\n",
+        )
+        .unwrap();
+
+        persist_user_model_settings(None, None).unwrap();
+
+        let parsed: Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["model"].as_str(), Some("deepseek-flash"));
+        assert_eq!(parsed["reasoning_effort"].as_str(), Some("low"));
+        unsafe {
+            std::env::remove_var(ORCA_HOME_ENV);
+        }
+    }
+
+    #[test]
+    fn persist_user_model_settings_does_not_create_a_missing_file_for_noop() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, temp.path());
+        }
+
+        let path = persist_user_model_settings(None, None).unwrap();
+
+        assert_eq!(path, temp.path().join(USER_CONFIG_FILE));
+        assert!(!path.exists());
+        unsafe {
+            std::env::remove_var(ORCA_HOME_ENV);
+        }
     }
 }

@@ -174,7 +174,9 @@ pub use interaction::{
     SurfacePermissionDomainPattern, SurfacePermissionNetworkProfile, SurfacePermissionOrigin,
     SurfacePermissionOwnerRef, SurfacePermissionPathLabel, SurfacePermissionProfile, SurfaceSchema,
     SurfaceSchemaInteger, SurfaceSchemaProperty, SurfaceToolAction, SurfaceToolRequest,
-    SurfaceUserInputDecision, ValidatedInteractionResponse,
+    SurfaceUserInputDecision, SurfaceUserInputOption, SurfaceUserInputQuestion,
+    SurfaceUserInputQuestionAnswer, SurfaceUserInputQuestionnaire, SurfaceUserInputResponse,
+    ValidatedInteractionResponse,
 };
 pub(crate) use interaction::{
     ContinuationTurnAnswerType, ContinuationTurnContextKind, ContinuationTurnIntent,

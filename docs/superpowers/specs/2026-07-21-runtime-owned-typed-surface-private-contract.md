@@ -3047,7 +3047,38 @@ SurfacePermissionClientDecision =
       strict_auto_review: bool,
     }
 
-SurfaceUserInputDecision = Answer(DisplayText) | Cancel
+SurfaceUserInputOption {
+  label: NonEmptyText,
+  description: DisplayText,
+  preview: Option<DisplayText>,
+}
+
+SurfaceUserInputQuestion {
+  id: NonEmptyText,
+  header: NonEmptyText,
+  question: NonEmptyText,
+  options: Vec<SurfaceUserInputOption>,
+  multi_select: bool,
+}
+
+SurfaceUserInputQuestionnaire {
+  questions: NonEmptyVec<SurfaceUserInputQuestion>,
+}
+
+SurfaceUserInputQuestionAnswer {
+  question_id: NonEmptyText,
+  answers: Vec<DisplayText>,
+}
+
+SurfaceUserInputResponse {
+  answers: Vec<SurfaceUserInputQuestionAnswer>,
+}
+
+SurfaceUserInputDecision =
+  Answer(DisplayText) // legacy single-question compatibility
+  | Submitted(SurfaceUserInputResponse)
+  | Chat(DisplayText)
+  | Cancel
 
 SurfaceMcpElicitationDecision =
   Accept { content: SurfaceDataValue }
@@ -5184,6 +5215,7 @@ RuntimeSettingsPatch =
   SetModel { model: NonEmptyText }
   | SetReasoning { effort: SurfaceReasoningEffort }
   | SetApprovalMode { mode: SurfaceApprovalMode }
+  | EnableFullAccess // explicit user-confirmed authority widening
   | SetCwd { cwd: CanonicalPath }
   | SetWorkspaceRoots { roots: Vec<CanonicalPath> }
   | SetActivePermissionProfile {

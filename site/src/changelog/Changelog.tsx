@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import {
-  type Locale,
-  type SeoEntry,
-  applySeoHead,
-  canonicalOrigin,
-  detectInitialLocale,
-  links,
-  localeStorageKey,
-  releaseVersion,
-  releases,
+    type Locale,
+    type SeoEntry,
+    applySeoHead,
+    canonicalOrigin,
+    detectInitialLocale,
+    links,
+    localeStorageKey,
+    releaseVersion,
+    releases,
 } from "../shared";
 
 const canonicalUrl = `${canonicalOrigin}/changelog/`;
@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.28":
+        "Adds structured inline questionnaires, persistent model and reasoning preferences, and confirmed Full Access transitions that update the active task at the next tool boundary while preserving already-running work.",
       "v0.4.27":
         "Adds cache-aware context compaction, durable terminal output paging, file-defined Agents, shared ACP sessions, actionable sandbox and TUI diagnostics, and canonical DeepSeek-V4.1-Flash routing with compatibility aliases.",
       "v0.4.26":
@@ -666,6 +668,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.28":
+        "新增结构化内联问卷与模型、推理强度持久化；Full Access 经二次确认后从当前任务的下一次工具准入生效，同时保持已运行工具和既有子代理的权限快照不变。",
       "v0.4.27":
         "新增缓存感知上下文压缩、持久化终端输出分页、文件化 Agent、共享 ACP 会话、可操作的沙箱与 TUI 诊断，并将 DeepSeek-V4.1-Flash 统一为规范模型名，同时兼容旧名称。",
       "v0.4.26":

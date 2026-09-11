@@ -11,6 +11,7 @@ use orca_runtime::history::SessionTranscript;
 use crate::agent_workspace_actions::handle_agent_workspace_key;
 use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::config_dialog_actions::handle_config_dialog_key;
+use crate::full_access_confirmation_actions::handle_full_access_confirmation_key;
 use crate::idle_key_actions::handle_idle_key;
 use crate::plan_approval_actions::handle_plan_approval_key;
 use crate::protocol::UserAction;
@@ -21,7 +22,7 @@ use crate::setup_actions::{SetupFlow, handle_setup_key};
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus};
-use crate::user_input_dialog::{UserInputDialogKeyFlow, handle_user_input_dialog_key};
+use crate::user_input_dialog::handle_user_input_dialog_key;
 use crate::vim::{VimState, VimTranscriptSearchIntent};
 
 pub(crate) enum StatusKeyFlow {
@@ -72,6 +73,12 @@ where
         return Ok(StatusKeyFlow::Continue);
     }
 
+    if state.full_access_confirmation.is_some() {
+        vim_state.cancel_pending_command();
+        handle_full_access_confirmation_key(key, state, action_tx);
+        return Ok(StatusKeyFlow::Continue);
+    }
+
     if state.status == AppStatus::WaitingApproval {
         vim_state.cancel_pending_command();
         handle_approval_dialog_key(key, state, action_tx);
@@ -98,11 +105,8 @@ where
 
     if state.user_input_dialog.is_some() {
         vim_state.cancel_pending_command();
-        if handle_user_input_dialog_key(key, state, textarea, action_tx)
-            == UserInputDialogKeyFlow::Handled
-        {
-            return Ok(StatusKeyFlow::Continue);
-        }
+        handle_user_input_dialog_key(key, state, textarea, action_tx);
+        return Ok(StatusKeyFlow::Continue);
     }
 
     if matches!(

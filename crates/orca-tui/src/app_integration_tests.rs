@@ -4002,16 +4002,27 @@ fn hosted_canonical_user_input_uses_operation_fence_and_resumes_turn() {
         let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
         harness.send(UserAction::Submit("ask continue?".to_string()));
 
-        let key = match harness
+        let (key, question_id) = match harness
             .recv_until(|event| matches!(event, TuiEvent::UserInputRequested { .. }))
         {
-            TuiEvent::UserInputRequested { key, .. } => key,
+            TuiEvent::UserInputRequested { key, questionnaire } => {
+                assert_eq!(questionnaire.questions.len(), 1);
+                assert_eq!(questionnaire.questions[0].question, "continue?");
+                (key, questionnaire.questions[0].id.clone())
+            }
             _ => unreachable!(),
         };
         assert!(harness.runtime.controller().has_surface_active());
         harness.send(UserAction::RespondToInteraction {
             key,
-            response: TuiInteractionResponse::UserInput("yes".to_string()),
+            response: TuiInteractionResponse::UserQuestionnaire(
+                crate::protocol::TuiUserInputResponse::Submitted {
+                    answers: vec![crate::protocol::TuiUserInputAnswer {
+                        question_id,
+                        answers: vec!["yes".to_string()],
+                    }],
+                },
+            ),
         });
 
         let terminal =

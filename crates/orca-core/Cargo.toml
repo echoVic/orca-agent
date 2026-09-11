@@ -13,6 +13,7 @@ clap = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 dirs = { workspace = true }
 libc = { workspace = true }
 

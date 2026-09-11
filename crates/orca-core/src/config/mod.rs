@@ -447,9 +447,7 @@ impl DelegationSnapshot {
     pub fn from_config(config: &RunConfig) -> Self {
         Self {
             approval_mode: config.approval_mode,
-            execution_profile: crate::capability::ExecutionProfile::for_approval_mode(
-                config.approval_mode,
-            ),
+            execution_profile: config.execution_profile,
             active_permission_profile: config.active_permission_profile.clone(),
             permission_profiles: config.permission_profiles.clone(),
             runtime_workspace_roots: config.runtime_workspace_roots.clone(),
@@ -1115,6 +1113,22 @@ mod tests {
         let encoded = serde_json::to_string(&snapshot).expect("serialize snapshot");
         let decoded: DelegationSnapshot =
             serde_json::from_str(&encoded).expect("deserialize snapshot");
+        parent.approval_mode = ApprovalMode::FullAuto;
+        let restricted_snapshot = DelegationSnapshot::from_config(&parent);
+        assert_eq!(
+            restricted_snapshot.execution_profile,
+            crate::capability::ExecutionProfile::ReadOnly
+        );
+        parent.execution_profile = crate::capability::ExecutionProfile::TrustedHost;
+        let future_snapshot = DelegationSnapshot::from_config(&parent);
+        assert_eq!(
+            decoded.execution_profile,
+            crate::capability::ExecutionProfile::ReadOnly
+        );
+        assert_eq!(
+            future_snapshot.execution_profile,
+            crate::capability::ExecutionProfile::TrustedHost
+        );
         decoded.apply_to(&mut parent, Some(FLASH_MODEL.to_string()));
 
         assert_eq!(decoded.approval_mode, ApprovalMode::Plan);

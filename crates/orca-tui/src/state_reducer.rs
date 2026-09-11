@@ -530,11 +530,7 @@ impl AppState {
                     diff: preview,
                 });
             }
-            TuiEvent::UserInputRequested {
-                key,
-                question,
-                choices,
-            } => {
+            TuiEvent::UserInputRequested { key, questionnaire } => {
                 self.set_status(AppStatus::WaitingUserInput);
                 self.interaction.pending_input = Some(PendingTuiInput::UserInput(key));
                 self.interaction.pending_mcp_elicitation_mode = None;
@@ -542,9 +538,19 @@ impl AppState {
                 self.finish_assistant_stream();
                 self.slash_menu = None;
                 self.mention.clear_projection();
-                self.user_input_dialog =
-                    (!choices.is_empty()).then(|| UserInputDialog::new(&question, choices));
-                self.push_message(ChatMessage::System(question));
+                let question_count = questionnaire.questions.len();
+                let transcript_message = if question_count == 1 {
+                    questionnaire.questions[0].question.clone()
+                } else {
+                    format!("Waiting on answers for {question_count} questions.")
+                };
+                self.user_input_dialog = (question_count > 1
+                    || questionnaire
+                        .questions
+                        .iter()
+                        .any(|question| !question.options.is_empty()))
+                .then(|| UserInputDialog::new(questionnaire));
+                self.push_message(ChatMessage::System(transcript_message));
             }
             TuiEvent::McpElicitationRequested {
                 key,
@@ -651,6 +657,9 @@ impl AppState {
                 self.model_name = model;
                 self.reasoning_effort = reasoning_effort;
                 self.approval_mode = approval_mode;
+                if approval_mode == ApprovalMode::FullAuto {
+                    self.full_access_confirmation = None;
+                }
                 self.push_message(ChatMessage::System(format!(
                     "Runtime settings updated: model {}, reasoning effort {}, approval mode {}.",
                     self.model_name,

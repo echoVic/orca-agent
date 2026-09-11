@@ -1069,6 +1069,7 @@ impl ThreadStore for JsonlThreadStore {
         if patch.title.is_none()
             && patch.approval_mode.is_none()
             && patch.active_permission_profile.is_none()
+            && !patch.clear_active_permission_profile
             && patch.runtime_workspace_roots.is_none()
             && patch.permission_rules.is_none()
             && patch.additional_working_directories.is_none()
@@ -1100,7 +1101,10 @@ impl ThreadStore for JsonlThreadStore {
                     meta.approval_mode = Some(approval_mode);
                     patched = true;
                 }
-                if let Some(active_permission_profile) = &patch.active_permission_profile {
+                if patch.clear_active_permission_profile {
+                    meta.active_permission_profile = None;
+                    patched = true;
+                } else if let Some(active_permission_profile) = &patch.active_permission_profile {
                     meta.active_permission_profile = Some(active_permission_profile.clone());
                     patched = true;
                 }

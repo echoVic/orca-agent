@@ -106,6 +106,7 @@ fn run_permission_respond<W: Write>(
             ThreadMetadataPatch {
                 title: None,
                 active_permission_profile: None,
+                clear_active_permission_profile: false,
                 approval_mode: None,
                 runtime_workspace_roots: None,
                 permission_rules: None,

@@ -3364,7 +3364,7 @@ impl ThreadActor {
         request_id: surface::SurfaceRequestId,
         expected_thread_revision: surface::SettingsRevision,
         patches: surface::NonEmptyVec<surface::RuntimeSettingsPatch>,
-        active_permission_update: bool,
+        active: Option<&mut ActiveOperation>,
     ) -> Result<
         surface::MutationReply<surface::SettingsMutationOutput>,
         surface::SurfaceClientCommandError,
@@ -3410,30 +3410,66 @@ impl ThreadActor {
         }
         let mut next_settings = current.clone();
         let mut next_config = self.config.clone();
+        let confirmed_full_access = patches
+            .as_slice()
+            .iter()
+            .any(|patch| matches!(patch, surface::RuntimeSettingsPatch::EnableFullAccess));
+        if confirmed_full_access
+            && patches.as_slice().iter().any(|patch| {
+                matches!(
+                    patch,
+                    surface::RuntimeSettingsPatch::SetApprovalMode { .. }
+                        | surface::RuntimeSettingsPatch::SetActivePermissionProfile {
+                            profile: Some(_)
+                        }
+                )
+            })
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let active_direct_update_authorized = patches.as_slice().iter().all(|patch| {
+            matches!(
+                patch,
+                surface::RuntimeSettingsPatch::SetModel { .. }
+                    | surface::RuntimeSettingsPatch::SetReasoning { .. }
+                    | surface::RuntimeSettingsPatch::EnableFullAccess
+            )
+        });
         for patch in patches.as_slice() {
             apply_runtime_settings_patch(&mut next_config, &mut next_settings.effective, patch)?;
         }
-        let active_permission_update_authorized =
-            self.resident_surface
-                .interactions
-                .values()
-                .any(|interaction| {
-                    interaction.cancelled.is_none()
-                        && interaction.winning_receipt.is_none()
-                        && interaction_route_admits(&interaction.route, client.attachment_id())
-                        && matches!(
-                            &interaction.record.request,
-                            surface::SurfaceInteractionRequest::PermissionRequest {
-                                permissions,
-                                ..
-                            } if surface_session_permission_settings_delta_authorized(
-                                &current.effective,
-                                &next_settings.effective,
-                                permissions,
-                            )
+        if !confirmed_full_access
+            && next_settings.effective.approval_mode == surface::SurfaceApprovalMode::FullAuto
+            && next_settings.effective.active_permission_profile.is_none()
+            && (current.effective.approval_mode != surface::SurfaceApprovalMode::FullAuto
+                || current.effective.active_permission_profile.is_some())
+        {
+            return Err(surface::SurfaceClientCommandError::Unauthorized);
+        }
+        let interaction_permission_update_authorized = self
+            .resident_surface
+            .interactions
+            .values()
+            .any(|interaction| {
+                interaction.cancelled.is_none()
+                    && interaction.winning_receipt.is_none()
+                    && interaction_route_admits(&interaction.route, client.attachment_id())
+                    && matches!(
+                        &interaction.record.request,
+                        surface::SurfaceInteractionRequest::PermissionRequest {
+                            permissions,
+                            ..
+                        } if surface_session_permission_settings_delta_authorized(
+                            &current.effective,
+                            &next_settings.effective,
+                            permissions,
                         )
-                });
-        if active_permission_update && !active_permission_update_authorized {
+                    )
+            });
+        if active.is_some()
+            && !active_direct_update_authorized
+            && !interaction_permission_update_authorized
+        {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         let next_revision = surface::SettingsRevision::try_new(
@@ -3483,6 +3519,12 @@ impl ThreadActor {
                     .session_mut()
                     .set_model(next_config.model.as_history_value().as_deref());
             }
+        }
+        if let Some(active) = active {
+            active.config = next_config.clone();
+            active
+                .execution_policy
+                .publish(next_config.clone(), next_revision.get());
         }
         self.config = next_config;
         self.persist_surface_settings_metadata_if_recorded(&next_settings.effective)
@@ -6402,6 +6444,7 @@ impl ThreadActor {
             false,
             HostedGenerationHandlers::default(),
             active.config.clone(),
+            active.execution_policy.clone(),
         );
         active.surface_operation = Some(successor.operation_fence);
         active.generation = self.spawn_generation(

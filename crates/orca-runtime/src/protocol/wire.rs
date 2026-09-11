@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::server::{
@@ -28,6 +28,31 @@ use super::turn::{prompt_from_turn_start_params, turn_start_input_from_params};
 pub struct Submission {
     pub id: Value,
     pub op: ClientOp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// A response accepted by the JSONL `user_input/respond` method.
+pub enum UserInputResponse {
+    /// Cancel the pending request.
+    Cancel,
+    /// Answer the legacy single-question request.
+    Answer(String),
+    /// Submit answers keyed by questionnaire question ID.
+    Submitted {
+        answers: Vec<UserInputQuestionAnswer>,
+    },
+    /// Return a conversational clarification instead of questionnaire answers.
+    Chat(String),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// One JSONL questionnaire answer bound to its stable question ID.
+pub struct UserInputQuestionAnswer {
+    /// The question ID from the emitted `questions` array.
+    pub question_id: String,
+    /// One answer for single-select/free-text, or multiple selected labels.
+    pub answers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,7 +144,7 @@ pub enum ClientOp {
     },
     UserInputRespond {
         request_id: String,
-        answer: Option<String>,
+        response: UserInputResponse,
     },
     McpElicitationRespond {
         request_id: String,
@@ -314,6 +339,10 @@ pub(super) struct WireParams {
     pub(super) input: Option<WireInputParam>,
     #[serde(default)]
     pub(super) answer: Option<String>,
+    #[serde(default)]
+    pub(super) answers: Option<Vec<UserInputQuestionAnswer>>,
+    #[serde(default)]
+    pub(super) chat: Option<String>,
     #[serde(default)]
     pub(super) accepted: bool,
     #[serde(rename = "contentJson", default)]
@@ -942,11 +971,35 @@ impl Submission {
                         message: "user_input/respond params.requestId is required".to_string(),
                     });
                 };
+                let answer = params.and_then(|params| params.answer.clone());
+                let answers = params.and_then(|params| params.answers.clone());
+                let chat = params.and_then(|params| params.chat.clone());
+                if usize::from(answer.is_some())
+                    + usize::from(answers.is_some())
+                    + usize::from(chat.is_some())
+                    > 1
+                {
+                    return Err(DecodeError {
+                        id: wire.id,
+                        message:
+                            "user_input/respond accepts only one of params.answer, params.answers, or params.chat"
+                                .to_string(),
+                    });
+                }
+                let response = if let Some(answers) = answers {
+                    UserInputResponse::Submitted { answers }
+                } else if let Some(chat) = chat {
+                    UserInputResponse::Chat(chat)
+                } else if let Some(answer) = answer {
+                    UserInputResponse::Answer(answer)
+                } else {
+                    UserInputResponse::Cancel
+                };
                 Ok(Self {
                     id: wire.id,
                     op: ClientOp::UserInputRespond {
                         request_id,
-                        answer: params.and_then(|params| params.answer.clone()),
+                        response,
                     },
                 })
             }
@@ -2296,8 +2349,49 @@ mod tests {
             submission.op,
             ClientOp::UserInputRespond {
                 request_id: "input-turn-1-ask".to_string(),
-                answer: Some("ship it".to_string()),
+                response: UserInputResponse::Answer("ship it".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn submission_decodes_structured_user_input_response_wire_shape() {
+        let submission = Submission::decode(
+            r#"{"id":"input-response","method":"user_input/respond","params":{"requestId":"input-turn-1-ask","answers":[{"questionId":"question-1","answers":["Focused"]},{"questionId":"question-2","answers":["Rust","TypeScript"]}]}}"#,
+        )
+        .expect("structured user_input/respond submission");
+
+        assert_eq!(
+            submission.op,
+            ClientOp::UserInputRespond {
+                request_id: "input-turn-1-ask".to_string(),
+                response: UserInputResponse::Submitted {
+                    answers: vec![
+                        UserInputQuestionAnswer {
+                            question_id: "question-1".to_string(),
+                            answers: vec!["Focused".to_string()],
+                        },
+                        UserInputQuestionAnswer {
+                            question_id: "question-2".to_string(),
+                            answers: vec!["Rust".to_string(), "TypeScript".to_string()],
+                        },
+                    ],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn submission_rejects_ambiguous_user_input_response_wire_shape() {
+        let error = Submission::decode(
+            r#"{"id":"input-response","method":"user_input/respond","params":{"requestId":"input-turn-1-ask","answer":"legacy","chat":"clarify"}}"#,
+        )
+        .expect_err("user_input/respond must select one response shape");
+
+        assert_eq!(error.id, Value::from("input-response"));
+        assert_eq!(
+            error.message,
+            "user_input/respond accepts only one of params.answer, params.answers, or params.chat"
         );
     }
 

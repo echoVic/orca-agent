@@ -21,7 +21,8 @@ use crate::lifecycle::{
 };
 use crate::memory::MemoryBlock;
 use crate::runtime_special::{
-    RuntimeGoalToolOutcome, RuntimeGoalToolRequest, RuntimeSpecialToolDispatch,
+    RuntimeGoalToolOutcome, RuntimeGoalToolRequest, RuntimeInteractionToolDispatch,
+    RuntimeSpecialToolDispatch,
 };
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::runtime_surface::RuntimeWorkflowLifecycleIngress;
@@ -297,42 +298,44 @@ impl<'a> RuntimeToolRouter<'a> {
                 }
                 Ok(result)
             }
-            RuntimeSpecialToolDispatch::RequestPermissions => {
-                let result = self.runtime.execute_request_permissions_tool_with_policy(
-                    execution_request,
-                    config.approval_mode,
-                    permission_handler
-                        .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
-                );
-                let extension_stores = extension_stores.unwrap_or_else(|| {
-                    RuntimeExtensionStores::new(
-                        &self.runtime.thread_extensions,
-                        &self.runtime.turn_extensions,
-                    )
-                });
-                let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
-                reducer.merge_permission_overlay(
-                    permission_overlay,
-                    self.runtime.permission_overlay(),
-                );
-                Ok(result)
-            }
-            RuntimeSpecialToolDispatch::RequestUserInput => {
-                let Some(user_input_handler) = user_input_handler else {
-                    return Ok(RuntimeToolDispatchOutput::continue_model(
-                        tool_types::ToolResult::failed(
-                            execution_request,
-                            format!(
-                                "{} requires a runtime user input handler",
-                                execution_request.name.as_str()
+            RuntimeSpecialToolDispatch::Interaction(interaction) => match interaction {
+                RuntimeInteractionToolDispatch::Permission => {
+                    let result = self.runtime.execute_request_permissions_tool_with_policy(
+                        execution_request,
+                        config.approval_mode,
+                        permission_handler
+                            .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
+                    );
+                    let extension_stores = extension_stores.unwrap_or_else(|| {
+                        RuntimeExtensionStores::new(
+                            &self.runtime.thread_extensions,
+                            &self.runtime.turn_extensions,
+                        )
+                    });
+                    let reducer = RuntimeTurnReducer::from_extension_stores(extension_stores);
+                    reducer.merge_permission_overlay(
+                        permission_overlay,
+                        self.runtime.permission_overlay(),
+                    );
+                    Ok(result)
+                }
+                RuntimeInteractionToolDispatch::UserInput => {
+                    let Some(user_input_handler) = user_input_handler else {
+                        return Ok(RuntimeToolDispatchOutput::continue_model(
+                            tool_types::ToolResult::failed(
+                                execution_request,
+                                format!(
+                                    "{} requires a runtime user input handler",
+                                    execution_request.name.as_str()
+                                ),
+                                None,
                             ),
-                            None,
-                        ),
-                    ));
-                };
-                self.runtime
-                    .execute_user_input_tool(execution_request, user_input_handler)
-            }
+                        ));
+                    };
+                    self.runtime
+                        .execute_user_input_tool(execution_request, user_input_handler)
+                }
+            },
             RuntimeSpecialToolDispatch::WorkflowIpc => Ok(self.runtime.execute_workflow_ipc_tool(
                 execution_request,
                 workflow_ipc.map(|ipc| ipc as &dyn RuntimeWorkflowIpc),

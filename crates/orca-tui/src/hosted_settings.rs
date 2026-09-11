@@ -3,8 +3,9 @@
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel as mpsc;
-use orca_core::config::RunConfig;
+use orca_core::config::{ReasoningEffort, RunConfig};
 use orca_runtime::runtime_host::RuntimeThreadHandle;
+use orca_runtime::surface::RuntimeSettingsPatch;
 
 use crate::protocol::TuiEvent;
 use crate::slash_command_actions::SettingsIntent;
@@ -37,11 +38,19 @@ pub(crate) fn settings_intent_patches(
         });
     }
     if let Some(mode) = intent.approval_mode {
-        patches.push(
-            orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
-                mode: surface_approval_mode(mode),
-            },
-        );
+        match (mode, intent.full_access_confirmed) {
+            (orca_core::approval_types::ApprovalMode::FullAuto, true) => {
+                patches.push(orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess);
+            }
+            (orca_core::approval_types::ApprovalMode::FullAuto, false) => {}
+            (mode, _) => {
+                patches.push(
+                    orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
+                        mode: surface_approval_mode(mode),
+                    },
+                );
+            }
+        }
     }
     patches
 }
@@ -129,6 +138,32 @@ pub(crate) fn apply_hosted_settings_action(
     if patches.is_empty() {
         return false;
     }
+    let unconfirmed_full_access = patches.iter().any(|patch| {
+        matches!(
+            patch,
+            RuntimeSettingsPatch::SetApprovalMode {
+                mode: orca_runtime::surface::SurfaceApprovalMode::FullAuto
+            }
+        )
+    }) && config
+        .lock()
+        .map(|config| config.approval_mode != orca_core::approval_types::ApprovalMode::FullAuto)
+        .unwrap_or(true);
+    if unconfirmed_full_access {
+        let _ = event_tx.send(TuiEvent::OperationRejected(
+            "Full Access requires explicit confirmation".to_string(),
+        ));
+        return false;
+    }
+    let persist_model = patches
+        .iter()
+        .any(|patch| matches!(patch, RuntimeSettingsPatch::SetModel { .. }));
+    let persist_effort = patches
+        .iter()
+        .any(|patch| matches!(patch, RuntimeSettingsPatch::SetReasoning { .. }));
+    let enables_full_access = patches
+        .iter()
+        .any(|patch| matches!(patch, RuntimeSettingsPatch::EnableFullAccess));
     if let Some(thread) = thread {
         let patches = match orca_runtime::surface::NonEmptyVec::try_new(patches) {
             Ok(patches) => patches,
@@ -161,12 +196,22 @@ pub(crate) fn apply_hosted_settings_action(
             cfg.model = cfg.model.with_value_unchecked(Some(model.clone()));
             cfg.reasoning_effort = reasoning_effort;
             cfg.approval_mode = approval_mode;
+            cfg.execution_profile =
+                orca_core::capability::ExecutionProfile::for_approval_mode(approval_mode);
+            if enables_full_access {
+                cfg.active_permission_profile = None;
+            }
         }
         let _ = event_tx.send(TuiEvent::SettingsUpdated {
-            model,
+            model: model.clone(),
             reasoning_effort,
             approval_mode,
         });
+        persist_user_settings_values(
+            persist_model.then_some(model.as_str()),
+            persist_effort.then_some(reasoning_effort),
+            event_tx,
+        );
         return true;
     }
 
@@ -209,6 +254,13 @@ pub(crate) fn apply_hosted_settings_action(
                         orca_core::approval_types::ApprovalMode::Plan
                     }
                 };
+                cfg.execution_profile =
+                    orca_core::capability::ExecutionProfile::for_approval_mode(cfg.approval_mode);
+            }
+            orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess => {
+                cfg.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+                cfg.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+                cfg.active_permission_profile = None;
             }
             _ => {}
         }
@@ -218,7 +270,28 @@ pub(crate) fn apply_hosted_settings_action(
         reasoning_effort: cfg.reasoning_effort,
         approval_mode: cfg.approval_mode,
     });
+    let model = persist_model.then(|| cfg.model.display_name().to_string());
+    let effort = persist_effort.then_some(cfg.reasoning_effort);
+    persist_user_settings_values(model.as_deref(), effort, event_tx);
     true
+}
+
+/// Persist the applied model and reasoning-effort choices to the user-owned
+/// config file. Persistence failure is surfaced as a notice; the in-session
+/// change has already been committed and is not rolled back.
+fn persist_user_settings_values(
+    model: Option<&str>,
+    effort: Option<ReasoningEffort>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) {
+    if model.is_none() && effort.is_none() {
+        return;
+    }
+    if let Err(error) = orca_core::config::file::persist_user_model_settings(model, effort) {
+        let _ = event_tx.send(TuiEvent::Notice(format!(
+            "Settings applied for this session, but saving them to the user config failed: {error}"
+        )));
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +314,7 @@ mod tests {
             model: Some(orca_core::model::LEGACY_VISION_MODEL.to_string()),
             reasoning_effort: Some(ReasoningEffort::High),
             approval_mode: Some(ApprovalMode::Plan),
+            full_access_confirmed: false,
         });
 
         assert!(matches!(
@@ -255,6 +329,30 @@ mod tests {
                 }
             ] if model.as_str() == orca_core::model::FLASH_MODEL
         ));
+    }
+
+    #[test]
+    fn confirmed_full_access_uses_the_authority_widening_patch() {
+        let patches = super::settings_intent_patches(SettingsIntent {
+            model: None,
+            reasoning_effort: None,
+            approval_mode: Some(ApprovalMode::FullAuto),
+            full_access_confirmed: true,
+        });
+
+        assert_eq!(patches, vec![RuntimeSettingsPatch::EnableFullAccess]);
+    }
+
+    #[test]
+    fn unconfirmed_full_access_intent_fails_closed() {
+        let patches = super::settings_intent_patches(SettingsIntent {
+            model: None,
+            reasoning_effort: None,
+            approval_mode: Some(ApprovalMode::FullAuto),
+            full_access_confirmed: false,
+        });
+
+        assert!(patches.is_empty());
     }
 
     #[test]
@@ -278,7 +376,32 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_direct_full_auto_patch_is_rejected() {
+        let config = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        assert!(!super::apply_hosted_settings_action(
+            None,
+            &config,
+            &event_tx,
+            vec![RuntimeSettingsPatch::SetApprovalMode {
+                mode: SurfaceApprovalMode::FullAuto,
+            }],
+        ));
+        assert_ne!(
+            config.lock().expect("config").approval_mode,
+            ApprovalMode::FullAuto
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::OperationRejected(message))
+                if message == "Full Access requires explicit confirmation"
+        ));
+    }
+
+    #[test]
     fn unattached_settings_update_mutates_config_then_emits_result() {
+        let _home = crate::test_support::isolate_orca_home();
         let config = Arc::new(Mutex::new(crate::test_support::test_run_config()));
         let (event_tx, event_rx) = mpsc::unbounded();
 
@@ -294,9 +417,7 @@ mod tests {
                 RuntimeSettingsPatch::SetReasoning {
                     effort: SurfaceReasoningEffort::Low,
                 },
-                RuntimeSettingsPatch::SetApprovalMode {
-                    mode: SurfaceApprovalMode::FullAuto,
-                },
+                RuntimeSettingsPatch::EnableFullAccess,
             ],
         ));
 
@@ -385,6 +506,147 @@ mod tests {
                 if message == "typed TUI settings attachment unavailable"
         ));
         assert!(event_rx.try_recv().is_err());
+        thread.shutdown().expect("runtime thread shutdown");
+        runtime.shutdown().expect("runtime host shutdown");
+    }
+
+    #[test]
+    fn unattached_model_update_persists_model_and_effort_to_user_config() {
+        let _home = crate::test_support::isolate_orca_home();
+        let config = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        assert!(super::apply_hosted_settings_action(
+            None,
+            &config,
+            &event_tx,
+            vec![
+                RuntimeSettingsPatch::SetModel {
+                    model: NonEmptyText::try_new(orca_core::model::FLASH_MODEL).expect("model"),
+                },
+                RuntimeSettingsPatch::SetReasoning {
+                    effort: SurfaceReasoningEffort::Low,
+                },
+            ],
+        ));
+
+        let content =
+            std::fs::read_to_string(_home.path().join("config.toml")).expect("config.toml written");
+        assert!(
+            content.contains(&format!("model = \"{}\"", orca_core::model::FLASH_MODEL)),
+            "model missing from {content:?}"
+        );
+        assert!(
+            content.contains("reasoning_effort = \"low\""),
+            "effort missing from {content:?}"
+        );
+        assert!(
+            event_rx
+                .try_iter()
+                .all(|event| !matches!(event, TuiEvent::Notice(_))),
+            "unexpected persistence notice"
+        );
+    }
+
+    #[test]
+    fn unattached_approval_mode_update_does_not_write_user_config() {
+        let _home = crate::test_support::isolate_orca_home();
+        let config = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        assert!(super::apply_hosted_settings_action(
+            None,
+            &config,
+            &event_tx,
+            vec![RuntimeSettingsPatch::EnableFullAccess],
+        ));
+
+        let config = config.lock().expect("config");
+        assert_eq!(config.approval_mode, ApprovalMode::FullAuto);
+        assert_eq!(
+            config.execution_profile,
+            orca_core::capability::ExecutionProfile::TrustedHost
+        );
+        assert!(config.active_permission_profile.is_none());
+        drop(config);
+        assert!(
+            !_home.path().join("config.toml").exists(),
+            "approval mode changes must not write the user config"
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::SettingsUpdated {
+                approval_mode: ApprovalMode::FullAuto,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unattached_model_update_notices_when_config_cannot_be_persisted() {
+        let _home = crate::test_support::isolate_orca_home();
+        let broken = "model = [\n";
+        std::fs::write(_home.path().join("config.toml"), broken).unwrap();
+        let config = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        assert!(super::apply_hosted_settings_action(
+            None,
+            &config,
+            &event_tx,
+            vec![RuntimeSettingsPatch::SetModel {
+                model: NonEmptyText::try_new(orca_core::model::FLASH_MODEL).expect("model"),
+            }],
+        ));
+
+        assert_eq!(
+            std::fs::read_to_string(_home.path().join("config.toml")).unwrap(),
+            broken,
+            "broken config must be preserved"
+        );
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    TuiEvent::SettingsUpdated { .. },
+                    TuiEvent::Notice(message)
+                ] if message.contains("saving them to the user config failed")
+            ),
+            "unexpected events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn attached_model_update_persists_after_runtime_commit() {
+        let _home = crate::test_support::isolate_orca_home();
+        let mut run_config = crate::test_support::test_run_config();
+        run_config.history_mode = orca_core::config::HistoryMode::Record;
+        let config = Arc::new(Mutex::new(run_config));
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+        let thread = runtime
+            .handle()
+            .start_thread(config.lock().expect("config").clone(), "settings persist")
+            .expect("runtime thread");
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        let applied = super::apply_hosted_settings_action(
+            Some(&thread),
+            &config,
+            &event_tx,
+            vec![RuntimeSettingsPatch::SetModel {
+                model: NonEmptyText::try_new(orca_core::model::FLASH_MODEL).expect("model"),
+            }],
+        );
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(applied, "settings events: {events:?}");
+
+        let content =
+            std::fs::read_to_string(_home.path().join("config.toml")).expect("config.toml written");
+        assert!(
+            content.contains(&format!("model = \"{}\"", orca_core::model::FLASH_MODEL)),
+            "model missing from {content:?}"
+        );
         thread.shutdown().expect("runtime thread shutdown");
         runtime.shutdown().expect("runtime host shutdown");
     }

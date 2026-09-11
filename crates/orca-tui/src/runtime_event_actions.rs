@@ -25,7 +25,16 @@ pub(crate) fn handle_interaction_response_ack(
 ) {
     match ack {
         InteractionResponseAck::Committed { key } => {
+            let summary = state
+                .interaction
+                .pending_submission
+                .as_ref()
+                .filter(|submission| submission.key == key)
+                .and_then(|submission| submission.response_summary.clone());
             state.discard_pending_interaction_submission(&key);
+            if let Some(summary) = summary {
+                state.push_message(crate::transcript_state::ChatMessage::System(summary));
+            }
         }
         InteractionResponseAck::NoLongerPending { key, message } => {
             let input_submission = matches!(
@@ -462,8 +471,10 @@ mod tests {
         state.enter_running();
         state.update(TuiEvent::UserInputRequested {
             key: new_key.clone(),
-            question: "new question".to_string(),
-            choices: Vec::new(),
+            questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                "new question",
+                Vec::new(),
+            ),
         });
         let theme = Theme::named(ThemeName::Dark);
         let mut vim = VimState::new(false);
@@ -1009,8 +1020,10 @@ mod tests {
             (
                 TuiEvent::UserInputRequested {
                     key: interaction_key(TuiInteractionKind::UserInput, "input"),
-                    question: "secret-question".to_string(),
-                    choices: vec!["secret-choice".to_string()],
+                    questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                        "secret-question",
+                        vec!["secret-choice".to_string()],
+                    ),
                 },
                 "Input required",
             ),
@@ -1208,8 +1221,10 @@ mod tests {
         handle_runtime_event(
             TuiEvent::UserInputRequested {
                 key: interaction_key(TuiInteractionKind::UserInput, "input"),
-                question: "question".to_string(),
-                choices: Vec::new(),
+                questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                    "question",
+                    Vec::new(),
+                ),
             },
             &mut state,
             &action_tx,
@@ -1259,8 +1274,10 @@ mod tests {
         handle_runtime_event(
             TuiEvent::UserInputRequested {
                 key: interaction_key(TuiInteractionKind::UserInput, "input"),
-                question: "question".to_string(),
-                choices: Vec::new(),
+                questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                    "question",
+                    Vec::new(),
+                ),
             },
             &mut state,
             &action_tx,

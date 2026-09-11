@@ -64,8 +64,14 @@ Windows PowerShell 使用 `$env:DEEPSEEK_API_KEY = "sk-..."` 设置密钥；
 
 在 TUI 中，`@` 可以搜索文件、Skills、Plugins 和 MCP Resources。会话指令包括
 `/new`、`/resume`、`/fork [名称]`、`/rename [名称]`、`/status` 和
-`/copy [N]`。`/resume` 选择器还可以分叉、重命名、归档、删除会话和复制
-Session ID。`/history` 已移除；`/clear` 仅作为 `/new` 的隐藏兼容别名保留。
+`/copy [N]`。`/config` 打开交互式会话设置面板。通过 `/model` 或 `/config`
+选择的模型和推理强度会保存到用户 `config.toml`，并应用到新会话；审批模式
+（approval mode）变更仅作用于当前会话，不会被保存。从其他模式进入 `full-auto`
+时必须明确确认 Full Access。runtime 提交成功后，当前任务的下一次工具准入会使用
+`TrustedHost` / `DangerFullAccess`；已经运行的工具和已经启动的委托 child
+继续使用各自原有的策略快照。`/status` 会显示实际 execution profile、shell sandbox
+与 active permission profile。`/resume` 选择器还可以分叉、重命名、归档、删除会话
+和复制 Session ID。`/history` 已移除；`/clear` 仅作为 `/new` 的隐藏兼容别名保留。
 `Ctrl+L` 只清除屏幕内容和终端回滚区，不会清除当前会话上下文。退出 TUI 时，
 Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
 

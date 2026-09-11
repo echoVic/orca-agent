@@ -38,7 +38,7 @@ use crate::transcript_view::{TranscriptRenderContext, viewport_paragraph};
 use crate::types::{
     AppState, AppStatus, ApprovalOption, ConfigDialog, PanelMode, SessionPickerPhase,
 };
-use crate::user_input_dialog::UserInputDialog;
+use crate::user_input_dialog::{UserInputDialog, UserInputDialogMode};
 use crate::viewport_state::CopyNotice;
 use crate::workspace_status::{GitIdentity, compact_cwd};
 
@@ -60,14 +60,24 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
 
     let search_height = u16::from(search_visible(state));
+    let input_region = input_region(state);
     let show_composer_hardware_cursor =
         main_composer_hardware_cursor_visible(state) && search_height == 0;
-    let composer_layout = composer_visible(state)
+    let composer_layout = (input_region == InputRegion::Composer)
         .then(|| composer_visual_layout(frame.area().width, textarea, theme));
-    let input_height = composer_layout
-        .as_ref()
-        .map(|layout| composer_input_height(frame.area().width, textarea, layout))
-        .unwrap_or(0);
+    let input_height = match input_region {
+        InputRegion::Hidden => 0,
+        InputRegion::Composer => composer_layout
+            .as_ref()
+            .map(|layout| composer_input_height(frame.area().width, textarea, layout))
+            .unwrap_or(0),
+        InputRegion::Interaction => state
+            .user_input_dialog
+            .as_ref()
+            .map(|dialog| user_input_region_height(frame.area().width, dialog))
+            .unwrap_or(0),
+    }
+    .min(frame.area().height.saturating_sub(3));
 
     let plan_height = plan_panel_height(state);
     let goal_height: u16 = if state.current_goal().is_some() { 3 } else { 0 };
@@ -124,21 +134,34 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         state.viewport.search_area = Some(chunks[5]);
         render_search_bar(frame, chunks[5], state, theme);
     }
-    if composer_visible(state) {
-        state.viewport.input_area = Some(chunks[6]);
-        render_input(
-            frame,
-            chunks[6],
-            textarea,
-            composer_layout.as_ref().expect("visible composer layout"),
-            state,
-            theme,
-            show_composer_hardware_cursor,
-        );
+    match input_region {
+        InputRegion::Hidden => {}
+        InputRegion::Composer => {
+            state.viewport.input_area = Some(chunks[6]);
+            render_input(
+                frame,
+                chunks[6],
+                textarea,
+                composer_layout.as_ref().expect("visible composer layout"),
+                state,
+                theme,
+                show_composer_hardware_cursor,
+            );
+        }
+        InputRegion::Interaction => {
+            state.viewport.input_area = Some(chunks[6]);
+            render_user_input_dialog(
+                frame,
+                chunks[6],
+                state.user_input_dialog.as_ref().expect("dialog checked"),
+                theme,
+            );
+        }
     }
     render_status(frame, chunks[7], state, theme);
 
     if state.user_input_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && !state.transcript.search.open
         && state.slash_menu.is_some()
     {
@@ -146,6 +169,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
 
     if state.user_input_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && !state.transcript.search.open
         && state.mention.phase.is_some()
         && state.slash_menu.is_none()
@@ -158,6 +182,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         && state.image_viewer.is_none()
         && state.user_input_dialog.is_none()
         && state.config_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && state.plan_approval_dialog.is_none()
         && !state.show_shortcuts
         && state.slash_menu.is_none()
@@ -192,10 +217,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         render_config_dialog(frame, state, theme);
     }
 
-    if let Some(dialog) = state.user_input_dialog.as_ref()
-        && state.status == AppStatus::WaitingUserInput
-    {
-        render_user_input_dialog(frame, dialog, theme);
+    if state.full_access_confirmation.is_some() {
+        render_full_access_confirmation(frame, state, theme);
     }
 
     if state.show_shortcuts {
@@ -318,14 +341,32 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputRegion {
+    Hidden,
+    Composer,
+    Interaction,
+}
+
+fn input_region(state: &AppState) -> InputRegion {
+    if matches!(state.status, AppStatus::WaitingApproval) || state.plan_approval_dialog.is_some() {
+        InputRegion::Hidden
+    } else if state.user_input_dialog.is_some() {
+        InputRegion::Interaction
+    } else {
+        InputRegion::Composer
+    }
+}
+
 fn composer_visible(state: &AppState) -> bool {
-    !matches!(state.status, AppStatus::WaitingApproval) && state.plan_approval_dialog.is_none()
+    input_region(state) == InputRegion::Composer
 }
 
 fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
     composer_visible(state)
         && !state.show_shortcuts
         && state.config_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && state.user_input_dialog.is_none()
         && state.image_viewer.is_none()
 }
@@ -333,6 +374,7 @@ fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
 fn search_visible(state: &AppState) -> bool {
     state.transcript.search.open
         && state.config_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && state.user_input_dialog.is_none()
         && state.plan_approval_dialog.is_none()
         && state.image_viewer.is_none()
@@ -343,37 +385,246 @@ fn search_visible(state: &AppState) -> bool {
         )
 }
 
-fn render_user_input_dialog(frame: &mut Frame, dialog: &UserInputDialog, theme: &Theme) {
-    let width = 82u16.min(frame.area().width.saturating_sub(4));
-    let question_width = width.saturating_sub(6) as usize;
-    let question_lines = wrap_text(dialog.question(), question_width);
-    let preview_rows = dialog
-        .selected_preview()
-        .map_or(0, |preview| preview.lines().count().clamp(1, 4) + 1);
-    let content_rows = question_lines.len() + dialog.choices().len() + preview_rows + 5;
-    let height = (content_rows as u16 + 2)
-        .min(frame.area().height.saturating_sub(2))
-        .max(8);
-    let popup = centered_rect(frame.area(), width, height);
-    frame.render_widget(Clear, popup);
+fn user_input_region_height(area_width: u16, dialog: &UserInputDialog) -> u16 {
+    let inner_width = area_width.saturating_sub(4).max(1) as usize;
+    let question_rows = wrap_text(dialog.question(), inner_width).len().max(1) as u16;
+    let header_rows = u16::from(dialog.question_count() == 1);
+    let navigation_rows = u16::from(dialog.question_count() > 1) * 2;
+    let content_rows = match dialog.mode() {
+        UserInputDialogMode::Choices => {
+            let stacked_preview = if area_width < 72 {
+                dialog
+                    .selected_preview()
+                    .map_or(0, |preview| preview.lines().count().clamp(1, 4) as u16 + 1)
+            } else {
+                0
+            };
+            dialog.choices().len() as u16 + 1 + stacked_preview
+        }
+        UserInputDialogMode::CustomAnswer { value } | UserInputDialogMode::Chat { value } => {
+            wrap_text(value, inner_width.saturating_sub(4)).len().max(1) as u16 + 1
+        }
+        UserInputDialogMode::ConfirmUnanswered { .. } => 4,
+    };
+    (2 + header_rows + navigation_rows + question_rows + 1 + content_rows + 2).clamp(8, 18)
+}
 
-    let mut lines = question_lines
-        .into_iter()
-        .map(|line| {
-            Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(theme.text),
-            ))
-        })
-        .collect::<Vec<_>>();
-    lines.push(Line::from(""));
+fn render_user_input_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &UserInputDialog,
+    theme: &Theme,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let mut y = inner.y;
+    if dialog.question_count() == 1 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" ◆ {} · 1/1", dialog.header()),
+                Style::default()
+                    .fg(theme.border)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y = y.saturating_add(1);
+    } else {
+        let mut tabs = Vec::new();
+        let question_tabs = dialog.question_tabs().collect::<Vec<_>>();
+        let position = format!(
+            " {}/{} ",
+            dialog.active_index() + 1,
+            dialog.question_count()
+        );
+        let expanded_width = question_tabs
+            .iter()
+            .map(|(header, _)| UnicodeWidthStr::width(*header) + 4)
+            .sum::<usize>()
+            + UnicodeWidthStr::width(" ⏎ Submit ")
+            + UnicodeWidthStr::width(position.as_str());
+        if expanded_width > inner.width as usize {
+            let answered = question_tabs
+                .iter()
+                .filter(|(_, answered)| *answered)
+                .count();
+            tabs.push(Span::styled(
+                format!(
+                    " ▸ {} · {}/{} ",
+                    dialog.header(),
+                    dialog.active_index() + 1,
+                    dialog.question_count()
+                ),
+                Style::default()
+                    .fg(theme.border)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            tabs.push(Span::styled(
+                format!(" {answered}/{} answered ", dialog.question_count()),
+                Style::default().fg(theme.muted),
+            ));
+        } else {
+            for (index, (header, answered)) in question_tabs.into_iter().enumerate() {
+                let marker = if index == dialog.active_index() {
+                    "▸"
+                } else if answered {
+                    "✓"
+                } else {
+                    "○"
+                };
+                let style = if index == dialog.active_index() {
+                    Style::default()
+                        .fg(theme.border)
+                        .add_modifier(Modifier::BOLD)
+                } else if answered {
+                    Style::default().fg(theme.success)
+                } else {
+                    Style::default().fg(theme.muted)
+                };
+                tabs.push(Span::styled(format!(" {marker} {header} "), style));
+            }
+        }
+        tabs.push(Span::styled(
+            if dialog.all_answered() {
+                " ⏎ Submit "
+            } else {
+                " ○ Submit "
+            },
+            Style::default().fg(if dialog.all_answered() {
+                theme.success
+            } else {
+                theme.muted
+            }),
+        ));
+        if expanded_width <= inner.width as usize {
+            tabs.push(Span::styled(position, Style::default().fg(theme.muted)));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(tabs)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y = y.saturating_add(1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(theme.muted),
+            )),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y = y.saturating_add(1);
+    }
+
+    let available_above_footer = inner.bottom().saturating_sub(y).saturating_sub(1);
+    let question_lines = wrap_text(dialog.question(), inner.width.saturating_sub(2) as usize);
+    let question_height = (question_lines.len() as u16).min(available_above_footer);
+    if question_height > 0 {
+        frame.render_widget(
+            Paragraph::new(
+                question_lines
+                    .into_iter()
+                    .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.text))))
+                    .collect::<Vec<_>>(),
+            ),
+            Rect::new(
+                inner.x + 1,
+                y,
+                inner.width.saturating_sub(2),
+                question_height,
+            ),
+        );
+        y = y.saturating_add(question_height).saturating_add(1);
+    }
+
+    let footer_y = inner.bottom().saturating_sub(1);
+    let content_height = footer_y.saturating_sub(y);
+    let content = Rect::new(
+        inner.x + 1,
+        y,
+        inner.width.saturating_sub(2),
+        content_height,
+    );
+    match dialog.mode() {
+        UserInputDialogMode::Choices => render_user_input_choices(frame, content, dialog, theme),
+        UserInputDialogMode::CustomAnswer { value } => {
+            render_user_input_text_mode(frame, content, "Custom answer", value, theme)
+        }
+        UserInputDialogMode::Chat { value } => {
+            render_user_input_text_mode(frame, content, "Chat about this", value, theme)
+        }
+        UserInputDialogMode::ConfirmUnanswered { .. } => {
+            render_user_input_unanswered_confirmation(frame, content, dialog, theme)
+        }
+    }
+
+    let footer = match dialog.mode() {
+        UserInputDialogMode::Choices if dialog.multi_select() => {
+            "↑↓ select · Space toggle · ←/→ questions · Enter confirm · Ctrl+T chat".to_string()
+        }
+        UserInputDialogMode::Choices if dialog.choices().is_empty() => {
+            "Type a custom answer · Ctrl+T chat · Esc cancel".to_string()
+        }
+        UserInputDialogMode::Choices => format!(
+            "↑↓ select · 1-{} pick · ←/→ questions · Enter next · Ctrl+T chat",
+            dialog.choices().len()
+        ),
+        UserInputDialogMode::CustomAnswer { .. } => "Enter save answer · Esc choices".to_string(),
+        UserInputDialogMode::Chat { .. } => "Enter send to agent · Esc choices".to_string(),
+        UserInputDialogMode::ConfirmUnanswered { .. } => {
+            "↑↓ select · Enter confirm · Esc back".to_string()
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(footer, Style::default().fg(theme.muted))),
+        Rect::new(inner.x + 1, footer_y, inner.width.saturating_sub(2), 1),
+    );
+}
+
+fn render_user_input_choices(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &UserInputDialog,
+    theme: &Theme,
+) {
+    let preview = dialog.selected_preview();
+    let show_preview = preview.is_some() && !dialog.multi_select() && area.width >= 72;
+    let (choices_area, preview_area) = if show_preview {
+        let split = Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)])
+            .split(area);
+        (split[0], Some(split[1]))
+    } else {
+        (area, None)
+    };
+    let option_prefix_width = if dialog.multi_select() { 8 } else { 6 };
+    let max_label_width = dialog
+        .choices()
+        .iter()
+        .map(|choice| UnicodeWidthStr::width(choice.label()))
+        .max()
+        .unwrap_or(0);
+    let label_column_width = max_label_width
+        .min((choices_area.width as usize / 2).saturating_sub(option_prefix_width + 2));
+    let mut lines = Vec::new();
     for (index, choice) in dialog.choices().iter().enumerate() {
         let focused = dialog.selected() == index;
-        let checked = dialog.is_checked(index);
         let marker = if dialog.multi_select() {
-            if checked { "[x]" } else { "[ ]" }
+            if dialog.is_checked(index) {
+                "[x]"
+            } else {
+                "[ ]"
+            }
         } else if focused {
-            "▸"
+            "›"
         } else {
             " "
         };
@@ -384,24 +635,30 @@ fn render_user_input_dialog(frame: &mut Frame, dialog: &UserInputDialog, theme: 
         } else {
             Style::default().fg(theme.text)
         };
+        let choice_label = truncate_to_display_width(choice.label(), label_column_width);
+        let label_padding =
+            label_column_width.saturating_sub(UnicodeWidthStr::width(choice_label.as_str()));
+        let label = format!(
+            " {marker} {}  {choice_label}{}",
+            index + 1,
+            " ".repeat(label_padding)
+        );
+        let label_width = UnicodeWidthStr::width(label.as_str());
         let detail = truncate_to_display_width(
             choice.description(),
-            width.saturating_sub(12 + choice.label().len() as u16) as usize,
+            choices_area.width.saturating_sub(label_width as u16 + 2) as usize,
         );
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {marker} {}. {}", index + 1, choice.label()),
-                style,
-            ),
+            Span::styled(label, style),
             Span::styled(format!("  {detail}"), Style::default().fg(theme.muted)),
         ]));
     }
     let custom_focused = dialog.selected() == dialog.choices().len();
     lines.push(Line::from(Span::styled(
         if custom_focused {
-            "  ▸ Type a custom answer"
+            " › z  Type a custom answer"
         } else {
-            "    Type a custom answer"
+            "   z  Type a custom answer"
         },
         if custom_focused {
             Style::default()
@@ -411,36 +668,115 @@ fn render_user_input_dialog(frame: &mut Frame, dialog: &UserInputDialog, theme: 
             Style::default().fg(theme.muted)
         },
     )));
-    if let Some(preview) = dialog.selected_preview() {
-        lines.push(Line::from(""));
-        for line in preview.lines().take(4) {
-            lines.push(Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(theme.muted),
-            )));
+    frame.render_widget(Paragraph::new(lines), choices_area);
+
+    if let (Some(preview), Some(preview_area)) = (preview, preview_area) {
+        frame.render_widget(
+            Paragraph::new(
+                preview
+                    .lines()
+                    .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.muted))))
+                    .collect::<Vec<_>>(),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .title(" preview ")
+                    .border_style(Style::default().fg(theme.muted)),
+            )
+            .wrap(Wrap { trim: false }),
+            preview_area,
+        );
+    } else if let Some(preview) = preview {
+        let preview_y = choices_area
+            .y
+            .saturating_add(dialog.choices().len() as u16 + 1);
+        if preview_y < choices_area.bottom() {
+            let preview_height = choices_area.bottom().saturating_sub(preview_y);
+            frame.render_widget(
+                Paragraph::new(
+                    std::iter::once(Line::from(Span::styled(
+                        "preview",
+                        Style::default().fg(theme.muted),
+                    )))
+                    .chain(preview.lines().take(4).map(|line| {
+                        Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(theme.muted),
+                        ))
+                    }))
+                    .collect::<Vec<_>>(),
+                )
+                .wrap(Wrap { trim: false }),
+                Rect::new(
+                    choices_area.x,
+                    preview_y,
+                    choices_area.width,
+                    preview_height,
+                ),
+            );
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        if dialog.multi_select() {
-            "  ↑↓ select · Space toggle · Enter submit · type for custom answer"
-        } else {
-            "  ↑↓ select · Enter choose · type for custom answer"
-        },
-        Style::default().fg(theme.muted),
-    )));
+}
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" User question ")
-        .border_style(Style::default().fg(theme.border));
+fn render_user_input_text_mode(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: &str,
+    theme: &Theme,
+) {
+    let mut text = value.to_string();
+    text.push('▍');
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        popup,
+        Paragraph::new(vec![
+            Line::from(Span::styled(label, Style::default().fg(theme.muted))),
+            Line::from(Span::styled(text, Style::default().fg(theme.text))),
+        ])
+        .wrap(Wrap { trim: false }),
+        area,
     );
+}
+
+fn render_user_input_unanswered_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &UserInputDialog,
+    theme: &Theme,
+) {
+    let selected = dialog.confirmation_selected().unwrap_or(0);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Some questions are unanswered.",
+            Style::default().fg(theme.warning),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            if selected == 0 {
+                " › Go back and answer"
+            } else {
+                "   Go back and answer"
+            },
+            Style::default().fg(if selected == 0 {
+                theme.border
+            } else {
+                theme.text
+            }),
+        )),
+        Line::from(Span::styled(
+            if selected == 1 {
+                " › Submit answered questions"
+            } else {
+                "   Submit answered questions"
+            },
+            Style::default().fg(if selected == 1 {
+                theme.border
+            } else {
+                theme.text
+            }),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_config_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
@@ -482,6 +818,66 @@ fn render_config_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .border_type(BorderType::Rounded)
         .title(" Runtime Configuration ")
         .border_style(Style::default().fg(theme.border));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn render_full_access_confirmation(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let Some(confirmation) = state.full_access_confirmation.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(
+        frame.area(),
+        72u16.min(frame.area().width.saturating_sub(4)),
+        12u16.min(frame.area().height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, popup);
+
+    let continue_style = if confirmation.selected == 0 {
+        Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    let cancel_style = if confirmation.selected == 1 {
+        Style::default()
+            .fg(theme.border)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            "  Full Access removes command approvals and OS sandbox restrictions.",
+            Style::default().fg(theme.warning),
+        )),
+        Line::from(""),
+        Line::from("  Commands may modify any file and access the network."),
+        Line::from("  The active task will use this authority from its next tool call."),
+        Line::from("  Tools already running keep the policy they started with."),
+        Line::from(""),
+        Line::from(Span::styled(
+            if confirmation.selected == 0 {
+                "  > Continue with Full Access"
+            } else {
+                "    Continue with Full Access"
+            },
+            continue_style,
+        )),
+        Line::from(Span::styled(
+            if confirmation.selected == 1 {
+                "  > Cancel"
+            } else {
+                "    Cancel"
+            },
+            cancel_style,
+        )),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Enable Full Access? ")
+        .border_style(Style::default().fg(theme.error));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -6264,15 +6660,77 @@ mod tests {
     }
 
     #[test]
-    fn user_input_dialog_renders_choices_without_skill_popup() {
+    fn full_access_confirmation_renders_risk_and_defaults_to_cancel() {
+        let mut state = test_state();
+        state.full_access_confirmation = Some(crate::types::FullAccessConfirmation {
+            selected: 1,
+            model: None,
+            reasoning_effort: None,
+        });
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::from([""]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(84, 22))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Enable Full Access?"));
+        assert!(rendered.contains("OS sandbox restrictions"));
+        assert!(rendered.contains("next tool call"));
+        assert!(rendered.contains("> Cancel"));
+    }
+
+    #[test]
+    fn user_input_questionnaire_renders_inline_without_skill_popup() {
         let mut state = test_state();
         state.set_status(AppStatus::WaitingUserInput);
+        state.push_message(ChatMessage::System(
+            "conversation context remains visible".to_string(),
+        ));
         state.user_input_dialog = Some(UserInputDialog::new(
-            "Task: Which path?",
-            vec![
-                "Audit - Run existing checks".to_string(),
-                "Improve - Replace placeholders\nPreview:\nfeature_list.json".to_string(),
-            ],
+            crate::protocol::TuiUserInputQuestionnaire {
+                questions: vec![
+                    crate::protocol::TuiUserInputQuestion {
+                        id: "question-1".to_string(),
+                        header: "Task".to_string(),
+                        question: "Which path?".to_string(),
+                        options: vec![
+                            crate::protocol::TuiUserInputOption {
+                                label: "Audit".to_string(),
+                                description: "Run existing checks".to_string(),
+                                preview: Some("cargo test --workspace".to_string()),
+                            },
+                            crate::protocol::TuiUserInputOption {
+                                label: "Improve".to_string(),
+                                description: "Replace placeholders".to_string(),
+                                preview: None,
+                            },
+                        ],
+                        multi_select: false,
+                    },
+                    crate::protocol::TuiUserInputQuestion {
+                        id: "question-2".to_string(),
+                        header: "Scope".to_string(),
+                        question: "Which scope?".to_string(),
+                        options: vec![
+                            crate::protocol::TuiUserInputOption {
+                                label: "Focused".to_string(),
+                                description: "Only this feature".to_string(),
+                                preview: None,
+                            },
+                            crate::protocol::TuiUserInputOption {
+                                label: "Broad".to_string(),
+                                description: "Include related cleanup".to_string(),
+                                preview: None,
+                            },
+                        ],
+                        multi_select: false,
+                    },
+                ],
+            },
         ));
         state.mention.phase = Some(SearchPhase::Complete);
         let theme = Theme::named(ThemeName::Dark);
@@ -6285,11 +6743,273 @@ mod tests {
             .expect("draw");
 
         let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("User question"));
-        assert!(rendered.contains("Task: Which path?"));
+        assert!(rendered.contains("▸ Task"));
+        assert!(rendered.contains("1/2"));
+        assert!(rendered.contains("Which path?"));
         assert!(rendered.contains("Audit"));
         assert!(rendered.contains("Improve"));
+        assert!(rendered.contains("Scope"));
+        assert!(rendered.contains("preview"));
+        assert!(rendered.contains("cargo test --workspace"));
+        assert!(rendered.contains("conversation context remains visible"));
         assert!(!rendered.contains("No matching skills"));
+        let width = terminal.backend().buffer().area.width as usize;
+        let task_rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width)
+            .filter(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("Task")
+            })
+            .count();
+        assert_eq!(task_rows, 1, "current header must render on one row");
+    }
+
+    #[test]
+    fn user_input_choice_descriptions_share_one_display_column() {
+        let mut state = test_state();
+        state.set_status(AppStatus::WaitingUserInput);
+        state.user_input_dialog = Some(UserInputDialog::new(
+            crate::protocol::TuiUserInputQuestionnaire {
+                questions: vec![crate::protocol::TuiUserInputQuestion {
+                    id: "question-1".to_string(),
+                    header: "验证安排".to_string(),
+                    question: "测试怎么安排？".to_string(),
+                    options: vec![
+                        crate::protocol::TuiUserInputOption {
+                            label: "我写测试你来跑".to_string(),
+                            description: "detail one".to_string(),
+                            preview: None,
+                        },
+                        crate::protocol::TuiUserInputOption {
+                            label: "只做静态审查".to_string(),
+                            description: "detail two".to_string(),
+                            preview: None,
+                        },
+                        crate::protocol::TuiUserInputOption {
+                            label: "附带验证脚本".to_string(),
+                            description: "detail three".to_string(),
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                }],
+            },
+        ));
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(121, 24))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("1-3 pick"));
+        assert!(!rendered.contains("1-4 pick"));
+        let width = terminal.backend().buffer().area.width as usize;
+        let detail_columns = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width)
+            .filter(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("detail")
+            })
+            .map(|row| {
+                row.iter()
+                    .position(|cell| cell.symbol() == "d")
+                    .expect("detail column")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(detail_columns.len(), 3);
+        assert!(
+            detail_columns
+                .iter()
+                .all(|column| *column == detail_columns[0]),
+            "descriptions must align to one display column: {detail_columns:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_user_input_questionnaire_keeps_context_and_stacks_preview() {
+        let mut state = test_state();
+        state.set_status(AppStatus::WaitingUserInput);
+        state.push_message(ChatMessage::System("narrow transcript context".to_string()));
+        state.user_input_dialog = Some(UserInputDialog::new(
+            crate::protocol::TuiUserInputQuestionnaire {
+                questions: vec![
+                    crate::protocol::TuiUserInputQuestion {
+                        id: "question-1".to_string(),
+                        header: "Architecture".to_string(),
+                        question: "Which implementation?".to_string(),
+                        options: vec![
+                            crate::protocol::TuiUserInputOption {
+                                label: "Focused".to_string(),
+                                description: "Keep the change local".to_string(),
+                                preview: Some("enum InputRegion".to_string()),
+                            },
+                            crate::protocol::TuiUserInputOption {
+                                label: "Broad".to_string(),
+                                description: "Refactor related code".to_string(),
+                                preview: None,
+                            },
+                        ],
+                        multi_select: false,
+                    },
+                    crate::protocol::TuiUserInputQuestion {
+                        id: "question-2".to_string(),
+                        header: "Verification".to_string(),
+                        question: "Which checks?".to_string(),
+                        options: vec![
+                            crate::protocol::TuiUserInputOption {
+                                label: "Focused".to_string(),
+                                description: "Feature tests".to_string(),
+                                preview: None,
+                            },
+                            crate::protocol::TuiUserInputOption {
+                                label: "Full".to_string(),
+                                description: "Workspace tests".to_string(),
+                                preview: None,
+                            },
+                        ],
+                        multi_select: true,
+                    },
+                    crate::protocol::TuiUserInputQuestion {
+                        id: "question-3".to_string(),
+                        header: "Compatibility".to_string(),
+                        question: "Keep legacy clients?".to_string(),
+                        options: vec![
+                            crate::protocol::TuiUserInputOption {
+                                label: "Keep".to_string(),
+                                description: "Preserve old clients".to_string(),
+                                preview: None,
+                            },
+                            crate::protocol::TuiUserInputOption {
+                                label: "Break".to_string(),
+                                description: "Require new clients".to_string(),
+                                preview: None,
+                            },
+                        ],
+                        multi_select: false,
+                    },
+                ],
+            },
+        ));
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(52, 18))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Architecture · 1/3"));
+        assert!(rendered.contains("0/3 answered"));
+        assert!(rendered.contains("narrow transcript context"));
+        assert!(rendered.contains("preview"));
+        assert!(rendered.contains("enum InputRegion"));
+    }
+
+    #[test]
+    fn multi_question_confirmation_does_not_duplicate_header_across_border_and_navigation() {
+        let mut state = test_state();
+        state.set_status(AppStatus::WaitingUserInput);
+        state.user_input_dialog = Some(UserInputDialog::new(
+            crate::protocol::TuiUserInputQuestionnaire {
+                questions: ["本次目标", "重构状态", "验证范围", "交付方式"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, header)| crate::protocol::TuiUserInputQuestion {
+                        id: format!("question-{}", index + 1),
+                        header: header.to_string(),
+                        question: "这次会话你希望我优先做什么？".to_string(),
+                        options: vec![
+                            crate::protocol::TuiUserInputOption {
+                                label: "继续".to_string(),
+                                description: "继续当前工作".to_string(),
+                                preview: None,
+                            },
+                            crate::protocol::TuiUserInputOption {
+                                label: "停止".to_string(),
+                                description: "停止当前工作".to_string(),
+                                preview: None,
+                            },
+                        ],
+                        multi_select: false,
+                    })
+                    .collect(),
+            },
+        ));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let textarea = TextArea::default();
+        for _ in 0..4 {
+            crate::user_input_dialog::handle_user_input_dialog_key(
+                &crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Right,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                &mut state,
+                &textarea,
+                &action_tx,
+            );
+        }
+        let theme = Theme::named(ThemeName::Dark);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(121, 31))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let width = terminal.backend().buffer().area.width as usize;
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let compact_rows = rows
+            .iter()
+            .map(|row| row.replace(' ', ""))
+            .collect::<Vec<_>>();
+        let matching_rows = compact_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("本次目标"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching_rows.len(),
+            1,
+            "the active header must not be duplicated into the border title: {rows:#?}"
+        );
+        let (navigation_row, navigation) = matching_rows[0];
+        assert!(navigation.contains("重构状态"));
+        assert!(navigation.contains("验证范围"));
+        assert!(navigation.contains("交付方式"));
+        assert!(navigation.contains("Submit"));
+        assert!(!compact_rows[navigation_row.saturating_sub(1)].contains("本次目标"));
+        assert!(
+            rows[navigation_row].contains("▸ 本"),
+            "the marker must keep a space before the active header: {:?}",
+            rows[navigation_row]
+        );
+        assert!(
+            rows[navigation_row].contains("○ 重"),
+            "unanswered markers must keep a space before the header: {:?}",
+            rows[navigation_row]
+        );
     }
 
     #[test]

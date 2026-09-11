@@ -240,6 +240,14 @@ pub fn canonical_action_kind(request: &ToolRequest) -> ActionKind {
     canonical_action_kind_with_mcp_and_external(request, None, &[])
 }
 
+pub fn canonical_capabilities(
+    request: &ToolRequest,
+) -> Option<orca_core::tool_types::CapabilitySet> {
+    registry::default_tool_registry()
+        .resolve(request.name.as_str())
+        .map(|resolved| resolved.spec.capabilities.clone())
+}
+
 pub fn canonical_action_kind_with_mcp_and_external(
     request: &ToolRequest,
     mcp_registry: Option<&McpRegistry>,

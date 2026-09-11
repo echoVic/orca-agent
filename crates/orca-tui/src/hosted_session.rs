@@ -141,18 +141,63 @@ struct QueueUserInputHandler {
 }
 
 impl RuntimeUserInputHandler for QueueUserInputHandler {
-    fn request_user_input(&self, request: &RuntimeUserInputRequest) -> io::Result<Option<String>> {
+    fn request_user_input(
+        &self,
+        request: &RuntimeUserInputRequest,
+    ) -> io::Result<Option<orca_runtime::lifecycle::RuntimeUserInputResponse>> {
         let response = self.control.await_queue_interaction(
             request.id.clone(),
             TuiInteractionKind::UserInput,
             |key| TuiEvent::UserInputRequested {
                 key,
-                question: request.question.clone(),
-                choices: request.choices.clone(),
+                questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+                    questions: request
+                        .questions
+                        .iter()
+                        .map(|question| crate::protocol::TuiUserInputQuestion {
+                            id: question.id.clone(),
+                            header: question.header.clone(),
+                            question: question.question.clone(),
+                            options: question
+                                .options
+                                .iter()
+                                .map(|option| crate::protocol::TuiUserInputOption {
+                                    label: option.label.clone(),
+                                    description: option.description.clone(),
+                                    preview: option.preview.clone(),
+                                })
+                                .collect(),
+                            multi_select: question.multi_select,
+                        })
+                        .collect(),
+                },
             },
         )?;
         match response {
-            TuiInteractionResponse::UserInput(answer) => Ok(Some(answer)),
+            TuiInteractionResponse::UserQuestionnaire(
+                crate::protocol::TuiUserInputResponse::Submitted { answers },
+            ) => Ok(Some(
+                orca_runtime::lifecycle::RuntimeUserInputResponse::Submitted {
+                    answers: answers
+                        .into_iter()
+                        .map(|answer| orca_runtime::lifecycle::RuntimeUserInputAnswer {
+                            question_id: answer.question_id,
+                            answers: answer.answers,
+                        })
+                        .collect(),
+                },
+            )),
+            TuiInteractionResponse::UserQuestionnaire(
+                crate::protocol::TuiUserInputResponse::Chat { message },
+            ) => Ok(Some(
+                orca_runtime::lifecycle::RuntimeUserInputResponse::Chat { message },
+            )),
+            TuiInteractionResponse::UserQuestionnaire(
+                crate::protocol::TuiUserInputResponse::Cancelled,
+            ) => Ok(None),
+            TuiInteractionResponse::UserInput(message) => Ok(Some(
+                orca_runtime::lifecycle::RuntimeUserInputResponse::Chat { message },
+            )),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "queued user-input response kind did not match the request",

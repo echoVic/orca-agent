@@ -73,8 +73,15 @@ the `orca` commands are the same.
 In the TUI, `@` searches files, skills, plugins, and MCP resources. Session
 commands are `/new`, `/resume`, `/fork [name]`, `/rename [name]`, `/status`,
 `/config`, and `/copy [N]`. `/config` opens an interactive session settings
-panel. The resume picker also supports fork, rename, archive, delete,
-and copying a session ID. `/history` is retired; `/clear` remains a hidden
+panel. Model and reasoning-effort choices from `/model` or `/config` are saved
+to the user `config.toml` and apply to new sessions; approval mode changes stay
+session-scoped and are never saved. Entering `full-auto` requires an explicit
+Full Access confirmation. Once the runtime commits it, the active task's next
+tool admission uses `TrustedHost` / `DangerFullAccess`; tools already running
+and delegated children already launched retain their original policy snapshot.
+`/status` reports the effective execution profile, shell sandbox, and active
+permission profile. The resume picker also supports fork, rename, archive,
+delete, and copying a session ID. `/history` is retired; `/clear` remains a hidden
 compatibility alias for `/new`. `Ctrl+L` clears only the displayed transcript
 and terminal scrollback, keeping the current conversation context. On exit,
 Orca prints the exact `orca --resume <SESSION_ID>` command for the session.

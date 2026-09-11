@@ -311,15 +311,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         background_workflows,
     } = io;
     let (step_snapshot, extensions) = step_context.into_parts();
-    let config = step_snapshot.config;
+    let base_config = step_snapshot.config;
     let cwd = step_snapshot.turn_context.cwd;
     let tool_policy = step_snapshot.tool_policy;
-    let delegation_config = tool_policy.allowed_tools().map(|allowed| {
-        let mut config = config.clone();
-        config.subagents.inherited_tools = Some(allowed.to_vec());
-        config
-    });
-    let config = delegation_config.as_ref().unwrap_or(config);
+    let execution_policy = step_snapshot.turn_context.execution_policy.cloned();
     let subagent_depth = step_snapshot.turn_context.subagent_depth;
     let root_task_id = step_snapshot.turn_context.root_task_id;
     let emit_deltas = step_snapshot.turn_context.emit_deltas;
@@ -327,7 +322,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let provider_response_ingress = step_snapshot.turn_context.provider_response_ingress();
     let workflow_lifecycle_ingress = step_snapshot.turn_context.workflow_lifecycle_ingress();
     let wait_for_background_workflows = step_snapshot.turn_context.wait_for_background_workflows;
-    let policy = step_snapshot.policy;
+    let initial_policy = step_snapshot.policy;
     let capabilities = step_snapshot.capabilities();
     let instructions = capabilities.instructions;
     let memory = capabilities.memory;
@@ -342,6 +337,30 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let user_input_handler = capabilities.user_input_handler;
     let mcp_elicitation_handler = capabilities.mcp_elicitation_handler;
     while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
+        // Capture one immutable execution-policy revision per dispatch. A user
+        // confirmed policy change therefore affects the next tool admission,
+        // while a tool that has already started keeps its original authority.
+        let policy_snapshot = execution_policy
+            .as_ref()
+            .map(crate::runtime_execution_policy::RuntimeExecutionPolicyHandle::snapshot);
+        let _policy_revision = policy_snapshot
+            .as_ref()
+            .map(crate::runtime_execution_policy::RuntimeExecutionPolicySnapshot::revision);
+        let policy_config = policy_snapshot
+            .as_ref()
+            .map(crate::runtime_execution_policy::RuntimeExecutionPolicySnapshot::config)
+            .unwrap_or(base_config);
+        let delegation_config = tool_policy.allowed_tools().map(|allowed| {
+            let mut config = policy_config.clone();
+            config.subagents.inherited_tools = Some(allowed.to_vec());
+            config
+        });
+        let config = delegation_config.as_ref().unwrap_or(policy_config);
+        let current_policy = policy_snapshot
+            .as_ref()
+            .map(|_| crate::tool_execution::policy_for_tool_execution(config));
+        let policy = current_policy.as_ref().unwrap_or(initial_policy);
+
         if cancel.is_cancelled() {
             close_unstarted_tool_requests(
                 sampling_state,
@@ -3227,7 +3246,7 @@ mod tests {
             fn request_user_input(
                 &self,
                 _request: &crate::lifecycle::RuntimeUserInputRequest,
-            ) -> io::Result<Option<String>> {
+            ) -> io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>> {
                 self.calls.set(self.calls.get() + 1);
                 Ok(None)
             }

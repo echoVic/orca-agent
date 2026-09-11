@@ -61,11 +61,11 @@ mod tests {
     }
 
     #[test]
-    fn full_auto_disables_prompts_without_selecting_trusted_host() {
+    fn full_auto_selects_trusted_host_execution() {
         assert_eq!(ApprovalMode::FullAuto.behavior(), ApprovalBehavior::Never);
         assert_eq!(
             crate::capability::ExecutionProfile::for_approval_mode(ApprovalMode::FullAuto),
-            crate::capability::ExecutionProfile::Workspace
+            crate::capability::ExecutionProfile::TrustedHost
         );
     }
 }

@@ -232,6 +232,8 @@ struct OrcaAcpInteractionCapabilitiesV1 {
 struct OrcaAcpUserInputRequestV1 {
     question: NonEmptyText,
     suggestions: Vec<DisplayText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    questionnaire: Option<crate::surface::SurfaceUserInputQuestionnaire>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -255,7 +257,15 @@ pub(crate) struct OrcaAcpUserInputExtensionResponseV1 {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum OrcaAcpUserInputResponseV1 {
-    Answer { value: DisplayText },
+    Answer {
+        value: DisplayText,
+    },
+    Submitted {
+        response: crate::surface::SurfaceUserInputResponse,
+    },
+    Chat {
+        value: DisplayText,
+    },
     Cancelled,
 }
 
@@ -2091,6 +2101,49 @@ fn build_interaction_request(
                     request: OrcaAcpUserInputRequestV1 {
                         question: question.clone(),
                         suggestions: suggestions.clone(),
+                        questionnaire: None,
+                    },
+                }),
+                AcpInteractionTarget::UserInput {
+                    session_id: session_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                },
+            ));
+        }
+        SurfaceInteractionRequest::UserQuestionnaire { questionnaire } => {
+            let first = &questionnaire.questions.as_slice()[0];
+            let mut legacy_question =
+                format!("{}: {}", first.header.as_str(), first.question.as_str());
+            if first.multi_select {
+                legacy_question.push_str(
+                    "\nSelect one or more choices separated by commas, or type a custom answer.",
+                );
+            }
+            return Ok((
+                AcpInteractionWireRequest::UserInput(OrcaAcpUserInputExtensionRequestV1 {
+                    version: ORCA_ACP_INTERACTION_EXTENSION_VERSION,
+                    session_id: session_id.clone(),
+                    interaction_id: interaction.interaction_id.clone(),
+                    request: OrcaAcpUserInputRequestV1 {
+                        question: NonEmptyText::try_new(legacy_question)
+                            .expect("structured question presentation is non-empty"),
+                        suggestions: first
+                            .options
+                            .iter()
+                            .map(|option| {
+                                let mut choice = format!(
+                                    "{} - {}",
+                                    option.label.as_str(),
+                                    option.description.as_str()
+                                );
+                                if let Some(preview) = option.preview.as_ref() {
+                                    choice.push_str("\nPreview:\n");
+                                    choice.push_str(preview.as_str());
+                                }
+                                DisplayText::new(choice)
+                            })
+                            .collect(),
+                        questionnaire: Some(questionnaire.clone()),
                     },
                 }),
                 AcpInteractionTarget::UserInput {
@@ -2267,6 +2320,10 @@ fn interaction_answer(
                 OrcaAcpUserInputResponseV1::Answer { value } => {
                     SurfaceUserInputDecision::Answer(value)
                 }
+                OrcaAcpUserInputResponseV1::Submitted { response } => {
+                    SurfaceUserInputDecision::Submitted(response)
+                }
+                OrcaAcpUserInputResponseV1::Chat { value } => SurfaceUserInputDecision::Chat(value),
                 OrcaAcpUserInputResponseV1::Cancelled => SurfaceUserInputDecision::Cancel,
             };
             Ok(SurfaceClientInteractionAnswer::UserInput { decision })
@@ -3820,6 +3877,7 @@ mod tests {
             request: OrcaAcpUserInputRequestV1 {
                 question: NonEmptyText::try_new("Continue?").unwrap(),
                 suggestions: vec![DisplayText::new("yes"), DisplayText::new("no")],
+                questionnaire: None,
             },
         });
         assert_eq!(

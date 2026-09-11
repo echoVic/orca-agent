@@ -9,6 +9,7 @@ use orca_core::config::{ReasoningEffort, RunConfig};
 
 use crate::commands;
 use crate::composer_textarea::{make_textarea, make_textarea_with_text, textarea_text};
+use crate::full_access_confirmation_actions::request_settings_change;
 use crate::protocol::UserAction;
 use crate::slash_command_actions::encode_settings_intent;
 use crate::slash_command_actions::{SlashOutcome, handle_slash_command, parse_approval_mode};
@@ -65,6 +66,7 @@ pub(crate) fn handle_slash_menu_key(
     theme: &Theme,
 ) -> bool {
     let mut pending_settings = None;
+    let mut pending_mode = None;
     let menu = match &mut state.slash_menu {
         Some(m) => m,
         None => return false,
@@ -109,13 +111,16 @@ pub(crate) fn handle_slash_menu_key(
                 } else if title == "/mode"
                     && let Some(mode) = parse_approval_mode(&chosen)
                 {
-                    pending_settings = Some(encode_settings_intent(None, None, Some(mode)));
+                    pending_mode = Some(mode);
                 }
                 if let Some(settings) = pending_settings {
                     let _ = action_tx.send(UserAction::SetModel(settings));
                 }
                 state.slash_menu = None;
                 *textarea = make_textarea(vim_state, theme);
+                if let Some(mode) = pending_mode {
+                    request_settings_change(state, action_tx, None, None, Some(mode));
+                }
                 return true;
             }
             KeyCode::Esc => {

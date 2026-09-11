@@ -11,6 +11,7 @@ use crate::composer_textarea::{
     MAX_USER_INPUT_TEXT_CHARS, expand_pending_pastes, make_textarea, make_textarea_with_text,
     textarea_text,
 };
+use crate::protocol::TuiUserInputResponse;
 use crate::protocol::{PendingTuiInput, TuiInteractionResponse, TuiMcpElicitationMode, UserAction};
 use crate::slash_command_actions::{SlashOutcome, handle_composer_slash_command};
 use crate::theme::Theme;
@@ -190,8 +191,8 @@ pub(crate) fn handle_idle_submit(
     true
 }
 
-pub(crate) fn submit_pending_user_input_choice(
-    answer: String,
+pub(crate) fn submit_pending_user_input_response(
+    response: TuiUserInputResponse,
     textarea: &TextArea,
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -200,6 +201,10 @@ pub(crate) fn submit_pending_user_input_choice(
         return false;
     };
     let key = key.clone();
+    let response_summary = state
+        .user_input_dialog
+        .as_ref()
+        .map(|dialog| dialog.response_summary(&response));
     let visible_text = textarea_text(textarea);
     let staged_key = state.stage_pending_interaction_submission_with_composer(
         visible_text,
@@ -208,6 +213,9 @@ pub(crate) fn submit_pending_user_input_choice(
         state.pending_pastes.clone(),
     );
     debug_assert_eq!(staged_key.as_ref(), Some(&key));
+    if let Some(submission) = state.interaction.pending_submission.as_mut() {
+        submission.response_summary = response_summary;
+    }
     state.interaction.pending_input = None;
     state.interaction.pending_mcp_elicitation_mode = None;
     state.user_input_dialog = None;
@@ -215,7 +223,7 @@ pub(crate) fn submit_pending_user_input_choice(
     state.scroll_to_bottom();
     let _ = action_tx.send(UserAction::RespondToInteraction {
         key,
-        response: TuiInteractionResponse::UserInput(answer),
+        response: TuiInteractionResponse::UserQuestionnaire(response),
     });
     true
 }
@@ -446,8 +454,10 @@ mod tests {
         let key = interaction_key(TuiInteractionKind::UserInput, "input-slash");
         state.update(TuiEvent::UserInputRequested {
             key: key.clone(),
-            question: "Which path?".to_string(),
-            choices: Vec::new(),
+            questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                "Which path?",
+                Vec::new(),
+            ),
         });
         let mut config = test_run_config();
         let shared = Arc::new(Mutex::new(config.clone()));
@@ -582,8 +592,10 @@ mod tests {
             (
                 TuiEvent::UserInputRequested {
                     key: user_key.clone(),
-                    question: "Continue?".to_string(),
-                    choices: Vec::new(),
+                    questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                        "Continue?",
+                        Vec::new(),
+                    ),
                 },
                 user_key,
                 None,

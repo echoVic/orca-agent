@@ -68,7 +68,7 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 | MCP | 支持 | 支持 | MCP 客户端工具路由与 resources list/templates/read 已接入 |
 | 自定义工具 | 插件/扩展 | MCP/插件 | TOML external tools + MCP |
 | Skills | skills / slash 工作流 | Codex skills / plugins | Markdown `SKILL.md` discovery + `$skill` 显式注入 |
-| 用户输入 | `AskUserQuestion` 多问题问卷 | `request_user_input` 多问题结构 | TUI `ask_user_question` 逐题选择框，支持多选与自定义回答 |
+| 用户输入 | `AskUserQuestion` 多问题问卷 | `request_user_input` 多问题结构 | TUI 内联 questionnaire，一次提交 1-4 题，支持翻页、多选、preview、自定义答案和 Chat |
 | 审批 | 工具能力/策略 | 工具能力/策略 | 从 `ToolSpec.capabilities` 推导 |
 | 上下文工具 | 按模式暴露 | 按模式暴露 | `get_goal` / `create_goal` / `update_goal` 等按 runtime context 过滤 |
 
@@ -142,8 +142,8 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 - `list_skills` / `read_skill` 可发现和读取 `$ORCA_HOME/skills`、`~/.orca/skills` 和项目 `.orca/skills` 下的 Markdown skills。
 - TUI `/skills` 会打开可搜索的 `$` picker；选择后的 `$skill_id` 作为原子 composer token 处理，退格或删除不会留下半个 skill 引用。
 - 当 prompt 明确提到 `$skill_id` 时，Orca 会把对应 `SKILL.md` 注入当轮模型上下文。
-- `ask_user_question` 是唯一注册且模型可见的澄清工具：单次接受 1-4 个问题，每题需要短 header、问题正文和 2-4 个 `label`/`description` 选项，可附 `preview` 并用 `multiSelect` 标记多选。runtime 逐题生成唯一 interaction id，经现有 broker 等待 composer 答案，最后返回 `answers` JSON；任一题取消会取消整次工具调用。
-- headless 路径确定性失败而不阻塞。TUI 允许输入选项标签或自定义文本；多选答案以逗号分隔，preview 会随选项正文展示。
+- `ask_user_question` 是唯一注册且模型可见的澄清工具：单次接受 1-4 个问题，每题需要短 header、问题正文和 2-4 个 `label`/`description` 选项，可附 `preview` 并用 `multiSelect` 标记多选。runtime 将整份 questionnaire 作为一个 typed interaction 发布并等待一次提交，最后返回 `answers` JSON；任一题可留空，取消会取消整次工具调用。
+- headless 路径确定性失败而不阻塞。TUI 在 composer 槽位内联显示整份 questionnaire，支持翻页、单选、多选、自定义答案、preview、未答确认及 `Ctrl+T` Chat；提交 ACK 后才在 transcript 回显答案，失败时恢复完整问卷和原 composer 草稿。
 
 ### 5. Empty-result Semantics
 
@@ -178,7 +178,7 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
 ### 短期
 
-1. 为 `ask_user_question` 增加可配置自动超时和专用多选控件；当前答案通过 composer 逐题提交。
+1. 为 `ask_user_question` 增加可配置自动超时；结构化多选与内联 questionnaire 已完成。
 
 ### 中期
 

@@ -15,9 +15,10 @@ pub(in crate::server::router) fn dispatch_user_input_operation<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     match op {
-        ClientOp::UserInputRespond { request_id, answer } => {
-            run_user_input_respond(state, request_id, answer.clone(), id, writer)
-        }
+        ClientOp::UserInputRespond {
+            request_id,
+            response,
+        } => run_user_input_respond(state, request_id, response.clone(), id, writer),
         _ => unreachable!("only user input operations can reach the user input processor"),
     }
 }
@@ -25,11 +26,22 @@ pub(in crate::server::router) fn dispatch_user_input_operation<W: Write>(
 fn run_user_input_respond<W: Write>(
     state: &mut ServerState,
     request_id: &str,
-    answer: Option<String>,
+    response: protocol::UserInputResponse,
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    let response_digest = jsonl_response_digest(&json!({ "answer": &answer }))?;
+    let response_digest = match &response {
+        protocol::UserInputResponse::Cancel => jsonl_response_digest(&json!({ "answer": null }))?,
+        protocol::UserInputResponse::Answer(answer) => {
+            jsonl_response_digest(&json!({ "answer": answer }))?
+        }
+        protocol::UserInputResponse::Submitted { answers } => {
+            jsonl_response_digest(&json!({ "answers": answers }))?
+        }
+        protocol::UserInputResponse::Chat(message) => {
+            jsonl_response_digest(&json!({ "chat": message }))?
+        }
+    };
     let pending = state.direct_interactions.published_route(
         request_id,
         direct_interaction_adapter::JsonlDirectInteractionKind::UserInput,
@@ -54,7 +66,7 @@ fn run_user_input_respond<W: Write>(
                 &id,
                 ServerEvent::UserInputResolved {
                     request_id: json!(request_id),
-                    answered: json!(answer.is_some()),
+                    answered: json!(!matches!(response, protocol::UserInputResponse::Cancel)),
                 },
             ),
             JsonlCommittedReplay::ConflictingResponse => protocol::write_server_event(
@@ -71,12 +83,15 @@ fn run_user_input_respond<W: Write>(
             ),
         };
     };
-    let answered = answer.is_some();
-    let decision = match answer {
-        Some(answer) => crate::surface::SurfaceUserInputDecision::Answer(
-            crate::surface::DisplayText::new(answer),
-        ),
-        None => crate::surface::SurfaceUserInputDecision::Cancel,
+    let (answered, decision) = match surface_user_input_decision(response) {
+        Ok(response) => response,
+        Err(error) => {
+            return protocol::write_server_event(
+                writer,
+                &id,
+                ServerEvent::error(format!("invalid structured user input response: {error}")),
+            );
+        }
     };
     let response_request_id = crate::surface::SurfaceRequestId::new();
     match pending.0.respond_interaction_by_id(
@@ -120,4 +135,84 @@ fn run_user_input_respond<W: Write>(
             answered: json!(answered),
         },
     )
+}
+
+fn surface_user_input_decision(
+    response: protocol::UserInputResponse,
+) -> Result<(bool, crate::surface::SurfaceUserInputDecision), crate::surface::SurfaceValueError> {
+    match response {
+        protocol::UserInputResponse::Cancel => {
+            Ok((false, crate::surface::SurfaceUserInputDecision::Cancel))
+        }
+        protocol::UserInputResponse::Answer(answer) => Ok((
+            true,
+            crate::surface::SurfaceUserInputDecision::Answer(crate::surface::DisplayText::new(
+                answer,
+            )),
+        )),
+        protocol::UserInputResponse::Submitted { answers } => {
+            let answers = answers
+                .into_iter()
+                .map(|answer| {
+                    Ok(crate::surface::SurfaceUserInputQuestionAnswer {
+                        question_id: crate::surface::NonEmptyText::try_new(answer.question_id)?,
+                        answers: answer
+                            .answers
+                            .into_iter()
+                            .map(crate::surface::DisplayText::new)
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, crate::surface::SurfaceValueError>>()?;
+            Ok((
+                true,
+                crate::surface::SurfaceUserInputDecision::Submitted(
+                    crate::surface::SurfaceUserInputResponse { answers },
+                ),
+            ))
+        }
+        protocol::UserInputResponse::Chat(message) => Ok((
+            true,
+            crate::surface::SurfaceUserInputDecision::Chat(crate::surface::DisplayText::new(
+                message,
+            )),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_answers_preserve_every_question_identity() {
+        let (_, decision) = surface_user_input_decision(protocol::UserInputResponse::Submitted {
+            answers: vec![
+                protocol::UserInputQuestionAnswer {
+                    question_id: "question-1".to_string(),
+                    answers: vec!["Focused".to_string()],
+                },
+                protocol::UserInputQuestionAnswer {
+                    question_id: "question-2".to_string(),
+                    answers: vec!["Rust".to_string(), "TypeScript".to_string()],
+                },
+            ],
+        })
+        .expect("structured response");
+
+        let crate::surface::SurfaceUserInputDecision::Submitted(response) = decision else {
+            panic!("structured response must remain submitted");
+        };
+        assert_eq!(response.answers.len(), 2);
+        assert_eq!(response.answers[0].question_id.as_str(), "question-1");
+        assert_eq!(response.answers[1].question_id.as_str(), "question-2");
+        assert_eq!(
+            response.answers[1]
+                .answers
+                .iter()
+                .map(crate::surface::DisplayText::as_str)
+                .collect::<Vec<_>>(),
+            vec!["Rust", "TypeScript"]
+        );
+    }
 }

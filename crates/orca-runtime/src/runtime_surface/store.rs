@@ -27,7 +27,7 @@ use super::interaction::{
     SurfaceInteractionKind, SurfaceInteractionLifecycle, SurfaceInteractionRequest,
     SurfaceInteractionResolutionReceipt, SurfaceInteractionRoute, SurfaceInteractionView,
     SurfaceMcpElicitationRequest, SurfacePermissionContext, SurfacePermissionProfile,
-    SurfaceToolRequest,
+    SurfaceToolRequest, SurfaceUserInputQuestionnaire,
 };
 #[cfg(test)]
 use super::operation::GenerationExecutionFailureClass;
@@ -1277,6 +1277,9 @@ enum StoredInteractionRequestV1 {
         question: NonEmptyText,
         suggestions: Vec<DisplayText>,
     },
+    UserQuestionnaire {
+        questionnaire: SurfaceUserInputQuestionnaire,
+    },
     McpElicitation {
         server_name: NonEmptyText,
         server_request_id: NonEmptyText,
@@ -1324,6 +1327,11 @@ impl StoredInteractionRequestV1 {
                 question: question.clone(),
                 suggestions: suggestions.clone(),
             },
+            SurfaceInteractionRequest::UserQuestionnaire { questionnaire } => {
+                Self::UserQuestionnaire {
+                    questionnaire: questionnaire.clone(),
+                }
+            }
             SurfaceInteractionRequest::McpElicitation {
                 server_name,
                 server_request_id,
@@ -1380,6 +1388,9 @@ impl StoredInteractionRequestV1 {
                 question,
                 suggestions,
             },
+            Self::UserQuestionnaire { questionnaire } => {
+                SurfaceInteractionRequest::UserQuestionnaire { questionnaire }
+            }
             Self::McpElicitation {
                 server_name,
                 server_request_id,

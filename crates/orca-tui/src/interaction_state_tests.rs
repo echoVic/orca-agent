@@ -41,8 +41,26 @@ fn user_input_requested_event_tracks_pending_runtime_interaction_id() {
     state.mention.phase = Some(SearchPhase::Complete);
     state.update(TuiEvent::UserInputRequested {
         key: interaction_key(TuiInteractionKind::UserInput, "ask-1"),
-        question: "Continue?".to_string(),
-        choices: vec!["yes - Continue".to_string(), "no - Stop".to_string()],
+        questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+            questions: vec![crate::protocol::TuiUserInputQuestion {
+                id: "question-1".to_string(),
+                header: "Continue".to_string(),
+                question: "Continue?".to_string(),
+                options: vec![
+                    crate::protocol::TuiUserInputOption {
+                        label: "yes".to_string(),
+                        description: "Continue".to_string(),
+                        preview: None,
+                    },
+                    crate::protocol::TuiUserInputOption {
+                        label: "no".to_string(),
+                        description: "Stop".to_string(),
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+            }],
+        },
     });
 
     assert_eq!(state.status, AppStatus::WaitingUserInput);
@@ -56,6 +74,39 @@ fn user_input_requested_event_tracks_pending_runtime_interaction_id() {
     assert_eq!(dialog.choices()[0].label(), "yes");
     assert!(state.slash_menu.is_none());
     assert!(state.mention.phase.is_none());
+}
+
+#[test]
+fn multi_question_free_text_request_opens_the_inline_dialog() {
+    let mut state = state();
+    state.update(TuiEvent::UserInputRequested {
+        key: interaction_key(TuiInteractionKind::UserInput, "ask-free-text"),
+        questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+            questions: vec![
+                crate::protocol::TuiUserInputQuestion {
+                    id: "question-1".to_string(),
+                    header: "First".to_string(),
+                    question: "Describe the first constraint.".to_string(),
+                    options: Vec::new(),
+                    multi_select: false,
+                },
+                crate::protocol::TuiUserInputQuestion {
+                    id: "question-2".to_string(),
+                    header: "Second".to_string(),
+                    question: "Describe the second constraint.".to_string(),
+                    options: Vec::new(),
+                    multi_select: false,
+                },
+            ],
+        },
+    });
+
+    let dialog = state
+        .user_input_dialog
+        .as_ref()
+        .expect("multi-question free-text request must remain answerable");
+    assert_eq!(dialog.question_count(), 2);
+    assert!(dialog.choices().is_empty());
 }
 
 #[test]

@@ -99,9 +99,8 @@ impl ExecutionProfile {
     pub fn for_approval_mode(mode: ApprovalMode) -> Self {
         match mode {
             ApprovalMode::Plan => Self::ReadOnly,
-            ApprovalMode::Suggest | ApprovalMode::AutoEdit | ApprovalMode::FullAuto => {
-                Self::Workspace
-            }
+            ApprovalMode::Suggest | ApprovalMode::AutoEdit => Self::Workspace,
+            ApprovalMode::FullAuto => Self::TrustedHost,
         }
     }
 

@@ -38,16 +38,18 @@ pub(crate) fn handle_hosted_plan_action(
             prompt,
             approval_mode,
         } => {
-            let settings_applied = apply_hosted_settings_action(
-                thread.as_ref(),
-                config,
-                event_tx,
-                vec![
-                    orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
-                        mode: surface_approval_mode(approval_mode),
-                    },
-                ],
-            );
+            let mode_patch = if approval_mode == ApprovalMode::FullAuto {
+                // `pre_plan_approval_mode` can only restore a mode that was
+                // already committed for this session, including its earlier
+                // Full Access confirmation.
+                orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess
+            } else {
+                orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
+                    mode: surface_approval_mode(approval_mode),
+                }
+            };
+            let settings_applied =
+                apply_hosted_settings_action(thread.as_ref(), config, event_tx, vec![mode_patch]);
             if !settings_applied {
                 control.cancel_surface_activation();
                 return;

@@ -14,6 +14,7 @@ pub(crate) struct PendingInteractionSubmission {
     pub(crate) atomic_skill_tokens: MentionBindings,
     pub(crate) pending_pastes: Vec<(String, String)>,
     pub(crate) user_input_dialog: Option<UserInputDialog>,
+    pub(crate) response_summary: Option<String>,
 }
 
 #[derive(Debug, Default)]

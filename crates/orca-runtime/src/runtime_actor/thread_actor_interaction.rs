@@ -1495,7 +1495,7 @@ impl ThreadActor {
         active: &mut ActiveOperation,
         fence: surface::SurfaceOperationFence,
         request: crate::lifecycle::RuntimeUserInputRequest,
-        reply: SyncSender<io::Result<Option<String>>>,
+        reply: SyncSender<io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>>>,
     ) {
         let result = self.request_surface_user_input_inner(active, fence, &request, reply.clone());
         if let Err(error) = result {
@@ -1508,7 +1508,7 @@ impl ThreadActor {
         active: &mut ActiveOperation,
         fence: surface::SurfaceOperationFence,
         request: &crate::lifecycle::RuntimeUserInputRequest,
-        reply: SyncSender<io::Result<Option<String>>>,
+        reply: SyncSender<io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>>>,
     ) -> io::Result<()> {
         if active.surface_operation.as_ref() != Some(&fence) {
             return Err(io::Error::new(
@@ -1524,9 +1524,102 @@ impl ThreadActor {
         }
         let request_identity = surface::NonEmptyText::try_new(request.id.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty user-input id"))?;
-        let question = surface::NonEmptyText::try_new(request.question.clone()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "empty user-input question")
-        })?;
+        let (interaction_request, continuation_intent) = if let Some(legacy) =
+            request.legacy_single_question()
+        {
+            let question =
+                surface::NonEmptyText::try_new(legacy.question.clone()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "empty user-input question")
+                })?;
+            let suggestions = legacy
+                .options
+                .iter()
+                .map(|option| surface::DisplayText::new(option.label.clone()))
+                .collect::<Vec<_>>();
+            (
+                surface::SurfaceInteractionRequest::UserInput {
+                    question: question.clone(),
+                    suggestions: suggestions.clone(),
+                },
+                surface::ContinuationTurnIntent::user_input(
+                    request_identity,
+                    question,
+                    suggestions,
+                ),
+            )
+        } else {
+            let questions = request
+                .questions
+                .iter()
+                .map(|question| {
+                    let options = question
+                        .options
+                        .iter()
+                        .map(|option| {
+                            Ok(surface::SurfaceUserInputOption {
+                                label: surface::NonEmptyText::try_new(option.label.clone())
+                                    .map_err(|_| {
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidInput,
+                                            "empty user-input option label",
+                                        )
+                                    })?,
+                                description: surface::DisplayText::new(option.description.clone()),
+                                preview: option
+                                    .preview
+                                    .as_ref()
+                                    .map(|preview| surface::DisplayText::new(preview.clone())),
+                            })
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    Ok(surface::SurfaceUserInputQuestion {
+                        id: surface::NonEmptyText::try_new(question.id.clone()).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "empty user-input question id",
+                            )
+                        })?,
+                        header: surface::NonEmptyText::try_new(question.header.clone()).map_err(
+                            |_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "empty user-input question header",
+                                )
+                            },
+                        )?,
+                        question: surface::NonEmptyText::try_new(question.question.clone())
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "empty user-input question",
+                                )
+                            })?,
+                        options,
+                        multi_select: question.multi_select,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let questionnaire = surface::SurfaceUserInputQuestionnaire {
+                questions: surface::NonEmptyVec::try_new(questions).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "user-input request requires questions",
+                    )
+                })?,
+            };
+            questionnaire
+                .validate()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+            (
+                surface::SurfaceInteractionRequest::UserQuestionnaire {
+                    questionnaire: questionnaire.clone(),
+                },
+                surface::ContinuationTurnIntent::user_questionnaire(
+                    request_identity,
+                    questionnaire,
+                ),
+            )
+        };
         let preferred = self
             .resident_surface
             .interactions
@@ -1539,25 +1632,6 @@ impl ThreadActor {
         let interaction_id =
             surface::SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
-        let interaction_request = surface::SurfaceInteractionRequest::UserInput {
-            question: question.clone(),
-            suggestions: request
-                .choices
-                .iter()
-                .cloned()
-                .map(surface::DisplayText::new)
-                .collect(),
-        };
-        let continuation_intent = surface::ContinuationTurnIntent::user_input(
-            request_identity,
-            question,
-            request
-                .choices
-                .iter()
-                .cloned()
-                .map(surface::DisplayText::new)
-                .collect(),
-        );
         let capsule = surface::DurableInteractionContinuationCapsule::try_new_restartable(
             interaction_id.clone(),
             fence.clone(),
@@ -2340,6 +2414,19 @@ impl ThreadActor {
                 "interaction request and answer kinds do not match",
             ));
         }
+        if let surface::SurfaceClientInteractionAnswer::UserInput { decision } = response.answer()
+            && let Err(message) = interaction
+                .record
+                .request
+                .validate_user_input_decision(decision)
+        {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::InvalidInput,
+                message,
+            ));
+        }
         if interaction.record.answer_policy != *response.policy() {
             return Ok(Self::uncommitted_interaction_response(
                 request_id,
@@ -3003,7 +3090,30 @@ impl ThreadActor {
                 ) => {
                     let answer = match decision {
                         surface::SurfaceUserInputDecision::Answer(answer) => {
-                            Some(answer.as_str().to_string())
+                            Some(crate::lifecycle::RuntimeUserInputResponse::Chat {
+                                message: answer.as_str().to_string(),
+                            })
+                        }
+                        surface::SurfaceUserInputDecision::Submitted(response) => {
+                            Some(crate::lifecycle::RuntimeUserInputResponse::Submitted {
+                                answers: response
+                                    .answers
+                                    .iter()
+                                    .map(|answer| crate::lifecycle::RuntimeUserInputAnswer {
+                                        question_id: answer.question_id.as_str().to_string(),
+                                        answers: answer
+                                            .answers
+                                            .iter()
+                                            .map(|value| value.as_str().to_string())
+                                            .collect(),
+                                    })
+                                    .collect(),
+                            })
+                        }
+                        surface::SurfaceUserInputDecision::Chat(message) => {
+                            Some(crate::lifecycle::RuntimeUserInputResponse::Chat {
+                                message: message.as_str().to_string(),
+                            })
                         }
                         surface::SurfaceUserInputDecision::Cancel => None,
                     };

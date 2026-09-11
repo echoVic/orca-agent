@@ -196,6 +196,7 @@ impl<'a> RuntimeTurnRequestContext<'a> {
             root_task_id: self.turn_context.root_task_id,
             continuation: self.turn_context.continuation.take(),
             steer_handle: self.turn_context.steer_handle,
+            execution_policy: self.turn_context.execution_policy,
             provider_suspension_control: self.turn_context.provider_suspension_control,
             provider_response_ingress: self.turn_context.provider_response_ingress,
             workflow_lifecycle_ingress: self.turn_context.workflow_lifecycle_ingress,

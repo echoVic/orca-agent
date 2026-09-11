@@ -604,7 +604,7 @@ mod tests {
         fn request_user_input(
             &self,
             _request: &RuntimeUserInputRequest,
-        ) -> io::Result<Option<String>> {
+        ) -> io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>> {
             unreachable!("test only checks handler routing identity")
         }
     }

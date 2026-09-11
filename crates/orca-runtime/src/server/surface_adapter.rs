@@ -2294,6 +2294,63 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                         writer.flush()
                     })?;
                 }
+                SurfaceInteractionRequest::UserQuestionnaire { questionnaire } => {
+                    let Some(request_id) = register_or_settle_unavailable(
+                        transport.direct.register(
+                            request_id.clone(),
+                            JsonlDirectInteractionKind::UserInput,
+                            JsonlDirectInteractionRoute::UserInput {
+                                client: projector.client.clone(),
+                                interaction_id: interaction.interaction_id.clone(),
+                            },
+                        ),
+                        projector,
+                        interaction,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    let first = &questionnaire.questions.as_slice()[0];
+                    let mut legacy_question =
+                        format!("{}: {}", first.header.as_str(), first.question.as_str());
+                    if first.multi_select {
+                        legacy_question.push_str(
+                            "\nSelect one or more choices separated by commas, or type a custom answer.",
+                        );
+                    }
+                    let payload = serde_json::json!({
+                        "request_id": request_id,
+                        "thread_id": projector.thread_id,
+                        "turn_id": projector.turn_id.to_string(),
+                        "question": legacy_question,
+                        "choices": first
+                            .options
+                            .iter()
+                            .map(|option| {
+                                let mut choice = format!(
+                                    "{} - {}",
+                                    option.label.as_str(),
+                                    option.description.as_str()
+                                );
+                                if let Some(preview) = option.preview.as_ref() {
+                                    choice.push_str("\nPreview:\n");
+                                    choice.push_str(preview.as_str());
+                                }
+                                choice
+                            })
+                            .collect::<Vec<_>>(),
+                        "questions": questionnaire.questions.as_slice(),
+                    });
+                    transport.direct.publish(&request_id, || {
+                        write_runtime_event(
+                            writer,
+                            "surface.user_input.requested",
+                            &projector.thread_id,
+                            payload,
+                        )?;
+                        writer.flush()
+                    })?;
+                }
                 SurfaceInteractionRequest::McpElicitation {
                     server_name,
                     message,
@@ -2393,7 +2450,8 @@ fn register_or_settle_unavailable(
                 },
             }
         }
-        SurfaceInteractionRequest::UserInput { .. } => {
+        SurfaceInteractionRequest::UserInput { .. }
+        | SurfaceInteractionRequest::UserQuestionnaire { .. } => {
             crate::surface::SurfaceClientInteractionAnswer::UserInput {
                 decision: crate::surface::SurfaceUserInputDecision::Cancel,
             }
@@ -2613,9 +2671,15 @@ fn settings_patches(
         orca_core::approval_types::ApprovalMode::Plan => crate::surface::SurfaceApprovalMode::Plan,
     };
     if snapshot.settings.effective.approval_mode != approval_mode {
-        patches.push(RuntimeSettingsPatch::SetApprovalMode {
-            mode: approval_mode,
-        });
+        if approval_mode == crate::surface::SurfaceApprovalMode::FullAuto
+            && config.active_permission_profile.is_none()
+        {
+            patches.push(RuntimeSettingsPatch::EnableFullAccess);
+        } else {
+            patches.push(RuntimeSettingsPatch::SetApprovalMode {
+                mode: approval_mode,
+            });
+        }
     }
     if let Some(roots) = config.runtime_workspace_roots.as_ref() {
         let roots = roots

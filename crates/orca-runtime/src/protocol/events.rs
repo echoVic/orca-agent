@@ -328,6 +328,8 @@ pub enum ServerEvent {
         turn_id: Value,
         question: Value,
         choices: Value,
+        #[serde(skip_serializing_if = "Value::is_null")]
+        questions: Value,
     },
     UserInputResolved {
         #[serde(rename = "requestId")]
@@ -664,6 +666,7 @@ pub fn map_runtime_event_line(line: &str) -> Option<ServerEvent> {
             turn_id: payload["turn_id"].clone(),
             question: payload["question"].clone(),
             choices: payload["choices"].clone(),
+            questions: payload["questions"].clone(),
         }),
         "surface.mcp_elicitation.requested" => Some(ServerEvent::McpElicitationRequest {
             request_id: payload["request_id"].clone(),

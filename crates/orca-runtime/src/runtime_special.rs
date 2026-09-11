@@ -6,7 +6,7 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolCapability, ToolName, ToolRequest, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -60,6 +60,12 @@ struct PagedAsyncSubagentResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeInteractionToolDispatch {
+    Permission,
+    UserInput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeSpecialToolDispatch {
     GetGoal,
     CreateGoal,
@@ -71,8 +77,7 @@ pub enum RuntimeSpecialToolDispatch {
     SubagentStatus,
     TaskList,
     TaskStop,
-    RequestPermissions,
-    RequestUserInput,
+    Interaction(RuntimeInteractionToolDispatch),
     WorkflowIpc,
     Normal,
 }
@@ -105,6 +110,18 @@ impl RuntimeToolActorContext {
         request: &ToolRequest,
         goal_mode: bool,
     ) -> RuntimeSpecialToolDispatch {
+        if let Some(capabilities) = orca_tools::canonical_capabilities(request) {
+            if capabilities.contains(ToolCapability::PermissionRequest) {
+                return RuntimeSpecialToolDispatch::Interaction(
+                    RuntimeInteractionToolDispatch::Permission,
+                );
+            }
+            if capabilities.contains(ToolCapability::UserInputRequest) {
+                return RuntimeSpecialToolDispatch::Interaction(
+                    RuntimeInteractionToolDispatch::UserInput,
+                );
+            }
+        }
         match request.name {
             ToolName::GetGoal if goal_mode => RuntimeSpecialToolDispatch::GetGoal,
             ToolName::CreateGoal if goal_mode => RuntimeSpecialToolDispatch::CreateGoal,
@@ -116,8 +133,6 @@ impl RuntimeToolActorContext {
             ToolName::SubagentStatus => RuntimeSpecialToolDispatch::SubagentStatus,
             ToolName::TaskList => RuntimeSpecialToolDispatch::TaskList,
             ToolName::TaskStop => RuntimeSpecialToolDispatch::TaskStop,
-            ToolName::RequestPermissions => RuntimeSpecialToolDispatch::RequestPermissions,
-            ToolName::AskUserQuestion => RuntimeSpecialToolDispatch::RequestUserInput,
             ToolName::WorkflowSendMessage
             | ToolName::WorkflowReadMessages
             | ToolName::WorkflowClearMessages
@@ -847,6 +862,33 @@ mod tests {
     use std::thread;
     #[cfg(unix)]
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn interaction_tools_are_classified_by_declared_capability() {
+        let context = RuntimeToolActorContext::new("interaction-routing");
+        for (name, expected) in [
+            (
+                ToolName::AskUserQuestion,
+                RuntimeInteractionToolDispatch::UserInput,
+            ),
+            (
+                ToolName::RequestPermissions,
+                RuntimeInteractionToolDispatch::Permission,
+            ),
+        ] {
+            let request = ToolRequest {
+                id: "interaction".to_string(),
+                name,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            };
+            assert_eq!(
+                context.classify_dispatch(&request, false),
+                RuntimeSpecialToolDispatch::Interaction(expected)
+            );
+        }
+    }
 
     #[test]
     fn task_summary_json_marks_backgrounded_main_sessions() {

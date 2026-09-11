@@ -121,6 +121,7 @@ pub(crate) fn execute_bash_with_shell_session(
         output,
         network_block,
     } = result;
+    let output = output.with_failure_policy_context(config, sandbox.mode);
     if let Some(block) = network_block
         && let Some(permission_prompt) =
             RuntimeBashPermissionPolicy::network_block_prompt(&request.id, &block)
@@ -155,17 +156,16 @@ pub(crate) fn execute_bash_with_shell_session(
             output_handler: reborrow_output_handler(&mut output_handler),
         })
         .output
+        .with_failure_policy_context(config, retry_sandbox.mode)
         .into_tool_result(request, output_truncation, shell_timeout_secs);
     }
     if let Some(diagnostic) = output.sandbox_denial_diagnostic(cwd) {
         // Process output is explanatory only. A path parsed from stderr is not
         // an authority-bearing kernel receipt and must never trigger a retry
         // with a wider filesystem or shell capability.
-        return output.with_diagnostic(diagnostic).into_tool_result(
-            request,
-            output_truncation,
-            shell_timeout_secs,
-        );
+        return output
+            .with_diagnostic(diagnostic, config, sandbox.mode)
+            .into_tool_result(request, output_truncation, shell_timeout_secs);
     }
     output.into_tool_result(request, output_truncation, shell_timeout_secs)
 }
@@ -266,10 +266,24 @@ impl BashShellOutput {
         diagnose_sandbox_denial(cwd, &output.stdout, &output.stderr)
     }
 
-    fn with_diagnostic(mut self, diagnostic: SandboxDenialDiagnostic) -> Self {
+    fn with_diagnostic(
+        mut self,
+        diagnostic: SandboxDenialDiagnostic,
+        config: &RunConfig,
+        sandbox_mode: ShellSandboxMode,
+    ) -> Self {
         let message = format!(
-            "Sandbox diagnostic (process output, non-authoritative): {}",
-            diagnostic.message
+            "Sandbox diagnostic (process output, non-authoritative): {}\n{}",
+            diagnostic.message,
+            resolved_policy_context(
+                config.approval_mode,
+                config.execution_profile,
+                sandbox_mode,
+                config
+                    .active_permission_profile
+                    .as_ref()
+                    .map_or("-", |profile| profile.id.as_str()),
+            ),
         );
         if let Ok(output) = &mut self.output {
             if output.stderr.trim_end().is_empty() {
@@ -277,6 +291,26 @@ impl BashShellOutput {
             } else {
                 output.stderr.push_str(&format!("\n\n{message}"));
             }
+        }
+        self
+    }
+
+    fn with_failure_policy_context(
+        mut self,
+        config: &RunConfig,
+        sandbox_mode: ShellSandboxMode,
+    ) -> Self {
+        if let Err(error) = &mut self.output {
+            error.push('\n');
+            error.push_str(&resolved_policy_context(
+                config.approval_mode,
+                config.execution_profile,
+                sandbox_mode,
+                config
+                    .active_permission_profile
+                    .as_ref()
+                    .map_or("-", |profile| profile.id.as_str()),
+            ));
         }
         self
     }
@@ -344,6 +378,38 @@ impl BashShellOutput {
         let mut result = ToolResult::failed(request, message, output.exit_code);
         result.set_truncated(truncated);
         result
+    }
+}
+
+fn resolved_policy_context(
+    approval_mode: orca_core::approval_types::ApprovalMode,
+    execution_profile: orca_core::capability::ExecutionProfile,
+    sandbox_mode: ShellSandboxMode,
+    active_permission_profile: &str,
+) -> String {
+    format!(
+        "Resolved policy: approval_mode={}, execution_profile={}, shell_sandbox={}, \
+         active_permission_profile={active_permission_profile}",
+        approval_mode.as_str(),
+        execution_profile_label(execution_profile),
+        shell_sandbox_mode_label(sandbox_mode),
+    )
+}
+
+fn execution_profile_label(profile: orca_core::capability::ExecutionProfile) -> &'static str {
+    match profile {
+        orca_core::capability::ExecutionProfile::ReadOnly => "read-only",
+        orca_core::capability::ExecutionProfile::Workspace => "workspace",
+        orca_core::capability::ExecutionProfile::TrustedHost => "trusted-host",
+        orca_core::capability::ExecutionProfile::RemoteSandbox => "remote-sandbox",
+    }
+}
+
+fn shell_sandbox_mode_label(mode: ShellSandboxMode) -> &'static str {
+    match mode {
+        ShellSandboxMode::WorkspaceWrite { .. } => "workspace-write",
+        ShellSandboxMode::ReadOnly { .. } => "read-only",
+        ShellSandboxMode::DangerFullAccess => "danger-full-access",
     }
 }
 
@@ -513,7 +579,7 @@ mod tests {
     use crate::network_proxy::RuntimeNetworkBlockReport;
     use crate::runtime_permission::{RuntimePermissionOrigin, RuntimePermissionRequestKind};
 
-    use super::RuntimeBashPermissionPolicy;
+    use super::{RuntimeBashPermissionPolicy, resolved_policy_context};
 
     #[test]
     fn runtime_bash_permission_policy_preserves_network_decision_metadata() {
@@ -530,6 +596,22 @@ mod tests {
         assert_eq!(
             prompt.request.reason.as_deref(),
             Some("bash attempted network access to api.orca.invalid (blocked-by-allowlist)")
+        );
+    }
+
+    #[test]
+    fn resolved_policy_context_names_full_access_without_ambiguity() {
+        let context = resolved_policy_context(
+            orca_core::approval_types::ApprovalMode::FullAuto,
+            orca_core::capability::ExecutionProfile::TrustedHost,
+            crate::shell_session::ShellSandboxMode::DangerFullAccess,
+            "-",
+        );
+
+        assert_eq!(
+            context,
+            "Resolved policy: approval_mode=full-auto, execution_profile=trusted-host, \
+             shell_sandbox=danger-full-access, active_permission_profile=-"
         );
     }
 }

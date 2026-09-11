@@ -4,11 +4,11 @@
   "artifacts": [
     {
       "path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-      "sha256": "183a03dd09a05fc6423cfef7aeb89956015503875a07f1188c823d918738bda5"
+      "sha256": "64e3306ebf861e3cf4f7e33dc11dd5a35e0646edfba046629471256c9519bdbe"
     },
     {
       "path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.manifest.json",
-      "sha256": "3428fa1bdf38b6554ba5599b8466b67bf7b8f2b47b3051a28f69913abc14a0ba"
+      "sha256": "4e1b9d4780b3542844a64fb94c3682a179e5f509c0bff9d887e2c51a677a77a4"
     },
     {
       "path": "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md",
