@@ -62,6 +62,7 @@ pub mod runtime_capability;
 mod runtime_conversation_bootstrap;
 pub mod runtime_directive;
 pub(crate) mod runtime_event_projector;
+mod runtime_execution_policy;
 pub mod runtime_host;
 mod runtime_lifecycle;
 mod runtime_model_route;

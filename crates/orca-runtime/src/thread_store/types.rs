@@ -660,6 +660,7 @@ impl From<StoredMessage> for Message {
 pub struct ThreadMetadataPatch {
     pub title: Option<String>,
     pub active_permission_profile: Option<ActivePermissionProfile>,
+    pub clear_active_permission_profile: bool,
     pub approval_mode: Option<ApprovalMode>,
     pub runtime_workspace_roots: Option<Vec<PathBuf>>,
     pub permission_rules: Option<PermissionRules>,

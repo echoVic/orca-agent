@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::commands::{self, GoalSlashCommand, QueueSlashCommand, SlashCommand, TrustSlashCommand};
+use crate::full_access_confirmation_actions::request_settings_change;
 use crate::protocol::TuiMemoryScope;
 use crate::protocol::{GoalDraft, UserAction};
 use crate::session_picker_actions::open_session_picker;
@@ -146,11 +147,7 @@ fn dispatch_slash_command(
         }
         SlashCommand::Mode(Some(mode)) => match parse_approval_mode(&mode) {
             Some(approval_mode) => {
-                pending_settings_action = Some(UserAction::SetModel(encode_settings_intent(
-                    None,
-                    None,
-                    Some(approval_mode),
-                )));
+                request_settings_change(state, action_tx, None, None, Some(approval_mode));
             }
             None => state.push_message(ChatMessage::Error(
                 "unsupported mode. Use suggest, auto-edit, full-auto, or plan.".to_string(),
@@ -299,7 +296,7 @@ fn dispatch_slash_command(
             let _ = action_tx.send(UserAction::RenameCurrentSession { title });
         }
         SlashCommand::Status => {
-            state.push_message(ChatMessage::System(format_status(state)));
+            state.push_message(ChatMessage::System(format_status(state, config)));
         }
         SlashCommand::Copy(argument) => {
             let position = match argument.as_deref() {
@@ -369,7 +366,7 @@ fn dispatch_slash_command(
     Some(SlashOutcome::Continue)
 }
 
-fn format_status(state: &AppState) -> String {
+fn format_status(state: &AppState, config: &RunConfig) -> String {
     let session_id = state.current_session_id().unwrap_or("-");
     let title = state.current_session_title().unwrap_or("-");
     let context_used_tokens = state.context_used_tokens();
@@ -399,12 +396,40 @@ fn format_status(state: &AppState) -> String {
     let goal = state.current_goal().map_or("-", |goal| {
         orca_core::goal_types::goal_status_label(goal.status)
     });
+    let execution_profile = match config.execution_profile {
+        orca_core::capability::ExecutionProfile::ReadOnly => "read-only",
+        orca_core::capability::ExecutionProfile::Workspace => "workspace",
+        orca_core::capability::ExecutionProfile::TrustedHost => "trusted-host",
+        orca_core::capability::ExecutionProfile::RemoteSandbox => "remote-sandbox",
+    };
+    let status_cwd = config
+        .cwd
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new(&state.cwd));
+    let shell_sandbox = match orca_runtime::server::bash_sandbox_for_cwd(config, status_cwd) {
+        Ok(sandbox) => match sandbox.mode {
+            orca_runtime::shell_session::ShellSandboxMode::ReadOnly { .. } => "read-only",
+            orca_runtime::shell_session::ShellSandboxMode::WorkspaceWrite { .. } => {
+                "workspace-write"
+            }
+            orca_runtime::shell_session::ShellSandboxMode::DangerFullAccess => "danger-full-access",
+        }
+        .to_string(),
+        Err(error) => format!("unavailable ({error})"),
+    };
+    let active_permission_profile = config
+        .active_permission_profile
+        .as_ref()
+        .map_or("-", |profile| profile.id.as_str());
     format!(
         "Session status\n\
          title: {title}\n\
          id: {session_id}\n\
          model: {} ({})\n\
          mode: {}\n\
+         execution profile: {execution_profile}\n\
+         shell sandbox: {shell_sandbox}\n\
+         active permission profile: {active_permission_profile}\n\
          cwd: {}\n\
          context: {context}\n\
          usage: {} input, {} output, {} cache\n\
@@ -445,6 +470,7 @@ pub(crate) struct SettingsIntent {
     pub model: Option<String>,
     pub reasoning_effort: Option<orca_core::config::ReasoningEffort>,
     pub approval_mode: Option<ApprovalMode>,
+    pub full_access_confirmed: bool,
 }
 
 pub(crate) fn encode_settings_intent(
@@ -452,11 +478,40 @@ pub(crate) fn encode_settings_intent(
     reasoning_effort: Option<orca_core::config::ReasoningEffort>,
     approval_mode: Option<ApprovalMode>,
 ) -> String {
+    encode_settings_intent_inner(model, reasoning_effort, approval_mode, false)
+}
+
+pub(crate) fn encode_confirmed_full_access_intent(
+    model: Option<&str>,
+    reasoning_effort: Option<orca_core::config::ReasoningEffort>,
+) -> String {
+    encode_settings_intent_inner(model, reasoning_effort, Some(ApprovalMode::FullAuto), true)
+}
+
+fn encode_settings_intent_inner(
+    model: Option<&str>,
+    reasoning_effort: Option<orca_core::config::ReasoningEffort>,
+    approval_mode: Option<ApprovalMode>,
+    full_access_confirmed: bool,
+) -> String {
+    if !full_access_confirmed {
+        return format!(
+            "{SETTINGS_INTENT_PREFIX}{}|{}|{}",
+            model.unwrap_or("-"),
+            reasoning_effort.map_or("-", orca_core::config::ReasoningEffort::as_str),
+            approval_mode.map_or("-", ApprovalMode::as_str),
+        );
+    }
     format!(
-        "{SETTINGS_INTENT_PREFIX}{}|{}|{}",
+        "{SETTINGS_INTENT_PREFIX}{}|{}|{}|{}",
         model.unwrap_or("-"),
         reasoning_effort.map_or("-", orca_core::config::ReasoningEffort::as_str),
         approval_mode.map_or("-", ApprovalMode::as_str),
+        if full_access_confirmed {
+            "full-access-confirmed"
+        } else {
+            "-"
+        },
     )
 }
 
@@ -465,7 +520,7 @@ pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
         .strip_prefix(SETTINGS_INTENT_PREFIX)?
         .split('|')
         .collect::<Vec<_>>();
-    if fields.len() != 3 {
+    if !matches!(fields.len(), 3 | 4) {
         return None;
     }
     let model = match fields[0] {
@@ -490,11 +545,20 @@ pub(crate) fn decode_settings_intent(value: &str) -> Option<SettingsIntent> {
         "plan" => Some(ApprovalMode::Plan),
         _ => return None,
     };
+    let full_access_confirmed = match fields.get(3).copied().unwrap_or("-") {
+        "-" => false,
+        "full-access-confirmed" => true,
+        _ => return None,
+    };
+    if full_access_confirmed && approval_mode != Some(ApprovalMode::FullAuto) {
+        return None;
+    }
     (model.is_some() || reasoning_effort.is_some() || approval_mode.is_some()).then_some(
         SettingsIntent {
             model,
             reasoning_effort,
             approval_mode,
+            full_access_confirmed,
         },
     )
 }
@@ -529,6 +593,18 @@ mod tests {
         assert_eq!(
             decoded.reasoning_effort,
             Some(orca_core::config::ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn settings_intent_keeps_legacy_payloads_and_scopes_confirmation_to_full_access() {
+        let legacy = decode_settings_intent("__orca_runtime_settings__:-|-|auto-edit")
+            .expect("legacy settings intent");
+        assert_eq!(legacy.approval_mode, Some(ApprovalMode::AutoEdit));
+        assert!(!legacy.full_access_confirmed);
+        assert!(
+            decode_settings_intent("__orca_runtime_settings__:-|-|auto-edit|full-access-confirmed")
+                .is_none()
         );
     }
 
@@ -621,7 +697,8 @@ mod tests {
             },
         )));
         let mut config = test_run_config();
-        config.approval_mode = ApprovalMode::Suggest;
+        config.approval_mode = ApprovalMode::Plan;
+        config.execution_profile = orca_core::capability::ExecutionProfile::ReadOnly;
         state.approval_mode = ApprovalMode::Plan;
         let shared = Arc::new(Mutex::new(config.clone()));
         let (action_tx, _) = mpsc::unbounded();
@@ -636,6 +713,8 @@ mod tests {
             "session-1",
             "deepseek-v4-pro",
             "plan",
+            "execution profile: read-only",
+            "shell sandbox: read-only",
             "/tmp/project",
             "750 remaining / 1000 total",
             "100 input, 50 output, 25 cache",
@@ -673,6 +752,55 @@ mod tests {
                 .approval_mode,
             Some(ApprovalMode::default())
         );
+    }
+
+    #[test]
+    fn full_auto_mode_command_opens_confirmation_without_dispatching() {
+        let mut state = state();
+        state.approval_mode = ApprovalMode::AutoEdit;
+        let mut config = test_run_config();
+        config.approval_mode = ApprovalMode::AutoEdit;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, action_rx) = mpsc::unbounded();
+
+        handle_slash_command(
+            "/mode full-auto",
+            &mut config,
+            &shared,
+            &mut state,
+            &action_tx,
+        );
+
+        assert!(state.full_access_confirmation.is_some());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn status_reports_confirmed_full_access_execution_policy() {
+        let mut state = state();
+        state.approval_mode = ApprovalMode::FullAuto;
+        let mut config = test_run_config();
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+        config.active_permission_profile = None;
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _) = mpsc::unbounded();
+
+        handle_slash_command("/status", &mut config, &shared, &mut state, &action_tx);
+
+        let Some(ChatMessage::System(status)) = state.transcript.messages.last() else {
+            panic!("status output was not appended");
+        };
+        assert!(status.contains("mode: full-auto"), "{status}");
+        assert!(
+            status.contains("execution profile: trusted-host"),
+            "{status}"
+        );
+        assert!(
+            status.contains("shell sandbox: danger-full-access"),
+            "{status}"
+        );
+        assert!(status.contains("active permission profile: -"), "{status}");
     }
 
     #[test]

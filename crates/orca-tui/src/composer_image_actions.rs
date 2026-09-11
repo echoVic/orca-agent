@@ -20,6 +20,7 @@ pub(crate) fn handle_image_paste_shortcut(
     if state.panel_mode != PanelMode::Conversation
         || !matches!(state.status, AppStatus::Idle | AppStatus::Running)
         || state.config_dialog.is_some()
+        || state.full_access_confirmation.is_some()
         || state.plan_approval_dialog.is_some()
         || state.user_input_dialog.is_some()
         || state.transcript.search.open

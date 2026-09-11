@@ -266,6 +266,36 @@ mod tests {
     }
 
     #[test]
+    fn full_access_confirmation_owns_cancel_before_running_interrupt() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_search_matches();
+        state.close_transcript_search();
+        state.enter_running();
+        state.full_access_confirmation = Some(crate::types::FullAccessConfirmation {
+            selected: 1,
+            model: None,
+            reasoning_effort: None,
+        });
+        let config = test_run_config();
+        let mut vim = crate::vim::VimState::new(false);
+
+        let flow = handle_key_event_preflight(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut state,
+            &config,
+            &action_tx,
+            &mut vim,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(flow, KeyEventFlow::Unhandled));
+        assert!(state.full_access_confirmation.is_some());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn draft_editor_shortcuts_precede_conflicting_global_actions() {
         let (action_tx, _action_rx) = mpsc::unbounded();
         let mut state = state_with_search_matches();
@@ -619,7 +649,7 @@ mod tests {
 pub(crate) fn handle_key_event_preflight<F>(
     key: KeyEvent,
     state: &mut AppState,
-    config: &RunConfig,
+    _config: &RunConfig,
     action_tx: &mpsc::Sender<UserAction>,
     vim_state: &mut VimState,
     composer_has_text: bool,
@@ -635,6 +665,11 @@ where
     if handle_image_viewer_key(key, state) {
         vim_state.cancel_pending_command();
         return Ok(KeyEventFlow::Continue);
+    }
+
+    if state.full_access_confirmation.is_some() {
+        vim_state.cancel_pending_command();
+        return Ok(KeyEventFlow::Unhandled);
     }
 
     // A focused child owns Esc as the return-to-parent action. Handle it before
@@ -768,7 +803,7 @@ where
         )
     {
         vim_state.cancel_pending_command();
-        cycle_approval_mode(config, state, action_tx);
+        cycle_approval_mode(state, action_tx);
         return Ok(KeyEventFlow::Continue);
     }
 

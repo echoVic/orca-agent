@@ -656,6 +656,9 @@ impl AppState {
                 self.model_name = model;
                 self.reasoning_effort = reasoning_effort;
                 self.approval_mode = approval_mode;
+                if approval_mode == ApprovalMode::FullAuto {
+                    self.full_access_confirmation = None;
+                }
                 self.push_message(ChatMessage::System(format!(
                     "Runtime settings updated: model {}, reasoning effort {}, approval mode {}.",
                     self.model_name,

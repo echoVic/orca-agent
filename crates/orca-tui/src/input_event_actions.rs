@@ -383,7 +383,7 @@ pub(crate) fn handle_paste_event(
     let Event::Paste(pasted) = ev else {
         return false;
     };
-    if state.config_dialog.is_some() {
+    if state.config_dialog.is_some() || state.full_access_confirmation.is_some() {
         return true;
     }
     if let Some(dialog) = state.user_input_dialog.as_mut() {
@@ -448,7 +448,10 @@ pub(crate) fn handle_mouse_event(
         state.viewport.selection = None;
         return MouseFlow::Handled;
     }
-    if state.config_dialog.is_some() || state.user_input_dialog.is_some() {
+    if state.config_dialog.is_some()
+        || state.full_access_confirmation.is_some()
+        || state.user_input_dialog.is_some()
+    {
         state.viewport.selection = None;
         return MouseFlow::Handled;
     }

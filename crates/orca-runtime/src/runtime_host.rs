@@ -91,6 +91,7 @@ use crate::runtime_actor::interaction::{
 use crate::runtime_actor::operation_recovery::{
     EphemeralReservationExpiry, OperationRecoveryController,
 };
+use crate::runtime_execution_policy::RuntimeExecutionPolicyHandle;
 use crate::runtime_surface as surface;
 use crate::tasks::{
     DetachedPermissionRequest, DurableTypedProviderOutcome, MainSessionTerminalUpdate,
@@ -885,7 +886,8 @@ impl HostedTurnRequest {
                     && self.emit_session_completed
                     && self.operation_kind != HostedOperationKind::GoalRun,
             )
-            .with_steer_handle(generation.steer_handle.clone());
+            .with_steer_handle(generation.steer_handle.clone())
+            .with_execution_policy(generation.execution_policy().clone());
         if let Some(handler) = generation
             .handlers
             .approval_handler
@@ -1089,6 +1091,7 @@ pub struct GenerationContext {
     resumes_existing_turn: bool,
     handlers: HostedGenerationHandlers,
     config: RunConfig,
+    execution_policy: RuntimeExecutionPolicyHandle,
 }
 
 impl GenerationContext {
@@ -1098,6 +1101,7 @@ impl GenerationContext {
         resumes_existing_turn: bool,
         handlers: HostedGenerationHandlers,
         config: RunConfig,
+        execution_policy: RuntimeExecutionPolicyHandle,
     ) -> Self {
         Self {
             fence,
@@ -1105,6 +1109,7 @@ impl GenerationContext {
             resumes_existing_turn,
             handlers,
             config,
+            execution_policy,
         }
     }
 
@@ -1118,6 +1123,10 @@ impl GenerationContext {
 
     pub fn config(&self) -> &RunConfig {
         &self.config
+    }
+
+    fn execution_policy(&self) -> &RuntimeExecutionPolicyHandle {
+        &self.execution_policy
     }
 
     pub fn drain_steer_inputs(&self) -> Vec<String> {
@@ -10957,13 +10966,27 @@ fn apply_runtime_settings_patch(
             settings.reasoning_effort = *effort;
         }
         surface::RuntimeSettingsPatch::SetApprovalMode { mode } => {
+            if *mode == surface::SurfaceApprovalMode::FullAuto
+                && settings.approval_mode != surface::SurfaceApprovalMode::FullAuto
+            {
+                return Err(surface::SurfaceClientCommandError::Unauthorized);
+            }
             config.approval_mode = match mode {
                 surface::SurfaceApprovalMode::Suggest => ApprovalMode::Suggest,
                 surface::SurfaceApprovalMode::AutoEdit => ApprovalMode::AutoEdit,
                 surface::SurfaceApprovalMode::FullAuto => ApprovalMode::FullAuto,
                 surface::SurfaceApprovalMode::Plan => ApprovalMode::Plan,
             };
+            config.execution_profile =
+                orca_core::capability::ExecutionProfile::for_approval_mode(config.approval_mode);
             settings.approval_mode = *mode;
+        }
+        surface::RuntimeSettingsPatch::EnableFullAccess => {
+            config.approval_mode = ApprovalMode::FullAuto;
+            config.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+            config.active_permission_profile = None;
+            settings.approval_mode = surface::SurfaceApprovalMode::FullAuto;
+            settings.active_permission_profile = None;
         }
         surface::RuntimeSettingsPatch::SetCwd { cwd } => {
             config.cwd = Some(cwd.as_path().to_path_buf());
@@ -11045,6 +11068,7 @@ fn runtime_settings_patch_affects_policy(patch: &surface::RuntimeSettingsPatch) 
     matches!(
         patch,
         surface::RuntimeSettingsPatch::SetApprovalMode { .. }
+            | surface::RuntimeSettingsPatch::EnableFullAccess
             | surface::RuntimeSettingsPatch::SetCwd { .. }
             | surface::RuntimeSettingsPatch::SetWorkspaceRoots { .. }
             | surface::RuntimeSettingsPatch::SetActivePermissionProfile { .. }
@@ -11074,13 +11098,15 @@ pub fn hydrate_run_config_from_surface_settings(
             effort: settings.reasoning_effort,
         },
     )?;
-    apply_runtime_settings_patch(
-        config,
-        &mut restored,
-        &surface::RuntimeSettingsPatch::SetApprovalMode {
+    let full_access = settings.approval_mode == surface::SurfaceApprovalMode::FullAuto;
+    let approval_patch = if full_access {
+        surface::RuntimeSettingsPatch::EnableFullAccess
+    } else {
+        surface::RuntimeSettingsPatch::SetApprovalMode {
             mode: settings.approval_mode,
-        },
-    )?;
+        }
+    };
+    apply_runtime_settings_patch(config, &mut restored, &approval_patch)?;
     apply_runtime_settings_patch(
         config,
         &mut restored,
@@ -11099,7 +11125,11 @@ pub fn hydrate_run_config_from_surface_settings(
         config,
         &mut restored,
         &surface::RuntimeSettingsPatch::SetActivePermissionProfile {
-            profile: settings.active_permission_profile.clone(),
+            profile: if full_access {
+                None
+            } else {
+                settings.active_permission_profile.clone()
+            },
         },
     )?;
     apply_runtime_settings_patch(
@@ -11155,6 +11185,7 @@ fn persist_surface_settings_metadata(
                             .map(|value| value.as_str().to_string()),
                     },
                 ),
+                clear_active_permission_profile: settings.active_permission_profile.is_none(),
                 approval_mode: Some(match settings.approval_mode {
                     surface::SurfaceApprovalMode::Suggest => ApprovalMode::Suggest,
                     surface::SurfaceApprovalMode::AutoEdit => ApprovalMode::AutoEdit,
@@ -13827,6 +13858,7 @@ struct ActiveOperation {
     completion: OperationCompletion,
     request: HostedTurnRequest,
     config: RunConfig,
+    execution_policy: RuntimeExecutionPolicyHandle,
     steer_handle: ThreadSteerHandle,
     pending_goal_pause_replies: Vec<(
         SyncSender<Result<PauseGoalRunResult, RuntimeHostError>>,
@@ -18065,7 +18097,7 @@ impl ThreadActor {
                     request_id,
                     expected_thread_revision,
                     patch,
-                    false,
+                    None,
                 );
                 let _ = reply.send(result);
             }
@@ -18558,6 +18590,7 @@ impl ThreadActor {
                 request.root_task_id = Some(root_task_id.clone());
                 let task_registry = state.thread.session().task_registry().clone();
                 let steer_handle = ThreadSteerHandle::default();
+                let execution_policy = RuntimeExecutionPolicyHandle::new(config.clone(), 0);
                 let goal_turn = request.surface_goal_turn.take();
                 let generation = self.spawn_generation(
                     state,
@@ -18570,6 +18603,7 @@ impl ThreadActor {
                         request.resumes_existing_turn,
                         HostedGenerationHandlers::default(),
                         config.clone(),
+                        execution_policy.clone(),
                     ),
                 );
                 assert!(
@@ -18586,6 +18620,7 @@ impl ThreadActor {
                     completion: completion.clone(),
                     request,
                     config,
+                    execution_policy,
                     steer_handle,
                     pending_goal_pause_replies: Vec::new(),
                     pending_goal_interrupt_replies: Vec::new(),
@@ -19066,7 +19101,7 @@ impl ThreadActor {
                     request_id,
                     expected_thread_revision,
                     patch,
-                    true,
+                    Some(active),
                 );
                 let _ = reply.send(result);
             }
@@ -20843,6 +20878,7 @@ impl ThreadActor {
                                         true,
                                         HostedGenerationHandlers::default(),
                                         active.config.clone(),
+                                        active.execution_policy.clone(),
                                     );
                                     active.surface_operation = Some(successor_fence);
                                     active.generation = self.spawn_generation(
@@ -20901,6 +20937,7 @@ impl ThreadActor {
                                 true,
                                 HostedGenerationHandlers::default(),
                                 active.config.clone(),
+                                active.execution_policy.clone(),
                             );
                             active.generation = self.spawn_generation(
                                 result.state,
@@ -21313,6 +21350,7 @@ impl ThreadActor {
                     false,
                     HostedGenerationHandlers::default(),
                     active.config.clone(),
+                    active.execution_policy.clone(),
                 );
                 active.generation = self.spawn_generation(
                     result.state,
@@ -23782,6 +23820,16 @@ mod tests {
         observed: SyncSender<(String, ApprovalMode, orca_core::config::ReasoningEffort)>,
     }
 
+    struct DynamicExecutionPolicyExecutor {
+        observed: SyncSender<(
+            u64,
+            ApprovalMode,
+            orca_core::capability::ExecutionProfile,
+            crate::shell_session::ShellSandboxMode,
+        )>,
+        release: Mutex<Receiver<()>>,
+    }
+
     #[derive(Clone, Copy)]
     enum ExactSelectorCorruption {
         Revision,
@@ -24253,6 +24301,57 @@ mod tests {
                     generation.config().reasoning_effort,
                 ))
                 .map_err(|_| io::Error::other("settings config snapshot observer closed"))?;
+            thread.lifecycle_mut().finish_task(RunStatus::Success);
+            Ok(RunStatus::Success.into())
+        }
+    }
+
+    impl ThreadOperationExecutor for DynamicExecutionPolicyExecutor {
+        fn run_turn(
+            &self,
+            thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            _cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let observe =
+                |snapshot: &crate::runtime_execution_policy::RuntimeExecutionPolicySnapshot| {
+                    let sandbox = crate::server::bash_sandbox_for_cwd(
+                        snapshot.config(),
+                        generation
+                            .config()
+                            .cwd
+                            .as_deref()
+                            .unwrap_or_else(|| std::path::Path::new(".")),
+                    )
+                    .map_err(io::Error::other)?;
+                    Ok::<_, io::Error>((
+                        snapshot.revision(),
+                        snapshot.config().approval_mode,
+                        snapshot.config().execution_profile,
+                        sandbox.mode,
+                    ))
+                };
+            let admitted = generation.execution_policy().snapshot();
+            self.observed
+                .send(observe(&admitted)?)
+                .map_err(|_| io::Error::other("dynamic policy observer closed"))?;
+            self.release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .map_err(|_| io::Error::other("dynamic policy release closed"))?;
+            assert_eq!(admitted.config().approval_mode, ApprovalMode::Suggest);
+            assert_eq!(
+                admitted.config().execution_profile,
+                orca_core::capability::ExecutionProfile::Workspace
+            );
+            let next = generation.execution_policy().snapshot();
+            self.observed
+                .send(observe(&next)?)
+                .map_err(|_| io::Error::other("dynamic policy observer closed"))?;
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
         }
@@ -30897,6 +30996,167 @@ mod tests {
         resumed_host
             .shutdown()
             .expect("shutdown resumed settings host");
+    }
+
+    #[test]
+    fn confirmed_full_access_updates_the_active_operations_next_policy_snapshot() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (observed_tx, observed_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(DynamicExecutionPolicyExecutor {
+            observed: observed_tx,
+            release: Mutex::new(release_rx),
+        }))
+        .expect("start dynamic policy runtime host");
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::Suggest;
+        config.execution_profile = orca_core::capability::ExecutionProfile::Workspace;
+        let thread = host
+            .start_thread(config, "dynamic full access")
+            .expect("start dynamic policy thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ManageThreadSettings,
+            ]),
+        );
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "switch full access while running",
+                    ),
+                )
+                .expect("reserve dynamic policy operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit dynamic policy operation"),
+        );
+
+        let (before_revision, before_mode, before_profile, before_sandbox) = observed_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("observe policy before widening");
+        assert_eq!(before_revision, 0);
+        assert_eq!(before_mode, ApprovalMode::Suggest);
+        assert_eq!(
+            before_profile,
+            orca_core::capability::ExecutionProfile::Workspace
+        );
+        assert!(!matches!(
+            before_sandbox,
+            crate::shell_session::ShellSandboxMode::DangerFullAccess
+        ));
+
+        let current = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::ManageThreadSettings,
+            ]),
+        );
+        let previous_epoch = current.baseline.snapshot.settings.effective.policy_epoch;
+        assert!(matches!(
+            current.client.update_settings(
+                surface_request_id(),
+                current.baseline.snapshot.settings.thread_revision,
+                surface::NonEmptyVec::try_new(vec![
+                    surface::RuntimeSettingsPatch::SetApprovalMode {
+                        mode: surface::SurfaceApprovalMode::FullAuto,
+                    },
+                ])
+                .unwrap(),
+            ),
+            Err(surface::SurfaceClientCommandError::Unauthorized)
+        ));
+        let updated = committed_surface_value(
+            current
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    current.baseline.snapshot.settings.thread_revision,
+                    surface::NonEmptyVec::try_new(vec![
+                        surface::RuntimeSettingsPatch::EnableFullAccess,
+                    ])
+                    .unwrap(),
+                )
+                .expect("enable full access while operation is active"),
+        );
+        assert_eq!(
+            updated.settings.effective.approval_mode,
+            surface::SurfaceApprovalMode::FullAuto
+        );
+        assert!(
+            updated
+                .settings
+                .effective
+                .active_permission_profile
+                .is_none()
+        );
+        assert_eq!(
+            updated.settings.effective.policy_epoch.get(),
+            previous_epoch.get() + 1
+        );
+        let mut restored = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        restored.active_permission_profile = Some(orca_core::config::ActivePermissionProfile::new(
+            "legacy-restrictive",
+            None::<String>,
+        ));
+        let mut legacy_settings = updated.settings.effective.clone();
+        legacy_settings.active_permission_profile = Some(surface::SurfaceActivePermissionProfile {
+            id: surface::NonEmptyText::try_new("legacy-restrictive").unwrap(),
+            extends: None,
+        });
+        hydrate_run_config_from_surface_settings(&mut restored, &legacy_settings)
+            .expect("hydrate confirmed full access");
+        assert_eq!(restored.approval_mode, ApprovalMode::FullAuto);
+        assert_eq!(
+            restored.execution_profile,
+            orca_core::capability::ExecutionProfile::TrustedHost
+        );
+        assert!(restored.active_permission_profile.is_none());
+
+        release_tx
+            .send(())
+            .expect("release dynamic policy executor");
+        let (after_revision, after_mode, after_profile, after_sandbox) = observed_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("observe policy after widening");
+        assert!(after_revision > before_revision);
+        assert_eq!(after_mode, ApprovalMode::FullAuto);
+        assert_eq!(
+            after_profile,
+            orca_core::capability::ExecutionProfile::TrustedHost
+        );
+        assert!(matches!(
+            after_sandbox,
+            crate::shell_session::ShellSandboxMode::DangerFullAccess
+        ));
+
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait dynamic policy operation");
+        assert!(matches!(
+            terminal,
+            surface::WaitOperationTerminalResult::Terminal { value }
+                if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+        ));
+        thread.shutdown().expect("shutdown dynamic policy thread");
+        host.shutdown().expect("shutdown dynamic policy host");
     }
 
     #[test]

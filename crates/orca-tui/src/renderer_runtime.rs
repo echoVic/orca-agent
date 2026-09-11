@@ -122,6 +122,11 @@ impl RendererRuntimeEventOwner {
                 config.model = config.model.with_value_unchecked(Some(model.clone()));
                 config.reasoning_effort = reasoning_effort;
                 config.approval_mode = approval_mode;
+                config.execution_profile =
+                    orca_core::capability::ExecutionProfile::for_approval_mode(approval_mode);
+                if approval_mode == orca_core::approval_types::ApprovalMode::FullAuto {
+                    config.active_permission_profile = None;
+                }
                 handle_runtime_event(
                     TuiEvent::SettingsUpdated {
                         model,
@@ -536,6 +541,10 @@ mod tests {
         let original_model = config.model.display_name().to_string();
         let original_effort = config.reasoning_effort;
         let original_approval = config.approval_mode;
+        config.active_permission_profile = Some(orca_core::config::ActivePermissionProfile::new(
+            "strict",
+            None::<String>,
+        ));
         state.reasoning_effort = original_effort;
         state.approval_mode = original_approval;
         let pending = bridge::PendingWorkflowNotifications::new();
@@ -596,6 +605,11 @@ mod tests {
         assert_eq!(config.model.display_name(), "deepseek-reasoner");
         assert_eq!(config.reasoning_effort, ReasoningEffort::High);
         assert_eq!(config.approval_mode, ApprovalMode::FullAuto);
+        assert_eq!(
+            config.execution_profile,
+            orca_core::capability::ExecutionProfile::TrustedHost
+        );
+        assert!(config.active_permission_profile.is_none());
         assert_eq!(state.model_name, "deepseek-reasoner");
         assert_eq!(state.reasoning_effort, ReasoningEffort::High);
         assert_eq!(state.approval_mode, ApprovalMode::FullAuto);

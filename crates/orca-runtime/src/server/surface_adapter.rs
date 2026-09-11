@@ -2671,9 +2671,13 @@ fn settings_patches(
         orca_core::approval_types::ApprovalMode::Plan => crate::surface::SurfaceApprovalMode::Plan,
     };
     if snapshot.settings.effective.approval_mode != approval_mode {
-        patches.push(RuntimeSettingsPatch::SetApprovalMode {
-            mode: approval_mode,
-        });
+        if approval_mode == crate::surface::SurfaceApprovalMode::FullAuto {
+            patches.push(RuntimeSettingsPatch::EnableFullAccess);
+        } else {
+            patches.push(RuntimeSettingsPatch::SetApprovalMode {
+                mode: approval_mode,
+            });
+        }
     }
     if let Some(roots) = config.runtime_workspace_roots.as_ref() {
         let roots = roots
@@ -2686,9 +2690,11 @@ fn settings_patches(
             patches.push(RuntimeSettingsPatch::SetWorkspaceRoots { roots });
         }
     }
-    let profile = config
-        .active_permission_profile
-        .as_ref()
+    let active_profile = (config.approval_mode
+        != orca_core::approval_types::ApprovalMode::FullAuto)
+        .then_some(config.active_permission_profile.as_ref())
+        .flatten();
+    let profile = active_profile
         .map(|profile| {
             Ok(crate::surface::SurfaceActivePermissionProfile {
                 id: crate::surface::NonEmptyText::try_new(profile.id.clone())?,

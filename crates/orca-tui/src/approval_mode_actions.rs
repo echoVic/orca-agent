@@ -1,25 +1,20 @@
-use orca_core::config::RunConfig;
-
+use crate::full_access_confirmation_actions::request_settings_change;
 use crate::protocol::UserAction;
-use crate::slash_command_actions::encode_settings_intent;
 use crate::types::AppState;
 
 pub(crate) fn cycle_approval_mode(
-    config: &RunConfig,
     state: &mut AppState,
     action_tx: &crossbeam_channel::Sender<UserAction>,
 ) {
-    let next = config.approval_mode.next();
-    let _ = action_tx.send(UserAction::SetModel(encode_settings_intent(
-        None,
-        None,
-        Some(next),
-    )));
-    state.push_message(crate::transcript_state::ChatMessage::System(format!(
-        "Approval mode change requested: {}.",
-        next.as_str()
-    )));
-    state.scroll_to_bottom();
+    let next = state.approval_mode.next();
+    let dispatched = request_settings_change(state, action_tx, None, None, Some(next));
+    if dispatched {
+        state.push_message(crate::transcript_state::ChatMessage::System(format!(
+            "Approval mode change requested: {}.",
+            next.as_str()
+        )));
+        state.scroll_to_bottom();
+    }
 }
 
 #[cfg(test)]
@@ -43,7 +38,7 @@ mod tests {
         );
         state.approval_mode = ApprovalMode::Suggest;
 
-        cycle_approval_mode(&config, &mut state, &action_tx);
+        cycle_approval_mode(&mut state, &action_tx);
 
         assert_eq!(config.approval_mode, ApprovalMode::Suggest);
         assert_eq!(state.approval_mode, ApprovalMode::Suggest);
@@ -57,5 +52,23 @@ mod tests {
                 .approval_mode,
             Some(ApprovalMode::AutoEdit)
         );
+    }
+
+    #[test]
+    fn approval_mode_cycle_requires_confirmation_before_full_access() {
+        let (action_tx, action_rx) = crossbeam_channel::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "model".to_string(),
+            "/tmp".to_string(),
+        );
+        state.approval_mode = ApprovalMode::AutoEdit;
+
+        cycle_approval_mode(&mut state, &action_tx);
+
+        assert_eq!(state.approval_mode, ApprovalMode::AutoEdit);
+        assert!(state.full_access_confirmation.is_some());
+        assert!(action_rx.try_recv().is_err());
     }
 }

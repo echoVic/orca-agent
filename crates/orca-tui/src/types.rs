@@ -206,6 +206,13 @@ pub struct ConfigDialog {
     pub approval_mode: ApprovalMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullAccessConfirmation {
+    pub selected: usize,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<orca_core::config::ReasoningEffort>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOption {
     /// Approve this single call.
@@ -402,6 +409,7 @@ pub struct AppState {
     pub approval_dialog: Option<ApprovalDialog>,
     pub plan_approval_dialog: Option<PlanApprovalDialog>,
     pub config_dialog: Option<ConfigDialog>,
+    pub full_access_confirmation: Option<FullAccessConfirmation>,
     pub(crate) user_input_dialog: Option<UserInputDialog>,
     pub(crate) interaction: InteractionState,
     /// Tool / "tool\u{0}target" keys the user chose to always allow this
@@ -650,6 +658,7 @@ impl AppState {
             approval_dialog: None,
             plan_approval_dialog: None,
             config_dialog: None,
+            full_access_confirmation: None,
             user_input_dialog: None,
             interaction: InteractionState::default(),
             approval_allowlist: std::collections::HashSet::new(),
@@ -1044,6 +1053,7 @@ impl AppState {
         self.atomic_skill_tokens.clear();
         self.plan_approval_dialog = None;
         self.config_dialog = None;
+        self.full_access_confirmation = None;
         self.user_input_dialog = None;
         self.pre_plan_approval_mode = None;
         self.pending_pastes.clear();

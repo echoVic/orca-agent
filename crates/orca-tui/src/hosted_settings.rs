@@ -38,11 +38,19 @@ pub(crate) fn settings_intent_patches(
         });
     }
     if let Some(mode) = intent.approval_mode {
-        patches.push(
-            orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
-                mode: surface_approval_mode(mode),
-            },
-        );
+        match (mode, intent.full_access_confirmed) {
+            (orca_core::approval_types::ApprovalMode::FullAuto, true) => {
+                patches.push(orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess);
+            }
+            (orca_core::approval_types::ApprovalMode::FullAuto, false) => {}
+            (mode, _) => {
+                patches.push(
+                    orca_runtime::surface::RuntimeSettingsPatch::SetApprovalMode {
+                        mode: surface_approval_mode(mode),
+                    },
+                );
+            }
+        }
     }
     patches
 }
@@ -130,12 +138,32 @@ pub(crate) fn apply_hosted_settings_action(
     if patches.is_empty() {
         return false;
     }
+    let unconfirmed_full_access = patches.iter().any(|patch| {
+        matches!(
+            patch,
+            RuntimeSettingsPatch::SetApprovalMode {
+                mode: orca_runtime::surface::SurfaceApprovalMode::FullAuto
+            }
+        )
+    }) && config
+        .lock()
+        .map(|config| config.approval_mode != orca_core::approval_types::ApprovalMode::FullAuto)
+        .unwrap_or(true);
+    if unconfirmed_full_access {
+        let _ = event_tx.send(TuiEvent::OperationRejected(
+            "Full Access requires explicit confirmation".to_string(),
+        ));
+        return false;
+    }
     let persist_model = patches
         .iter()
         .any(|patch| matches!(patch, RuntimeSettingsPatch::SetModel { .. }));
     let persist_effort = patches
         .iter()
         .any(|patch| matches!(patch, RuntimeSettingsPatch::SetReasoning { .. }));
+    let enables_full_access = patches
+        .iter()
+        .any(|patch| matches!(patch, RuntimeSettingsPatch::EnableFullAccess));
     if let Some(thread) = thread {
         let patches = match orca_runtime::surface::NonEmptyVec::try_new(patches) {
             Ok(patches) => patches,
@@ -168,6 +196,11 @@ pub(crate) fn apply_hosted_settings_action(
             cfg.model = cfg.model.with_value_unchecked(Some(model.clone()));
             cfg.reasoning_effort = reasoning_effort;
             cfg.approval_mode = approval_mode;
+            cfg.execution_profile =
+                orca_core::capability::ExecutionProfile::for_approval_mode(approval_mode);
+            if enables_full_access {
+                cfg.active_permission_profile = None;
+            }
         }
         let _ = event_tx.send(TuiEvent::SettingsUpdated {
             model: model.clone(),
@@ -221,6 +254,13 @@ pub(crate) fn apply_hosted_settings_action(
                         orca_core::approval_types::ApprovalMode::Plan
                     }
                 };
+                cfg.execution_profile =
+                    orca_core::capability::ExecutionProfile::for_approval_mode(cfg.approval_mode);
+            }
+            orca_runtime::surface::RuntimeSettingsPatch::EnableFullAccess => {
+                cfg.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+                cfg.execution_profile = orca_core::capability::ExecutionProfile::TrustedHost;
+                cfg.active_permission_profile = None;
             }
             _ => {}
         }
@@ -274,6 +314,7 @@ mod tests {
             model: Some(orca_core::model::LEGACY_VISION_MODEL.to_string()),
             reasoning_effort: Some(ReasoningEffort::High),
             approval_mode: Some(ApprovalMode::Plan),
+            full_access_confirmed: false,
         });
 
         assert!(matches!(
@@ -288,6 +329,30 @@ mod tests {
                 }
             ] if model.as_str() == orca_core::model::FLASH_MODEL
         ));
+    }
+
+    #[test]
+    fn confirmed_full_access_uses_the_authority_widening_patch() {
+        let patches = super::settings_intent_patches(SettingsIntent {
+            model: None,
+            reasoning_effort: None,
+            approval_mode: Some(ApprovalMode::FullAuto),
+            full_access_confirmed: true,
+        });
+
+        assert_eq!(patches, vec![RuntimeSettingsPatch::EnableFullAccess]);
+    }
+
+    #[test]
+    fn unconfirmed_full_access_intent_fails_closed() {
+        let patches = super::settings_intent_patches(SettingsIntent {
+            model: None,
+            reasoning_effort: None,
+            approval_mode: Some(ApprovalMode::FullAuto),
+            full_access_confirmed: false,
+        });
+
+        assert!(patches.is_empty());
     }
 
     #[test]
@@ -311,6 +376,30 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_direct_full_auto_patch_is_rejected() {
+        let config = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let (event_tx, event_rx) = mpsc::unbounded();
+
+        assert!(!super::apply_hosted_settings_action(
+            None,
+            &config,
+            &event_tx,
+            vec![RuntimeSettingsPatch::SetApprovalMode {
+                mode: SurfaceApprovalMode::FullAuto,
+            }],
+        ));
+        assert_ne!(
+            config.lock().expect("config").approval_mode,
+            ApprovalMode::FullAuto
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TuiEvent::OperationRejected(message))
+                if message == "Full Access requires explicit confirmation"
+        ));
+    }
+
+    #[test]
     fn unattached_settings_update_mutates_config_then_emits_result() {
         let _home = crate::test_support::isolate_orca_home();
         let config = Arc::new(Mutex::new(crate::test_support::test_run_config()));
@@ -328,9 +417,7 @@ mod tests {
                 RuntimeSettingsPatch::SetReasoning {
                     effort: SurfaceReasoningEffort::Low,
                 },
-                RuntimeSettingsPatch::SetApprovalMode {
-                    mode: SurfaceApprovalMode::FullAuto,
-                },
+                RuntimeSettingsPatch::EnableFullAccess,
             ],
         ));
 
@@ -471,11 +558,17 @@ mod tests {
             None,
             &config,
             &event_tx,
-            vec![RuntimeSettingsPatch::SetApprovalMode {
-                mode: SurfaceApprovalMode::FullAuto,
-            }],
+            vec![RuntimeSettingsPatch::EnableFullAccess],
         ));
 
+        let config = config.lock().expect("config");
+        assert_eq!(config.approval_mode, ApprovalMode::FullAuto);
+        assert_eq!(
+            config.execution_profile,
+            orca_core::capability::ExecutionProfile::TrustedHost
+        );
+        assert!(config.active_permission_profile.is_none());
+        drop(config);
         assert!(
             !_home.path().join("config.toml").exists(),
             "approval mode changes must not write the user config"

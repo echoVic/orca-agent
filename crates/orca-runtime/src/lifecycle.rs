@@ -32,6 +32,7 @@ use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
 use crate::provider_stream::RuntimeProviderSuspensionControl;
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
+use crate::runtime_execution_policy::RuntimeExecutionPolicyHandle;
 use crate::runtime_state::RuntimeTurnReducer;
 use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
 use crate::runtime_tool_call::{
@@ -231,6 +232,7 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) root_task_id: Option<&'a str>,
     pub(crate) continuation: Option<RuntimeTurnContinuation>,
     pub(crate) steer_handle: Option<&'a ThreadSteerHandle>,
+    pub(crate) execution_policy: Option<&'a RuntimeExecutionPolicyHandle>,
     pub(crate) provider_suspension_control: Option<&'a dyn RuntimeProviderSuspensionControl>,
     pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
     pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
@@ -1069,6 +1071,14 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    pub(crate) fn with_execution_policy(
+        mut self,
+        execution_policy: Option<&'a RuntimeExecutionPolicyHandle>,
+    ) -> Self {
+        self.turn_context = self.turn_context.with_execution_policy(execution_policy);
+        self
+    }
+
     pub(crate) fn with_provider_suspension_control(
         mut self,
         control: Option<&'a dyn RuntimeProviderSuspensionControl>,
@@ -1225,6 +1235,7 @@ impl<'a> RuntimeTurnContext<'a> {
             root_task_id: None,
             continuation: None,
             steer_handle: None,
+            execution_policy: None,
             provider_suspension_control: None,
             provider_response_ingress: None,
             workflow_lifecycle_ingress: None,
@@ -1265,6 +1276,14 @@ impl<'a> RuntimeTurnContext<'a> {
 
     pub(crate) fn with_steer_handle(mut self, steer_handle: Option<&'a ThreadSteerHandle>) -> Self {
         self.steer_handle = steer_handle;
+        self
+    }
+
+    pub(crate) fn with_execution_policy(
+        mut self,
+        execution_policy: Option<&'a RuntimeExecutionPolicyHandle>,
+    ) -> Self {
+        self.execution_policy = execution_policy;
         self
     }
 

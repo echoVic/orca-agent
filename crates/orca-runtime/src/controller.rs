@@ -41,6 +41,7 @@ use crate::lifecycle::{
 };
 use crate::provider_stream::{RuntimeProviderSuspension, RuntimeProviderSuspensionControl};
 use crate::runtime_conversation_bootstrap::AgentConversationContext;
+use crate::runtime_execution_policy::RuntimeExecutionPolicyHandle;
 use crate::runtime_host::{
     HeadlessInteractionCheckpoint, HeadlessOperationHandle, HeadlessSurfaceSession, RuntimeHost,
     RuntimeHostError, RuntimeThreadStartRequest,
@@ -318,6 +319,7 @@ pub struct ThreadTurnRequest {
     options: ControllerRunOptions,
     emit_session_completed: bool,
     steer_handle: Option<ThreadSteerHandle>,
+    execution_policy: Option<RuntimeExecutionPolicyHandle>,
     approval_handler: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler>>,
@@ -764,6 +766,7 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             loop_context
         }
         .with_owned_permission_handler(request.permission_handler_arc())
+        .with_execution_policy(request.execution_policy())
         .with_provider_suspension_control(request.provider_suspension_control())
         .with_provider_response_ingress(request.provider_response_ingress())
         .with_workflow_lifecycle_ingress(request.workflow_lifecycle_ingress())
@@ -1034,6 +1037,7 @@ impl ThreadTurnRequest {
             options: ControllerRunOptions::default(),
             emit_session_completed: true,
             steer_handle: None,
+            execution_policy: None,
             approval_handler: None,
             permission_handler: None,
             user_input_handler: None,
@@ -1143,6 +1147,15 @@ impl ThreadTurnRequest {
     pub fn with_steer_handle(mut self, handle: ThreadSteerHandle) -> Self {
         self.steer_handle = Some(handle);
         self
+    }
+
+    pub(crate) fn with_execution_policy(mut self, policy: RuntimeExecutionPolicyHandle) -> Self {
+        self.execution_policy = Some(policy);
+        self
+    }
+
+    pub(crate) fn execution_policy(&self) -> Option<&RuntimeExecutionPolicyHandle> {
+        self.execution_policy.as_ref()
     }
 
     pub fn with_permission_handler(

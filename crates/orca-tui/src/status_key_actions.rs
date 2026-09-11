@@ -11,6 +11,7 @@ use orca_runtime::history::SessionTranscript;
 use crate::agent_workspace_actions::handle_agent_workspace_key;
 use crate::approval_dialog_actions::handle_approval_dialog_key;
 use crate::config_dialog_actions::handle_config_dialog_key;
+use crate::full_access_confirmation_actions::handle_full_access_confirmation_key;
 use crate::idle_key_actions::handle_idle_key;
 use crate::plan_approval_actions::handle_plan_approval_key;
 use crate::protocol::UserAction;
@@ -69,6 +70,12 @@ where
     if state.status == AppStatus::SessionPicker {
         vim_state.cancel_pending_command();
         handle_session_picker_key(key, state, action_tx, clear_terminal)?;
+        return Ok(StatusKeyFlow::Continue);
+    }
+
+    if state.full_access_confirmation.is_some() {
+        vim_state.cancel_pending_command();
+        handle_full_access_confirmation_key(key, state, action_tx);
         return Ok(StatusKeyFlow::Continue);
     }
 

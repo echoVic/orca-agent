@@ -161,6 +161,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     render_status(frame, chunks[7], state, theme);
 
     if state.user_input_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && !state.transcript.search.open
         && state.slash_menu.is_some()
     {
@@ -168,6 +169,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
     }
 
     if state.user_input_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && !state.transcript.search.open
         && state.mention.phase.is_some()
         && state.slash_menu.is_none()
@@ -180,6 +182,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         && state.image_viewer.is_none()
         && state.user_input_dialog.is_none()
         && state.config_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && state.plan_approval_dialog.is_none()
         && !state.show_shortcuts
         && state.slash_menu.is_none()
@@ -212,6 +215,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 
     if state.config_dialog.is_some() {
         render_config_dialog(frame, state, theme);
+    }
+
+    if state.full_access_confirmation.is_some() {
+        render_full_access_confirmation(frame, state, theme);
     }
 
     if state.show_shortcuts {
@@ -359,6 +366,7 @@ fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
     composer_visible(state)
         && !state.show_shortcuts
         && state.config_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && state.user_input_dialog.is_none()
         && state.image_viewer.is_none()
 }
@@ -366,6 +374,7 @@ fn main_composer_hardware_cursor_visible(state: &AppState) -> bool {
 fn search_visible(state: &AppState) -> bool {
     state.transcript.search.open
         && state.config_dialog.is_none()
+        && state.full_access_confirmation.is_none()
         && state.user_input_dialog.is_none()
         && state.plan_approval_dialog.is_none()
         && state.image_viewer.is_none()
@@ -809,6 +818,66 @@ fn render_config_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .border_type(BorderType::Rounded)
         .title(" Runtime Configuration ")
         .border_style(Style::default().fg(theme.border));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn render_full_access_confirmation(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let Some(confirmation) = state.full_access_confirmation.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(
+        frame.area(),
+        72u16.min(frame.area().width.saturating_sub(4)),
+        12u16.min(frame.area().height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, popup);
+
+    let continue_style = if confirmation.selected == 0 {
+        Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    let cancel_style = if confirmation.selected == 1 {
+        Style::default()
+            .fg(theme.border)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            "  Full Access removes command approvals and OS sandbox restrictions.",
+            Style::default().fg(theme.warning),
+        )),
+        Line::from(""),
+        Line::from("  Commands may modify any file and access the network."),
+        Line::from("  The active task will use this authority from its next tool call."),
+        Line::from("  Tools already running keep the policy they started with."),
+        Line::from(""),
+        Line::from(Span::styled(
+            if confirmation.selected == 0 {
+                "  > Continue with Full Access"
+            } else {
+                "    Continue with Full Access"
+            },
+            continue_style,
+        )),
+        Line::from(Span::styled(
+            if confirmation.selected == 1 {
+                "  > Cancel"
+            } else {
+                "    Cancel"
+            },
+            cancel_style,
+        )),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Enable Full Access? ")
+        .border_style(Style::default().fg(theme.error));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -6588,6 +6657,30 @@ mod tests {
                 .iter()
                 .any(|cell| { cell.modifier.contains(Modifier::REVERSED) && cell.symbol() == " " })
         );
+    }
+
+    #[test]
+    fn full_access_confirmation_renders_risk_and_defaults_to_cancel() {
+        let mut state = test_state();
+        state.full_access_confirmation = Some(crate::types::FullAccessConfirmation {
+            selected: 1,
+            model: None,
+            reasoning_effort: None,
+        });
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = TextArea::from([""]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(84, 22))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Enable Full Access?"));
+        assert!(rendered.contains("OS sandbox restrictions"));
+        assert!(rendered.contains("next tool call"));
+        assert!(rendered.contains("> Cancel"));
     }
 
     #[test]

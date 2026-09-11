@@ -36,14 +36,18 @@ pub(super) fn mode_patch(mode: &str, ceiling: ApprovalMode) -> Result<RuntimeSet
     if !allowed_modes(ceiling).contains(&mode) {
         return Err(Error::invalid_params().data("mode exceeds daemon policy or is unknown"));
     }
-    Ok(RuntimeSettingsPatch::SetApprovalMode {
-        mode: match mode {
-            "plan" => SurfaceApprovalMode::Plan,
-            "suggest" => SurfaceApprovalMode::Suggest,
-            "auto-edit" => SurfaceApprovalMode::AutoEdit,
-            "full-auto" => SurfaceApprovalMode::FullAuto,
-            _ => unreachable!(),
+    Ok(match mode {
+        "plan" => RuntimeSettingsPatch::SetApprovalMode {
+            mode: SurfaceApprovalMode::Plan,
         },
+        "suggest" => RuntimeSettingsPatch::SetApprovalMode {
+            mode: SurfaceApprovalMode::Suggest,
+        },
+        "auto-edit" => RuntimeSettingsPatch::SetApprovalMode {
+            mode: SurfaceApprovalMode::AutoEdit,
+        },
+        "full-auto" => RuntimeSettingsPatch::EnableFullAccess,
+        _ => unreachable!(),
     })
 }
 
@@ -160,4 +164,20 @@ pub(super) fn options(
             reasoning,
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mode_patch;
+    use crate::surface::RuntimeSettingsPatch;
+    use orca_core::approval_types::ApprovalMode;
+
+    #[test]
+    fn acp_full_auto_uses_the_explicit_full_access_patch() {
+        assert!(matches!(
+            mode_patch("full-auto", ApprovalMode::FullAuto).expect("allowed mode"),
+            RuntimeSettingsPatch::EnableFullAccess
+        ));
+        assert!(mode_patch("full-auto", ApprovalMode::AutoEdit).is_err());
+    }
 }

@@ -5,8 +5,8 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::config::ReasoningEffort;
 
 use crate::commands;
+use crate::full_access_confirmation_actions::request_settings_change;
 use crate::protocol::UserAction;
-use crate::slash_command_actions::encode_settings_intent;
 use crate::types::AppState;
 
 const CONFIG_ROW_COUNT: usize = 3;
@@ -102,11 +102,13 @@ fn apply_dialog(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
     {
         return;
     }
-    let _ = action_tx.send(UserAction::SetModel(encode_settings_intent(
-        Some(&dialog.model),
+    request_settings_change(
+        state,
+        action_tx,
+        Some(dialog.model),
         Some(dialog.reasoning_effort),
         Some(dialog.approval_mode),
-    )));
+    );
 }
 
 #[cfg(test)]
@@ -181,6 +183,35 @@ mod tests {
         );
 
         assert!(state.config_dialog.is_none());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn applying_full_access_preserves_other_changes_until_confirmation() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state();
+        state.approval_mode = ApprovalMode::AutoEdit;
+        state.config_dialog = Some(ConfigDialog {
+            selected: 2,
+            model: "deepseek-flash".to_string(),
+            reasoning_effort: ReasoningEffort::High,
+            approval_mode: ApprovalMode::FullAuto,
+        });
+
+        handle_config_dialog_key(
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &action_tx,
+        );
+
+        assert!(state.config_dialog.is_none());
+        let confirmation = state
+            .full_access_confirmation
+            .as_ref()
+            .expect("full access confirmation");
+        assert_eq!(confirmation.selected, 1);
+        assert_eq!(confirmation.model.as_deref(), Some("deepseek-flash"));
+        assert_eq!(confirmation.reasoning_effort, Some(ReasoningEffort::High));
         assert!(action_rx.try_recv().is_err());
     }
 }

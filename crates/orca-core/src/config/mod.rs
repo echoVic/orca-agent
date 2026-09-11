@@ -1115,6 +1115,17 @@ mod tests {
         let encoded = serde_json::to_string(&snapshot).expect("serialize snapshot");
         let decoded: DelegationSnapshot =
             serde_json::from_str(&encoded).expect("deserialize snapshot");
+        parent.approval_mode = ApprovalMode::FullAuto;
+        parent.execution_profile = crate::capability::ExecutionProfile::TrustedHost;
+        let future_snapshot = DelegationSnapshot::from_config(&parent);
+        assert_eq!(
+            decoded.execution_profile,
+            crate::capability::ExecutionProfile::ReadOnly
+        );
+        assert_eq!(
+            future_snapshot.execution_profile,
+            crate::capability::ExecutionProfile::TrustedHost
+        );
         decoded.apply_to(&mut parent, Some(FLASH_MODEL.to_string()));
 
         assert_eq!(decoded.approval_mode, ApprovalMode::Plan);
