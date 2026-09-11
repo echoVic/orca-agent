@@ -26393,6 +26393,26 @@ mod tests {
 
     #[test]
     fn workflow_cancel_checkpoint_failure_retries_exact_batch_before_signalling_worker() {
+        let diagnostic_stage = Arc::new(AtomicUsize::new(1));
+        let diagnostic_complete = Arc::new(AtomicBool::new(false));
+        let diagnostic_watchdog = std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").map(|_| {
+            let stage = Arc::clone(&diagnostic_stage);
+            let complete = Arc::clone(&diagnostic_complete);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while Instant::now() < deadline {
+                    if complete.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let stage = stage.load(Ordering::Acquire);
+                let _ = std::panic::catch_unwind(|| {
+                    panic!("workflow cancel diagnostic timed out at stage {stage}");
+                });
+                std::process::exit(200 + stage as i32);
+            })
+        });
         if !crate::workflow::host::WorkflowHost::node_available() {
             return;
         }
@@ -26415,6 +26435,7 @@ mod tests {
         .unwrap();
         let (foreground_entered_tx, foreground_entered_rx) = mpsc::sync_channel(1);
         let (foreground_release_tx, foreground_release_rx) = mpsc::sync_channel(1);
+        diagnostic_stage.store(2, Ordering::Release);
         let host = RuntimeHost::start_with_executor(Arc::new(GatedSuccessExecutor {
             entered: foreground_entered_tx,
             release: Mutex::new(foreground_release_rx),
@@ -26422,6 +26443,7 @@ mod tests {
         .expect("start workflow cancel retry runtime");
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
         config.approval_mode = ApprovalMode::FullAuto;
+        diagnostic_stage.store(3, Ordering::Release);
         let thread = host
             .start_thread(config, "retry workflow cancellation")
             .expect("start recorded workflow thread");
@@ -26430,6 +26452,7 @@ mod tests {
             .expect("load workflow transcript")
             .path;
         let surface_handle = thread.surface();
+        diagnostic_stage.store(4, Ordering::Release);
         let attachment = fresh_surface_attachment_with_capabilities(
             &surface_handle,
             BTreeSet::from([
@@ -26443,6 +26466,7 @@ mod tests {
         let mut subscription = surface_handle
             .claim_subscription(&attachment.subscription)
             .expect("claim workflow cancellation subscription");
+        diagnostic_stage.store(5, Ordering::Release);
         let workflow = committed_surface_value(
             attachment
                 .client
@@ -26460,6 +26484,7 @@ mod tests {
                 .expect("launch cancellable workflow"),
         );
         let workflow_operation_id = workflow.operation_id.expect("workflow operation");
+        diagnostic_stage.store(6, Ordering::Release);
         let foreground = committed_surface_value(
             attachment
                 .client
@@ -26472,6 +26497,7 @@ mod tests {
                 )
                 .expect("reserve foreground turn"),
         );
+        diagnostic_stage.store(7, Ordering::Release);
         let _ = committed_surface_value(
             attachment
                 .client
@@ -26482,6 +26508,7 @@ mod tests {
                 )
                 .expect("admit foreground turn"),
         );
+        diagnostic_stage.store(8, Ordering::Release);
         foreground_entered_rx
             .recv_timeout(SURFACE_TEST_TIMEOUT)
             .expect("foreground turn did not enter executor");
@@ -26489,6 +26516,7 @@ mod tests {
         surface::JsonlSurfaceCommitLedger::inject_terminal_checkpoint_failure_once(
             transcript_path.clone(),
         );
+        diagnostic_stage.store(9, Ordering::Release);
         assert!(matches!(
             attachment
                 .client
@@ -26496,6 +26524,7 @@ mod tests {
             Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
         ));
 
+        diagnostic_stage.store(10, Ordering::Release);
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         let recovered_control = loop {
             let mut found = None;
@@ -26535,6 +26564,7 @@ mod tests {
             panic!("prepared workflow cancellation was not retried");
         }
         let recovered_control = recovered_control.expect("checked recovered workflow control");
+        diagnostic_stage.store(11, Ordering::Release);
         let during_cancel = fresh_surface_attachment_with_capabilities(
             &surface_handle,
             BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
@@ -26549,13 +26579,16 @@ mod tests {
             Some(&foreground.operation_id),
             "background recovery must not cancel the active foreground operation"
         );
+        diagnostic_stage.store(12, Ordering::Release);
         foreground_release_tx
             .send(())
             .expect("release foreground after background cancellation");
+        diagnostic_stage.store(13, Ordering::Release);
         let _ = attachment
             .client
             .wait_operation_terminal(surface_request_id(), foreground.operation_id)
             .expect("wait foreground terminal");
+        diagnostic_stage.store(14, Ordering::Release);
         let terminal = attachment
             .client
             .wait_operation_terminal(surface_request_id(), workflow_operation_id.clone())
@@ -26571,6 +26604,7 @@ mod tests {
                 }
             }
         ));
+        diagnostic_stage.store(15, Ordering::Release);
         let recovered =
             surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor.clone())
                 .recover_batches()
@@ -26598,8 +26632,14 @@ mod tests {
         assert_eq!(exact[0].cursor_after, recovered_control.cursor_after);
         assert_eq!(exact[0].batch_digest, recovered_control.batch_digest);
 
+        diagnostic_stage.store(16, Ordering::Release);
         host.shutdown()
             .expect("shutdown workflow cancel retry host");
+        diagnostic_stage.store(17, Ordering::Release);
+        diagnostic_complete.store(true, Ordering::Release);
+        if let Some(watchdog) = diagnostic_watchdog {
+            watchdog.join().expect("join workflow cancel watchdog");
+        }
     }
 
     #[test]

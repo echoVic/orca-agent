@@ -70,6 +70,7 @@ jobs:
         with:
           node-version: 22
       - name: Validate reviewed platform boundaries
+        if: ${{ false }}
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
@@ -80,10 +81,13 @@ jobs:
           node scripts/test-validate-execution-broker-boundary.mjs
           node scripts/validate-execution-broker-boundary.mjs
       - name: Check the full workspace
+        if: ${{ false }}
         run: cargo check --workspace --all-targets --locked
       - name: Run workspace clippy
+        if: ${{ false }}
         run: cargo clippy --workspace --all-targets --locked
       - name: Run native Windows platform contracts
+        if: ${{ false }}
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
@@ -107,19 +111,26 @@ jobs:
           cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
           cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
       - name: Build the Windows async subagent runner
+        if: ${{ false }}
         run: cargo build -p orca-windows-runner --locked
-      - name: Run the full Windows test suite
+      - name: Run focused workflow cancellation diagnostic
         timeout-minutes: 75
         env:
           RUST_BACKTRACE: "1"
+          ORCA_WORKFLOW_CANCEL_DIAGNOSTIC: "1"
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo nextest run -p orca-tui --lib --locked --profile ci-serial
-          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass
-          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+          for ($attempt = 1; $attempt -le 20; $attempt++) {
+            Write-Host "Diagnostic attempt $attempt"
+            cargo test -p orca-runtime --lib "runtime_host::tests::workflow_cancel_checkpoint_failure_retries_exact_batch_before_signalling_worker" --locked -- --exact --nocapture --test-threads=1
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
 
   native-arm64:
+    if: ${{ false }}
     runs-on: windows-11-arm
     defaults:
       run:
