@@ -386,7 +386,9 @@ pub(crate) fn handle_paste_event(
     if state.config_dialog.is_some() {
         return true;
     }
-    state.user_input_dialog = None;
+    if let Some(dialog) = state.user_input_dialog.as_mut() {
+        return dialog.insert_paste(pasted);
+    }
     if state.transcript.search.open {
         state.transcript.search.insert_paste(pasted);
         state.refresh_transcript_search();

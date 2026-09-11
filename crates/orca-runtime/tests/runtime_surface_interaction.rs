@@ -23,7 +23,9 @@ use orca_core::subagent_config::SubagentConfig;
 use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::{McpElicitationMode, McpElicitationRequest, McpElicitationResponse};
-use orca_runtime::lifecycle::RuntimeUserInputRequest;
+use orca_runtime::lifecycle::{
+    RuntimeUserInputOption, RuntimeUserInputQuestion, RuntimeUserInputRequest,
+};
 use orca_runtime::model_response::RuntimeModelResponse;
 use orca_runtime::protocol::{
     PermissionGrantScope as RuntimePermissionGrantScope, PermissionResponseDecision,
@@ -82,6 +84,18 @@ struct CrossKindReuseExecutor {
 
 struct BlockingResolvedUserInputExecutor {
     answer_tx: mpsc::SyncSender<Option<String>>,
+}
+
+fn user_input_text(
+    response: Option<orca_runtime::lifecycle::RuntimeUserInputResponse>,
+) -> Option<String> {
+    match response {
+        Some(orca_runtime::lifecycle::RuntimeUserInputResponse::Chat { message }) => Some(message),
+        Some(orca_runtime::lifecycle::RuntimeUserInputResponse::Submitted { answers }) => {
+            answers.into_iter().flat_map(|answer| answer.answers).next()
+        }
+        None => None,
+    }
 }
 
 struct ToolApprovalExecutor {
@@ -703,12 +717,12 @@ impl ThreadOperationExecutor for BlockingResolvedUserInputExecutor {
         let answer = generation
             .user_input_handler()
             .unwrap()
-            .request_user_input(&RuntimeUserInputRequest {
-                id: "input-1".to_string(),
-                question: "Persist live-only winner?".to_string(),
-                choices: Vec::new(),
-            })?;
-        self.answer_tx.send(answer).unwrap();
+            .request_user_input(&RuntimeUserInputRequest::single(
+                "input-1",
+                "Persist live-only winner?",
+                Vec::new(),
+            ))?;
+        self.answer_tx.send(user_input_text(answer)).unwrap();
         std::thread::park();
         unreachable!("restart fixture exits the process while generation is blocked")
     }
@@ -755,11 +769,11 @@ impl ThreadOperationExecutor for CrossKindReuseExecutor {
         let user_input = generation
             .user_input_handler()
             .expect("runtime installs a user-input broker")
-            .request_user_input(&RuntimeUserInputRequest {
-                id: "shared".to_string(),
-                question: "First interaction?".to_string(),
-                choices: Vec::new(),
-            })?;
+            .request_user_input(&RuntimeUserInputRequest::single(
+                "shared",
+                "First interaction?",
+                Vec::new(),
+            ))?;
         let mcp = generation
             .mcp_elicitation_handler()
             .expect("runtime installs an MCP elicitation broker")
@@ -772,7 +786,9 @@ impl ThreadOperationExecutor for CrossKindReuseExecutor {
                 requested_schema: None,
             })
             .map_err(io::Error::other)?;
-        self.result_tx.send((user_input, mcp)).unwrap();
+        self.result_tx
+            .send((user_input_text(user_input), mcp))
+            .unwrap();
         thread.lifecycle_mut().finish_task(RunStatus::Success);
         Ok(RunStatus::Success.into())
     }
@@ -793,15 +809,31 @@ impl ThreadOperationExecutor for UserInputExecutor {
             .expect("runtime installs a user-input broker for typed foreground generations")
             .request_user_input(&RuntimeUserInputRequest {
                 id: "input-1".to_string(),
-                question: "Ship this change?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                questions: vec![RuntimeUserInputQuestion {
+                    id: "question-1".to_string(),
+                    header: "Confirm".to_string(),
+                    question: "Ship this change?".to_string(),
+                    options: vec![
+                        RuntimeUserInputOption {
+                            label: "yes".to_string(),
+                            description: "Ship the change".to_string(),
+                            preview: None,
+                        },
+                        RuntimeUserInputOption {
+                            label: "no".to_string(),
+                            description: "Keep working".to_string(),
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                }],
             })?;
         let status = if answer.is_some() {
             RunStatus::Success
         } else {
             RunStatus::Cancelled
         };
-        self.answer_tx.send(answer).unwrap();
+        self.answer_tx.send(user_input_text(answer)).unwrap();
         thread.lifecycle_mut().finish_task(status);
         Ok(status.into())
     }
@@ -2984,15 +3016,31 @@ fn foreground_user_input_is_durable_before_typed_response_wakes_generation() {
         interaction.recovery_disposition,
         InteractionUnavailableDisposition::RestartableUserInput { .. }
     ));
+    let question_id = match &interaction.request {
+        SurfaceInteractionRequest::UserQuestionnaire { questionnaire } => {
+            let [question] = questionnaire.questions.as_slice() else {
+                panic!("foreground questionnaire must contain one question")
+            };
+            assert_eq!(question.header.as_str(), "Confirm");
+            assert_eq!(question.options.len(), 2);
+            question.id.clone()
+        }
+        _ => panic!("structured foreground request must publish a questionnaire"),
+    };
     assert!(answer_rx.try_recv().is_err());
 
     let oversized = attachment.client.respond_interaction_by_id(
         request_id(),
         interaction.interaction_id.clone(),
         SurfaceClientInteractionAnswer::UserInput {
-            decision: SurfaceUserInputDecision::Answer(DisplayText::new(
-                "x".repeat(SURFACE_COMMIT_BATCH_BYTE_LIMIT as usize + 1),
-            )),
+            decision: SurfaceUserInputDecision::Submitted(SurfaceUserInputResponse {
+                answers: vec![SurfaceUserInputQuestionAnswer {
+                    question_id: question_id.clone(),
+                    answers: vec![DisplayText::new(
+                        "x".repeat(SURFACE_COMMIT_BATCH_BYTE_LIMIT as usize + 1),
+                    )],
+                }],
+            }),
         },
     );
     assert!(matches!(
@@ -3029,7 +3077,12 @@ fn foreground_user_input_is_durable_before_typed_response_wakes_generation() {
                 request_id(),
                 interaction.interaction_id.clone(),
                 SurfaceClientInteractionAnswer::UserInput {
-                    decision: SurfaceUserInputDecision::Answer(DisplayText::new("ship")),
+                    decision: SurfaceUserInputDecision::Submitted(SurfaceUserInputResponse {
+                        answers: vec![SurfaceUserInputQuestionAnswer {
+                            question_id: question_id.clone(),
+                            answers: vec![DisplayText::new("ship")],
+                        }],
+                    }),
                 },
             )
             .expect("respond through attachment-bound interaction grant"),
@@ -3052,7 +3105,12 @@ fn foreground_user_input_is_durable_before_typed_response_wakes_generation() {
                 request_id(),
                 interaction.interaction_id.clone(),
                 SurfaceClientInteractionAnswer::UserInput {
-                    decision: SurfaceUserInputDecision::Answer(DisplayText::new("replace")),
+                    decision: SurfaceUserInputDecision::Submitted(SurfaceUserInputResponse {
+                        answers: vec![SurfaceUserInputQuestionAnswer {
+                            question_id,
+                            answers: vec![DisplayText::new("replace")],
+                        }],
+                    }),
                 },
             )
             .expect("replay resolved user input"),

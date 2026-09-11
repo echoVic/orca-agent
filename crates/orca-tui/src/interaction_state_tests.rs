@@ -41,8 +41,26 @@ fn user_input_requested_event_tracks_pending_runtime_interaction_id() {
     state.mention.phase = Some(SearchPhase::Complete);
     state.update(TuiEvent::UserInputRequested {
         key: interaction_key(TuiInteractionKind::UserInput, "ask-1"),
-        question: "Continue?".to_string(),
-        choices: vec!["yes - Continue".to_string(), "no - Stop".to_string()],
+        questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+            questions: vec![crate::protocol::TuiUserInputQuestion {
+                id: "question-1".to_string(),
+                header: "Continue".to_string(),
+                question: "Continue?".to_string(),
+                options: vec![
+                    crate::protocol::TuiUserInputOption {
+                        label: "yes".to_string(),
+                        description: "Continue".to_string(),
+                        preview: None,
+                    },
+                    crate::protocol::TuiUserInputOption {
+                        label: "no".to_string(),
+                        description: "Stop".to_string(),
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+            }],
+        },
     });
 
     assert_eq!(state.status, AppStatus::WaitingUserInput);

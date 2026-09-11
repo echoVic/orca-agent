@@ -7,12 +7,87 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeUserInputRequest {
     pub id: String,
+    pub questions: Vec<RuntimeUserInputQuestion>,
+}
+
+impl RuntimeUserInputRequest {
+    pub fn single(
+        id: impl Into<String>,
+        question: impl Into<String>,
+        choices: Vec<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            questions: vec![RuntimeUserInputQuestion {
+                id: "question-1".to_string(),
+                header: "Question".to_string(),
+                question: question.into(),
+                options: choices
+                    .into_iter()
+                    .map(|label| RuntimeUserInputOption {
+                        label,
+                        description: String::new(),
+                        preview: None,
+                    })
+                    .collect(),
+                multi_select: false,
+            }],
+        }
+    }
+
+    /// Recognizes only the compatibility shape emitted by `single`.
+    pub(crate) fn legacy_single_question(&self) -> Option<&RuntimeUserInputQuestion> {
+        let [question] = self.questions.as_slice() else {
+            return None;
+        };
+        (question.id == "question-1"
+            && question.header == "Question"
+            && !question.multi_select
+            && question
+                .options
+                .iter()
+                .all(|option| option.description.is_empty() && option.preview.is_none()))
+        .then_some(question)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUserInputQuestion {
+    pub id: String,
+    pub header: String,
     pub question: String,
-    pub choices: Vec<String>,
+    pub options: Vec<RuntimeUserInputOption>,
+    pub multi_select: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUserInputOption {
+    pub label: String,
+    pub description: String,
+    pub preview: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUserInputAnswer {
+    pub question_id: String,
+    pub answers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeUserInputResponse {
+    Submitted {
+        answers: Vec<RuntimeUserInputAnswer>,
+    },
+    Chat {
+        message: String,
+    },
 }
 
 pub trait RuntimeUserInputHandler {
-    fn request_user_input(&self, request: &RuntimeUserInputRequest) -> io::Result<Option<String>>;
+    fn request_user_input(
+        &self,
+        request: &RuntimeUserInputRequest,
+    ) -> io::Result<Option<RuntimeUserInputResponse>>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,49 +127,91 @@ pub(crate) fn execute_ask_user_question_tool(
     handler: &dyn RuntimeUserInputHandler,
 ) -> io::Result<ToolResult> {
     let questions = parse_ask_user_question_request(request)?;
-    let mut answers = BTreeMap::new();
-
-    for (index, question) in questions.into_iter().enumerate() {
-        let question_text = question.question.trim().to_string();
-        let mut presentation = format!("{}: {question_text}", question.header.trim());
-        if question.multi_select {
-            presentation.push_str(
-                "\nSelect one or more choices separated by commas, or type a custom answer.",
-            );
-        }
-        let choices = question
-            .options
-            .into_iter()
-            .map(|option| {
-                let mut choice = format!("{} - {}", option.label.trim(), option.description.trim());
-                if let Some(preview) = option.preview.filter(|preview| !preview.trim().is_empty()) {
-                    choice.push_str("\nPreview:\n");
-                    choice.push_str(preview.trim());
-                }
-                choice
+    let input = RuntimeUserInputRequest {
+        id: request.id.clone(),
+        questions: questions
+            .iter()
+            .enumerate()
+            .map(|(index, question)| RuntimeUserInputQuestion {
+                id: format!("question-{}", index + 1),
+                header: question.header.trim().to_string(),
+                question: question.question.trim().to_string(),
+                options: question
+                    .options
+                    .iter()
+                    .map(|option| RuntimeUserInputOption {
+                        label: option.label.trim().to_string(),
+                        description: option.description.trim().to_string(),
+                        preview: option
+                            .preview
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|preview| !preview.is_empty())
+                            .map(str::to_string),
+                    })
+                    .collect(),
+                multi_select: question.multi_select,
             })
-            .collect();
-        let input = RuntimeUserInputRequest {
-            id: format!("{}:question:{}", request.id, index + 1),
-            question: presentation,
-            choices,
-        };
-        let Some(answer) = handler.request_user_input(&input)? else {
-            return Ok(ToolResult::cancelled(
-                request,
-                "user question request cancelled",
-                None,
-            ));
-        };
-        answers.insert(question_text, answer);
-    }
+            .collect(),
+    };
+    let Some(response) = handler.request_user_input(&input)? else {
+        return Ok(ToolResult::cancelled(
+            request,
+            "user question request cancelled",
+            None,
+        ));
+    };
+    let output = match response {
+        RuntimeUserInputResponse::Submitted { answers: submitted } => {
+            let question_by_id = input
+                .questions
+                .iter()
+                .map(|question| (question.id.clone(), question.question.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let mut seen = HashSet::new();
+            let mut answers = BTreeMap::new();
+            for answer in submitted {
+                let Some(question) = question_by_id.get(&answer.question_id) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "user-input response references unknown question id '{}'",
+                            answer.question_id
+                        ),
+                    ));
+                };
+                if !seen.insert(answer.question_id.clone()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "user-input response repeats question id '{}'",
+                            answer.question_id
+                        ),
+                    ));
+                }
+                let answer = answer
+                    .answers
+                    .into_iter()
+                    .map(|answer| answer.trim().to_string())
+                    .filter(|answer| !answer.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !answer.is_empty() {
+                    answers.insert(question.clone(), answer);
+                }
+            }
+            serde_json::json!({ "answers": answers })
+        }
+        RuntimeUserInputResponse::Chat { message } => {
+            serde_json::json!({ "answers": {}, "chat": message })
+        }
+    };
 
-    let output =
-        serde_json::to_string(&serde_json::json!({ "answers": answers })).map_err(|error| {
-            io::Error::other(format!(
-                "failed to serialize ask_user_question answers: {error}"
-            ))
-        })?;
+    let output = serde_json::to_string(&output).map_err(|error| {
+        io::Error::other(format!(
+            "failed to serialize ask_user_question answers: {error}"
+        ))
+    })?;
     Ok(ToolResult::completed(request, output, false))
 }
 
@@ -173,7 +290,6 @@ fn invalid_questionnaire(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use orca_core::approval_types::ActionKind;
@@ -182,19 +298,14 @@ mod tests {
     use super::*;
 
     struct RecordingHandler {
-        answers: Mutex<VecDeque<Option<String>>>,
+        answer: Mutex<Option<RuntimeUserInputResponse>>,
         requests: Mutex<Vec<RuntimeUserInputRequest>>,
     }
 
     impl RecordingHandler {
-        fn new(answers: impl IntoIterator<Item = Option<&'static str>>) -> Self {
+        fn new(answer: Option<RuntimeUserInputResponse>) -> Self {
             Self {
-                answers: Mutex::new(
-                    answers
-                        .into_iter()
-                        .map(|answer| answer.map(str::to_string))
-                        .collect(),
-                ),
+                answer: Mutex::new(answer),
                 requests: Mutex::new(Vec::new()),
             }
         }
@@ -204,9 +315,9 @@ mod tests {
         fn request_user_input(
             &self,
             request: &RuntimeUserInputRequest,
-        ) -> io::Result<Option<String>> {
+        ) -> io::Result<Option<RuntimeUserInputResponse>> {
             self.requests.lock().unwrap().push(request.clone());
-            Ok(self.answers.lock().unwrap().pop_front().flatten())
+            Ok(self.answer.lock().unwrap().take())
         }
     }
 
@@ -218,6 +329,29 @@ mod tests {
             target: None,
             raw_arguments: Some(arguments.to_string()),
         }
+    }
+
+    #[test]
+    fn legacy_single_detection_does_not_capture_structured_questions() {
+        let legacy =
+            RuntimeUserInputRequest::single("legacy", "Continue?", vec!["yes".to_string()]);
+        assert!(legacy.legacy_single_question().is_some());
+
+        let structured = RuntimeUserInputRequest {
+            id: "structured".to_string(),
+            questions: vec![RuntimeUserInputQuestion {
+                id: "question-1".to_string(),
+                header: "Question".to_string(),
+                question: "Continue?".to_string(),
+                options: vec![RuntimeUserInputOption {
+                    label: "yes".to_string(),
+                    description: "Continue the operation".to_string(),
+                    preview: None,
+                }],
+                multi_select: false,
+            }],
+        };
+        assert!(structured.legacy_single_question().is_none());
     }
 
     #[test]
@@ -246,7 +380,18 @@ mod tests {
                 ]
             }"#,
         );
-        let handler = RecordingHandler::new([Some("Reuse"), Some("Logs, Metrics")]);
+        let handler = RecordingHandler::new(Some(RuntimeUserInputResponse::Submitted {
+            answers: vec![
+                RuntimeUserInputAnswer {
+                    question_id: "question-1".to_string(),
+                    answers: vec!["Reuse".to_string()],
+                },
+                RuntimeUserInputAnswer {
+                    question_id: "question-2".to_string(),
+                    answers: vec!["Logs".to_string(), "Metrics".to_string()],
+                },
+            ],
+        }));
 
         let result = execute_ask_user_question_tool(&request, &handler).expect("questionnaire");
 
@@ -261,25 +406,24 @@ mod tests {
             })
         );
         let requests = handler.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].id, "ask-1:question:1");
-        assert_eq!(requests[0].question, "Runtime: Which path?");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "ask-1");
+        assert_eq!(requests[0].questions.len(), 2);
+        assert_eq!(requests[0].questions[0].header, "Runtime");
+        assert_eq!(requests[0].questions[0].question, "Which path?");
         assert_eq!(
-            requests[0].choices,
-            [
-                "Reuse - Use the runtime broker",
-                "New - Create another interaction path"
-            ]
+            requests[0].questions[0].options[0],
+            RuntimeUserInputOption {
+                label: "Reuse".to_string(),
+                description: "Use the runtime broker".to_string(),
+                preview: None,
+            }
         );
-        assert_eq!(requests[1].id, "ask-1:question:2");
-        assert!(requests[1].question.contains("Select one or more"));
         assert_eq!(
-            requests[1].choices,
-            [
-                "Logs - Capture structured logs",
-                "Metrics - Capture numeric metrics\nPreview:\np95"
-            ]
+            requests[0].questions[1].options[1].preview.as_deref(),
+            Some("p95")
         );
+        assert!(requests[0].questions[1].multi_select);
     }
 
     #[test]
@@ -287,7 +431,7 @@ mod tests {
         let request = questionnaire_request(
             r#"{"questions":[{"header":"Runtime","question":"Which path?","options":[{"label":"Reuse","description":"Use it"},{"label":"New","description":"Replace it"}]}]}"#,
         );
-        let handler = RecordingHandler::new([None]);
+        let handler = RecordingHandler::new(None);
 
         let result = execute_ask_user_question_tool(&request, &handler).expect("cancel result");
 
@@ -295,6 +439,26 @@ mod tests {
         assert_eq!(
             result.error.as_deref(),
             Some("user question request cancelled")
+        );
+    }
+
+    #[test]
+    fn ask_user_question_returns_chat_response_for_follow_up_round() {
+        let request = questionnaire_request(
+            r#"{"questions":[{"header":"Runtime","question":"Which path?","options":[{"label":"Reuse","description":"Use it"},{"label":"New","description":"Replace it"}]}]}"#,
+        );
+        let handler = RecordingHandler::new(Some(RuntimeUserInputResponse::Chat {
+            message: "Explain the rollback tradeoff first.".to_string(),
+        }));
+
+        let result = execute_ask_user_question_tool(&request, &handler).expect("chat response");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(result.output.as_deref().unwrap()).unwrap(),
+            serde_json::json!({
+                "answers": {},
+                "chat": "Explain the rollback tradeoff first."
+            })
         );
     }
 
@@ -313,7 +477,7 @@ mod tests {
         for arguments in invalid_arguments {
             let error = execute_ask_user_question_tool(
                 &questionnaire_request(arguments),
-                &RecordingHandler::new([]),
+                &RecordingHandler::new(None),
             )
             .expect_err(arguments);
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{arguments}");

@@ -56,9 +56,14 @@ pub use crate::runtime_permission::{
     RuntimePermissionContext, RuntimePermissionRequest, RuntimePermissionRequestHandler,
     RuntimePermissionResponse, TurnPermissionOverlay,
 };
-pub use crate::runtime_special::{RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest};
+pub use crate::runtime_special::{
+    RuntimeInteractionToolDispatch, RuntimeSpecialToolDispatch, RuntimeWorkflowDraftRequest,
+};
 pub use crate::runtime_tool_actor::RuntimeToolActorContext;
-pub use crate::runtime_user_input::{RuntimeUserInputHandler, RuntimeUserInputRequest};
+pub use crate::runtime_user_input::{
+    RuntimeUserInputAnswer, RuntimeUserInputHandler, RuntimeUserInputOption,
+    RuntimeUserInputQuestion, RuntimeUserInputRequest, RuntimeUserInputResponse,
+};
 
 pub struct RuntimeTaskActor<'a> {
     lifecycle: &'a mut RuntimeSessionLifecycle,

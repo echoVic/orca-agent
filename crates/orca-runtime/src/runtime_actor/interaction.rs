@@ -31,7 +31,7 @@ pub(crate) enum ResidentInteractionWaiter {
         key: String,
         request_digest: surface::Sha256Digest,
     },
-    UserInput(SyncSender<io::Result<Option<String>>>),
+    UserInput(SyncSender<io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>>>),
     McpElicitation(SyncSender<Result<orca_mcp::McpElicitationResponse, String>>),
 }
 

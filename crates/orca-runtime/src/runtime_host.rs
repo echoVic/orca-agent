@@ -1600,7 +1600,7 @@ impl RuntimeUserInputHandler for RuntimeSurfaceUserInputHandler {
     fn request_user_input(
         &self,
         request: &crate::lifecycle::RuntimeUserInputRequest,
-    ) -> io::Result<Option<String>> {
+    ) -> io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx
             .try_send(ThreadCommand::SurfaceRequestUserInput {
@@ -4856,7 +4856,7 @@ enum ThreadCommand {
     SurfaceRequestUserInput {
         fence: surface::SurfaceOperationFence,
         request: crate::lifecycle::RuntimeUserInputRequest,
-        reply: SyncSender<io::Result<Option<String>>>,
+        reply: SyncSender<io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>>>,
     },
     SurfaceRequestMcpElicitation {
         fence: surface::SurfaceOperationFence,
@@ -9370,7 +9370,7 @@ fn preflight_encoded_restartable_capsule(
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .ok_or(ColdRecoveryCheckpointFailure::Missing)?;
-    if !matches!(version, 1 | 2) {
+    if !matches!(version, 1 | 2 | 3) {
         return Err(ColdRecoveryCheckpointFailure::Unsupported);
     }
     if version == 1 {
@@ -13647,7 +13647,7 @@ fn interaction_safe_projection(
         }
         surface::SurfaceClientInteractionAnswer::UserInput { decision } => {
             surface::SurfaceInteractionSafeProjection::UserInput {
-                answered: matches!(decision, surface::SurfaceUserInputDecision::Answer(_)),
+                answered: !matches!(decision, surface::SurfaceUserInputDecision::Cancel),
             }
         }
         surface::SurfaceClientInteractionAnswer::McpElicitation { decision } => {
@@ -23718,6 +23718,18 @@ mod tests {
         answer_tx: SyncSender<Option<String>>,
     }
 
+    fn user_input_text(
+        response: Option<crate::lifecycle::RuntimeUserInputResponse>,
+    ) -> Option<String> {
+        match response {
+            Some(crate::lifecycle::RuntimeUserInputResponse::Chat { message }) => Some(message),
+            Some(crate::lifecycle::RuntimeUserInputResponse::Submitted { answers }) => {
+                answers.into_iter().flat_map(|answer| answer.answers).next()
+            }
+            None => None,
+        }
+    }
+
     struct ProviderResponseCheckpointRetryExecutor;
 
     struct RetainedCapabilityShutdownExecutor {
@@ -24528,11 +24540,12 @@ mod tests {
             let result = generation
                 .user_input_handler()
                 .expect("runtime installs typed user-input broker")
-                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
-                    id: "queued-during-host-shutdown".to_string(),
-                    question: "Reject interaction behind shutdown?".to_string(),
-                    choices: Vec::new(),
-                });
+                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest::single(
+                    "queued-during-host-shutdown",
+                    "Reject interaction behind shutdown?",
+                    Vec::new(),
+                ))
+                .map(user_input_text);
             self.interaction_result
                 .send(result)
                 .expect("report rejected interaction");
@@ -24615,12 +24628,14 @@ mod tests {
             let answer = generation
                 .user_input_handler()
                 .expect("runtime installs typed user-input broker")
-                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
-                    id: "exact-selector-input".to_string(),
-                    question: "Accept exact selector?".to_string(),
-                    choices: Vec::new(),
-                })?;
-            self.answer_tx.send(answer).expect("report typed answer");
+                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest::single(
+                    "exact-selector-input",
+                    "Accept exact selector?",
+                    Vec::new(),
+                ))?;
+            self.answer_tx
+                .send(user_input_text(answer))
+                .expect("report typed answer");
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
         }
@@ -24669,13 +24684,14 @@ mod tests {
             let handler = generation
                 .user_input_handler()
                 .expect("runtime installs typed user-input broker");
-            let first = handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
-                id: "private-input-1".to_string(),
-                question: "First private answer?".to_string(),
-                choices: Vec::new(),
-            })?;
+            let first =
+                handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest::single(
+                    "private-input-1",
+                    "First private answer?",
+                    Vec::new(),
+                ))?;
             self.first_answer_tx
-                .send(first)
+                .send(user_input_text(first))
                 .expect("report first typed answer");
             self.continue_second
                 .lock()
@@ -24683,13 +24699,13 @@ mod tests {
                 .recv()
                 .expect("release second typed interaction");
             let second =
-                handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
-                    id: "private-input-2".to_string(),
-                    question: "Second private answer?".to_string(),
-                    choices: Vec::new(),
-                })?;
+                handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest::single(
+                    "private-input-2",
+                    "Second private answer?",
+                    Vec::new(),
+                ))?;
             self.second_answer_tx
-                .send(second)
+                .send(user_input_text(second))
                 .expect("report second typed answer");
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
@@ -24709,19 +24725,22 @@ mod tests {
             let handler = generation
                 .user_input_handler()
                 .expect("runtime installs typed user-input broker");
-            let first = handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
-                id: "cancel-private-input-1".to_string(),
-                question: "First answer before cancellation?".to_string(),
-                choices: Vec::new(),
-            })?;
+            let first =
+                handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest::single(
+                    "cancel-private-input-1",
+                    "First answer before cancellation?",
+                    Vec::new(),
+                ))?;
             self.first_answer_tx
-                .send(first)
+                .send(user_input_text(first))
                 .expect("report first typed answer");
-            let second = handler.request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
-                id: "cancel-private-input-2".to_string(),
-                question: "Second answer after cancellation starts?".to_string(),
-                choices: Vec::new(),
-            });
+            let second = handler
+                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest::single(
+                    "cancel-private-input-2",
+                    "Second answer after cancellation starts?",
+                    Vec::new(),
+                ))
+                .map(user_input_text);
             self.second_result_tx
                 .send(second)
                 .expect("report second typed interaction result");
@@ -24749,12 +24768,14 @@ mod tests {
             let answer = generation
                 .user_input_handler()
                 .expect("runtime installs typed user-input broker")
-                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest {
-                    id: "slow-subscriber-input".to_string(),
-                    question: "Reroute slow responder?".to_string(),
-                    choices: Vec::new(),
-                })?;
-            self.answer_tx.send(answer).expect("report typed answer");
+                .request_user_input(&crate::lifecycle::RuntimeUserInputRequest::single(
+                    "slow-subscriber-input",
+                    "Reroute slow responder?",
+                    Vec::new(),
+                ))?;
+            self.answer_tx
+                .send(user_input_text(answer))
+                .expect("report typed answer");
             thread.lifecycle_mut().finish_task(RunStatus::Success);
             Ok(RunStatus::Success.into())
         }
@@ -24989,6 +25010,19 @@ mod tests {
                         ),
                     }
                 }
+                surface::SurfaceInteractionRequest::UserQuestionnaire { questionnaire } => {
+                    let question = &questionnaire.questions.as_slice()[0];
+                    surface::SurfaceClientInteractionAnswer::UserInput {
+                        decision: surface::SurfaceUserInputDecision::Submitted(
+                            surface::SurfaceUserInputResponse {
+                                answers: vec![surface::SurfaceUserInputQuestionAnswer {
+                                    question_id: question.id.clone(),
+                                    answers: vec![surface::DisplayText::new("yes")],
+                                }],
+                            },
+                        ),
+                    }
+                }
                 surface::SurfaceInteractionRequest::McpElicitation { .. } => {
                     surface::SurfaceClientInteractionAnswer::McpElicitation {
                         decision: surface::SurfaceMcpElicitationDecision::Decline,
@@ -25046,7 +25080,8 @@ mod tests {
         assert!(matches!(
             (&checkpoint.interaction.request, &checkpoint.selector),
             (
-                surface::SurfaceInteractionRequest::UserInput { .. },
+                surface::SurfaceInteractionRequest::UserInput { .. }
+                    | surface::SurfaceInteractionRequest::UserQuestionnaire { .. },
                 surface::InteractionSelector::Exact {
                     interaction_id,
                     expected_revision,

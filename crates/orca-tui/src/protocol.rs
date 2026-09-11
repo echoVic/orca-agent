@@ -122,10 +122,68 @@ impl TuiPermissionDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiUserInputOption {
+    pub label: String,
+    pub description: String,
+    pub preview: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiUserInputQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<TuiUserInputOption>,
+    pub multi_select: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiUserInputQuestionnaire {
+    pub questions: Vec<TuiUserInputQuestion>,
+}
+
+impl TuiUserInputQuestionnaire {
+    #[cfg(test)]
+    pub(crate) fn single(question: impl Into<String>, choices: Vec<String>) -> Self {
+        Self {
+            questions: vec![TuiUserInputQuestion {
+                id: "question-1".to_string(),
+                header: "Question".to_string(),
+                question: question.into(),
+                options: choices
+                    .into_iter()
+                    .map(|label| TuiUserInputOption {
+                        label,
+                        description: String::new(),
+                        preview: None,
+                    })
+                    .collect(),
+                multi_select: false,
+            }],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiUserInputAnswer {
+    pub question_id: String,
+    pub answers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiUserInputResponse {
+    Submitted { answers: Vec<TuiUserInputAnswer> },
+    Chat { message: String },
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TuiInteractionResponse {
     Approval(bool),
     Permission(TuiPermissionDecision),
+    /// Legacy single-answer response retained for non-questionnaire clients.
     UserInput(String),
+    UserQuestionnaire(TuiUserInputResponse),
     McpElicitation {
         accepted: bool,
         content_json: Option<String>,
@@ -137,7 +195,7 @@ impl TuiInteractionResponse {
         match self {
             Self::Approval(_) => TuiInteractionKind::Approval,
             Self::Permission(_) => TuiInteractionKind::Permission,
-            Self::UserInput(_) => TuiInteractionKind::UserInput,
+            Self::UserInput(_) | Self::UserQuestionnaire(_) => TuiInteractionKind::UserInput,
             Self::McpElicitation { .. } => TuiInteractionKind::McpElicitation,
         }
     }
@@ -274,8 +332,7 @@ pub enum TuiEvent {
     },
     UserInputRequested {
         key: TuiInteractionKey,
-        question: String,
-        choices: Vec<String>,
+        questionnaire: TuiUserInputQuestionnaire,
     },
     McpElicitationRequested {
         key: TuiInteractionKey,

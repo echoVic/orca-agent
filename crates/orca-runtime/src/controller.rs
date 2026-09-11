@@ -1525,7 +1525,8 @@ fn headless_answer_matches(
             SurfaceInteractionRequest::PermissionRequest { .. },
             SurfaceClientInteractionAnswer::PermissionRequest { .. }
         ) | (
-            SurfaceInteractionRequest::UserInput { .. },
+            SurfaceInteractionRequest::UserInput { .. }
+                | SurfaceInteractionRequest::UserQuestionnaire { .. },
             SurfaceClientInteractionAnswer::UserInput { .. }
         ) | (
             SurfaceInteractionRequest::McpElicitation { .. },
@@ -1552,7 +1553,8 @@ fn fail_closed_headless_answer(
                 },
             })
         }
-        SurfaceInteractionRequest::UserInput { .. } => {
+        SurfaceInteractionRequest::UserInput { .. }
+        | SurfaceInteractionRequest::UserQuestionnaire { .. } => {
             Ok(SurfaceClientInteractionAnswer::UserInput {
                 decision: SurfaceUserInputDecision::Cancel,
             })
@@ -2709,10 +2711,18 @@ mod tests {
             fn request_user_input(
                 &self,
                 request: &RuntimeUserInputRequest,
-            ) -> io::Result<Option<String>> {
-                assert_eq!(request.question, "Confirm: Continue?");
-                assert_eq!(request.choices, ["yes - Continue", "no - Stop"]);
-                Ok(Some("yes".to_string()))
+            ) -> io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>> {
+                assert_eq!(request.questions[0].header, "Confirm");
+                assert_eq!(request.questions[0].question, "Continue?");
+                assert_eq!(request.questions[0].options[0].label, "yes");
+                Ok(Some(
+                    crate::lifecycle::RuntimeUserInputResponse::Submitted {
+                        answers: vec![crate::lifecycle::RuntimeUserInputAnswer {
+                            question_id: request.questions[0].id.clone(),
+                            answers: vec!["yes".to_string()],
+                        }],
+                    },
+                ))
             }
         }
 

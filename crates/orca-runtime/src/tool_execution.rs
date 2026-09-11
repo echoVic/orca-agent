@@ -2432,14 +2432,19 @@ mod tests {
             fn request_user_input(
                 &self,
                 request: &RuntimeUserInputRequest,
-            ) -> io::Result<Option<String>> {
-                assert_eq!(request.id, "ask:question:1");
-                assert_eq!(request.question, "Confirm: Continue?");
-                assert_eq!(
-                    request.choices,
-                    vec!["yes - Continue".to_string(), "no - Stop".to_string()]
-                );
-                Ok(Some("yes".to_string()))
+            ) -> io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>> {
+                assert_eq!(request.id, "ask");
+                assert_eq!(request.questions[0].header, "Confirm");
+                assert_eq!(request.questions[0].question, "Continue?");
+                assert_eq!(request.questions[0].options[0].label, "yes");
+                Ok(Some(
+                    crate::lifecycle::RuntimeUserInputResponse::Submitted {
+                        answers: vec![crate::lifecycle::RuntimeUserInputAnswer {
+                            question_id: request.questions[0].id.clone(),
+                            answers: vec!["yes".to_string()],
+                        }],
+                    },
+                ))
             }
         }
 
@@ -2516,7 +2521,7 @@ mod tests {
             fn request_user_input(
                 &self,
                 _request: &RuntimeUserInputRequest,
-            ) -> io::Result<Option<String>> {
+            ) -> io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>> {
                 Err(io::Error::other("interaction channel closed"))
             }
         }

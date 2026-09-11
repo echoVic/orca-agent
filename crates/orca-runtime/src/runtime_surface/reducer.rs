@@ -5196,6 +5196,7 @@ fn interaction_kind_matches_request(
         ) | (
             SurfaceInteractionKind::UserInput,
             SurfaceInteractionRequest::UserInput { .. }
+                | SurfaceInteractionRequest::UserQuestionnaire { .. }
         ) | (
             SurfaceInteractionKind::McpElicitation,
             SurfaceInteractionRequest::McpElicitation { .. }
@@ -5339,6 +5340,7 @@ fn interaction_request_matches_snapshot(
                 && interaction_tool_authority_matches(tool, authority)
         }
         SurfaceInteractionRequest::UserInput { .. }
+        | SurfaceInteractionRequest::UserQuestionnaire { .. }
         | SurfaceInteractionRequest::McpElicitation { .. } => true,
     }
 }

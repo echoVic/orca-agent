@@ -733,6 +733,10 @@ impl TuiSurfaceTaskControl {
             return None;
         };
         let request_id = format!("{:?}", interaction.interaction_id);
+        let legacy_user_input = matches!(
+            interaction.request,
+            orca_runtime::surface::SurfaceInteractionRequest::UserInput { .. }
+        );
         let (kind, event, permissions) = match &interaction.request {
             orca_runtime::surface::SurfaceInteractionRequest::ToolApproval {
                 tool,
@@ -796,11 +800,64 @@ impl TuiSurfaceTaskControl {
                     TuiInteractionKind::UserInput,
                     TuiEvent::UserInputRequested {
                         key,
-                        question: question.as_str().to_string(),
-                        choices: suggestions
-                            .iter()
-                            .map(|value| value.as_str().to_string())
-                            .collect(),
+                        questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+                            questions: vec![crate::protocol::TuiUserInputQuestion {
+                                id: "question-1".to_string(),
+                                header: "Question".to_string(),
+                                question: question.as_str().to_string(),
+                                options: suggestions
+                                    .iter()
+                                    .map(|value| crate::protocol::TuiUserInputOption {
+                                        label: value.as_str().to_string(),
+                                        description: String::new(),
+                                        preview: None,
+                                    })
+                                    .collect(),
+                                multi_select: false,
+                            }],
+                        },
+                    },
+                    None,
+                )
+            }
+            orca_runtime::surface::SurfaceInteractionRequest::UserQuestionnaire {
+                questionnaire,
+            } => {
+                let key = TuiInteractionKey::new(
+                    active.ui_operation_id,
+                    request_id.clone(),
+                    TuiInteractionKind::UserInput,
+                );
+                (
+                    TuiInteractionKind::UserInput,
+                    TuiEvent::UserInputRequested {
+                        key,
+                        questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+                            questions: questionnaire
+                                .questions
+                                .as_slice()
+                                .iter()
+                                .map(|question| crate::protocol::TuiUserInputQuestion {
+                                    id: question.id.as_str().to_string(),
+                                    header: question.header.as_str().to_string(),
+                                    question: question.question.as_str().to_string(),
+                                    options: question
+                                        .options
+                                        .as_slice()
+                                        .iter()
+                                        .map(|option| crate::protocol::TuiUserInputOption {
+                                            label: option.label.as_str().to_string(),
+                                            description: option.description.as_str().to_string(),
+                                            preview: option
+                                                .preview
+                                                .as_ref()
+                                                .map(|value| value.as_str().to_string()),
+                                        })
+                                        .collect(),
+                                    multi_select: question.multi_select,
+                                })
+                                .collect(),
+                        },
                     },
                     None,
                 )
@@ -870,6 +927,7 @@ impl TuiSurfaceTaskControl {
                 interaction_id: interaction.interaction_id.clone(),
                 kind,
                 permissions,
+                legacy_user_input,
             });
         Some(event)
     }
@@ -942,6 +1000,74 @@ impl TuiSurfaceTaskControl {
                     decision,
                 }
             }
+            (
+                TuiInteractionKind::UserInput,
+                TuiInteractionResponse::UserQuestionnaire(
+                    crate::protocol::TuiUserInputResponse::Submitted { answers },
+                ),
+            ) => {
+                let response = orca_runtime::surface::SurfaceUserInputResponse {
+                    answers: answers
+                        .iter()
+                        .map(|answer| {
+                            Ok(orca_runtime::surface::SurfaceUserInputQuestionAnswer {
+                                question_id: orca_runtime::surface::NonEmptyText::try_new(
+                                    answer.question_id.clone(),
+                                )
+                                .map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "empty questionnaire answer id",
+                                    )
+                                })?,
+                                answers: answer
+                                    .answers
+                                    .iter()
+                                    .cloned()
+                                    .map(orca_runtime::surface::DisplayText::new)
+                                    .collect(),
+                            })
+                        })
+                        .collect::<io::Result<Vec<_>>>()?,
+                };
+                let decision = if binding.legacy_user_input {
+                    let answer = response
+                        .answers
+                        .iter()
+                        .flat_map(|answer| answer.answers.iter())
+                        .map(|answer| answer.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    orca_runtime::surface::SurfaceUserInputDecision::Answer(
+                        orca_runtime::surface::DisplayText::new(answer),
+                    )
+                } else {
+                    orca_runtime::surface::SurfaceUserInputDecision::Submitted(response)
+                };
+                orca_runtime::surface::SurfaceClientInteractionAnswer::UserInput { decision }
+            }
+            (
+                TuiInteractionKind::UserInput,
+                TuiInteractionResponse::UserQuestionnaire(
+                    crate::protocol::TuiUserInputResponse::Chat { message },
+                ),
+            ) => {
+                let message = orca_runtime::surface::DisplayText::new(message.clone());
+                let decision = if binding.legacy_user_input {
+                    orca_runtime::surface::SurfaceUserInputDecision::Answer(message)
+                } else {
+                    orca_runtime::surface::SurfaceUserInputDecision::Chat(message)
+                };
+                orca_runtime::surface::SurfaceClientInteractionAnswer::UserInput { decision }
+            }
+            (
+                TuiInteractionKind::UserInput,
+                TuiInteractionResponse::UserQuestionnaire(
+                    crate::protocol::TuiUserInputResponse::Cancelled,
+                ),
+            ) => orca_runtime::surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: orca_runtime::surface::SurfaceUserInputDecision::Cancel,
+            },
             (TuiInteractionKind::UserInput, TuiInteractionResponse::UserInput(answer)) => {
                 orca_runtime::surface::SurfaceClientInteractionAnswer::UserInput {
                     decision: orca_runtime::surface::SurfaceUserInputDecision::Answer(
@@ -1088,6 +1214,7 @@ struct SurfaceInteractionBinding {
     interaction_id: orca_runtime::surface::SurfaceInteractionId,
     kind: TuiInteractionKind,
     permissions: Option<orca_runtime::surface::SurfacePermissionProfile>,
+    legacy_user_input: bool,
 }
 
 impl std::fmt::Debug for SurfaceActiveOperation {
@@ -1435,8 +1562,10 @@ mod tests {
                 crate::protocol::TuiInteractionKind::UserInput,
                 |key| crate::protocol::TuiEvent::UserInputRequested {
                     key,
-                    question: "question".to_string(),
-                    choices: Vec::new(),
+                    questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                        "question",
+                        Vec::new(),
+                    ),
                 },
             )
         });

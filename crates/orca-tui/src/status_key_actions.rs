@@ -21,7 +21,7 @@ use crate::setup_actions::{SetupFlow, handle_setup_key};
 use crate::shortcuts::{RunningShortcut, ShortcutAction, ShortcutContext, resolve_shortcut};
 use crate::theme::Theme;
 use crate::types::{AppState, AppStatus};
-use crate::user_input_dialog::{UserInputDialogKeyFlow, handle_user_input_dialog_key};
+use crate::user_input_dialog::handle_user_input_dialog_key;
 use crate::vim::{VimState, VimTranscriptSearchIntent};
 
 pub(crate) enum StatusKeyFlow {
@@ -98,11 +98,8 @@ where
 
     if state.user_input_dialog.is_some() {
         vim_state.cancel_pending_command();
-        if handle_user_input_dialog_key(key, state, textarea, action_tx)
-            == UserInputDialogKeyFlow::Handled
-        {
-            return Ok(StatusKeyFlow::Continue);
-        }
+        handle_user_input_dialog_key(key, state, textarea, action_tx);
+        return Ok(StatusKeyFlow::Continue);
     }
 
     if matches!(

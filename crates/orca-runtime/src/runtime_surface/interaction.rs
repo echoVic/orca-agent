@@ -560,6 +560,43 @@ pub struct SurfaceToolRequest {
     pub arguments_digest: Sha256Digest,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceUserInputOption {
+    pub label: NonEmptyText,
+    pub description: DisplayText,
+    pub preview: Option<DisplayText>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceUserInputQuestion {
+    pub id: NonEmptyText,
+    pub header: NonEmptyText,
+    pub question: NonEmptyText,
+    pub options: Vec<SurfaceUserInputOption>,
+    pub multi_select: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceUserInputQuestionnaire {
+    pub questions: NonEmptyVec<SurfaceUserInputQuestion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceUserInputQuestionAnswer {
+    pub question_id: NonEmptyText,
+    pub answers: Vec<DisplayText>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceUserInputResponse {
+    pub answers: Vec<SurfaceUserInputQuestionAnswer>,
+}
+
 #[derive(Clone, PartialEq)]
 pub enum SurfaceInteractionRequest {
     ToolApproval {
@@ -578,6 +615,9 @@ pub enum SurfaceInteractionRequest {
     UserInput {
         question: NonEmptyText,
         suggestions: Vec<DisplayText>,
+    },
+    UserQuestionnaire {
+        questionnaire: SurfaceUserInputQuestionnaire,
     },
     McpElicitation {
         server_name: NonEmptyText,
@@ -605,7 +645,8 @@ pub enum SurfaceMcpElicitationRequest {
 }
 
 const LEGACY_DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION: u8 = 1;
-pub(crate) const DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION: u8 = 2;
+const SINGLE_USER_INPUT_DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION: u8 = 2;
+pub(crate) const DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum ToolInvocationCheckpoint {
@@ -815,6 +856,11 @@ pub(crate) enum ContinuationTurnIntent {
         suggestions: Vec<DisplayText>,
         injection: ContinuationTurnAnswerInjection,
     },
+    UserQuestionnaire {
+        request_id: NonEmptyText,
+        questionnaire: SurfaceUserInputQuestionnaire,
+        injection: ContinuationTurnAnswerInjection,
+    },
     McpElicitation {
         server_name: NonEmptyText,
         server_request_id: NonEmptyText,
@@ -838,6 +884,17 @@ impl ContinuationTurnIntent {
         }
     }
 
+    pub fn user_questionnaire(
+        request_id: NonEmptyText,
+        questionnaire: SurfaceUserInputQuestionnaire,
+    ) -> Self {
+        Self::UserQuestionnaire {
+            request_id,
+            questionnaire,
+            injection: ContinuationTurnAnswerInjection::user_input(),
+        }
+    }
+
     pub fn mcp_elicitation(
         server_name: NonEmptyText,
         server_request_id: NonEmptyText,
@@ -855,7 +912,9 @@ impl ContinuationTurnIntent {
 
     pub const fn kind(&self) -> SurfaceInteractionKind {
         match self {
-            Self::UserInput { .. } => SurfaceInteractionKind::UserInput,
+            Self::UserInput { .. } | Self::UserQuestionnaire { .. } => {
+                SurfaceInteractionKind::UserInput
+            }
             Self::McpElicitation { .. } => SurfaceInteractionKind::McpElicitation,
         }
     }
@@ -870,6 +929,11 @@ impl ContinuationTurnIntent {
                 question: question.clone(),
                 suggestions: suggestions.clone(),
             },
+            Self::UserQuestionnaire { questionnaire, .. } => {
+                SurfaceInteractionRequest::UserQuestionnaire {
+                    questionnaire: questionnaire.clone(),
+                }
+            }
             Self::McpElicitation {
                 server_name,
                 server_request_id,
@@ -887,7 +951,9 @@ impl ContinuationTurnIntent {
 
     pub fn request_identity(&self) -> &NonEmptyText {
         match self {
-            Self::UserInput { request_id, .. } => request_id,
+            Self::UserInput { request_id, .. } | Self::UserQuestionnaire { request_id, .. } => {
+                request_id
+            }
             Self::McpElicitation {
                 server_request_id, ..
             } => server_request_id,
@@ -896,7 +962,9 @@ impl ContinuationTurnIntent {
 
     pub fn injection(&self) -> &ContinuationTurnAnswerInjection {
         match self {
-            Self::UserInput { injection, .. } | Self::McpElicitation { injection, .. } => injection,
+            Self::UserInput { injection, .. }
+            | Self::UserQuestionnaire { injection, .. }
+            | Self::McpElicitation { injection, .. } => injection,
         }
     }
 }
@@ -951,6 +1019,9 @@ pub(crate) enum DurableInteractionContinuationRequest {
     UserInput {
         question: NonEmptyText,
         suggestions: Vec<DisplayText>,
+    },
+    UserQuestionnaire {
+        questionnaire: SurfaceUserInputQuestionnaire,
     },
     McpElicitation {
         server_name: NonEmptyText,
@@ -1091,7 +1162,7 @@ impl DurableInteractionContinuationCapsule {
     /// - Input: the persisted interaction identity, owning operation fence,
     ///   typed interaction request, and opaque fingerprint of the thread-owned
     ///   runtime configuration/dependency snapshot.
-    /// - Output: an immutable version-2 restartable checkpoint for tool
+    /// - Output: an immutable version-3 restartable checkpoint for tool
     ///   approval, user input, or MCP elicitation.
     /// - Errors: rejects permission requests without the complete retry
     ///   context, unsupported kinds, mismatched identities, or authority bound
@@ -1131,6 +1202,14 @@ impl DurableInteractionContinuationCapsule {
                     suggestions.clone(),
                 ),
             ),
+            DurableInteractionContinuationRequest::UserQuestionnaire { questionnaire } => {
+                DurableInteractionContinuationIntent::ContinuationTurn(
+                    ContinuationTurnIntent::user_questionnaire(
+                        fallback_request_identity,
+                        questionnaire.clone(),
+                    ),
+                )
+            }
             DurableInteractionContinuationRequest::McpElicitation {
                 server_name,
                 server_request_id,
@@ -1247,6 +1326,7 @@ impl DurableInteractionContinuationCapsule {
                 Some(authority)
             }
             DurableInteractionContinuationRequest::UserInput { .. }
+            | DurableInteractionContinuationRequest::UserQuestionnaire { .. }
             | DurableInteractionContinuationRequest::McpElicitation { .. } => None,
         };
         if authority.is_some_and(|authority| authority.operation_id() != &self.fence.operation_id) {
@@ -1367,6 +1447,7 @@ impl DurableInteractionContinuationCapsule {
             }
             (
                 DurableInteractionContinuationRequest::UserInput { .. }
+                | DurableInteractionContinuationRequest::UserQuestionnaire { .. }
                 | DurableInteractionContinuationRequest::McpElicitation { .. },
                 DurableInteractionContinuationIntent::ContinuationTurn(intent),
             ) => {
@@ -1378,7 +1459,8 @@ impl DurableInteractionContinuationCapsule {
                     );
                 }
                 let expected_injection = match intent {
-                    ContinuationTurnIntent::UserInput { .. } => {
+                    ContinuationTurnIntent::UserInput { .. }
+                    | ContinuationTurnIntent::UserQuestionnaire { .. } => {
                         ContinuationTurnAnswerInjection::user_input()
                     }
                     ContinuationTurnIntent::McpElicitation { .. } => {
@@ -1490,8 +1572,9 @@ impl<'de> Deserialize<'de> for DurableInteractionContinuationCapsule {
                 DurableInteractionContinuationDisposition::Unsupported,
                 None,
             ),
-            DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION => (
-                stored.version,
+            SINGLE_USER_INPUT_DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION
+            | DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION => (
+                DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION,
                 stored.execution_context_fingerprint,
                 stored.disposition.ok_or_else(|| {
                     serde::de::Error::custom(
@@ -1529,7 +1612,9 @@ impl DurableInteractionContinuationRequest {
         match self {
             Self::ToolApproval { .. } => SurfaceInteractionKind::ToolApproval,
             Self::PermissionRequest { .. } => SurfaceInteractionKind::PermissionRequest,
-            Self::UserInput { .. } => SurfaceInteractionKind::UserInput,
+            Self::UserInput { .. } | Self::UserQuestionnaire { .. } => {
+                SurfaceInteractionKind::UserInput
+            }
             Self::McpElicitation { .. } => SurfaceInteractionKind::McpElicitation,
         }
     }
@@ -1567,6 +1652,11 @@ impl DurableInteractionContinuationRequest {
                 question: question.clone(),
                 suggestions: suggestions.clone(),
             },
+            Self::UserQuestionnaire { questionnaire } => {
+                SurfaceInteractionRequest::UserQuestionnaire {
+                    questionnaire: questionnaire.clone(),
+                }
+            }
             Self::McpElicitation {
                 server_name,
                 server_request_id,
@@ -1618,6 +1708,9 @@ impl TryFrom<SurfaceInteractionRequest> for DurableInteractionContinuationReques
                 question,
                 suggestions,
             }),
+            SurfaceInteractionRequest::UserQuestionnaire { questionnaire } => {
+                Ok(Self::UserQuestionnaire { questionnaire })
+            }
             SurfaceInteractionRequest::McpElicitation {
                 server_name,
                 server_request_id,
@@ -1679,7 +1772,10 @@ impl SurfacePermissionClientDecision {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceUserInputDecision {
+    /// Legacy single-question answer retained for ACP v1 and stored sessions.
     Answer(DisplayText),
+    Submitted(SurfaceUserInputResponse),
+    Chat(DisplayText),
     Cancel,
 }
 
@@ -1946,7 +2042,8 @@ impl DurableInteractionContinuationOperationIdentity {
     }
 }
 
-const DURABLE_INTERACTION_CONTINUATION_ANSWER_VERSION: u8 = 1;
+const LEGACY_DURABLE_INTERACTION_CONTINUATION_ANSWER_VERSION: u8 = 1;
+const DURABLE_INTERACTION_CONTINUATION_ANSWER_VERSION: u8 = 2;
 
 /// Private durable payload for a cold-recovered continuation answer. The
 /// record is journaled with the public safe resolution receipt, but its fields
@@ -1966,6 +2063,7 @@ pub struct DurableInteractionContinuationAnswer {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum DurableInteractionContinuationAnswerPayload {
     UserInput { answer: DisplayText },
+    UserQuestionnaire { response: SurfaceUserInputResponse },
     McpElicitation { content: SurfaceDataValue },
 }
 
@@ -2007,6 +2105,33 @@ impl DurableInteractionContinuationAnswer {
                 answer: answer.clone(),
             },
             (
+                ContinuationTurnIntent::UserQuestionnaire { .. },
+                SurfaceClientInteractionAnswer::UserInput {
+                    decision: SurfaceUserInputDecision::Submitted(response),
+                },
+                SurfaceInteractionSafeProjection::UserInput { answered: true },
+            ) => DurableInteractionContinuationAnswerPayload::UserQuestionnaire {
+                response: response.clone(),
+            },
+            (
+                ContinuationTurnIntent::UserQuestionnaire { .. },
+                SurfaceClientInteractionAnswer::UserInput {
+                    decision: SurfaceUserInputDecision::Chat(message),
+                },
+                SurfaceInteractionSafeProjection::UserInput { answered: true },
+            ) => DurableInteractionContinuationAnswerPayload::UserInput {
+                answer: message.clone(),
+            },
+            (
+                ContinuationTurnIntent::UserQuestionnaire { .. },
+                SurfaceClientInteractionAnswer::UserInput {
+                    decision: SurfaceUserInputDecision::Answer(answer),
+                },
+                SurfaceInteractionSafeProjection::UserInput { answered: true },
+            ) => DurableInteractionContinuationAnswerPayload::UserInput {
+                answer: answer.clone(),
+            },
+            (
                 ContinuationTurnIntent::McpElicitation { .. },
                 SurfaceClientInteractionAnswer::McpElicitation {
                     decision: SurfaceMcpElicitationDecision::Accept { content },
@@ -2016,7 +2141,8 @@ impl DurableInteractionContinuationAnswer {
                 content: content.clone(),
             },
             (
-                ContinuationTurnIntent::UserInput { .. },
+                ContinuationTurnIntent::UserInput { .. }
+                | ContinuationTurnIntent::UserQuestionnaire { .. },
                 SurfaceClientInteractionAnswer::UserInput {
                     decision: SurfaceUserInputDecision::Cancel,
                 },
@@ -2072,13 +2198,21 @@ impl DurableInteractionContinuationAnswer {
                 DurableInteractionContinuationAnswerPayload::UserInput { .. },
                 SurfaceInteractionSafeProjection::UserInput { answered: true },
             ) | (
+                ContinuationTurnIntent::UserQuestionnaire { .. },
+                DurableInteractionContinuationAnswerPayload::UserQuestionnaire { .. }
+                    | DurableInteractionContinuationAnswerPayload::UserInput { .. },
+                SurfaceInteractionSafeProjection::UserInput { answered: true },
+            ) | (
                 ContinuationTurnIntent::McpElicitation { .. },
                 DurableInteractionContinuationAnswerPayload::McpElicitation { .. },
                 SurfaceInteractionSafeProjection::McpElicitation { accepted: true },
             )
         );
-        if self.version != DURABLE_INTERACTION_CONTINUATION_ANSWER_VERSION
-            || self.interaction_id != *capsule.interaction_id()
+        if !matches!(
+            self.version,
+            LEGACY_DURABLE_INTERACTION_CONTINUATION_ANSWER_VERSION
+                | DURABLE_INTERACTION_CONTINUATION_ANSWER_VERSION
+        ) || self.interaction_id != *capsule.interaction_id()
             || self.fence != *capsule.fence()
             || self.response_id != receipt.response_id
             || self.receipt_id != receipt.receipt_id
@@ -2124,6 +2258,9 @@ impl DurableInteractionContinuationAnswer {
         match &self.payload {
             DurableInteractionContinuationAnswerPayload::UserInput { answer } => {
                 answer.as_str().to_string()
+            }
+            DurableInteractionContinuationAnswerPayload::UserQuestionnaire { response } => {
+                serde_json::to_string(response).expect("surface questionnaire is serializable")
             }
             DurableInteractionContinuationAnswerPayload::McpElicitation { content } => {
                 serde_json::to_string(content).expect("surface data value is serializable")
@@ -2289,6 +2426,9 @@ enum CanonicalInteractionRequestV1<'a> {
         question: &'a NonEmptyText,
         suggestions: &'a Vec<DisplayText>,
     },
+    UserQuestionnaire {
+        questionnaire: &'a SurfaceUserInputQuestionnaire,
+    },
     McpElicitation {
         server_name: &'a NonEmptyText,
         server_request_id: &'a NonEmptyText,
@@ -2337,6 +2477,9 @@ fn canonical_interaction_request_v1(
             question,
             suggestions,
         },
+        SurfaceInteractionRequest::UserQuestionnaire { questionnaire } => {
+            CanonicalInteractionRequestV1::UserQuestionnaire { questionnaire }
+        }
         SurfaceInteractionRequest::McpElicitation {
             server_name,
             server_request_id,
@@ -2728,6 +2871,77 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn questionnaire_capsule_round_trips_structured_questions_and_answers() {
+        let interaction_id = SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(60)).unwrap();
+        let question_id = NonEmptyText::try_new("question-1").unwrap();
+        let questionnaire = SurfaceUserInputQuestionnaire {
+            questions: NonEmptyVec::try_new(vec![SurfaceUserInputQuestion {
+                id: question_id.clone(),
+                header: NonEmptyText::try_new("Scope").unwrap(),
+                question: NonEmptyText::try_new("Which scope?").unwrap(),
+                options: vec![
+                    SurfaceUserInputOption {
+                        label: NonEmptyText::try_new("Focused").unwrap(),
+                        description: DisplayText::new("Only this feature"),
+                        preview: Some(DisplayText::new("one crate")),
+                    },
+                    SurfaceUserInputOption {
+                        label: NonEmptyText::try_new("Broad").unwrap(),
+                        description: DisplayText::new("Related cleanup"),
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+            }])
+            .unwrap(),
+        };
+        let request = SurfaceInteractionRequest::UserQuestionnaire {
+            questionnaire: questionnaire.clone(),
+        };
+        let capsule = DurableInteractionContinuationCapsule::try_new_restartable(
+            interaction_id,
+            continuation_fence(61),
+            request.clone(),
+            Sha256Digest::new([61; 32]),
+            DurableInteractionContinuationIntent::ContinuationTurn(
+                ContinuationTurnIntent::user_questionnaire(
+                    NonEmptyText::try_new("ask-1").unwrap(),
+                    questionnaire,
+                ),
+            ),
+        )
+        .unwrap();
+        let decoded = DurableInteractionContinuationCapsule::decode(&capsule.encode().unwrap())
+            .expect("questionnaire capsule decodes");
+        assert_eq!(
+            decoded.version,
+            DURABLE_INTERACTION_CONTINUATION_CAPSULE_VERSION
+        );
+        assert!(matches!(
+            decoded.request(),
+            DurableInteractionContinuationRequest::UserQuestionnaire { .. }
+        ));
+
+        let receipt = continuation_receipt(
+            62,
+            SurfaceInteractionKind::UserInput,
+            SurfaceInteractionSafeProjection::UserInput { answered: true },
+        );
+        let answer = SurfaceClientInteractionAnswer::UserInput {
+            decision: SurfaceUserInputDecision::Submitted(SurfaceUserInputResponse {
+                answers: vec![SurfaceUserInputQuestionAnswer {
+                    question_id,
+                    answers: vec![DisplayText::new("Focused")],
+                }],
+            }),
+        };
+        let durable = DurableInteractionContinuationAnswer::try_new(&capsule, &receipt, &answer)
+            .unwrap()
+            .expect("submitted questionnaire creates a private answer");
+        assert!(durable.answer_text().contains("\"Focused\""));
     }
 
     #[test]

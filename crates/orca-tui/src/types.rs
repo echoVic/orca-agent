@@ -566,6 +566,7 @@ impl AppState {
             atomic_skill_tokens,
             pending_pastes,
             user_input_dialog: self.user_input_dialog.clone(),
+            response_summary: None,
         });
         Some(key)
     }

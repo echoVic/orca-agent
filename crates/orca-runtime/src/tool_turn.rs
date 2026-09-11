@@ -3227,7 +3227,7 @@ mod tests {
             fn request_user_input(
                 &self,
                 _request: &crate::lifecycle::RuntimeUserInputRequest,
-            ) -> io::Result<Option<String>> {
+            ) -> io::Result<Option<crate::lifecycle::RuntimeUserInputResponse>> {
                 self.calls.set(self.calls.get() + 1);
                 Ok(None)
             }

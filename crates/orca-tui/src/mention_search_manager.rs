@@ -585,7 +585,7 @@ mod tests {
             );
         }
         state.status = AppStatus::WaitingUserInput;
-        state.user_input_dialog = Some(crate::user_input_dialog::UserInputDialog::new(
+        state.user_input_dialog = Some(crate::user_input_dialog::UserInputDialog::from_legacy(
             "Choose?",
             vec!["A - First".to_string(), "B - Second".to_string()],
         ));

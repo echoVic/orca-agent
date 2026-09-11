@@ -2888,6 +2888,15 @@ mod tests {
         McpElicitation(McpElicitationResponse),
     }
 
+    fn user_input_text(response: crate::lifecycle::RuntimeUserInputResponse) -> Option<String> {
+        match response {
+            crate::lifecycle::RuntimeUserInputResponse::Chat { message } => Some(message),
+            crate::lifecycle::RuntimeUserInputResponse::Submitted { answers } => {
+                answers.into_iter().flat_map(|answer| answer.answers).next()
+            }
+        }
+    }
+
     struct TerminalOutputCancelExecutor;
 
     struct MultiTerminalCreateExecutor {
@@ -3399,11 +3408,12 @@ mod tests {
                     generation
                         .user_input_handler()
                         .expect("typed ACP operation provides user-input broker")
-                        .request_user_input(&RuntimeUserInputRequest {
-                            id: "standard-user-input".to_string(),
-                            question: "Continue?".to_string(),
-                            choices: vec!["yes".to_string(), "no".to_string()],
-                        })?,
+                        .request_user_input(&RuntimeUserInputRequest::single(
+                            "standard-user-input",
+                            "Continue?",
+                            vec!["yes".to_string(), "no".to_string()],
+                        ))?
+                        .and_then(user_input_text),
                 ),
                 StandardInteractionBehavior::McpElicitation => {
                     StandardInteractionOutcome::McpElicitation(

@@ -1823,6 +1823,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "toml_edit",
  "uuid",
 ]
 
