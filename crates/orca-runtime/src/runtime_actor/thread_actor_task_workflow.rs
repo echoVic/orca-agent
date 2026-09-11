@@ -375,8 +375,20 @@ impl ThreadActor {
                 if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
                     eprintln!("[workflow-cancel-diagnostic] actor-before-workflow-completion");
                 }
-                if let Err(error) = self.commit_typed_workflow_completion(typed_workflow, None) {
-                    self.operation_recovery.terminal_blocked = Some(error.to_string());
+                match self.commit_typed_workflow_completion(typed_workflow, None) {
+                    Ok(()) => {
+                        if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                            eprintln!("[workflow-cancel-diagnostic] actor-workflow-completion-ok");
+                        }
+                    }
+                    Err(error) => {
+                        if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                            eprintln!(
+                                "[workflow-cancel-diagnostic] actor-workflow-completion-error: {error}"
+                            );
+                        }
+                        self.operation_recovery.terminal_blocked = Some(error.to_string());
+                    }
                 }
                 if std::env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
                     eprintln!("[workflow-cancel-diagnostic] actor-after-workflow-completion");
