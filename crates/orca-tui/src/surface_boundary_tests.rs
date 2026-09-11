@@ -106,11 +106,12 @@ fn current_user_action_name(action: &UserAction) -> &'static str {
     }
 }
 
-const TUI_ENTRYPOINTS: [&str; 41] = [
+const TUI_ENTRYPOINTS: [&str; 43] = [
     "slash.new",
     "slash.model_write",
     "slash.model_read",
     "slash.mode_plan_and_backtab",
+    "full_access.confirmation",
     "slash.config",
     "slash.cost",
     "slash.goal",
@@ -126,6 +127,7 @@ const TUI_ENTRYPOINTS: [&str; 41] = [
     "slash_menu.discovery",
     "dispatcher.route_action",
     "approval_always",
+    "interaction.user_input_submission",
     "background_approval_reconstruction",
     "workflow_result_autosubmit",
     "background_task_callbacks",

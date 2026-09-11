@@ -378,6 +378,10 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
     "slash.mode_plan_and_backtab",
     /SlashCommand::Mode|SlashCommand::Plan|KeyCode::BackTab|cycle_approval_mode|title == "\/mode"/,
   ],
+  [
+    "full_access.confirmation",
+    /request_settings_change|handle_full_access_confirmation_key/,
+  ],
   ["slash.config", /SlashCommand::Config|handle_config_dialog_key/],
   ["slash.cost", /SlashCommand::Cost/],
   ["slash.goal", /SlashCommand::Goal/],
@@ -393,6 +397,7 @@ const TUI_ENTRYPOINT_ANCHORS = new Map([
   ["slash_menu.discovery", /update_slash_menu|available_commands|discover_saved_workflows/],
   ["dispatcher.route_action", /fn route_action/],
   ["approval_always", /fn resolve_approval_option|pending approval|TuiEvent::ApprovalNeeded/],
+  ["interaction.user_input_submission", /submit_pending_user_input_response/],
   [
     "background_approval_reconstruction",
     /open_selected_background_approval_dialog|fn resolve_approval/,
@@ -1145,15 +1150,17 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval:user_action.route", 2],
   ["crates/orca-tui/src/approval_actions.rs:resolve_approval_option:approval_allowlist.insert", 2],
-  ["crates/orca-tui/src/approval_mode_actions.rs:cycle_approval_mode:user_action.route", 1],
-  ["crates/orca-tui/src/config_dialog_actions.rs:apply_dialog:user_action.route", 1],
+  [
+    "crates/orca-tui/src/full_access_confirmation_actions.rs:request_settings_change:user_action.route",
+    1,
+  ],
+  [
+    "crates/orca-tui/src/full_access_confirmation_actions.rs:handle_full_access_confirmation_key:user_action.route",
+    1,
+  ],
   ["crates/orca-tui/src/global_actions.rs:handle_global_shortcut:user_action.route", 4],
   ["crates/orca-tui/src/idle_navigation_actions.rs:handle_idle_navigation_shortcut:user_action.route", 1],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:user_action.route", 2],
-  [
-    "crates/orca-tui/src/idle_submit_actions.rs:submit_pending_user_input_choice:user_action.route",
-    1,
-  ],
   ["crates/orca-tui/src/idle_submit_actions.rs:handle_idle_submit:input_history.record", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:settings.update", 1],
   ["crates/orca-tui/src/key_event_actions.rs:handle_key_event_preflight:user_action.route", 3],
@@ -1170,6 +1177,10 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
   ["crates/orca-tui/src/setup_actions.rs:handle_setup_key:credentials.update", 2],
   ["crates/orca-tui/src/setup_actions.rs:finish_setup:user_action.route", 1],
   ["crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:user_action.route", 14],
+  [
+    "crates/orca-tui/src/idle_submit_actions.rs:submit_pending_user_input_response:user_action.route",
+    1,
+  ],
   [
     "crates/orca-tui/src/slash_command_actions.rs:dispatch_slash_command:input_history.record",
     1,
