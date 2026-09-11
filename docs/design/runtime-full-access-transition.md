@@ -19,9 +19,11 @@ confirmation. Canceling the confirmation sends no runtime mutation.
 
 ## Runtime Boundary
 
-Authority widening uses the dedicated `RuntimeSettingsPatch::EnableFullAccess`
-variant. A generic `SetApprovalMode(FullAuto)` cannot widen authority. This
-keeps confirmation provenance distinct from ordinary mode synchronization.
+Interactive authority widening during an active operation uses the dedicated
+`RuntimeSettingsPatch::EnableFullAccess` variant. A generic
+`SetApprovalMode(FullAuto)` cannot widen an active operation. This keeps TUI
+confirmation provenance distinct from ordinary mode synchronization and
+server-side configuration.
 
 The runtime commits the surface settings revision and policy epoch before it
 publishes the new operation policy or acknowledges the mutation.
@@ -50,10 +52,12 @@ The confirmation defaults to Cancel. A pending `/config` change keeps its model
 and reasoning choices, but none of those changes are submitted if the user
 cancels Full Access.
 
-ACP and JSONL settings adapters translate an explicit protocol-level
-`full-auto` selection to `EnableFullAccess`. Restoring an older saved session
-normalizes `full-auto` to `TrustedHost` and removes a stale active permission
-profile.
+ACP translates an allowed `full-auto` selection to `EnableFullAccess`. The
+JSONL/server startup adapter synchronizes approval mode and an explicit
+permission profile separately; its generic mode synchronization cannot widen
+an operation that is already active. Restoring a no-profile `full-auto`
+session normalizes it to `TrustedHost`, while a legacy explicit profile remains
+authoritative.
 
 ## Diagnostics
 

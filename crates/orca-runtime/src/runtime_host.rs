@@ -10966,11 +10966,6 @@ fn apply_runtime_settings_patch(
             settings.reasoning_effort = *effort;
         }
         surface::RuntimeSettingsPatch::SetApprovalMode { mode } => {
-            if *mode == surface::SurfaceApprovalMode::FullAuto
-                && settings.approval_mode != surface::SurfaceApprovalMode::FullAuto
-            {
-                return Err(surface::SurfaceClientCommandError::Unauthorized);
-            }
             config.approval_mode = match mode {
                 surface::SurfaceApprovalMode::Suggest => ApprovalMode::Suggest,
                 surface::SurfaceApprovalMode::AutoEdit => ApprovalMode::AutoEdit,
@@ -11098,7 +11093,8 @@ pub fn hydrate_run_config_from_surface_settings(
             effort: settings.reasoning_effort,
         },
     )?;
-    let full_access = settings.approval_mode == surface::SurfaceApprovalMode::FullAuto;
+    let full_access = settings.approval_mode == surface::SurfaceApprovalMode::FullAuto
+        && settings.active_permission_profile.is_none();
     let approval_patch = if full_access {
         surface::RuntimeSettingsPatch::EnableFullAccess
     } else {
@@ -31080,7 +31076,7 @@ mod tests {
                 ])
                 .unwrap(),
             ),
-            Err(surface::SurfaceClientCommandError::Unauthorized)
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
         ));
         let updated = committed_surface_value(
             current
@@ -31115,12 +31111,7 @@ mod tests {
             "legacy-restrictive",
             None::<String>,
         ));
-        let mut legacy_settings = updated.settings.effective.clone();
-        legacy_settings.active_permission_profile = Some(surface::SurfaceActivePermissionProfile {
-            id: surface::NonEmptyText::try_new("legacy-restrictive").unwrap(),
-            extends: None,
-        });
-        hydrate_run_config_from_surface_settings(&mut restored, &legacy_settings)
+        hydrate_run_config_from_surface_settings(&mut restored, &updated.settings.effective)
             .expect("hydrate confirmed full access");
         assert_eq!(restored.approval_mode, ApprovalMode::FullAuto);
         assert_eq!(
@@ -31128,6 +31119,21 @@ mod tests {
             orca_core::capability::ExecutionProfile::TrustedHost
         );
         assert!(restored.active_permission_profile.is_none());
+
+        let mut legacy_settings = updated.settings.effective.clone();
+        legacy_settings.active_permission_profile = Some(surface::SurfaceActivePermissionProfile {
+            id: surface::NonEmptyText::try_new("legacy-restrictive").unwrap(),
+            extends: None,
+        });
+        hydrate_run_config_from_surface_settings(&mut restored, &legacy_settings)
+            .expect("hydrate legacy profiled full-auto");
+        assert_eq!(
+            restored
+                .active_permission_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str()),
+            Some("legacy-restrictive")
+        );
 
         release_tx
             .send(())
