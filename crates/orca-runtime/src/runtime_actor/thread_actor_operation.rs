@@ -3439,10 +3439,10 @@ impl ThreadActor {
             apply_runtime_settings_patch(&mut next_config, &mut next_settings.effective, patch)?;
         }
         if !confirmed_full_access
-            && current.effective.approval_mode == surface::SurfaceApprovalMode::FullAuto
-            && current.effective.active_permission_profile.is_some()
             && next_settings.effective.approval_mode == surface::SurfaceApprovalMode::FullAuto
             && next_settings.effective.active_permission_profile.is_none()
+            && (current.effective.approval_mode != surface::SurfaceApprovalMode::FullAuto
+                || current.effective.active_permission_profile.is_some())
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }

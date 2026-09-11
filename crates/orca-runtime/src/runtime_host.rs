@@ -31140,7 +31140,7 @@ mod tests {
                 ])
                 .unwrap(),
             ),
-            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+            Err(surface::SurfaceClientCommandError::Unauthorized)
         ));
         let updated = committed_surface_value(
             current

@@ -53,9 +53,10 @@ and reasoning choices, but none of those changes are submitted if the user
 cancels Full Access.
 
 ACP translates an allowed `full-auto` selection to `EnableFullAccess`. The
-JSONL/server startup adapter synchronizes approval mode and an explicit
-permission profile separately; its generic mode synchronization cannot widen
-an operation that is already active. Restoring a no-profile `full-auto`
+JSONL/server startup adapter does the same for unprofiled `full-auto`, but
+synchronizes a profiled `full-auto` mode and its explicit profile separately.
+Generic mode/profile synchronization cannot enter unprofiled `FullAuto` or
+widen an operation that is already active. Restoring a no-profile `full-auto`
 session normalizes it to `TrustedHost`, while a legacy explicit profile remains
 authoritative.
 

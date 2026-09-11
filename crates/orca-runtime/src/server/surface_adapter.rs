@@ -2671,9 +2671,15 @@ fn settings_patches(
         orca_core::approval_types::ApprovalMode::Plan => crate::surface::SurfaceApprovalMode::Plan,
     };
     if snapshot.settings.effective.approval_mode != approval_mode {
-        patches.push(RuntimeSettingsPatch::SetApprovalMode {
-            mode: approval_mode,
-        });
+        if approval_mode == crate::surface::SurfaceApprovalMode::FullAuto
+            && config.active_permission_profile.is_none()
+        {
+            patches.push(RuntimeSettingsPatch::EnableFullAccess);
+        } else {
+            patches.push(RuntimeSettingsPatch::SetApprovalMode {
+                mode: approval_mode,
+            });
+        }
     }
     if let Some(roots) = config.runtime_workspace_roots.as_ref() {
         let roots = roots
