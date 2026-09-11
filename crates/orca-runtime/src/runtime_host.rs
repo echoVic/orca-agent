@@ -26483,6 +26483,7 @@ mod tests {
                 )
                 .expect("launch cancellable workflow"),
         );
+        let workflow_task_id = workflow.workflow.task_id.clone();
         let workflow_operation_id = workflow.operation_id.expect("workflow operation");
         diagnostic_stage.store(6, Ordering::Release);
         let foreground = committed_surface_value(
@@ -26589,6 +26590,22 @@ mod tests {
             .wait_operation_terminal(surface_request_id(), foreground.operation_id)
             .expect("wait foreground terminal");
         diagnostic_stage.store(14, Ordering::Release);
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let status = thread
+                .task_registry()
+                .get(workflow_task_id.as_str())
+                .map(|task| task.status);
+            if status.is_some_and(|status| !status.is_active()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "workflow worker task did not settle after cancellation: {status:?}"
+            );
+            std::thread::yield_now();
+        }
+        diagnostic_stage.store(15, Ordering::Release);
         let terminal = attachment
             .client
             .wait_operation_terminal(surface_request_id(), workflow_operation_id.clone())
@@ -26604,7 +26621,7 @@ mod tests {
                 }
             }
         ));
-        diagnostic_stage.store(15, Ordering::Release);
+        diagnostic_stage.store(16, Ordering::Release);
         let recovered =
             surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor.clone())
                 .recover_batches()
@@ -26632,10 +26649,10 @@ mod tests {
         assert_eq!(exact[0].cursor_after, recovered_control.cursor_after);
         assert_eq!(exact[0].batch_digest, recovered_control.batch_digest);
 
-        diagnostic_stage.store(16, Ordering::Release);
+        diagnostic_stage.store(17, Ordering::Release);
         host.shutdown()
             .expect("shutdown workflow cancel retry host");
-        diagnostic_stage.store(17, Ordering::Release);
+        diagnostic_stage.store(18, Ordering::Release);
         diagnostic_complete.store(true, Ordering::Release);
         if let Some(watchdog) = diagnostic_watchdog {
             watchdog.join().expect("join workflow cancel watchdog");

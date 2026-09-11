@@ -36,9 +36,10 @@
 | 11 | Read snapshot during cancellation |
 | 12 | Release foreground executor |
 | 13 | Wait for foreground terminal |
-| 14 | Wait for workflow terminal |
-| 15 | Recover and verify ledger |
-| 16 | Shut down runtime host |
+| 14 | Wait for workflow task-registry terminal state |
+| 15 | Wait for workflow surface terminal |
+| 16 | Recover and verify ledger |
+| 17 | Shut down runtime host |
 
 ## Verification Conclusion
 Pending focused Windows stage evidence.
