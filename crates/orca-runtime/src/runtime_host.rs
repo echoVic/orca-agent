@@ -26404,7 +26404,7 @@ mod tests {
         std::fs::create_dir_all(&workflow_dir).unwrap();
         std::fs::write(
             workflow_dir.join("retry-cancel.js"),
-            "export const meta = { name: 'retry-cancel', description: 'retry cancel', phases: ['main'] };\nexport default await phase('main', async () => agent('mock_stream_delay_ms 30000'));",
+            "export const meta = { name: 'retry-cancel', description: 'retry cancel', phases: ['main'] };\nexport default await phase('main', async () => new Promise((resolve) => setTimeout(() => resolve('done'), 30000)));",
         )
         .unwrap();
         orca_core::config::folder_trust::set_trust_with_config_dir(
