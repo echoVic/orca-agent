@@ -275,6 +275,11 @@ impl WorkflowHost {
         C: Fn() -> io::Result<bool>,
         A: Fn(),
     {
+        let diagnostic = |stage: &str| {
+            if env::var_os("ORCA_WORKFLOW_CANCEL_DIAGNOSTIC").is_some() {
+                eprintln!("[workflow-cancel-diagnostic] {stage}");
+            }
+        };
         let host_path = ensure_host_file()?;
         let _host_file = WorkflowHostFileGuard::new(host_path.clone());
         let args_json = serialize_bounded_json(
@@ -370,6 +375,7 @@ impl WorkflowHost {
                 let mut event_bytes = 0usize;
                 loop {
                     if should_cancel()? {
+                        diagnostic("host-cancel-observed");
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "workflow host cancelled",
@@ -461,18 +467,24 @@ impl WorkflowHost {
             })();
 
             if run_result.is_err() {
+                diagnostic("before-on-abort");
                 on_abort();
+                diagnostic("after-on-abort");
                 abort_workers.store(true, Ordering::Release);
+                diagnostic("before-child-terminate");
                 let _ = child.terminate_and_wait();
+                diagnostic("after-child-terminate");
             }
             drop(call_tx);
 
+            diagnostic("before-agent-worker-join");
             let mut worker_panic = false;
             for handle in worker_handles {
                 if handle.join().is_err() {
                     worker_panic = true;
                 }
             }
+            diagnostic("after-agent-worker-join");
             if worker_panic && run_result.is_ok() {
                 on_abort();
                 abort_workers.store(true, Ordering::Release);
@@ -491,6 +503,7 @@ impl WorkflowHost {
         });
         drop(stdin);
 
+        diagnostic("before-exit-result");
         let exit_result = if execution_result.is_ok() {
             child.wait_for_exit(WORKFLOW_HOST_EXIT_GRACE)
         } else {
@@ -499,9 +512,14 @@ impl WorkflowHost {
                 forced: true,
             })
         };
+        diagnostic("after-exit-result");
         drop(frame_rx);
+        diagnostic("before-stdout-join");
         let stdout_result = join_host_thread(stdout_handle, "stdout frame reader");
+        diagnostic("after-stdout-join");
+        diagnostic("before-stderr-join");
         let stderr_result = join_host_thread(stderr_handle, "stderr reader");
+        diagnostic("after-stderr-join");
 
         if let Err(error) = execution_result {
             return Err(error);

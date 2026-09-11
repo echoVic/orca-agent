@@ -11,15 +11,17 @@
 ## Hypotheses & Verification
 | ID | Hypothesis | Likelihood | Effort | Evidence |
 |----|------------|------------|--------|----------|
-| A | A surface command blocks before cancellation is durably retried. | Medium | Low | Pending: stage markers around launch, foreground admission, cancellation, and retry observation. |
-| B | The exact control batch commits but the workflow worker does not observe cancellation. | High | Medium | Pending: compare committed control with worker/task completion. |
-| C | The worker exits but the actor does not reap completion or wake the terminal waiter. | High | Medium | Pending: distinguish terminal waits from shutdown. |
-| D | Operations terminalize and only host shutdown hangs. | Medium | Low | Pending: markers before and after host shutdown. |
+| A | A surface command blocks before cancellation is durably retried. | Medium | Low | Rejected: diagnostic run reached the foreground terminal. |
+| B | The exact control batch commits but the workflow worker does not observe cancellation. | High | Medium | Rejected: TaskRegistry reached a terminal state. |
+| C | The worker reaches TaskRegistry terminal state but workflow-host cleanup or actor reaping does not publish the surface terminal. | High | Medium | Confirmed boundary: diagnostic stage 15. |
+| D | Operations terminalize and only host shutdown hangs. | Medium | Low | Rejected: the workflow surface terminal was never observed. |
 
 ## Log Evidence
 - PR run `34651520641` x64 attempt 1 timed out at 120 seconds and attempt 2 passed in 0.797 seconds.
 - The target had `threads-required = 2` under a two-thread nextest profile, and no peer test ran during the timeout.
 - Replacing the nested agent call with a workflow-host timer did not remove the first-attempt timeout.
+- Focused run `34655357956` reproduced at stage 14: foreground terminal completed, workflow terminal did not.
+- Focused run `34656018054` reproduced at stage 15: TaskRegistry was terminal, but the workflow surface terminal was not published.
 
 ## Diagnostic Stage Codes
 | Stage | Next blocking boundary |
@@ -42,4 +44,6 @@
 | 17 | Shut down runtime host |
 
 ## Verification Conclusion
-Pending focused Windows stage evidence.
+The durable control retry and worker stop request succeed. The remaining hang
+is between workflow TaskRegistry terminalization and surface completion
+publication. Instrument workflow-host child and reader cleanup next.
