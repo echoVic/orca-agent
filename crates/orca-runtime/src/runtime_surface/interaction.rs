@@ -584,6 +584,44 @@ pub struct SurfaceUserInputQuestionnaire {
     pub questions: NonEmptyVec<SurfaceUserInputQuestion>,
 }
 
+impl SurfaceUserInputQuestionnaire {
+    pub(crate) fn validate_response(
+        &self,
+        response: &SurfaceUserInputResponse,
+    ) -> Result<(), &'static str> {
+        let mut seen = std::collections::HashSet::new();
+        for answer in &response.answers {
+            let question_id = answer.question_id.as_str();
+            if question_id.trim().is_empty() {
+                return Err("questionnaire response contains an empty question id");
+            }
+            if !seen.insert(question_id) {
+                return Err("questionnaire response repeats a question id");
+            }
+            let Some(question) = self
+                .questions
+                .as_slice()
+                .iter()
+                .find(|question| question.id.as_str() == question_id)
+            else {
+                return Err("questionnaire response references an unknown question id");
+            };
+            if answer.answers.is_empty()
+                || answer
+                    .answers
+                    .iter()
+                    .any(|value| value.as_str().trim().is_empty())
+            {
+                return Err("questionnaire response contains an empty answer");
+            }
+            if !question.multi_select && answer.answers.len() != 1 {
+                return Err("single-select questionnaire response contains multiple answers");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SurfaceUserInputQuestionAnswer {
@@ -2094,6 +2132,20 @@ impl DurableInteractionContinuationAnswer {
                 },
             );
         }
+        if let (
+            ContinuationTurnIntent::UserQuestionnaire { questionnaire, .. },
+            SurfaceClientInteractionAnswer::UserInput {
+                decision: SurfaceUserInputDecision::Submitted(response),
+            },
+        ) = (intent, answer)
+            && questionnaire.validate_response(response).is_err()
+        {
+            return Err(
+                DurableInteractionContinuationCapsuleError::RequestIntentMismatch {
+                    kind: capsule.kind(),
+                },
+            );
+        }
         let payload = match (intent, answer, &receipt.safe_projection) {
             (
                 ContinuationTurnIntent::UserInput { .. },
@@ -2274,17 +2326,17 @@ impl DurableInteractionContinuationAnswer {
                             .map_or(answer.question_id.as_str(), |question| {
                                 question.question.as_str()
                             });
-                        (
-                            question.to_string(),
-                            answer
+                        serde_json::json!({
+                            "questionId": answer.question_id.as_str(),
+                            "question": question,
+                            "answers": answer
                                 .answers
                                 .iter()
                                 .map(DisplayText::as_str)
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        )
+                                .collect::<Vec<_>>(),
+                        })
                     })
-                    .collect::<std::collections::BTreeMap<_, _>>();
+                    .collect::<Vec<_>>();
                 serde_json::json!({ "answers": answers }).to_string()
             }
             (
@@ -2918,27 +2970,87 @@ mod tests {
     fn questionnaire_capsule_round_trips_structured_questions_and_answers() {
         let interaction_id = SurfaceInteractionId::try_from_bytes(uuid_v7_bytes(60)).unwrap();
         let question_id = NonEmptyText::try_new("question-1").unwrap();
+        let second_question_id = NonEmptyText::try_new("question-2").unwrap();
         let questionnaire = SurfaceUserInputQuestionnaire {
-            questions: NonEmptyVec::try_new(vec![SurfaceUserInputQuestion {
-                id: question_id.clone(),
-                header: NonEmptyText::try_new("Scope").unwrap(),
-                question: NonEmptyText::try_new("Which scope?").unwrap(),
-                options: vec![
-                    SurfaceUserInputOption {
-                        label: NonEmptyText::try_new("Focused").unwrap(),
-                        description: DisplayText::new("Only this feature"),
-                        preview: Some(DisplayText::new("one crate")),
-                    },
-                    SurfaceUserInputOption {
-                        label: NonEmptyText::try_new("Broad").unwrap(),
-                        description: DisplayText::new("Related cleanup"),
-                        preview: None,
-                    },
-                ],
-                multi_select: false,
-            }])
+            questions: NonEmptyVec::try_new(vec![
+                SurfaceUserInputQuestion {
+                    id: question_id.clone(),
+                    header: NonEmptyText::try_new("Scope").unwrap(),
+                    question: NonEmptyText::try_new("Which scope?").unwrap(),
+                    options: vec![
+                        SurfaceUserInputOption {
+                            label: NonEmptyText::try_new("Focused").unwrap(),
+                            description: DisplayText::new("Only this feature"),
+                            preview: Some(DisplayText::new("one crate")),
+                        },
+                        SurfaceUserInputOption {
+                            label: NonEmptyText::try_new("Broad").unwrap(),
+                            description: DisplayText::new("Related cleanup"),
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                },
+                SurfaceUserInputQuestion {
+                    id: second_question_id.clone(),
+                    header: NonEmptyText::try_new("Fallback").unwrap(),
+                    question: NonEmptyText::try_new("Which scope?").unwrap(),
+                    options: vec![],
+                    multi_select: false,
+                },
+            ])
             .unwrap(),
         };
+        let submitted_response = SurfaceUserInputResponse {
+            answers: vec![
+                SurfaceUserInputQuestionAnswer {
+                    question_id: question_id.clone(),
+                    answers: vec![DisplayText::new("Focused")],
+                },
+                SurfaceUserInputQuestionAnswer {
+                    question_id: second_question_id.clone(),
+                    answers: vec![DisplayText::new("Fallback")],
+                },
+            ],
+        };
+        assert!(questionnaire.validate_response(&submitted_response).is_ok());
+        assert!(
+            questionnaire
+                .validate_response(&SurfaceUserInputResponse {
+                    answers: vec![SurfaceUserInputQuestionAnswer {
+                        question_id: question_id.clone(),
+                        answers: vec![DisplayText::new("Focused")],
+                    }],
+                })
+                .is_ok(),
+            "explicitly skipped questions remain valid"
+        );
+        assert!(
+            questionnaire
+                .validate_response(&SurfaceUserInputResponse {
+                    answers: vec![
+                        SurfaceUserInputQuestionAnswer {
+                            question_id: question_id.clone(),
+                            answers: vec![DisplayText::new("Focused")],
+                        },
+                        SurfaceUserInputQuestionAnswer {
+                            question_id: question_id.clone(),
+                            answers: vec![DisplayText::new("Broad")],
+                        },
+                    ],
+                })
+                .is_err()
+        );
+        assert!(
+            questionnaire
+                .validate_response(&SurfaceUserInputResponse {
+                    answers: vec![SurfaceUserInputQuestionAnswer {
+                        question_id: NonEmptyText::try_new("unknown-question").unwrap(),
+                        answers: vec![DisplayText::new("Focused")],
+                    }],
+                })
+                .is_err()
+        );
         let request = SurfaceInteractionRequest::UserQuestionnaire {
             questionnaire: questionnaire.clone(),
         };
@@ -2972,20 +3084,18 @@ mod tests {
             SurfaceInteractionSafeProjection::UserInput { answered: true },
         );
         let answer = SurfaceClientInteractionAnswer::UserInput {
-            decision: SurfaceUserInputDecision::Submitted(SurfaceUserInputResponse {
-                answers: vec![SurfaceUserInputQuestionAnswer {
-                    question_id,
-                    answers: vec![DisplayText::new("Focused")],
-                }],
-            }),
+            decision: SurfaceUserInputDecision::Submitted(submitted_response),
         };
         let durable = DurableInteractionContinuationAnswer::try_new(&capsule, &receipt, &answer)
             .unwrap()
             .expect("submitted questionnaire creates a private answer");
-        assert_eq!(
-            durable.answer_text(&capsule),
-            r#"{"answers":{"Which scope?":"Focused"}}"#
-        );
+        let rendered: serde_json::Value =
+            serde_json::from_str(&durable.answer_text(&capsule)).unwrap();
+        assert_eq!(rendered["answers"].as_array().unwrap().len(), 2);
+        assert_eq!(rendered["answers"][0]["questionId"], "question-1");
+        assert_eq!(rendered["answers"][0]["question"], "Which scope?");
+        assert_eq!(rendered["answers"][1]["questionId"], "question-2");
+        assert_eq!(rendered["answers"][1]["question"], "Which scope?");
     }
 
     #[test]

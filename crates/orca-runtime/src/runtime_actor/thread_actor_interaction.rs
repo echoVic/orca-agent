@@ -2411,6 +2411,21 @@ impl ThreadActor {
                 "interaction request and answer kinds do not match",
             ));
         }
+        if let (
+            surface::SurfaceInteractionRequest::UserQuestionnaire { questionnaire },
+            surface::SurfaceClientInteractionAnswer::UserInput {
+                decision: surface::SurfaceUserInputDecision::Submitted(submitted),
+            },
+        ) = (&interaction.record.request, response.answer())
+            && let Err(message) = questionnaire.validate_response(submitted)
+        {
+            return Ok(Self::uncommitted_interaction_response(
+                request_id,
+                interaction,
+                surface::SurfaceMutationErrorCode::InvalidInput,
+                message,
+            ));
+        }
         if interaction.record.answer_policy != *response.policy() {
             return Ok(Self::uncommitted_interaction_response(
                 request_id,

@@ -256,7 +256,9 @@ complete `questions` array. They answer a questionnaire with
 `{"requestId":"...","answers":[{"questionId":"question-1","answers":["..."]}]}`.
 The legacy `answer` string and the `chat` string remain supported; `answer`,
 `answers`, and `chat` are mutually exclusive, and omitting all three cancels
-the request.
+the request. Submitted entries must use unique IDs from the emitted
+questionnaire and contain non-empty answers. Questions the user explicitly
+chooses to leave unanswered are omitted from the array.
 
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
