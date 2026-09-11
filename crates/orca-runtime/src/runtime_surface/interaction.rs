@@ -2254,15 +2254,56 @@ impl DurableInteractionContinuationAnswer {
         &self.injection
     }
 
-    pub(crate) fn answer_text(&self) -> String {
-        match &self.payload {
-            DurableInteractionContinuationAnswerPayload::UserInput { answer } => {
+    pub(crate) fn answer_text(&self, capsule: &DurableInteractionContinuationCapsule) -> String {
+        match (&self.payload, capsule.intent()) {
+            (
+                DurableInteractionContinuationAnswerPayload::UserQuestionnaire { response },
+                Some(DurableInteractionContinuationIntent::ContinuationTurn(
+                    ContinuationTurnIntent::UserQuestionnaire { questionnaire, .. },
+                )),
+            ) => {
+                let answers = response
+                    .answers
+                    .iter()
+                    .map(|answer| {
+                        let question = questionnaire
+                            .questions
+                            .as_slice()
+                            .iter()
+                            .find(|question| question.id == answer.question_id)
+                            .map_or(answer.question_id.as_str(), |question| {
+                                question.question.as_str()
+                            });
+                        (
+                            question.to_string(),
+                            answer
+                                .answers
+                                .iter()
+                                .map(DisplayText::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                serde_json::json!({ "answers": answers }).to_string()
+            }
+            (
+                DurableInteractionContinuationAnswerPayload::UserInput { answer },
+                Some(DurableInteractionContinuationIntent::ContinuationTurn(
+                    ContinuationTurnIntent::UserQuestionnaire { .. },
+                )),
+            ) => serde_json::json!({
+                "answers": {},
+                "chat": answer.as_str(),
+            })
+            .to_string(),
+            (DurableInteractionContinuationAnswerPayload::UserInput { answer }, _) => {
                 answer.as_str().to_string()
             }
-            DurableInteractionContinuationAnswerPayload::UserQuestionnaire { response } => {
+            (DurableInteractionContinuationAnswerPayload::UserQuestionnaire { response }, _) => {
                 serde_json::to_string(response).expect("surface questionnaire is serializable")
             }
-            DurableInteractionContinuationAnswerPayload::McpElicitation { content } => {
+            (DurableInteractionContinuationAnswerPayload::McpElicitation { content }, _) => {
                 serde_json::to_string(content).expect("surface data value is serializable")
             }
         }
@@ -2941,7 +2982,10 @@ mod tests {
         let durable = DurableInteractionContinuationAnswer::try_new(&capsule, &receipt, &answer)
             .unwrap()
             .expect("submitted questionnaire creates a private answer");
-        assert!(durable.answer_text().contains("\"Focused\""));
+        assert_eq!(
+            durable.answer_text(&capsule),
+            r#"{"answers":{"Which scope?":"Focused"}}"#
+        );
     }
 
     #[test]

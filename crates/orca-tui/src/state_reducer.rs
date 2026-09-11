@@ -544,11 +544,12 @@ impl AppState {
                 } else {
                     format!("Waiting on answers for {question_count} questions.")
                 };
-                self.user_input_dialog = questionnaire
-                    .questions
-                    .iter()
-                    .any(|question| !question.options.is_empty())
-                    .then(|| UserInputDialog::new(questionnaire));
+                self.user_input_dialog = (question_count > 1
+                    || questionnaire
+                        .questions
+                        .iter()
+                        .any(|question| !question.options.is_empty()))
+                .then(|| UserInputDialog::new(questionnaire));
                 self.push_message(ChatMessage::System(transcript_message));
             }
             TuiEvent::McpElicitationRequested {

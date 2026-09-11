@@ -9160,7 +9160,7 @@ impl ContinuationTurnCheckpointOwner {
             answer.injection().template().as_str(),
             answer.request_identity().as_str(),
             self.historical_fence.generation_id.get(),
-            answer_text = answer.answer_text(),
+            answer_text = answer.answer_text(&self.capsule),
         ))
     }
 }
@@ -10972,8 +10972,13 @@ fn apply_runtime_settings_patch(
                 surface::SurfaceApprovalMode::FullAuto => ApprovalMode::FullAuto,
                 surface::SurfaceApprovalMode::Plan => ApprovalMode::Plan,
             };
-            config.execution_profile =
-                orca_core::capability::ExecutionProfile::for_approval_mode(config.approval_mode);
+            config.execution_profile = if config.approval_mode == ApprovalMode::FullAuto
+                && config.active_permission_profile.is_some()
+            {
+                orca_core::capability::ExecutionProfile::Workspace
+            } else {
+                orca_core::capability::ExecutionProfile::for_approval_mode(config.approval_mode)
+            };
             settings.approval_mode = *mode;
         }
         surface::RuntimeSettingsPatch::EnableFullAccess => {
@@ -11007,6 +11012,11 @@ fn apply_runtime_settings_patch(
                             .as_ref()
                             .map(|value| value.as_str().to_string()),
                     });
+            if config.approval_mode == ApprovalMode::FullAuto
+                && config.active_permission_profile.is_some()
+            {
+                config.execution_profile = orca_core::capability::ExecutionProfile::Workspace;
+            }
             settings.active_permission_profile = profile.clone();
         }
         surface::RuntimeSettingsPatch::ReplacePermissionRules { rules } => {
@@ -31064,7 +31074,59 @@ mod tests {
                 surface::SurfaceCapability::ManageThreadSettings,
             ]),
         );
+        let preference_epoch = current.baseline.snapshot.settings.effective.policy_epoch;
+        let updated_preferences = committed_surface_value(
+            current
+                .client
+                .update_settings(
+                    surface_request_id(),
+                    current.baseline.snapshot.settings.thread_revision,
+                    surface::NonEmptyVec::try_new(vec![
+                        surface::RuntimeSettingsPatch::SetModel {
+                            model: surface::NonEmptyText::try_new("deepseek-v4-pro").unwrap(),
+                        },
+                        surface::RuntimeSettingsPatch::SetReasoning {
+                            effort: surface::SurfaceReasoningEffort::Low,
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .expect("update model preferences while operation is active"),
+        );
+        assert_eq!(
+            updated_preferences.settings.effective.model.as_str(),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            updated_preferences.settings.effective.reasoning_effort,
+            surface::SurfaceReasoningEffort::Low
+        );
+        assert_eq!(
+            updated_preferences.settings.effective.policy_epoch,
+            preference_epoch
+        );
+        let current = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::ManageThreadSettings,
+            ]),
+        );
         let previous_epoch = current.baseline.snapshot.settings.effective.policy_epoch;
+        assert!(matches!(
+            current.client.update_settings(
+                surface_request_id(),
+                current.baseline.snapshot.settings.thread_revision,
+                surface::NonEmptyVec::try_new(vec![
+                    surface::RuntimeSettingsPatch::EnableFullAccess,
+                    surface::RuntimeSettingsPatch::SetCwd {
+                        cwd: surface::CanonicalPath::try_new(cwd.path().join("other")).unwrap(),
+                    },
+                ])
+                .unwrap(),
+            ),
+            Err(surface::SurfaceClientCommandError::RuntimeUnavailable)
+        ));
         assert!(matches!(
             current.client.update_settings(
                 surface_request_id(),
@@ -31127,6 +31189,10 @@ mod tests {
         });
         hydrate_run_config_from_surface_settings(&mut restored, &legacy_settings)
             .expect("hydrate legacy profiled full-auto");
+        assert_eq!(
+            restored.execution_profile,
+            orca_core::capability::ExecutionProfile::Workspace
+        );
         assert_eq!(
             restored
                 .active_permission_profile

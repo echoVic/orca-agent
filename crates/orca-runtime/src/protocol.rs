@@ -17,4 +17,4 @@ pub use permissions::{
     RequestFileSystemPermissions, RequestNetworkPermissions, RequestPermissionProfile,
 };
 pub use shell::shell_join;
-pub use wire::{ClientOp, DecodeError, Submission};
+pub use wire::{ClientOp, DecodeError, Submission, UserInputQuestionAnswer, UserInputResponse};

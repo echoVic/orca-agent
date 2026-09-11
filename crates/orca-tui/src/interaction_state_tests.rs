@@ -77,6 +77,39 @@ fn user_input_requested_event_tracks_pending_runtime_interaction_id() {
 }
 
 #[test]
+fn multi_question_free_text_request_opens_the_inline_dialog() {
+    let mut state = state();
+    state.update(TuiEvent::UserInputRequested {
+        key: interaction_key(TuiInteractionKind::UserInput, "ask-free-text"),
+        questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+            questions: vec![
+                crate::protocol::TuiUserInputQuestion {
+                    id: "question-1".to_string(),
+                    header: "First".to_string(),
+                    question: "Describe the first constraint.".to_string(),
+                    options: Vec::new(),
+                    multi_select: false,
+                },
+                crate::protocol::TuiUserInputQuestion {
+                    id: "question-2".to_string(),
+                    header: "Second".to_string(),
+                    question: "Describe the second constraint.".to_string(),
+                    options: Vec::new(),
+                    multi_select: false,
+                },
+            ],
+        },
+    });
+
+    let dialog = state
+        .user_input_dialog
+        .as_ref()
+        .expect("multi-question free-text request must remain answerable");
+    assert_eq!(dialog.question_count(), 2);
+    assert!(dialog.choices().is_empty());
+}
+
+#[test]
 fn mcp_elicitation_requested_event_tracks_pending_runtime_interaction_id() {
     let mut state = state();
     state.update(TuiEvent::McpElicitationRequested {

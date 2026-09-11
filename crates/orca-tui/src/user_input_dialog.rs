@@ -337,9 +337,13 @@ impl UserInputDialog {
     }
 
     fn begin_chat(&mut self) {
-        self.mode = UserInputDialogMode::Chat {
-            value: String::new(),
+        let value = match &self.mode {
+            UserInputDialogMode::CustomAnswer { value } | UserInputDialogMode::Chat { value } => {
+                value.clone()
+            }
+            _ => String::new(),
         };
+        self.mode = UserInputDialogMode::Chat { value };
     }
 
     fn append_text(&mut self, text: &str) -> bool {
@@ -888,6 +892,33 @@ mod tests {
                     TuiUserInputResponse::Chat { message },
                 ),
             }) if actual_key == key && message == "Why?"
+        ));
+    }
+
+    #[test]
+    fn ctrl_t_preserves_existing_custom_and_chat_text() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let (mut state, key) = state_with_dialog("Task: Which path?");
+        let textarea = TextArea::default();
+
+        for key in [
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            handle_user_input_dialog_key(&key, &mut state, &textarea, &action_tx);
+        }
+
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::RespondToInteraction {
+                key: actual_key,
+                response: TuiInteractionResponse::UserQuestionnaire(
+                    TuiUserInputResponse::Chat { message },
+                ),
+            }) if actual_key == key && message == "no"
         ));
     }
 

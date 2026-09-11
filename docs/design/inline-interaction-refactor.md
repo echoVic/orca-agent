@@ -437,7 +437,8 @@ durable 重启 capsule），收敛度甚至超过 grok/claude-code。真正的�
 - **durable capsule 兼容**：当前编码版本为 v3，decoder 接受 v1/v2/v3；旧单题 intent
   仍接收 legacy `Answer`，新 questionnaire 接收 `Submitted` / `Chat` / `Answer` / `Cancel`。
 - **客户端兼容**：ACP/JSONL 同时输出旧 `question`/`choices` 与新 `questionnaire`/`questions`；
-  新客户端可提交结构化答案，旧客户端的字符串 answer 继续有效。
+  新 JSONL 客户端通过 `answers: [{ questionId, answers }]` 提交结构化答案，也可通过
+  `chat` 提交澄清消息；旧客户端的字符串 `answer` 继续有效，三种响应形态互斥。
 - **提交一致性**：TUI 只在 `InteractionResponseAck::Committed` 后回显答案；提交失败时
   恢复完整问卷、当前页、勾选、自定义文本、原 composer 草稿、mentions 和 pastes。
 - **无头降级不变**：没有 runtime user-input handler 时继续确定性 fail closed，不等待输入。

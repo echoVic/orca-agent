@@ -3427,6 +3427,14 @@ impl ThreadActor {
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
+        let active_direct_update_authorized = patches.as_slice().iter().all(|patch| {
+            matches!(
+                patch,
+                surface::RuntimeSettingsPatch::SetModel { .. }
+                    | surface::RuntimeSettingsPatch::SetReasoning { .. }
+                    | surface::RuntimeSettingsPatch::EnableFullAccess
+            )
+        });
         for patch in patches.as_slice() {
             apply_runtime_settings_patch(&mut next_config, &mut next_settings.effective, patch)?;
         }
@@ -3450,7 +3458,10 @@ impl ThreadActor {
                         )
                     )
             });
-        if active.is_some() && !confirmed_full_access && !interaction_permission_update_authorized {
+        if active.is_some()
+            && !active_direct_update_authorized
+            && !interaction_permission_update_authorized
+        {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         let next_revision = surface::SettingsRevision::try_new(

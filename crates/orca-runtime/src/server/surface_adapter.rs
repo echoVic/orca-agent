@@ -2339,7 +2339,7 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                                 choice
                             })
                             .collect::<Vec<_>>(),
-                        "questions": questionnaire,
+                        "questions": questionnaire.questions.as_slice(),
                     });
                     transport.direct.publish(&request_id, || {
                         write_runtime_event(

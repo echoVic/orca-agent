@@ -8095,13 +8095,24 @@ enabled = true
                     .is_some_and(|question| question == "Confirm: Continue?")
             );
             assert_eq!(request["choices"], json!(["yes - Continue", "no - Stop"]));
+            assert_eq!(request["questions"][0]["id"], "question-1");
+            assert_eq!(request["questions"][0]["question"], "Continue?");
 
             handle_line(
                 &server_config,
                 &mut state,
-                &format!(
-                    r#"{{"id":"input-response","method":"user_input/respond","params":{{"requestId":"{request_id}","answer":"yes"}}}}"#
-                ),
+                &json!({
+                    "id": "input-response",
+                    "method": "user_input/respond",
+                    "params": {
+                        "requestId": request_id,
+                        "answers": [{
+                            "questionId": "question-1",
+                            "answers": ["yes"],
+                        }],
+                    },
+                })
+                .to_string(),
                 Arc::clone(&writer),
             )
             .expect("user input response");
@@ -8110,18 +8121,36 @@ enabled = true
             handle_line(
                 &server_config,
                 &mut state,
-                &format!(
-                    r#"{{"id":"input-response-retry","method":"user_input/respond","params":{{"requestId":"{request_id}","answer":"yes"}}}}"#
-                ),
+                &json!({
+                    "id": "input-response-retry",
+                    "method": "user_input/respond",
+                    "params": {
+                        "requestId": request_id,
+                        "answers": [{
+                            "questionId": "question-1",
+                            "answers": ["yes"],
+                        }],
+                    },
+                })
+                .to_string(),
                 Arc::clone(&writer),
             )
             .expect("idempotent user input response retry");
             handle_line(
                 &server_config,
                 &mut state,
-                &format!(
-                    r#"{{"id":"input-response-conflict","method":"user_input/respond","params":{{"requestId":"{request_id}","answer":"no"}}}}"#
-                ),
+                &json!({
+                    "id": "input-response-conflict",
+                    "method": "user_input/respond",
+                    "params": {
+                        "requestId": request_id,
+                        "answers": [{
+                            "questionId": "question-1",
+                            "answers": ["no"],
+                        }],
+                    },
+                })
+                .to_string(),
                 Arc::clone(&writer),
             )
             .expect("conflicting user input response retry");

@@ -578,8 +578,11 @@ fn persist_user_model_settings_to_dir(
     model: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> io::Result<PathBuf> {
-    fs::create_dir_all(dir)?;
     let path = dir.join(USER_CONFIG_FILE);
+    if model.is_none() && reasoning_effort.is_none() {
+        return Ok(path);
+    }
+    fs::create_dir_all(dir)?;
     let mut document = match fs::read_to_string(&path) {
         Ok(content) => content.parse::<toml_edit::DocumentMut>().map_err(|error| {
             io::Error::other(format!(
@@ -1793,6 +1796,23 @@ workflowKeywordTriggerEnabled = true
         let parsed: Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["model"].as_str(), Some("deepseek-flash"));
         assert_eq!(parsed["reasoning_effort"].as_str(), Some("low"));
+        unsafe {
+            std::env::remove_var(ORCA_HOME_ENV);
+        }
+    }
+
+    #[test]
+    fn persist_user_model_settings_does_not_create_a_missing_file_for_noop() {
+        let _guard = EFFECTIVE_CONFIG_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ORCA_HOME_ENV, temp.path());
+        }
+
+        let path = persist_user_model_settings(None, None).unwrap();
+
+        assert_eq!(path, temp.path().join(USER_CONFIG_FILE));
+        assert!(!path.exists());
         unsafe {
             std::env::remove_var(ORCA_HOME_ENV);
         }

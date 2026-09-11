@@ -250,6 +250,14 @@ Chat. Dismissal cancels the whole tool call. Headless execution fails
 deterministically instead of waiting for input. `ask_user_question` is the only
 registered and model-visible user-question tool.
 
+JSONL clients receive both the legacy `question` / `choices` fields and the
+complete `questions` array. They answer a questionnaire with
+`user_input/respond` parameters shaped as
+`{"requestId":"...","answers":[{"questionId":"question-1","answers":["..."]}]}`.
+The legacy `answer` string and the `chat` string remain supported; `answer`,
+`answers`, and `chat` are mutually exclusive, and omitting all three cancels
+the request.
+
 Tool events:
 - `tool.call.requested` — emitted before execution, contains `name`, `action`, `target`
 - `tool.call.completed` — emitted after execution, contains `name`, `status` (completed/failed/denied), `output`, `truncated`
