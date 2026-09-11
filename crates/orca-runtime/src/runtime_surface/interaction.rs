@@ -585,10 +585,21 @@ pub struct SurfaceUserInputQuestionnaire {
 }
 
 impl SurfaceUserInputQuestionnaire {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        let mut question_ids = std::collections::HashSet::new();
+        for question in self.questions.as_slice() {
+            if !question_ids.insert(question.id.as_str()) {
+                return Err("questionnaire contains a duplicate question id");
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_response(
         &self,
         response: &SurfaceUserInputResponse,
     ) -> Result<(), &'static str> {
+        self.validate()?;
         let mut seen = std::collections::HashSet::new();
         for answer in &response.answers {
             let question_id = answer.question_id.as_str();
@@ -668,6 +679,24 @@ pub enum SurfaceInteractionRequest {
         tool: SurfaceToolRequest,
         authority: AuthorityFingerprint,
     },
+}
+
+impl SurfaceInteractionRequest {
+    pub(crate) fn validate_user_input_decision(
+        &self,
+        decision: &SurfaceUserInputDecision,
+    ) -> Result<(), &'static str> {
+        match (self, decision) {
+            (
+                Self::UserQuestionnaire { questionnaire },
+                SurfaceUserInputDecision::Submitted(response),
+            ) => questionnaire.validate_response(response),
+            (Self::UserInput { .. }, SurfaceUserInputDecision::Submitted(_)) => {
+                Err("legacy user-input interaction cannot accept a questionnaire submission")
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1354,6 +1383,16 @@ impl DurableInteractionContinuationCapsule {
             return Err(
                 DurableInteractionContinuationCapsuleError::UnsupportedVersion {
                     observed_version: self.version,
+                },
+            );
+        }
+        if let DurableInteractionContinuationRequest::UserQuestionnaire { questionnaire } =
+            &self.request
+            && questionnaire.validate().is_err()
+        {
+            return Err(
+                DurableInteractionContinuationCapsuleError::RequestIntentMismatch {
+                    kind: SurfaceInteractionKind::UserInput,
                 },
             );
         }
@@ -3014,6 +3053,14 @@ mod tests {
             ],
         };
         assert!(questionnaire.validate_response(&submitted_response).is_ok());
+        let duplicate_questionnaire = SurfaceUserInputQuestionnaire {
+            questions: NonEmptyVec::try_new(vec![
+                questionnaire.questions.as_slice()[0].clone(),
+                questionnaire.questions.as_slice()[0].clone(),
+            ])
+            .unwrap(),
+        };
+        assert!(duplicate_questionnaire.validate().is_err());
         assert!(
             questionnaire
                 .validate_response(&SurfaceUserInputResponse {
@@ -3054,6 +3101,21 @@ mod tests {
         let request = SurfaceInteractionRequest::UserQuestionnaire {
             questionnaire: questionnaire.clone(),
         };
+        let submitted_decision = SurfaceUserInputDecision::Submitted(submitted_response.clone());
+        assert!(
+            request
+                .validate_user_input_decision(&submitted_decision)
+                .is_ok()
+        );
+        let legacy_request = SurfaceInteractionRequest::UserInput {
+            question: NonEmptyText::try_new("Continue?").unwrap(),
+            suggestions: vec![],
+        };
+        assert!(
+            legacy_request
+                .validate_user_input_decision(&submitted_decision)
+                .is_err()
+        );
         let capsule = DurableInteractionContinuationCapsule::try_new_restartable(
             interaction_id,
             continuation_fence(61),
@@ -3084,7 +3146,7 @@ mod tests {
             SurfaceInteractionSafeProjection::UserInput { answered: true },
         );
         let answer = SurfaceClientInteractionAnswer::UserInput {
-            decision: SurfaceUserInputDecision::Submitted(submitted_response),
+            decision: submitted_decision,
         };
         let durable = DurableInteractionContinuationAnswer::try_new(&capsule, &receipt, &answer)
             .unwrap()

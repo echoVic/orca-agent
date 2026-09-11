@@ -1607,6 +1607,9 @@ impl ThreadActor {
                     )
                 })?,
             };
+            questionnaire
+                .validate()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
             (
                 surface::SurfaceInteractionRequest::UserQuestionnaire {
                     questionnaire: questionnaire.clone(),
@@ -2411,13 +2414,11 @@ impl ThreadActor {
                 "interaction request and answer kinds do not match",
             ));
         }
-        if let (
-            surface::SurfaceInteractionRequest::UserQuestionnaire { questionnaire },
-            surface::SurfaceClientInteractionAnswer::UserInput {
-                decision: surface::SurfaceUserInputDecision::Submitted(submitted),
-            },
-        ) = (&interaction.record.request, response.answer())
-            && let Err(message) = questionnaire.validate_response(submitted)
+        if let surface::SurfaceClientInteractionAnswer::UserInput { decision } = response.answer()
+            && let Err(message) = interaction
+                .record
+                .request
+                .validate_user_input_decision(decision)
         {
             return Ok(Self::uncommitted_interaction_response(
                 request_id,
