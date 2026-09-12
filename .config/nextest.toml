@@ -37,8 +37,25 @@ threads-required = 2
 filter = "package(=orca-tools) & test(/^bash::tests::(streaming_reports_output_chunks_and_final_result|streaming_large_unterminated_output_is_bounded_before_result_truncation|bash_commands_receive_eof_on_stdin_instead_of_inheriting_terminal|streaming_respects_shell_timeout_and_returns_partial_output|noisy_streaming_timeout_does_not_deadlock_reader_shutdown|bash_wait_observes_cancel_callback|bash_wait_preserves_one_shot_cancel_observation|streaming_bash_wait_observes_cancel_callback|noisy_streaming_cancel_does_not_deadlock_reader_shutdown)$/)"
 threads-required = 2
 
+# Cold Windows runners need exclusive I/O and process capacity for these
+# durability and multi-process contracts.
 [[profile.ci.overrides]]
 filter = "package(=orca-runtime) & binary(=task_output_store)"
+threads-required = 2
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = "package(=orca-runtime) & test(=task_output::tests::persistent_store_keeps_output_before_memory_eviction_and_after_reopen)"
+threads-required = 2
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = "binary(=subagent_recovery_contract) & test(/^(custom_agent_exec_continue_recovers_original_owner_and_rejects_other_sessions|detached_custom_agent_recovers_across_modes_and_rejects_other_sessions)$/)"
+threads-required = 2
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = "binary(=exec_jsonl) & test(=exec_post_model_hook_observes_usage_environment)"
 threads-required = 2
 
 [[profile.ci.overrides]]

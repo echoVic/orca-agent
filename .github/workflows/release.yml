@@ -142,6 +142,7 @@ jobs:
             binary: orca.exe
             archive: zip
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
         with:
