@@ -12,7 +12,7 @@ use orca_core::workflow_types::{
     WorkflowEvidencePhase, WorkflowEvidenceToolEvent, WorkflowInput, WorkflowRunState,
     WorkflowRunStatus, WorkflowTaskLifecycleEvidence,
 };
-use orca_platform::fs::{AtomicWritePolicy, atomic_write};
+use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -180,6 +180,7 @@ impl Serialize for AgentOutputField {
 pub struct WorkflowStateStore {
     root: PathBuf,
     agent_cache_write_lock: Arc<Mutex<()>>,
+    run_mutation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -215,6 +216,7 @@ impl WorkflowStateStore {
         Self {
             root,
             agent_cache_write_lock: Arc::new(Mutex::new(())),
+            run_mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -228,6 +230,10 @@ impl WorkflowStateStore {
 
     pub fn state_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("state.json")
+    }
+
+    fn run_mutation_lock_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("run-state.lock")
     }
 
     pub fn launch_input_path(&self, run_id: &str) -> PathBuf {
@@ -264,6 +270,10 @@ impl WorkflowStateStore {
     }
 
     pub fn write_state(&self, state: &WorkflowRunState) -> io::Result<()> {
+        self.with_run_mutation_lock(&state.run_id, || self.write_state_unlocked(state))
+    }
+
+    fn write_state_unlocked(&self, state: &WorkflowRunState) -> io::Result<()> {
         let run_dir = self.run_dir(&state.run_id);
         fs::create_dir_all(&run_dir)?;
         write_json_pretty(&self.state_path(&state.run_id), state)
@@ -398,10 +408,12 @@ impl WorkflowStateStore {
     }
 
     pub fn request_stop(&self, run_id: &str) -> io::Result<()> {
-        let mut control = self.load_control_request(run_id)?;
-        control.stop_requested = true;
-        control.updated_at_ms = now_ms();
-        write_json_pretty(&self.stop_request_path(run_id), &control)
+        self.with_run_mutation_lock(run_id, || {
+            let mut control = self.load_control_request(run_id)?;
+            control.stop_requested = true;
+            control.updated_at_ms = now_ms();
+            write_json_pretty(&self.stop_request_path(run_id), &control)
+        })
     }
 
     pub fn stop_requested(&self, run_id: &str) -> io::Result<bool> {
@@ -409,23 +421,27 @@ impl WorkflowStateStore {
     }
 
     pub fn request_pause(&self, run_id: &str) -> io::Result<()> {
-        let mut control = self.load_control_request(run_id)?;
-        control.pause_requested = true;
-        control.updated_at_ms = now_ms();
-        write_json_pretty(&self.stop_request_path(run_id), &control)
+        self.with_run_mutation_lock(run_id, || {
+            let mut control = self.load_control_request(run_id)?;
+            control.pause_requested = true;
+            control.updated_at_ms = now_ms();
+            write_json_pretty(&self.stop_request_path(run_id), &control)
+        })
     }
 
     pub fn request_resume(&self, run_id: &str) -> io::Result<()> {
-        let mut control = self.load_control_request(run_id)?;
-        control.pause_requested = false;
-        control.updated_at_ms = now_ms();
-        write_json_pretty(&self.stop_request_path(run_id), &control)?;
-        let mut state = self.load_run(run_id)?;
-        if state.status == WorkflowRunStatus::Paused {
-            state.status = WorkflowRunStatus::Running;
-            self.write_state(&state)?;
-        }
-        Ok(())
+        self.with_run_mutation_lock(run_id, || {
+            let mut control = self.load_control_request(run_id)?;
+            control.pause_requested = false;
+            control.updated_at_ms = now_ms();
+            write_json_pretty(&self.stop_request_path(run_id), &control)?;
+            let mut state = self.load_run(run_id)?;
+            if state.status == WorkflowRunStatus::Paused {
+                state.status = WorkflowRunStatus::Running;
+                self.write_state_unlocked(&state)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn pause_requested(&self, run_id: &str) -> io::Result<bool> {
@@ -438,6 +454,20 @@ impl WorkflowStateStore {
             return Ok(WorkflowControlRequest::default());
         }
         read_json(&path)
+    }
+
+    fn with_run_mutation_lock<T>(
+        &self,
+        run_id: &str,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let _process_guard = self
+            .run_mutation_lock
+            .lock()
+            .map_err(|_| io::Error::other("workflow run mutation lock poisoned"))?;
+        let _file_guard = ExclusiveFileLock::acquire(&self.run_mutation_lock_path(run_id))
+            .map_err(io::Error::other)?;
+        operation()
     }
 
     pub fn record_agent_completed(

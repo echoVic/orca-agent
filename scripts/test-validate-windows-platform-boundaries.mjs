@@ -587,6 +587,37 @@ const workflow = normalizeLineEndings(readFileSync(workflowPath, "utf8"));
 const releaseWorkflowPath = path.join(repoRoot, ".github/workflows/release.yml");
 assert.ok(existsSync(releaseWorkflowPath), "release workflow must exist");
 const releaseWorkflow = normalizeLineEndings(readFileSync(releaseWorkflowPath, "utf8"));
+const linuxWorkflowPath = path.join(
+  repoRoot,
+  ".github/workflows/runtime-contract.yml",
+);
+assert.ok(existsSync(linuxWorkflowPath), "Linux CI workflow must exist");
+const linuxWorkflow = normalizeLineEndings(
+  readFileSync(linuxWorkflowPath, "utf8"),
+);
+const pinnedNextestAction =
+  "taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e";
+for (const [source, label] of [
+  [workflow, "Windows CI"],
+  [linuxWorkflow, "Linux CI"],
+  [releaseWorkflow, "Release dry-run"],
+]) {
+  assert.ok(
+    source.includes(pinnedNextestAction) &&
+      !source.includes("taiki-e/install-action@nextest"),
+    `${label} must pin the nextest installer to the reviewed commit`,
+  );
+  const nextestCommands = source
+    .split("\n")
+    .filter((line) => line.includes("cargo nextest run"));
+  assert.ok(nextestCommands.length > 0, `${label} must run nextest`);
+  for (const command of nextestCommands) {
+    assert.ok(
+      command.includes("--retries 0"),
+      `${label} nextest commands must disable framework retries: ${command.trim()}`,
+    );
+  }
+}
 const installerSource = readFileSync(path.join(repoRoot, "install.ps1"), "utf8");
 const pullRequest = workflow.match(/  pull_request:\n([\s\S]*?)\n  push:/);
 assert.ok(pullRequest, "Windows CI must validate pull requests before merge");
@@ -616,6 +647,58 @@ for (const marker of [
     `Windows push trigger must contain ${marker}`,
   );
 }
+const linuxPullRequest = linuxWorkflow.match(
+  /  pull_request:\n([\s\S]*?)\n  push:/,
+);
+assert.ok(linuxPullRequest, "Linux CI must validate pull requests before merge");
+const linuxPush = linuxWorkflow.match(/  push:\n([\s\S]*?)\n\npermissions:/);
+assert.ok(linuxPush, "Linux CI must validate relevant main-branch pushes");
+for (const trigger of [linuxPullRequest[1], linuxPush[1]]) {
+  for (const marker of [
+    "branches: [main]",
+    '"Cargo.toml"',
+    '"Cargo.lock"',
+    '"src/**"',
+    '"crates/**"',
+    '"tests/**"',
+    '"terminal_bench/**"',
+    '"scripts/**"',
+    '".config/nextest.toml"',
+    '".github/workflows/release.yml"',
+    '".github/workflows/runtime-contract.yml"',
+    '".github/workflows/windows-ci.yml"',
+  ]) {
+    assert.ok(
+      trigger.includes(marker),
+      `Linux PR/main trigger must contain ${marker}`,
+    );
+  }
+}
+for (const marker of [
+  "name: Linux",
+  "  linux-full:",
+  "runs-on: ubuntu-22.04",
+  "timeout-minutes: 90",
+  pinnedNextestAction,
+  "sudo apt-get install -y ripgrep bubblewrap",
+  "python3 -m unittest discover -s terminal_bench -p 'test_*.py' -v",
+  "node scripts/test-repository-hygiene.mjs",
+  "cargo nextest run -p orca-tui --lib --locked --profile ci-serial",
+  "cargo nextest run --test tui_pty_contract --locked --profile ci-serial",
+  "cargo clippy --workspace --all-targets --locked -j 1",
+  "cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast",
+  "generation_stop_terminal_mapping_preserves_not_started_reasons",
+  "surface_goal_terminal_checkpoint_failure_recovers_exact_verified_batch",
+  "cargo test -p orca-runtime --test runtime_host",
+  "cargo test -p orca-runtime --test subagent_observability_contract",
+  "cargo test -p orca-runtime --test runtime_surface_interaction",
+  "cargo test --test subagent_contract",
+]) {
+  assert.ok(
+    linuxWorkflow.includes(marker),
+    `Linux full CI workflow must contain ${marker}`,
+  );
+}
 for (const marker of [
   "windows-latest",
   "windows-11-arm",
@@ -626,7 +709,7 @@ for (const marker of [
   "node scripts/test-validate-windows-platform-boundaries.mjs",
   "cargo check --workspace --all-targets --locked",
   "cargo clippy --workspace --all-targets --locked",
-  "taiki-e/install-action@nextest",
+  pinnedNextestAction,
   "cargo nextest run -p orca-tui --lib --locked --profile ci-serial",
   "cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass",
   "cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast",
@@ -741,6 +824,20 @@ for (const marker of [
   assert.ok(
     taskRegistrySource.includes(marker),
     `task persistence and recovered workers must contain ${marker}`,
+  );
+}
+const workflowStateSource = readNormalizedSource(
+  "crates/orca-runtime/src/workflow/state.rs",
+);
+for (const marker of [
+  "ExclusiveFileLock",
+  'join("run-state.lock")',
+  "with_run_mutation_lock",
+  "write_state_unlocked",
+]) {
+  assert.ok(
+    workflowStateSource.includes(marker),
+    `workflow state and control mutations must share the cross-process run lock: ${marker}`,
   );
 }
 const providerSource = readNormalizedSource(
@@ -931,6 +1028,17 @@ for (const gate of [releaseWindowsX64Gate[0], releaseWindowsArm64Gate[0]]) {
       gate.includes("$PSNativeCommandUseErrorActionPreference = $true"),
     "release Windows behavior gates must fail on every native command error",
   );
+  for (const marker of [
+    "cargo build -p orca-windows-runner --locked",
+    "cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0",
+    "cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass --retries 0",
+    "cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0",
+  ]) {
+    assert.ok(
+      gate.includes(marker),
+      `release Windows behavior gates must retain the zero-retry full suite: ${marker}`,
+    );
+  }
 }
 for (const marker of [
   "prompt_names_powershell_7_as_the_active_shell_dialect",
@@ -951,9 +1059,15 @@ for (const marker of [
 assert.ok(
   releaseWorkflow.includes("- name: Verify tagged commit passed main gates") &&
     releaseWorkflow.includes("checks: read") &&
+    releaseWorkflow.includes("actions: read") &&
     releaseWorkflow.includes('test "$(git rev-parse origin/main)" = "$GITHUB_SHA"') &&
-    releaseWorkflow.includes("for name in validate native-x64 native-arm64") &&
-    releaseWorkflow.includes('.app.slug == "github-actions"'),
+    releaseWorkflow.includes("check-runs?per_page=100") &&
+    releaseWorkflow.includes("for name in linux-full native-x64 native-arm64") &&
+    releaseWorkflow.includes('.app.slug == "github-actions"') &&
+    releaseWorkflow.includes('-f head_sha="$GITHUB_SHA"') &&
+    releaseWorkflow.includes("-f event=push") &&
+    releaseWorkflow.includes("for workflow in Linux Windows") &&
+    releaseWorkflow.includes('.event == "push"'),
   "tag releases must verify successful main checks for the exact tagged commit",
 );
 for (const marker of [

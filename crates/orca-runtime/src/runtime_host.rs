@@ -17376,7 +17376,6 @@ impl ThreadActor {
                                     "goal run paused during runtime shutdown",
                                 );
                                 if pause_result.is_ok() && self.goal_controller.is_blocking() {
-                                    active.generation.cancel.cancel();
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Retry);
                                     }
@@ -17451,7 +17450,6 @@ impl ThreadActor {
                                 "goal run paused during runtime shutdown",
                             );
                             if pause_result.is_ok() && self.goal_controller.is_blocking() {
-                                active.generation.cancel.cancel();
                                 if let Some(reply) = reply {
                                     let _ = reply.send(ThreadShutdownAck::Retry);
                                 }
@@ -37006,14 +37004,23 @@ mod tests {
                 .expect("submit prepared Goal continuation"),
         );
         let operation_id = output.operation_id.expect("Goal operation id");
-        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
-        let prepared = loop {
-            let recovered =
-                surface::JsonlSurfaceCommitLedger::new(&transcript_path, initial_cursor.clone())
-                    .recover_batches()
-                    .expect("read prepared Goal continuation");
-            if let Some(batch) = recovered.prepared
-                && batch.events.as_slice().iter().any(|event| {
+        let checkpoint_observed =
+            surface::JsonlSurfaceCommitLedger::wait_for_terminal_checkpoint_failure(
+                transcript_path.clone(),
+                Duration::from_secs(15),
+            );
+        assert!(
+            checkpoint_observed,
+            "Goal continuation did not reach the injected checkpoint failure"
+        );
+        let recovered =
+            surface::JsonlSurfaceCommitLedger::new(&transcript_path, initial_cursor.clone())
+                .recover_batches()
+                .expect("read prepared Goal continuation");
+        let prepared = recovered
+            .prepared
+            .filter(|batch| {
+                batch.events.as_slice().iter().any(|event| {
                     matches!(
                         &event.event,
                         surface::SurfaceEvent::Goal(surface::GoalPatchEnvelope {
@@ -37025,15 +37032,8 @@ mod tests {
                         })
                     )
                 })
-            {
-                break batch;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Goal continuation did not reach prepared state"
-            );
-            std::thread::yield_now();
-        };
+            })
+            .expect("injected checkpoint failure must retain the prepared Goal continuation");
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
         let prepared_commit = prepared.commit_class.clone();
         let prepared_digest = prepared.batch_digest.clone();

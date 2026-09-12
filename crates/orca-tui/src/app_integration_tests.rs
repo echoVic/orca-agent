@@ -3735,12 +3735,20 @@ fn hosted_tui_rename_restores_runtime_projection_when_durable_write_fails() {
 
 #[test]
 fn hosted_tui_new_session_rejects_active_background_work() {
-    with_orca_home(|_| {
+    with_orca_home(|home| {
         let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
-        harness.send(UserAction::Submit("mock_stream_delay_ms 3000".to_string()));
-        harness.recv_until(|event| {
-                matches!(event, TuiEvent::MessageDelta(text) if text.contains("Mock slow stream started."))
-            });
+        let release_marker = home.join("release-new-session-background-work");
+        harness.send(UserAction::Submit(format!(
+            "mock_stream_release_marker {}",
+            release_marker.display()
+        )));
+        assert!(
+            harness
+                .runtime
+                .controller()
+                .wait_for_surface_active(Duration::from_secs(10)),
+            "backgrounded turn must install the TUI controller"
+        );
 
         harness.send(UserAction::BackgroundCurrentTurn);
         let task = loop {

@@ -62,7 +62,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e # nextest
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: windows-x64-${{ hashFiles('Cargo.lock') }}
@@ -115,9 +115,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo nextest run -p orca-tui --lib --locked --profile ci-serial
-          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass
-          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+          cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass --retries 0
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0
 
   native-arm64:
     runs-on: windows-11-arm
@@ -132,7 +132,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-pc-windows-msvc
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e # nextest
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: windows-arm64-${{ hashFiles('Cargo.lock') }}
@@ -184,6 +184,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo nextest run -p orca-tui --lib --locked --profile ci-serial
-          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass
-          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+          cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass --retries 0
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0

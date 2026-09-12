@@ -238,7 +238,10 @@ mod platform {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
 
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_REMOVE_REPLACED,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
         MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
@@ -310,12 +313,10 @@ mod platform {
                 return Ok(());
             }
             let error = io::Error::last_os_error();
-            if !matches!(
-                error.raw_os_error(),
-                Some(code)
-                    if code == ERROR_SHARING_VIOLATION as i32
-                        || code == ERROR_LOCK_VIOLATION as i32
-            ) || Instant::now() >= deadline
+            if !error
+                .raw_os_error()
+                .is_some_and(|code| retryable_replace_error(code, destination_existed))
+                || Instant::now() >= deadline
             {
                 return Err(PlatformError::io("atomically replace destination", error));
             }
@@ -329,5 +330,33 @@ mod platform {
 
     fn wide_path(path: &Path) -> Vec<u16> {
         path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    fn retryable_replace_error(code: i32, destination_existed: bool) -> bool {
+        code == ERROR_SHARING_VIOLATION as i32
+            || code == ERROR_LOCK_VIOLATION as i32
+            || code == ERROR_UNABLE_TO_REMOVE_REPLACED as i32
+            || code == ERROR_UNABLE_TO_MOVE_REPLACEMENT as i32
+            || (destination_existed && code == ERROR_FILE_NOT_FOUND as i32)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn retryable_replace_errors_cover_safe_windows_collision_states() {
+            for code in [
+                ERROR_SHARING_VIOLATION,
+                ERROR_LOCK_VIOLATION,
+                ERROR_UNABLE_TO_REMOVE_REPLACED,
+                ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+            ] {
+                assert!(retryable_replace_error(code as i32, false));
+            }
+            assert!(retryable_replace_error(ERROR_FILE_NOT_FOUND as i32, true));
+            assert!(!retryable_replace_error(ERROR_FILE_NOT_FOUND as i32, false));
+            assert!(!retryable_replace_error(1177, true));
+        }
     }
 }

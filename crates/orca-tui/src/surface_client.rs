@@ -2865,10 +2865,18 @@ mod tests {
     use super::*;
 
     const TEST_SURFACE_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
+    const TEST_SURFACE_TERMINAL_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn assert_surface_active(controller: &TuiSurfaceTaskControl, context: &str) {
         assert!(
             controller.wait_for_surface_active(TEST_SURFACE_ACTIVATION_TIMEOUT),
+            "{context}"
+        );
+    }
+
+    fn assert_surface_inactive(controller: &TuiSurfaceTaskControl, context: &str) {
+        assert!(
+            controller.wait_for_surface_inactive(TEST_SURFACE_TERMINAL_TIMEOUT),
             "{context}"
         );
     }
@@ -3403,11 +3411,15 @@ mod tests {
         );
 
         let _ = controller.interrupt_current();
+        assert_surface_inactive(
+            &controller,
+            "typed cancellation must reach a terminal controller state",
+        );
+        worker.join().expect("typed TUI worker");
         let outcome = result_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv()
             .expect("typed cancellation terminal")
             .expect("typed cancellation outcome");
-        worker.join().expect("typed TUI worker");
 
         assert!(matches!(
             outcome,
@@ -4749,11 +4761,15 @@ mod tests {
         );
         let _ = controller.interrupt_current();
 
+        assert_surface_inactive(
+            &controller,
+            "typed cancellation restart must reach a terminal controller state",
+        );
+        worker.join().expect("cancelled worker");
         let cancelled = result_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv()
             .expect("cancelled terminal")
             .expect("cancelled typed turn");
-        worker.join().expect("cancelled worker");
         assert!(matches!(
             cancelled,
             TuiHostedOperationOutcome::Turn { status } if status == "cancelled"
