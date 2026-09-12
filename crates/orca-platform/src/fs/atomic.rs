@@ -240,7 +240,7 @@ mod platform {
 
     use windows_sys::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
-        ERROR_UNABLE_TO_REMOVE_REPLACED,
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_REMOVE_REPLACED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
@@ -319,6 +319,7 @@ mod platform {
                     if code == ERROR_SHARING_VIOLATION as i32
                         || code == ERROR_LOCK_VIOLATION as i32
                         || code == ERROR_UNABLE_TO_REMOVE_REPLACED as i32
+                        || code == ERROR_UNABLE_TO_MOVE_REPLACEMENT as i32
                         || (destination_existed && code == ERROR_FILE_NOT_FOUND as i32)
             ) || Instant::now() >= deadline
             {
