@@ -1,32 +1,44 @@
-name: Runtime Surface Contract
+name: Linux
 
 on:
   workflow_dispatch:
   pull_request:
     branches: [main]
     paths:
-      - "crates/orca-runtime/**"
-      - "crates/orca-tui/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "crates/**"
+      - "tests/**"
+      - "terminal_bench/**"
+      - "npm/orca/**"
+      - "install.sh"
+      - "install.ps1"
+      - "scripts/**"
       - "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md"
       - "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract*"
-      - "scripts/validate-runtime-surface-contract.mjs"
-      - "scripts/test-validate-runtime-surface-contract.mjs"
-      - "scripts/validate-execution-broker-boundary.mjs"
-      - "scripts/test-validate-execution-broker-boundary.mjs"
+      - ".config/nextest.toml"
+      - ".gitattributes"
       - ".github/workflows/runtime-contract.yml"
       - ".github/workflows/release.yml"
       - ".github/workflows/windows-ci.yml"
   push:
     branches: [main]
     paths:
-      - "crates/orca-runtime/**"
-      - "crates/orca-tui/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "crates/**"
+      - "tests/**"
+      - "terminal_bench/**"
+      - "npm/orca/**"
+      - "install.sh"
+      - "install.ps1"
+      - "scripts/**"
       - "docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md"
       - "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract*"
-      - "scripts/validate-runtime-surface-contract.mjs"
-      - "scripts/test-validate-runtime-surface-contract.mjs"
-      - "scripts/validate-execution-broker-boundary.mjs"
-      - "scripts/test-validate-execution-broker-boundary.mjs"
+      - ".config/nextest.toml"
+      - ".gitattributes"
       - ".github/workflows/runtime-contract.yml"
       - ".github/workflows/release.yml"
       - ".github/workflows/windows-ci.yml"
@@ -35,8 +47,9 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    runs-on: ubuntu-latest
+  linux-full:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
         with:
@@ -46,7 +59,12 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+      - name: Install test runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep bubblewrap
       - name: Validate reviewed artifacts and current inventories
         run: |
           node scripts/test-validate-runtime-surface-contract.mjs
@@ -57,3 +75,27 @@ jobs:
         run: |
           cargo metadata --locked --format-version 1 > /dev/null
           cargo test -p orca-tui runtime_surface_contract --lib --locked
+      - name: Validate repository adapters and hygiene
+        run: |
+          python3 -m unittest discover -s terminal_bench -p 'test_*.py' -v
+          node scripts/test-repository-hygiene.mjs
+      - name: Run TUI library gate
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run -p orca-tui --lib --locked --profile ci-serial
+      - name: Run TUI PTY contract gate
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run --test tui_pty_contract --locked --profile ci-serial
+      - name: Run workspace gate
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo clippy --workspace --all-targets --locked -j 1
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+          cargo test -p orca-runtime --lib generation_stop_terminal_mapping_preserves_not_started_reasons --locked -- --test-threads=1
+          cargo test -p orca-runtime --lib surface_goal_terminal_checkpoint_failure_recovers_exact_verified_batch --locked -- --test-threads=1
+          cargo test -p orca-runtime --test runtime_host --locked -- --test-threads=1
+          cargo test -p orca-runtime --test subagent_observability_contract --locked -- --test-threads=1
+          cargo test -p orca-runtime --test runtime_surface_interaction --locked -- --test-threads=1
+          cargo test --test subagent_contract --locked -- --test-threads=1

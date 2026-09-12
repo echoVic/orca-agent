@@ -62,11 +62,12 @@ failures; do not hide them with a global allow, and do not turn a patch release
 into an unrelated public-API cleanup merely to satisfy a newer toolchain lint.
 
 For a tag-triggered release, `release.yml` verifies that the tagged commit is
-the current `origin/main` commit and that the `Runtime Surface Contract`
-`validate` check plus the Windows `native-x64` and `native-arm64` checks already
-succeeded for that exact SHA. It then reuses that evidence instead of rerunning
-the same full suites. A manual `workflow_dispatch` remains the full release
-dry-run path and executes every gate above.
+the current `origin/main` commit and that the Linux `linux-full` check plus the
+Windows `native-x64` and `native-arm64` checks already succeeded for that exact
+SHA. These PR/main checks retain the complete runtime, subprocess, SQLite,
+filesystem, and platform coverage. The tag workflow reuses that evidence
+instead of rerunning the same full suites. A manual `workflow_dispatch` remains
+the full release dry-run path and executes every gate above.
 
 ### 5. Update the website
 
@@ -98,7 +99,7 @@ git push -u origin <release-branch>
 # open the pull request, wait for required Linux and Windows checks, then merge
 git switch main
 git pull --ff-only origin main
-git tag vX.Y.Z
+git tag -a vX.Y.Z -F docs/releases/vX.Y.Z.md
 git push origin vX.Y.Z
 ```
 

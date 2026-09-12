@@ -35,11 +35,18 @@ jobs:
         run: |
           git fetch origin main --depth=1
           test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
-          checks="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs")"
-          for name in validate native-x64 native-arm64; do
+          checks="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100")"
+          for name in linux-full native-x64 native-arm64; do
             jq -e --arg name "$name" \
               'any(.check_runs[]; .name == $name and .conclusion == "success" and .app.slug == "github-actions")' \
               <<<"$checks" >/dev/null
+          done
+          runs="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=push -f status=completed -f per_page=100)"
+          for workflow in Linux Windows; do
+            jq -e --arg workflow "$workflow" --arg sha "$GITHUB_SHA" \
+              'any(.workflow_runs[]; .name == $workflow and .head_sha == $sha and .event == "push" and .conclusion == "success")' \
+              <<<"$runs" >/dev/null
           done
       - uses: dtolnay/rust-toolchain@stable
         if: github.event_name == 'workflow_dispatch'
