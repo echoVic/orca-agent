@@ -16,6 +16,7 @@
 | C | The worker reaches TaskRegistry terminal state but workflow-host cleanup or actor reaping does not publish the surface terminal. | High | Medium | Confirmed: workflow completion reads the registry through temporarily unavailable actor state. |
 | D | Operations terminalize and only host shutdown hangs. | Medium | Low | Rejected: the workflow surface terminal was never observed. |
 | E | The surface terminal commits but its waiter is not replayed. | Medium | Low | Rejected: failing attempts report `actor-workflow-completion-error` before any terminal commit. |
+| F | A recovered foreign batch advances the cursor after workflow completion prepares its batch. | High | Medium | Confirmed: post-fix runs fail with `CursorRangeAlreadyConsumed`; provider completion already rebuilds after this condition, workflow completion did not. |
 
 ## Log Evidence
 - PR run `34651520641` x64 attempt 1 timed out at 120 seconds and attempt 2 passed in 0.797 seconds.
@@ -36,6 +37,10 @@
   background completion branch can run before foreground finalization restores
   that state, so `commit_typed_workflow_completion` cannot reliably obtain the
   registry through `self.state`.
+- Post-fix runs `34673404902`, `34673405004`, and `34673405551` eliminated the
+  registry error but exposed `failed to commit typed workflow completion:
+  CursorRangeAlreadyConsumed` while the injected cancellation checkpoint batch
+  was being recovered.
 
 ## Diagnostic Stage Codes
 | Stage | Next blocking boundary |
@@ -67,6 +72,9 @@ state. The workflow's own durable registry record remains present and terminal.
 ## Post-Fix Verification
 - `TypedWorkflowBackground` now owns the `TaskRegistry` handle captured at
   launch, matching the existing typed-provider ownership pattern.
+- Workflow completion now waits for a foreign incomplete batch and rebuilds its
+  cursor-bound completion or terminal batch after that batch advances the
+  surface cursor, matching typed-provider completion semantics.
 - The regression test keeps the foreground executor blocked until the workflow
   surface terminal is committed, making the former race deterministic.
 - Local post-fix result: 30 consecutive exact-test runs passed with zero

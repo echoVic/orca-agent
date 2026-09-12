@@ -14138,6 +14138,7 @@ enum TypedWorkflowCompletionStage {
 #[derive(Clone)]
 struct PendingTypedWorkflowCompletion {
     typed: TypedWorkflowBackground,
+    shutdown_reason: Option<surface::SurfaceShutdownReason>,
     operation_id: surface::SurfaceOperationId,
     finalize_intent_id: surface::SurfaceFinalizeIntentId,
     terminal_commit_id: surface::SurfaceCommitId,
@@ -14147,6 +14148,7 @@ struct PendingTypedWorkflowCompletion {
     terminal_batch: Option<surface::SurfaceCommitBatch>,
     terminal_value: Option<surface::OperationTerminalAtCursor>,
     stage: TypedWorkflowCompletionStage,
+    rebuild_after_foreign_incomplete: bool,
     retry_at: tokio::time::Instant,
 }
 

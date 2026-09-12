@@ -1159,6 +1159,25 @@ impl ThreadActor {
         typed: TypedWorkflowBackground,
         shutdown_reason: Option<surface::SurfaceShutdownReason>,
     ) -> Result<(), RuntimeHostError> {
+        let operation_id = typed.fence.operation_fence.operation_id.clone();
+        let mut pending = self.prepare_typed_workflow_completion(typed, shutdown_reason)?;
+        match self.settle_typed_workflow_completion(&mut pending) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                pending.retry_at =
+                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+                self.background_controller
+                    .retain_workflow_completion(operation_id, pending);
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn prepare_typed_workflow_completion(
+        &mut self,
+        typed: TypedWorkflowBackground,
+        shutdown_reason: Option<surface::SurfaceShutdownReason>,
+    ) -> Result<PendingTypedWorkflowCompletion, RuntimeHostError> {
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let task = snapshot
             .tasks
@@ -1447,8 +1466,9 @@ impl ThreadActor {
             ),
         ]);
         let completion_batch = self.surface_event_batch_with_commit_id(completion_events, None);
-        let mut pending = PendingTypedWorkflowCompletion {
+        Ok(PendingTypedWorkflowCompletion {
             typed,
+            shutdown_reason,
             operation_id: operation_id.clone(),
             finalize_intent_id,
             terminal_commit_id,
@@ -1458,18 +1478,9 @@ impl ThreadActor {
             terminal_batch: None,
             terminal_value: None,
             stage: TypedWorkflowCompletionStage::Completion,
+            rebuild_after_foreign_incomplete: false,
             retry_at: tokio::time::Instant::now(),
-        };
-        match self.settle_typed_workflow_completion(&mut pending) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                pending.retry_at =
-                    tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                self.background_controller
-                    .retain_workflow_completion(operation_id, pending);
-                Err(error)
-            }
-        }
+        })
     }
 
     pub(super) fn settle_typed_workflow_completion(
@@ -1477,6 +1488,35 @@ impl ThreadActor {
         pending: &mut PendingTypedWorkflowCompletion,
     ) -> Result<(), RuntimeHostError> {
         if pending.stage == TypedWorkflowCompletionStage::Completion {
+            if self.resident_surface.coordinator.has_incomplete_batch()
+                && !self
+                    .resident_surface
+                    .coordinator
+                    .incomplete_batch_is(&pending.completion_batch)
+            {
+                pending.rebuild_after_foreign_incomplete = true;
+                return Err(RuntimeHostError::ThreadStartFailed {
+                    message:
+                        "typed workflow completion is waiting for another prepared surface batch"
+                            .to_string(),
+                });
+            }
+            let current_cursor = self
+                .resident_surface
+                .coordinator
+                .state()
+                .snapshot()
+                .cursor
+                .clone();
+            if !self.resident_surface.coordinator.has_incomplete_batch()
+                && (pending.rebuild_after_foreign_incomplete
+                    || pending.completion_batch.cursor_before != current_cursor)
+            {
+                *pending = self.prepare_typed_workflow_completion(
+                    pending.typed.clone(),
+                    pending.shutdown_reason.clone(),
+                )?;
+            }
             self.resident_surface
                 .coordinator
                 .commit_workflow_background_stop_batch(
@@ -1490,7 +1530,30 @@ impl ThreadActor {
                 })?;
             pending.stage = TypedWorkflowCompletionStage::Terminal;
         }
-        if pending.terminal_batch.is_none() {
+        if self.resident_surface.coordinator.has_incomplete_batch()
+            && !pending
+                .terminal_batch
+                .as_ref()
+                .is_some_and(|batch| self.resident_surface.coordinator.incomplete_batch_is(batch))
+        {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "typed workflow terminal is waiting for another prepared surface batch"
+                    .to_string(),
+            });
+        }
+        let current_cursor = self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .cursor
+            .clone();
+        let terminal_batch_is_stale = pending
+            .terminal_batch
+            .as_ref()
+            .is_some_and(|batch| batch.cursor_before != current_cursor)
+            && !self.resident_surface.coordinator.has_incomplete_batch();
+        if pending.terminal_batch.is_none() || terminal_batch_is_stale {
             let terminal_batch = self.surface_event_batch_with_commit_id(
                 vec![(
                     surface::SurfaceScope::Background {
