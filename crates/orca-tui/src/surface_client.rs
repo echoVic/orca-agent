@@ -2864,6 +2864,15 @@ fn detach(surface: &RuntimeSurfaceHandle, client: &RuntimeSurfaceClientHandle) {
 mod tests {
     use super::*;
 
+    const TEST_SURFACE_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn assert_surface_active(controller: &TuiSurfaceTaskControl, context: &str) {
+        assert!(
+            controller.wait_for_surface_active(TEST_SURFACE_ACTIVATION_TIMEOUT),
+            "{context}"
+        );
+    }
+
     #[test]
     fn task_transcript_surface_errors_remain_typed_and_path_free() {
         let result =
@@ -3388,11 +3397,10 @@ mod tests {
             );
             let _ = result_tx.send(result);
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !controller.has_surface_active() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(controller.has_surface_active());
+        assert_surface_active(
+            &controller,
+            "typed cancellation must install the TUI controller",
+        );
 
         let _ = controller.interrupt_current();
         let outcome = result_rx
@@ -3445,11 +3453,10 @@ mod tests {
             );
             let _ = result_tx.send(result);
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !controller.has_surface_active() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(controller.has_surface_active());
+        assert_surface_active(
+            &controller,
+            "typed background turn must install the TUI controller",
+        );
         let first_delta_deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if event_rx.try_iter().any(|event| {
@@ -3852,13 +3859,9 @@ mod tests {
             );
             let _ = foreground_tx.send(result);
         });
-        let active_deadline = Instant::now() + Duration::from_secs(2);
-        while !controller.has_surface_active() && Instant::now() < active_deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            controller.has_surface_active(),
-            "foreground attach must install the TUI controller"
+        assert_surface_active(
+            &controller,
+            "foreground attach must install the TUI controller",
         );
         assert!(controller.request_background_current());
         let projection = match foreground_rx.recv_timeout(Duration::from_secs(2)) {
@@ -3928,11 +3931,10 @@ mod tests {
             );
             let _ = result_tx.send(result);
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !controller.has_surface_active() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(controller.has_surface_active());
+        assert_surface_active(
+            &controller,
+            "typed approval background must install the TUI controller",
+        );
         assert!(controller.request_background_current());
         let outcome = result_rx
             .recv_timeout(Duration::from_secs(2))
@@ -4648,11 +4650,10 @@ mod tests {
             );
             let _ = result_tx.send(result);
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !controller.has_surface_active() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(controller.has_surface_active());
+        assert_surface_active(
+            &controller,
+            "typed background owner must install the TUI controller",
+        );
         assert!(controller.request_background_current());
         let outcome = result_rx
             .recv_timeout(Duration::from_secs(2))
@@ -4742,11 +4743,10 @@ mod tests {
             );
             let _ = result_tx.send(result);
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !controller.has_surface_active() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(controller.has_surface_active());
+        assert_surface_active(
+            &controller,
+            "typed cancellation restart must install the TUI controller",
+        );
         let _ = controller.interrupt_current();
 
         let cancelled = result_rx
