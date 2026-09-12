@@ -595,6 +595,22 @@ assert.ok(existsSync(linuxWorkflowPath), "Linux CI workflow must exist");
 const linuxWorkflow = normalizeLineEndings(
   readFileSync(linuxWorkflowPath, "utf8"),
 );
+for (const [source, label] of [
+  [workflow, "Windows CI"],
+  [linuxWorkflow, "Linux CI"],
+  [releaseWorkflow, "Release dry-run"],
+]) {
+  const nextestCommands = source
+    .split("\n")
+    .filter((line) => line.includes("cargo nextest run"));
+  assert.ok(nextestCommands.length > 0, `${label} must run nextest`);
+  for (const command of nextestCommands) {
+    assert.ok(
+      command.includes("--retries 0"),
+      `${label} nextest commands must disable framework retries: ${command.trim()}`,
+    );
+  }
+}
 const installerSource = readFileSync(path.join(repoRoot, "install.ps1"), "utf8");
 const pullRequest = workflow.match(/  pull_request:\n([\s\S]*?)\n  push:/);
 assert.ok(pullRequest, "Windows CI must validate pull requests before merge");
@@ -991,6 +1007,17 @@ for (const gate of [releaseWindowsX64Gate[0], releaseWindowsArm64Gate[0]]) {
       gate.includes("$PSNativeCommandUseErrorActionPreference = $true"),
     "release Windows behavior gates must fail on every native command error",
   );
+  for (const marker of [
+    "cargo build -p orca-windows-runner --locked",
+    "cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0",
+    "cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass --retries 0",
+    "cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0",
+  ]) {
+    assert.ok(
+      gate.includes(marker),
+      `release Windows behavior gates must retain the zero-retry full suite: ${marker}`,
+    );
+  }
 }
 for (const marker of [
   "prompt_names_powershell_7_as_the_active_shell_dialect",

@@ -45,8 +45,8 @@ node --test scripts/test-validate-runtime-surface-contract.mjs
 node scripts/validate-runtime-surface-contract.mjs
 node --test scripts/test-validate-windows-platform-boundaries.mjs
 node scripts/validate-windows-platform-boundaries.mjs
-cargo nextest run -p orca-tui --lib --locked --profile ci-serial
-cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
+cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0
+cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0
 node scripts/release/test-verify-version-sync.mjs
 node scripts/release/test-stage-npm.mjs
 node scripts/release/test-verify-published.mjs
@@ -65,9 +65,10 @@ For a tag-triggered release, `release.yml` verifies that the tagged commit is
 the current `origin/main` commit and that the Linux `linux-full` check plus the
 Windows `native-x64` and `native-arm64` checks already succeeded for that exact
 SHA. These PR/main checks retain the complete runtime, subprocess, SQLite,
-filesystem, and platform coverage. The tag workflow reuses that evidence
-instead of rerunning the same full suites. A manual `workflow_dispatch` remains
-the full release dry-run path and executes every gate above.
+filesystem, and platform coverage with framework retries disabled. The tag
+workflow reuses that evidence instead of rerunning the same full suites. A
+manual `workflow_dispatch` remains the full release dry-run path and executes
+every gate above with framework retries disabled.
 
 ### 5. Update the website
 
