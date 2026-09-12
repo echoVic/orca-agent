@@ -3930,13 +3930,20 @@ mod tests {
         let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, _event_rx) = mpsc::unbounded();
         let (result_tx, result_rx) = mpsc::bounded(1);
+        let release_marker = home.path().join("release-background-tool-call");
+        let prompt = format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({
+                "marker": release_marker.display().to_string(),
+                "toolPrompt": "task_list",
+            })
+        );
         let run_thread = thread.clone();
         let run_controller = controller.clone();
         let worker = std::thread::spawn(move || {
             let result = run_through_dispatch(
                 &run_thread,
-                HostedTurnRequest::new("mock_stream_tool_delay_ms 250 task_list")
-                    .with_task_description("typed approval background"),
+                HostedTurnRequest::new(prompt).with_task_description("typed approval background"),
                 config,
                 &run_controller,
                 &event_tx,
@@ -3957,6 +3964,7 @@ mod tests {
             outcome,
             TuiHostedOperationOutcome::Turn { status } if status == "backgrounded"
         ));
+        std::fs::write(&release_marker, "release").expect("release backgrounded tool stream");
 
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {

@@ -329,6 +329,27 @@ pub async fn call_streaming_async(
                     usage: None,
                 };
             }
+            if let Some((release_marker, tool_prompt)) =
+                mock_stream_tool_release_marker(conversation)
+            {
+                let started =
+                    ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
+                on_step(&started);
+                while !release_marker.exists() {
+                    if !sleep_with_cancel(Duration::from_millis(10), cancel).await {
+                        return ProviderResponse {
+                            steps: vec![started],
+                            assistant_content: Some("Mock slow tool stream started.".to_string()),
+                            assistant_reasoning: None,
+                            tool_calls: Vec::new(),
+                            usage: None,
+                        };
+                    }
+                }
+                if let Some(response) = mock_stream_tool_response(started, &tool_prompt) {
+                    return response;
+                }
+            }
             if let Some((delay_ms, tool_prompt)) = mock_stream_tool_delay_ms(conversation) {
                 let started =
                     ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
@@ -342,19 +363,8 @@ pub async fn call_streaming_async(
                         usage: None,
                     };
                 }
-                if let Some(tool_request) = parse_mock_prompt(&tool_prompt) {
-                    let raw_call = RawToolCall {
-                        id: tool_request.id.clone(),
-                        function_name: tool_request.name.as_str().to_string(),
-                        arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
-                    };
-                    return ProviderResponse {
-                        steps: vec![started, ProviderStep::ToolCall(tool_request)],
-                        assistant_content: None,
-                        assistant_reasoning: None,
-                        tool_calls: vec![raw_call],
-                        usage: None,
-                    };
+                if let Some(response) = mock_stream_tool_response(started, &tool_prompt) {
+                    return response;
                 }
             }
             if let Some(delay_ms) = mock_stream_delay_ms(conversation) {
@@ -579,6 +589,37 @@ fn mock_stream_tool_delay_ms(conversation: &Conversation) -> Option<(u64, String
     let (delay, tool_prompt) = rest.split_once(' ')?;
     let delay = delay.trim().parse::<u64>().ok()?.min(10_000);
     Some((delay, tool_prompt.trim().to_string()))
+}
+
+fn mock_stream_tool_release_marker(
+    conversation: &Conversation,
+) -> Option<(std::path::PathBuf, String)> {
+    let payload = conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_tool_release_marker ")?;
+    let payload: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let marker = payload.get("marker")?.as_str()?.trim();
+    let tool_prompt = payload.get("toolPrompt")?.as_str()?.trim();
+    (!marker.is_empty() && !tool_prompt.is_empty())
+        .then(|| (std::path::PathBuf::from(marker), tool_prompt.to_string()))
+}
+
+fn mock_stream_tool_response(started: ProviderStep, tool_prompt: &str) -> Option<ProviderResponse> {
+    let tool_request = parse_mock_prompt(tool_prompt)?;
+    let raw_call = RawToolCall {
+        id: tool_request.id.clone(),
+        function_name: tool_request.name.as_str().to_string(),
+        arguments: tool_request.raw_arguments.clone().unwrap_or_default(),
+    };
+    Some(ProviderResponse {
+        steps: vec![started, ProviderStep::ToolCall(tool_request)],
+        assistant_content: None,
+        assistant_reasoning: None,
+        tool_calls: vec![raw_call],
+        usage: None,
+    })
 }
 
 fn mock_stream_delay_ms(conversation: &Conversation) -> Option<u64> {
@@ -2155,6 +2196,58 @@ mod tests {
             ProviderStreamEvent::Step(ref delivery)
                 if matches!(delivery.step(), ProviderStep::MessageDelta(text)
                     if text == "Mock release-marker stream completed.")
+        ));
+    }
+
+    #[test]
+    fn mock_stream_tool_release_marker_waits_before_returning_tool_call() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let release_marker = temp.path().join("release marker");
+        let mut conversation = Conversation::new();
+        conversation.add_user(format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({
+                "marker": release_marker,
+                "toolPrompt": "task_list",
+            })
+        ));
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut stream = start_streaming(ProviderKind::Mock, &conversation, &config, cancel);
+
+        let started = stream
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release-marker tool stream start");
+        assert!(matches!(
+            started,
+            ProviderStreamEvent::Step(ref delivery)
+                if matches!(delivery.step(), ProviderStep::MessageDelta(text)
+                    if text == "Mock slow tool stream started.")
+        ));
+        drop(started);
+
+        assert!(matches!(
+            stream.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        std::fs::write(&release_marker, "release").expect("create release marker");
+
+        let completed = stream
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release-marker tool completion");
+        assert!(matches!(
+            completed,
+            ProviderStreamEvent::Completed(ref response)
+                if response.tool_calls.len() == 1
+                    && response.tool_calls[0].function_name == "task_list"
         ));
     }
 
