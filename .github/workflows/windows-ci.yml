@@ -62,7 +62,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e # nextest
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: windows-x64-${{ hashFiles('Cargo.lock') }}
@@ -132,7 +132,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-pc-windows-msvc
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e # nextest
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: windows-arm64-${{ hashFiles('Cargo.lock') }}

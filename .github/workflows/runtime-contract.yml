@@ -59,7 +59,7 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e # nextest
       - uses: Swatinem/rust-cache@v2
       - name: Install test runtime dependencies
         run: |

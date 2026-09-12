@@ -595,11 +595,18 @@ assert.ok(existsSync(linuxWorkflowPath), "Linux CI workflow must exist");
 const linuxWorkflow = normalizeLineEndings(
   readFileSync(linuxWorkflowPath, "utf8"),
 );
+const pinnedNextestAction =
+  "taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e";
 for (const [source, label] of [
   [workflow, "Windows CI"],
   [linuxWorkflow, "Linux CI"],
   [releaseWorkflow, "Release dry-run"],
 ]) {
+  assert.ok(
+    source.includes(pinnedNextestAction) &&
+      !source.includes("taiki-e/install-action@nextest"),
+    `${label} must pin the nextest installer to the reviewed commit`,
+  );
   const nextestCommands = source
     .split("\n")
     .filter((line) => line.includes("cargo nextest run"));
@@ -672,7 +679,7 @@ for (const marker of [
   "  linux-full:",
   "runs-on: ubuntu-22.04",
   "timeout-minutes: 90",
-  "taiki-e/install-action@nextest",
+  pinnedNextestAction,
   "sudo apt-get install -y ripgrep bubblewrap",
   "python3 -m unittest discover -s terminal_bench -p 'test_*.py' -v",
   "node scripts/test-repository-hygiene.mjs",
@@ -702,7 +709,7 @@ for (const marker of [
   "node scripts/test-validate-windows-platform-boundaries.mjs",
   "cargo check --workspace --all-targets --locked",
   "cargo clippy --workspace --all-targets --locked",
-  "taiki-e/install-action@nextest",
+  pinnedNextestAction,
   "cargo nextest run -p orca-tui --lib --locked --profile ci-serial",
   "cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass",
   "cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast",
