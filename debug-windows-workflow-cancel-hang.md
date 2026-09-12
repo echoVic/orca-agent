@@ -79,3 +79,11 @@ state. The workflow's own durable registry record remains present and terminal.
   surface terminal is committed, making the former race deterministic.
 - Local post-fix result: 30 consecutive exact-test runs passed with zero
   retries.
+- Native Windows x64 post-fix runs `34673808505`, `34673808669`, and
+  `34673809086` each passed 20 consecutive exact-test attempts, for 60/60
+  total. No attempt reported `CursorRangeAlreadyConsumed` or a watchdog
+  timeout.
+- Two Windows runs each exercised the expected internal defer path once while
+  the injected cancellation batch was still prepared; both rebuilt the
+  workflow completion after that batch settled and passed without a test
+  framework retry.
