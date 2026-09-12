@@ -14136,7 +14136,17 @@ enum TypedWorkflowCompletionStage {
 }
 
 #[derive(Clone)]
-struct PendingTypedWorkflowCompletion {
+enum PendingTypedWorkflowCompletion {
+    Preparation {
+        typed: TypedWorkflowBackground,
+        shutdown_reason: Option<surface::SurfaceShutdownReason>,
+        retry_at: tokio::time::Instant,
+    },
+    Completion(PreparedTypedWorkflowCompletion),
+}
+
+#[derive(Clone)]
+struct PreparedTypedWorkflowCompletion {
     typed: TypedWorkflowBackground,
     shutdown_reason: Option<surface::SurfaceShutdownReason>,
     operation_id: surface::SurfaceOperationId,
@@ -14154,11 +14164,20 @@ struct PendingTypedWorkflowCompletion {
 
 impl ScheduledBackgroundRetry for PendingTypedWorkflowCompletion {
     fn retry_at(&self) -> tokio::time::Instant {
-        self.retry_at
+        match self {
+            Self::Preparation { retry_at, .. } => *retry_at,
+            Self::Completion(pending) => pending.retry_at,
+        }
     }
 
     fn defer_until(&mut self, retry_at: tokio::time::Instant) {
-        self.retry_at = retry_at;
+        match self {
+            Self::Preparation {
+                retry_at: pending_retry_at,
+                ..
+            } => *pending_retry_at = retry_at,
+            Self::Completion(pending) => pending.retry_at = retry_at,
+        }
     }
 }
 

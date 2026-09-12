@@ -1127,14 +1127,31 @@ impl ThreadActor {
         shutdown_reason: Option<surface::SurfaceShutdownReason>,
     ) -> Result<(), RuntimeHostError> {
         let operation_id = typed.fence.operation_fence.operation_id.clone();
-        let mut pending = self.prepare_typed_workflow_completion(typed, shutdown_reason)?;
+        let mut pending =
+            match self.prepare_typed_workflow_completion(typed.clone(), shutdown_reason.clone()) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    self.background_controller.retain_workflow_completion(
+                        operation_id,
+                        PendingTypedWorkflowCompletion::Preparation {
+                            typed,
+                            shutdown_reason,
+                            retry_at: tokio::time::Instant::now()
+                                + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
+                        },
+                    );
+                    return Err(error);
+                }
+            };
         match self.settle_typed_workflow_completion(&mut pending) {
             Ok(()) => Ok(()),
             Err(error) => {
                 pending.retry_at =
                     tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
-                self.background_controller
-                    .retain_workflow_completion(operation_id, pending);
+                self.background_controller.retain_workflow_completion(
+                    operation_id,
+                    PendingTypedWorkflowCompletion::Completion(pending),
+                );
                 Err(error)
             }
         }
@@ -1144,7 +1161,7 @@ impl ThreadActor {
         &mut self,
         typed: TypedWorkflowBackground,
         shutdown_reason: Option<surface::SurfaceShutdownReason>,
-    ) -> Result<PendingTypedWorkflowCompletion, RuntimeHostError> {
+    ) -> Result<PreparedTypedWorkflowCompletion, RuntimeHostError> {
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let task = snapshot
             .tasks
@@ -1433,7 +1450,7 @@ impl ThreadActor {
             ),
         ]);
         let completion_batch = self.surface_event_batch_with_commit_id(completion_events, None);
-        Ok(PendingTypedWorkflowCompletion {
+        Ok(PreparedTypedWorkflowCompletion {
             typed,
             shutdown_reason,
             operation_id: operation_id.clone(),
@@ -1452,7 +1469,7 @@ impl ThreadActor {
 
     pub(super) fn settle_typed_workflow_completion(
         &mut self,
-        pending: &mut PendingTypedWorkflowCompletion,
+        pending: &mut PreparedTypedWorkflowCompletion,
     ) -> Result<(), RuntimeHostError> {
         if pending.stage == TypedWorkflowCompletionStage::Completion {
             if self.resident_surface.coordinator.has_incomplete_batch()
@@ -1587,17 +1604,57 @@ impl ThreadActor {
         let key = BackgroundRetryKey::WorkflowCompletion(operation_id.clone());
         let Some(BackgroundRetryEffect::WorkflowCompletion {
             operation_id,
-            mut pending,
+            pending,
         }) = self.background_controller.begin_retry(&key)
         else {
             return;
         };
-        let resolution = if self.settle_typed_workflow_completion(&mut pending).is_err() {
-            BackgroundRetryResolution::RetryAt(
-                tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL,
-            )
-        } else {
-            BackgroundRetryResolution::Settled
+        let retry_at = tokio::time::Instant::now() + SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL;
+        let (pending, resolution) = match pending {
+            PendingTypedWorkflowCompletion::Preparation {
+                typed,
+                shutdown_reason,
+                retry_at: previous_retry_at,
+            } => match self
+                .prepare_typed_workflow_completion(typed.clone(), shutdown_reason.clone())
+            {
+                Ok(mut completion) => {
+                    let resolution = if self
+                        .settle_typed_workflow_completion(&mut completion)
+                        .is_err()
+                    {
+                        BackgroundRetryResolution::RetryAt(retry_at)
+                    } else {
+                        BackgroundRetryResolution::Settled
+                    };
+                    (
+                        PendingTypedWorkflowCompletion::Completion(completion),
+                        resolution,
+                    )
+                }
+                Err(_) => (
+                    PendingTypedWorkflowCompletion::Preparation {
+                        typed,
+                        shutdown_reason,
+                        retry_at: previous_retry_at,
+                    },
+                    BackgroundRetryResolution::RetryAt(retry_at),
+                ),
+            },
+            PendingTypedWorkflowCompletion::Completion(mut completion) => {
+                let resolution = if self
+                    .settle_typed_workflow_completion(&mut completion)
+                    .is_err()
+                {
+                    BackgroundRetryResolution::RetryAt(retry_at)
+                } else {
+                    BackgroundRetryResolution::Settled
+                };
+                (
+                    PendingTypedWorkflowCompletion::Completion(completion),
+                    resolution,
+                )
+            }
         };
         self.background_controller.resolve_retry(
             BackgroundRetryEffect::WorkflowCompletion {
