@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.30":
+        "Makes release promotion reuse successful checks from the exact main commit while preserving full pull-request and main coverage. It also removes Windows timing races from TUI activation and background terminal proof generation.",
       "v0.4.29":
         "Adds structured inline questionnaires, persistent model and reasoning preferences, and confirmed Full Access transitions that update the active task at the next tool boundary while preserving already-running work. It also isolates the multi-process workflow cancellation contract for deterministic release validation.",
       "v0.4.27":
@@ -668,6 +670,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.30":
+        "发布流程复用同一 main 提交已通过的完整检查，同时保留 PR 与 main 的全量跨平台覆盖；并修复 TUI 激活等待及后台终态证明生成中的 Windows 时序竞争。",
       "v0.4.29":
         "新增结构化内联问卷与模型、推理强度持久化；Full Access 经二次确认后从当前任务的下一次工具准入生效，同时保持已运行工具和既有子代理的权限快照不变；发布门禁同时隔离多进程 workflow cancellation 契约，避免并发调度造成非确定性超时。",
       "v0.4.27":
