@@ -819,6 +819,20 @@ for (const marker of [
     `task persistence and recovered workers must contain ${marker}`,
   );
 }
+const workflowStateSource = readNormalizedSource(
+  "crates/orca-runtime/src/workflow/state.rs",
+);
+for (const marker of [
+  "ExclusiveFileLock",
+  'join("run-state.lock")',
+  "with_run_mutation_lock",
+  "write_state_unlocked",
+]) {
+  assert.ok(
+    workflowStateSource.includes(marker),
+    `workflow state and control mutations must share the cross-process run lock: ${marker}`,
+  );
+}
 const providerSource = readNormalizedSource(
   "crates/orca-provider/src/lib.rs",
 );

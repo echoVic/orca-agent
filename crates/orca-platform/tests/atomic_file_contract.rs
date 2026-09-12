@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+#[cfg(windows)]
+use orca_platform::fs::ExclusiveFileLock;
 #[cfg(unix)]
 use orca_platform::fs::open_nofollow_nonblocking;
 use orca_platform::fs::{AtomicWritePolicy, atomic_write, atomic_write_with, open_nofollow};
@@ -249,6 +251,8 @@ fn cross_process_atomic_writer_child() {
     };
     let start =
         std::env::var_os("ORCA_ATOMIC_WRITE_CHILD_START").expect("cross-process writer start path");
+    let lock =
+        std::env::var_os("ORCA_ATOMIC_WRITE_CHILD_LOCK").expect("cross-process writer lock path");
     let ready =
         std::env::var_os("ORCA_ATOMIC_WRITE_CHILD_READY").expect("cross-process writer ready path");
     let writer = std::env::var("ORCA_ATOMIC_WRITE_CHILD_ID").expect("cross-process writer id");
@@ -266,6 +270,8 @@ fn cross_process_atomic_writer_child() {
     let destination = Path::new(&destination);
     for revision in 0..128 {
         let value = format!("writer-{writer}-revision-{revision}");
+        let _guard = ExclusiveFileLock::acquire(Path::new(&lock))
+            .expect("acquire cross-process atomic write lock");
         atomic_write(destination, value.as_bytes(), AtomicWritePolicy::NoFollow)
             .expect("cross-process atomic write");
     }
@@ -273,9 +279,10 @@ fn cross_process_atomic_writer_child() {
 
 #[cfg(windows)]
 #[test]
-fn concurrent_cross_process_atomic_writers_retry_replace_collisions() {
+fn concurrent_cross_process_atomic_writers_are_serialized() {
     let temp = tempfile::tempdir().expect("tempdir");
     let destination = temp.path().join("state.json");
+    let lock = temp.path().join("state.lock");
     let start = temp.path().join("start");
     atomic_write(&destination, b"seed", AtomicWritePolicy::NoFollow).expect("seed state");
 
@@ -293,6 +300,7 @@ fn concurrent_cross_process_atomic_writers_retry_replace_collisions() {
             ])
             .env("ORCA_ATOMIC_WRITE_CHILD_DESTINATION", &destination)
             .env("ORCA_ATOMIC_WRITE_CHILD_START", &start)
+            .env("ORCA_ATOMIC_WRITE_CHILD_LOCK", &lock)
             .env("ORCA_ATOMIC_WRITE_CHILD_READY", &ready)
             .env("ORCA_ATOMIC_WRITE_CHILD_ID", writer.to_string())
             .stdout(std::process::Stdio::piped())
