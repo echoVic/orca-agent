@@ -305,18 +305,28 @@ fn concurrent_cross_process_atomic_writers_retry_replace_collisions() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while ready_paths.iter().any(|ready| !ready.exists()) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "cross-process writers did not become ready"
-        );
+        if std::time::Instant::now() >= deadline {
+            for child in &mut children {
+                let _ = child.kill();
+            }
+            for mut child in children {
+                let _ = child.wait();
+            }
+            panic!("cross-process writers did not become ready");
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     std::fs::write(&start, b"go").expect("release cross-process writers");
 
-    for child in children {
-        let child = child
-            .wait_with_output()
-            .expect("wait for cross-process atomic writer");
+    let outputs = children
+        .into_iter()
+        .map(|child| {
+            child
+                .wait_with_output()
+                .expect("wait for cross-process atomic writer")
+        })
+        .collect::<Vec<_>>();
+    for child in outputs {
         assert!(
             child.status.success(),
             "cross-process atomic writer failed: status={:?}, stdout={}, stderr={}",
