@@ -12,14 +12,12 @@ on:
         default: "0.1.0"
 
 permissions:
+  actions: read
+  checks: read
   contents: read
 
 jobs:
   test:
-    # Ubuntu 24.04's hosted AppArmor profile blocks the unprivileged user
-    # namespaces required by bubblewrap. Pin the behavioral gate to 22.04 so
-    # the release path exercises the real namespace backend; production still
-    # fails closed when a host cannot enforce the same boundary.
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -30,32 +28,54 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - name: Verify tagged commit passed main gates
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main --depth=1
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          checks="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs")"
+          for name in validate native-x64 native-arm64; do
+            jq -e --arg name "$name" \
+              'any(.check_runs[]; .name == $name and .conclusion == "success" and .app.slug == "github-actions")' \
+              <<<"$checks" >/dev/null
+          done
       - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'workflow_dispatch'
       - uses: taiki-e/install-action@nextest
+        if: github.event_name == 'workflow_dispatch'
       - uses: Swatinem/rust-cache@v2
+        if: github.event_name == 'workflow_dispatch'
       - name: Install test runtime dependencies
+        if: github.event_name == 'workflow_dispatch'
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep bubblewrap
       - name: Validate runtime surface contract
+        if: github.event_name == 'workflow_dispatch'
         run: |
           node scripts/test-validate-runtime-surface-contract.mjs
           node scripts/validate-runtime-surface-contract.mjs
           cargo metadata --locked --format-version 1 > /dev/null
           cargo test -p orca-tui runtime_surface_contract --lib --locked
       - name: Validate repository adapters and hygiene
+        if: github.event_name == 'workflow_dispatch'
         run: |
           python3 -m unittest discover -s terminal_bench -p 'test_*.py' -v
           node scripts/test-repository-hygiene.mjs
       - name: Run TUI library gate
+        if: github.event_name == 'workflow_dispatch'
         env:
           RUST_BACKTRACE: "1"
         run: cargo nextest run -p orca-tui --lib --locked --profile ci-serial
       - name: Run TUI PTY contract gate
+        if: github.event_name == 'workflow_dispatch'
         env:
           RUST_BACKTRACE: "1"
         run: cargo nextest run --test tui_pty_contract --locked --profile ci-serial
       - name: Run workspace gate
+        if: github.event_name == 'workflow_dispatch'
         env:
           RUST_BACKTRACE: "1"
         run: |
@@ -160,7 +180,7 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: Run native Windows x64 behavior gates
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: github.event_name == 'workflow_dispatch' && matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         env:
           RUST_BACKTRACE: "1"
@@ -179,7 +199,7 @@ jobs:
           cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass
           cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast
       - name: Run native Windows ARM64 behavior gates
-        if: matrix.target == 'aarch64-pc-windows-msvc'
+        if: github.event_name == 'workflow_dispatch' && matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"

@@ -61,6 +61,13 @@ broad workspace run passes. Clippy warnings are tracked separately from release
 failures; do not hide them with a global allow, and do not turn a patch release
 into an unrelated public-API cleanup merely to satisfy a newer toolchain lint.
 
+For a tag-triggered release, `release.yml` verifies that the tagged commit is
+the current `origin/main` commit and that the `Runtime Surface Contract`
+`validate` check plus the Windows `native-x64` and `native-arm64` checks already
+succeeded for that exact SHA. It then reuses that evidence instead of rerunning
+the same full suites. A manual `workflow_dispatch` remains the full release
+dry-run path and executes every gate above.
+
 ### 5. Update the website
 
 Edit `site/src/shared.ts`:
@@ -103,7 +110,7 @@ version already exists or points elsewhere, stop and choose a new version.
 
 The `release.yml` workflow is the sole publisher. It triggers on the tag push
 and:
-1. Runs tests
+1. Verifies the tagged SHA already passed the required `main` checks
 2. Builds binaries for all six targets, including native Windows x64 and ARM64
 3. Creates a GitHub Release with binary assets
 4. Stages, smoke-tests, and publishes npm packages

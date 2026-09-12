@@ -923,6 +923,10 @@ assert.ok(
 for (const gate of [releaseWindowsX64Gate[0], releaseWindowsArm64Gate[0]]) {
   assert.ok(gate.includes("shell: pwsh"), "release Windows behavior gates must use PowerShell 7");
   assert.ok(
+    gate.includes("github.event_name == 'workflow_dispatch'"),
+    "release Windows behavior gates must run only for explicit dry-run validation",
+  );
+  assert.ok(
     gate.includes('$ErrorActionPreference = "Stop"') &&
       gate.includes("$PSNativeCommandUseErrorActionPreference = $true"),
     "release Windows behavior gates must fail on every native command error",
@@ -944,6 +948,14 @@ for (const marker of [
     `release ARM64 gate must run the native Windows behavior contract ${marker}`,
   );
 }
+assert.ok(
+  releaseWorkflow.includes("- name: Verify tagged commit passed main gates") &&
+    releaseWorkflow.includes("checks: read") &&
+    releaseWorkflow.includes('test "$(git rev-parse origin/main)" = "$GITHUB_SHA"') &&
+    releaseWorkflow.includes("for name in validate native-x64 native-arm64") &&
+    releaseWorkflow.includes('.app.slug == "github-actions"'),
+  "tag releases must verify successful main checks for the exact tagged commit",
+);
 for (const marker of [
   "orca-windows-runner.exe",
   "orca-windows-sandbox-setup.exe",
