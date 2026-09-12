@@ -860,6 +860,14 @@ impl ThreadActor {
             .is_some_and(|batch| batch.cursor_before != current_cursor)
             && !self.resident_surface.coordinator.has_incomplete_batch();
         if pending.terminal_batch.is_none() || terminal_batch_is_stale {
+            let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+            let operation = Self::surface_operation_record(&snapshot, &pending.operation_id)
+                .cloned()
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: "typed provider operation disappeared before terminal".to_string(),
+                })?;
+            let completion_proof =
+                Self::surface_completion_proof(&snapshot, &operation, &pending.terminal, None)?;
             let terminal_batch = self.surface_event_batch_with_commit_id(
                 vec![(
                     surface::SurfaceScope::Background {
@@ -873,9 +881,7 @@ impl ThreadActor {
                             usage: pending.usage.clone(),
                             source_diagnostic_digest: None,
                             settlement_receipts: Vec::new(),
-                            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
-                                "background workflow terminal has no verifier proof",
-                            ),
+                            completion_proof: completion_proof.clone(),
                             committed_at: surface::UnixMillis::new(
                                 chrono::Utc::now().timestamp_millis(),
                             ),
@@ -887,9 +893,7 @@ impl ThreadActor {
             pending.terminal_value = Some(surface::OperationTerminalAtCursor {
                 operation_id: pending.operation_id.clone(),
                 terminal: pending.terminal.clone(),
-                completion_proof: surface::SurfaceOperationCompletionProof::unverified(
-                    "background workflow terminal has no verifier proof",
-                ),
+                completion_proof,
                 cursor: terminal_batch.cursor_after.clone(),
                 commit_class: terminal_batch.commit_class.clone(),
                 batch_digest: terminal_batch.batch_digest.clone(),

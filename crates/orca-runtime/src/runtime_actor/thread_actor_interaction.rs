@@ -5273,6 +5273,9 @@ impl ThreadActor {
         let terminal = surface::OperationTerminal::Cancelled {
             reason: surface::CancelReason::User,
         };
+        let current_snapshot = self.resident_surface.coordinator.state().snapshot();
+        let completion_proof =
+            Self::surface_completion_proof(&current_snapshot, &operation, &terminal, None)?;
         let terminal_record = surface::OperationTerminalRecord {
             operation_id: operation.operation_id.clone(),
             finalize_intent_id: finalize_intent_id.clone(),
@@ -5285,9 +5288,7 @@ impl ThreadActor {
             },
             source_diagnostic_digest: None,
             settlement_receipts: Vec::new(),
-            completion_proof: surface::SurfaceOperationCompletionProof::unverified(
-                "interaction terminal has no verifier proof",
-            ),
+            completion_proof,
             committed_at: surface::UnixMillis::new(0),
         };
         let projection = prepare_main_session_task_terminal_projection(
