@@ -17376,7 +17376,6 @@ impl ThreadActor {
                                     "goal run paused during runtime shutdown",
                                 );
                                 if pause_result.is_ok() && self.goal_controller.is_blocking() {
-                                    active.generation.cancel.cancel();
                                     if let Some(reply) = reply {
                                         let _ = reply.send(ThreadShutdownAck::Retry);
                                     }
@@ -17451,7 +17450,6 @@ impl ThreadActor {
                                 "goal run paused during runtime shutdown",
                             );
                             if pause_result.is_ok() && self.goal_controller.is_blocking() {
-                                active.generation.cancel.cancel();
                                 if let Some(reply) = reply {
                                     let _ = reply.send(ThreadShutdownAck::Retry);
                                 }
