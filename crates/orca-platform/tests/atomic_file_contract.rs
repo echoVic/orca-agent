@@ -1,9 +1,9 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use orca_platform::fs::{
-    AtomicWritePolicy, atomic_write, atomic_write_with, open_nofollow, open_nofollow_nonblocking,
-};
+#[cfg(unix)]
+use orca_platform::fs::open_nofollow_nonblocking;
+use orca_platform::fs::{AtomicWritePolicy, atomic_write, atomic_write_with, open_nofollow};
 
 #[test]
 fn atomic_replace_never_leaves_a_partial_file_or_temp_artifact() {
@@ -237,6 +237,98 @@ fn concurrent_atomic_writers_complete_and_leave_a_readable_destination() {
         !std::fs::read_to_string(&path)
             .expect("final atomic destination")
             .is_empty()
+    );
+    assert_no_temp_artifacts(temp.path());
+}
+
+#[cfg(windows)]
+#[test]
+fn cross_process_atomic_writer_child() {
+    let Some(destination) = std::env::var_os("ORCA_ATOMIC_WRITE_CHILD_DESTINATION") else {
+        return;
+    };
+    let start =
+        std::env::var_os("ORCA_ATOMIC_WRITE_CHILD_START").expect("cross-process writer start path");
+    let ready =
+        std::env::var_os("ORCA_ATOMIC_WRITE_CHILD_READY").expect("cross-process writer ready path");
+    let writer = std::env::var("ORCA_ATOMIC_WRITE_CHILD_ID").expect("cross-process writer id");
+
+    std::fs::write(&ready, b"ready").expect("announce cross-process writer");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !Path::new(&start).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cross-process writer start signal timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let destination = Path::new(&destination);
+    for revision in 0..128 {
+        let value = format!("writer-{writer}-revision-{revision}");
+        atomic_write(destination, value.as_bytes(), AtomicWritePolicy::NoFollow)
+            .expect("cross-process atomic write");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn concurrent_cross_process_atomic_writers_retry_replace_collisions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let destination = temp.path().join("state.json");
+    let start = temp.path().join("start");
+    atomic_write(&destination, b"seed", AtomicWritePolicy::NoFollow).expect("seed state");
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let mut children = Vec::new();
+    let mut ready_paths = Vec::new();
+    for writer in 0..4 {
+        let ready = temp.path().join(format!("writer-{writer}.ready"));
+        let child = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "cross_process_atomic_writer_child",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("ORCA_ATOMIC_WRITE_CHILD_DESTINATION", &destination)
+            .env("ORCA_ATOMIC_WRITE_CHILD_START", &start)
+            .env("ORCA_ATOMIC_WRITE_CHILD_READY", &ready)
+            .env("ORCA_ATOMIC_WRITE_CHILD_ID", writer.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("launch cross-process atomic writer");
+        children.push(child);
+        ready_paths.push(ready);
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ready_paths.iter().any(|ready| !ready.exists()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cross-process writers did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::fs::write(&start, b"go").expect("release cross-process writers");
+
+    for child in children {
+        let child = child
+            .wait_with_output()
+            .expect("wait for cross-process atomic writer");
+        assert!(
+            child.status.success(),
+            "cross-process atomic writer failed: status={:?}, stdout={}, stderr={}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+    assert!(
+        std::fs::read_to_string(&destination)
+            .expect("final atomic destination")
+            .starts_with("writer-")
     );
     assert_no_temp_artifacts(temp.path());
 }

@@ -238,7 +238,9 @@ mod platform {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
 
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+    use windows_sys::Win32::Foundation::{
+        ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_REMOVE_REPLACED,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
         MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
@@ -315,6 +317,7 @@ mod platform {
                 Some(code)
                     if code == ERROR_SHARING_VIOLATION as i32
                         || code == ERROR_LOCK_VIOLATION as i32
+                        || code == ERROR_UNABLE_TO_REMOVE_REPLACED as i32
             ) || Instant::now() >= deadline
             {
                 return Err(PlatformError::io("atomically replace destination", error));
