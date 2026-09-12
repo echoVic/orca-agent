@@ -251,6 +251,10 @@ fn exec_post_model_hook_observes_usage_environment() {
         home.path().join("config.toml"),
         format!(
             r#"
+update_check = false
+auto_memory = false
+mode = "full-auto"
+
 [[hooks]]
 event = "post_model_call"
 command = {}
