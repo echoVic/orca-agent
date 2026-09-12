@@ -14022,6 +14022,7 @@ impl ManagedBackgroundTask<TypedWorkflowBackground, TypedProviderBackground>
 struct TypedWorkflowBackground {
     fence: surface::SurfaceBackgroundFence,
     task_id: surface::SurfaceTaskId,
+    task_registry: TaskRegistry,
     workflow_run_id: surface::SurfaceWorkflowRunId,
     tool_use_id: surface::SurfaceToolCallId,
 }
@@ -26590,15 +26591,6 @@ mod tests {
             "background recovery must not cancel the active foreground operation"
         );
         diagnostic_stage.store(12, Ordering::Release);
-        foreground_release_tx
-            .send(())
-            .expect("release foreground after background cancellation");
-        diagnostic_stage.store(13, Ordering::Release);
-        let _ = attachment
-            .client
-            .wait_operation_terminal(surface_request_id(), foreground.operation_id)
-            .expect("wait foreground terminal");
-        diagnostic_stage.store(14, Ordering::Release);
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         loop {
             let status = thread
@@ -26614,7 +26606,7 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        diagnostic_stage.store(15, Ordering::Release);
+        diagnostic_stage.store(13, Ordering::Release);
         let terminal = attachment
             .client
             .wait_operation_terminal(surface_request_id(), workflow_operation_id.clone())
@@ -26630,6 +26622,15 @@ mod tests {
                 }
             }
         ));
+        diagnostic_stage.store(14, Ordering::Release);
+        foreground_release_tx
+            .send(())
+            .expect("release foreground after background cancellation");
+        diagnostic_stage.store(15, Ordering::Release);
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), foreground.operation_id)
+            .expect("wait foreground terminal");
         diagnostic_stage.store(16, Ordering::Release);
         let recovered =
             surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor.clone())

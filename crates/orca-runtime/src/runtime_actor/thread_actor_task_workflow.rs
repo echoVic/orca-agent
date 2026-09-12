@@ -1176,16 +1176,9 @@ impl ThreadActor {
             .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
                 message: "typed workflow disappeared before completion".to_string(),
             })?;
-        let record = self
-            .state
-            .as_ref()
-            .and_then(|state| {
-                state
-                    .thread
-                    .session()
-                    .task_registry()
-                    .get(typed.task_id.as_str())
-            })
+        let record = typed
+            .task_registry
+            .get(typed.task_id.as_str())
             .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
                 message: "workflow task registry record disappeared before completion".to_string(),
             })?;

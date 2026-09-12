@@ -13,8 +13,9 @@
 |----|------------|------------|--------|----------|
 | A | A surface command blocks before cancellation is durably retried. | Medium | Low | Rejected: diagnostic run reached the foreground terminal. |
 | B | The exact control batch commits but the workflow worker does not observe cancellation. | High | Medium | Rejected: TaskRegistry reached a terminal state. |
-| C | The worker reaches TaskRegistry terminal state but workflow-host cleanup or actor reaping does not publish the surface terminal. | High | Medium | Confirmed boundary: diagnostic stage 15. |
+| C | The worker reaches TaskRegistry terminal state but workflow-host cleanup or actor reaping does not publish the surface terminal. | High | Medium | Confirmed: workflow completion reads the registry through temporarily unavailable actor state. |
 | D | Operations terminalize and only host shutdown hangs. | Medium | Low | Rejected: the workflow surface terminal was never observed. |
+| E | The surface terminal commits but its waiter is not replayed. | Medium | Low | Rejected: failing attempts report `actor-workflow-completion-error` before any terminal commit. |
 
 ## Log Evidence
 - PR run `34651520641` x64 attempt 1 timed out at 120 seconds and attempt 2 passed in 0.797 seconds.
@@ -27,6 +28,14 @@
 - Focused run `34657316412` showed the background handle finishing, the
   completion notification being sent, and the actor completing its reap and
   workflow-completion call before stage 15.
+- Focused runs `34658262069` and `34658264468` reproduced the same failure:
+  `actor-workflow-completion-error: failed to start runtime thread: workflow
+  task registry record disappeared before completion`.
+- Passing attempts on the same commit report `actor-workflow-completion-ok`.
+- The foreground generation owns `ThreadActor.state` while active. The
+  background completion branch can run before foreground finalization restores
+  that state, so `commit_typed_workflow_completion` cannot reliably obtain the
+  registry through `self.state`.
 
 ## Diagnostic Stage Codes
 | Stage | Next blocking boundary |
@@ -41,15 +50,24 @@
 | 9 | Dispatch cancellation with injected checkpoint failure |
 | 10 | Observe exact retry batch |
 | 11 | Read snapshot during cancellation |
-| 12 | Release foreground executor |
-| 13 | Wait for foreground terminal |
-| 14 | Wait for workflow task-registry terminal state |
-| 15 | Wait for workflow surface terminal |
+| 12 | Wait for workflow task-registry terminal state while foreground stays active |
+| 13 | Wait for workflow surface terminal while foreground stays active |
+| 14 | Release foreground executor |
+| 15 | Wait for foreground terminal |
 | 16 | Recover and verify ledger |
 | 17 | Shut down runtime host |
 
 ## Verification Conclusion
 The durable control retry, worker stop request, and workflow-host process
-cleanup succeed. The actor receives and reaps the completion. The remaining
-question is whether `commit_typed_workflow_completion` succeeds without waking
-the waiter or returns a retained completion error.
+cleanup succeed. The actor receives and reaps the completion. The failure is a
+state-ownership race: `commit_typed_workflow_completion` reads TaskRegistry
+through `self.state`, but an active foreground generation temporarily owns that
+state. The workflow's own durable registry record remains present and terminal.
+
+## Post-Fix Verification
+- `TypedWorkflowBackground` now owns the `TaskRegistry` handle captured at
+  launch, matching the existing typed-provider ownership pattern.
+- The regression test keeps the foreground executor blocked until the workflow
+  surface terminal is committed, making the former race deterministic.
+- Local post-fix result: 30 consecutive exact-test runs passed with zero
+  retries.
