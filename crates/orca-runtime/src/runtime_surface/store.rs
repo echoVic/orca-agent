@@ -62,7 +62,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SurfaceLedgerError {
@@ -3108,6 +3108,9 @@ static TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = 
 static PENDING_TERMINAL_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
+static OBSERVED_TERMINAL_CHECKPOINT_FAILURES: OnceLock<(Mutex<HashSet<PathBuf>>, Condvar)> =
+    OnceLock::new();
+#[cfg(test)]
 static ADMISSION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 #[cfg(test)]
 static PENDING_ADMISSION_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
@@ -3407,6 +3410,29 @@ impl JsonlSurfaceCommitLedger {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&path);
+        OBSERVED_TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()))
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_terminal_checkpoint_failure(
+        path: impl Into<PathBuf>,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let path = path.into();
+        let (observed, changed) = OBSERVED_TERMINAL_CHECKPOINT_FAILURES
+            .get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()));
+        let observed = observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut observed, _) = changed
+            .wait_timeout_while(observed, timeout, |observed| !observed.contains(&path))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observed.remove(&path)
     }
 
     #[cfg(test)]
@@ -3845,19 +3871,31 @@ impl JsonlSurfaceCommitLedger {
 
     #[cfg(test)]
     fn take_pending_terminal_checkpoint_failure(&self) -> bool {
-        let mut failures = PENDING_TERMINAL_CHECKPOINT_FAILURES
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(count) = failures.get_mut(&self.path) else {
-            return false;
+        let should_fail = {
+            let mut failures = PENDING_TERMINAL_CHECKPOINT_FAILURES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(count) = failures.get_mut(&self.path) else {
+                return false;
+            };
+            if *count <= 1 {
+                failures.remove(&self.path);
+            } else {
+                *count -= 1;
+            }
+            true
         };
-        if *count <= 1 {
-            failures.remove(&self.path);
-        } else {
-            *count -= 1;
+        if should_fail {
+            let (observed, changed) = OBSERVED_TERMINAL_CHECKPOINT_FAILURES
+                .get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()));
+            observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.path.clone());
+            changed.notify_all();
         }
-        true
+        should_fail
     }
 
     #[cfg(test)]
