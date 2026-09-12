@@ -1160,6 +1160,19 @@ impl TuiSurfaceTaskControl {
         hosted.surface_active.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn wait_for_surface_inactive(&self, timeout: Duration) -> bool {
+        let hosted = self.lock_hosted();
+        let (hosted, _) = self
+            .hosted
+            .changed
+            .wait_timeout_while(hosted, timeout, |hosted| {
+                hosted.surface_active.is_some() && !hosted.shutdown
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hosted.surface_active.is_none()
+    }
+
     pub(crate) fn install_focused_child_surface(
         &self,
         client: orca_runtime::surface::RuntimeSurfaceClientHandle,
