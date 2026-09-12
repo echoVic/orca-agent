@@ -2881,6 +2881,7 @@ impl ThreadActor {
         let typed_workflow = TypedWorkflowBackground {
             fence: background_fence,
             task_id,
+            task_registry: task_registry.clone(),
             workflow_run_id: workflow_run_id.clone(),
             tool_use_id: surface_tool_use_id,
         };

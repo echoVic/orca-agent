@@ -14022,6 +14022,7 @@ impl ManagedBackgroundTask<TypedWorkflowBackground, TypedProviderBackground>
 struct TypedWorkflowBackground {
     fence: surface::SurfaceBackgroundFence,
     task_id: surface::SurfaceTaskId,
+    task_registry: TaskRegistry,
     workflow_run_id: surface::SurfaceWorkflowRunId,
     tool_use_id: surface::SurfaceToolCallId,
 }
@@ -14135,8 +14136,19 @@ enum TypedWorkflowCompletionStage {
 }
 
 #[derive(Clone)]
-struct PendingTypedWorkflowCompletion {
+enum PendingTypedWorkflowCompletion {
+    Preparation {
+        typed: TypedWorkflowBackground,
+        shutdown_reason: Option<surface::SurfaceShutdownReason>,
+        retry_at: tokio::time::Instant,
+    },
+    Completion(PreparedTypedWorkflowCompletion),
+}
+
+#[derive(Clone)]
+struct PreparedTypedWorkflowCompletion {
     typed: TypedWorkflowBackground,
+    shutdown_reason: Option<surface::SurfaceShutdownReason>,
     operation_id: surface::SurfaceOperationId,
     finalize_intent_id: surface::SurfaceFinalizeIntentId,
     terminal_commit_id: surface::SurfaceCommitId,
@@ -14146,16 +14158,26 @@ struct PendingTypedWorkflowCompletion {
     terminal_batch: Option<surface::SurfaceCommitBatch>,
     terminal_value: Option<surface::OperationTerminalAtCursor>,
     stage: TypedWorkflowCompletionStage,
+    rebuild_after_foreign_incomplete: bool,
     retry_at: tokio::time::Instant,
 }
 
 impl ScheduledBackgroundRetry for PendingTypedWorkflowCompletion {
     fn retry_at(&self) -> tokio::time::Instant {
-        self.retry_at
+        match self {
+            Self::Preparation { retry_at, .. } => *retry_at,
+            Self::Completion(pending) => pending.retry_at,
+        }
     }
 
     fn defer_until(&mut self, retry_at: tokio::time::Instant) {
-        self.retry_at = retry_at;
+        match self {
+            Self::Preparation {
+                retry_at: pending_retry_at,
+                ..
+            } => *pending_retry_at = retry_at,
+            Self::Completion(pending) => pending.retry_at = retry_at,
+        }
     }
 }
 
@@ -26549,13 +26571,6 @@ mod tests {
             Some(&foreground.operation_id),
             "background recovery must not cancel the active foreground operation"
         );
-        foreground_release_tx
-            .send(())
-            .expect("release foreground after background cancellation");
-        let _ = attachment
-            .client
-            .wait_operation_terminal(surface_request_id(), foreground.operation_id)
-            .expect("wait foreground terminal");
         let terminal = attachment
             .client
             .wait_operation_terminal(surface_request_id(), workflow_operation_id.clone())
@@ -26571,6 +26586,13 @@ mod tests {
                 }
             }
         ));
+        foreground_release_tx
+            .send(())
+            .expect("release foreground after background cancellation");
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), foreground.operation_id)
+            .expect("wait foreground terminal");
         let recovered =
             surface::JsonlSurfaceCommitLedger::new(transcript_path, initial_cursor.clone())
                 .recover_batches()
