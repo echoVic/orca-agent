@@ -950,6 +950,7 @@ for (const marker of [
 }
 assert.ok(
   releaseWorkflow.includes("- name: Verify tagged commit passed main gates") &&
+    releaseWorkflow.includes("checks: read") &&
     releaseWorkflow.includes('test "$(git rev-parse origin/main)" = "$GITHUB_SHA"') &&
     releaseWorkflow.includes("for name in validate native-x64 native-arm64") &&
     releaseWorkflow.includes('.app.slug == "github-actions"'),
