@@ -7,6 +7,7 @@ pub(crate) use persistence::ArchivedShell;
 use persistence::OutputArchive;
 
 pub const DEFAULT_TASK_OUTPUT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const TASK_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_CHUNKS: usize = 32 * 1024;
 
 #[derive(Clone, Debug)]
@@ -248,7 +249,7 @@ impl TaskOutputStore {
         let buffer = inner.buffers.entry(task_id.to_string()).or_default();
         let mut remaining = content;
         while !remaining.is_empty() {
-            let end = utf8_ceil(remaining, remaining.len().min(8192));
+            let end = utf8_ceil(remaining, remaining.len().min(TASK_OUTPUT_CHUNK_BYTES));
             buffer.append(stream, &remaining[..end]);
             buffer.trim_to_budget(max_retained_bytes);
             remaining = &remaining[end..];

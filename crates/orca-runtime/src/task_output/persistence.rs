@@ -8,10 +8,11 @@ use std::time::Duration;
 use orca_platform::fs::{ExclusiveFileLock, open_nofollow_nonblocking};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use super::{TaskOutputBuffer, TaskOutputChunk, TaskOutputRead, TaskOutputStream};
+use super::{
+    TASK_OUTPUT_CHUNK_BYTES, TaskOutputBuffer, TaskOutputChunk, TaskOutputRead, TaskOutputStream,
+};
 
 pub(super) const MAX_PAGE_BYTES: usize = 256 * 1024;
-const CHUNK_BYTES: usize = 8192;
 const DATABASE: &str = "archive.sqlite3";
 
 #[derive(Clone, Copy, Debug)]
@@ -390,7 +391,7 @@ impl OutputArchive {
         // Limit individual SQLite allocations even for a caller-provided giant append.
         let mut remaining = content;
         while !remaining.is_empty() {
-            let end = super::utf8_ceil(remaining, CHUNK_BYTES.min(remaining.len()));
+            let end = super::utf8_ceil(remaining, TASK_OUTPUT_CHUNK_BYTES.min(remaining.len()));
             if let Err(error) = self.append_chunk(task_id, stream, &remaining[..end]) {
                 self.write_failure = Some(error.to_string());
                 return Err(error);
@@ -588,14 +589,15 @@ impl OutputArchive {
         };
         if start < total {
             let mut stmt = self.connection.prepare(
-                "SELECT start, stream, substr(content, 1, 8196), stdout_before, stderr_before, length(content) FROM chunks
+                "SELECT start, stream, substr(content, 1, ?4), stdout_before, stderr_before, length(content) FROM chunks
                  WHERE task_id = ?1 AND start >= ?2 AND start < ?3 ORDER BY start",
             ).map_err(sql_error)?;
             let mut rows = stmt
                 .query(params![
                     task_id,
                     offset(first.unwrap_or(start))?,
-                    offset(end.max(start + 1))?
+                    offset(end.max(start + 1))?,
+                    offset(TASK_OUTPUT_CHUNK_BYTES + 3)?
                 ])
                 .map_err(sql_error)?;
             let mut expected = first.unwrap_or(start);
@@ -604,7 +606,10 @@ impl OutputArchive {
                 let stream: i64 = row.get(1).map_err(sql_error)?;
                 let bytes: Vec<u8> = row.get(2).map_err(sql_error)?;
                 let stored_len: usize = row.get(5).map_err(sql_error)?;
-                if chunk_start != expected || bytes.is_empty() || stored_len > CHUNK_BYTES + 3 {
+                if chunk_start != expected
+                    || bytes.is_empty()
+                    || stored_len > TASK_OUTPUT_CHUNK_BYTES + 3
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "task output archive has invalid chunk bounds",
@@ -1029,7 +1034,7 @@ mod tests {
         register(&mut archive, "one");
         let text = format!(
             "{}\u{9519}{}",
-            "a".repeat(CHUNK_BYTES - 1),
+            "a".repeat(TASK_OUTPUT_CHUNK_BYTES - 1),
             "b".repeat(MAX_PAGE_BYTES)
         );
         archive
@@ -1048,7 +1053,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert!(max_chunk <= CHUNK_BYTES + 3);
+        assert!(max_chunk <= TASK_OUTPUT_CHUNK_BYTES + 3);
     }
 
     #[test]
