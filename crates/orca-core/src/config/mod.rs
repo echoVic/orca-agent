@@ -441,6 +441,10 @@ pub struct DelegationSnapshot {
     #[serde(default)]
     pub additional_working_directories: Vec<AdditionalWorkingDirectory>,
     pub model: Option<String>,
+    /// How proactively this owner may start child agents. Snapshotted so a
+    /// detached child sees the policy in force when it was admitted.
+    #[serde(default)]
+    pub delegation: crate::subagent_config::DelegationPolicy,
 }
 
 impl DelegationSnapshot {
@@ -454,6 +458,7 @@ impl DelegationSnapshot {
             permission_rules: config.permission_rules.clone(),
             additional_working_directories: config.additional_working_directories.clone(),
             model: config.model.as_option(),
+            delegation: config.subagents.delegation,
         }
     }
 
@@ -465,6 +470,7 @@ impl DelegationSnapshot {
         config.runtime_workspace_roots = self.runtime_workspace_roots.clone();
         config.permission_rules = self.permission_rules.clone();
         config.additional_working_directories = self.additional_working_directories.clone();
+        config.subagents.delegation = self.delegation;
 
         let model = child_model_override.or_else(|| self.model.clone());
         if let Ok(model) = config.model.with_value(model) {
@@ -764,6 +770,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "[subagents]\n",
             "max_depth = {}\n",
             "max_parallel = {}\n",
+            "delegation = \"{}\"\n",
             "\n",
             "[counts]\n",
             "mcp_servers = {}\n",
@@ -820,6 +827,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.tools.shell_timeout_secs,
         config.subagents.max_depth,
         config.subagents.max_parallel,
+        config.subagents.delegation.as_str(),
         config.mcp_servers.len(),
         config.external_tools.len(),
         config.hooks.len(),
@@ -1063,6 +1071,91 @@ mod tests {
         assert!(shown.contains("terminal_notifications = false"));
         assert!(shown.contains("api_key = \"<redacted>\""));
         assert!(!shown.contains("sk-secret"));
+        // The delegation policy is a first-class setting, not a hidden field.
+        assert!(shown.contains("[subagents]"));
+        assert!(shown.contains("delegation = \"explicit\""));
+    }
+
+    #[test]
+    fn delegation_snapshot_carries_the_policy_to_a_child() {
+        let parent = RunConfig {
+            app_version: "test".to_string(),
+            prompt: String::new(),
+            cwd: None,
+            output_format: OutputFormat::Text,
+            approval_mode: ApprovalMode::Suggest,
+            execution_profile: crate::capability::ExecutionProfile::Workspace,
+            provider: crate::config::ProviderKind::Mock,
+            verifier: None,
+            model: ModelSelection::parse(None).unwrap(),
+            model_runtime: ModelRuntimeConfig::default(),
+            reasoning_effort: ReasoningEffort::Max,
+            api_key: None,
+            base_url: None,
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            external_tools: Vec::new(),
+            history_mode: HistoryMode::Disabled,
+            show_session_picker: false,
+            active_permission_profile: None,
+            permission_profiles: HashMap::new(),
+            runtime_workspace_roots: None,
+            permission_rules: PermissionRules::default(),
+            additional_working_directories: Vec::new(),
+            budget: BudgetConfig::default(),
+            subagents: SubagentConfig {
+                delegation: crate::subagent_config::DelegationPolicy::Adaptive,
+                ..SubagentConfig::default()
+            },
+            tools: ToolConfig::default(),
+            workflows: WorkflowConfig::default(),
+            theme: ThemeName::default(),
+            vim_mode: false,
+            vim_insert_escape: None,
+            update_check: false,
+            desktop_notifications: false,
+            terminal_notifications: false,
+            auto_memory: false,
+        };
+
+        let encoded = serde_json::to_string(&DelegationSnapshot::from_config(&parent)).unwrap();
+        let decoded: DelegationSnapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.delegation,
+            crate::subagent_config::DelegationPolicy::Adaptive
+        );
+
+        let mut child = parent.clone();
+        child.subagents.delegation = crate::subagent_config::DelegationPolicy::Off;
+        decoded.apply_to(&mut child, None);
+        assert_eq!(
+            child.subagents.delegation,
+            crate::subagent_config::DelegationPolicy::Adaptive,
+            "a child must inherit the admitting owner's delegation policy"
+        );
+    }
+
+    #[test]
+    fn legacy_delegation_snapshot_without_the_policy_defaults_to_explicit() {
+        let legacy = serde_json::json!({
+            "approvalMode": "suggest",
+            "executionProfile": "workspace",
+            "activePermissionProfile": null,
+            "permissionProfiles": {},
+            "runtimeWorkspaceRoots": null,
+            "permissionRules": {"rules": []},
+            "additionalWorkingDirectories": [],
+            "model": null
+        });
+
+        let decoded: DelegationSnapshot =
+            serde_json::from_value(legacy).expect("legacy snapshot decodes");
+
+        assert_eq!(
+            decoded.delegation,
+            crate::subagent_config::DelegationPolicy::Explicit,
+            "a snapshot written before this field existed must not gain proactivity"
+        );
     }
 
     #[test]

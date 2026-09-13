@@ -812,11 +812,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "Full standalone instructions for the child agent"
+                        "description": "Full standalone instructions for the child agent: the goal, the context it cannot infer, the scope, what it may do, and what to return."
                     },
                     "subagent_type": {
                         "type": "string",
-                        "description": "Built-in type (general, code_reviewer, test_writer, debugger, documenter) or an ASCII custom identifier from the available agent catalog. Unknown or invalid custom agents fail closed. Omit when resuming to inherit the frozen source definition."
+                        "description": "Built-in role identifier (see the built-in roles list in this description) or an ASCII custom identifier from the available agent catalog. Aliases are accepted. Unknown or invalid custom agents fail closed. Omit when resuming to inherit the frozen source definition."
                     },
                     "model": {
                         "type": "string",

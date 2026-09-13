@@ -124,6 +124,10 @@ pub(crate) struct AsyncSubagentLaunchContext<'a> {
     /// any worker process is spawned. The relay worker starts at source
     /// sequence two after this durable pre-launch commit.
     pub activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
+    /// Whether this launch counts against the session-wide running-child
+    /// limit. A launch refused by the limit reports a capacity error instead of
+    /// spawning an unowned process.
+    pub enforce_admission: bool,
 }
 
 pub(crate) struct AsyncSubagentLaunchOutput {
@@ -784,6 +788,7 @@ pub(crate) fn launch_async_subagent(
         root_task_id,
         parent_fence,
         activity_ingress,
+        enforce_admission,
     } = context;
     let mut request = subagent::with_delegation_snapshot(
         request,
@@ -818,6 +823,26 @@ pub(crate) fn launch_async_subagent(
             ),
             task: None,
         };
+    };
+    // Reserve before any durable task or OS process exists, so a saturated
+    // session never leaves an unowned child behind. The reservation is held
+    // across task creation, which closes the check-then-register race between
+    // concurrent launches in this process.
+    let _admission = match enforce_admission {
+        true => match task_registry.admit_child(config.subagents.max_parallel) {
+            Ok(reservation) => Some(reservation),
+            Err(error) => {
+                return AsyncSubagentLaunchOutput {
+                    result: tool_types::ToolResult::failed_before_start(
+                        tool_request,
+                        error.message(),
+                        None,
+                    ),
+                    task: None,
+                };
+            }
+        },
+        false => None,
     };
     let coordinator = match ChildAgentCoordinator::new(task_registry.clone()) {
         Ok(coordinator) => coordinator,
@@ -857,6 +882,9 @@ pub(crate) fn launch_async_subagent(
         agent_type,
         root_task_id.map(str::to_string),
     );
+    // The parent is not blocked on this child, so its outcome has to be pushed
+    // back into the parent conversation instead of returned in-band.
+    let _ = task_registry.mark_subagent_result_pending(&task.id);
     let agent_id = task.id.clone();
     if task_registry.is_cancelled(&agent_id) {
         let _ = task_registry.stop(
@@ -1927,6 +1955,7 @@ mod tests {
             root_task_id: None,
             parent_fence: None,
             activity_ingress: None,
+            enforce_admission: false,
         });
 
         assert_eq!(output.result.status, ToolStatus::Failed);

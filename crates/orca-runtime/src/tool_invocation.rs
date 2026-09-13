@@ -4,6 +4,7 @@ use orca_core::approval_types::{ActionKind, ApprovalRequest};
 use orca_core::config::RunConfig;
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::provider_types::ProviderStep;
+use orca_core::subagent_config::DelegationPolicy;
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
@@ -25,6 +26,7 @@ pub(crate) struct AgentToolPolicyContext<'a> {
     allowed_tools: Option<&'a [String]>,
     label: Option<&'a str>,
     goal_mode: bool,
+    delegation: DelegationPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +41,7 @@ impl<'a> AgentToolPolicyContext<'a> {
             allowed_tools,
             label,
             goal_mode: false,
+            delegation: DelegationPolicy::default(),
         }
     }
 
@@ -51,7 +54,14 @@ impl<'a> AgentToolPolicyContext<'a> {
             allowed_tools: None,
             label: None,
             goal_mode: true,
+            delegation: DelegationPolicy::default(),
         }
+    }
+
+    /// Attaches the delegation policy that governs this turn.
+    pub(crate) fn with_delegation(mut self, delegation: DelegationPolicy) -> Self {
+        self.delegation = delegation;
+        self
     }
 
     pub(crate) fn replace_allowed_tools(
@@ -60,7 +70,7 @@ impl<'a> AgentToolPolicyContext<'a> {
         label: &'a str,
     ) -> Self {
         if let Some(allowed_tools) = allowed_tools {
-            Self::new(Some(allowed_tools), Some(label))
+            Self::new(Some(allowed_tools), Some(label)).with_delegation(self.delegation)
         } else {
             self
         }
@@ -76,6 +86,10 @@ impl<'a> AgentToolPolicyContext<'a> {
 
     pub(crate) fn is_goal_mode(&self) -> bool {
         self.goal_mode
+    }
+
+    pub(crate) fn delegation(&self) -> DelegationPolicy {
+        self.delegation
     }
 }
 
@@ -108,6 +122,10 @@ pub(crate) fn provider_tool_schema_override(
     Some(
         canonical_tool_definitions(&policy, &registry)
             .into_iter()
+            .filter(|definition| {
+                // A policy the model cannot act on must not be advertised.
+                definition.name != "subagent" || tool_policy.delegation().allows_new_children()
+            })
             .map(|definition| ProviderToolDefinition {
                 name: definition.name,
                 description: definition.description,

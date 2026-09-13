@@ -1014,6 +1014,35 @@ max_parallel = 6
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.subagents.max_depth, 3);
         assert_eq!(config.subagents.max_parallel, 6);
+        // A config written before the delegation policy existed keeps today's
+        // behavior instead of silently becoming proactive.
+        assert_eq!(
+            config.subagents.delegation,
+            crate::subagent_config::DelegationPolicy::Explicit
+        );
+    }
+
+    #[test]
+    fn parse_subagent_delegation_policy() {
+        for (value, expected) in [
+            ("off", crate::subagent_config::DelegationPolicy::Off),
+            (
+                "explicit",
+                crate::subagent_config::DelegationPolicy::Explicit,
+            ),
+            (
+                "adaptive",
+                crate::subagent_config::DelegationPolicy::Adaptive,
+            ),
+        ] {
+            let config: FileConfig =
+                toml::from_str(&format!("[subagents]\ndelegation = \"{value}\"\n")).unwrap();
+            assert_eq!(config.subagents.delegation, expected, "{value}");
+        }
+        assert!(
+            toml::from_str::<FileConfig>("[subagents]\ndelegation = \"aggressive\"\n").is_err(),
+            "an unknown policy must fail closed instead of silently defaulting"
+        );
     }
 
     #[test]

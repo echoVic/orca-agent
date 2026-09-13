@@ -158,14 +158,17 @@ pub(crate) fn bootstrap_agent_conversation_for_loop(
     instructions: &ProjectInstructions,
     approval_mode: orca_core::approval_types::ApprovalMode,
     memory: &MemoryBlock,
+    delegation: orca_core::subagent_config::DelegationPolicy,
 ) -> Conversation {
-    let system_prompt = agent_common::build_agent_system_prompt(
+    let system_prompt = agent_common::build_agent_system_prompt_with_goal(
         cwd,
         subagent_depth,
         subagent_type,
         Some(instructions),
         approval_mode,
         Some(memory),
+        None,
+        delegation,
     );
     bootstrap_agent_conversation(None, system_prompt, cwd, prompt)
 }
@@ -1059,6 +1062,7 @@ mod tests {
             &instructions,
             ApprovalMode::Suggest,
             &memory,
+            orca_core::subagent_config::DelegationPolicy::default(),
         );
 
         assert_eq!(conversation.messages.len(), 2);

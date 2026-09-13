@@ -1663,14 +1663,13 @@ fn prepare_sync_worktree(
 }
 
 pub(crate) fn serialized_subagent_type(subagent_type: &SubagentType) -> Option<String> {
-    Some(match subagent_type {
-        SubagentType::General => "general".to_string(),
-        SubagentType::CodeReviewer => "code_reviewer".to_string(),
-        SubagentType::TestWriter => "test_writer".to_string(),
-        SubagentType::Debugger => "debugger".to_string(),
-        SubagentType::Documenter => "documenter".to_string(),
-        SubagentType::Custom(value) => value.clone(),
-    })
+    // One source of truth: the role catalog owns every built-in identifier.
+    match subagent_type {
+        SubagentType::Custom(value) => Some(value.clone()),
+        builtin => builtin
+            .builtin()
+            .map(|descriptor| descriptor.name.to_string()),
+    }
 }
 
 pub(crate) fn validate_resume_overrides(

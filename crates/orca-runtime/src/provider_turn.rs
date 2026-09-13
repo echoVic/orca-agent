@@ -2079,6 +2079,7 @@ mod tests {
                 &instructions,
                 config.approval_mode,
                 &memory,
+                orca_core::subagent_config::DelegationPolicy::default(),
             );
         let mut lifecycle = crate::runtime_lifecycle::RuntimeSessionLifecycle::new(
             "provider-cycle-continuation".to_string(),

@@ -2,6 +2,7 @@ use std::path::Path;
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::conversation::Conversation;
+use orca_core::subagent_config::DelegationPolicy;
 use orca_core::subagent_types::SubagentType;
 
 use crate::child_agent_types::ChildAgentCheckpointSink;
@@ -79,6 +80,7 @@ impl RuntimeConversationBootstrapStep {
         instructions: &ProjectInstructions,
         approval_mode: ApprovalMode,
         memory: &MemoryBlock,
+        delegation: DelegationPolicy,
     ) -> RuntimePreparedConversation<'a> {
         let prepared = match conversation_context {
             AgentConversationContext::Owned {
@@ -93,6 +95,7 @@ impl RuntimeConversationBootstrapStep {
                         instructions,
                         approval_mode,
                         memory,
+                        delegation,
                     ),
                 ),
                 history_writer: None,

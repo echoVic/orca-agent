@@ -2004,6 +2004,7 @@ impl ThreadActor {
                 root_task_id: binding.parent_task_id.as_deref(),
                 parent_fence: binding.parent_fence,
                 activity_ingress,
+                enforce_admission: true,
             },
         );
         let launched_task = launched

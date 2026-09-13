@@ -97,6 +97,10 @@ pub(crate) fn run_agent_loop(
         turn_deps.instructions,
         config.approval_mode,
         turn_deps.memory,
+        config
+            .subagents
+            .delegation
+            .for_child(subagent_depth, config.subagents.max_depth),
     );
     let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
     let shell_context = shell_readiness.model_context(config.approval_mode);
@@ -242,6 +246,12 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         AgentToolPolicyContext::new(
             request.allowed_tools.as_deref(),
             request.tool_policy_label.as_deref(),
+        )
+        .with_delegation(
+            config
+                .subagents
+                .delegation
+                .for_child(request.depth, config.subagents.max_depth),
         ),
     )?;
     let AgentLoopOutcome::Completed(child) = child else {

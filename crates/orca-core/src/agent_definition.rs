@@ -589,13 +589,33 @@ mod tests {
             "Project policy.",
         );
         let discover = || AgentCatalog::discover_in(&nested, Some(home.path()), &tools(), &[]);
-        assert_eq!(discover().agents["audit"].system_prompt, "User policy.");
+        // A definition that omits `extends` inherits the general role, so the
+        // general role instructions prefix the agent body. The layer that wins
+        // is still identified by which body is present.
+        assert!(
+            discover().agents["audit"]
+                .system_prompt
+                .ends_with("User policy.")
+        );
+        assert!(
+            !discover().agents["audit"]
+                .system_prompt
+                .contains("Project policy.")
+        );
         folder_trust::set_trust_with_config_dir(project.path(), home.path(), TrustLevel::Trusted)
             .unwrap();
-        assert_eq!(discover().agents["audit"].system_prompt, "Project policy.");
+        assert!(
+            discover().agents["audit"]
+                .system_prompt
+                .ends_with("Project policy.")
+        );
         folder_trust::set_trust_with_config_dir(&nested, home.path(), TrustLevel::Untrusted)
             .unwrap();
-        assert_eq!(discover().agents["audit"].system_prompt, "User policy.");
+        assert!(
+            discover().agents["audit"]
+                .system_prompt
+                .ends_with("User policy.")
+        );
     }
 
     #[test]

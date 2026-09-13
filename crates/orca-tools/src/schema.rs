@@ -1,10 +1,45 @@
 use std::collections::HashSet;
 
-use orca_core::subagent_types::SubagentType;
+use orca_core::subagent_types::{SubagentType, builtin_agents, resolve_builtin_agent};
 use orca_core::tool_types::{ToolName, ToolRequest};
 use serde_json::Value;
 
 use crate::registry::ToolRegistry;
+
+/// Renders the selection contract for every built-in role. This is the only
+/// place that turns the role catalog into model-visible prose, so the tool
+/// description, the tool schema enum, and the runtime ceiling cannot drift.
+///
+/// `capsule` keeps the main system prompt short by emitting one line per role;
+/// the full selection guidance is reserved for the `subagent` tool description.
+pub fn render_builtin_role_catalog(capsule: bool) -> String {
+    let mut output = String::new();
+    for descriptor in builtin_agents() {
+        if capsule {
+            output.push_str(&format!(
+                "\n- `{}`: {}",
+                descriptor.name, descriptor.when_to_use
+            ));
+            continue;
+        }
+        output.push_str(&format!(
+            "\n- `{}`: {}",
+            descriptor.name, descriptor.when_to_use
+        ));
+        output.push_str(&format!("\n  Avoid when: {}", descriptor.avoid_when));
+        output.push_str(&format!("\n  Tools: {}", descriptor.tools.join(", ")));
+        output.push_str(&format!(
+            "\n  Report: {}",
+            descriptor.deliverables.join("; ")
+        ));
+    }
+    output
+}
+
+/// The canonical built-in role names, in catalog order.
+pub fn builtin_role_names() -> Vec<&'static str> {
+    builtin_agents().iter().map(|d| d.name).collect()
+}
 
 /// Advertise only resolved definitions; bodies and filesystem paths stay out of the catalog.
 pub fn apply_subagent_catalog(
@@ -12,25 +47,32 @@ pub fn apply_subagent_catalog(
     input_schema: &mut Value,
     catalog: &orca_core::subagent_types::agent_definition::AgentCatalog,
 ) {
-    let mut names = vec![
-        "general",
-        "code_reviewer",
-        "test_writer",
-        "debugger",
-        "documenter",
-    ];
+    let mut names = builtin_role_names();
     names.extend(catalog.agents.keys().map(String::as_str));
     input_schema["properties"]["subagent_type"]["enum"] = serde_json::json!(names);
+    description.push_str("\n\nBuilt-in roles (use the identifier verbatim):");
+    description.push_str(&render_builtin_role_catalog(false));
     if !catalog.agents.is_empty() {
-        description.push_str("\nAvailable custom agents (identifier: description):");
+        description.push_str("\n\nAvailable custom agents (identifier: description):");
         for agent in catalog.agents.values() {
-            description.push_str(&format!("\n{}: {}", agent.name, agent.description));
+            description.push_str(&format!("\n- {}: {}", agent.name, agent.description));
         }
     }
     if !catalog.diagnostics.is_empty() {
         description
-            .push_str("\nSome agent definitions were invalid or ambiguous and were excluded.");
+            .push_str("\n\nSome agent definitions were invalid or ambiguous and were excluded.");
     }
+    description.push_str(
+        "\n\nAccepted aliases: explore/scout=explorer, reviewer=code_reviewer, tester=test_writer, debug=debugger, docs=documenter.",
+    );
+}
+
+/// Resolves a requested identifier to the canonical built-in role name.
+///
+/// Built-in aliases resolve to their canonical role; anything else is a custom
+/// agent identifier and returns `None`.
+pub fn canonical_builtin_role(requested: &str) -> Option<&'static str> {
+    resolve_builtin_agent(requested).map(|descriptor| descriptor.name)
 }
 
 const GOAL_TOOL_NAMES: &[&str] = &["get_goal", "create_goal", "update_goal"];

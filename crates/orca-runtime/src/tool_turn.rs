@@ -216,6 +216,35 @@ fn subagent_budget_exhaustion_error(
     })
 }
 
+/// Rejects a new child launch when the effective delegation policy is `off`.
+///
+/// Sibling tools that never started are settled by the normal rejection path.
+/// Resuming an existing child stays allowed so results already produced remain
+/// reachable, and `subagent_status` / `task_stop` are unaffected.
+fn reject_delegation_off(
+    tool_request: &ToolRequest,
+    delegation: orca_core::subagent_config::DelegationPolicy,
+    subagent_depth: u32,
+    max_depth: u32,
+) -> Option<ToolResult> {
+    if tool_request.name != orca_core::tool_types::ToolName::Subagent {
+        return None;
+    }
+    let effective = delegation.for_child(subagent_depth, max_depth);
+    if effective.allows_new_children() {
+        return None;
+    }
+    let resuming = crate::subagent::extract_subagent_field(tool_request, "resume_from")
+        .is_some_and(|selector| !selector.trim().is_empty());
+    if resuming {
+        return None;
+    }
+    Some(ToolResult::invalid_input(
+        tool_request,
+        "delegation policy is off: no new child agent may be started; continue locally, ask the user, or resume an existing child by id",
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn terminal_tool_turn(status: RunStatus, error: Option<String>) -> ToolTurnOutcome {
     ToolTurnOutcome::from_terminal(status, error)
@@ -378,6 +407,54 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 error: Some("tool turn cancelled".to_string()),
                 terminal: None,
             });
+        }
+        if let Some(result) = reject_delegation_off(
+            tool_request,
+            config.subagents.delegation,
+            subagent_depth,
+            config.subagents.max_depth,
+        ) {
+            let event_error = emit_tool_terminal_events(
+                events,
+                sink,
+                tool_request,
+                &result,
+                emit_deltas,
+                provider_response_ingress,
+            )
+            .err();
+            if let Some(error) = event_error.as_ref()
+                && is_semantic_commit_failure(error)
+            {
+                return Err(io::Error::new(error.kind(), error.to_string()));
+            }
+            record_tool_result_for_agent(
+                conversation,
+                history_writer.as_deref_mut(),
+                &result,
+                emit_deltas,
+            )?;
+            sampling_state.advance_tool_cursor_one(tool_requests.len());
+            let outcome = ToolTurnOutcome::Return {
+                status: RunStatus::Failed,
+                error: Some(result.error.clone().unwrap_or_default()),
+                terminal: None,
+            };
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                provider_response_ingress,
+                "an earlier sibling was rejected by the delegation policy",
+            )?;
+            if let Some(error) = event_error {
+                return Err(error);
+            }
+            return Ok(outcome);
         }
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,

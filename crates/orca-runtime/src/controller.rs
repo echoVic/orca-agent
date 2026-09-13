@@ -1710,6 +1710,7 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
     turn_extension_id: Option<String>,
 ) -> io::Result<ThreadTurnOutcome> {
     drain_terminal_notifications(session, thread_extensions.as_deref());
+    drain_subagent_notifications(session);
     let context = ThreadTurnContext::prepare(config, session, request)?;
     if let Some(events) = events {
         let mut sink = EventSink::new(writer, config.output_format)
@@ -1770,6 +1771,21 @@ fn drain_terminal_notifications(
     };
     for completion in service.drain_completions() {
         let message = Message::pinned_system(completion.model_notification());
+        session.append_message(&message);
+        session.conversation_mut().messages.push(message);
+    }
+}
+
+/// Pushes finished detached children back into the parent conversation.
+///
+/// This runs at a turn boundary, the only point where appending a system
+/// message cannot interleave with an in-flight model request or a tool result.
+/// Claiming a result and marking it delivered happen in one registry critical
+/// section, so a later turn start cannot inject the same result twice.
+fn drain_subagent_notifications(session: &mut InteractiveSession) {
+    let pending = session.task_registry().drain_pending_subagent_results();
+    for result in pending {
+        let message = Message::pinned_system(result.model_notification());
         session.append_message(&message);
         session.conversation_mut().messages.push(message);
     }

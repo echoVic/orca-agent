@@ -2,7 +2,8 @@ use std::path::Path;
 
 use orca_core::approval_types::{ActionKind, ApprovalMode};
 use orca_core::goal_types::ThreadGoal;
-use orca_core::subagent_types::SubagentType;
+use orca_core::subagent_config::DelegationPolicy;
+use orca_core::subagent_types::{SubagentType, builtin_agents};
 use orca_core::tool_types::ToolResult;
 use orca_tools::skills;
 
@@ -46,9 +47,14 @@ pub fn build_agent_system_prompt(
         approval_mode,
         memory,
         None,
+        DelegationPolicy::default(),
     )
 }
 
+/// Builds the agent system prompt with the delegation policy that actually
+/// applies to this agent. The policy selects the delegation guidance and
+/// nothing else; permissions remain enforced by the runtime.
+#[allow(clippy::too_many_arguments)]
 pub fn build_agent_system_prompt_with_goal(
     cwd: &Path,
     subagent_depth: u32,
@@ -57,6 +63,7 @@ pub fn build_agent_system_prompt_with_goal(
     approval_mode: ApprovalMode,
     memory: Option<&MemoryBlock>,
     active_goal: Option<&ThreadGoal>,
+    delegation: DelegationPolicy,
 ) -> String {
     let mut prompt = build_system_prompt(cwd);
     if let Some(block) = memory.and_then(MemoryBlock::to_system_prompt_block) {
@@ -67,14 +74,10 @@ pub fn build_agent_system_prompt_with_goal(
         prompt.push_str("\n\n");
         prompt.push_str(&block);
     }
-    if subagent_depth > 0 {
-        prompt.push_str(
-            "\n\n## Subagent Role\nYou are running as a synchronous subagent. Complete only the delegated task and return a concise report for the parent agent. Do not assume the user can see your intermediate tool output.",
-        );
-        let suffix = subagent_type.system_prompt_suffix();
-        if !suffix.is_empty() {
-            prompt.push_str(suffix);
-        }
+    if subagent_depth == 0 {
+        prompt.push_str(&format_subagent_guidance(delegation));
+    } else {
+        prompt.push_str(&format_child_agent_contract(subagent_type, delegation));
     }
     if approval_mode == ApprovalMode::Plan {
         prompt.push_str("\n\n");
@@ -85,6 +88,122 @@ pub fn build_agent_system_prompt_with_goal(
         prompt.push_str(&format_goal_mode_instructions(goal));
     }
     prompt
+}
+
+/// The role catalog, one line per built-in role. The full selection contract
+/// (avoid-when, tool ceiling, required report) lives in the `subagent` tool
+/// description so the stable prompt prefix stays small.
+fn format_role_catalog_capsule() -> String {
+    let mut output = String::new();
+    for descriptor in builtin_agents() {
+        output.push_str(&format!(
+            "\n- `{}`: {}",
+            descriptor.name, descriptor.when_to_use
+        ));
+    }
+    output
+}
+
+/// Delegation guidance for the main agent, selected by the effective policy.
+pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
+    let roles = format_role_catalog_capsule();
+    let header = match delegation {
+        DelegationPolicy::Off => {
+            return String::from(
+                r#"## Delegation
+
+Delegation is turned off for this task. Do not start new child agents.
+
+Existing children remain visible: `subagent_status` reports their progress and `task_stop` can stop one. If a task genuinely needs parallel work, say so and ask the user instead of working around the setting."#,
+            );
+        }
+        DelegationPolicy::Explicit => {
+            r#"## Delegation
+
+Start a child agent only when the user explicitly asked you to delegate, use parallel work, or hand a piece of this task to another agent. Otherwise complete the task yourself and keep the delegation guidance below as a fallback if the task later turns out to be much wider than it first appeared."#
+        }
+        DelegationPolicy::Adaptive => {
+            r#"## Delegation
+
+You may split independent work off to child agents inside the scope the user already authorized. Delegation is a tool, not a goal: the measure is whether the task finishes correctly and sooner, never how many agents ran."#
+        }
+    };
+
+    let rules = match delegation {
+        DelegationPolicy::Off => String::new(),
+        DelegationPolicy::Explicit => format!(
+            r#"
+Decision rules when you do delegate:
+1. Determine which modules the task touches, what must be solved first, and what your next local step is.
+2. Delegate a branch that can be answered on its own and matters to the result. Do not wait until you have read everything.
+3. Judgement is required, exploration is broad, or the raw output would be large: delegate to keep your own context for the work only you can do.
+4. Keep single-file work, small targeted lookups, tightly coupled changes, and anything needing live user input local.
+5. After delegating, keep working on a non-overlapping part. Do not repeat the same searches, and do not redraw the whole investigation once the result arrives — verify and integrate it.
+
+Built-in roles (pass the identifier in `subagent_type`):{roles}
+"#
+        ),
+        DelegationPolicy::Adaptive => format!(
+            r#"
+Decision rules:
+1. Determine which modules the task touches, what must be solved first, and what your next local step is.
+2. Delegate a branch that can be answered on its own and matters to the result. Do not wait until you have read everything.
+3. No parallel local work is available, but one line of investigation will produce a large amount of one-off output: delegate it to keep your own context for the work only you can do. Weigh this against the cost of starting and briefing a child.
+4. Keep single-file work, small targeted lookups, tightly coupled changes, and anything needing live user input local. Never delegate just to fill a quota.
+5. After delegating, keep working on a non-overlapping part. Do not repeat the same searches, and do not redraw the whole investigation once the result arrives — verify and integrate it.
+
+Built-in roles (pass the identifier in `subagent_type`):{roles}
+
+Scope discipline: delegate only work inside what the user asked for, and do not keep spawning children after the remaining work is smaller than the cost of briefing one."#
+        ),
+    };
+
+    format!("{header}{rules}")
+}
+
+/// The contract for a child agent: what it must produce and what it must not do.
+pub fn format_child_agent_contract(
+    subagent_type: &SubagentType,
+    delegation: DelegationPolicy,
+) -> String {
+    let mut contract = String::from(
+        "\n\n## Subagent Role\nYou are running as a subagent. Complete only the delegated task and return a concise report for the parent agent. Do not assume the user can see your intermediate tool output.",
+    );
+    contract.push_str(
+        "\n\nReturn, in this order:\n\
+         1. Status: complete, partial, failed, or uncertain.\n\
+         2. Result: the direct answer or the outcome, without restating the prompt.\n\
+         3. Evidence: exact `path:line` references, commands run, or command output for every claim that matters.\n\
+         4. Files changed: every file you modified, with a one-line reason (say \"none\" if you changed nothing).\n\
+         5. Verification: what you actually ran and its result, or an explicit statement that nothing was verified.\n\
+         6. Open questions: anything unresolved or needing a parent decision.",
+    );
+    match delegation {
+        DelegationPolicy::Off => contract.push_str(
+            "\n\nDo not start child agents of your own. The parent owns coordination for this task.",
+        ),
+        DelegationPolicy::Explicit | DelegationPolicy::Adaptive => contract.push_str(
+            "\n\nStay inside the delegated scope. Do not widen it into unrelated work, and do not start further agents unless the brief explicitly allows it.",
+        ),
+    }
+    let descriptor = subagent_type.builtin();
+    let Some(descriptor) = descriptor else {
+        return contract;
+    };
+    if descriptor.is_read_only() {
+        contract.push_str(
+            "\n\nThis role is enforced read-only: file edits, writes, and shell or process execution are denied at runtime, not merely discouraged. If the task appears to require a change, report what should change and why instead of attempting it.",
+        );
+    }
+    contract.push_str("\n\nRequired in your report: ");
+    contract.push_str(&descriptor.deliverables.join("; "));
+    contract.push('.');
+    // The role instructions are appended here, at the child's only prompt
+    // assembly point, so the prompt, the tool ceiling, and the model-visible
+    // catalog all come from the same descriptor.
+    contract.push_str("\n\n");
+    contract.push_str(descriptor.prompt);
+    contract
 }
 
 pub fn mode_context(approval_mode: ApprovalMode) -> Option<String> {

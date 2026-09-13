@@ -352,3 +352,76 @@ orca exec "analyze the codebase and refactor the auth module"
 5. **结果缓存**: 相同任务的子代理可以复用结果
 6. **超时控制**: 为子代理设置执行时间限制
 7. **资源追踪**: 统计子代理的 token 使用和工具调用次数
+
+---
+
+# 委派策略与角色目录（2026-09 更新）
+
+本节描述当前实现，取代上文「只支持一层嵌套」「同步执行模型」等历史描述。
+
+## 委派策略 `[subagents] delegation`
+
+委派策略与审批模式（`mode` / `approval`）是两个独立的轴：审批模式决定工具能不能执行，委派策略只决定主 agent 是否应当主动拆分任务。full-auto 不等于要求尽可能多地派单。
+
+```toml
+[subagents]
+max_depth = 2
+max_parallel = 6
+delegation = "adaptive"   # off | explicit | adaptive
+```
+
+| 值 | 行为 |
+|---|---|
+| `off` | 不开放新建子任务（`subagent` 工具不再下发，调用被硬拒绝）。已有子任务仍可 `subagent_status` 查询、`task_stop` 停止、按 id `resume_from` 续跑。 |
+| `explicit`（默认） | 只有用户明确要求委派时才主动启动；提示词里保留关键路径规则作为兜底。 |
+| `adaptive` | 允许在用户已授权的任务范围内自主拆分独立分支，同时保留本地关键路径。 |
+
+默认值为 `explicit`，所以在完成真实模型评测前，现有会话的行为不会改变。策略随 `DelegationSnapshot` 传给子 agent，并受 `max_depth` 约束：到达深度上限的子任务生效策略为 `off`。
+
+## 角色目录
+
+内置角色只有一处定义（`orca-core/src/subagent_types.rs` 的 `builtin_agents()`），同一份描述同时生成：模型可见目录、`subagent_type` 枚举、运行期工具上限、子 agent 提示词。
+
+| 角色 | 用途 | 工具上限 | 交付要求 |
+|---|---|---|---|
+| `explorer`（新增，别名 `explore`/`scout`） | 多文件只读探索、符号定位、调用链与依赖追踪 | `read_file` `glob` `grep` `git_status` | 直接结论、`path:line` 证据、未决问题 |
+| `general`（默认） | 边界明确的多步骤实现、需要执行的专项调查 | 读写 + `bash` + `web_search` | 结果、改动文件、实际跑过的验证 |
+| `code_reviewer`（`reviewer`） | 独立审查改动的缺陷与回归风险 | 只读 | 按严重程度、带 `path:line` 的缺陷 |
+| `test_writer`（`tester`） | 指定范围内的测试实现与执行 | 读写 + `bash` | 测试文件、测试命令与结果、未覆盖项 |
+| `debugger`（`debug`） | 复现、定位根因、受控验证 | 读写 + `bash` | 复现步骤、根因、是否真正复现 |
+| `documenter`（`docs`） | 任务明确要求的文档 | 读写（不含 `bash`） | 文档改动、每条结论的来源 |
+
+自定义 agent 仍然用 `.orca/agents/*.md` 定义，并且不能被 `explorer`/`explore`/`scout` 等保留名覆盖。
+
+## 只读角色是硬约束
+
+`explorer` 和 `code_reviewer` 的工具上限不只是提示词：角色上限会写入 `ChildAgentRequest.allowed_tools`，因此
+
+- 子 agent 的 provider schema 里根本看不到 `bash` / `edit` / `write_file`；
+- 即使模型硬报一个越界调用，也会在 `reject_disallowed_child_tool` 被拒绝并使该轮失败。
+
+越界不会因为 `resume_from`、自定义定义继承或 plan mode 而扩大；恢复时沿用 checkpoint 里冻结的角色。
+
+## 并发上限是会话级的
+
+`max_parallel` 现在是所有**分离式**子 agent 共享的运行中上限：direct async、UI 触发的 continue、以及后续任何独立进程子任务都计入同一个计数。计数来自持久 `TaskRegistry`，因此子 agent 跑在独立进程里也准确。
+
+同步批次子任务不计入这个计数：它已经被同一轮的批次窗口（宽度也是 `max_parallel`）限制住，而且父 agent 正阻塞等待它，把它也计入会让嵌套批次和自己的祖先互相饿死。两类瓶颈合起来保证不会有不受限的子任务数量。
+
+容量满时启动被拒绝并返回说明（不会留下无主进程），提示主 agent 不要立刻重试，而是继续本地工作或用 `subagent_status` / `task_stop` 收敛。
+
+## 分离模式的结果交付
+
+父 agent 没有阻塞等待的子任务（`mode: "async"`）完成后，结果会在下一个回合边界以 `<task-notification>` 注入父对话，而不是只停留在 TUI 里。投递标记随任务记录持久化，因此：
+
+- 同一结果不会重复注入；
+- 运行中的子任务不会被提前投递；
+- 失败也会带上失败原因；
+- 超长结果会截断并提示用 `subagent_status` 的 `output_next_offset` 取回余下内容；
+- 通知文本明确说明这是子 agent 的报告而非用户指令。
+
+同步子任务不需要通知——它的结果已经在 `subagent` 工具返回值里。
+
+## 预算边界（未变）
+
+cost budget 激活时 async 仍然被拒绝：跨进程的持久预算预留与结算闭环尚未实现，这条保护在闭环完成前保留。
