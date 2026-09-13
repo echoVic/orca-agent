@@ -11,7 +11,7 @@ export const releases = [
     version: "v0.4.30",
     date: "2026-09-12",
     title: "Faster, deterministic releases",
-    body: "Preserves full cross-platform coverage while promoting already-verified main commits, and removes Windows races from TUI activation, background terminal proofs, and cross-process workflow state replacement.",
+    body: "Preserves full cross-platform coverage while promoting already-verified main commits, and removes scheduler and Windows races from TUI background handoff, terminal proofs, and cross-process workflow state replacement.",
     url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.30",
   },
   {

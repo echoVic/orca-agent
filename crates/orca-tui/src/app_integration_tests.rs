@@ -1554,6 +1554,55 @@ fn matching_task_update(
     }
 }
 
+fn start_backgrounded_mock_tool(
+    home: &std::path::Path,
+    action_tx: &mpsc::Sender<UserAction>,
+    event_rx: &mpsc::Receiver<TuiEvent>,
+    tool_prompt: &str,
+) -> orca_core::task_types::BackgroundTaskSummary {
+    let release_marker = home.join("release-background-tool-call");
+    action_tx
+        .send(UserAction::Submit(format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({
+                "marker": release_marker.display().to_string(),
+                "toolPrompt": tool_prompt,
+            })
+        )))
+        .expect("submit release-marker tool stream");
+
+    loop {
+        match event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("release-marker tool stream start")
+        {
+            TuiEvent::MessageDelta(text) if text.contains("Mock slow tool stream started.") => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    action_tx
+        .send(UserAction::BackgroundCurrentTurn)
+        .expect("background current tool turn");
+    let backgrounded_task = loop {
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("backgrounded tool task update");
+        if let Some(task) = matching_task_update(event, |task| {
+            task.task_type == orca_core::task_types::TaskType::MainSession
+                && task.is_backgrounded
+                && task.status == orca_core::task_types::TaskStatus::Running
+        }) {
+            break task;
+        }
+    };
+
+    std::fs::write(release_marker, "release").expect("release backgrounded tool stream");
+    backgrounded_task
+}
+
 fn workflow_task(id: &str, name: &str) -> orca_core::task_types::BackgroundTaskSummary {
     orca_core::task_types::BackgroundTaskSummary {
         id: id.to_string(),
@@ -2293,7 +2342,7 @@ fn resumed_tui_projects_reconciled_terminal_legacy_task_as_non_actionable() {
 
 #[test]
 fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
-    with_orca_home(|_| {
+    with_orca_home(|home| {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -2314,32 +2363,15 @@ fn background_approval_action_denial_stops_task_and_refreshes_tasks() {
                 )
             }
         });
-        action_tx
-            .send(UserAction::Submit(
-                "mock_stream_tool_delay_ms 250 task_list".to_string(),
-            ))
-            .unwrap();
-        loop {
-            if matches!(
-                event_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-                TuiEvent::MessageDelta(text)
-                    if text.contains("Mock slow tool stream started.")
-            ) {
-                break;
-            }
-        }
-        action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
-        let (task_id, approval_id) = loop {
+        let backgrounded = start_backgrounded_mock_tool(home, &action_tx, &event_rx, "task_list");
+        let task_id = backgrounded.id;
+        let approval_id = loop {
             let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             if let Some(task) = matching_task_update(event, |task| {
-                task.task_type == orca_core::task_types::TaskType::MainSession
-                    && task.is_backgrounded
+                task.id == task_id
                     && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
             }) {
-                break (
-                    task.id,
-                    task.pending_tool_call.expect("pending background tool").id,
-                );
+                break task.pending_tool_call.expect("pending background tool").id;
             }
         };
         action_tx
@@ -5807,7 +5839,7 @@ fn hosted_goal_notification_request_preserves_pinned_task_semantics() {
 
 #[test]
 fn backgrounded_hosted_tui_does_not_complete_unexecuted_tool_calls() {
-    with_orca_home(|_| {
+    with_orca_home(|home| {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -5830,29 +5862,13 @@ fn backgrounded_hosted_tui_does_not_complete_unexecuted_tool_calls() {
             }
         });
 
-        action_tx
-            .send(UserAction::Submit(
-                "mock_stream_tool_delay_ms 250 task_list".to_string(),
-            ))
-            .unwrap();
-
-        loop {
-            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                TuiEvent::MessageDelta(text) if text.contains("Mock slow tool stream started.") => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+        let backgrounded = start_backgrounded_mock_tool(home, &action_tx, &event_rx, "task_list");
+        let task_id = backgrounded.id;
 
         let status = loop {
             let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             if let Some(task) = matching_task_update(event, |task| {
-                task.task_type == orca_core::task_types::TaskType::MainSession
-                    && task.is_backgrounded
-                    && task.status != orca_core::task_types::TaskStatus::Running
+                task.id == task_id && task.status != orca_core::task_types::TaskStatus::Running
             }) {
                 break task.status;
             }
@@ -5871,7 +5887,7 @@ fn backgrounded_hosted_tui_does_not_complete_unexecuted_tool_calls() {
 
 #[test]
 fn backgrounded_hosted_tui_marks_unexecuted_tool_calls_approval_required() {
-    with_orca_home(|_| {
+    with_orca_home(|home| {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -5894,29 +5910,13 @@ fn backgrounded_hosted_tui_marks_unexecuted_tool_calls_approval_required() {
             }
         });
 
-        action_tx
-            .send(UserAction::Submit(
-                "mock_stream_tool_delay_ms 250 task_list".to_string(),
-            ))
-            .unwrap();
-
-        loop {
-            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                TuiEvent::MessageDelta(text) if text.contains("Mock slow tool stream started.") => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+        let backgrounded = start_backgrounded_mock_tool(home, &action_tx, &event_rx, "task_list");
+        let task_id = backgrounded.id;
 
         let status = loop {
             let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             if let Some(task) = matching_task_update(event, |task| {
-                task.task_type == orca_core::task_types::TaskType::MainSession
-                    && task.is_backgrounded
-                    && task.status != orca_core::task_types::TaskStatus::Running
+                task.id == task_id && task.status != orca_core::task_types::TaskStatus::Running
             }) {
                 break task.status;
             }
@@ -5935,7 +5935,7 @@ fn backgrounded_hosted_tui_marks_unexecuted_tool_calls_approval_required() {
 
 #[test]
 fn backgrounded_hosted_tui_reports_pending_tool_name() {
-    with_orca_home(|_| {
+    with_orca_home(|home| {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -5958,28 +5958,13 @@ fn backgrounded_hosted_tui_reports_pending_tool_name() {
             }
         });
 
-        action_tx
-            .send(UserAction::Submit(
-                "mock_stream_tool_delay_ms 250 task_list".to_string(),
-            ))
-            .unwrap();
-
-        loop {
-            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                TuiEvent::MessageDelta(text) if text.contains("Mock slow tool stream started.") => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+        let backgrounded = start_backgrounded_mock_tool(home, &action_tx, &event_rx, "task_list");
+        let task_id = backgrounded.id;
 
         let pending_tool = loop {
             let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             if let Some(task) = matching_task_update(event, |task| {
-                task.task_type == orca_core::task_types::TaskType::MainSession
-                    && task.is_backgrounded
+                task.id == task_id
                     && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
             }) {
                 break task.pending_tool_call;
@@ -6027,22 +6012,8 @@ fn backgrounded_hosted_tui_notifies_approval_required_in_user_language() {
             }
         });
 
-        action_tx
-            .send(UserAction::Submit(
-                "mock_stream_tool_delay_ms 250 task_list".to_string(),
-            ))
-            .unwrap();
-
-        loop {
-            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                TuiEvent::MessageDelta(text) if text.contains("Mock slow tool stream started.") => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+        let backgrounded = start_backgrounded_mock_tool(home, &action_tx, &event_rx, "task_list");
+        let task_id = backgrounded.id;
 
         let mut notice = None;
         let mut seen = Vec::new();
@@ -6059,9 +6030,7 @@ fn backgrounded_hosted_tui_notifies_approval_required_in_user_language() {
                     let statuses = projection
                         .workflow_tasks
                         .into_iter()
-                        .filter(|task| {
-                            task.task_type == orca_core::task_types::TaskType::MainSession
-                        })
+                        .filter(|task| task.id == task_id)
                         .map(|task| format!("{:?}", task.status))
                         .collect::<Vec<_>>();
                     seen.push(format!("tasks: {}", statuses.join(",")));
@@ -6082,7 +6051,7 @@ fn backgrounded_hosted_tui_notifies_approval_required_in_user_language() {
 
 #[test]
 fn approved_background_tool_call_executes_and_completes_session() {
-    with_orca_home(|_| {
+    with_orca_home(|home| {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -6105,28 +6074,13 @@ fn approved_background_tool_call_executes_and_completes_session() {
             }
         });
 
-        action_tx
-            .send(UserAction::Submit(
-                "mock_stream_tool_delay_ms 250 task_list".to_string(),
-            ))
-            .unwrap();
+        let backgrounded = start_backgrounded_mock_tool(home, &action_tx, &event_rx, "task_list");
+        let task_id = backgrounded.id;
 
-        loop {
-            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                TuiEvent::MessageDelta(text) if text.contains("Mock slow tool stream started.") => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
-
-        let (task_id, approval_id) = loop {
+        let approval_id = loop {
             let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             if let Some(task) = matching_task_update(event, |task| {
-                task.task_type == orca_core::task_types::TaskType::MainSession
-                    && task.is_backgrounded
+                task.id == task_id
                     && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
             }) {
                 let approval_id = task
@@ -6135,7 +6089,7 @@ fn approved_background_tool_call_executes_and_completes_session() {
                     .expect("pending tool call")
                     .id
                     .clone();
-                break (task.id, approval_id);
+                break approval_id;
             }
         };
 
@@ -6203,7 +6157,7 @@ fn approved_background_tool_call_executes_and_completes_session() {
 
 #[test]
 fn approved_background_tool_call_does_not_prompt_again_for_same_tool() {
-    with_orca_home(|_| {
+    with_orca_home(|home| {
         let config = Arc::new(Mutex::new(test_config(HistoryMode::Record)));
         let preloaded = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded();
@@ -6226,28 +6180,14 @@ fn approved_background_tool_call_does_not_prompt_again_for_same_tool() {
             }
         });
 
-        action_tx
-            .send(UserAction::Submit(
-                "mock_stream_tool_delay_ms 250 mcp__broken__tool".to_string(),
-            ))
-            .unwrap();
-
-        loop {
-            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                TuiEvent::MessageDelta(text) if text.contains("Mock slow tool stream started.") => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        action_tx.send(UserAction::BackgroundCurrentTurn).unwrap();
+        let backgrounded =
+            start_backgrounded_mock_tool(home, &action_tx, &event_rx, "mcp__broken__tool");
+        let task_id = backgrounded.id;
 
         let approval_id = loop {
             let event = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             if let Some(task) = matching_task_update(event, |task| {
-                task.task_type == orca_core::task_types::TaskType::MainSession
-                    && task.is_backgrounded
+                task.id == task_id
                     && task.status == orca_core::task_types::TaskStatus::ApprovalRequired
                     && task
                         .pending_tool_call

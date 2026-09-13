@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use orca_platform::fs::{ExclusiveFileLock, open_nofollow_nonblocking};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use super::{TaskOutputBuffer, TaskOutputChunk, TaskOutputRead, TaskOutputStream};
 
@@ -387,26 +387,33 @@ impl OutputArchive {
         content: &str,
     ) -> io::Result<()> {
         self.check_files()?;
-        // Limit individual SQLite allocations even for a caller-provided giant append.
-        let mut remaining = content;
-        while !remaining.is_empty() {
-            let end = super::utf8_ceil(remaining, CHUNK_BYTES.min(remaining.len()));
-            if let Err(error) = self.append_chunk(task_id, stream, &remaining[..end]) {
-                self.write_failure = Some(error.to_string());
-                return Err(error);
+        let limits = self.limits;
+        let result = (|| {
+            let tx = self.connection.transaction().map_err(sql_error)?;
+            // Keep the persisted row bound stable while committing all chunks
+            // observed in one reader batch atomically.
+            let mut remaining = content;
+            while !remaining.is_empty() {
+                let end = super::utf8_ceil(remaining, CHUNK_BYTES.min(remaining.len()));
+                Self::append_chunk(&tx, limits, task_id, stream, &remaining[..end])?;
+                remaining = &remaining[end..];
             }
-            remaining = &remaining[end..];
+            tx.commit().map_err(sql_error)
+        })();
+        if let Err(error) = result {
+            self.write_failure = Some(error.to_string());
+            return Err(error);
         }
         Ok(())
     }
 
     fn append_chunk(
-        &mut self,
+        tx: &Transaction<'_>,
+        limits: ArchiveLimits,
         task_id: &str,
         stream: TaskOutputStream,
         content: &str,
     ) -> io::Result<()> {
-        let tx = self.connection.transaction().map_err(sql_error)?;
         let (start, stdout, stderr): (i64, i64, i64) = tx.query_row(
             "SELECT total, stdout_total, stderr_total FROM shells WHERE task_id = ?1 AND state = 'running'",
             [task_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -453,9 +460,7 @@ impl OutputArchive {
             ],
         )
         .map_err(sql_error)?;
-        let cutoff = end.saturating_sub(offset(
-            self.limits.task_bytes.min(self.limits.session_bytes),
-        )?);
+        let cutoff = end.saturating_sub(offset(limits.task_bytes.min(limits.session_bytes))?);
         tx.execute(
             "DELETE FROM chunks WHERE task_id = ?1 AND end <= ?2",
             params![task_id, cutoff],
@@ -513,7 +518,7 @@ impl OutputArchive {
                     Ok((row.get(0)?, row.get(1)?))
                 })
                 .map_err(sql_error)?;
-            if bytes <= self.limits.session_bytes && chunks <= self.limits.chunks {
+            if bytes <= limits.session_bytes && chunks <= limits.chunks {
                 break;
             }
             let removed = tx
@@ -529,7 +534,7 @@ impl OutputArchive {
                 ));
             }
         }
-        tx.commit().map_err(sql_error)
+        Ok(())
     }
 
     pub(super) fn tail(&self, task_id: &str, max_bytes: usize) -> io::Result<TaskOutputRead> {

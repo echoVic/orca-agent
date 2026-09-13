@@ -44,6 +44,8 @@ use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
+const SHELL_OUTPUT_READ_BUFFER_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct ShellSessionCommand {
     pub command: String,
@@ -2004,7 +2006,7 @@ fn spawn_output_reader<R: Read + Send + 'static>(
     zero_is_transient: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
+        let mut buffer = [0_u8; SHELL_OUTPUT_READ_BUFFER_BYTES];
         let mut pending = Vec::new();
         loop {
             match reader.read(&mut buffer) {
