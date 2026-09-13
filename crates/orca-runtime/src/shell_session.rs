@@ -28,7 +28,7 @@ use orca_windows_sandbox::{
 use uuid::Uuid;
 
 use crate::execution_broker::{ExecutionBroker, LaunchError};
-use crate::task_output::{TASK_OUTPUT_CHUNK_BYTES, TaskOutputRead, TaskOutputStore};
+use crate::task_output::{TaskOutputRead, TaskOutputStore};
 use crate::tasks::TaskRegistry;
 use orca_core::capability::{
     CapabilityProcessClass, CapabilityReceipt, CapabilityRequest, CapabilitySet,
@@ -43,6 +43,8 @@ use std::os::unix::io::FromRawFd;
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+
+const SHELL_OUTPUT_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ShellSessionCommand {
@@ -2004,7 +2006,7 @@ fn spawn_output_reader<R: Read + Send + 'static>(
     zero_is_transient: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut buffer = [0_u8; TASK_OUTPUT_CHUNK_BYTES];
+        let mut buffer = [0_u8; SHELL_OUTPUT_READ_BUFFER_BYTES];
         let mut pending = Vec::new();
         loop {
             match reader.read(&mut buffer) {
