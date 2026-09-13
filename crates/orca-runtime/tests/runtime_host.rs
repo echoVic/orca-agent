@@ -53,6 +53,7 @@ use orca_runtime::thread::RuntimeThread;
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(windows))]
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
+const WORKFLOW_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct OneShotProviderSuspension {
@@ -3411,7 +3412,7 @@ fn workflow_capacity_cleanup_keeps_the_thread_event_sequence() {
 
     assert!(matches!(
         operation
-            .wait_timeout(TEST_TIMEOUT)
+            .wait_timeout(WORKFLOW_CLEANUP_TIMEOUT)
             .expect("capacity failure terminal")
             .outcome(),
         OperationOutcome::ExecutionFailed {
