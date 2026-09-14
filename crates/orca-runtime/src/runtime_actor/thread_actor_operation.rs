@@ -2103,8 +2103,10 @@ impl ThreadActor {
         surface::MutationReply<surface::TaskControlOutput>,
         surface::SurfaceClientCommandError,
     > {
-        if self.background_controller.task_ownership().is_some()
-            || self.resident_surface.coordinator.has_incomplete_batch()
+        let has_active_task_ownership = self.background_controller.task_ownership().is_some();
+        if self.resident_surface.coordinator.has_incomplete_batch()
+            || (has_active_task_ownership
+                && !matches!(&action, surface::TaskControlAction::Stop { .. }))
         {
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
@@ -2170,6 +2172,9 @@ impl ThreadActor {
                     }),
                 },
             });
+        }
+        if has_active_task_ownership && task.task_type != surface::SurfaceTaskType::Subagent {
+            return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
         if task.task_type == surface::SurfaceTaskType::Subagent {
             if foreground {

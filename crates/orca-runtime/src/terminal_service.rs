@@ -1376,13 +1376,18 @@ mod tests {
         )
         .expect("start long command");
         assert_eq!(started.status, "running", "{started:?}");
+        let stop_started = Instant::now();
         assert!(service.stop_task(&started.task_id).expect("stop task"));
-
         let stopped = service
             .write_stdin(&started.session_id, None, Duration::ZERO, 8 * 1024, || {
                 false
             })
             .expect("poll stopped task");
+        assert!(
+            stop_started.elapsed() < Duration::from_secs(10),
+            "stopping a command must remain bounded well below natural completion"
+        );
+
         assert_ne!(stopped.status, "running", "{stopped:?}");
         assert_eq!(stopped.termination, "cancelled", "{stopped:?}");
     }

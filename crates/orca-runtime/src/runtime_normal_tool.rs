@@ -940,7 +940,7 @@ mod tests {
         );
 
         let mut granted = TurnPermissionOverlay::default();
-        granted.grant_additional_working_directory(std::path::PathBuf::from("/tmp/granted"));
+        granted.grant_additional_working_directory(std::env::temp_dir().join("granted"));
         let error = super::check_workspace_lifetime(TaskLifetime::Workspace, &granted)
             .expect_err("a temporary grant must not outlive its turn");
         assert!(error.contains("temporary permission grants"), "{error}");

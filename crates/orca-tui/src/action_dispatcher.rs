@@ -293,6 +293,30 @@ fn route_action(
                 let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
             }
         },
+        UserAction::StopTask { task_id } => {
+            match controller.stop_background_task(&task_id, event_tx) {
+                Ok(Some(projection)) => {
+                    let _ =
+                        event_tx.try_send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+                    let _ = event_tx.try_send(TuiEvent::Notice(format!(
+                        "Task stop requested for {task_id}."
+                    )));
+                }
+                Ok(None) => match enqueue_action(
+                    UserAction::StopTask { task_id },
+                    command_tx,
+                    backlog,
+                    backlog_capacity,
+                ) {
+                    EnqueueResult::Queued => {}
+                    EnqueueResult::Disconnected => return false,
+                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                },
+                Err(error) => {
+                    let _ = event_tx.try_send(TuiEvent::Error(error));
+                }
+            }
+        }
         UserAction::Cancel => return false,
         action => {
             let arms_surface_activation = matches!(

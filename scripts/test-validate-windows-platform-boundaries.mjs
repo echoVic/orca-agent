@@ -266,6 +266,7 @@ mod tests {
 mod tests {
     fn portable_fixtures() {
         let _ = test_canonical_path("orca-test");
+        let _ = std::env::temp_dir().join("granted");
         let _ = platform_command_argv();
         // Documentation example only: ["sh", "-lc"]
         /* Another documentation example: vec!["bash", "-lc"] */
@@ -564,12 +565,12 @@ for (const marker of ["Sha256", "receipt_path", "verify_setup_for_workspace"]) {
     `Windows setup receipts must be workspace-scoped: ${marker}`,
   );
 }
-const runtimeBashSource = readFileSync(
-  path.join(repoRoot, "crates/orca-runtime/src/runtime_bash.rs"),
+const terminalServiceSource = readFileSync(
+  path.join(repoRoot, "crates/orca-runtime/src/terminal_service.rs"),
   "utf8",
 );
 assert.ok(
-  runtimeBashSource.includes("domain-restricted network sandbox is unavailable"),
+  terminalServiceSource.includes("domain-restricted network sandbox is unavailable"),
   "Windows domain-restricted network policy must fail closed until direct bypass is enforced",
 );
 const serverSource = readFileSync(
@@ -950,12 +951,17 @@ assert.ok(
     !pauseResumeFixture.includes("agent('mock_stream_delay_ms 6000')"),
   "workflow pause/resume must create its pause window at the workflow runner boundary",
 );
-const runtimeLifecycleContract = readNormalizedSource(
-  "tests/runtime_lifecycle_contract.rs",
+const terminalStopFixture = terminalServiceSource.slice(
+  terminalServiceSource.indexOf(
+    "fn stop_task_terminates_the_owned_process()",
+  ),
+  terminalServiceSource.indexOf(
+    "fn background_command_settles_without_poll()",
+  ),
 );
 assert.ok(
-  runtimeLifecycleContract.includes("Duration::from_secs(10)") &&
-    runtimeLifecycleContract.includes("printf before; sleep 30; printf after"),
+  terminalStopFixture.includes("Duration::from_secs(10)") &&
+    terminalStopFixture.includes("printf ready; sleep 30"),
   "Windows shell cancellation must stay bounded well below the fixture's natural completion",
 );
 const bashToolSource = readNormalizedSource("crates/orca-tools/src/bash.rs");
