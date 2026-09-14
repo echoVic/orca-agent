@@ -11,7 +11,10 @@ use orca_core::task_types::TaskStatus;
 use serde::Serialize;
 
 use crate::lifecycle::TurnPermissionOverlay;
-use crate::network_proxy::{RuntimeNetworkPolicy, RuntimeNetworkProxy};
+use crate::network_proxy::{
+    RuntimeNetworkBlockReport, RuntimeNetworkPolicy, RuntimeNetworkProxy,
+    runtime_network_block_channel,
+};
 #[cfg(test)]
 use crate::shell_session::ShellSandboxMode;
 use crate::shell_session::{
@@ -53,6 +56,7 @@ struct TerminalSessionState {
     completion_queued: bool,
     completed_at: Option<Instant>,
     network_proxy: Option<RuntimeNetworkProxy>,
+    network_block_receiver: Option<Receiver<RuntimeNetworkBlockReport>>,
 }
 
 #[derive(Clone, Copy)]
@@ -71,6 +75,7 @@ enum TerminalCommand {
         command: Box<ShellSessionCommand>,
         metadata_writable_directories: Vec<PathBuf>,
         network_proxy: Option<RuntimeNetworkProxy>,
+        network_block_receiver: Option<Receiver<RuntimeNetworkBlockReport>>,
         /// Absolute deadline armed when the process actually starts.
         deadline: Option<(Instant, &'static str)>,
         /// The configured limit this deadline was derived from.
@@ -161,6 +166,8 @@ pub(crate) struct TerminalServiceOutput {
     pub(crate) deadline_source: Option<&'static str>,
     /// Wall-clock milliseconds from process start to the effective deadline.
     pub(crate) effective_deadline_ms: Option<u64>,
+    #[serde(skip)]
+    pub(crate) network_block: Option<RuntimeNetworkBlockReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,7 +241,7 @@ impl TerminalService {
     ) -> io::Result<TerminalServiceOutput> {
         let requested_deadline = request.execution_deadline;
         let request_lifetime = request.lifetime;
-        let (command, metadata_writable_directories, network_proxy) =
+        let (command, metadata_writable_directories, network_proxy, network_block_receiver) =
             prepare_shell_command(request)?;
         let deadline =
             requested_deadline.map(|deadline| (Instant::now() + deadline.after, deadline.source));
@@ -245,6 +252,7 @@ impl TerminalService {
             command: Box::new(command),
             metadata_writable_directories,
             network_proxy,
+            network_block_receiver,
             deadline,
             deadline_after,
             response,
@@ -509,6 +517,7 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                 command,
                 metadata_writable_directories,
                 network_proxy,
+                network_block_receiver,
                 deadline,
                 deadline_after,
                 response,
@@ -529,7 +538,11 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                         )));
                         continue;
                     }
-                    let mut session = TerminalSessionState::from_handle(handle, network_proxy);
+                    let mut session = TerminalSessionState::from_handle(
+                        handle,
+                        network_proxy,
+                        network_block_receiver,
+                    );
                     session.deadline = deadline;
                     session.deadline_after = deadline_after;
                     state.sessions.insert(handle.id.clone(), session);
@@ -695,6 +708,11 @@ impl TerminalServiceState {
                 .and_then(|session| session.deadline)
                 .map(|(_deadline, source)| source)
         });
+        let network_block = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|session| session.network_block_receiver.as_ref())
+            .and_then(|receiver| receiver.try_recv().ok());
         Ok(TerminalServiceOutput {
             session_id: session_id.to_string(),
             task_id,
@@ -725,6 +743,7 @@ impl TerminalServiceState {
                 .get(session_id)
                 .and_then(|session| session.deadline_after)
                 .map(|after| after.as_millis() as u64),
+            network_block,
         })
     }
 
@@ -919,12 +938,14 @@ fn merge_terminal_output(
     current.eof = next.eof;
     current.requested_terminal = next.requested_terminal;
     current.effective_terminal = next.effective_terminal;
+    current.network_block = current.network_block.take().or(next.network_block);
 }
 
 impl TerminalSessionState {
     fn from_handle(
         handle: &ShellSessionHandle,
         network_proxy: Option<RuntimeNetworkProxy>,
+        network_block_receiver: Option<Receiver<RuntimeNetworkBlockReport>>,
     ) -> Self {
         Self {
             task_id: handle.task_id.clone(),
@@ -939,6 +960,7 @@ impl TerminalSessionState {
             completion_queued: false,
             completed_at: None,
             network_proxy,
+            network_block_receiver,
         }
     }
 }
@@ -1003,6 +1025,7 @@ fn prepare_shell_command(
     ShellSessionCommand,
     Vec<PathBuf>,
     Option<RuntimeNetworkProxy>,
+    Option<Receiver<RuntimeNetworkBlockReport>>,
 )> {
     let mut sandbox = crate::server::bash_sandbox_for_cwd(request.config, request.cwd)
         .map_err(io::Error::other)?;
@@ -1039,12 +1062,17 @@ fn prepare_shell_command(
         ));
     }
 
-    let network_proxy = if sandbox.network_policy_domains.is_empty() {
-        None
+    let (network_proxy, network_block_receiver) = if sandbox.network_policy_domains.is_empty() {
+        (None, None)
     } else {
-        Some(RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(
-            sandbox.network_policy_domains.clone(),
-        ))?)
+        let (reporter, receiver) = runtime_network_block_channel();
+        (
+            Some(RuntimeNetworkProxy::start_with_block_reporter(
+                RuntimeNetworkPolicy::new(sandbox.network_policy_domains.clone()),
+                Some(reporter),
+            )?),
+            Some(receiver),
+        )
     };
     let mut env = BTreeMap::new();
     if let Some(proxy) = network_proxy.as_ref() {
@@ -1085,6 +1113,7 @@ fn prepare_shell_command(
         },
         metadata_writable_directories,
         network_proxy,
+        network_block_receiver,
     ))
 }
 
@@ -1283,6 +1312,45 @@ mod tests {
 
         assert_eq!(output.status, "completed", "{output:?}");
         assert_eq!(output.output, "unified");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn exec_returns_structured_network_block_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut overlay = TurnPermissionOverlay::default();
+        overlay.merge_network_permissions(&crate::protocol::RequestPermissionProfile {
+            file_system: None,
+            network: Some(crate::protocol::RequestNetworkPermissions {
+                enabled: Some(true),
+                domains: std::collections::HashMap::from([(
+                    "api.example.com".to_string(),
+                    PermissionProfileNetworkAccess::Allow,
+                )]),
+            }),
+        });
+        let (service, _) = service(temp.path());
+        let output = start(
+            &service,
+            request(
+                "curl --max-time 2 --proxy \"$HTTP_PROXY\" -sS -o /dev/null http://blocked.orca.invalid/ || true",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_secs(5),
+            8 * 1024,
+            || false,
+        )
+        .expect("exec through policy proxy");
+
+        assert_eq!(
+            output.network_block,
+            Some(RuntimeNetworkBlockReport {
+                host: "blocked.orca.invalid".to_string(),
+                error: "blocked-by-allowlist",
+            })
+        );
     }
 
     #[test]

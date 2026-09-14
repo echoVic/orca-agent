@@ -171,6 +171,7 @@ pub(crate) struct RuntimeNormalToolWorkerContext<'a> {
 impl RuntimeNormalToolWorkerContext<'_> {
     /// Reports output the running tool observed, so clients can render
     /// progress before the call terminates.
+    #[cfg(test)]
     pub(crate) fn emit_output(&mut self, chunk: &str) {
         if let Some(handler) = self.output_handler.as_deref_mut() {
             handler(chunk);

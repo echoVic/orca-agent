@@ -459,6 +459,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             mcp_registry,
             &config.external_tools,
         ) {
+            let error = result.error.clone();
             let event_error = emit_tool_terminal_events(
                 events,
                 sink,
@@ -483,7 +484,22 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             if let Some(error) = event_error {
                 return Err(error);
             }
-            continue;
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                provider_response_ingress,
+                "an earlier sibling was rejected by the child tool policy",
+            )?;
+            return Ok(ToolTurnOutcome::Return {
+                status: RunStatus::Failed,
+                error,
+                terminal: None,
+            });
         }
 
         let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)

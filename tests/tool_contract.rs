@@ -348,7 +348,7 @@ output_truncation = { mode = "tokens", limit = 12 }
             "mock",
             "--approval-mode",
             "full-auto",
-            "bash printf 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma'",
+            "bash_wait 10000 :: printf 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma'",
         ])
         .output()
         .expect("run orca");

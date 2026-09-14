@@ -233,7 +233,7 @@ fn headless_explicit_three_turn_budget_stops_with_typed_terminal() {
 }
 
 #[test]
-fn failed_multi_call_turn_has_one_terminal_per_assistant_call() {
+fn synchronous_subagent_batch_has_one_terminal_per_assistant_call() {
     let home = tempdir().expect("temporary ORCA_HOME");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
@@ -249,7 +249,7 @@ fn failed_multi_call_turn_has_one_terminal_per_assistant_call() {
         .output()
         .expect("run orca");
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(0));
 
     let events = parse_jsonl(&output.stdout);
     let records = parse_jsonl(&fs::read(only_session_file(home.path())).expect("read session"));
@@ -317,7 +317,7 @@ fn failed_multi_call_turn_has_one_terminal_per_assistant_call() {
         .map(|event| event["payload"]["status"].as_str().unwrap_or_default())
         .collect::<Vec<_>>();
     assert_eq!(statuses, ["failed", "completed", "completed"]);
-    assert_eq!(events.last().unwrap()["payload"]["status"], "failed");
+    assert_eq!(events.last().unwrap()["payload"]["status"], "success");
 }
 
 fn find_event<'a>(events: &'a [Value], event_type: &str) -> Option<&'a Value> {

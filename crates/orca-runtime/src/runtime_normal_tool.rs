@@ -4,6 +4,11 @@ use std::time::{Duration, Instant};
 use orca_core::tool_types::{ToolName, ToolResult};
 use serde::Deserialize;
 
+use crate::protocol::PermissionResponseDecision;
+use crate::runtime_permission::{
+    RuntimePermissionEvaluation, RuntimePermissionOrigin, RuntimePermissionPolicy,
+};
+use crate::runtime_state::PermissionRuntimeState;
 use crate::runtime_tool_call::{RuntimeNormalToolInvocation, RuntimeNormalToolWorkerContext};
 use crate::shell_session::ShellTerminalMode;
 use crate::terminal_service::{ExecutionDeadline, TerminalExecRequest, TerminalServiceOutput};
@@ -209,24 +214,78 @@ fn execute_bash(
             execution_deadline = Some(inherited);
         }
     }
-    let output = service.exec(
-        TerminalExecRequest {
-            lifetime,
-            command,
-            cwd: &cwd,
-            additional_roots: &invocation.additional_roots,
-            config: &invocation.config,
-            permission_overlay: &invocation.permission_overlay,
-            terminal,
-            execution_deadline,
-            #[cfg(test)]
-            sandbox_override: None,
-        },
-        yield_time(args.yield_time_ms, DEFAULT_YIELD_TIME_MS),
-        max_command_output_bytes(invocation, args.max_output_tokens),
-        || context.cancel.is_cancelled(),
-        &mut |chunk: &str| context.emit_output(chunk),
-    );
+    let cancel = context.cancel;
+    let output_handler = &mut context.output_handler;
+    let mut run = |permission_overlay: &crate::runtime_permission::TurnPermissionOverlay| {
+        service.exec(
+            TerminalExecRequest {
+                lifetime,
+                command,
+                cwd: &cwd,
+                additional_roots: &invocation.additional_roots,
+                config: &invocation.config,
+                permission_overlay,
+                terminal,
+                execution_deadline,
+                #[cfg(test)]
+                sandbox_override: None,
+            },
+            yield_time(args.yield_time_ms, DEFAULT_YIELD_TIME_MS),
+            max_command_output_bytes(invocation, args.max_output_tokens),
+            || cancel.is_cancelled(),
+            &mut |chunk: &str| {
+                if let Some(handler) = output_handler.as_deref_mut() {
+                    handler(chunk);
+                }
+            },
+        )
+    };
+    let mut output = run(context.permission_overlay);
+    if let Ok(first) = &output
+        && let Some(block) = &first.network_block
+    {
+        match RuntimePermissionPolicy::network_block_evaluation(
+            &invocation.request.id,
+            RuntimePermissionOrigin::Bash,
+            block,
+        ) {
+            RuntimePermissionEvaluation::Deny { reason, .. } => {
+                return ToolResult::denied(&invocation.request, reason);
+            }
+            RuntimePermissionEvaluation::Request(decision) => {
+                let Some(handler) = context.permission_handler else {
+                    return ToolResult::denied(
+                        &invocation.request,
+                        decision
+                            .request
+                            .reason
+                            .unwrap_or_else(|| "network permission required".to_string()),
+                    );
+                };
+                let response = match PermissionRuntimeState.request_permission(
+                    context.permission_overlay,
+                    handler,
+                    decision.into_request(),
+                ) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return ToolResult::failed_after_start(
+                            &invocation.request,
+                            error.to_string(),
+                            None,
+                        );
+                    }
+                };
+                if response.decision == PermissionResponseDecision::Deny {
+                    return ToolResult::denied(
+                        &invocation.request,
+                        "permission request denied".to_string(),
+                    );
+                }
+                output = run(context.permission_overlay);
+            }
+        }
+    }
     terminal_output_result(invocation, output.map(Some))
 }
 
@@ -742,10 +801,21 @@ fn terminal_output_result(
             );
         }
     };
-    if running {
-        ToolResult::running(&invocation.request, serialized, output.truncated)
-    } else {
-        ToolResult::completed(&invocation.request, serialized, output.truncated)
+    match output.status {
+        "running" => ToolResult::running(&invocation.request, serialized, output.truncated),
+        "completed" => ToolResult::completed(&invocation.request, serialized, output.truncated),
+        "stopped" if output.termination == "cancelled" => {
+            let mut result =
+                ToolResult::cancelled(&invocation.request, serialized, output.exit_code);
+            result.set_truncated(output.truncated);
+            result
+        }
+        _ => {
+            let mut result =
+                ToolResult::failed_after_start(&invocation.request, serialized, output.exit_code);
+            result.set_truncated(output.truncated);
+            result
+        }
     }
 }
 
@@ -830,11 +900,19 @@ mod tests {
             deadline_reached: false,
             deadline_source: None,
             effective_deadline_ms: None,
+            network_block: None,
         }
     }
 
     fn payload(result: &orca_core::tool_types::ToolResult) -> serde_json::Value {
-        serde_json::from_str(result.output.as_deref().expect("output")).expect("json payload")
+        serde_json::from_str(
+            result
+                .output
+                .as_deref()
+                .or(result.error.as_deref())
+                .expect("terminal payload"),
+        )
+        .expect("json payload")
     }
 
     #[test]
@@ -886,13 +964,35 @@ mod tests {
         timed_out.effective_deadline_ms = Some(1_500);
         let result = terminal_output_result(&invocation, Ok(Some(timed_out)));
 
-        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.status, ToolStatus::Failed);
         let payload = payload(&result);
         assert_eq!(payload["return_reason"], "deadline_exceeded");
         assert_eq!(payload["termination_reason"], "timed_out");
         assert_eq!(payload["deadline_source"], "caller timeout_ms");
         assert_eq!(payload["effective_deadline_ms"], 1_500);
         assert_ne!(payload["exit_code"], 0);
+    }
+
+    #[test]
+    fn a_cancelled_command_is_not_reported_as_completed() {
+        let invocation = invocation();
+        let result = terminal_output_result(
+            &invocation,
+            Ok(Some(output("stopped", "cancelled", Some(137)))),
+        );
+
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(result.exit_code, Some(137));
+    }
+
+    #[test]
+    fn a_failed_command_is_not_reported_as_completed() {
+        let invocation = invocation();
+        let result =
+            terminal_output_result(&invocation, Ok(Some(output("failed", "exited", Some(2)))));
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(result.exit_code, Some(2));
     }
 
     #[test]
