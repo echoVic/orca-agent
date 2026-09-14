@@ -27,6 +27,17 @@ run 支持 --cwd、--model、--api-key、--base-url、--args 和 --resume-from-r
 
 名称形式从配置的工作流目录解析；路径形式直接指定脚本。工作流脚本是带元数据导出的 JavaScript 模块，不是 YAML 文件。应把脚本、验证逻辑和输入模式放进版本控制。
 
+## 共享执行容量
+
+Workflow agent 调用不会创建独立 worker 池。它们与直接、嵌套、托管和恢复的子代理
+共用根任务树的持久执行作用域。`max_running` 满额时，已接受任务保持排队且不会
+提前创建 worker。父代理通过 `task_wait` 等待时会在安全检查点释放执行 lease，
+继续运行前必须重新取得名额。
+
+Workflow 子任务与直接子代理共用 `task_list`、`task_wait`、
+`task_read_output`、`task_send_input` 和 `task_stop`。旧的
+`subagent_status` 以及模型可见的 sync/async 模式不再属于当前协议。
+
 ## 观察与恢复
 
 ~~~bash

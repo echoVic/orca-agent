@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.30";
+export const releaseVersion = "v0.4.31";
 
 export const releases = [
+  {
+    version: "v0.4.31",
+    date: "2026-09-14",
+    title: "Unified subagent scheduling",
+    body: "Runs direct, nested, Workflow, hosted, and resumed child agents through one durable 32-slot execution scope with queued admission, persistent budget settlement, reliable result delivery, and one shared task control plane. Bash now uses the same managed command lifecycle.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.31",
+  },
   {
     version: "v0.4.30",
     date: "2026-09-12",

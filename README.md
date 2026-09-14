@@ -124,6 +124,11 @@ deletion.
   a new prompt to the same durable child conversation. Task/status output on
   TUI, ACP, JSONL, and headless surfaces includes the current attempt,
   checkpoint, resumable, and indeterminate state.
+- Runs direct, nested, Workflow, hosted, continued, and recovered children
+  through one durable execution scope per root task tree. The default 32
+  execution leases are a capacity ceiling rather than a delegation target;
+  accepted overflow queues without creating a worker, and parents waiting for
+  children yield their lease before re-entering the fair queue.
 - Keeps up to four active child summaries visible in the conversation and up to
   eight durable activity entries per child. `/tasks` opens live transcripts and
   exposes only controls the selected child can safely perform: stop, resume,

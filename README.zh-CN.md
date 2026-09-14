@@ -101,6 +101,9 @@ Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
   并通过子智能体和 JavaScript 工作流处理长任务。Conversation 最多保留 4 行
   子代理实时摘要，每个 child 最多持久化 8 条活动历史；`/tasks` 可进入实时
   transcript，并按 child 的可恢复状态提供 stop、resume、retry 和 follow-up。
+- 直接、嵌套、Workflow、托管、续跑和恢复的子代理共用每棵根任务树的持久执行
+  作用域。默认 32 个执行 lease 是容量上限而非派单目标；超出的已接受任务排队且
+  不提前创建 worker，等待子任务的父代理会释放名额并在恢复前重新进入公平队列。
 - 在工作区受信任后加载项目指令、Skills、Plugins、自定义工具、MCP 工具和资源。
 - 为编辑器、测试框架和 CI 提供稳定的 JSONL、app-server 与 Agent Client
   Protocol（ACP）协议。
