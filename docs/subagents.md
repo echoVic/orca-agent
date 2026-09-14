@@ -92,6 +92,32 @@ instead of a tool failure. Use `task_wait`, `task_read_output`, `task_list`, and
 `task_stop` to observe and control the task. Finite parent budgets use the same
 path through a durable child reservation.
 
+## Scheduling And Capacity
+
+Direct, nested, Workflow, hosted, continued, and recovered children share one
+durable execution scope per root task tree:
+
+```toml
+[subagents]
+delegation = "adaptive" # off | explicit | adaptive
+max_depth = 2
+max_running = 32
+max_queued = 256
+max_live_tasks = 512
+max_investigation_turns = 6
+max_investigation_tool_calls = 8
+```
+
+`max_running` is a capacity ceiling, not a target number of children. When it
+is full, accepted work remains queued without creating a worker. `max_queued`
+bounds work waiting to start; `max_live_tasks` bounds all non-terminal
+descendants, including parents that released their execution lease while
+waiting for children. A waiting parent must re-enter the fair queue before it
+can continue.
+
+The retired `max_parallel` key is ignored. Use `delegation = "off"` to disable
+new child submission.
+
 Built-in read-only roles (`explorer` and `code_reviewer`) have runtime-owned
 evidence limits. After 6 model turns or 8 started tool calls, Orca closes the
 unstarted remainder of the current tool batch and asks for one tool-free final

@@ -93,18 +93,16 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
         "TUI did not advance to the runtime-owned tool approval",
     );
     process.write(b"1").expect("approve bash once");
-    receive_until(
+    assert_screen_shows_wrapped_token(
         &process,
         &mut output,
         PERMISSION_SENTINEL,
-        Duration::from_secs(10),
         "TUI did not resume after the typed capability response",
     );
-    receive_until(
+    assert_screen_shows(
         &process,
         &mut output,
         "Mock completed after tool execution.",
-        Duration::from_secs(10),
         "TUI did not complete after the approved tool execution",
     );
 
@@ -149,19 +147,22 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
     let cwd = tempfile::tempdir().expect("temporary workspace");
     std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n")
         .expect("configure full-auto mode");
+    let release_marker = cwd.path().join("release-detached-subagent");
     let mut process = PtyProcess::spawn_with_prompt(
         home.path(),
         cwd.path(),
-        "subagent async mock_stream_delay_ms 30000",
+        &format!(
+            "subagent mock_stream_release_marker {}",
+            release_marker.display()
+        ),
     )
     .expect("spawn detached-subagent TUI in PTY");
     let mut output = Vec::new();
-    receive_until(
+    assert_screen_shows(
         &process,
         &mut output,
-        "Mock completed after tool execution.",
-        Duration::from_secs(20),
-        "parent turn did not finish after launching the detached child",
+        "Agents 1 active",
+        "parent did not expose the running detached child",
     );
 
     process.write(b"/tasks\r").expect("open Tasks workspace");
@@ -174,7 +175,7 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
     assert_screen_shows(
         &process,
         &mut output,
-        "mock_stream_delay_ms 30000",
+        "mock_stream_release_marker",
         "Tasks workspace did not expose the detached child",
     );
     process.write(b"s").expect("stop selected subagent");
@@ -554,6 +555,34 @@ fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &st
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if screen_contains(output, expected) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "{failure}; reconstructed screen=\n{}",
+                reconstruct_screen(output)
+            );
+        }
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+}
+
+fn assert_screen_shows_wrapped_token(
+    process: &PtyProcess,
+    output: &mut Vec<u8>,
+    expected: &str,
+    failure: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let compact: String = reconstruct_screen(output)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        if compact.contains(expected) {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());

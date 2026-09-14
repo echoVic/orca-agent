@@ -348,7 +348,7 @@ output_truncation = { mode = "tokens", limit = 12 }
             "mock",
             "--approval-mode",
             "full-auto",
-            "bash printf 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma'",
+            "bash_wait 10000 :: printf 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma'",
         ])
         .output()
         .expect("run orca");
@@ -365,7 +365,13 @@ output_truncation = { mode = "tokens", limit = 12 }
     let events = parse_jsonl(&output.stdout);
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
-    assert_eq!(completed["payload"]["status"], "completed");
+    assert!(
+        matches!(
+            completed["payload"]["status"].as_str(),
+            Some("running" | "completed")
+        ),
+        "a capped first page may return before the process exit is observed: {completed}"
+    );
     assert_eq!(completed["payload"]["truncated"], true);
     // A capped page is not a lost result. The command envelope carries the
     // cursor that continues it, so the caller reads the rest instead of

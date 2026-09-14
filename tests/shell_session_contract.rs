@@ -293,7 +293,7 @@ fn shell_session_kill_preserves_already_exited_terminal_with_buffered_output() {
             env: Default::default(),
             description: "already completed shell".to_string(),
             terminal: ShellTerminalMode::pipe(),
-            sandbox: ShellSandboxMode::default(),
+            sandbox: ShellSandboxMode::DangerFullAccess,
         })
         .expect("spawn shell session");
 

@@ -106,6 +106,14 @@ impl RuntimeNetworkPolicy {
             None => RuntimeNetworkDecision::Allow,
         }
     }
+
+    fn with_allowed_host(&self, host: &str) -> Self {
+        let mut policy = self.clone();
+        policy
+            .domains
+            .insert(normalize_host(host), PermissionProfileNetworkAccess::Allow);
+        policy
+    }
 }
 
 pub struct RuntimeNetworkProxy {
@@ -125,12 +133,20 @@ impl RuntimeNetworkProxy {
         policy: RuntimeNetworkPolicy,
         block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
     ) -> io::Result<Self> {
-        Self::start_with_connection_limit(policy, block_reporter, MAX_PROXY_CONNECTIONS)
+        Self::start_with_connection_limit(policy, block_reporter, None, MAX_PROXY_CONNECTIONS)
+    }
+
+    pub fn start_with_permission_gate(
+        policy: RuntimeNetworkPolicy,
+        permission_gate: Option<mpsc::SyncSender<RuntimeNetworkBlockRequest>>,
+    ) -> io::Result<Self> {
+        Self::start_with_connection_limit(policy, None, permission_gate, MAX_PROXY_CONNECTIONS)
     }
 
     fn start_with_connection_limit(
         policy: RuntimeNetworkPolicy,
         block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
+        permission_gate: Option<mpsc::SyncSender<RuntimeNetworkBlockRequest>>,
         max_connections: usize,
     ) -> io::Result<Self> {
         if max_connections == 0 {
@@ -156,6 +172,7 @@ impl RuntimeNetworkProxy {
                     listener,
                     Arc::new(policy),
                     block_reporter,
+                    permission_gate,
                     max_connections,
                     supervisor_active_connections,
                     shutdown_receiver,
@@ -195,7 +212,7 @@ impl RuntimeNetworkProxy {
         block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
         max_connections: usize,
     ) -> io::Result<Self> {
-        Self::start_with_connection_limit(policy, block_reporter, max_connections)
+        Self::start_with_connection_limit(policy, block_reporter, None, max_connections)
     }
 
     pub fn proxy_url(&self) -> &str {
@@ -241,10 +258,40 @@ pub fn runtime_network_block_channel() -> (
     mpsc::sync_channel(MAX_NETWORK_BLOCK_REPORTS)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeNetworkBlockDecision {
+    Allow,
+    Deny,
+}
+
+pub struct RuntimeNetworkBlockRequest {
+    pub report: RuntimeNetworkBlockReport,
+    decision: oneshot::Sender<RuntimeNetworkBlockDecision>,
+}
+
+impl RuntimeNetworkBlockRequest {
+    pub fn resolve(self, decision: RuntimeNetworkBlockDecision) -> io::Result<()> {
+        self.decision.send(decision).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network permission request is no longer active",
+            )
+        })
+    }
+}
+
+pub fn runtime_network_permission_gate_channel() -> (
+    mpsc::SyncSender<RuntimeNetworkBlockRequest>,
+    mpsc::Receiver<RuntimeNetworkBlockRequest>,
+) {
+    mpsc::sync_channel(MAX_NETWORK_BLOCK_REPORTS)
+}
+
 async fn run_proxy_supervisor(
     listener: StdTcpListener,
     policy: Arc<RuntimeNetworkPolicy>,
     block_reporter: Option<mpsc::SyncSender<RuntimeNetworkBlockReport>>,
+    permission_gate: Option<mpsc::SyncSender<RuntimeNetworkBlockRequest>>,
     max_connections: usize,
     active_connections: Arc<AtomicUsize>,
     mut shutdown: oneshot::Receiver<()>,
@@ -295,12 +342,21 @@ async fn run_proxy_supervisor(
                 let policy = Arc::clone(&policy);
                 let resolver = Arc::clone(&resolver);
                 let reporter = block_reporter.clone();
+                let permission_gate = permission_gate.clone();
                 let active_connections = Arc::clone(&active_connections);
                 active_connections.fetch_add(1, Ordering::AcqRel);
+                let active = ActiveConnectionGuard(active_connections);
                 connections.spawn(async move {
                     let _permit = permit;
-                    let _active = ActiveConnectionGuard(active_connections);
-                    let _ = handle_proxy_connection(stream, &policy, reporter.as_ref(), &resolver).await;
+                    let _active = active;
+                    let _ = handle_proxy_connection(
+                        stream,
+                        &policy,
+                        reporter.as_ref(),
+                        permission_gate.as_ref(),
+                        &resolver,
+                    )
+                    .await;
                 });
             }
         }
@@ -333,6 +389,7 @@ async fn handle_proxy_connection(
     mut client: TcpStream,
     policy: &RuntimeNetworkPolicy,
     block_reporter: Option<&mpsc::SyncSender<RuntimeNetworkBlockReport>>,
+    permission_gate: Option<&mpsc::SyncSender<RuntimeNetworkBlockRequest>>,
     resolver: &TokioResolver,
 ) -> io::Result<()> {
     let request = {
@@ -362,11 +419,20 @@ async fn handle_proxy_connection(
         write_forbidden(&mut client, RuntimeNetworkBlockReason::Policy, None).await?;
         return Ok(());
     }
+    let mut approved_policy = None;
     if let RuntimeNetworkDecision::Block(reason) = policy.decision_for_host(&host) {
         report_block(block_reporter, &host, reason);
-        write_forbidden(&mut client, reason, Some(&host)).await?;
-        return Ok(());
+        let decision = request_network_permission(permission_gate, &host, reason).await;
+        if reason != RuntimeNetworkBlockReason::Denylist
+            && decision == Some(RuntimeNetworkBlockDecision::Allow)
+        {
+            approved_policy = Some(policy.with_allowed_host(&host));
+        } else {
+            write_forbidden(&mut client, reason, Some(&host)).await?;
+            return Ok(());
+        }
     }
+    let policy = approved_policy.as_ref().unwrap_or(policy);
 
     let proxy_result = if method.eq_ignore_ascii_case("CONNECT") {
         proxy_connect(&mut client, target, policy, resolver).await
@@ -397,6 +463,25 @@ async fn handle_proxy_connection(
         return Ok(());
     }
     proxy_result
+}
+
+async fn request_network_permission(
+    permission_gate: Option<&mpsc::SyncSender<RuntimeNetworkBlockRequest>>,
+    host: &str,
+    reason: RuntimeNetworkBlockReason,
+) -> Option<RuntimeNetworkBlockDecision> {
+    let permission_gate = permission_gate?;
+    let (decision, receiver) = oneshot::channel();
+    permission_gate
+        .try_send(RuntimeNetworkBlockRequest {
+            report: RuntimeNetworkBlockReport {
+                host: normalize_host(host),
+                error: reason.proxy_error(),
+            },
+            decision,
+        })
+        .ok()?;
+    receiver.await.ok()
 }
 
 fn report_block(
@@ -1038,6 +1123,92 @@ mod tests {
             Err(RecvTimeoutError::Disconnected),
             "report queue remains owned until the proxy is dropped"
         );
+    }
+
+    #[test]
+    fn permission_gate_resumes_the_same_blocked_proxy_connection() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_port = upstream.local_addr().expect("upstream address").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().expect("accept approved request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone upstream stream"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("read request") != 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nresumed")
+                .expect("write upstream response");
+        });
+        let (gate_sender, gate_receiver) = runtime_network_permission_gate_channel();
+        let proxy = RuntimeNetworkProxy::start_with_permission_gate(
+            RuntimeNetworkPolicy::new(HashMap::from([(
+                "api.example.com".to_string(),
+                PermissionProfileNetworkAccess::Allow,
+            )])),
+            Some(gate_sender),
+        )
+        .expect("start gated proxy");
+        let mut client = TcpStream::connect(proxy_addr(&proxy)).expect("connect to proxy");
+        write!(
+            client,
+            "GET http://127.0.0.1:{upstream_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write blocked request");
+
+        let request = gate_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("permission gate request");
+        assert_eq!(request.report.host, "127.0.0.1");
+        assert_eq!(request.report.error, "blocked-by-policy");
+        request
+            .resolve(RuntimeNetworkBlockDecision::Allow)
+            .expect("allow blocked request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read resumed response");
+        assert!(response.contains("200 OK"));
+        assert!(response.ends_with("resumed"));
+        server.join().expect("upstream server");
+    }
+
+    #[test]
+    fn permission_gate_cannot_override_an_explicit_denylist() {
+        let (gate_sender, gate_receiver) = runtime_network_permission_gate_channel();
+        let proxy = RuntimeNetworkProxy::start_with_permission_gate(
+            RuntimeNetworkPolicy::new(HashMap::from([(
+                "blocked.example.com".to_string(),
+                PermissionProfileNetworkAccess::Deny,
+            )])),
+            Some(gate_sender),
+        )
+        .expect("start gated proxy");
+        let mut client = TcpStream::connect(proxy_addr(&proxy)).expect("connect to proxy");
+        write!(
+            client,
+            "GET http://blocked.example.com/ HTTP/1.1\r\nHost: blocked.example.com\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write denied request");
+
+        let request = gate_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("denylist report");
+        assert_eq!(request.report.host, "blocked.example.com");
+        assert_eq!(request.report.error, "blocked-by-denylist");
+        request
+            .resolve(RuntimeNetworkBlockDecision::Allow)
+            .expect("resolve request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read denied response");
+        assert!(response.contains("403 Forbidden"));
     }
 
     #[test]

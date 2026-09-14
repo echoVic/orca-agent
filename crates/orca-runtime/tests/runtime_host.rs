@@ -1494,8 +1494,9 @@ fn interrupt_waits_for_sync_subagent_cleanup_before_accepting_next_turn() {
 }
 
 #[test]
-fn async_agent_thread_outlives_parent_turn_and_remains_addressable() {
+fn parent_waits_for_async_agent_while_child_thread_remains_addressable() {
     let cwd = tempfile::tempdir().unwrap();
+    let release_marker = cwd.path().join("release-async-agent");
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
     let host = RuntimeHost::start().expect("start runtime host");
@@ -1506,36 +1507,49 @@ fn async_agent_thread_outlives_parent_turn_and_remains_addressable() {
     let observer = Arc::new(RecordingEventObserver::default());
     let operation = thread
         .start_turn(
-            HostedTurnRequest::new("subagent async mock_stream_delay_ms 500")
-                .with_event_observer(observer.clone()),
+            HostedTurnRequest::new(format!(
+                "subagent async mock_stream_release_marker {}",
+                release_marker.display()
+            ))
+            .with_event_observer(observer.clone()),
             io::sink(),
         )
         .expect("start parent turn");
 
-    operation
-        .wait_timeout(TEST_TIMEOUT)
-        .expect("parent turn terminal");
-    let events = observer.events();
-    let tool = events
-        .iter()
-        .find(|event| event.event_type == EventType::ToolCallCompleted)
-        .expect("async child tool terminal");
-    let output = tool.payload["output"].as_str().expect("async child output");
-    let payload: serde_json::Value = serde_json::from_str(output).expect("async child JSON");
-    let agent_id = payload["agent_id"].as_str().expect("agent id");
-    let child_thread_id = payload["thread_id"].as_str().expect("child thread id");
-    let registry = host_handle.agent_registry_snapshot(thread.thread_id());
-    let registry_agent = registry
-        .agents
-        .iter()
-        .find(|agent| agent.agent_id == agent_id)
-        .expect("registry entry for launched agent");
-
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let registry_agent = loop {
+        let registry = host_handle.agent_registry_snapshot(thread.thread_id());
+        if let Some(agent) = registry
+            .agents
+            .into_iter()
+            .find(|agent| !agent.thread_id.is_empty())
+        {
+            break agent;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "launched child never published its thread binding"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let child_thread_id = registry_agent.thread_id.clone();
     assert_ne!(child_thread_id, thread.thread_id());
-    assert_eq!(registry_agent.thread_id, child_thread_id);
     assert!(
-        host_handle.resolve_live_thread(child_thread_id).is_ok(),
-        "child thread must remain live after the parent turn settles"
+        host_handle.resolve_live_thread(&child_thread_id).is_ok(),
+        "child thread must remain live while the parent waits"
+    );
+    std::fs::write(&release_marker, b"release").expect("release async child");
+    let parent_completion_timeout = if cfg!(windows) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(10)
+    };
+    assert_eq!(
+        operation
+            .wait_timeout(parent_completion_timeout)
+            .expect("parent turn terminal")
+            .outcome(),
+        &OperationOutcome::Completed(RunStatus::Success)
     );
     host.shutdown().expect("shutdown runtime host");
 }
@@ -3254,6 +3268,7 @@ fn runtime_host_owns_turn_launched_workflow_until_shutdown() {
     }
 
     let cwd = tempfile::tempdir().unwrap();
+    let release_marker = cwd.path().join("release-host-owned-workflow");
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
     let host = RuntimeHost::start().expect("start runtime host");
@@ -3263,9 +3278,12 @@ fn runtime_host_owns_turn_launched_workflow_until_shutdown() {
     let observer = Arc::new(RecordingEventObserver::default());
     let operation = thread
         .start_turn(
-            HostedTurnRequest::new("workflow inline")
-                .with_wait_for_background_workflows(false)
-                .with_event_observer(observer.clone()),
+            HostedTurnRequest::new(format!(
+                "workflow release_marker {}",
+                release_marker.display()
+            ))
+            .with_wait_for_background_workflows(false)
+            .with_event_observer(observer.clone()),
             io::sink(),
         )
         .expect("start workflow turn");
@@ -3394,6 +3412,7 @@ fn workflow_capacity_cleanup_keeps_the_thread_event_sequence() {
     }
 
     let cwd = tempfile::tempdir().unwrap();
+    let release_marker = cwd.path().join("release-capacity-workflow");
     let mut config = test_config(cwd.path().to_path_buf());
     config.approval_mode = ApprovalMode::FullAuto;
     let host = RuntimeHost::start_with_background_capacity(0).expect("start runtime host");
@@ -3403,9 +3422,12 @@ fn workflow_capacity_cleanup_keeps_the_thread_event_sequence() {
     let observer = Arc::new(RecordingEventObserver::default());
     let operation = thread
         .start_turn(
-            HostedTurnRequest::new("workflow inline")
-                .with_wait_for_background_workflows(false)
-                .with_event_observer(observer.clone()),
+            HostedTurnRequest::new(format!(
+                "workflow release_marker {}",
+                release_marker.display()
+            ))
+            .with_wait_for_background_workflows(false)
+            .with_event_observer(observer.clone()),
             io::sink(),
         )
         .expect("start workflow turn");

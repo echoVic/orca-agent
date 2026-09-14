@@ -54,6 +54,20 @@ fn danger_full_access_config() -> RunConfig {
     config
 }
 
+fn host_long_running_command() -> &'static str {
+    match orca_platform::shell::ShellResolver::for_current_host()
+        .resolve_from_environment()
+        .expect("resolve host shell")
+        .kind()
+    {
+        orca_platform::shell::ShellKind::Posix | orca_platform::shell::ShellKind::GitBash => {
+            "sleep 5"
+        }
+        orca_platform::shell::ShellKind::PowerShell(_) => "Start-Sleep -Seconds 5",
+        orca_platform::shell::ShellKind::Cmd => "ping 127.0.0.1 -n 6 > nul",
+    }
+}
+
 #[test]
 fn reported_session_triggers_soft_compaction() {
     // Exact JSONL bytes reproduce the released session incident contract.
@@ -1718,14 +1732,15 @@ fn the_tighter_of_the_caller_deadline_and_the_configured_cap_wins() {
     // later observation of that command.
     let mut context = RuntimeToolActorContext::new("run-tools");
     let task_registry = TaskRegistry::new("run-tools".to_string());
+    let command = host_long_running_command();
     // The caller asks for five minutes; the administrator cap is one second.
     let request = ToolRequest {
         id: "tool-cap".to_string(),
         name: ToolName::Bash,
         action: ActionKind::Shell,
-        target: Some("sleep 5".to_string()),
+        target: Some(command.to_string()),
         raw_arguments: Some(
-            serde_json::json!({ "command": "sleep 5", "timeout_ms": 300_000 }).to_string(),
+            serde_json::json!({ "command": command, "timeout_ms": 300_000 }).to_string(),
         ),
     };
 
@@ -1743,9 +1758,13 @@ fn the_tighter_of_the_caller_deadline_and_the_configured_cap_wins() {
         None,
     );
 
+    let payload_text = result
+        .output
+        .as_deref()
+        .or(result.error.as_deref())
+        .unwrap_or_else(|| panic!("terminal contract payload: {result:?}"));
     let payload: serde_json::Value =
-        serde_json::from_str(result.output.as_deref().expect("terminal contract payload"))
-            .expect("terminal contract is JSON");
+        serde_json::from_str(payload_text).expect("terminal contract is JSON");
     assert_eq!(
         payload["effective_deadline_ms"], 1_000,
         "the tighter limit must win: {payload}"

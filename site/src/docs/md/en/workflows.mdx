@@ -33,6 +33,19 @@ the script directly. Workflow scripts are JavaScript modules with a declared
 metadata export, not YAML files. Keep the script, its verifier logic, and its
 input schema under version control.
 
+## Shared execution capacity
+
+Workflow agent calls do not create a separate worker pool. They share the root
+task tree's durable subagent execution scope with direct, nested, hosted, and
+resumed children. When `max_running` is full, accepted work stays queued without
+starting a worker. A parent waiting through `task_wait` releases its execution
+lease at a safe checkpoint and must reacquire one before continuing.
+
+The same task controls apply to workflow children and direct subagents:
+`task_list`, `task_wait`, `task_read_output`, `task_send_input`, and
+`task_stop`. The retired `subagent_status` tool and model-facing sync/async mode
+are not part of the current protocol.
+
 ## Observe and recover
 
 ~~~bash

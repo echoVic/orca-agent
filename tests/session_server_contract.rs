@@ -2034,9 +2034,6 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
 
 #[test]
 fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
-    if !sandbox_backend_available() {
-        return;
-    }
     let workspace = tempdir().expect("workspace");
     let invocation_marker = workspace.path().join("bash-invocation-started");
     let command_marker = workspace
@@ -2046,11 +2043,7 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
         .join("bash-invocation-started");
     let home = workspace.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
-    std::fs::write(
-        home.join("config.toml"),
-        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
-    )
-    .expect("write config");
+    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
     let mut child = orca_command()
         .args([
             "--mode",
@@ -4857,7 +4850,7 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
         let workspace = tempdir().expect("workspace");
         std::fs::write(
             home.join("config.toml"),
-            "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"api.example.com\" = \"allow\"\n",
+            "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":danger-full-access\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"api.example.com\" = \"allow\"\n",
         )
         .expect("write permission profile config");
 
@@ -4940,7 +4933,7 @@ fn server_mode_bash_inherits_thread_active_permission_profile_network_policy() {
 
 #[cfg(not(windows))]
 #[test]
-fn server_mode_bash_network_permission_allow_retries_with_grant() {
+fn server_mode_bash_network_permission_allow_resumes_without_replay() {
     with_orca_home(|home| {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test server");
         let port = listener.local_addr().expect("server addr").port();
@@ -4959,9 +4952,10 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
                 .expect("write response");
         });
         let workspace = tempdir().expect("workspace");
+        let replay_marker = workspace.path().join("network-command-runs");
         std::fs::write(
             home.join("config.toml"),
-            "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":workspace\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"api.example.com\" = \"allow\"\n",
+            "mode = \"full-auto\"\n\n[permission_profiles.net]\nextends = \":danger-full-access\"\n\n[permission_profiles.net.network]\nenabled = true\n\n[permission_profiles.net.network.domains]\n\"api.example.com\" = \"allow\"\n",
         )
         .expect("write permission profile config");
 
@@ -4996,7 +4990,7 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
             let stdin = child.stdin_mut();
             writeln!(
                 stdin,
-                r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"net"}},"input":[{{"type":"text","text":"bash curl --max-time 2 --proxy \"$HTTP_PROXY\" -sS http://127.0.0.1:{}/"}}]}}}}"#,
+                r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{}","activePermissionProfile":{{"id":"net"}},"input":[{{"type":"text","text":"bash printf executed >> network-command-runs; curl --max-time 2 --proxy \"$HTTP_PROXY\" -sS http://127.0.0.1:{}/"}}]}}}}"#,
                 thread_id,
                 port
             )
@@ -5032,7 +5026,18 @@ fn server_mode_bash_network_permission_allow_retries_with_grant() {
         let completed =
             child.expect_event_matching("turn", "tool_completed", |event| event["tool"] == "bash");
         assert_eq!(completed["status"], "completed");
-        assert_eq!(completed["output"], "bash-network-ok");
+        let output: serde_json::Value = serde_json::from_str(
+            completed["output"]
+                .as_str()
+                .expect("serialized terminal output"),
+        )
+        .expect("parse terminal output");
+        assert_eq!(output["output"], "bash-network-ok");
+        assert_eq!(
+            std::fs::read_to_string(replay_marker).expect("read command run marker"),
+            "executed",
+            "granting network access must resume the original shell instead of replaying it"
+        );
         let _turn_completed = child.expect_event("turn", "turn_completed");
 
         child.close_stdin();
@@ -10034,30 +10039,6 @@ fn sandbox_seatbelt_available() -> bool {
         )
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-}
-
-fn sandbox_backend_available() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        // The server harness provisions the native AppContainer capability
-        // store before spawning each Windows test process.
-        true
-    }
-    #[cfg(target_os = "macos")]
-    {
-        sandbox_seatbelt_available()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        matches!(
-            orca_tools::sandbox::enforcement_state(),
-            orca_core::capability::EnforcementState::Enforced
-        )
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
     }

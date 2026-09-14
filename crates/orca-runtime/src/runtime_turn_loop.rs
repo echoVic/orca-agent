@@ -385,7 +385,10 @@ impl RuntimeTurnLoopStep {
                                             == orca_core::task_types::TaskType::MainSession
                                     })
                             });
-                    if root_or_main && !input.workflow.background_workflows.is_empty() {
+                    if root_or_main
+                        && input.request.turn_context.wait_for_background_workflows
+                        && !input.workflow.background_workflows.is_empty()
+                    {
                         crate::workflow_execution::observe_background_workflows(
                             true,
                             input.output.events,

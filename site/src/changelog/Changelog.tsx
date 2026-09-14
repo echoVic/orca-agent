@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.31":
+        "Unifies direct, nested, Workflow, hosted, and resumed child agents under one durable execution scope with queued admission, persistent budget receipts, restart-safe result delivery, and shared task controls. Bash now owns long-running commands through the same task lifecycle; network grants resume the blocked proxy connection without replaying prior shell side effects, and cancellation, timeout, and exit terminals remain truthful.",
       "v0.4.30":
         "Makes release promotion reuse successful checks from the exact main commit while preserving full pull-request and main coverage. It also removes scheduler and Windows races from TUI background handoff, terminal proof generation, and cross-process workflow state replacement.",
       "v0.4.29":
@@ -670,6 +672,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.31":
+        "将直接、嵌套、Workflow、托管与恢复后的子代理统一到一个持久执行作用域，提供排队准入、持久预算回执、可恢复结果投递和共享任务控制面；bash 长命令也纳入同一任务生命周期，网络授权会恢复被阻塞的原连接而不重放此前的 shell 副作用，并保留准确的取消、超时和退出终态。",
       "v0.4.30":
         "发布流程复用同一 main 提交已通过的完整检查，同时保留 PR 与 main 的全量跨平台覆盖；并消除 TUI 后台切换、终态证明生成及跨进程 workflow 状态替换中的调度与 Windows 竞争。",
       "v0.4.29":

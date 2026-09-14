@@ -45,6 +45,29 @@ max_wall_time_ms = 1800000
 `--max-tool-calls`、`--max-cost-usd` 或 `--max-wall-time-secs`。
 配置文件使用整数微美元和毫秒；CLI 分别使用美元和秒。
 
+## 子代理
+
+子代理执行以根任务树为作用域。直接、嵌套、Workflow、托管、续跑和恢复的子任务
+共用同一组限制：
+
+```toml
+[subagents]
+delegation = "adaptive" # off | explicit | adaptive
+max_depth = 2
+max_running = 32
+max_queued = 256
+max_live_tasks = 512
+max_investigation_turns = 6
+max_investigation_tool_calls = 8
+```
+
+`max_running` 限制活动执行 lease。超出的已接受任务会排队且不会提前创建 worker；
+`max_queued` 限制该队列，`max_live_tasks` 限制所有未终结后代，包括正在等待子任务
+的父代理。等待中的父代理会释放执行 lease，并在恢复执行前重新进入队列。
+
+旧的 `max_parallel` 键会被忽略，不再形成第二套容量来源。需要禁止新委派时使用
+`delegation = "off"`。
+
 ## 凭据
 
 优先使用环境变量：

@@ -11,7 +11,10 @@ use orca_core::task_types::TaskStatus;
 use serde::Serialize;
 
 use crate::lifecycle::TurnPermissionOverlay;
-use crate::network_proxy::{RuntimeNetworkPolicy, RuntimeNetworkProxy};
+use crate::network_proxy::{
+    RuntimeNetworkBlockDecision, RuntimeNetworkBlockReport, RuntimeNetworkBlockRequest,
+    RuntimeNetworkPolicy, RuntimeNetworkProxy, runtime_network_permission_gate_channel,
+};
 #[cfg(test)]
 use crate::shell_session::ShellSandboxMode;
 use crate::shell_session::{
@@ -53,6 +56,8 @@ struct TerminalSessionState {
     completion_queued: bool,
     completed_at: Option<Instant>,
     network_proxy: Option<RuntimeNetworkProxy>,
+    network_block_receiver: Option<Receiver<RuntimeNetworkBlockRequest>>,
+    pending_network_block: Option<RuntimeNetworkBlockRequest>,
 }
 
 #[derive(Clone, Copy)]
@@ -71,6 +76,7 @@ enum TerminalCommand {
         command: Box<ShellSessionCommand>,
         metadata_writable_directories: Vec<PathBuf>,
         network_proxy: Option<RuntimeNetworkProxy>,
+        network_block_receiver: Option<Receiver<RuntimeNetworkBlockRequest>>,
         /// Absolute deadline armed when the process actually starts.
         deadline: Option<(Instant, &'static str)>,
         /// The configured limit this deadline was derived from.
@@ -97,6 +103,11 @@ enum TerminalCommand {
     },
     CloseInput {
         session_id: String,
+        response: SyncSender<io::Result<()>>,
+    },
+    ResolveNetworkBlock {
+        session_id: String,
+        decision: RuntimeNetworkBlockDecision,
         response: SyncSender<io::Result<()>>,
     },
     StopTask {
@@ -161,6 +172,8 @@ pub(crate) struct TerminalServiceOutput {
     pub(crate) deadline_source: Option<&'static str>,
     /// Wall-clock milliseconds from process start to the effective deadline.
     pub(crate) effective_deadline_ms: Option<u64>,
+    #[serde(skip)]
+    pub(crate) network_block: Option<RuntimeNetworkBlockReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,7 +247,7 @@ impl TerminalService {
     ) -> io::Result<TerminalServiceOutput> {
         let requested_deadline = request.execution_deadline;
         let request_lifetime = request.lifetime;
-        let (command, metadata_writable_directories, network_proxy) =
+        let (command, metadata_writable_directories, network_proxy, network_block_receiver) =
             prepare_shell_command(request)?;
         let deadline =
             requested_deadline.map(|deadline| (Instant::now() + deadline.after, deadline.source));
@@ -245,6 +258,7 @@ impl TerminalService {
             command: Box::new(command),
             metadata_writable_directories,
             network_proxy,
+            network_block_receiver,
             deadline,
             deadline_after,
             response,
@@ -258,7 +272,7 @@ impl TerminalService {
             should_cancel,
             on_output,
         )?;
-        if output.status == "running" {
+        if output.status == "running" && output.network_block.is_none() {
             let _ = self.send(TerminalCommand::MarkBackground {
                 session_id: handle.id,
             });
@@ -379,6 +393,38 @@ impl TerminalService {
         receive_response(receiver, "terminal stop")?
     }
 
+    pub(crate) fn resolve_network_permission(
+        &self,
+        session_id: &str,
+        decision: RuntimeNetworkBlockDecision,
+    ) -> io::Result<()> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send(TerminalCommand::ResolveNetworkBlock {
+            session_id: session_id.to_string(),
+            decision,
+            response,
+        })?;
+        receive_response(receiver, "terminal network permission")?
+    }
+
+    pub(crate) fn continue_session(
+        &self,
+        session_id: &str,
+        yield_time: Duration,
+        max_output_bytes: usize,
+        should_cancel: impl Fn() -> bool,
+        on_output: &mut dyn FnMut(&str),
+    ) -> io::Result<TerminalServiceOutput> {
+        self.poll_until_with_output(
+            session_id,
+            yield_time,
+            max_output_bytes,
+            false,
+            should_cancel,
+            on_output,
+        )
+    }
+
     pub(crate) fn drain_completions(&self) -> Vec<TerminalCompletion> {
         let (response, receiver) = mpsc::sync_channel(1);
         if self
@@ -426,19 +472,36 @@ impl TerminalService {
             let output = self.poll_once(session_id, remaining_output_bytes, None)?;
             let observed_output = output.output.len();
             let status = output.status;
+            let network_blocked = output.network_block.is_some();
             if observed_output > 0 {
                 on_output(&output.output);
             }
             merge_terminal_output(&mut aggregate, output);
             remaining_output_bytes = remaining_output_bytes.saturating_sub(observed_output);
-            if status != "running"
+            if status != "running" {
+                return Ok(aggregate.expect("terminal poll always produces output metadata"));
+            }
+            if should_cancel() {
+                let task_id = aggregate
+                    .as_ref()
+                    .expect("terminal poll always produces output metadata")
+                    .task_id
+                    .clone();
+                let _ = self.stop_task(&task_id)?;
+                let terminal = self.poll_once(session_id, remaining_output_bytes.max(1), None)?;
+                merge_terminal_output(&mut aggregate, terminal);
+                if let Some(output) = aggregate.as_mut() {
+                    output.network_block = None;
+                }
+                return Ok(aggregate.expect("terminal cancellation produces output metadata"));
+            }
+            if network_blocked
                 || (return_on_output
                     && aggregate
                         .as_ref()
                         .is_some_and(|output| !output.output.is_empty()))
                 || remaining_output_bytes == 0
                 || Instant::now() >= deadline
-                || should_cancel()
             {
                 return Ok(aggregate.expect("terminal poll always produces output metadata"));
             }
@@ -509,6 +572,7 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                 command,
                 metadata_writable_directories,
                 network_proxy,
+                network_block_receiver,
                 deadline,
                 deadline_after,
                 response,
@@ -529,7 +593,11 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                         )));
                         continue;
                     }
-                    let mut session = TerminalSessionState::from_handle(handle, network_proxy);
+                    let mut session = TerminalSessionState::from_handle(
+                        handle,
+                        network_proxy,
+                        network_block_receiver,
+                    );
                     session.deadline = deadline;
                     session.deadline_after = deadline_after;
                     state.sessions.insert(handle.id.clone(), session);
@@ -577,6 +645,14 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                 let result = state.close_input(&session_id);
                 let _ = response.send(result);
             }
+            Ok(TerminalCommand::ResolveNetworkBlock {
+                session_id,
+                decision,
+                response,
+            }) => {
+                let result = state.resolve_network_permission(&session_id, decision);
+                let _ = response.send(result);
+            }
             Ok(TerminalCommand::StopTask { task_id, response }) => {
                 let result = state.stop_task(&task_id);
                 let _ = response.send(result);
@@ -585,12 +661,14 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                 let _ = response.send(state.completions.drain(..).collect());
             }
             Ok(TerminalCommand::Shutdown { response }) => {
+                state.deny_pending_network_requests();
                 state.manager.terminate_all();
                 let _ = response.send(());
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
+                state.deny_pending_network_requests();
                 state.manager.terminate_all();
                 break;
             }
@@ -695,6 +773,18 @@ impl TerminalServiceState {
                 .and_then(|session| session.deadline)
                 .map(|(_deadline, source)| source)
         });
+        let network_block = self.sessions.get_mut(session_id).and_then(|session| {
+            if session.pending_network_block.is_none() {
+                session.pending_network_block = session
+                    .network_block_receiver
+                    .as_ref()
+                    .and_then(|receiver| receiver.try_recv().ok());
+            }
+            session
+                .pending_network_block
+                .as_ref()
+                .map(|request| request.report.clone())
+        });
         Ok(TerminalServiceOutput {
             session_id: session_id.to_string(),
             task_id,
@@ -725,6 +815,7 @@ impl TerminalServiceState {
                 .get(session_id)
                 .and_then(|session| session.deadline_after)
                 .map(|after| after.as_millis() as u64),
+            network_block,
         })
     }
 
@@ -777,6 +868,40 @@ impl TerminalServiceState {
         self.manager.close_stdin(session_id)
     }
 
+    fn resolve_network_permission(
+        &mut self,
+        session_id: &str,
+        decision: RuntimeNetworkBlockDecision,
+    ) -> io::Result<()> {
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown terminal session: {session_id}"),
+            )
+        })?;
+        if session.terminal.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("terminal session has already completed: {session_id}"),
+            ));
+        }
+        let request = session.pending_network_block.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("terminal session has no pending network permission: {session_id}"),
+            )
+        })?;
+        request.resolve(decision)
+    }
+
+    fn deny_pending_network_requests(&mut self) {
+        for session in self.sessions.values_mut() {
+            if let Some(request) = session.pending_network_block.take() {
+                let _ = request.resolve(RuntimeNetworkBlockDecision::Deny);
+            }
+        }
+    }
+
     fn stop_task(&mut self, task_id: &str) -> io::Result<bool> {
         let session_id = self.sessions.iter().find_map(|(session_id, session)| {
             (session.task_id == task_id && session.terminal.is_none()).then(|| session_id.clone())
@@ -824,6 +949,10 @@ impl TerminalServiceState {
             }
             session.terminal = Some(terminal);
             session.completed_at = Some(Instant::now());
+            if let Some(request) = session.pending_network_block.take() {
+                let _ = request.resolve(RuntimeNetworkBlockDecision::Deny);
+            }
+            session.network_block_receiver.take();
             session.network_proxy.take();
         }
         self.queue_completion(&output.id);
@@ -898,7 +1027,7 @@ impl TerminalServiceState {
     }
 }
 
-fn merge_terminal_output(
+pub(crate) fn merge_terminal_output(
     aggregate: &mut Option<TerminalServiceOutput>,
     next: TerminalServiceOutput,
 ) {
@@ -919,12 +1048,14 @@ fn merge_terminal_output(
     current.eof = next.eof;
     current.requested_terminal = next.requested_terminal;
     current.effective_terminal = next.effective_terminal;
+    current.network_block = current.network_block.take().or(next.network_block);
 }
 
 impl TerminalSessionState {
     fn from_handle(
         handle: &ShellSessionHandle,
         network_proxy: Option<RuntimeNetworkProxy>,
+        network_block_receiver: Option<Receiver<RuntimeNetworkBlockRequest>>,
     ) -> Self {
         Self {
             task_id: handle.task_id.clone(),
@@ -939,6 +1070,8 @@ impl TerminalSessionState {
             completion_queued: false,
             completed_at: None,
             network_proxy,
+            network_block_receiver,
+            pending_network_block: None,
         }
     }
 }
@@ -1003,6 +1136,7 @@ fn prepare_shell_command(
     ShellSessionCommand,
     Vec<PathBuf>,
     Option<RuntimeNetworkProxy>,
+    Option<Receiver<RuntimeNetworkBlockRequest>>,
 )> {
     let mut sandbox = crate::server::bash_sandbox_for_cwd(request.config, request.cwd)
         .map_err(io::Error::other)?;
@@ -1039,12 +1173,17 @@ fn prepare_shell_command(
         ));
     }
 
-    let network_proxy = if sandbox.network_policy_domains.is_empty() {
-        None
+    let (network_proxy, network_block_receiver) = if sandbox.network_policy_domains.is_empty() {
+        (None, None)
     } else {
-        Some(RuntimeNetworkProxy::start(RuntimeNetworkPolicy::new(
-            sandbox.network_policy_domains.clone(),
-        ))?)
+        let (permission_gate, receiver) = runtime_network_permission_gate_channel();
+        (
+            Some(RuntimeNetworkProxy::start_with_permission_gate(
+                RuntimeNetworkPolicy::new(sandbox.network_policy_domains.clone()),
+                Some(permission_gate),
+            )?),
+            Some(receiver),
+        )
     };
     let mut env = BTreeMap::new();
     if let Some(proxy) = network_proxy.as_ref() {
@@ -1085,6 +1224,7 @@ fn prepare_shell_command(
         },
         metadata_writable_directories,
         network_proxy,
+        network_block_receiver,
     ))
 }
 
@@ -1120,6 +1260,22 @@ fn termination_label(termination: ShellSessionTermination) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_long_running_command() -> &'static str {
+        match orca_platform::shell::ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .expect("resolve host shell")
+            .kind()
+        {
+            orca_platform::shell::ShellKind::Posix | orca_platform::shell::ShellKind::GitBash => {
+                "printf ready; sleep 30"
+            }
+            orca_platform::shell::ShellKind::PowerShell(_) => {
+                "Write-Host -NoNewline 'ready'; Start-Sleep -Seconds 30"
+            }
+            orca_platform::shell::ShellKind::Cmd => "echo ready & ping 127.0.0.1 -n 31 > nul",
+        }
+    }
 
     fn service(cwd: &Path) -> (TerminalService, TaskRegistry) {
         let registry = TaskRegistry::new_persistent(
@@ -1269,6 +1425,82 @@ mod tests {
         assert_eq!(output.output, "unified");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn exec_returns_structured_network_block_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let upstream = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind upstream");
+        let upstream_port = upstream.local_addr().expect("upstream address").port();
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+
+            let (mut stream, _) = upstream.accept().expect("accept resumed request");
+            let mut reader =
+                std::io::BufReader::new(stream.try_clone().expect("clone upstream stream"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("read request") != 0 {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nresumed")
+                .expect("write upstream response");
+        });
+        let mut overlay = TurnPermissionOverlay::default();
+        overlay.merge_network_permissions(&crate::protocol::RequestPermissionProfile {
+            file_system: None,
+            network: Some(crate::protocol::RequestNetworkPermissions {
+                enabled: Some(true),
+                domains: std::collections::HashMap::from([(
+                    "api.example.com".to_string(),
+                    PermissionProfileNetworkAccess::Allow,
+                )]),
+            }),
+        });
+        let (service, _) = service(temp.path());
+        let output = start(
+            &service,
+            request(
+                &format!(
+                    "curl --max-time 5 --proxy \"$HTTP_PROXY\" -sS http://127.0.0.1:{upstream_port}/"
+                ),
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_secs(5),
+            8 * 1024,
+            || false,
+        )
+        .expect("exec through policy proxy");
+
+        assert_eq!(output.status, "running");
+        assert_eq!(
+            output.network_block,
+            Some(RuntimeNetworkBlockReport {
+                host: "127.0.0.1".to_string(),
+                error: "blocked-by-policy",
+            })
+        );
+        service
+            .resolve_network_permission(&output.session_id, RuntimeNetworkBlockDecision::Allow)
+            .expect("allow blocked connection");
+        let completed = service
+            .write_stdin(
+                &output.session_id,
+                None,
+                Duration::from_secs(5),
+                8 * 1024,
+                || false,
+            )
+            .expect("poll resumed command");
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.output, "resumed");
+        server.join().expect("upstream server");
+    }
+
     #[test]
     fn running_session_accepts_stdin() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1362,29 +1594,54 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, _) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
+        let command = host_long_running_command();
         let started = start(
             &service,
-            request(
-                "printf ready; sleep 30",
-                temp.path(),
-                &overlay,
-                ShellTerminalMode::pipe(),
-            ),
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
             Duration::from_millis(50),
             8 * 1024,
             || false,
         )
         .expect("start long command");
         assert_eq!(started.status, "running", "{started:?}");
+        let stop_started = Instant::now();
         assert!(service.stop_task(&started.task_id).expect("stop task"));
-
         let stopped = service
             .write_stdin(&started.session_id, None, Duration::ZERO, 8 * 1024, || {
                 false
             })
             .expect("poll stopped task");
+        assert!(
+            stop_started.elapsed() < Duration::from_secs(10),
+            "stopping a command must remain bounded well below natural completion"
+        );
+
         assert_ne!(stopped.status, "running", "{stopped:?}");
         assert_eq!(stopped.termination, "cancelled", "{stopped:?}");
+    }
+
+    #[test]
+    fn exec_cancellation_stops_the_running_process_before_returning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, _) = service(temp.path());
+        let overlay = TurnPermissionOverlay::default();
+
+        let output = start(
+            &service,
+            request(
+                host_long_running_command(),
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_secs(5),
+            8 * 1024,
+            || true,
+        )
+        .expect("cancel long command");
+
+        assert_eq!(output.status, "stopped", "{output:?}");
+        assert_eq!(output.termination, "cancelled", "{output:?}");
     }
 
     #[test]
@@ -1421,14 +1678,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, registry) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
+        let command = host_long_running_command();
         let started = start(
             &service,
-            request(
-                "printf ready; sleep 30",
-                temp.path(),
-                &overlay,
-                ShellTerminalMode::pipe(),
-            ),
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
             Duration::from_millis(50),
             8 * 1024,
             || false,

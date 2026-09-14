@@ -50,6 +50,31 @@ operation-scoped: set `--max-turns`, `--max-tool-calls`, `--max-cost-usd`, or
 stored budget default. The file uses integer microdollars and milliseconds;
 the CLI accepts USD and seconds.
 
+## Subagents
+
+Subagent execution is scoped to one root task tree. Direct, nested, Workflow,
+hosted, continued, and recovered children share the same limits:
+
+```toml
+[subagents]
+delegation = "adaptive" # off | explicit | adaptive
+max_depth = 2
+max_running = 32
+max_queued = 256
+max_live_tasks = 512
+max_investigation_turns = 6
+max_investigation_tool_calls = 8
+```
+
+`max_running` limits active execution leases. Accepted overflow is queued
+without starting a worker; `max_queued` bounds that queue and `max_live_tasks`
+bounds every non-terminal descendant, including parents waiting for children.
+Waiting parents release their execution lease and must re-enter the queue before
+running again.
+
+The retired `max_parallel` key is ignored and does not act as a second capacity
+authority. Use `delegation = "off"` to disable new delegation.
+
 ## Credentials
 
 Prefer an environment variable:

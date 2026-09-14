@@ -911,8 +911,9 @@ impl RuntimeShellSessionManager {
         let tasks = session.tasks.clone();
         if wait_for_process_exit(&mut session, Duration::from_millis(150))?.is_some() {
             let status = session.finish_after_exit()?;
-            // The stop was requested, so the exit is attributed to it rather
-            // than reported as a natural completion.
+            // A deadline remains authoritative after it expires. An ordinary
+            // kill preserves a process exit already observed during the grace
+            // window instead of rewriting it as cancellation.
             let output = session.output(
                 id,
                 if status.success() {
@@ -921,7 +922,11 @@ impl RuntimeShellSessionManager {
                     TaskStatus::Failed
                 },
                 process_exit_code(status),
-                termination,
+                if termination == ShellSessionTermination::TimedOut {
+                    termination
+                } else {
+                    ShellSessionTermination::Exited
+                },
             )?;
             Self::record_terminal_output(&tasks, &output)?;
             if remove_completed_output {

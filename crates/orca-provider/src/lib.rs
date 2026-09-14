@@ -1581,10 +1581,18 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
 
     if let Some(rest) = prompt.strip_prefix("workflow ") {
         let mode = rest.trim();
-        let script = if mode == "inline" {
+        let script = if let Some(marker) = mode.strip_prefix("release_marker ") {
+            let prompt = serde_json::to_string(&format!("mock_stream_release_marker {marker}"))
+                .expect("serialize workflow release marker");
+            format!(
+                "export const meta = {{ name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] }};\nconst result = await phase('main', async () => agent({prompt}));\nexport default result;"
+            )
+        } else if mode == "inline" {
             "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst until = Date.now() + 900;\nwhile (Date.now() < until) {}\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;"
+                .to_string()
         } else {
             "export const meta = { name: 'mock-workflow', description: 'Mock workflow', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;"
+                .to_string()
         };
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
@@ -1790,6 +1798,25 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
             action: ActionKind::Read,
             target: Some(pattern.clone()),
             raw_arguments: Some(serde_json::json!({ "pattern": pattern }).to_string()),
+        });
+    }
+
+    if let Some(rest) = prompt.strip_prefix("bash_wait ")
+        && let Some((yield_time, command)) = rest.split_once(" :: ")
+        && let Ok(yield_time_ms) = yield_time.parse::<u64>()
+    {
+        return Some(ToolRequest {
+            id: "mock-tool-1".to_string(),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some(command.to_string()),
+            raw_arguments: Some(
+                serde_json::json!({
+                    "command": command,
+                    "yield_time_ms": yield_time_ms
+                })
+                .to_string(),
+            ),
         });
     }
 

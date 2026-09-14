@@ -459,6 +459,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             mcp_registry,
             &config.external_tools,
         ) {
+            let error = result.error.clone();
             let event_error = emit_tool_terminal_events(
                 events,
                 sink,
@@ -483,7 +484,22 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             if let Some(error) = event_error {
                 return Err(error);
             }
-            continue;
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                provider_response_ingress,
+                "an earlier sibling was rejected by the child tool policy",
+            )?;
+            return Ok(ToolTurnOutcome::Return {
+                status: RunStatus::Failed,
+                error,
+                terminal: None,
+            });
         }
 
         let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)
@@ -2740,7 +2756,7 @@ mod tests {
     }
 
     #[test]
-    fn run_tool_turns_records_each_policy_failure_without_cancelling_siblings() {
+    fn child_policy_failure_cancels_unstarted_siblings_and_ends_the_turn() {
         let cwd = tempfile::tempdir().expect("cwd");
         let mut config = config_with_external(Vec::new());
         config.subagents.max_depth = 2;
@@ -2816,10 +2832,23 @@ mod tests {
         })
         .expect("run tool turns");
 
-        assert!(matches!(outcome, ToolTurnOutcome::Continue));
+        assert!(matches!(
+            outcome,
+            ToolTurnOutcome::Return {
+                status: RunStatus::Failed,
+                ..
+            }
+        ));
         assert_eq!(sampling_state.tool_cursor_position(), 3);
         assert_eq!(conversation.messages.len(), 3);
-        for (index, expected_id) in ["tool-1", "tool-2", "tool-3"].iter().enumerate() {
+        for (index, (expected_id, expected_status)) in [
+            ("tool-1", ToolStatus::Failed),
+            ("tool-2", ToolStatus::Cancelled),
+            ("tool-3", ToolStatus::Cancelled),
+        ]
+        .iter()
+        .enumerate()
+        {
             let Message::Tool {
                 tool_call_id,
                 terminal: Some(terminal),
@@ -2830,7 +2859,7 @@ mod tests {
             };
             assert_eq!(tool_call_id, expected_id);
             assert_eq!(terminal.started, ToolInvocationStarted::No);
-            assert_eq!(terminal.status, ToolStatus::Failed);
+            assert_eq!(terminal.status, *expected_status);
         }
 
         let emitted = String::from_utf8(sink.writer_mut().clone()).expect("jsonl events");

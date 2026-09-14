@@ -10,7 +10,7 @@ use crossbeam_channel::Sender;
 use orca_core::cancel::{OperationId, OperationIdAllocator};
 
 use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse};
-use crate::surface_projection::TuiStreamDeliveryWatermark;
+use crate::surface_projection::{SurfaceProjectionState, TuiStreamDeliveryWatermark};
 
 /// Presentation-side correlation for a typed runtime surface operation.
 ///
@@ -190,6 +190,26 @@ impl TuiSurfaceTaskControl {
             .prompt_queue(action)
             .map(Some)
             .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    pub(crate) fn stop_background_task(
+        &self,
+        task_id: &str,
+        event_tx: &Sender<TuiEvent>,
+    ) -> Result<Option<SurfaceProjectionState>, String> {
+        let runtime = self.lock_hosted().queue_runtime.clone();
+        let Some(runtime) = runtime else {
+            return Ok(None);
+        };
+        if runtime
+            .task_registry()
+            .get(task_id)
+            .is_some_and(|task| task.task_type == orca_core::task_types::TaskType::MainSession)
+        {
+            return Ok(None);
+        }
+        crate::surface_client::stop_task(&runtime.typed_surface(), task_id, self, event_tx)
+            .map(Some)
     }
 
     pub(crate) fn pause_current_goal(&self) -> io::Result<bool> {
