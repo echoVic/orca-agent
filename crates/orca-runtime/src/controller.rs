@@ -194,7 +194,8 @@ impl Default for ControllerRunOptions {
 impl ControllerRunOptions {
     fn for_run_config(config: &RunConfig) -> Self {
         Self {
-            wait_for_background_workflows: config.output_format == OutputFormat::Jsonl,
+            wait_for_background_workflows: config.output_format == OutputFormat::Jsonl
+                || !config.budget.to_spec().is_unlimited(),
         }
     }
 }
@@ -736,9 +737,42 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
             .map(|policy| &policy.subagent_type)
             .unwrap_or(&default_subagent_type);
         let subagent_depth = agent_policy.as_ref().map_or(0, |policy| policy.depth);
+        let role_tools = agent_policy
+            .as_ref()
+            .map(|policy| crate::child_agent_entrypoints::role_tool_ceiling(&policy.subagent_type));
+        let role_label = format!("role '{}' tool policy", subagent_type.identifier());
+        let tool_policy = request
+            .tool_mode()
+            .policy()
+            .replace_allowed_tools(role_tools.as_deref(), &role_label)
+            .with_delegation(
+                config
+                    .subagents
+                    .delegation
+                    .for_child(subagent_depth, config.subagents.max_depth),
+            );
+        let agent_usage_before = parts.cost_tracker.totals();
+        let mut agent_admission = agent_policy
+            .as_ref()
+            .map(|policy| {
+                crate::agent_controller::AgentTurnAdmission::acquire(
+                    policy,
+                    parts.task_registry,
+                    config.subagents.limits,
+                    &prompt,
+                    request.root_task_id(),
+                    cancel,
+                )
+            })
+            .transpose()?;
         let loop_context =
             AgentLoopContext::new(&cwd, &prompt, subagent_depth, true, subagent_type)
                 .with_turn_id(request.turn_id().clone())
+                .with_task_id(
+                    agent_admission
+                        .as_ref()
+                        .map(|admission| admission.task_id.as_str()),
+                )
                 .with_deferred_cancel_terminal(request.defer_cancel_terminal())
                 .with_root_task_id(request.root_task_id())
                 .with_services(
@@ -784,12 +818,15 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                 events,
                 sink,
                 AgentConversationContext::borrowed(parts.conversation, parts.writer),
-                request.tool_mode().policy(),
+                tool_policy,
             )
         })();
         let usage = parts.cost_tracker.totals();
         let result = match turn_result {
             Ok(AgentLoopOutcome::ProviderSuspended(suspension)) => {
+                if let Some(admission) = agent_admission.as_mut() {
+                    admission.suspend();
+                }
                 return Ok(PreparedThreadTurnOutcome::ProviderSuspended {
                     suspension: Box::new(suspension),
                     background_workflows: RuntimeBackgroundWorkflows::from_vec(std::mem::take(
@@ -811,6 +848,9 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                 return Err(error);
             }
         };
+        if let Some(admission) = agent_admission.as_mut() {
+            admission.finish(&result, task_usage_delta(agent_usage_before, usage))?;
+        }
         let completion =
             (|| -> io::Result<(
                 RunStatus,
@@ -1710,7 +1750,13 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
     turn_extension_id: Option<String>,
 ) -> io::Result<ThreadTurnOutcome> {
     drain_terminal_notifications(session, thread_extensions.as_deref());
-    drain_subagent_notifications(session);
+    if thread_extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get::<crate::agent_controller::AgentThreadPolicy>())
+        .is_none()
+    {
+        drain_subagent_notifications(session);
+    }
     let context = ThreadTurnContext::prepare(config, session, request)?;
     if let Some(events) = events {
         let mut sink = EventSink::new(writer, config.output_format)
@@ -1780,14 +1826,45 @@ fn drain_terminal_notifications(
 ///
 /// This runs at a turn boundary, the only point where appending a system
 /// message cannot interleave with an in-flight model request or a tool result.
-/// Claiming a result and marking it delivered happen in one registry critical
-/// section, so a later turn start cannot inject the same result twice.
+///
+/// Delivery is claim-then-acknowledge, not claim-as-delivered: the claim is
+/// written first, the conversation is appended second, and only then is the
+/// result marked delivered. A crash between the steps leaves an unacknowledged
+/// claim that a later turn retries, so the notification is neither lost nor
+/// injected twice for the same result revision.
 fn drain_subagent_notifications(session: &mut InteractiveSession) {
-    let pending = session.task_registry().drain_pending_subagent_results();
-    for result in pending {
-        let message = Message::pinned_system(result.model_notification());
-        session.append_message(&message);
-        session.conversation_mut().messages.push(message);
+    if session.session_id().is_some() && session.writer_mut().is_none() {
+        return;
+    }
+    let claimed = session
+        .task_registry()
+        .claim_subagent_results_for_parent(None);
+    for result in claimed {
+        let ack = crate::tasks::DeliveryAck::from(&result);
+        let content = result.model_notification();
+        let already_present = session.conversation().messages.iter().any(|message|
+            matches!(message, Message::System { content: existing, .. } if existing == &content));
+        let appended = match session.writer_mut() {
+            Some(writer) => writer.append_system_delivery_once(&content),
+            None => Ok(!already_present),
+        };
+        match appended {
+            Ok(true) if !already_present => session
+                .conversation_mut()
+                .messages
+                .push(Message::pinned_system(content)),
+            Ok(_) => {}
+            Err(_) => {
+                session.task_registry().release_subagent_result_claim(&ack);
+                continue;
+            }
+        }
+        // Acknowledge only after the message is in the conversation and, when a
+        // writer exists, durably recorded.
+        if !session.task_registry().ack_subagent_result(&ack) {
+            // The claim moved under us; the next turn re-claims the result.
+            continue;
+        }
     }
 }
 
@@ -2002,12 +2079,14 @@ mod tests {
         let started = service
             .exec(
                 crate::terminal_service::TerminalExecRequest {
+                    lifetime: crate::tasks::TaskLifetime::Task,
                     command: "sleep 0.1; printf notified",
                     cwd: temp.path(),
                     additional_roots: &[],
                     config: &config,
                     permission_overlay: &overlay,
                     terminal: crate::shell_session::ShellTerminalMode::pipe(),
+                    execution_deadline: None,
                     sandbox_override: Some(
                         crate::shell_session::ShellSandboxMode::DangerFullAccess,
                     ),
@@ -2015,6 +2094,7 @@ mod tests {
                 Duration::from_millis(10),
                 8 * 1024,
                 || false,
+                &mut |_chunk: &str| {},
             )
             .expect("start background terminal");
         assert_eq!(started.status, "running", "{started:?}");
@@ -2419,13 +2499,20 @@ mod tests {
         });
     }
 
+    /// A normal-tool invocation whose task tools can reach the given registry.
+    fn normal_invocation_with_registry(
+        registry: &TaskRegistry,
+    ) -> crate::runtime_tool_call::RuntimeNormalToolInvocation {
+        crate::runtime_normal_tool::normal_invocation_for_test(registry)
+    }
+
     fn subagent_request(id: &str) -> tool_types::ToolRequest {
         tool_types::ToolRequest {
             id: id.to_string(),
             name: tool_types::ToolName::Subagent,
             action: ActionKind::Read,
             target: Some("task".to_string()),
-            raw_arguments: None,
+            raw_arguments: Some(serde_json::json!({"mode":"sync"}).to_string()),
         }
     }
 
@@ -2901,7 +2988,7 @@ mod tests {
         ];
 
         assert!(should_run_subagent_batch(&config, &requests[0], 0));
-        assert_eq!(collect_subagent_batch(&config, &requests, 0), 6);
+        assert_eq!(collect_subagent_batch(&config, &requests, 0), 7);
     }
 
     #[test]
@@ -2930,7 +3017,10 @@ mod tests {
         let config = config(
             SubagentConfig {
                 max_depth: 2,
-                max_parallel: 1,
+                limits: orca_core::subagent_config::SubagentLimits {
+                    max_running: 1,
+                    ..Default::default()
+                },
                 ..SubagentConfig::default()
             }
             .normalized(),
@@ -2979,92 +3069,81 @@ mod tests {
     }
 
     #[test]
-    fn subagent_status_returns_session_local_task_result() {
-        let mut context = RuntimeToolActorContext::new("test-run");
-        let registry = TaskRegistry::new("session-status".to_string());
+    fn task_read_output_serves_a_child_agent_result() {
+        let registry = TaskRegistry::new("session-child-read".to_string());
         let task =
             registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
         registry
             .complete(&task.id, "finished async audit".to_string())
             .unwrap();
+        let invocation = normal_invocation_with_registry(&registry);
         let request = tool_types::ToolRequest {
-            id: "status".to_string(),
-            name: tool_types::ToolName::SubagentStatus,
+            id: "read".to_string(),
+            name: tool_types::ToolName::TaskReadOutput,
             action: ActionKind::Read,
             target: None,
-            raw_arguments: Some(serde_json::json!({ "agent_id": task.id }).to_string()),
+            raw_arguments: Some(serde_json::json!({ "task_id": task.id }).to_string()),
         };
 
-        let result = context.execute_subagent_status_tool(&request, &registry);
+        let result =
+            crate::runtime_normal_tool::execute_runtime_normal_tool_for_test(&invocation, &request);
 
         assert_eq!(result.status, tool_types::ToolStatus::Completed);
         let payload: serde_json::Value =
             serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
-        assert_eq!(payload["status"], "completed");
-        assert_eq!(payload["description"], "inspect auth");
-        assert_eq!(payload["agent_type"], "general");
-        assert!(payload["created_at_ms"].as_i64().unwrap() > 0);
-        assert!(payload["started_at_ms"].as_i64().unwrap() > 0);
-        assert!(payload["completed_at_ms"].as_i64().unwrap() > 0);
-        assert_eq!(payload["output"], "finished async audit");
+        assert_eq!(payload["task_id"], task.id);
+        assert_eq!(payload["kind"], "agent");
+        assert_eq!(payload["role"], "general");
+        assert_eq!(payload["state"], "terminal");
+        assert_eq!(payload["result"], "finished async audit");
         assert_eq!(payload["error"], serde_json::Value::Null);
+        assert_eq!(payload["kind"], "agent");
     }
 
     #[test]
-    fn subagent_status_pages_persisted_result_output() {
-        let mut context = RuntimeToolActorContext::new("test-run");
-        let registry = TaskRegistry::new("session-status-page".to_string());
+    fn task_read_output_pages_a_child_result_on_character_boundaries() {
+        let registry = TaskRegistry::new("session-child-page".to_string());
         let task = registry.create_subagent("inspect large output".to_string(), None);
+        // Multi-byte characters must not be split by a cursor boundary.
         registry
-            .complete(&task.id, "0123456789".to_string())
+            .complete(&task.id, "0123中文结果".to_string())
             .unwrap();
+        let invocation = normal_invocation_with_registry(&registry);
         let request = tool_types::ToolRequest {
-            id: "status-page".to_string(),
-            name: tool_types::ToolName::SubagentStatus,
+            id: "read-page".to_string(),
+            name: tool_types::ToolName::TaskReadOutput,
             action: ActionKind::Read,
             target: None,
-            raw_arguments: Some(
-                serde_json::json!({
-                    "agent_id": task.id,
-                    "offset": 4,
-                    "limit": 3,
-                })
-                .to_string(),
-            ),
+            raw_arguments: Some(serde_json::json!({ "task_id": task.id, "cursor": 4 }).to_string()),
         };
 
-        let result = context.execute_subagent_status_tool(&request, &registry);
+        let result =
+            crate::runtime_normal_tool::execute_runtime_normal_tool_for_test(&invocation, &request);
 
-        assert_eq!(result.status, tool_types::ToolStatus::Completed);
         let payload: serde_json::Value =
             serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
-        assert_eq!(payload["output"], "456");
-        assert_eq!(payload["output_total_chars"], 10);
-        assert_eq!(payload["output_offset"], 4);
-        assert_eq!(payload["output_next_offset"], 7);
+        assert_eq!(payload["result_total_chars"], 8);
+        assert_eq!(payload["result_offset"], 4);
+        assert!(
+            payload["result"].as_str().unwrap().starts_with('中'),
+            "a cursor must land on a character boundary: {payload}"
+        );
     }
 
     #[test]
-    fn subagent_status_rejects_invalid_result_page_size() {
-        let mut context = RuntimeToolActorContext::new("test-run");
-        let registry = TaskRegistry::new("session-status-page-limit".to_string());
-        let task = registry.create_subagent("inspect output".to_string(), None);
-        registry.complete(&task.id, "result".to_string()).unwrap();
+    fn task_read_output_rejects_an_unknown_task() {
+        let registry = TaskRegistry::new("session-unknown-task".to_string());
+        let invocation = normal_invocation_with_registry(&registry);
         let request = tool_types::ToolRequest {
-            id: "status-page-limit".to_string(),
-            name: tool_types::ToolName::SubagentStatus,
+            id: "read-missing".to_string(),
+            name: tool_types::ToolName::TaskReadOutput,
             action: ActionKind::Read,
             target: None,
-            raw_arguments: Some(
-                serde_json::json!({
-                    "agent_id": task.id,
-                    "limit": 0,
-                })
-                .to_string(),
-            ),
+            raw_arguments: Some(serde_json::json!({ "task_id": "task-missing" }).to_string()),
         };
 
-        let result = context.execute_subagent_status_tool(&request, &registry);
+        let result =
+            crate::runtime_normal_tool::execute_runtime_normal_tool_for_test(&invocation, &request);
 
         assert_eq!(result.status, tool_types::ToolStatus::Failed);
         assert_eq!(
@@ -3075,8 +3154,10 @@ mod tests {
             result
                 .error
                 .as_deref()
-                .unwrap()
-                .contains("between 1 and 32000")
+                .unwrap_or_default()
+                .contains("unknown task"),
+            "unexpected error: {:?}",
+            result.error
         );
     }
 

@@ -22,10 +22,8 @@ use orca_core::config::{
 use orca_core::model::ModelSelection;
 use orca_core::subagent_config::{DelegationPolicy, SubagentConfig};
 use orca_core::subagent_types::{RoleCapability, SubagentType, builtin_agents};
-use orca_core::task_types::TaskStatus;
 use orca_runtime::child_agent_entrypoints::role_tool_ceiling;
 use orca_runtime::session::InteractiveSession;
-use orca_runtime::subagent_admission::{SubagentAdmission, SubagentAdmissionError};
 use orca_runtime::tasks::{ResultDelivery, TaskRegistry};
 
 fn test_config() -> RunConfig {
@@ -142,7 +140,7 @@ fn the_enforced_ceiling_is_exactly_the_role_catalog_tool_list() {
 }
 
 #[test]
-fn every_enforced_builtin_ceiling_resolves_and_excludes_grandchildren() {
+fn every_enforced_builtin_ceiling_resolves_and_only_general_can_delegate() {
     let registry = orca_tools::registry::default_tool_registry();
     for descriptor in builtin_agents() {
         let ceiling = role_tool_ceiling(&descriptor.kind.subagent_type());
@@ -158,9 +156,10 @@ fn every_enforced_builtin_ceiling_resolves_and_excludes_grandchildren() {
                 descriptor.name
             );
         }
-        assert!(
-            !ceiling.iter().any(|tool| tool == "subagent"),
-            "{} must not be able to launch grandchildren",
+        assert_eq!(
+            ceiling.iter().any(|tool| tool == "subagent"),
+            descriptor.name == "general",
+            "{} has an unexpected nested delegation capability",
             descriptor.name
         );
     }
@@ -225,11 +224,20 @@ fn delegation_policy_is_independent_of_approval_mode() {
 }
 
 #[test]
-fn explicit_policy_is_the_default_and_never_delegates_proactively() {
+fn adaptive_is_the_default_and_delegates_proactively() {
     let config = test_config();
-    assert_eq!(config.subagents.delegation, DelegationPolicy::Explicit);
+    assert_eq!(config.subagents.delegation, DelegationPolicy::Adaptive);
     assert!(config.subagents.delegation.allows_new_children());
-    assert!(!config.subagents.delegation.is_proactive());
+    assert!(config.subagents.delegation.is_proactive());
+}
+
+#[test]
+fn explicit_policy_never_delegates_proactively() {
+    let policy = DelegationPolicy::Explicit;
+    assert!(policy.allows_new_children());
+    assert!(!policy.is_proactive());
+    let prompt = orca_runtime::agent_common::format_subagent_guidance(policy);
+    assert!(prompt.contains("only when the user explicitly asked"));
 }
 
 #[test]
@@ -268,7 +276,8 @@ fn off_prompt_forbids_new_children_and_keeps_existing_ones_reachable() {
 
     assert!(prompt.contains("Delegation is turned off"));
     assert!(prompt.contains("Do not start new child agents"));
-    assert!(prompt.contains("subagent_status"));
+    assert!(prompt.contains("task_list"));
+    assert!(prompt.contains("task_wait"));
     assert!(prompt.contains("task_stop"));
     assert!(!prompt.contains("Decision rules"));
 }
@@ -333,77 +342,140 @@ fn child_system_prompt_does_not_claim_a_synchronous_role() {
 // ------------------------------------------------------------------ admission
 
 #[test]
-fn shared_limit_refuses_a_second_launch_and_recovers_after_release() {
-    let registry = TaskRegistry::new("subagent-contract-admission".to_string());
-    let admission = SubagentAdmission::default();
+fn a_full_execution_pool_queues_the_next_child_instead_of_refusing_it() {
+    use orca_core::subagent_config::SubagentLimits;
+    use orca_runtime::execution_scope::Admission;
 
-    let held = admission
-        .admit(&registry, 1)
-        .expect("first reservation is admitted");
-    let refused = admission
-        .admit(&registry, 1)
-        .expect_err("second reservation must be refused");
-    assert_eq!(
-        refused,
-        SubagentAdmissionError::CapacityExceeded {
-            limit: 1,
-            running: 1
-        }
+    let registry = TaskRegistry::new("subagent-contract-queue".to_string());
+    let limits = SubagentLimits {
+        max_running: 1,
+        max_queued: 8,
+        max_live_tasks: 32,
+    };
+    let scope = registry.execution_scope(&limits);
+
+    let first = registry.create_subagent("first".to_string(), None);
+    assert_eq!(scope.classify(&first.id), Some(Admission::Started));
+    registry.mark_running(&first.id).expect("running");
+
+    // The second submission is accepted and waits; it is not a tool failure.
+    let second = registry.create_subagent("second".to_string(), None);
+    assert_eq!(scope.classify(&second.id), Some(Admission::Queued));
+    assert!(
+        scope.refuses().is_none(),
+        "capacity pressure is a queue position, not a refusal"
     );
-    let message = refused.message();
-    assert!(message.contains("No child was started"));
-    assert!(message.contains("Do not retry immediately"));
 
-    drop(held);
-    admission
-        .admit(&registry, 1)
-        .expect("slot returns after release");
+    let capacity = scope.capacity();
+    assert_eq!(capacity.running, 1);
+    assert_eq!(capacity.queued, 1);
+    assert_eq!(capacity.limits.max_running, 1);
+    assert_eq!(capacity.to_json()["limit"], 1);
+    assert_eq!(capacity.to_json()["queued"], 1);
 }
 
 #[test]
-fn registry_admission_is_shared_across_clones() {
+fn capacity_is_shared_by_clones_of_one_registry() {
+    use orca_core::subagent_config::SubagentLimits;
+
     let registry = TaskRegistry::new("subagent-contract-shared".to_string());
     let clone = registry.clone();
+    let limits = SubagentLimits {
+        max_running: 1,
+        max_queued: 4,
+        max_live_tasks: 16,
+    };
 
-    let held = registry.admit_child(1).expect("first admission");
-    assert!(
-        clone.admit_child(1).is_err(),
-        "a clone must share the same admission gate"
+    let first = registry.create_subagent("first".to_string(), None);
+    registry.mark_running(&first.id).expect("running");
+
+    let scope = clone.execution_scope(&limits);
+    assert_eq!(
+        scope.running(),
+        1,
+        "a clone must see the same durable execution leases"
     );
-    drop(held);
-    clone.admit_child(1).expect("slot returns");
+    assert_eq!(scope.ready_to_start(0), Vec::<String>::new());
 }
 
 #[test]
-fn admission_counts_detached_running_children_only() {
-    let registry = TaskRegistry::new("subagent-contract-count".to_string());
-    assert_eq!(registry.active_detached_subagent_count(), 0);
+fn a_saturated_scope_refuses_only_at_a_real_boundary() {
+    use orca_core::subagent_config::SubagentLimits;
+    use orca_runtime::execution_scope::AdmissionRefusal;
 
-    // An in-band child is bounded by its own batch window and its parent is
-    // blocked on it, so it must not consume the detached-child limit.
-    let in_band = registry.create_subagent("sync child".to_string(), None);
-    assert_eq!(registry.active_detached_subagent_count(), 0);
+    let registry = TaskRegistry::new("subagent-contract-refusal".to_string());
+    let limits = SubagentLimits {
+        max_running: 1,
+        max_queued: 2,
+        max_live_tasks: 64,
+    };
+    let scope = registry.execution_scope(&limits);
 
-    let detached = registry.create_subagent("detached child".to_string(), None);
-    assert!(registry.mark_subagent_result_pending(&detached.id));
-    assert_eq!(registry.active_detached_subagent_count(), 1);
+    let running = registry.create_subagent("running".to_string(), None);
+    registry.mark_running(&running.id).expect("running");
+    registry.create_subagent("queued-one".to_string(), None);
+    registry.create_subagent("queued-two".to_string(), None);
+
+    let refusal = scope.refuses().expect("the queue is at its limit");
     assert_eq!(
-        registry.get(&detached.id).unwrap().status,
-        TaskStatus::Queued
+        refusal,
+        AdmissionRefusal::QueueFull {
+            queued: 2,
+            limit: 2
+        }
     );
+    let message = refusal.message();
+    assert!(message.contains("was not accepted"));
+    assert!(
+        message.contains("task_stop"),
+        "a refusal must say what still works: {message}"
+    );
+}
+
+#[test]
+fn the_running_count_tracks_execution_leases_not_delivery() {
+    let registry = TaskRegistry::new("subagent-contract-count".to_string());
+    assert_eq!(registry.active_subagent_lease_count(), 0);
+
+    // A queued child is waiting for a lease, not holding one.
+    let child = registry.create_subagent("child".to_string(), None);
+    assert_eq!(
+        registry.active_subagent_lease_count(),
+        0,
+        "a queued child holds no execution lease"
+    );
+    registry.mark_running(&child.id).expect("running");
+    assert_eq!(
+        registry.active_subagent_lease_count(),
+        1,
+        "a running child holds one"
+    );
+    // A child that released its lease while waiting for its own children is
+    // still non-terminal, and still does not hold a lease.
+    assert!(registry.request_pause(&child.id).is_err());
+    assert_eq!(registry.active_subagent_lease_count(), 1);
+    assert!(
+        registry.requeue_for_resume(&child.id, orca_runtime::task_view::WaitReason::Dependency)
+    );
+    assert_eq!(registry.active_subagent_lease_count(), 0);
 
     registry
-        .stop(&detached.id, "test stop".to_string())
+        .stop(&child.id, "test stop".to_string())
         .expect("stop child");
     assert_eq!(
-        registry.active_detached_subagent_count(),
+        registry.active_subagent_lease_count(),
         0,
         "a terminal child must not hold a running slot"
     );
 
+    // Delivery state is a separate axis: whether the parent still owes this
+    // result a notification never changes how much execution capacity is used.
+    let delivered = registry.create_subagent("delivered".to_string(), None);
+    let _ = registry.mark_subagent_result_pending(&delivered.id);
     registry
-        .stop(&in_band.id, "test stop".to_string())
-        .expect("stop in-band child");
+        .complete(&delivered.id, "done".to_string())
+        .expect("complete");
+    assert_eq!(registry.active_subagent_lease_count(), 0);
 }
 
 // ------------------------------------------------------------ result delivery
@@ -418,7 +490,7 @@ fn detached_child_result_is_delivered_to_the_parent_exactly_once() {
         registry.get(&child.id).unwrap().result_delivery,
         ResultDelivery::InBand
     );
-    assert!(registry.drain_pending_subagent_results().is_empty());
+    assert!(registry.claim_pending_subagent_results().is_empty());
 
     // A detached child does.
     assert!(registry.mark_subagent_result_pending(&child.id));
@@ -430,7 +502,7 @@ fn detached_child_result_is_delivered_to_the_parent_exactly_once() {
         .complete(&child.id, "found it in src/a.rs:12".to_string())
         .expect("complete child");
 
-    let first = registry.drain_pending_subagent_results();
+    let first = registry.claim_pending_subagent_results();
     assert_eq!(first.len(), 1);
     let notification = first[0].model_notification();
     assert!(notification.starts_with("<task-notification>"));
@@ -443,7 +515,7 @@ fn detached_child_result_is_delivered_to_the_parent_exactly_once() {
     );
 
     assert!(
-        registry.drain_pending_subagent_results().is_empty(),
+        registry.claim_pending_subagent_results().is_empty(),
         "a delivered result must never be injected twice"
     );
 }
@@ -455,7 +527,7 @@ fn unfinished_detached_child_is_not_delivered_early() {
     let _ = registry.mark_subagent_result_pending(&child.id);
 
     assert!(
-        registry.drain_pending_subagent_results().is_empty(),
+        registry.claim_pending_subagent_results().is_empty(),
         "a running child has no result to deliver"
     );
     assert_eq!(
@@ -474,7 +546,7 @@ fn failed_detached_child_delivers_its_failure_reason() {
         .fail(&child.id, "provider returned 500".to_string())
         .expect("fail child");
 
-    let pending = registry.drain_pending_subagent_results();
+    let pending = registry.claim_pending_subagent_results();
     assert_eq!(pending.len(), 1);
     let notification = pending[0].model_notification();
     assert!(notification.contains("status failed"));
@@ -490,11 +562,12 @@ fn long_detached_result_is_truncated_with_a_paging_hint() {
         .complete(&child.id, "x".repeat(20_000))
         .expect("complete child");
 
-    let pending = registry.drain_pending_subagent_results();
+    let pending = registry.claim_pending_subagent_results();
     let notification = pending[0].model_notification();
     assert!(notification.contains("result truncated"));
     assert!(
-        notification.contains("output_next_limit") || notification.contains("output_next_offset")
+        notification.contains("task_read_output") && notification.contains("next_cursor"),
+        "a truncated notification must name the tool and cursor that read the rest: {notification}"
     );
     assert!(
         notification.chars().count() < 5_000,
@@ -503,22 +576,92 @@ fn long_detached_result_is_truncated_with_a_paging_hint() {
 }
 
 #[test]
-fn a_delivered_result_is_already_marked_after_a_restart() {
-    // The marker is persisted with the task record, so a fresh registry that
-    // loads the same session must not re-deliver.
-    let registry = TaskRegistry::new("subagent-contract-delivery-restart".to_string());
+fn a_claimed_result_is_not_delivered_until_it_is_acknowledged() {
+    // Claiming is not delivering: a crash between the claim and the parent
+    // conversation must retry, not lose the notification.
+    let registry = TaskRegistry::new("subagent-contract-delivery-claim".to_string());
     let child = registry.create_subagent("once".to_string(), None);
     let _ = registry.mark_subagent_result_pending(&child.id);
     registry
         .complete(&child.id, "done".to_string())
         .expect("complete child");
-    assert_eq!(registry.drain_pending_subagent_results().len(), 1);
 
-    let reloaded = TaskRegistry::new("subagent-contract-delivery-restart".to_string());
+    let claimed = registry.claim_pending_subagent_results();
+    assert_eq!(claimed.len(), 1);
     assert!(
-        reloaded.drain_pending_subagent_results().is_empty(),
-        "an in-memory session reload must not resurface a delivered result"
+        !claimed[0].claim_id.is_empty(),
+        "a claim must carry the identity the acknowledgement returns"
     );
+
+    // The claim is durable: a second turn sees it is in flight and does not
+    // inject the same result concurrently.
+    assert!(
+        registry.claim_pending_subagent_results().is_empty(),
+        "an unacknowledged but live claim must not be handed out twice"
+    );
+    assert_eq!(
+        registry.outstanding_subagent_results().len(),
+        1,
+        "an unacknowledged result is still owed to the parent"
+    );
+
+    // The acknowledgement closes it.
+    let ack = orca_runtime::tasks::DeliveryAck::from(&claimed[0]);
+    assert!(registry.ack_subagent_result(&ack));
+    assert!(
+        registry.claim_pending_subagent_results().is_empty(),
+        "an acknowledged result must never be injected again"
+    );
+    assert!(registry.outstanding_subagent_results().is_empty());
+}
+
+#[test]
+fn a_replayed_acknowledgement_cannot_mark_a_newer_result_delivered() {
+    let registry = TaskRegistry::new("subagent-contract-delivery-replay".to_string());
+    let child = registry.create_subagent("once".to_string(), None);
+    let _ = registry.mark_subagent_result_pending(&child.id);
+    registry
+        .complete(&child.id, "first".to_string())
+        .expect("complete child");
+
+    let claimed = registry.claim_pending_subagent_results();
+    let stale_ack = orca_runtime::tasks::DeliveryAck::from(&claimed[0]);
+    assert!(registry.ack_subagent_result(&stale_ack));
+
+    // A second, replayed acknowledgement with the same identity is rejected.
+    assert!(
+        !registry.ack_subagent_result(&stale_ack),
+        "a replayed acknowledgement must not be accepted"
+    );
+    // An acknowledgement for a different result revision is rejected too.
+    let wrong_revision = orca_runtime::tasks::DeliveryAck {
+        task_id: stale_ack.task_id.clone(),
+        result_revision: stale_ack.result_revision + 1,
+        claim_id: stale_ack.claim_id.clone(),
+    };
+    assert!(!registry.ack_subagent_result(&wrong_revision));
+}
+
+#[test]
+fn a_released_claim_makes_the_result_deliverable_again() {
+    let registry = TaskRegistry::new("subagent-contract-delivery-release".to_string());
+    let child = registry.create_subagent("once".to_string(), None);
+    let _ = registry.mark_subagent_result_pending(&child.id);
+    registry
+        .complete(&child.id, "done".to_string())
+        .expect("complete child");
+
+    let claimed = registry.claim_pending_subagent_results();
+    let ack = orca_runtime::tasks::DeliveryAck::from(&claimed[0]);
+    // The parent conversation could not be written: the result must not be lost.
+    assert!(registry.release_subagent_result_claim(&ack));
+    let reclaimed = registry.claim_pending_subagent_results();
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "a released claim must be retried by the next turn"
+    );
+    assert_eq!(reclaimed[0].result_revision, claimed[0].result_revision);
 }
 
 // ------------------------------------------------------------- session wiring
@@ -533,11 +676,11 @@ fn session_opens_with_a_system_prompt_and_an_available_task_registry() {
         Some(orca_core::conversation::Message::System { .. })
     ));
     // A fresh session has nothing to deliver and nothing occupying a slot.
-    assert_eq!(session.task_registry().active_detached_subagent_count(), 0);
+    assert_eq!(session.task_registry().active_subagent_lease_count(), 0);
     assert!(
         session
             .task_registry()
-            .drain_pending_subagent_results()
+            .claim_pending_subagent_results()
             .is_empty()
     );
 }

@@ -37,7 +37,9 @@ pub use retention::{
     SessionRetentionError, SessionRetentionPolicy, SessionRetentionReport, retain_sessions,
 };
 pub use session_index::SessionSummaryPage;
-pub(crate) use types::{ManualCompactionDurableSnapshot, SessionRecord, StoredConversationRecord};
+pub(crate) use types::{
+    ManualCompactionDurableSnapshot, SessionRecord, StoredAgentScope, StoredConversationRecord,
+};
 pub use types::{
     SessionCheckpointRecord, SessionMeta, SessionSummary, SessionTranscript, SortDirection,
     StoredSessionHealth, StoredSessionHealthIssue, StoredThreadItem, StoredThreadItemPage,

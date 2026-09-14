@@ -22,11 +22,10 @@ use orca_runtime::hooks::HookRunner;
 use orca_runtime::lifecycle::{
     RuntimeApprovalDecision, RuntimeApprovalHandler, RuntimeInteractionToolDispatch,
     RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
-    RuntimeSessionLifecycle, RuntimeSpecialToolDispatch, RuntimeSubagentStatusLookup,
-    RuntimeSubagentStatusRecord, RuntimeTaskActor, RuntimeTaskKind, RuntimeTaskStatus,
-    RuntimeToolActorContext, RuntimeTurnRunner, RuntimeUserInputAnswer, RuntimeUserInputHandler,
-    RuntimeUserInputRequest, RuntimeUserInputResponse, RuntimeWorkflowDraftRequest,
-    RuntimeWorkflowIpc, TurnPermissionOverlay,
+    RuntimeSessionLifecycle, RuntimeSpecialToolDispatch, RuntimeTaskActor, RuntimeTaskKind,
+    RuntimeTaskStatus, RuntimeToolActorContext, RuntimeTurnRunner, RuntimeUserInputAnswer,
+    RuntimeUserInputHandler, RuntimeUserInputRequest, RuntimeUserInputResponse,
+    RuntimeWorkflowDraftRequest, RuntimeWorkflowIpc, TurnPermissionOverlay,
 };
 use orca_runtime::protocol::{
     PermissionGrantScope, PermissionResponseDecision, RequestFileSystemPermissions,
@@ -1207,9 +1206,18 @@ fn task_actor_executes_normal_tool_with_runtime_policy() {
         None,
     );
 
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
-    assert_eq!(result.output.as_deref(), Some("actor-tool"));
-    assert_eq!(result.exit_code, Some(0));
+    // The actor path has no terminal service, so bash fails closed instead of
+    // silently starting a second, unmanaged execution path.
+    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("runtime-owned terminal service")),
+        "unexpected error: {:?}",
+        result.error
+    );
+    let _ = task_registry;
 }
 
 #[test]
@@ -1503,16 +1511,36 @@ fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution()
         None,
         None,
     );
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
-    assert_eq!(result.output.as_deref(), Some("actor-context"));
-    let shell_tasks = task_registry.list();
-    assert_eq!(shell_tasks.len(), 1);
-    assert_eq!(shell_tasks[0].task_type, TaskType::Shell);
-    assert_eq!(shell_tasks[0].status, TaskStatus::Completed);
-    assert_eq!(
-        shell_tasks[0].command.as_deref(),
-        Some("printf actor-context")
+    // The command runs through the runtime-owned terminal service and reports
+    // the unified contract rather than a bare output string.
+    assert!(
+        matches!(
+            result.status,
+            orca_core::tool_types::ToolStatus::Completed
+                | orca_core::tool_types::ToolStatus::Running
+        ),
+        "unexpected status: {:?} ({:?})",
+        result.status,
+        result.error
     );
+    let payload: serde_json::Value =
+        serde_json::from_str(result.output.as_deref().expect("terminal contract payload"))
+            .expect("terminal contract is JSON");
+    assert!(
+        payload["return_reason"].is_string(),
+        "every command result names why the call returned: {payload}"
+    );
+    assert!(
+        payload["task_id"].is_string(),
+        "every command result carries its task identity: {payload}"
+    );
+    assert!(
+        payload["effective_deadline_ms"].is_null(),
+        "no caller deadline and no configured cap means no execution limit: {payload}"
+    );
+    let shell_tasks = task_registry.list();
+    assert_eq!(shell_tasks.len(), 1, "one command must create one task");
+    assert_eq!(shell_tasks[0].task_type, TaskType::Shell);
 
     assert!(
         context
@@ -1592,20 +1620,114 @@ fn tool_actor_context_cancels_normal_tool_before_admission_without_shell_task() 
 }
 
 #[test]
-fn tool_actor_context_preserves_shell_session_timeout_as_failure() {
+fn caller_timeout_is_the_effective_execution_deadline() {
     let config = danger_full_access_config();
+    // One context owns the terminal service for both the launch and every
+    // later observation of that command.
     let mut context = RuntimeToolActorContext::new("run-tools");
-    let task_registry = orca_runtime::tasks::TaskRegistry::new("run-tools".to_string());
+    let task_registry = TaskRegistry::new("run-tools".to_string());
+    // The command sleeps far longer than its deadline, and the call returns as
+    // soon as the process is registered, so only the deadline can end it.
     let request = ToolRequest {
         id: "tool-timeout".to_string(),
         name: ToolName::Bash,
         action: ActionKind::Shell,
-        target: Some("printf before; sleep 5; printf after".to_string()),
+        target: Some("printf before; sleep 30; printf after".to_string()),
         raw_arguments: Some(
-            serde_json::json!({ "command": "printf before; sleep 5; printf after" }).to_string(),
+            serde_json::json!({
+                "command": "printf before; sleep 30; printf after",
+                "timeout_ms": 300,
+                "yield_time_ms": 0,
+            })
+            .to_string(),
         ),
     };
     let start = std::time::Instant::now();
+
+    let result = context.execute_normal_tool_with_roots_and_cancel(
+        &config,
+        &request,
+        std::env::current_dir().expect("cwd").as_path(),
+        &[],
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        ToolConfig::default().shell_timeout_secs,
+        Some(&task_registry),
+        None,
+        None,
+    );
+
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(8),
+        "the launch must return as soon as the process is registered"
+    );
+    assert_eq!(
+        result.status,
+        orca_core::tool_types::ToolStatus::Running,
+        "a zero yield returns while the command is still running"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(result.output.as_deref().expect("terminal contract payload"))
+            .expect("terminal contract is JSON");
+    assert_eq!(
+        payload["effective_deadline_ms"], 300,
+        "the caller deadline is the effective execution deadline: {payload}"
+    );
+    assert_eq!(
+        payload["deadline_source"], "caller timeout_ms",
+        "the result names the origin of the deadline: {payload}"
+    );
+    assert!(
+        payload["termination_reason"].is_null(),
+        "a yielded command has not terminated: {payload}"
+    );
+    assert_eq!(payload["return_reason"], "yield_elapsed");
+
+    // The supervisor enforces the deadline on its own maintenance tick. Wait
+    // for it, then read the settled terminal state.
+    let task_id = payload["task_id"]
+        .as_str()
+        .expect("task identity")
+        .to_string();
+    let settled = loop {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "the deadline never stopped the command"
+        );
+        let record = task_registry.get(&task_id).expect("task record");
+        if matches!(
+            record.status,
+            TaskStatus::Stopped | TaskStatus::Failed | TaskStatus::Completed
+        ) {
+            break record;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    assert!(
+        matches!(settled.status, TaskStatus::Stopped | TaskStatus::Failed),
+        "a command stopped by its deadline must not be reported as completed: {:?}",
+        settled.status
+    );
+}
+
+#[test]
+fn the_tighter_of_the_caller_deadline_and_the_configured_cap_wins() {
+    let config = danger_full_access_config();
+    // One context owns the terminal service for both the launch and every
+    // later observation of that command.
+    let mut context = RuntimeToolActorContext::new("run-tools");
+    let task_registry = TaskRegistry::new("run-tools".to_string());
+    // The caller asks for five minutes; the administrator cap is one second.
+    let request = ToolRequest {
+        id: "tool-cap".to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some("sleep 5".to_string()),
+        raw_arguments: Some(
+            serde_json::json!({ "command": "sleep 5", "timeout_ms": 300_000 }).to_string(),
+        ),
+    };
 
     let result = context.execute_normal_tool_with_roots_and_cancel(
         &config,
@@ -1621,109 +1743,70 @@ fn tool_actor_context_preserves_shell_session_timeout_as_failure() {
         None,
     );
 
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(3),
-        "timed out shell-session tool should stop near its timeout"
-    );
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+    let payload: serde_json::Value =
+        serde_json::from_str(result.output.as_deref().expect("terminal contract payload"))
+            .expect("terminal contract is JSON");
     assert_eq!(
-        result.kind,
-        orca_core::tool_types::ToolResultKind::RuntimeError
+        payload["effective_deadline_ms"], 1_000,
+        "the tighter limit must win: {payload}"
+    );
+    assert_eq!(
+        payload["deadline_source"], "administrator command cap",
+        "the result must name the tighter source instead of silently truncating the caller: {payload}"
     );
     assert!(
-        result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("shell command timed out after 1s"),
-        "unexpected error: {:?}",
-        result.error
+        payload["termination_reason"].is_null() || payload["termination_reason"] == "timed_out",
+        "unexpected termination: {payload}"
     );
 }
 
 #[test]
-fn tool_actor_context_task_stop_cancels_running_shell_task_wait() {
+fn task_stop_cancels_a_running_shell_task() {
+    // The actor path no longer launches commands, so this covers the retained
+    // task_stop contract: a running shell task becomes stopping and its cancel
+    // token fires.
     let task_registry = TaskRegistry::new("run-tools".to_string());
-    let shell_registry = task_registry.clone();
-    let handle = std::thread::spawn(move || {
-        let config = danger_full_access_config();
-        let mut context = RuntimeToolActorContext::new("run-tools");
-        let request = ToolRequest {
-            id: "tool-1".to_string(),
-            name: ToolName::Bash,
-            action: ActionKind::Shell,
-            target: Some("printf before; sleep 30; printf after".to_string()),
-            raw_arguments: Some(
-                serde_json::json!({ "command": "printf before; sleep 30; printf after" })
-                    .to_string(),
-            ),
-        };
+    let shell_task = task_registry.create_shell(
+        "printf before; sleep 30; printf after".to_string(),
+        "printf before; sleep 30; printf after".to_string(),
+    );
+    task_registry
+        .mark_running(&shell_task.id)
+        .expect("mark running");
+    let cancel = task_registry
+        .get(&shell_task.id)
+        .map(|task| task.control.cancel.clone())
+        .expect("task record");
+    assert!(!cancel.is_cancelled());
 
-        context.execute_normal_tool_with_roots_and_cancel(
-            &config,
-            &request,
-            std::env::current_dir().expect("cwd").as_path(),
-            &[],
-            &McpRegistry::default(),
-            &[],
-            ToolConfig::default().output_truncation,
-            30,
-            Some(&shell_registry),
-            None,
-            None,
-        )
-    });
-    let started = std::time::Instant::now();
-    let task_id =
-        loop {
-            if let Some(task) = task_registry.list().into_iter().find(|task| {
-                task.task_type == TaskType::Shell && task.status == TaskStatus::Running
-            }) {
-                break task.id;
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(2),
-                "shell task did not start"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-    let mut stop_context = RuntimeToolActorContext::new("run-tools");
+    let mut context = RuntimeToolActorContext::new("run-tools");
     let stop_request = ToolRequest {
         id: "stop".to_string(),
         name: ToolName::TaskStop,
         action: ActionKind::Write,
         target: None,
-        raw_arguments: Some(format!(r#"{{"task_id":"{}"}}"#, task_id)),
+        raw_arguments: Some(format!(r#"{{"task_id":"{}"}}"#, shell_task.id)),
     };
     let stop_started = std::time::Instant::now();
-
-    let stop_result = stop_context.execute_task_stop_tool(&stop_request, &task_registry);
-    let result = handle.join().expect("shell thread result");
+    let stop_result = context.execute_task_stop_tool(&stop_request, &task_registry);
 
     assert_eq!(
         stop_result.status,
         orca_core::tool_types::ToolStatus::Completed
     );
-    let stop_deadline = if cfg!(windows) {
-        std::time::Duration::from_secs(10)
-    } else {
-        std::time::Duration::from_secs(2)
-    };
     assert!(
-        stop_started.elapsed() < stop_deadline,
-        "task_stop should cancel the running shell wait promptly"
-    );
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Cancelled);
-    assert_eq!(
-        result.kind,
-        orca_core::tool_types::ToolResultKind::Cancelled
+        stop_started.elapsed() < std::time::Duration::from_secs(2),
+        "task_stop should return promptly"
     );
     assert!(
-        task_registry
-            .list()
-            .iter()
-            .any(|task| task.id == task_id && task.status == TaskStatus::Stopped),
-        "task_stop should stop the shell task record"
+        cancel.is_cancelled(),
+        "stopping the task must cancel the running command's token"
+    );
+    let record = task_registry.get(&shell_task.id).expect("task record");
+    assert!(
+        matches!(record.status, TaskStatus::Stopping | TaskStatus::Stopped),
+        "unexpected status: {:?}",
+        record.status
     );
 }
 
@@ -1746,10 +1829,6 @@ fn tool_actor_context_classifies_runtime_special_tool_dispatch() {
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::Subagent), false),
         RuntimeSpecialToolDispatch::Subagent
-    );
-    assert_eq!(
-        context.classify_dispatch(&tool_request(ToolName::SubagentStatus), false),
-        RuntimeSpecialToolDispatch::SubagentStatus
     );
     assert_eq!(
         context.classify_dispatch(&tool_request(ToolName::TaskList), false),
@@ -1846,35 +1925,6 @@ fn tool_actor_context_executes_workflow_ipc_against_runtime_trait() {
     assert_eq!(output["channel"], "findings");
     assert_eq!(output["from"], "worker-a");
     assert_eq!(output["message"]["status"], "ready");
-}
-
-#[test]
-fn tool_actor_context_executes_subagent_status_against_runtime_lookup() {
-    let mut context = RuntimeToolActorContext::new("run-tools");
-    let request = ToolRequest {
-        id: "status".to_string(),
-        name: ToolName::SubagentStatus,
-        action: ActionKind::Read,
-        target: None,
-        raw_arguments: Some(serde_json::json!({ "agent_id": "agent-1" }).to_string()),
-    };
-    let lookup = FakeSubagentStatusLookup;
-
-    let result = context.execute_subagent_status_tool(&request, &lookup);
-
-    assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
-    let output: Value = serde_json::from_str(result.output.as_deref().expect("output")).unwrap();
-    assert_eq!(output["agent_id"], "agent-1");
-    assert_eq!(output["status"], "completed");
-    assert_eq!(output["description"], "inspect auth");
-    assert_eq!(output["agent_type"], "general");
-    assert_eq!(output["output"], "finished async audit");
-    assert_eq!(output["error"], Value::Null);
-    assert_eq!(output["continuation_id"], "continuation-1");
-    assert_eq!(output["attempt_id"], "attempt-2");
-    assert_eq!(output["checkpoint_id"], "checkpoint-3");
-    assert_eq!(output["resumable"], true);
-    assert_eq!(output["indeterminate"], false);
 }
 
 #[test]
@@ -2110,40 +2160,6 @@ fn controller_turn_started_events_include_agent_task_lifecycle() {
 
 fn workflow_script() -> &'static str {
     "export const meta = { name: 'runtime-draft', description: 'Runtime draft', phases: ['main'] };\nconst result = await phase('main', async () => agent('inspect repo'));\nexport default result;"
-}
-
-struct FakeSubagentStatusLookup;
-
-impl RuntimeSubagentStatusLookup for FakeSubagentStatusLookup {
-    fn subagent_status_record(&self, agent_id: &str) -> Option<RuntimeSubagentStatusRecord> {
-        if agent_id != "agent-1" {
-            return None;
-        }
-        Some(RuntimeSubagentStatusRecord {
-            id: agent_id.to_string(),
-            status: "completed".to_string(),
-            description: "inspect auth".to_string(),
-            agent_type: Some("general".to_string()),
-            created_at_ms: 1,
-            started_at_ms: Some(2),
-            completed_at_ms: Some(3),
-            output: Some("finished async audit".to_string()),
-            error: None,
-            usage: None,
-            subagent_current_activity: None,
-            subagent_activity_history: Vec::new(),
-            subagent_child_thread_id: None,
-            subagent_batch_id: None,
-            subagent_batch_size: None,
-            subagent_turn: None,
-            last_activity_at_ms: None,
-            continuation_id: Some("continuation-1".to_string()),
-            continuation_attempt_id: Some("attempt-2".to_string()),
-            continuation_checkpoint_id: Some("checkpoint-3".to_string()),
-            continuation_resumable: true,
-            continuation_indeterminate: false,
-        })
-    }
 }
 
 struct FakeWorkflowIpc;

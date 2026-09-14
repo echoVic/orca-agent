@@ -534,13 +534,13 @@ fn is_builtin_tool(tool: &str) -> bool {
             | "glob"
             | "grep"
             | "bash"
-            | "exec_command"
-            | "write_stdin"
+            | "task_read_output"
+            | "task_send_input"
+            | "task_wait"
             | "edit"
             | "write_file"
             | "git_status"
             | "subagent"
-            | "subagent_status"
             | "task_list"
             | "task_stop"
             | "WorkflowDraft"
@@ -716,9 +716,15 @@ mod tests {
 
     #[test]
     fn unified_exec_tools_are_projected_as_builtins() {
-        assert!(is_builtin_tool("exec_command"));
-        assert!(is_builtin_tool("write_stdin"));
-        assert!(!is_dynamic_tool("exec_command"));
-        assert!(!is_dynamic_tool("write_stdin"));
+        assert!(is_builtin_tool("bash"));
+        assert!(is_builtin_tool("task_read_output"));
+        assert!(is_builtin_tool("task_wait"));
+        assert!(!is_dynamic_tool("bash"));
+        assert!(!is_dynamic_tool("task_read_output"));
+        assert!(
+            !is_builtin_tool("exec_command"),
+            "the removed tools must not linger in the builtin set"
+        );
+        assert!(!is_builtin_tool("write_stdin"));
     }
 }

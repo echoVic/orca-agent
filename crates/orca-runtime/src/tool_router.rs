@@ -220,6 +220,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 workflow_child_executor,
                 wait_for_background_workflows,
                 workflow_lifecycle_ingress,
+                task_registry.take_child_budget(root_task_id, &execution_request.id),
             ),
             RuntimeSpecialToolDispatch::Workflow => execute_workflow_tool(
                 config,
@@ -233,6 +234,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 workflow_child_executor,
                 wait_for_background_workflows,
                 workflow_lifecycle_ingress,
+                task_registry.take_child_budget(root_task_id, &execution_request.id),
             ),
             RuntimeSpecialToolDispatch::Subagent => {
                 let (result, child_budget_usage) = execute_subagent_tool_with_activity_ingress(
@@ -267,12 +269,12 @@ impl<'a> RuntimeToolRouter<'a> {
                 dispatch_child_budget_usage = child_budget_usage;
                 Ok(result)
             }
-            RuntimeSpecialToolDispatch::SubagentStatus => Ok(self
-                .runtime
-                .execute_subagent_status_tool(execution_request, task_registry)),
             RuntimeSpecialToolDispatch::TaskList => Ok(self
                 .runtime
                 .execute_task_list_tool(execution_request, task_registry)),
+            RuntimeSpecialToolDispatch::SubagentMessage => Ok(self
+                .runtime
+                .execute_subagent_message_tool(execution_request, task_registry)),
             RuntimeSpecialToolDispatch::TaskStop => {
                 let result = self
                     .runtime
@@ -356,9 +358,17 @@ impl<'a> RuntimeToolRouter<'a> {
                             .cloned(),
                     )
                     .collect::<Vec<_>>();
+                // `bash` is the single command entry point, so it is the tool
+                // that needs the runtime-owned terminal service.
+                // Every command tool shares one runtime-owned terminal service:
+                // the starter and the tools that observe it must reach the same
+                // supervisor.
                 let terminal_service = matches!(
                     execution_request.name,
-                    tool_types::ToolName::ExecCommand | tool_types::ToolName::WriteStdin
+                    tool_types::ToolName::Bash
+                        | tool_types::ToolName::TaskReadOutput
+                        | tool_types::ToolName::TaskSendInput
+                        | tool_types::ToolName::TaskWait
                 )
                 .then(|| {
                     let thread_store = extension_stores
@@ -380,7 +390,8 @@ impl<'a> RuntimeToolRouter<'a> {
                     Some(task_registry),
                     permission_overlay.clone(),
                 )
-                .with_terminal_service(terminal_service);
+                .with_terminal_service(terminal_service)
+                .with_owner(root_task_id);
                 let output = {
                     let mut output_handler = |chunk: &str| {
                         sink.emit(events.tool_output_delta(&execution_request.id, chunk))

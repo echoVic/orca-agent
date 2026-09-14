@@ -101,11 +101,15 @@ deletion.
 - Uses DeepSeek's reasoning and tool-use semantics directly, with SSE streaming,
   prefix-cache-friendly prompts, automatic context management, and retry logic.
 - Reads, searches, edits, and writes code; runs shell commands; and can verify
-  the result with a command you choose. Runtime-owned `exec_command` sessions
-  can stay alive across tool calls, allocate a PTY, and receive input through
-  `write_stdin` for editors, REPLs, and terminal UIs. A background supervisor
-  settles exited or stopped sessions without polling and injects one bounded
-  completion notification before the next model turn.
+  the result with a command you choose. `bash` is the only command entry point,
+  and every command it starts belongs to the task rather than to the tool call:
+  a long build, a CI watch, or an interactive PTY session keeps running after
+  the call returns. `yield_time_ms` bounds only how long the call waits, while
+  `timeout_ms` is the sole caller-side execution deadline. `task_read_output`,
+  `task_send_input`, `task_wait`, and `task_stop` continue, feed, wait for, and
+  stop a command by its `task_id`. A background supervisor settles exited or
+  stopped sessions without polling and injects one bounded completion
+  notification before the next model turn.
 - Asks one to four structured clarification questions in interactive TUI
   sessions, including described choices, optional previews, and multi-select
   answers.

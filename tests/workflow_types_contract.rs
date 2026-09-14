@@ -1,4 +1,6 @@
-use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
+use orca_core::task_types::{
+    BackgroundTaskSummary, TaskLifetime, TaskStatus, TaskType, WorkflowTaskProgress,
+};
 use orca_core::tool_types::ToolName;
 use orca_core::workflow_types::{
     WorkflowInput, WorkflowOutput, WorkflowRunStatus, WorkflowTokenBudget,
@@ -96,6 +98,7 @@ fn background_task_summary_matches_sdk_names() {
         task_type: TaskType::Workflow,
         status: TaskStatus::Running,
         is_backgrounded: false,
+        lifetime: TaskLifetime::Task,
         description: "Audit codebase".to_string(),
         command: None,
         agent_type: None,

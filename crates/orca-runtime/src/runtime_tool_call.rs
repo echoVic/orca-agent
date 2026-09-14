@@ -24,6 +24,7 @@ use crate::runtime_permission::{
     TurnPermissionOverlay, TurnPermissionOverlayDelta,
 };
 #[cfg(test)]
+#[cfg(test)]
 use crate::runtime_state::PermissionRuntimeState;
 use crate::tasks::TaskRegistry;
 use crate::terminal_service::TerminalService;
@@ -51,8 +52,11 @@ pub(crate) struct RuntimeNormalToolInvocation {
     pub(crate) external_tools: Vec<ExternalToolConfig>,
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) shell_timeout_secs: u64,
+    /// The runtime-owned task registry, so a task tool can serve work the
+    /// terminal service does not own (child agents and other task kinds).
     pub(crate) task_registry: Option<TaskRegistry>,
     pub(crate) terminal_service: Option<Arc<TerminalService>>,
+    pub(crate) owner_task_id: Option<String>,
     pub(crate) permission_overlay: TurnPermissionOverlay,
     pub(crate) control: ToolControlSemantics,
 }
@@ -92,9 +96,37 @@ impl RuntimeNormalToolInvocation {
             shell_timeout_secs,
             task_registry: task_registry.cloned(),
             terminal_service: None,
+            owner_task_id: None,
             permission_overlay,
             control,
         }
+    }
+
+    /// Test helper: a copy of this invocation carrying a different request.
+    #[cfg(test)]
+    pub(crate) fn clone_for_request(&self, request: &ToolRequest) -> RuntimeNormalToolInvocation {
+        let mut clone = RuntimeNormalToolInvocation {
+            request: request.clone(),
+            config: self.config.clone(),
+            cwd: self.cwd.clone(),
+            additional_roots: self.additional_roots.clone(),
+            mcp_registry: self.mcp_registry.clone(),
+            external_tools: self.external_tools.clone(),
+            output_truncation: self.output_truncation,
+            shell_timeout_secs: self.shell_timeout_secs,
+            task_registry: self.task_registry.clone(),
+            terminal_service: self.terminal_service.clone(),
+            owner_task_id: self.owner_task_id.clone(),
+            permission_overlay: self.permission_overlay.clone(),
+            control: self.control,
+        };
+        clone.request = request.clone();
+        clone
+    }
+
+    pub(crate) fn with_owner(mut self, owner: Option<&str>) -> Self {
+        self.owner_task_id = owner.map(str::to_owned);
+        self
     }
 
     pub(crate) fn with_terminal_service(
@@ -121,6 +153,13 @@ pub(crate) struct RuntimeNormalToolCallOutput {
     pub(crate) event_error: Option<io::Error>,
 }
 
+/// Per-invocation context handed to a normal tool while it runs on its worker.
+///
+/// `permission_handler`, `output_handler`, and `permission_overlay` are the
+/// worker bridge used by tools that report observed output or escalate
+/// permissions mid-call. Command approval is decided at the tool layer before
+/// dispatch, so `permission_handler` is only exercised by tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RuntimeNormalToolWorkerContext<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
@@ -130,7 +169,8 @@ pub(crate) struct RuntimeNormalToolWorkerContext<'a> {
 }
 
 impl RuntimeNormalToolWorkerContext<'_> {
-    #[cfg(test)]
+    /// Reports output the running tool observed, so clients can render
+    /// progress before the call terminates.
     pub(crate) fn emit_output(&mut self, chunk: &str) {
         if let Some(handler) = self.output_handler.as_deref_mut() {
             handler(chunk);
@@ -406,8 +446,8 @@ impl RuntimeToolCallRuntime {
         let worker_admission = Arc::clone(&admission);
         let worker_cancel = child_cancel.clone();
         let enable_output = interactions.output_handler.is_some();
-        let enable_permissions = interactions.permission_handler.is_some();
         let enable_mcp_elicitation = interactions.mcp_elicitation_handler.is_some();
+        let enable_permissions = interactions.permission_handler.is_some();
         let worker_request = request.clone();
         let join = match thread::Builder::new()
             .name("orca-normal-tool".to_string())
@@ -795,7 +835,7 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Barrier, Condvar, mpsc};
 
@@ -816,7 +856,6 @@ mod tests {
         RuntimePermissionRequest, RuntimePermissionRequestHandler, RuntimePermissionResponse,
         TurnPermissionOverlay,
     };
-    use crate::tasks::TaskRegistry;
 
     struct CancelAwareExecutor {
         started: Arc<Barrier>,
@@ -1131,7 +1170,10 @@ mod tests {
         }
     }
 
-    fn normal_invocation(id: &str, interrupt: InterruptSemantics) -> RuntimeNormalToolInvocation {
+    pub(crate) fn normal_invocation(
+        id: &str,
+        interrupt: InterruptSemantics,
+    ) -> RuntimeNormalToolInvocation {
         RuntimeNormalToolInvocation {
             request: ToolRequest {
                 id: id.to_string(),
@@ -1147,8 +1189,9 @@ mod tests {
             external_tools: Vec::new(),
             output_truncation: ToolOutputTruncation::default(),
             shell_timeout_secs: 120,
-            task_registry: Some(TaskRegistry::new(format!("normal-{id}"))),
+            task_registry: None,
             terminal_service: None,
+            owner_task_id: None,
             permission_overlay: TurnPermissionOverlay::default(),
             control: ToolControlSemantics {
                 interrupt,
@@ -1157,7 +1200,7 @@ mod tests {
         }
     }
 
-    fn test_config() -> RunConfig {
+    pub(crate) fn test_config() -> RunConfig {
         crate::command::config::assemble_run_config(
             crate::command::config::RunConfigRequest::new(
                 "0.0.0-test",

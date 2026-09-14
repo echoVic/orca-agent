@@ -249,6 +249,11 @@ pub struct ToolConfig {
     pub max_read_parallel: usize,
     #[serde(default)]
     pub output_truncation: ToolOutputTruncation,
+    /// Administrator cap on how long a shell command may run, in seconds.
+    ///
+    /// `0` means no administrator cap. It is not a general command lifetime:
+    /// a model that needs a deadline passes `timeout_ms` to `bash`, and a
+    /// namespace that needs an operational cap sets this value explicitly.
     #[serde(default = "default_shell_timeout_secs")]
     pub shell_timeout_secs: u64,
     /// Runtime-captured host evidence. It is never loaded from or persisted to
@@ -278,9 +283,9 @@ impl ToolConfig {
         } else if self.max_read_parallel > Self::MAX_READ_PARALLEL_UPPER {
             self.max_read_parallel = Self::MAX_READ_PARALLEL_UPPER;
         }
-        if self.shell_timeout_secs == 0 {
-            self.shell_timeout_secs = 1;
-        } else if self.shell_timeout_secs > Self::MAX_SHELL_TIMEOUT_SECS {
+        // 0 keeps its meaning: the administrator set no cap. Any positive
+        // value is still clamped to the supported maximum.
+        if self.shell_timeout_secs > Self::MAX_SHELL_TIMEOUT_SECS {
             self.shell_timeout_secs = Self::MAX_SHELL_TIMEOUT_SECS;
         }
         self.output_truncation = self.output_truncation.normalized();
@@ -292,8 +297,13 @@ fn default_max_read_parallel() -> usize {
     DEFAULT_MAX_READ_PARALLEL_TOOLS
 }
 
+/// Commands have no default execution deadline.
+///
+/// The previous 120-second default silently killed long builds, CI watches,
+/// and interactive sessions. Wait time is now a per-call choice on `bash`
+/// (`yield_time_ms`) and an execution limit is an explicit `timeout_ms`.
 fn default_shell_timeout_secs() -> u64 {
-    120
+    0
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -769,8 +779,12 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "\n",
             "[subagents]\n",
             "max_depth = {}\n",
-            "max_parallel = {}\n",
             "delegation = \"{}\"\n",
+            "max_running = {}\n",
+            "max_queued = {}\n",
+            "max_live_tasks = {}\n",
+            "max_investigation_turns = {}\n",
+            "max_investigation_tool_calls = {}\n",
             "\n",
             "[counts]\n",
             "mcp_servers = {}\n",
@@ -826,8 +840,12 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.tools.output_truncation,
         config.tools.shell_timeout_secs,
         config.subagents.max_depth,
-        config.subagents.max_parallel,
         config.subagents.delegation.as_str(),
+        config.subagents.max_running(),
+        config.subagents.max_queued(),
+        config.subagents.max_live_tasks(),
+        config.subagents.max_investigation_turns,
+        config.subagents.max_investigation_tool_calls,
         config.mcp_servers.len(),
         config.external_tools.len(),
         config.hooks.len(),
@@ -1071,9 +1089,15 @@ mod tests {
         assert!(shown.contains("terminal_notifications = false"));
         assert!(shown.contains("api_key = \"<redacted>\""));
         assert!(!shown.contains("sk-secret"));
-        // The delegation policy is a first-class setting, not a hidden field.
+        // The delegation policy and the scope limits are first-class
+        // settings, not hidden fields.
         assert!(shown.contains("[subagents]"));
-        assert!(shown.contains("delegation = \"explicit\""));
+        assert!(shown.contains("delegation = \"adaptive\""));
+        assert!(shown.contains("max_running = 32"));
+        assert!(shown.contains("max_queued = 256"));
+        assert!(shown.contains("max_live_tasks = 512"));
+        assert!(shown.contains("max_investigation_turns = 6"));
+        assert!(shown.contains("max_investigation_tool_calls = 8"));
     }
 
     #[test]
@@ -1136,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_delegation_snapshot_without_the_policy_defaults_to_explicit() {
+    fn legacy_delegation_snapshot_without_the_policy_defaults_to_adaptive() {
         let legacy = serde_json::json!({
             "approvalMode": "suggest",
             "executionProfile": "workspace",
@@ -1153,8 +1177,8 @@ mod tests {
 
         assert_eq!(
             decoded.delegation,
-            crate::subagent_config::DelegationPolicy::Explicit,
-            "a snapshot written before this field existed must not gain proactivity"
+            crate::subagent_config::DelegationPolicy::Adaptive,
+            "a snapshot written before this field existed reads the current default"
         );
     }
 

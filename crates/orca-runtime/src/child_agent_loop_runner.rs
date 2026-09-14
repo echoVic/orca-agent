@@ -5,7 +5,7 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::event_schema::RunStatus;
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
-use orca_core::tool_types::ToolRequest;
+use orca_core::tool_types::{ToolRequest, ToolResult};
 
 use crate::agent_continuation::{conversation_has_open_tool_calls, try_last_settled_tool_boundary};
 use crate::child_agent_entrypoints::run_child_agent_with_executor;
@@ -43,6 +43,58 @@ pub struct ChildAgentLoopContext<'a> {
     /// Parent budget lease bounding this child's admission; `None` (tests and
     /// legacy callers) falls back to an unlimited lease derived from config.
     pub lease: Option<&'a mut crate::budget_controller::BudgetLease>,
+}
+
+fn is_built_in_read_only_investigation(request: &ChildAgentRequest) -> bool {
+    crate::investigation_convergence::applies(&request.subagent_type)
+}
+
+fn investigation_summary_due(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    lease: &crate::budget_controller::BudgetLease,
+) -> bool {
+    crate::investigation_convergence::summary_due(config, &request.subagent_type, lease.usage())
+}
+
+fn close_unstarted_investigation_tools(
+    setup: &mut ChildAgentLoopSetup,
+    tool_requests: &[&ToolRequest],
+) {
+    for request in tool_requests {
+        let result = ToolResult::cancelled_before_start(
+            request,
+            "the read-only investigation reached its evidence-gathering limit",
+        );
+        let content = crate::agent_common::format_tool_result_for_model(&result);
+        setup
+            .conversation
+            .add_tool_result_with_terminal(&result, content);
+    }
+}
+
+fn prepare_investigation_summary_turn(
+    setup: &mut ChildAgentLoopSetup,
+    provider_config: &mut orca_provider::ProviderConfig,
+    prompt_added: &mut bool,
+) {
+    if !*prompt_added {
+        crate::investigation_convergence::ensure_summary_prompt(&mut setup.conversation);
+        *prompt_added = true;
+    }
+    crate::investigation_convergence::disable_tools(provider_config);
+}
+
+fn summary_tool_call_failure() -> ChildAgentResult {
+    ChildAgentResult {
+        status: RunStatus::Failed,
+        final_message: None,
+        error: Some(
+            "read-only investigation summary turn returned tool calls after tools were disabled"
+                .to_string(),
+        ),
+        budget_usage: None,
+    }
 }
 
 /// Attaches the child's consumed budget receipt from its lease to the
@@ -183,7 +235,11 @@ where
         None => &mut fallback_lease,
     };
     let mut recorded_cost_usd_micros = lease.usage().cost_usd_micros;
+    let mut summary_requested = false;
+    let mut summary_prompt_added = false;
     loop {
+        let summary_only =
+            summary_requested || investigation_summary_due(config, context.request, lease);
         match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {}
             ChildAgentTurnBudget::Stop(result) => {
@@ -194,8 +250,15 @@ where
         compact_child_agent_conversation_if_needed(config, &mut setup, context.cwd, context.hooks)?;
 
         let child_cancel = CancelToken::new();
-        let turn_provider_config =
+        let mut turn_provider_config =
             route_child_agent_model(config, context.request, &setup, context.child_cost_tracker);
+        if summary_only {
+            prepare_investigation_summary_turn(
+                &mut setup,
+                &mut turn_provider_config,
+                &mut summary_prompt_added,
+            );
+        }
 
         let response = match run_child_agent_provider_turn(
             config,
@@ -291,11 +354,28 @@ where
             ChildAgentProviderResponseFold::Complete(result) => {
                 return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
+            ChildAgentProviderResponseFold::ContinueToTools if summary_only => {
+                let tool_requests = child_agent_tool_requests(&response);
+                close_unstarted_investigation_tools(&mut setup, &tool_requests);
+                return finish_lightweight_child_result(
+                    &setup,
+                    lease,
+                    checkpoint_observer,
+                    summary_tool_call_failure(),
+                );
+            }
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
 
         let tool_requests = child_agent_tool_requests(&response);
         for (index, tool_request) in tool_requests.iter().enumerate() {
+            if is_built_in_read_only_investigation(context.request)
+                && lease.usage().tool_calls >= config.subagents.max_investigation_tool_calls
+            {
+                close_unstarted_investigation_tools(&mut setup, &tool_requests[index..]);
+                summary_requested = true;
+                break;
+            }
             if let Err(stop) = lease.admit_tool_call() {
                 return finish_lightweight_child_result(
                     &setup,
@@ -405,7 +485,11 @@ where
         None => &mut fallback_lease,
     };
     let mut recorded_cost_usd_micros = lease.usage().cost_usd_micros;
+    let mut summary_requested = false;
+    let mut summary_prompt_added = false;
     loop {
+        let summary_only =
+            summary_requested || investigation_summary_due(config, context.request, lease);
         match advance_child_agent_turn(&mut setup, &mut lease) {
             ChildAgentTurnBudget::Continue => {
                 if let Some(observer) = observer {
@@ -421,8 +505,15 @@ where
         compact_child_agent_conversation_if_needed(config, &mut setup, context.cwd, context.hooks)?;
 
         let child_cancel = CancelToken::new();
-        let turn_provider_config =
+        let mut turn_provider_config =
             route_child_agent_model(config, context.request, &setup, context.child_cost_tracker);
+        if summary_only {
+            prepare_investigation_summary_turn(
+                &mut setup,
+                &mut turn_provider_config,
+                &mut summary_prompt_added,
+            );
+        }
 
         let response = match run_child_agent_provider_turn_observed(
             config,
@@ -532,11 +623,28 @@ where
             ChildAgentProviderResponseFold::Complete(result) => {
                 return finish_lightweight_child_result(&setup, lease, checkpoint_observer, result);
             }
+            ChildAgentProviderResponseFold::ContinueToTools if summary_only => {
+                let tool_requests = child_agent_tool_requests(&response);
+                close_unstarted_investigation_tools(&mut setup, &tool_requests);
+                return finish_lightweight_child_result(
+                    &setup,
+                    lease,
+                    checkpoint_observer,
+                    summary_tool_call_failure(),
+                );
+            }
             ChildAgentProviderResponseFold::ContinueToTools => {}
         }
 
         let tool_requests = child_agent_tool_requests(&response);
         for (index, tool_request) in tool_requests.iter().enumerate() {
+            if is_built_in_read_only_investigation(context.request)
+                && lease.usage().tool_calls >= config.subagents.max_investigation_tool_calls
+            {
+                close_unstarted_investigation_tools(&mut setup, &tool_requests[index..]);
+                summary_requested = true;
+                break;
+            }
             if let Err(stop) = lease.admit_tool_call() {
                 return finish_lightweight_child_result(
                     &setup,

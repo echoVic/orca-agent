@@ -7,7 +7,7 @@ use crate::transcript_state::ChatMessage;
 use crate::viewport_state::CopyNotice;
 use orca_core::conversation::ConversationTarget;
 use orca_core::plan_types::PlanStatus;
-use orca_core::task_types::{TaskStatus, TaskType};
+use orca_core::task_types::{TaskLifetime, TaskStatus, TaskType};
 
 fn inserted_source_line<'a>(
     lines: &'a [ratatui::text::Line<'static>],
@@ -409,6 +409,7 @@ fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
         task_type: TaskType::Workflow,
         status: TaskStatus::Running,
         is_backgrounded: false,
+        lifetime: TaskLifetime::Task,
         description: name.to_string(),
         created_at_ms: 1_000,
         started_at_ms: Some(1_000),
@@ -2507,6 +2508,7 @@ fn show_workflows_preserves_available_selection() {
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
             is_backgrounded: false,
+            lifetime: TaskLifetime::Task,
             description: "demo".to_string(),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),
@@ -2753,6 +2755,7 @@ fn workflow_events_update_panel_and_queue_model_notification() {
         task_type: TaskType::Workflow,
         status: TaskStatus::Completed,
         is_backgrounded: false,
+        lifetime: TaskLifetime::Task,
         description: "demo".to_string(),
         created_at_ms: 1_000,
         started_at_ms: Some(1_000),
@@ -3065,6 +3068,7 @@ fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
         task_type: TaskType::MainSession,
         status: TaskStatus::Running,
         is_backgrounded: true,
+        lifetime: TaskLifetime::Task,
         description: "long answer".to_string(),
         created_at_ms: 1_000,
         started_at_ms: Some(1_000),
@@ -3188,6 +3192,7 @@ fn backgrounded_main_session_completion_adds_system_notice() {
         task_type: TaskType::MainSession,
         status: TaskStatus::Running,
         is_backgrounded: true,
+        lifetime: TaskLifetime::Task,
         description: "long answer".to_string(),
         created_at_ms: 1_000,
         started_at_ms: Some(1_000),

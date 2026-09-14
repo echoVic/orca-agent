@@ -30,6 +30,155 @@ pub(crate) enum AgentRunMode {
 pub(crate) struct AgentThreadPolicy {
     pub(crate) subagent_type: SubagentType,
     pub(crate) depth: u32,
+    pub(crate) task_id: Option<String>,
+    pub(crate) continued_task: Arc<Mutex<Option<String>>>,
+}
+
+/// UI continuation is an execution attempt in the original shared scope.
+/// The original launcher settles its first attempt; later UI turns own theirs.
+pub(crate) struct AgentTurnAdmission {
+    pub(crate) task_id: String,
+    registry: crate::tasks::TaskRegistry,
+    managed: bool,
+    settled: bool,
+}
+
+impl AgentTurnAdmission {
+    pub(crate) fn acquire(
+        policy: &AgentThreadPolicy,
+        registry: &crate::tasks::TaskRegistry,
+        limits: orca_core::subagent_config::SubagentLimits,
+        prompt: &str,
+        parent: Option<&str>,
+        cancel: &CancelToken,
+    ) -> io::Result<Self> {
+        let mut continued = policy
+            .continued_task
+            .lock()
+            .map_err(|_| io::Error::other("agent continuation identity lock poisoned"))?;
+        let current = continued
+            .as_ref()
+            .or(policy.task_id.as_ref())
+            .and_then(|id| registry.get(id));
+        if current.is_none() {
+            return Err(io::Error::other(
+                "agent task is absent from its owning execution scope",
+            ));
+        }
+        if current
+            .as_ref()
+            .is_some_and(|record| record.stop_requested || record.control.cancel.is_cancelled())
+        {
+            return Err(io::Error::other(
+                "agent continuation stopped before execution",
+            ));
+        }
+        let scope = registry.execution_scope(&limits);
+        let (task_id, managed) =
+            if let Some(record) = current.as_ref().filter(|record| record.status.is_active()) {
+                (record.id.clone(), continued.is_some())
+            } else {
+                let submission = scope
+                    .submit_subagent(
+                        prompt.to_string(),
+                        Some(policy.subagent_type.identifier().into()),
+                        parent.map(str::to_owned),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .map_err(|error| io::Error::other(error.message()))?;
+                if submission.cancelled {
+                    return Err(io::Error::other("agent continuation parent cancelled"));
+                }
+                if let Some(thread_id) = current
+                    .as_ref()
+                    .and_then(|record| record.subagent_child_thread_id.as_deref())
+                {
+                    registry
+                        .bind_subagent_thread(&submission.task_id, thread_id)
+                        .map_err(io::Error::other)?;
+                }
+                *continued = Some(submission.task_id.clone());
+                (submission.task_id, true)
+            };
+        drop(continued);
+        let guard = Self {
+            task_id,
+            registry: registry.clone(),
+            managed,
+            settled: false,
+        };
+        loop {
+            if cancel.is_cancelled() || registry.is_cancelled(&guard.task_id) {
+                return Err(io::Error::other(
+                    "agent continuation cancelled before execution",
+                ));
+            }
+            if scope.acquire(&guard.task_id, chrono::Utc::now().timestamp_millis())
+                == crate::execution_scope::Admission::Started
+            {
+                return Ok(guard);
+            }
+            if registry
+                .get(&guard.task_id)
+                .is_none_or(|record| !record.status.is_active())
+            {
+                return Err(io::Error::other(
+                    "agent continuation stopped before execution",
+                ));
+            }
+            scope.wait_for_capacity(Some(cancel), Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        result: &crate::lifecycle::AgentLoopResult,
+        usage: orca_core::cost_types::UsageTotals,
+    ) -> io::Result<()> {
+        if self.managed {
+            match result.status {
+                RunStatus::Success => self.registry.complete_with_usage(
+                    &self.task_id,
+                    result.final_message.clone().unwrap_or_default(),
+                    Some(usage),
+                ),
+                RunStatus::Cancelled => self.registry.stop_with_usage(
+                    &self.task_id,
+                    result.error.clone().unwrap_or_else(|| "cancelled".into()),
+                    Some(usage),
+                ),
+                RunStatus::ApprovalRequired => {
+                    self.settled = true;
+                    return Ok(());
+                }
+                _ => self.registry.fail_with_usage(
+                    &self.task_id,
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "agent continuation failed".into()),
+                    Some(usage),
+                ),
+            }
+            .map_err(io::Error::other)?;
+        }
+        self.settled = true;
+        Ok(())
+    }
+    pub(crate) fn suspend(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for AgentTurnAdmission {
+    fn drop(&mut self) {
+        if self.managed && !self.settled {
+            let _ = self.registry.fail(
+                &self.task_id,
+                "agent continuation ended before settlement".into(),
+            );
+        }
+    }
 }
 
 /// Delivery boundary for a sync child's activity on the parent thread's
@@ -68,6 +217,7 @@ impl AgentSurfaceActivity {
 
 pub(crate) struct AgentLaunchRequest {
     pub(crate) agent_id: String,
+    pub(crate) task_registry: crate::tasks::TaskRegistry,
     pub(crate) description: String,
     pub(crate) prompt: String,
     pub(crate) model: Option<String>,
@@ -192,6 +342,8 @@ impl AgentController {
             &self.root_thread_id,
             self.depth.saturating_add(1),
             request.subagent_type.clone(),
+            request.agent_id.clone(),
+            request.task_registry.clone(),
             child_config.clone(),
             request.description.clone(),
         ) {
@@ -247,9 +399,8 @@ impl AgentController {
                 )),
             });
         }
-        let mut turn = HostedTurnRequest::new(request.prompt)
-            .with_task_description(request.description)
-            .with_event_observer(publisher.clone());
+        let mut turn =
+            HostedTurnRequest::new(request.prompt).with_event_observer(publisher.clone());
         if let Some(handler) = request.approval_handler {
             turn = turn.with_approval_handler(handler);
         }
@@ -796,6 +947,89 @@ fn settle_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ui_continuation_queues_in_shared_scope_and_creates_a_new_attempt() {
+        let registry = crate::tasks::TaskRegistry::new("ui-shared-scope".into());
+        let limits = orca_core::subagent_config::SubagentLimits {
+            max_running: 1,
+            ..Default::default()
+        };
+        let scope = registry.execution_scope(&limits);
+        let first = scope
+            .submit_subagent("first".into(), None, None, 1)
+            .unwrap();
+        registry
+            .bind_subagent_thread(&first.task_id, "ui-child-thread")
+            .unwrap();
+        registry
+            .complete_with_usage(&first.task_id, "done".into(), None)
+            .unwrap();
+        let busy = scope.submit_subagent("busy".into(), None, None, 2).unwrap();
+        let policy = AgentThreadPolicy {
+            subagent_type: SubagentType::General,
+            depth: 1,
+            task_id: Some(first.task_id.clone()),
+            continued_task: Default::default(),
+        };
+        let worker_registry = registry.clone();
+        let worker_policy = policy.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(AgentTurnAdmission::acquire(
+                &worker_policy,
+                &worker_registry,
+                limits,
+                "continue",
+                None,
+                &CancelToken::new(),
+            ))
+            .unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while scope.queued().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "UI continuation did not enter queue"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(scope.running(), 1);
+        registry
+            .complete_with_usage(&busy.task_id, "done".into(), None)
+            .unwrap();
+        let mut admitted = rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        worker.join().unwrap();
+        assert_ne!(admitted.task_id, first.task_id);
+        assert_eq!(
+            registry
+                .get(&admitted.task_id)
+                .unwrap()
+                .subagent_child_thread_id
+                .as_deref(),
+            Some("ui-child-thread")
+        );
+        assert_eq!(scope.running(), 1);
+        admitted
+            .finish(
+                &crate::lifecycle::AgentLoopResult::success(Some("continued".into())),
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(scope.running(), 0);
+        let next = AgentTurnAdmission::acquire(
+            &policy,
+            &registry,
+            limits,
+            "again",
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert_ne!(next.task_id, admitted.task_id);
+        drop(next);
+        assert_eq!(scope.running(), 0);
+    }
     use crate::agent_continuation::AgentAttemptId;
     use crate::child_agent_types::SubagentActivityIdentity;
     use crate::runtime_subagent_call::RuntimeSubagentActivitySink;

@@ -9,7 +9,7 @@ use orca_tools::skills;
 
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
-use crate::system_prompt::build_system_prompt;
+use crate::system_prompt::build_system_prompt_for_tools as build_base_system_prompt_for_tools;
 
 const PLAN_MODE_INSTRUCTIONS: &str = r#"## Plan Mode
 You are in read-only planning mode. Your job is to investigate the request and produce an implementation-ready plan for user approval before any execution begins.
@@ -39,7 +39,29 @@ pub fn build_agent_system_prompt(
     approval_mode: ApprovalMode,
     memory: Option<&MemoryBlock>,
 ) -> String {
-    build_agent_system_prompt_with_goal(
+    let role_tools = inferred_role_tools(subagent_depth, subagent_type);
+    build_agent_system_prompt_for_tools(
+        cwd,
+        subagent_depth,
+        subagent_type,
+        instructions,
+        approval_mode,
+        memory,
+        role_tools.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_agent_system_prompt_for_tools(
+    cwd: &Path,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    instructions: Option<&ProjectInstructions>,
+    approval_mode: ApprovalMode,
+    memory: Option<&MemoryBlock>,
+    allowed_tools: Option<&[String]>,
+) -> String {
+    build_agent_system_prompt_with_goal_and_tools(
         cwd,
         subagent_depth,
         subagent_type,
@@ -48,6 +70,7 @@ pub fn build_agent_system_prompt(
         memory,
         None,
         DelegationPolicy::default(),
+        allowed_tools,
     )
 }
 
@@ -65,7 +88,33 @@ pub fn build_agent_system_prompt_with_goal(
     active_goal: Option<&ThreadGoal>,
     delegation: DelegationPolicy,
 ) -> String {
-    let mut prompt = build_system_prompt(cwd);
+    let role_tools = inferred_role_tools(subagent_depth, subagent_type);
+    build_agent_system_prompt_with_goal_and_tools(
+        cwd,
+        subagent_depth,
+        subagent_type,
+        instructions,
+        approval_mode,
+        memory,
+        active_goal,
+        delegation,
+        role_tools.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_agent_system_prompt_with_goal_and_tools(
+    cwd: &Path,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    instructions: Option<&ProjectInstructions>,
+    approval_mode: ApprovalMode,
+    memory: Option<&MemoryBlock>,
+    active_goal: Option<&ThreadGoal>,
+    delegation: DelegationPolicy,
+    allowed_tools: Option<&[String]>,
+) -> String {
+    let mut prompt = build_base_system_prompt_for_tools(cwd, allowed_tools);
     if let Some(block) = memory.and_then(MemoryBlock::to_system_prompt_block) {
         prompt.push_str("\n\n");
         prompt.push_str(&block);
@@ -88,6 +137,19 @@ pub fn build_agent_system_prompt_with_goal(
         prompt.push_str(&format_goal_mode_instructions(goal));
     }
     prompt
+}
+
+fn inferred_role_tools(subagent_depth: u32, subagent_type: &SubagentType) -> Option<Vec<String>> {
+    (subagent_depth > 0)
+        .then(|| subagent_type.builtin())
+        .flatten()
+        .map(|descriptor| {
+            descriptor
+                .tools
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect()
+        })
 }
 
 /// The role catalog, one line per built-in role. The full selection contract
@@ -114,7 +176,7 @@ pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
 
 Delegation is turned off for this task. Do not start new child agents.
 
-Existing children remain visible: `subagent_status` reports their progress and `task_stop` can stop one. If a task genuinely needs parallel work, say so and ask the user instead of working around the setting."#,
+Existing children remain visible: `task_list` and `task_wait` report their progress and `task_stop` can stop one. If a task genuinely needs parallel work, say so and ask the user instead of working around the setting."#,
             );
         }
         DelegationPolicy::Explicit => {
@@ -136,9 +198,13 @@ You may split independent work off to child agents inside the scope the user alr
 Decision rules when you do delegate:
 1. Determine which modules the task touches, what must be solved first, and what your next local step is.
 2. Delegate a branch that can be answered on its own and matters to the result. Do not wait until you have read everything.
-3. Judgement is required, exploration is broad, or the raw output would be large: delegate to keep your own context for the work only you can do.
-4. Keep single-file work, small targeted lookups, tightly coupled changes, and anything needing live user input local.
-5. After delegating, keep working on a non-overlapping part. Do not repeat the same searches, and do not redraw the whole investigation once the result arrives — verify and integrate it.
+3. Give each child the smallest useful evidence scope: normally one subsystem or call chain and a few entry files. Do not turn every branch into a repository-wide audit.
+4. When the user names independent branches and capacity is available, give each branch its own child. Do not bundle unrelated branches merely to reduce the child count.
+5. Judgement is required, exploration is broad, or the raw output would be large: delegate to keep your own context for the work only you can do.
+6. Keep single-file work, small targeted lookups, tightly coupled changes, and anything needing live user input local.
+7. After delegating, keep working on a non-overlapping part. Do not repeat the same searches or reread cited files after successful children return. Treat exact child evidence, including a direct missing-file error, as the delegated result; verify only a concrete inconsistency, then integrate it.
+8. Do not attach an output `schema` to an ordinary evidence report for a human reader. Use one only when a downstream machine consumer requires that exact structure.
+9. One launch owns each named branch. When that child returns complete, partial, failed, or uncertain, integrate that outcome and its open questions. Do not launch a replacement child for the same branch unless the user explicitly asks for exhaustive completion or the result exposes one new, independently bounded question that blocks the task.
 
 Built-in roles (pass the identifier in `subagent_type`):{roles}
 "#
@@ -148,9 +214,13 @@ Built-in roles (pass the identifier in `subagent_type`):{roles}
 Decision rules:
 1. Determine which modules the task touches, what must be solved first, and what your next local step is.
 2. Delegate a branch that can be answered on its own and matters to the result. Do not wait until you have read everything.
-3. No parallel local work is available, but one line of investigation will produce a large amount of one-off output: delegate it to keep your own context for the work only you can do. Weigh this against the cost of starting and briefing a child.
-4. Keep single-file work, small targeted lookups, tightly coupled changes, and anything needing live user input local. Never delegate just to fill a quota.
-5. After delegating, keep working on a non-overlapping part. Do not repeat the same searches, and do not redraw the whole investigation once the result arrives — verify and integrate it.
+3. Give each child the smallest useful evidence scope: normally one subsystem or call chain and a few entry files. Do not turn every branch into a repository-wide audit.
+4. When the user names independent branches and capacity is available, give each branch its own child. Do not bundle unrelated branches merely to reduce the child count.
+5. No parallel local work is available, but one line of investigation will produce a large amount of one-off output: delegate it to keep your own context for the work only you can do. Weigh this against the cost of starting and briefing a child.
+6. Keep single-file work, small targeted lookups, tightly coupled changes, and anything needing live user input local. Never delegate just to fill a quota. The capacity limit is a ceiling, not a target.
+7. After delegating, keep working on a non-overlapping part. Do not repeat the same searches or reread cited files after successful children return. Treat exact child evidence, including a direct missing-file error, as the delegated result; verify only a concrete inconsistency, then integrate it.
+8. Do not attach an output `schema` to an ordinary evidence report for a human reader. Use one only when a downstream machine consumer requires that exact structure.
+9. One launch owns each named branch. When that child returns complete, partial, failed, or uncertain, integrate that outcome and its open questions. Do not launch a replacement child for the same branch unless the user explicitly asks for exhaustive completion or the result exposes one new, independently bounded question that blocks the task.
 
 Built-in roles (pass the identifier in `subagent_type`):{roles}
 
@@ -193,6 +263,9 @@ pub fn format_child_agent_contract(
     if descriptor.is_read_only() {
         contract.push_str(
             "\n\nThis role is enforced read-only: file edits, writes, and shell or process execution are denied at runtime, not merely discouraged. If the task appears to require a change, report what should change and why instead of attempting it.",
+        );
+        contract.push_str(
+            "\n\nRead-only investigation budget: normally finish within 8 focused tool calls. By 6 calls, stop broadening the search and reserve the remaining work for checking the strongest evidence and writing the report. If the brief cannot be completed inside that scope, return a useful partial result with explicit open questions instead of continuing an exhaustive inventory.",
         );
     }
     contract.push_str("\n\nRequired in your report: ");
@@ -362,6 +435,52 @@ mod tests {
         assert!(prompt.contains("exactly one `<proposed_plan>` block"));
         assert!(prompt.contains("Do not ask whether to proceed in prose"));
         assert!(prompt.contains("concrete implementation steps with file paths"));
+    }
+
+    #[test]
+    fn explorer_prompt_does_not_advertise_forbidden_shell_tool() {
+        let cwd = tempfile::tempdir().unwrap();
+        let prompt = build_agent_system_prompt(
+            cwd.path(),
+            1,
+            &SubagentType::Explorer,
+            None,
+            ApprovalMode::FullAuto,
+            None,
+        );
+
+        assert!(prompt.contains("### read_file"));
+        assert!(!prompt.contains("### bash"));
+        assert!(!prompt.contains("Every shell command goes through `bash`"));
+        assert!(prompt.contains("This role has no shell or process execution tool"));
+        assert!(prompt.contains("This role is enforced read-only"));
+    }
+
+    #[test]
+    fn adaptive_guidance_sizes_children_without_treating_capacity_as_a_target() {
+        let guidance = format_subagent_guidance(DelegationPolicy::Adaptive);
+
+        assert!(guidance.contains("smallest useful evidence scope"));
+        assert!(guidance.contains("one subsystem or call chain"));
+        assert!(guidance.contains("give each branch its own child"));
+        assert!(guidance.contains("Do not bundle unrelated branches"));
+        assert!(guidance.contains("capacity limit is a ceiling, not a target"));
+        assert!(guidance.contains("Do not wait until you have read everything"));
+        assert!(guidance.contains("Do not repeat the same searches or reread cited files"));
+        assert!(guidance.contains("verify only a concrete inconsistency"));
+        assert!(guidance.contains("including a direct missing-file error"));
+        assert!(guidance.contains("Do not attach an output `schema`"));
+        assert!(guidance.contains("One launch owns each named branch"));
+        assert!(guidance.contains("Do not launch a replacement child for the same branch"));
+    }
+
+    #[test]
+    fn read_only_child_contract_has_a_convergence_budget() {
+        let contract = format_child_agent_contract(&SubagentType::Explorer, DelegationPolicy::Off);
+
+        assert!(contract.contains("normally finish within 8 focused tool calls"));
+        assert!(contract.contains("By 6 calls, stop broadening the search"));
+        assert!(contract.contains("return a useful partial result"));
     }
 
     #[test]

@@ -1341,7 +1341,9 @@ mod tests {
     use super::*;
     use crate::config::OutputFormat;
     use crate::event_sink::{EventObserver, EventSink};
-    use crate::task_types::{BackgroundTaskSummary, TaskStatus, TaskType, WorkflowTaskProgress};
+    use crate::task_types::{
+        BackgroundTaskSummary, TaskLifetime, TaskStatus, TaskType, WorkflowTaskProgress,
+    };
     use crate::tool_types::{ToolName, ToolRequest};
 
     fn publish(drafts: impl IntoIterator<Item = EventDraft>) -> Vec<EventEnvelope> {
@@ -1611,6 +1613,7 @@ mod tests {
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
             is_backgrounded: false,
+            lifetime: TaskLifetime::Task,
             description: "demo workflow".to_string(),
             created_at_ms: 10,
             started_at_ms: Some(20),
@@ -1676,6 +1679,7 @@ mod tests {
             task_type: TaskType::MainSession,
             status: TaskStatus::ApprovalRequired,
             is_backgrounded: true,
+            lifetime: TaskLifetime::Task,
             description: "background turn".to_string(),
             created_at_ms: 10,
             started_at_ms: Some(20),

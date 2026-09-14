@@ -522,6 +522,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             lifecycle: Some(&mut child_lifecycle),
             task_registry: Some(&task_registry),
             root_task_id: Some(&agent_id),
+            child_task_id: Some(&agent_id),
             checkpoint_observer: Some(&checkpoint_observer),
             permission_handler: Some(
                 child_permission_handler
@@ -580,6 +581,17 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 1;
         }
     };
+    if let (Some(reservation), Some(usage)) = (&request.budget_reservation, child.budget_usage) {
+        if let Err(error) = reservation.settle(usage) {
+            let _ = task_registry.fail_with_usage_and_lease(
+                &task_lease,
+                &agent_id,
+                format!("child budget settlement failed: {error}"),
+                None,
+            );
+            return 1;
+        }
+    }
     let terminal_status = match child.status {
         RunStatus::Success => SurfaceSubagentTerminalStatus::Completed,
         RunStatus::Cancelled => SurfaceSubagentTerminalStatus::Cancelled,
@@ -603,52 +615,59 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         let mut output = child
             .final_message
             .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-        if let Err(mut error) =
-            validate_subagent_output_schema(&request.description, request.schema.as_ref(), &output)
-        {
-            append_worktree_outcome(&mut error, worktree.as_ref());
-            let projection = match commit_async_terminal(
-                &coordinator,
-                &continuation_lease,
-                Some(&shared_revision),
-                AgentTerminal::Failed {
-                    error: error.clone(),
-                },
-            ) {
-                Ok(projection) => projection,
-                Err(commit_error) => {
-                    let error = format!(
-                        "{error}\n\nfailed to commit async continuation terminal: {commit_error}"
-                    );
-                    let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
-                    let error = async_subagent_result_payload(error, Some(failed_task.payload()));
-                    let _ = task_registry.fail_with_usage_and_lease(
-                        &task_lease,
-                        &agent_id,
-                        error,
-                        usage,
-                    );
-                    return 1;
-                }
-            };
-            let mut error = append_projection_footer(error, Some(&projection));
-            if let Err(activity_error) =
-                activity.publish_payload(SubagentActivityPayload::Completed {
-                    status: SurfaceSubagentTerminalStatus::Failed,
-                    output: None,
-                    error: Some(DisplayText::new(&error)),
-                    usage: usage.map(|_| child_cost_tracker.totals()),
-                })
-            {
-                error.push_str(&format!(
+        output = match validate_subagent_output_schema(
+            &request.description,
+            request.schema.as_ref(),
+            &output,
+        ) {
+            Ok(normalized) => normalized,
+            Err(mut error) => {
+                append_worktree_outcome(&mut error, worktree.as_ref());
+                let projection = match commit_async_terminal(
+                    &coordinator,
+                    &continuation_lease,
+                    Some(&shared_revision),
+                    AgentTerminal::Failed {
+                        error: error.clone(),
+                    },
+                ) {
+                    Ok(projection) => projection,
+                    Err(commit_error) => {
+                        let error = format!(
+                            "{error}\n\nfailed to commit async continuation terminal: {commit_error}"
+                        );
+                        let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
+                        let error =
+                            async_subagent_result_payload(error, Some(failed_task.payload()));
+                        let _ = task_registry.fail_with_usage_and_lease(
+                            &task_lease,
+                            &agent_id,
+                            error,
+                            usage,
+                        );
+                        return 1;
+                    }
+                };
+                let mut error = append_projection_footer(error, Some(&projection));
+                if let Err(activity_error) =
+                    activity.publish_payload(SubagentActivityPayload::Completed {
+                        status: SurfaceSubagentTerminalStatus::Failed,
+                        output: None,
+                        error: Some(DisplayText::new(&error)),
+                        usage: usage.map(|_| child_cost_tracker.totals()),
+                    })
+                {
+                    error.push_str(&format!(
                     "\n\nchild activity terminal could not be durably published: {activity_error}"
                 ));
+                }
+                let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
+                let error = async_subagent_result_payload(error, Some(failed_task.payload()));
+                let _ =
+                    task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, usage);
+                return 1;
             }
-            let failed_task = completed_task.with_status(RuntimeTaskStatus::Failed);
-            let error = async_subagent_result_payload(error, Some(failed_task.payload()));
-            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, usage);
-            return 1;
-        }
+        };
         append_worktree_outcome(&mut output, worktree.as_ref());
         let projection = match commit_async_terminal(
             &coordinator,
@@ -778,6 +797,157 @@ fn restore_worker_agent(
 pub(crate) fn launch_async_subagent(
     context: AsyncSubagentLaunchContext<'_>,
 ) -> AsyncSubagentLaunchOutput {
+    if context.task_registry.is_process_local()
+        || context.parent_fence.is_none()
+        || context.activity_ingress.is_none()
+    {
+        return AsyncSubagentLaunchOutput {
+            task: None,
+            result: tool_types::ToolResult::failed_before_start(
+                context.tool_request,
+                "async subagents require persistent task ownership and an actor-owned parent fence and activity ingress",
+                None,
+            ),
+        };
+    }
+
+    let registry = context.task_registry.clone();
+    let config = context.config.clone();
+    let limits = config.subagents.limits;
+    let submission = match registry.execution_scope(&limits).submit_subagent(
+        context.request.description.clone(),
+        serialized_subagent_type(&context.request.subagent_type),
+        context.root_task_id.map(str::to_owned),
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        Ok(submission) => submission,
+        Err(error) => {
+            return AsyncSubagentLaunchOutput {
+                result: tool_types::ToolResult::failed_before_start(
+                    context.tool_request,
+                    error.message(),
+                    None,
+                ),
+                task: None,
+            };
+        }
+    };
+    let task_id = submission.task_id;
+    if submission.cancelled {
+        return async_launch_output(
+            &registry,
+            &task_id,
+            tool_types::ToolResult::cancelled_before_start(
+                context.tool_request,
+                "parent cancelled",
+            ),
+        );
+    }
+    registry.mark_subagent_result_pending(&task_id);
+    if let Some(reservation) = &context.request.budget_reservation {
+        if let Err(error) = reservation.bind_task(&task_id).and_then(|_| {
+            registry
+                .bind_child_budget(&task_id, reservation.clone())
+                .map_err(io::Error::other)
+        }) {
+            let _ = registry.fail(&task_id, error.to_string());
+            return async_launch_output(
+                &registry,
+                &task_id,
+                tool_types::ToolResult::failed_before_start(
+                    context.tool_request,
+                    error.to_string(),
+                    None,
+                ),
+            );
+        }
+    }
+    let mut budget_guard = crate::child_budget_ledger::PendingChildBudget::new(
+        context.request.budget_reservation.clone(),
+    );
+
+    if let Some(duration) = context.request.deadline_ms {
+        let deadline = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(duration.min(i64::MAX as u64) as i64);
+        let _ = registry.set_deadline_at(&task_id, deadline, "caller deadline");
+    }
+    let result = tool_types::ToolResult::running(context.tool_request, serde_json::json!({
+        "task_id": task_id, "agent_id": task_id, "accepted": true,
+        "status": if submission.admission == crate::execution_scope::Admission::Started { "running" } else { "queued" },
+        "wait_reason": if submission.admission == crate::execution_scope::Admission::Queued { Some("execution_capacity") } else { None },
+    }).to_string(), false);
+    let cwd = context.cwd.to_path_buf();
+    let tool_request = context.tool_request.clone();
+    let request = context.request;
+    let depth = context.subagent_depth;
+    let root = context.root_task_id.map(str::to_owned);
+    let fence = context.parent_fence;
+    let ingress = context.activity_ingress;
+    let child_registry = registry.clone();
+    let child_id = task_id.clone();
+    let queued =
+        registry
+            .scope_arbiter()
+            .enqueue(registry.clone(), task_id.clone(), limits, move || {
+                budget_guard.start();
+                let output = launch_admitted_async_subagent(
+                    AsyncSubagentLaunchContext {
+                        config: &config,
+                        cwd: &cwd,
+                        tool_request: &tool_request,
+                        request,
+                        subagent_depth: depth,
+                        task_registry: &child_registry,
+                        root_task_id: root.as_deref(),
+                        parent_fence: fence,
+                        activity_ingress: ingress,
+                        enforce_admission: false,
+                    },
+                    &child_id,
+                );
+                if output.result.terminal().started == tool_types::ToolInvocationStarted::No
+                    && let Some(reservation) = &budget_guard.reservation
+                    && let Err(error) =
+                        reservation.settle(orca_core::budget::BudgetUsage::default())
+                {
+                    let _ = child_registry.fail(
+                        &child_id,
+                        format!("child budget settlement failed: {error}"),
+                    );
+                }
+                if matches!(
+                    output.result.status,
+                    orca_core::tool_types::ToolStatus::Failed
+                ) {
+                    let _ = child_registry.fail(
+                        &child_id,
+                        output
+                            .result
+                            .output
+                            .unwrap_or_else(|| "launch failed".into()),
+                    );
+                }
+            });
+    if let Err(error) = queued {
+        let _ = registry.fail(&task_id, error.to_string());
+        return async_launch_output(
+            &registry,
+            &task_id,
+            tool_types::ToolResult::failed_before_start(
+                context.tool_request,
+                error.to_string(),
+                None,
+            ),
+        );
+    }
+    async_launch_output(&registry, &task_id, result)
+}
+
+fn launch_admitted_async_subagent(
+    context: AsyncSubagentLaunchContext<'_>,
+    submitted_task_id: &str,
+) -> AsyncSubagentLaunchOutput {
     let AsyncSubagentLaunchContext {
         config,
         cwd,
@@ -798,7 +968,7 @@ pub(crate) fn launch_async_subagent(
         return AsyncSubagentLaunchOutput {
             result: tool_types::ToolResult::failed(
                 tool_request,
-                "async subagents require persistent task ownership; use sync mode for a history-disabled run",
+                "background subagents require persistent task ownership; enable saved history for this run",
                 None,
             ),
             task: None,
@@ -824,26 +994,23 @@ pub(crate) fn launch_async_subagent(
             task: None,
         };
     };
-    // Reserve before any durable task or OS process exists, so a saturated
-    // session never leaves an unowned child behind. The reservation is held
-    // across task creation, which closes the check-then-register race between
-    // concurrent launches in this process.
-    let _admission = match enforce_admission {
-        true => match task_registry.admit_child(config.subagents.max_parallel) {
-            Ok(reservation) => Some(reservation),
-            Err(error) => {
-                return AsyncSubagentLaunchOutput {
-                    result: tool_types::ToolResult::failed_before_start(
-                        tool_request,
-                        error.message(),
-                        None,
-                    ),
-                    task: None,
-                };
-            }
-        },
-        false => None,
-    };
+    // Capacity is decided by the scope, before any durable task or OS process
+    // exists. Only a real boundary refuses; a full execution pool is not a
+    // refusal, it is a queue position, so the child is still accepted and the
+    // caller is told it is waiting rather than being asked to resubmit.
+    if enforce_admission {
+        let scope = task_registry.execution_scope(&config.subagents.limits);
+        if let Some(refusal) = scope.refuses() {
+            return AsyncSubagentLaunchOutput {
+                result: tool_types::ToolResult::failed_before_start(
+                    tool_request,
+                    refusal.message(),
+                    None,
+                ),
+                task: None,
+            };
+        }
+    }
     let coordinator = match ChildAgentCoordinator::new(task_registry.clone()) {
         Ok(coordinator) => coordinator,
         Err(error) => {
@@ -877,15 +1044,8 @@ pub(crate) fn launch_async_subagent(
         .as_ref()
         .map(|source| source.compatibility.subagent_type.clone())
         .or_else(|| serialized_subagent_type(&request.subagent_type));
-    let task = task_registry.create_subagent_with_parent(
-        request.description.clone(),
-        agent_type,
-        root_task_id.map(str::to_string),
-    );
-    // The parent is not blocked on this child, so its outcome has to be pushed
-    // back into the parent conversation instead of returned in-band.
-    let _ = task_registry.mark_subagent_result_pending(&task.id);
-    let agent_id = task.id.clone();
+    let _ = agent_type;
+    let agent_id = submitted_task_id.to_owned();
     if task_registry.is_cancelled(&agent_id) {
         let _ = task_registry.stop(
             &agent_id,
@@ -1714,7 +1874,12 @@ mod tests {
         _cost: &mut crate::cost::CostTracker,
     ) -> io::Result<crate::agent_child::ChildAgentResult> {
         let definition = config.subagents.effective_definition.as_ref().unwrap();
-        assert_eq!(definition.system_prompt, "Frozen worker instructions.");
+        assert!(
+            definition
+                .system_prompt
+                .ends_with("Frozen worker instructions.")
+        );
+        assert!(definition.system_prompt.contains("## General Role"));
         assert_eq!(
             request.allowed_tools.as_ref().unwrap(),
             &vec!["read_file".to_string()]
@@ -1964,7 +2129,7 @@ mod tests {
                 .result
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("use sync mode"))
+                .is_some_and(|error| error.contains("persistent task ownership"))
         );
         assert!(output.task.is_none());
         assert!(registry.list().is_empty());

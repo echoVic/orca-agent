@@ -245,8 +245,13 @@ fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
             .or_else(|| Some(".".to_string())),
         ToolName::Grep => arguments["pattern"].as_str().map(String::from),
         ToolName::Bash => arguments["command"].as_str().map(String::from),
-        ToolName::ExecCommand => arguments["cmd"].as_str().map(String::from),
-        ToolName::WriteStdin => arguments["session_id"].as_str().map(String::from),
+        ToolName::TaskReadOutput | ToolName::TaskSendInput | ToolName::TaskWait => {
+            arguments["task_id"].as_str().map(String::from).or_else(|| {
+                arguments["task_ids"]
+                    .as_array()
+                    .map(|ids| format!("{} tasks", ids.len()))
+            })
+        }
         ToolName::GitStatus => Some(".".to_string()),
         ToolName::Subagent => arguments["description"]
             .as_str()
@@ -311,20 +316,29 @@ mod tests {
     }
 
     #[test]
-    fn unified_exec_tools_extract_command_and_session_targets() {
+    fn command_and_task_tools_extract_a_stable_target() {
+        // Every task tool addresses work by task_id, so the audit target is the
+        // task identity rather than a second session id.
         assert_eq!(
             tool_target(
-                &ToolName::ExecCommand,
-                &serde_json::json!({"cmd": "vim README.md"}),
+                &ToolName::Bash,
+                &serde_json::json!({"command": "vim README.md"}),
             ),
             Some("vim README.md".to_string())
         );
         assert_eq!(
             tool_target(
-                &ToolName::WriteStdin,
-                &serde_json::json!({"session_id": "shell-1", "chars": "\\u0015"}),
+                &ToolName::TaskSendInput,
+                &serde_json::json!({"task_id": "cmd_1", "chars": "x"}),
             ),
-            Some("shell-1".to_string())
+            Some("cmd_1".to_string())
+        );
+        assert_eq!(
+            tool_target(
+                &ToolName::TaskWait,
+                &serde_json::json!({"task_ids": ["cmd_1", "cmd_2"]}),
+            ),
+            Some("2 tasks".to_string())
         );
     }
 }

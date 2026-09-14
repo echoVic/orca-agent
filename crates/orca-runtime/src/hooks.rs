@@ -308,12 +308,7 @@ impl HookRunner {
                     .as_deref()
                     .map(|tool| {
                         tool_request
-                            .map(|request| {
-                                request.name.as_str() == tool
-                                    || (request.name
-                                        == orca_core::tool_types::ToolName::ExecCommand
-                                        && tool == "bash")
-                            })
+                            .map(|request| request.name.as_str() == tool)
                             .unwrap_or(false)
                     })
                     .unwrap_or(true)
@@ -472,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_hooks_match_exec_command_for_compatibility() {
+    fn bash_hooks_match_the_single_command_entry_point() {
         let runner = HookRunner::new(vec![HookConfig {
             event: HookEvent::PreToolUse,
             command: "true".to_string(),
@@ -480,10 +475,10 @@ mod tests {
         }]);
         let request = ToolRequest {
             id: "tool-exec".to_string(),
-            name: ToolName::ExecCommand,
+            name: ToolName::Bash,
             action: ActionKind::Shell,
             target: Some("printf test".to_string()),
-            raw_arguments: Some(r#"{"cmd":"printf test"}"#.to_string()),
+            raw_arguments: Some(r#"{"command":"printf test"}"#.to_string()),
         };
 
         assert_eq!(

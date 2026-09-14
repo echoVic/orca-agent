@@ -345,7 +345,7 @@ fn relay_lifecycle_failures_have_bounded_retry_and_durable_health() {
 
 #[test]
 fn async_launch_commits_started_before_worker_spawn_and_reuses_turn_identity() {
-    let launch = balanced_block(ASYNC_SUBAGENT, "pub(crate) fn launch_async_subagent");
+    let launch = balanced_block(ASYNC_SUBAGENT, "fn launch_admitted_async_subagent");
     let started = launch
         .find("parent_activity.publish_payload(SubagentActivityPayload::Started")
         .expect("actor launch must commit Started before spawning the worker");
@@ -362,7 +362,7 @@ fn async_launch_commits_started_before_worker_spawn_and_reuses_turn_identity() {
 
 #[test]
 fn async_launch_failures_terminalize_continuation_before_surface_failure() {
-    let launch = balanced_block(ASYNC_SUBAGENT, "pub(crate) fn launch_async_subagent");
+    let launch = balanced_block(ASYNC_SUBAGENT, "fn launch_admitted_async_subagent");
     let helper = balanced_block(ASYNC_SUBAGENT, "fn finish_async_launch_failure");
     let continuation = helper
         .find("coordinator.commit_prepared_terminal(")

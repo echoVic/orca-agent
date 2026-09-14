@@ -137,6 +137,7 @@ pub(crate) fn handle_agent_workspace_key(
 mod tests {
     use crossbeam_channel as mpsc;
     use crossterm::event::KeyCode;
+    use orca_core::task_types::TaskLifetime;
     use orca_core::task_types::{
         BackgroundTaskSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
     };
@@ -153,6 +154,7 @@ mod tests {
             task_type: TaskType::Subagent,
             status: TaskStatus::Running,
             is_backgrounded: false,
+            lifetime: TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms,
             started_at_ms: Some(created_at_ms),

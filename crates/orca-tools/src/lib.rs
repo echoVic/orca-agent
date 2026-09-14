@@ -226,11 +226,21 @@ pub fn tool_is_available_readonly_concurrent(request: &ToolRequest) -> bool {
         .unwrap_or(false)
 }
 
+/// Tools only the runtime can execute.
+///
+/// These read or steer tasks the runtime owns; the registry entry is the
+/// fail-closed fallback for a caller that bypassed the runtime, not an
+/// implementation. Sending them through the concurrent read-only batch would
+/// dispatch them straight to that fallback, so they are excluded here and
+/// reach their runtime handler through the normal tool path instead.
 fn runtime_owned_tool_requires_controller(name: &ToolName) -> bool {
     matches!(
         name,
-        ToolName::SubagentStatus
-            | ToolName::TaskList
+        ToolName::TaskList
+            | ToolName::TaskReadOutput
+            | ToolName::TaskWait
+            | ToolName::TaskStop
+            | ToolName::SubagentMessage
             | ToolName::WorkflowReadMessages
             | ToolName::WorkflowListTasks
     )

@@ -690,6 +690,7 @@ fn workflow_task_activity_ms(task: &BackgroundTaskSummary) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use orca_core::task_types::TaskLifetime;
     use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 
     use super::{TaskTreeKeyResult, WorkflowPanelState};
@@ -702,6 +703,7 @@ mod tests {
             task_type: TaskType::Workflow,
             status: TaskStatus::Running,
             is_backgrounded: false,
+            lifetime: TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms: activity_at_ms,
             started_at_ms: Some(activity_at_ms),

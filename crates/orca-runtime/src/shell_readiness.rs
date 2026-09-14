@@ -96,11 +96,11 @@ impl ShellReadiness {
     }
 
     pub(crate) fn blocks_tool(&self, tool: &ToolName) -> bool {
-        self.blocks_new_processes() && matches!(tool, ToolName::Bash | ToolName::ExecCommand)
+        self.blocks_new_processes() && matches!(tool, ToolName::Bash)
     }
 
     pub(crate) fn blocks_tool_name(&self, tool: &str) -> bool {
-        self.blocks_new_processes() && matches!(tool, "bash" | "exec_command")
+        self.blocks_new_processes() && tool == "bash"
     }
 
     pub(crate) fn failure_message(&self) -> Option<String> {
@@ -130,12 +130,10 @@ impl ShellReadiness {
         self.failure_message().map(|reason| {
             format!(
                 "## Shell availability\n\
-                 New shell process tools (`bash` and `exec_command`) are unavailable in {} mode \
-                 and have been removed from the tool catalog. Do not call them. Continue with the \
-                 dedicated file and search tools that remain available. `write_stdin` may only be \
-                 used for a terminal session that already exists. Reason: {reason}. Do not use \
-                 `/trust` as a workaround; only the user may explicitly select a trusted-host \
-                 policy.",
+                 The `bash` command entry point is unavailable in {} mode and has been removed \
+                 from the tool catalog. Do not call it. Continue with the dedicated file and \
+                 search tools that remain available. Reason: {reason}. Do not use `/trust` as a \
+                 workaround; only the user may explicitly select a trusted-host policy.",
                 approval_mode.as_str()
             )
         })
@@ -176,8 +174,11 @@ mod tests {
         );
 
         assert!(readiness.blocks_tool(&ToolName::Bash));
-        assert!(readiness.blocks_tool(&ToolName::ExecCommand));
-        assert!(!readiness.blocks_tool(&ToolName::WriteStdin));
+        assert!(
+            !readiness.blocks_tool(&ToolName::TaskReadOutput),
+            "reading an existing task's output starts no process"
+        );
+        assert!(!readiness.blocks_tool(&ToolName::TaskWait));
         assert!(!readiness.blocks_tool(&ToolName::Edit));
     }
 

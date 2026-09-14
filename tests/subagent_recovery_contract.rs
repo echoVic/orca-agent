@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 const TOKEN: &str = "FROZEN_DEFINITION_ONLY_RECOVERY_TOKEN";
 
+#[derive(Clone)]
 struct Response {
     delta: Value,
     child: bool,
@@ -45,6 +46,7 @@ impl ScriptedEndpoint {
         let task_sessions = home.join("task-sessions");
         let worker = thread::spawn(move || {
             let mut delayed = Vec::new();
+            let mut final_reports = std::collections::HashMap::<String, Response>::new();
             while !worker_stop.load(Ordering::Acquire) {
                 let mut stream = match listener.accept() {
                     Ok((stream, _)) => stream,
@@ -63,7 +65,34 @@ impl ScriptedEndpoint {
                 let is_child = request.get("tools").is_none_or(|tools| {
                     tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)
                 });
-                let response = {
+                let messages = request["messages"]
+                    .as_array()
+                    .ok_or_else(|| io::Error::other("missing model messages"))?;
+                let last_user = messages
+                    .iter()
+                    .rposition(|message| message["role"] == "user");
+                let last_tool = messages
+                    .iter()
+                    .rposition(|message| message["role"] == "tool");
+                let report_key = last_tool
+                    .filter(|index| last_user.is_none_or(|user| user < *index))
+                    .and_then(|index| messages[index]["tool_call_id"].as_str())
+                    .map(str::to_owned);
+                // A child can finish while the parent's first final response
+                // is in flight. The runtime then gives the model its durable
+                // result and asks for integration. Script that extra boundary
+                // once, without consuming the next user turn's tool call.
+                let cached = if !is_child {
+                    report_key
+                        .as_ref()
+                        .and_then(|key| final_reports.remove(key))
+                } else {
+                    None
+                };
+                let repeated_report = cached.is_some();
+                let response = if let Some(response) = cached {
+                    response
+                } else {
                     let mut pending = worker_pending.lock().unwrap();
                     let index = pending
                         .iter()
@@ -71,6 +100,15 @@ impl ScriptedEndpoint {
                         .ok_or_else(|| io::Error::other("unexpected model request"))?;
                     pending.remove(index).unwrap()
                 };
+                if !is_child
+                    && !repeated_report
+                    && response.delta.get("tool_calls").is_none()
+                    && let Some(key) = report_key
+                {
+                    let mut report = response.clone();
+                    report.wait_for_child = false;
+                    final_reports.insert(key, report);
+                }
                 let messages = request["messages"]
                     .as_array()
                     .ok_or_else(|| io::Error::other("missing model messages"))?;
@@ -98,14 +136,31 @@ impl ScriptedEndpoint {
                         "resumed child must restore its own checkpoint"
                     );
                 } else {
-                    assert!(
-                        !messages.iter().any(|message| {
+                    // A finished child's own report reaches the parent as a
+                    // pinned `<task-notification>`; the report is the child's
+                    // output and the parent is meant to read it. What must not
+                    // happen is the definition body arriving as *instructions*,
+                    // so every other system message is checked.
+                    let leaked = messages
+                        .iter()
+                        .filter(|message| {
                             message["role"] == "system"
                                 && message["content"]
                                     .as_str()
                                     .is_some_and(|s| s.contains(TOKEN))
-                        }),
-                        "the custom body must not leak into the parent's system prompt"
+                        })
+                        .filter(|message| {
+                            !message["content"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .starts_with("<task-notification>")
+                        })
+                        .map(|message| message["content"].as_str().unwrap_or_default().to_string())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        leaked.is_empty(),
+                        "the custom body must not leak into the parent's system prompt as \
+                         instructions: {leaked:?}"
                     );
                 }
                 let finish = if response.delta.get("tool_calls").is_some() {
@@ -132,29 +187,25 @@ impl ScriptedEndpoint {
                                 })
                                 .flatten()
                         })
-                        .find(|value| value["status"] == "async_launched")
+                        .find(|value| value["accepted"] == true && value["task_id"].is_string())
                         .ok_or_else(|| io::Error::other("missing async launch result"))?;
                     let sessions = task_sessions.clone();
                     delayed.push(thread::spawn(move || {
-                        let selector = launch["continuation_id"].as_str().unwrap();
-                        let attempt = &launch["attempt_id"];
+                        let task_id = launch["task_id"].as_str().unwrap();
                         let deadline = Instant::now() + Duration::from_secs(20);
                         loop {
-                            let record =
-                                fs::read_dir(&sessions)?
-                                    .filter_map(Result::ok)
-                                    .find_map(|entry| {
-                                        let bytes = fs::read(
-                                            entry
-                                                .path()
-                                                .join("continuations")
-                                                .join(format!("{selector}.json")),
-                                        )
-                                        .ok()?;
-                                        serde_json::from_slice::<Value>(&bytes).ok()
-                                    });
+                            let record = fs::read_dir(&sessions)?
+                                .filter_map(Result::ok)
+                                .flat_map(|entry| {
+                                    fs::read_dir(entry.path().join("continuations"))
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(Result::ok)
+                                })
+                                .filter_map(|entry| fs::read(entry.path()).ok())
+                                .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                                .find(|record| record["latest_task_id"] == task_id);
                             if let Some(record) = record
-                                && record["current_attempt"]["attempt_id"] == *attempt
                                 && record["terminal"].is_object()
                             {
                                 assert_eq!(record["terminal"]["status"], "completed", "{record}");
@@ -265,8 +316,14 @@ impl Drop for ScriptedEndpoint {
         if thread::panicking() {
             eprintln!(
                 "scripted endpoint requests: {}, pending responses: {}",
-                self.requests.lock().unwrap().len(),
-                self.pending.lock().unwrap().len()
+                self.requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .len(),
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .len()
             );
         }
     }
@@ -380,11 +437,15 @@ fn completed_child(output: &Output) -> (String, String) {
         })
         .collect();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0]["payload"]["status"], "completed");
     let text = results[0]["payload"]["output"].as_str().unwrap();
     let selector = if let Ok(launch) = serde_json::from_str::<Value>(text) {
-        assert_eq!(launch["status"], "async_launched");
-        launch["continuation_id"].as_str().unwrap().to_string()
+        assert_eq!(results[0]["payload"]["status"], "running");
+        assert_eq!(launch["accepted"], true);
+        let id = launch["task_id"].as_str().unwrap();
+        events.iter().rev().flat_map(|event| event["payload"].get("task").into_iter().chain(event["payload"]["tasks"].as_array().into_iter().flatten()))
+            .find(|task| task["id"] == id && task["continuation"]["continuationId"].is_string())
+            .expect("settled child continuation in task observation")["continuation"]["continuationId"]
+            .as_str().unwrap().to_string()
     } else {
         assert!(text.contains(TOKEN));
         text.lines()

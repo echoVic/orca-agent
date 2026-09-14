@@ -618,7 +618,10 @@ mod tests {
         let names = schema_names(&tools);
         assert!(!names.contains(&"bash"));
         assert!(!names.contains(&"exec_command"));
-        assert!(names.contains(&"write_stdin"));
+        assert!(names.contains(&"task_send_input"));
+        assert!(names.contains(&"task_read_output"));
+        assert!(names.contains(&"task_stop"));
+        assert!(!names.contains(&"write_stdin"));
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"read_file"));
 
@@ -629,16 +632,19 @@ mod tests {
         );
         let restored_names = schema_names(&restored);
         assert!(restored_names.contains(&"bash"));
-        assert!(restored_names.contains(&"exec_command"));
+        assert!(
+            !restored_names.contains(&"exec_command"),
+            "there is no second command entry point to restore"
+        );
     }
 
     #[test]
     fn unavailable_shell_rejects_a_stale_launch_request_before_dispatch() {
         let request = request(
-            ToolName::ExecCommand,
+            ToolName::Bash,
             ActionKind::Shell,
             Some("cargo test"),
-            Some(r#"{"cmd":"cargo test"}"#),
+            Some(r#"{"command":"cargo test"}"#),
         );
         let invocation = ToolInvocation {
             requested: request.clone(),
@@ -653,7 +659,7 @@ mod tests {
         let failure = unavailable_shell_tool_failure(&invocation, &readiness)
             .expect("stale shell invocation must fail");
 
-        assert_eq!(failure.request.name, ToolName::ExecCommand);
+        assert_eq!(failure.request.name, ToolName::Bash);
         assert!(failure.message.contains("signal 6"));
     }
 
@@ -791,8 +797,10 @@ mod tests {
         let names = schema_names(&definitions);
 
         assert!(names.contains(&"bash"));
-        assert!(names.contains(&"exec_command"));
-        assert!(names.contains(&"write_stdin"));
+        assert!(!names.contains(&"exec_command"));
+        assert!(!names.contains(&"write_stdin"));
+        assert!(names.contains(&"task_send_input"));
+        assert!(names.contains(&"task_wait"));
     }
 
     #[test]

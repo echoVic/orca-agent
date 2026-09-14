@@ -61,7 +61,7 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 |------|-------------|-----------|--------------|
 | 工具定义 | 类型化 schema | 规格/能力驱动 | `ToolSpec` 规格驱动，执行前校验支持 `oneOf` / `anyOf` |
 | 文件发现 | `Glob` | 文件搜索工具优先 | `glob` 优先，支持 glob/fuzzy 两种发现模式；`list_files` 兼容 |
-| Shell | `Bash`，支持后台任务 | `exec_command`/shell session | `exec_command` + `write_stdin`，支持跨调用 session、PTY、增量输出和 task stop；单 owner supervisor 主动结算退出/停止任务并在下一轮注入一次完成通知；保留同步 `bash` 兼容 |
+| Shell | `Bash`，支持后台任务 | `exec_command`/shell session | `bash` 是唯一启动入口，所有命令从启动起就是运行时持有的任务；`yield_time_ms` 只限制本次调用等待，`timeout_ms` 才是执行期限；`task_read_output` / `task_send_input` / `task_wait` / `task_stop` 按 `task_id` 操作；单 owner supervisor 主动结算退出/停止任务并在下一轮注入一次完成通知 |
 | 文件写入 | `FileWrite`/`FileEdit` | patch/edit 类工具 | `write_file`/`edit` |
 | 子代理 | 同步/异步能力 | 多代理/任务能力 | 同步 `subagent`，深度受配置限制 |
 | 工作流 | workflow/task 能力 | 自动化/任务工具 | `Workflow` JS 动态 workflow |
@@ -167,7 +167,7 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 ## 可靠性保证
 
 - 历史恢复会按顺序重放压缩记录；相同消息计数的多次压缩只消费各自对应的一份摘要，避免恢复后上下文重新膨胀。
-- 异步 subagent 结果持久保存，`subagent_status` 通过 `offset` / `limit` 分页返回完整结果，并显式给出下一页游标。
+- subagent 结果持久保存；`task_read_output` 通过游标分页读取完整结果，`task_wait` 负责等待状态变化，统一服务子代理和命令任务。
 - 后台主会话、shell、subagent 和 workflow 的状态都进入任务列表；后台任务完成、失败、取消或等待审批时，TUI 会主动提示，完成结果可从任务详情查看。
 - stdio MCP 在超时、连接关闭或管道失败后会重建 transport、重新初始化并同步工具；后续请求不需要重启 Orca。
 - JSONL 会话记录逐条使用跨进程文件锁写入；事件序号区间也在锁内比较当前持久游标，旧游标写入会显式失败，不会生成重叠序号流。
@@ -200,7 +200,7 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 - `crates/orca-tools/src/glob.rs` — 首选文件发现工具。
 - `crates/orca-tools/src/list_files.rs` — 兼容目录列表工具。
 - `crates/orca-runtime/src/tool_router.rs` — runtime-special/normal 工具路由与 turn disposition。
-- `crates/orca-runtime/src/terminal_service.rs` — thread-owned `exec_command` / `write_stdin` 会话、PTY、增量输出、task stop、后台退出监督和完成队列。
+- `crates/orca-runtime/src/terminal_service.rs` — thread-owned 命令会话（`bash` 的唯一执行后端）、PTY、增量输出、按 cursor 的读取、执行期限强制、task stop、后台退出监督和完成队列。
 - `crates/orca-runtime/src/runtime_special.rs` — Goal、workflow、task 等 runtime 控制面执行。
 - `crates/orca-runtime/src/runtime_host.rs` — hosted turn 准入、失败 Goal stall 和 context 清理。
 - `crates/orca-tools/src/update_goal.rs` — Goal 参数解析与模型结果格式化，不持有 session owner。

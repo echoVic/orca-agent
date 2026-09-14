@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::execution_broker::{ExecutionBroker, LaunchError};
 use crate::task_output::{TaskOutputRead, TaskOutputStore};
-use crate::tasks::TaskRegistry;
+use crate::tasks::{TaskLifetime, TaskRegistry};
 use orca_core::capability::{
     CapabilityProcessClass, CapabilityReceipt, CapabilityRequest, CapabilitySet,
     EffectiveCapability, EnforcementState,
@@ -610,6 +610,11 @@ impl RuntimeShellSessionManager {
         result
     }
 
+    /// Records who owns a started command on its task record.
+    pub fn mark_task_lifetime(&self, task_id: &str, lifetime: TaskLifetime) -> bool {
+        self.tasks.mark_task_lifetime(task_id, lifetime)
+    }
+
     pub fn write_stdin(&mut self, id: &str, input: &str) -> io::Result<()> {
         let session = self.session_mut(id)?;
         session.stdin.write_all(id, input.as_bytes())
@@ -883,6 +888,15 @@ impl RuntimeShellSessionManager {
         self.terminate(id, ShellSessionTermination::Cancelled, false)
     }
 
+    /// Stops a command because its execution deadline expired.
+    ///
+    /// The reason is recorded even when the process happens to exit during the
+    /// stop grace window: the caller must be able to tell a deadline stop from
+    /// a command that finished on its own.
+    pub(crate) fn stop_for_deadline(&mut self, id: &str) -> io::Result<ShellSessionOutput> {
+        self.terminate(id, ShellSessionTermination::TimedOut, false)
+    }
+
     fn terminate(
         &mut self,
         id: &str,
@@ -897,6 +911,8 @@ impl RuntimeShellSessionManager {
         let tasks = session.tasks.clone();
         if wait_for_process_exit(&mut session, Duration::from_millis(150))?.is_some() {
             let status = session.finish_after_exit()?;
+            // The stop was requested, so the exit is attributed to it rather
+            // than reported as a natural completion.
             let output = session.output(
                 id,
                 if status.success() {
@@ -905,7 +921,7 @@ impl RuntimeShellSessionManager {
                     TaskStatus::Failed
                 },
                 process_exit_code(status),
-                ShellSessionTermination::Exited,
+                termination,
             )?;
             Self::record_terminal_output(&tasks, &output)?;
             if remove_completed_output {

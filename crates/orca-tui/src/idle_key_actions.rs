@@ -151,6 +151,7 @@ mod tests {
             task_type: orca_core::task_types::TaskType::Subagent,
             status: orca_core::task_types::TaskStatus::Running,
             is_backgrounded: false,
+            lifetime: orca_core::task_types::TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms: 1_000,
             started_at_ms: Some(1_000),

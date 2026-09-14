@@ -273,6 +273,12 @@ fn surface_task_transcript_item(
             id: surface::SurfaceHistoryId::try_new(id).map_err(|_| ())?,
             content: surface_persisted_display_text(&content),
             status: match status {
+                // A tool call that returned while its side effect is still
+                // running is presented like any other returned call; the
+                // authoritative running state lives on the task record.
+                orca_core::tool_types::ToolStatus::Running => {
+                    surface::TaskTranscriptToolStatus::Completed
+                }
                 orca_core::tool_types::ToolStatus::Completed => {
                     surface::TaskTranscriptToolStatus::Completed
                 }
@@ -1914,6 +1920,9 @@ impl ThreadActor {
             | orca_core::tool_types::ToolResultKind::Empty
             | orca_core::tool_types::ToolResultKind::NoMatches
             | orca_core::tool_types::ToolResultKind::Truncated => {
+                surface::SurfaceToolResultKind::Success
+            }
+            orca_core::tool_types::ToolResultKind::Running => {
                 surface::SurfaceToolResultKind::Success
             }
             orca_core::tool_types::ToolResultKind::PermissionDenied => {

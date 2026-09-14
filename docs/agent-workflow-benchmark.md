@@ -1,5 +1,11 @@
 # Agent & Workflow Parallel Audit Benchmark
 
+> **Historical benchmark snapshot.** The model-facing `mode`, `max_parallel`,
+> and `subagent_status` descriptions below no longer describe the current
+> runtime. The current unified 32-slot queued design and real-model A/B results
+> are documented in [the optimization plan](subagent-runtime-optimization-plan.md)
+> and [implementation progress](subagent-runtime-optimization-progress.md).
+
 **Generated**: 2026-06-25  
 **Project**: Orca (blade-deepseek) — DeepSeek-native coding agent in Rust  
 **Audit mode**: Multi-agent parallel workflow (Phase 1: 8 subagents → Phase 2: 3 reviewers)  

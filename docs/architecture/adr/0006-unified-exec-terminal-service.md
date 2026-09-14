@@ -1,6 +1,8 @@
 # ADR 0006: Unified Exec Terminal Service
 
-- Status: Accepted; released in v0.3.23
+- Status: Superseded by ADR 0009 for the model-facing tool list and the default
+  command lifetime. The `TerminalService` supervisor design below still stands.
+- Released in v0.3.23
 - Date: 2026-08-17
 - Updated: 2026-09-09 (durable output and explicit offset polling)
 - Scope: model-facing shell execution, interactive stdin, PTY, task control

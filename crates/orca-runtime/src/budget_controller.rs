@@ -40,6 +40,7 @@ pub struct BudgetController {
     cost_reminder_index: u32,
     pending_soft_landing: Option<String>,
     reservations: SharedReservations,
+    external_reserved: BudgetUsage,
 }
 
 impl BudgetController {
@@ -65,6 +66,7 @@ impl BudgetController {
             cost_reminder_index: 0,
             pending_soft_landing: None,
             reservations: Arc::new(Mutex::new(LeaseReservationPool::default())),
+            external_reserved: BudgetUsage::default(),
         }
     }
 
@@ -106,6 +108,7 @@ impl BudgetController {
             cost_reminder_index: 0,
             pending_soft_landing: None,
             reservations: Arc::new(Mutex::new(LeaseReservationPool::default())),
+            external_reserved: BudgetUsage::default(),
         };
         controller.observe_inner_turn_soft_landing();
         controller.observe_cost_soft_landing();
@@ -157,9 +160,8 @@ impl BudgetController {
     /// Record provider cost (USD micros) spent so far.
     pub fn record_cost_usd_micros(&mut self, cost_usd_micros: u64) -> Result<(), BudgetStop> {
         self.sync_wall_time_inner();
-        if let Some(stop) = self.stop_if_exhausted_without_turn_dimension() {
-            return Err(stop);
-        }
+        // This is a receipt for work already performed, never an admission.
+        // A concurrent stop must not erase consumption reported afterwards.
         self.usage.add_cost_usd_micros(cost_usd_micros);
         self.observe_cost_soft_landing();
         self.stop_if_exhausted_without_turn_dimension()
@@ -169,9 +171,6 @@ impl BudgetController {
     /// Merge a child lease's consumed usage into this operation.
     pub fn merge_child_usage(&mut self, child_usage: BudgetUsage) -> Result<(), BudgetStop> {
         self.sync_wall_time_inner();
-        if let Some(stop) = self.stop_if_exhausted() {
-            return Err(stop);
-        }
         // Child turns, tools, and cost are additive work. Wall time is not: all
         // concurrent children share this controller's monotonic deadline, so
         // their individual elapsed values must not be summed into the parent.
@@ -206,6 +205,57 @@ impl BudgetController {
     /// The reservation is held for the lease's lifetime and returned when the
     /// lease settles (RAII via [`BudgetLease::finish`] and `Drop`); consumed
     /// usage reports back through [`BudgetController::merge_child_usage`].
+    pub(crate) fn set_external_reservations(&mut self, usage: BudgetUsage) {
+        self.external_reserved = usage;
+    }
+
+    /// Keep a tenth of each finite dimension for the parent's final integration.
+    /// Siblings in one model response receive equal shares of the remainder.
+    pub(crate) fn background_child_lease(
+        &mut self,
+        requested: BudgetSpec,
+        siblings: usize,
+    ) -> Result<BudgetLease, BudgetStop> {
+        let pool = self.reservations.lock().expect("lease pool").reserved;
+        let available = self.remaining_spec_after(pool);
+        let split = |available: Option<u64>, total: Option<u64>, requested: Option<u64>| {
+            available
+                .map(|value| {
+                    let finish = total.unwrap_or(0).div_ceil(10);
+                    let share = value.saturating_sub(finish) / siblings.max(1) as u64;
+                    requested.map_or(share, |requested| requested.min(share))
+                })
+                .or(requested)
+        };
+        let spec = BudgetSpec {
+            max_turns: split(
+                available.max_turns.map(u64::from),
+                self.spec.max_turns.map(u64::from),
+                requested.max_turns.map(u64::from),
+            )
+            .map(|n| n as u32),
+            max_tool_calls: split(
+                available.max_tool_calls.map(u64::from),
+                self.spec.max_tool_calls.map(u64::from),
+                requested.max_tool_calls.map(u64::from),
+            )
+            .map(|n| n as u32),
+            max_cost_usd_micros: split(
+                available.max_cost_usd_micros,
+                self.spec.max_cost_usd_micros,
+                requested.max_cost_usd_micros,
+            ),
+            max_wall_time_ms: available.max_wall_time_ms,
+        };
+        if let Some(reason) = exhausted_dimension_of(&spec, &self.spec) {
+            return Err(BudgetStop {
+                reason,
+                usage: self.usage(),
+            });
+        }
+        self.child_lease(spec)
+    }
+
     pub fn child_lease(&mut self, child_spec: BudgetSpec) -> Result<BudgetLease, BudgetStop> {
         let mut leases = self.child_leases(child_spec, 1)?;
         Ok(leases.pop().expect("one requested child lease"))
@@ -338,7 +388,8 @@ impl BudgetController {
     /// usage and capacity reserved by outstanding child leases. A dimension
     /// with nothing left yields `Some(0)` — never a padded minimum — so a
     /// lease can never be granted capacity the parent does not have.
-    fn remaining_spec_after(&self, reserved: BudgetUsage) -> BudgetSpec {
+    fn remaining_spec_after(&self, mut reserved: BudgetUsage) -> BudgetSpec {
+        reserved.merge(self.external_reserved);
         let subtract_turns = |limit: Option<u32>| {
             limit.map(|limit| {
                 limit
@@ -434,19 +485,21 @@ impl BudgetController {
     }
 
     fn exhausted_dimension(&self, skip_turn: bool) -> Option<StopReason> {
+        let mut usage = self.usage;
+        usage.merge(self.external_reserved);
         if !skip_turn
             && let Some(max_turns) = self.spec.max_turns
-            && self.usage.turns >= max_turns
+            && usage.turns >= max_turns
         {
             return Some(StopReason::TurnBudget { max_turns });
         }
         if let Some(max_tool_calls) = self.spec.max_tool_calls
-            && self.usage.tool_calls >= max_tool_calls
+            && usage.tool_calls >= max_tool_calls
         {
             return Some(StopReason::ToolCallBudget { max_tool_calls });
         }
         if let Some(max_cost_usd_micros) = self.spec.max_cost_usd_micros
-            && self.usage.cost_usd_micros > max_cost_usd_micros
+            && usage.cost_usd_micros > max_cost_usd_micros
         {
             return Some(StopReason::CostBudget {
                 max_cost_usd_micros,
@@ -509,9 +562,22 @@ pub struct BudgetLease {
     started_at: Instant,
     reservations: Option<SharedReservations>,
     settled: bool,
+    durable: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 }
 
 impl BudgetLease {
+    pub(crate) fn from_durable(
+        reservation: crate::child_budget_ledger::ChildBudgetReservation,
+    ) -> Self {
+        Self {
+            effective_spec: reservation.spec,
+            usage: BudgetUsage::default(),
+            started_at: Instant::now(),
+            reservations: None,
+            settled: true,
+            durable: Some(reservation),
+        }
+    }
     fn new(effective_spec: BudgetSpec, reservations: SharedReservations) -> Self {
         Self {
             effective_spec,
@@ -519,7 +585,21 @@ impl BudgetLease {
             started_at: Instant::now(),
             reservations: Some(reservations),
             settled: false,
+            durable: None,
         }
+    }
+
+    pub(crate) fn attach_durable(
+        &mut self,
+        reservation: crate::child_budget_ledger::ChildBudgetReservation,
+    ) {
+        self.settle_reservation();
+        self.durable = Some(reservation);
+    }
+    pub(crate) fn durable_reservation(
+        &self,
+    ) -> Option<&crate::child_budget_ledger::ChildBudgetReservation> {
+        self.durable.as_ref()
     }
 
     pub fn spec(&self) -> &BudgetSpec {
@@ -553,10 +633,7 @@ impl BudgetLease {
     }
 
     pub fn record_cost_usd_micros(&mut self, cost_usd_micros: u64) -> Result<(), BudgetStop> {
-        self.sync_wall_time()?;
-        if let Some(stop) = self.stop_if_exhausted() {
-            return Err(stop);
-        }
+        self.sync_wall_time_inner();
         self.usage.add_cost_usd_micros(cost_usd_micros);
         self.stop_if_exhausted().map_or(Ok(()), Err)
     }
@@ -657,6 +734,11 @@ impl Drop for BudgetLease {
     /// reservation so the parent's pool is never permanently drained.
     fn drop(&mut self) {
         self.settle_reservation();
+        if let Some(reservation) = &self.durable {
+            // No task binding proves that execution never became eligible.
+            // Bound work must supply a receipt, including after a panic.
+            let _ = reservation.refund_unsubmitted();
+        }
     }
 }
 

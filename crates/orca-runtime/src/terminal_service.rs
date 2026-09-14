@@ -41,6 +41,10 @@ struct TerminalServiceState {
 struct TerminalSessionState {
     task_id: String,
     cursor: usize,
+    /// Absolute instant the managed process must not outlive.
+    deadline: Option<(Instant, &'static str)>,
+    /// The configured limit this deadline was derived from, for reporting.
+    deadline_after: Option<Duration>,
     requested_terminal: ShellTerminalMode,
     effective_terminal: ShellTerminalMode,
     terminal: Option<TerminalState>,
@@ -56,13 +60,21 @@ struct TerminalState {
     status: TaskStatus,
     termination: &'static str,
     exit_code: Option<i32>,
+    /// Whether this terminal was produced by an execution deadline.
+    deadline_reached: bool,
+    deadline_source: Option<&'static str>,
 }
 
 enum TerminalCommand {
     Start {
+        lifetime: crate::tasks::TaskLifetime,
         command: Box<ShellSessionCommand>,
         metadata_writable_directories: Vec<PathBuf>,
         network_proxy: Option<RuntimeNetworkProxy>,
+        /// Absolute deadline armed when the process actually starts.
+        deadline: Option<(Instant, &'static str)>,
+        /// The configured limit this deadline was derived from.
+        deadline_after: Option<Duration>,
         response: SyncSender<io::Result<ShellSessionHandle>>,
     },
     Write {
@@ -79,6 +91,14 @@ enum TerminalCommand {
     MarkBackground {
         session_id: String,
     },
+    ResolveTask {
+        task_id: String,
+        response: SyncSender<io::Result<String>>,
+    },
+    CloseInput {
+        session_id: String,
+        response: SyncSender<io::Result<()>>,
+    },
     StopTask {
         task_id: String,
         response: SyncSender<io::Result<bool>>,
@@ -92,14 +112,30 @@ enum TerminalCommand {
 }
 
 pub(crate) struct TerminalExecRequest<'a> {
+    /// Ownership of the started command. `Workspace` marks a service the user
+    /// asked to keep running; it survives its starting task.
+    pub(crate) lifetime: crate::tasks::TaskLifetime,
     pub(crate) command: &'a str,
     pub(crate) cwd: &'a Path,
     pub(crate) additional_roots: &'a [PathBuf],
     pub(crate) config: &'a RunConfig,
     pub(crate) permission_overlay: &'a TurnPermissionOverlay,
     pub(crate) terminal: ShellTerminalMode,
+    /// Caller-requested execution deadline, measured from process start.
+    ///
+    /// This is the "how long may the process run" axis, separate from the
+    /// yield time that only bounds how long a tool call waits before handing
+    /// control back. `None` adds no limit of its own.
+    pub(crate) execution_deadline: Option<ExecutionDeadline>,
     #[cfg(test)]
     pub(crate) sandbox_override: Option<ShellSandboxMode>,
+}
+
+/// A wall-clock execution limit and where it came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionDeadline {
+    pub(crate) after: Duration,
+    pub(crate) source: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -118,6 +154,13 @@ pub(crate) struct TerminalServiceOutput {
     pub(crate) eof: bool,
     pub(crate) requested_terminal: &'static str,
     pub(crate) effective_terminal: &'static str,
+    /// Whether the effective deadline was reached.
+    pub(crate) deadline_reached: bool,
+    /// Why a deadline existed, so a caller timeout is distinguishable from an
+    /// administrator cap.
+    pub(crate) deadline_source: Option<&'static str>,
+    /// Wall-clock milliseconds from process start to the effective deadline.
+    pub(crate) effective_deadline_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,29 +219,44 @@ impl TerminalService {
         }
     }
 
+    /// Starts one command and observes it for at most `yield_time`.
+    ///
+    /// `on_output` receives output as it is observed, before this call
+    /// returns, so a client can render progress while the command is still
+    /// running. It never changes the command.
     pub(crate) fn exec(
         &self,
         request: TerminalExecRequest<'_>,
         yield_time: Duration,
         max_output_bytes: usize,
         should_cancel: impl Fn() -> bool,
+        on_output: &mut dyn FnMut(&str),
     ) -> io::Result<TerminalServiceOutput> {
+        let requested_deadline = request.execution_deadline;
+        let request_lifetime = request.lifetime;
         let (command, metadata_writable_directories, network_proxy) =
             prepare_shell_command(request)?;
+        let deadline =
+            requested_deadline.map(|deadline| (Instant::now() + deadline.after, deadline.source));
+        let deadline_after = requested_deadline.map(|deadline| deadline.after);
         let (response, receiver) = mpsc::sync_channel(1);
         self.send(TerminalCommand::Start {
+            lifetime: request_lifetime,
             command: Box::new(command),
             metadata_writable_directories,
             network_proxy,
+            deadline,
+            deadline_after,
             response,
         })?;
         let handle = receive_response(receiver, "terminal start")??;
-        let output = self.poll_until(
+        let output = self.poll_until_with_output(
             &handle.id,
             yield_time,
             max_output_bytes,
             false,
             should_cancel,
+            on_output,
         )?;
         if output.status == "running" {
             let _ = self.send(TerminalCommand::MarkBackground {
@@ -208,60 +266,108 @@ impl TerminalService {
         Ok(output)
     }
 
-    pub(crate) fn write_stdin(
-        &self,
-        session_id: &str,
-        chars: Option<&str>,
-        yield_time: Duration,
-        max_output_bytes: usize,
-        should_cancel: impl Fn() -> bool,
-    ) -> io::Result<TerminalServiceOutput> {
-        self.write_stdin_with_offset(
-            session_id,
-            chars,
-            None,
-            yield_time,
-            max_output_bytes,
-            should_cancel,
-        )
+    /// Resolves a model-facing `task_id` to its terminal session id.
+    ///
+    /// The model addresses work by `task_id` only; `session_id` stays an
+    /// internal detail so callers never translate between two ids.
+    fn session_id_for_task(&self, task_id: &str) -> io::Result<String> {
+        // Only the supervisor owns the session map, so the lookup always goes
+        // through it rather than through a second, possibly stale copy.
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send(TerminalCommand::ResolveTask {
+            task_id: task_id.to_string(),
+            response,
+        })?;
+        receive_response(receiver, "terminal resolve")?
     }
 
-    pub(crate) fn write_stdin_with_offset(
+    /// Reads the task's output from its own advancing cursor.
+    pub(crate) fn read_output(
         &self,
-        session_id: &str,
-        chars: Option<&str>,
-        output_offset: Option<usize>,
+        task_id: &str,
+        max_output_bytes: usize,
+    ) -> io::Result<Option<TerminalServiceOutput>> {
+        self.read_output_at_or_cursor(task_id, None, max_output_bytes)
+    }
+
+    /// Reads one idempotent page at an absolute byte offset.
+    ///
+    /// The offset is caller-owned: it does not advance the task cursor, so
+    /// repeated reads return the same bytes and concurrent readers never
+    /// consume each other's output. An offset past the retained end is an
+    /// explicit error instead of a silent restart from zero.
+    pub(crate) fn read_output_at(
+        &self,
+        task_id: &str,
+        cursor: usize,
+        max_output_bytes: usize,
+    ) -> io::Result<Option<TerminalServiceOutput>> {
+        self.read_output_at_or_cursor(task_id, Some(cursor), max_output_bytes)
+    }
+
+    fn read_output_at_or_cursor(
+        &self,
+        task_id: &str,
+        cursor: Option<usize>,
+        max_output_bytes: usize,
+    ) -> io::Result<Option<TerminalServiceOutput>> {
+        let session_id = match self.session_id_for_task(task_id) {
+            Ok(session_id) => session_id,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send(TerminalCommand::Poll {
+            session_id,
+            max_output_bytes,
+            output_offset: cursor,
+            response,
+        })?;
+        Ok(Some(receive_response(receiver, "terminal read")??))
+    }
+
+    /// Writes to a task's stdin, optionally closing it, and observes output.
+    pub(crate) fn send_input(
+        &self,
+        task_id: &str,
+        chars: &str,
+        eof: bool,
         yield_time: Duration,
         max_output_bytes: usize,
         should_cancel: impl Fn() -> bool,
-    ) -> io::Result<TerminalServiceOutput> {
-        if let Some(offset) = output_offset {
-            if chars.is_some_and(|chars| !chars.is_empty()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "output_offset cannot be combined with nonempty chars",
-                ));
-            }
-            // An explicit read is a single, repeatable page, not an advancing
-            // long poll. It neither writes stdin nor consumes the shared cursor.
-            return self.poll_once(session_id, max_output_bytes, Some(offset));
-        }
-        if let Some(chars) = chars.filter(|chars| !chars.is_empty()) {
+    ) -> io::Result<Option<TerminalServiceOutput>> {
+        let session_id = match self.session_id_for_task(task_id) {
+            Ok(session_id) => session_id,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !chars.is_empty() {
             let (response, receiver) = mpsc::sync_channel(1);
             self.send(TerminalCommand::Write {
-                session_id: session_id.to_string(),
+                session_id: session_id.clone(),
                 chars: chars.to_string(),
                 response,
             })?;
             receive_response(receiver, "terminal write")??;
         }
+        if eof {
+            let (response, receiver) = mpsc::sync_channel(1);
+            self.send(TerminalCommand::CloseInput {
+                session_id: session_id.clone(),
+                response,
+            })?;
+            // A terminal without a stdin pipe cannot be closed; that must not
+            // fail the write that already succeeded.
+            let _ = receive_response(receiver, "terminal close input");
+        }
         self.poll_until(
-            session_id,
+            &session_id,
             yield_time,
             max_output_bytes,
             true,
             should_cancel,
         )
+        .map(Some)
     }
 
     pub(crate) fn stop_task(&self, task_id: &str) -> io::Result<bool> {
@@ -292,6 +398,25 @@ impl TerminalService {
         return_on_output: bool,
         should_cancel: impl Fn() -> bool,
     ) -> io::Result<TerminalServiceOutput> {
+        self.poll_until_with_output(
+            session_id,
+            yield_time,
+            max_output_bytes,
+            return_on_output,
+            should_cancel,
+            &mut |_chunk: &str| {},
+        )
+    }
+
+    fn poll_until_with_output(
+        &self,
+        session_id: &str,
+        yield_time: Duration,
+        max_output_bytes: usize,
+        return_on_output: bool,
+        should_cancel: impl Fn() -> bool,
+        on_output: &mut dyn FnMut(&str),
+    ) -> io::Result<TerminalServiceOutput> {
         let deadline = Instant::now()
             .checked_add(yield_time)
             .unwrap_or_else(Instant::now);
@@ -301,6 +426,9 @@ impl TerminalService {
             let output = self.poll_once(session_id, remaining_output_bytes, None)?;
             let observed_output = output.output.len();
             let status = output.status;
+            if observed_output > 0 {
+                on_output(&output.output);
+            }
             merge_terminal_output(&mut aggregate, output);
             remaining_output_bytes = remaining_output_bytes.saturating_sub(observed_output);
             if status != "running"
@@ -377,19 +505,34 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
     loop {
         match receiver.recv_timeout(POLL_INTERVAL) {
             Ok(TerminalCommand::Start {
+                lifetime,
                 command,
                 metadata_writable_directories,
                 network_proxy,
+                deadline,
+                deadline_after,
                 response,
             }) => {
                 let result = state
                     .manager
                     .spawn_with_metadata_roots(*command, metadata_writable_directories);
                 if let Ok(handle) = &result {
-                    state.sessions.insert(
-                        handle.id.clone(),
-                        TerminalSessionState::from_handle(handle, network_proxy),
-                    );
+                    if lifetime == crate::tasks::TaskLifetime::Workspace
+                        && !state.manager.mark_task_lifetime(&handle.task_id, lifetime)
+                    {
+                        // Ownership must be recorded before the caller is told
+                        // the service started; otherwise a later cancel could
+                        // sweep a service the user asked to keep running.
+                        let _ = state.manager.kill_preserving_output(&handle.id);
+                        let _ = response.send(Err(io::Error::other(
+                            "failed to record workspace ownership for the started service",
+                        )));
+                        continue;
+                    }
+                    let mut session = TerminalSessionState::from_handle(handle, network_proxy);
+                    session.deadline = deadline;
+                    session.deadline_after = deadline_after;
+                    state.sessions.insert(handle.id.clone(), session);
                 }
                 let _ = response.send(result);
             }
@@ -413,6 +556,27 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
             Ok(TerminalCommand::MarkBackground { session_id }) => {
                 state.mark_background(&session_id);
             }
+            Ok(TerminalCommand::ResolveTask { task_id, response }) => {
+                let resolved = state
+                    .sessions
+                    .iter()
+                    .find(|(_, session)| session.task_id == task_id)
+                    .map(|(session_id, _)| session_id.clone())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("unknown terminal task: {task_id}"),
+                        )
+                    });
+                let _ = response.send(resolved);
+            }
+            Ok(TerminalCommand::CloseInput {
+                session_id,
+                response,
+            }) => {
+                let result = state.close_input(&session_id);
+                let _ = response.send(result);
+            }
             Ok(TerminalCommand::StopTask { task_id, response }) => {
                 let result = state.stop_task(&task_id);
                 let _ = response.send(result);
@@ -431,6 +595,7 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                 break;
             }
         }
+        let _ = state.enforce_deadlines();
         let _ = state.reap();
         state.cleanup_completed();
     }
@@ -506,11 +671,30 @@ impl TerminalServiceState {
             if terminal.status != TaskStatus::Running {
                 self.observe_completion(session_id);
             }
-            if terminal.status != TaskStatus::Running && output.next_offset >= output.bytes_total {
-                self.sessions.remove(session_id);
-                self.manager.remove_output(&task_id);
-            }
+            // A session that reached EOF stays addressable until the retention
+            // window expires. Dropping it here made a finished command
+            // unreadable by its task_id: the model could see the completion
+            // notification but could not page the output it referred to.
+            let _ = &task_id;
         }
+        // A deadline stop is recorded on the session's terminal state, but the
+        // command may have been observed terminal before that stamp existed
+        // (the supervisor's next maintenance tick). The session's own deadline
+        // is the tiebreaker: if it has expired and the command is terminal,
+        // the deadline is what ended it.
+        let deadline_expired = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.deadline)
+            .is_some_and(|(deadline, _source)| Instant::now() >= deadline);
+        let deadline_reached = terminal.deadline_reached
+            || (deadline_expired && terminal.status != TaskStatus::Running);
+        let deadline_source = terminal.deadline_source.or_else(|| {
+            self.sessions
+                .get(session_id)
+                .and_then(|session| session.deadline)
+                .map(|(_deadline, source)| source)
+        });
         Ok(TerminalServiceOutput {
             session_id: session_id.to_string(),
             task_id,
@@ -519,7 +703,11 @@ impl TerminalServiceState {
             } else {
                 task_status_label(terminal.status)
             },
-            termination: terminal.termination,
+            termination: if deadline_reached {
+                "timed_out"
+            } else {
+                terminal.termination
+            },
             output: output.combined,
             exit_code: terminal.exit_code,
             truncated: output.omitted_prefix_bytes > 0 || output.next_offset < output.bytes_total,
@@ -530,7 +718,63 @@ impl TerminalServiceState {
             eof: terminal.status != TaskStatus::Running && output.next_offset >= output.bytes_total,
             requested_terminal: requested_terminal.as_str(),
             effective_terminal: effective_terminal.as_str(),
+            deadline_reached,
+            deadline_source,
+            effective_deadline_ms: self
+                .sessions
+                .get(session_id)
+                .and_then(|session| session.deadline_after)
+                .map(|after| after.as_millis() as u64),
         })
+    }
+
+    /// Terminates every managed process whose caller deadline has expired.
+    ///
+    /// A deadline limits execution, not waiting: the process tree is stopped
+    /// and recorded as timed out, with partial output preserved.
+    fn enforce_deadlines(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        let expired = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.terminal.is_none()
+                    && session
+                        .deadline
+                        .is_some_and(|(deadline, _source)| now >= deadline)
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in expired {
+            let source = self
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.deadline)
+                .map(|(_deadline, source)| source);
+            let mut output = self.manager.stop_for_deadline(&session_id)?;
+            output.status = TaskStatus::Failed;
+            // Stamp the terminal before it is recorded: the recorded state is
+            // what every later poll reports, and the first response the caller
+            // sees must already name the deadline that stopped the command.
+            self.record_terminal_with_deadline(&output, source);
+        }
+        Ok(())
+    }
+
+    fn close_input(&mut self, session_id: &str) -> io::Result<()> {
+        let session = self.sessions.get(session_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown terminal session: {session_id}"),
+            )
+        })?;
+        if session.terminal.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("terminal session has already completed: {session_id}"),
+            ));
+        }
+        self.manager.close_stdin(session_id)
     }
 
     fn stop_task(&mut self, task_id: &str) -> io::Result<bool> {
@@ -562,10 +806,23 @@ impl TerminalServiceState {
     }
 
     fn record_terminal(&mut self, output: &ShellSessionOutput) {
+        self.record_terminal_with_deadline(output, None);
+    }
+
+    fn record_terminal_with_deadline(
+        &mut self,
+        output: &ShellSessionOutput,
+        deadline_source: Option<&'static str>,
+    ) {
         if let Some(session) = self.sessions.get_mut(&output.id)
             && session.terminal.is_none()
         {
-            session.terminal = Some(TerminalState::from_output(output));
+            let mut terminal = TerminalState::from_output(output);
+            if let Some(source) = deadline_source {
+                terminal.deadline_reached = true;
+                terminal.deadline_source = Some(source);
+            }
+            session.terminal = Some(terminal);
             session.completed_at = Some(Instant::now());
             session.network_proxy.take();
         }
@@ -672,6 +929,8 @@ impl TerminalSessionState {
         Self {
             task_id: handle.task_id.clone(),
             cursor: 0,
+            deadline: None,
+            deadline_after: None,
             requested_terminal: handle.requested_terminal,
             effective_terminal: handle.effective_terminal,
             terminal: None,
@@ -687,6 +946,8 @@ impl TerminalSessionState {
 impl TerminalState {
     fn running() -> Self {
         Self {
+            deadline_reached: false,
+            deadline_source: None,
             status: TaskStatus::Running,
             termination: "running",
             exit_code: None,
@@ -698,6 +959,8 @@ impl TerminalState {
             status: output.status,
             termination: termination_label(output.termination),
             exit_code: output.exit_code,
+            deadline_reached: output.termination == ShellSessionTermination::TimedOut,
+            deadline_source: None,
         }
     }
 
@@ -726,6 +989,10 @@ impl TerminalState {
             status,
             termination,
             exit_code: output.exit_code,
+            // An archived record does not persist the deadline origin, so a
+            // recovered timeout reports the fact without inventing a source.
+            deadline_reached: termination == "timed_out",
+            deadline_source: None,
         })
     }
 }
@@ -863,6 +1130,96 @@ mod tests {
         (TerminalService::new(registry.clone()), registry)
     }
 
+    /// Test-only polling helpers for this module's supervisor tests.
+    ///
+    /// The model-facing path is `send_input` / `read_output`, which address a
+    /// task by `task_id` and never expose a raw session id. These wrappers keep
+    /// the original session-addressed shape so the supervisor tests stay
+    /// focused on lifecycle and archive behaviour.
+    impl TerminalService {
+        pub(crate) fn write_stdin(
+            &self,
+            session_id: &str,
+            chars: Option<&str>,
+            yield_time: Duration,
+            max_output_bytes: usize,
+            should_cancel: impl Fn() -> bool,
+        ) -> io::Result<TerminalServiceOutput> {
+            self.write_stdin_with_offset(
+                session_id,
+                chars,
+                None,
+                yield_time,
+                max_output_bytes,
+                should_cancel,
+            )
+        }
+
+        pub(crate) fn write_stdin_with_offset(
+            &self,
+            session_id: &str,
+            chars: Option<&str>,
+            output_offset: Option<usize>,
+            yield_time: Duration,
+            max_output_bytes: usize,
+            should_cancel: impl Fn() -> bool,
+        ) -> io::Result<TerminalServiceOutput> {
+            if let Some(offset) = output_offset {
+                if chars.is_some_and(|chars| !chars.is_empty()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "output_offset cannot be combined with nonempty chars",
+                    ));
+                }
+                return self.poll_once(session_id, max_output_bytes, Some(offset));
+            }
+            if let Some(chars) = chars.filter(|chars| !chars.is_empty()) {
+                let (response, receiver) = mpsc::sync_channel(1);
+                self.send(TerminalCommand::Write {
+                    session_id: session_id.to_string(),
+                    chars: chars.to_string(),
+                    response,
+                })?;
+                receive_response(receiver, "terminal write")??;
+            }
+            self.poll_until(
+                session_id,
+                yield_time,
+                max_output_bytes,
+                true,
+                should_cancel,
+            )
+        }
+    }
+
+    /// Test wrapper: these suites observe no incremental output.
+    fn start(
+        service: &TerminalService,
+        request: TerminalExecRequest<'_>,
+        yield_time: Duration,
+        max_output_bytes: usize,
+        should_cancel: impl Fn() -> bool,
+    ) -> io::Result<TerminalServiceOutput> {
+        service.exec(
+            request,
+            yield_time,
+            max_output_bytes,
+            should_cancel,
+            &mut |_chunk: &str| {},
+        )
+    }
+
+    fn request_with_deadline<'a>(
+        command: &'a str,
+        cwd: &'a Path,
+        overlay: &'a TurnPermissionOverlay,
+        deadline: Option<ExecutionDeadline>,
+    ) -> TerminalExecRequest<'a> {
+        let mut request = request(command, cwd, overlay, ShellTerminalMode::pipe());
+        request.execution_deadline = deadline;
+        request
+    }
+
     fn request<'a>(
         command: &'a str,
         cwd: &'a Path,
@@ -877,12 +1234,14 @@ mod tests {
             .expect("test config"),
         ));
         TerminalExecRequest {
+            lifetime: crate::tasks::TaskLifetime::Task,
             command,
             cwd,
             additional_roots: &[],
             config,
             permission_overlay: overlay,
             terminal,
+            execution_deadline: None,
             sandbox_override: Some(ShellSandboxMode::DangerFullAccess),
         }
     }
@@ -892,19 +1251,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let overlay = TurnPermissionOverlay::default();
         let (service, _) = service(temp.path());
-        let output = service
-            .exec(
-                request(
-                    "printf unified",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_secs(2),
-                8 * 1024,
-                || false,
-            )
-            .expect("exec");
+        let output = start(
+            &service,
+            request(
+                "printf unified",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_secs(2),
+            8 * 1024,
+            || false,
+        )
+        .expect("exec");
 
         assert_eq!(output.status, "completed", "{output:?}");
         assert_eq!(output.output, "unified");
@@ -920,14 +1279,14 @@ mod tests {
         } else {
             "read line; printf 'got:%s' \"$line\""
         };
-        let started = service
-            .exec(
-                request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
-                Duration::from_millis(50),
-                8 * 1024,
-                || false,
-            )
-            .expect("start");
+        let started = start(
+            &service,
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+            Duration::from_millis(50),
+            8 * 1024,
+            || false,
+        )
+        .expect("start");
         assert_eq!(started.status, "running", "{started:?}");
 
         let observed = service
@@ -968,19 +1327,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, _) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
-        let started = service
-            .exec(
-                request(
-                    "read line; printf '\\nvalue:%s\\n' \"$line\"",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pty(Some(100), Some(30)),
-                ),
-                Duration::from_millis(50),
-                8 * 1024,
-                || false,
-            )
-            .expect("start pty");
+        let started = start(
+            &service,
+            request(
+                "read line; printf '\\nvalue:%s\\n' \"$line\"",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pty(Some(100), Some(30)),
+            ),
+            Duration::from_millis(50),
+            8 * 1024,
+            || false,
+        )
+        .expect("start pty");
         assert_eq!(started.status, "running", "{started:?}");
         assert_eq!(started.effective_terminal, "pty");
 
@@ -1003,19 +1362,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, _) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
-        let started = service
-            .exec(
-                request(
-                    "printf ready; sleep 30",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_millis(50),
-                8 * 1024,
-                || false,
-            )
-            .expect("start long command");
+        let started = start(
+            &service,
+            request(
+                "printf ready; sleep 30",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(50),
+            8 * 1024,
+            || false,
+        )
+        .expect("start long command");
         assert_eq!(started.status, "running", "{started:?}");
         assert!(service.stop_task(&started.task_id).expect("stop task"));
 
@@ -1033,19 +1392,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, registry) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
-        let started = service
-            .exec(
-                request(
-                    "sleep 0.1; printf done",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_millis(10),
-                8 * 1024,
-                || false,
-            )
-            .expect("start background command");
+        let started = start(
+            &service,
+            request(
+                "sleep 0.1; printf done",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(10),
+            8 * 1024,
+            || false,
+        )
+        .expect("start background command");
         assert_eq!(started.status, "running", "{started:?}");
 
         wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
@@ -1062,19 +1421,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, registry) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
-        let started = service
-            .exec(
-                request(
-                    "printf ready; sleep 30",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_millis(50),
-                8 * 1024,
-                || false,
-            )
-            .expect("start long command");
+        let started = start(
+            &service,
+            request(
+                "printf ready; sleep 30",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(50),
+            8 * 1024,
+            || false,
+        )
+        .expect("start long command");
         assert_eq!(started.status, "running", "{started:?}");
 
         registry
@@ -1091,19 +1450,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, registry) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
-        let started = service
-            .exec(
-                request(
-                    "sleep 0.1; printf once",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_millis(10),
-                8 * 1024,
-                || false,
-            )
-            .expect("start background command");
+        let started = start(
+            &service,
+            request(
+                "sleep 0.1; printf once",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(10),
+            8 * 1024,
+            || false,
+        )
+        .expect("start background command");
         assert_eq!(started.status, "running", "{started:?}");
 
         wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
@@ -1117,19 +1476,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, registry) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
-        let started = service
-            .exec(
-                request(
-                    "sleep 0.1; printf observed",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_millis(10),
-                8 * 1024,
-                || false,
-            )
-            .expect("start background command");
+        let started = start(
+            &service,
+            request(
+                "sleep 0.1; printf observed",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(10),
+            8 * 1024,
+            || false,
+        )
+        .expect("start background command");
         assert_eq!(started.status, "running", "{started:?}");
 
         wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
@@ -1148,32 +1507,32 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, registry) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
-        let first = service
-            .exec(
-                request(
-                    "sleep 0.1; printf first",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_millis(10),
-                8 * 1024,
-                || false,
-            )
-            .expect("start first command");
-        let second = service
-            .exec(
-                request(
-                    "sleep 0.15; printf second",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_millis(10),
-                8 * 1024,
-                || false,
-            )
-            .expect("start second command");
+        let first = start(
+            &service,
+            request(
+                "sleep 0.1; printf first",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(10),
+            8 * 1024,
+            || false,
+        )
+        .expect("start first command");
+        let second = start(
+            &service,
+            request(
+                "sleep 0.15; printf second",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(10),
+            8 * 1024,
+            || false,
+        )
+        .expect("start second command");
         assert_eq!(first.status, "running", "{first:?}");
         assert_eq!(second.status, "running", "{second:?}");
 
@@ -1197,19 +1556,19 @@ mod tests {
         let marker = temp.path().join("leaked");
         let overlay = TurnPermissionOverlay::default();
         let (service, _) = service(temp.path());
-        let started = service
-            .exec(
-                request(
-                    "(sleep 0.5; printf leaked > leaked) & wait",
-                    temp.path(),
-                    &overlay,
-                    ShellTerminalMode::pipe(),
-                ),
-                Duration::from_millis(50),
-                8 * 1024,
-                || false,
-            )
-            .expect("start process tree");
+        let started = start(
+            &service,
+            request(
+                "(sleep 0.5; printf leaked > leaked) & wait",
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_millis(50),
+            8 * 1024,
+            || false,
+        )
+        .expect("start process tree");
         assert_eq!(started.status, "running", "{started:?}");
 
         drop(service);
@@ -1241,14 +1600,14 @@ mod tests {
         } else {
             "printf abcdef"
         };
-        let started = service
-            .exec(
-                request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
-                Duration::from_secs(2),
-                2,
-                || false,
-            )
-            .unwrap();
+        let started = start(
+            &service,
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+            Duration::from_secs(2),
+            2,
+            || false,
+        )
+        .unwrap();
         wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
         let first = explicit_page(&service, &started.session_id, 0, 2);
         assert_eq!(first.output, "ab");
@@ -1339,14 +1698,14 @@ mod tests {
         } else {
             "printf seed; read line; printf ':%s' \"$line\""
         };
-        let started = service
-            .exec(
-                request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
-                Duration::from_secs(1),
-                99,
-                || false,
-            )
-            .unwrap();
+        let started = start(
+            &service,
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+            Duration::from_secs(1),
+            99,
+            || false,
+        )
+        .unwrap();
         assert_eq!(started.status, "running");
         assert_eq!(started.output, "seed");
         assert_eq!(
@@ -1433,6 +1792,220 @@ mod tests {
                 explicit_page(&service, "shell-recovered", 0, 99).output,
                 "before-restart"
             );
+        }
+    }
+
+    #[test]
+    fn execution_deadline_terminates_the_process_tree_and_reports_timed_out() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let overlay = TurnPermissionOverlay::default();
+        let (service, registry) = service(temp.path());
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 60"
+        } else {
+            "sleep 60"
+        };
+        // Long enough that process startup cannot consume it, short enough
+        // that the test stays fast.
+        let deadline = ExecutionDeadline {
+            after: Duration::from_millis(1_500),
+            source: "caller timeout_ms",
+        };
+
+        let started = start(
+            &service,
+            request_with_deadline(command, temp.path(), &overlay, Some(deadline)),
+            Duration::ZERO,
+            8 * 1024,
+            || false,
+        )
+        .expect("started");
+        assert_eq!(
+            started.status, "running",
+            "unexpected start output: {started:?}"
+        );
+        assert_eq!(started.effective_deadline_ms, Some(1_500));
+        assert_eq!(started.deadline_source, Some("caller timeout_ms"));
+
+        // The process must end on its own at the deadline.
+        let give_up_at = Instant::now() + Duration::from_secs(15);
+        let terminal = loop {
+            let observed = service
+                .read_output(&started.task_id, 8 * 1024)
+                .expect("read")
+                .expect("known task");
+            if observed.status != "running" {
+                break observed;
+            }
+            assert!(
+                Instant::now() < give_up_at,
+                "the deadline did not stop the managed process"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        assert_eq!(terminal.termination, "timed_out");
+        assert!(
+            terminal.deadline_reached,
+            "deadline_reached must survive the terminal transition: {terminal:?}"
+        );
+        assert_eq!(terminal.deadline_source, Some("caller timeout_ms"));
+        assert_ne!(
+            terminal.exit_code,
+            Some(0),
+            "a command stopped by its deadline must never look like a clean exit"
+        );
+        let recorded = registry
+            .get(&started.task_id)
+            .map(|task| task.status)
+            .expect("task record");
+        assert!(
+            matches!(recorded, TaskStatus::Stopped | TaskStatus::Failed),
+            "the task record must not claim the deadline-killed command completed: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn no_deadline_leaves_the_process_running_past_the_yield() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let overlay = TurnPermissionOverlay::default();
+        let (service, _) = service(temp.path());
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+
+        let started = start(
+            &service,
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+            Duration::from_millis(200),
+            8 * 1024,
+            || false,
+        )
+        .expect("started");
+
+        assert_eq!(started.status, "running");
+        assert_eq!(
+            started.exit_code, None,
+            "a running command has no exit code to report"
+        );
+        assert_eq!(started.effective_deadline_ms, None);
+        assert_eq!(started.deadline_source, None);
+
+        std::thread::sleep(Duration::from_millis(400));
+        let observed = service
+            .read_output(&started.task_id, 8 * 1024)
+            .expect("read")
+            .expect("known task");
+        assert_eq!(
+            observed.status, "running",
+            "yield elapsing must never terminate the command"
+        );
+
+        service.stop_task(&started.task_id).expect("stop");
+    }
+
+    #[test]
+    fn cursor_reads_are_per_caller_and_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let overlay = TurnPermissionOverlay::default();
+        let (service, _) = service(temp.path());
+        let command = if cfg!(windows) {
+            "[Console]::Out.Write('abcdefghij')"
+        } else {
+            "printf abcdefghij"
+        };
+
+        let started = start(
+            &service,
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+            Duration::from_secs(5),
+            8 * 1024,
+            || false,
+        )
+        .expect("started");
+        assert_ne!(
+            started.status, "running",
+            "the command should have finished"
+        );
+        assert!(
+            service
+                .read_output(&started.task_id, 16)
+                .expect("lookup")
+                .is_some(),
+            "the finished task must remain addressable by task_id"
+        );
+
+        // Two readers asking for the same page get the same bytes: a read
+        // never consumes a shared position.
+        let first = service
+            .read_output_at(&started.task_id, 0, 4)
+            .expect("read")
+            .expect("known task");
+        let second = service
+            .read_output_at(&started.task_id, 0, 4)
+            .expect("read")
+            .expect("known task");
+        assert_eq!(first.output, second.output);
+        assert!(!first.output.is_empty());
+
+        let third = service
+            .read_output_at(&started.task_id, first.next_output_offset, 64)
+            .expect("read")
+            .expect("known task");
+        assert_ne!(third.output, first.output);
+
+        // An offset past the retained end is an explicit error rather than a
+        // silent restart from zero.
+        assert!(
+            service
+                .read_output_at(&started.task_id, usize::MAX, 16)
+                .is_err(),
+            "an out-of-range cursor must fail loudly"
+        );
+
+        // An unknown task is reported as absent, not as empty output.
+        assert!(
+            service
+                .read_output("cmd-does-not-exist", 16)
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_state_is_not_reopened_by_late_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let overlay = TurnPermissionOverlay::default();
+        let (service, _) = service(temp.path());
+        let command = if cfg!(windows) {
+            "[Console]::Out.Write('done')"
+        } else {
+            "printf done"
+        };
+
+        let started = start(
+            &service,
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+            Duration::from_secs(5),
+            8 * 1024,
+            || false,
+        )
+        .expect("started");
+        assert_ne!(started.status, "running");
+        let exit_code = started.exit_code;
+
+        for _ in 0..3 {
+            let observed = service
+                .read_output(&started.task_id, 8 * 1024)
+                .expect("read")
+                .expect("known task");
+            assert_ne!(
+                observed.status, "running",
+                "a terminal task must not return to running"
+            );
+            assert_eq!(observed.exit_code, exit_code);
         }
     }
 

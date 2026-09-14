@@ -220,7 +220,7 @@ fn subagent_budget_exhaustion_error(
 ///
 /// Sibling tools that never started are settled by the normal rejection path.
 /// Resuming an existing child stays allowed so results already produced remain
-/// reachable, and `subagent_status` / `task_stop` are unaffected.
+/// reachable, and `task_list` / `task_wait` / `task_stop` are unaffected.
 fn reject_delegation_off(
     tool_request: &ToolRequest,
     delegation: orca_core::subagent_config::DelegationPolicy,
@@ -239,10 +239,21 @@ fn reject_delegation_off(
     if resuming {
         return None;
     }
-    Some(ToolResult::invalid_input(
-        tool_request,
-        "delegation policy is off: no new child agent may be started; continue locally, ask the user, or resume an existing child by id",
-    ))
+    // Say which rule stopped it. The depth limit and an explicitly disabled
+    // policy are different facts, and only the first one is negotiable by
+    // restructuring the work.
+    let message = if subagent_depth >= max_depth {
+        format!(
+            "subagent max depth {max_depth} reached: this agent is already the deepest allowed \
+             child and cannot start another; continue locally, ask the user, or resume an \
+             existing child by id"
+        )
+    } else {
+        "delegation policy is off: no new child agent may be started; continue locally, ask the \
+         user, or resume an existing child by id"
+            .to_string()
+    };
+    Some(ToolResult::invalid_input(tool_request, message))
 }
 
 #[cfg(test)]
@@ -345,7 +356,9 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let tool_policy = step_snapshot.tool_policy;
     let execution_policy = step_snapshot.turn_context.execution_policy.cloned();
     let subagent_depth = step_snapshot.turn_context.subagent_depth;
+    let subagent_type = step_snapshot.turn_context.subagent_type;
     let root_task_id = step_snapshot.turn_context.root_task_id;
+    let parent_task_id = step_snapshot.turn_context.task_id.as_deref();
     let emit_deltas = step_snapshot.turn_context.emit_deltas;
     let turn_id = step_snapshot.turn_context.turn_id.as_str();
     let provider_response_ingress = step_snapshot.turn_context.provider_response_ingress();
@@ -435,26 +448,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 emit_deltas,
             )?;
             sampling_state.advance_tool_cursor_one(tool_requests.len());
-            let outcome = ToolTurnOutcome::Return {
-                status: RunStatus::Failed,
-                error: Some(result.error.clone().unwrap_or_default()),
-                terminal: None,
-            };
-            close_unstarted_tool_requests(
-                sampling_state,
-                tool_requests,
-                events,
-                sink,
-                conversation,
-                history_writer.as_deref_mut(),
-                emit_deltas,
-                provider_response_ingress,
-                "an earlier sibling was rejected by the delegation policy",
-            )?;
             if let Some(error) = event_error {
                 return Err(error);
             }
-            return Ok(outcome);
+            continue;
         }
         if let Some(result) = reject_disallowed_child_tool(
             tool_request,
@@ -483,11 +480,24 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 emit_deltas,
             )?;
             sampling_state.advance_tool_cursor_one(tool_requests.len());
-            let outcome = ToolTurnOutcome::Return {
-                status: RunStatus::Failed,
-                error: Some(result.error.clone().unwrap_or_default()),
-                terminal: None,
-            };
+            if let Some(error) = event_error {
+                return Err(error);
+            }
+            continue;
+        }
+
+        let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)
+            .next_dispatch(sampling_state, tool_requests)
+        else {
+            break;
+        };
+
+        let dispatch_len = match &dispatch {
+            RuntimeToolDispatch::Normal(_) => 1,
+            RuntimeToolDispatch::SubagentBatch(window)
+            | RuntimeToolDispatch::ReadonlyBatch(window) => window.tool_requests().len(),
+        };
+        if crate::investigation_convergence::summary_prompt_present(conversation) {
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -497,19 +507,41 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 history_writer.as_deref_mut(),
                 emit_deltas,
                 provider_response_ingress,
-                "an earlier sibling was rejected by tool policy",
+                "the provider returned tool calls after the runtime disabled tools for the final report",
             )?;
-            if let Some(error) = event_error {
-                return Err(error);
-            }
-            return Ok(outcome);
+            return Ok(ToolTurnOutcome::Return {
+                status: RunStatus::Failed,
+                error: Some(
+                    "read-only investigation summary turn returned tool calls after tools were disabled"
+                        .to_string(),
+                ),
+                terminal: None,
+            });
         }
-
-        let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)
-            .next_dispatch(sampling_state, tool_requests)
-        else {
-            break;
-        };
+        if crate::investigation_convergence::applies(subagent_type)
+            && operation.as_ref().is_some_and(|operation| {
+                operation
+                    .controller
+                    .usage()
+                    .tool_calls
+                    .saturating_add(u32::try_from(dispatch_len).unwrap_or(u32::MAX))
+                    > config.subagents.max_investigation_tool_calls.max(1)
+            })
+        {
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                provider_response_ingress,
+                "the read-only investigation reached its evidence-gathering limit",
+            )?;
+            crate::investigation_convergence::ensure_summary_prompt(conversation);
+            return Ok(ToolTurnOutcome::Continue);
+        }
 
         // Admit every tool in this dispatch window against the operation
         // budget before any of them runs. Already-admitted calls are settled
@@ -694,6 +726,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     cancel,
                     task_registry,
                     root_task_id,
+                    parent_task_id,
                     workflow_ipc,
                     permission_handler: permission_handler_owned.clone(),
                     activity_ingress: workflow_lifecycle_ingress
@@ -861,11 +894,39 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         // children of this tool call; the effective spec bounds the child and
         // settles back (RAII) once the tool settles. A refused lease is a
         // budget stop, never a silent fallback to an unbounded child.
-        let mut child_lease = if tool_request.name == orca_core::tool_types::ToolName::Subagent {
-            match operation
-                .as_deref_mut()
-                .map(|operation| operation.controller.child_lease(config.budget.to_spec()))
-            {
+        let budgeted_child = matches!(
+            tool_request.name,
+            orca_core::tool_types::ToolName::Subagent
+                | orca_core::tool_types::ToolName::Workflow
+                | orca_core::tool_types::ToolName::WorkflowDraftAction
+        );
+        let mut child_lease = if budgeted_child {
+            let background = tool_request.name != orca_core::tool_types::ToolName::Subagent
+                || crate::subagent::create_subagent_request(tool_request).mode
+                    == crate::subagent::SubagentMode::Async;
+            let siblings = tool_requests
+                .iter()
+                .skip_while(|request| request.id != tool_request.id)
+                .filter(|request| {
+                    matches!(
+                        request.name,
+                        orca_core::tool_types::ToolName::Subagent
+                            | orca_core::tool_types::ToolName::Workflow
+                            | orca_core::tool_types::ToolName::WorkflowDraftAction
+                    )
+                })
+                .count()
+                .max(1);
+            let granted = match operation.as_deref_mut() {
+                Some(operation) if background => Some(operation.background_child_lease(
+                    config.budget.to_spec(),
+                    siblings,
+                    &tool_request.id,
+                )?),
+                Some(operation) => Some(operation.controller.child_lease(config.budget.to_spec())),
+                None => None,
+            };
+            match granted {
                 Some(Ok(lease)) => Some(lease),
                 Some(Err(stop)) => {
                     // Settle in journal order: the admitted tool (committed
@@ -928,6 +989,16 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             None
         };
 
+        if let Some(reservation) = child_lease
+            .as_ref()
+            .and_then(|lease| lease.durable_reservation())
+        {
+            task_registry.set_child_budget(
+                parent_task_id.or(root_task_id),
+                &tool_request.id,
+                reservation.clone(),
+            );
+        }
         let execution = run_normal_tool_turn(RuntimeNormalToolTurnContext {
             sampling_state,
             request: RuntimeNormalToolTurnRequest {
@@ -938,7 +1009,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 emit_deltas,
                 goal_mode: tool_policy.is_goal_mode(),
                 policy,
-                root_task_id,
+                root_task_id: parent_task_id.or(root_task_id),
                 child_budget: child_lease.as_ref().map(|lease| *lease.spec()),
             },
             io: RuntimeNormalToolTurnIo {
@@ -976,6 +1047,8 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 workflow_child_executor,
             },
         });
+        // Validation may reject before the submission consumes this trusted binding.
+        task_registry.take_child_budget(parent_task_id.or(root_task_id), &tool_request.id);
         let execution = match execution {
             Ok(execution) => execution,
             Err(failure) => {
@@ -1112,6 +1185,13 @@ fn settle_child_lease(
     let Some(lease) = child_lease.take() else {
         return Ok(());
     };
+    if let Some(reservation) = lease.durable_reservation() {
+        reservation.refund_unsubmitted()?;
+        if let Some(operation) = operation.as_deref_mut() {
+            operation.refresh_child_budgets()?;
+        }
+        return Ok(());
+    }
     let consumed = child_usage.unwrap_or_else(|| lease.finish());
     if let Some(operation) = operation.as_deref_mut() {
         // Merging past the parent's ceiling latches the parent stop; the
@@ -1151,6 +1231,7 @@ fn tool_status_label(status: &orca_core::tool_types::ToolStatus) -> &'static str
         ToolStatus::Completed => "completed",
         ToolStatus::Failed => "failed",
         ToolStatus::Indeterminate => "indeterminate",
+        ToolStatus::Running => "running",
         ToolStatus::Denied => "denied",
         ToolStatus::Cancelled => "cancelled",
         ToolStatus::NotImplemented => "not_implemented",
@@ -1972,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn sampling_request_state_records_subagent_failure_normal_tool_result() {
+    fn sampling_request_state_returns_subagent_failure_to_the_model() {
         let mut conversation = Conversation::new();
         let sampling_state = RuntimeSamplingRequestState::new();
         let request = request(ToolName::Subagent, ActionKind::Agent, Some("audit"), None);
@@ -1989,19 +2070,43 @@ mod tests {
             )
             .expect("record subagent failure");
 
-        match outcome {
-            RuntimeToolResultRecordOutcome::Return { status, error } => {
-                assert_eq!(status, RunStatus::Failed);
-                assert_eq!(error.as_deref(), Some("child failed"));
-            }
-            RuntimeToolResultRecordOutcome::Continue => {
-                panic!("failed subagent result must return")
-            }
-        }
+        assert!(matches!(outcome, RuntimeToolResultRecordOutcome::Continue));
         assert_eq!(conversation.messages.len(), 1);
         assert!(
             matches!(&conversation.messages[0], Message::Tool { tool_call_id, .. } if tool_call_id == "tool-1")
         );
+    }
+
+    #[test]
+    fn sampling_request_state_terminalizes_continuation_ownership_violation() {
+        let mut conversation = Conversation::new();
+        let sampling_state = RuntimeSamplingRequestState::new();
+        let request = request(ToolName::Subagent, ActionKind::Agent, Some("resume"), None);
+        let result = ToolResult::failed_before_start(
+            &request,
+            "continuation task binding mismatch: expected parent-a, found parent-b",
+            None,
+        );
+
+        let outcome = sampling_state
+            .record_normal_tool_result(
+                &mut conversation,
+                None,
+                &request,
+                &result,
+                RunStatus::Failed,
+                false,
+            )
+            .expect("record ownership failure");
+
+        assert!(matches!(
+            outcome,
+            RuntimeToolResultRecordOutcome::Return {
+                status: RunStatus::Failed,
+                ..
+            }
+        ));
+        assert_eq!(conversation.messages.len(), 1);
     }
 
     #[test]
@@ -2635,9 +2740,10 @@ mod tests {
     }
 
     #[test]
-    fn run_tool_turns_records_policy_failure_and_closes_unstarted_siblings() {
+    fn run_tool_turns_records_each_policy_failure_without_cancelling_siblings() {
         let cwd = tempfile::tempdir().expect("cwd");
-        let config = config_with_external(Vec::new());
+        let mut config = config_with_external(Vec::new());
+        config.subagents.max_depth = 2;
         let mut events = EventFactory::new("tool-turns-disallowed".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let mut conversation = Conversation::new();
@@ -2710,20 +2816,7 @@ mod tests {
         })
         .expect("run tool turns");
 
-        match outcome {
-            ToolTurnOutcome::Return {
-                status,
-                error,
-                terminal: _,
-            } => {
-                assert_eq!(status, RunStatus::Failed);
-                assert_eq!(
-                    error.as_deref(),
-                    Some("test child disallows tool 'subagent'")
-                );
-            }
-            ToolTurnOutcome::Continue => panic!("disallowed child tool should end the turn"),
-        }
+        assert!(matches!(outcome, ToolTurnOutcome::Continue));
         assert_eq!(sampling_state.tool_cursor_position(), 3);
         assert_eq!(conversation.messages.len(), 3);
         for (index, expected_id) in ["tool-1", "tool-2", "tool-3"].iter().enumerate() {
@@ -2737,14 +2830,7 @@ mod tests {
             };
             assert_eq!(tool_call_id, expected_id);
             assert_eq!(terminal.started, ToolInvocationStarted::No);
-            assert_eq!(
-                terminal.status,
-                if index == 0 {
-                    ToolStatus::Failed
-                } else {
-                    ToolStatus::Cancelled
-                }
-            );
+            assert_eq!(terminal.status, ToolStatus::Failed);
         }
 
         let emitted = String::from_utf8(sink.writer_mut().clone()).expect("jsonl events");
@@ -2782,7 +2868,7 @@ mod tests {
         let mut config = config_with_external(Vec::new());
         config.approval_mode = ApprovalMode::FullAuto;
         config.output_format = OutputFormat::Text;
-        config.subagents.max_parallel = 2;
+        config.subagents.limits.max_running = 2;
         let mut events = EventFactory::new("tool-turn-batch-event-error".to_string());
         let mut sink = EventSink::new(FailThirdFlush::default(), OutputFormat::Text);
         let mut conversation = Conversation::new();
@@ -2794,7 +2880,7 @@ mod tests {
                 action: ActionKind::Agent,
                 target: Some(format!("inspect {id}")),
                 raw_arguments: Some(
-                    json!({
+                    json!({"mode":"sync",
                         "description": format!("inspect {id}"),
                         "prompt": format!("inspect {id}")
                     })
@@ -3570,7 +3656,7 @@ mod tests {
             action: ActionKind::Agent,
             target: Some(prompt.to_string()),
             raw_arguments: Some(
-                json!({
+                json!({"mode":"sync",
                     "description": prompt,
                     "prompt": prompt
                 })

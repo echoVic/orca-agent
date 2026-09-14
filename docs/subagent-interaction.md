@@ -1,5 +1,11 @@
 # Subagent 交互机制
 
+> **历史设计快照。** 本文记录早期同步 MVP 及随后的一次增量方案，里面的
+> `max_parallel`、`mode`、`subagent_status` 和默认 `explicit` 已不再是当前
+> 协议。当前架构、配置与真实模型验收以
+> [子代理运行时优化方案](subagent-runtime-optimization-plan.md) 和
+> [实施进度](subagent-runtime-optimization-progress.md) 为准。
+
 ## 概述
 
 Subagent 是 Orca 的第7个工具，用于运行同步的子代理循环来完成委托任务。子代理共享父代理的工作空间、provider配置和审批策略。
@@ -355,9 +361,9 @@ orca exec "analyze the codebase and refactor the auth module"
 
 ---
 
-# 委派策略与角色目录（2026-09 更新）
+# 委派策略与角色目录（2026-09 历史快照）
 
-本节描述当前实现，取代上文「只支持一层嵌套」「同步执行模型」等历史描述。
+本节也属于被新运行时方案取代的历史记录。
 
 ## 委派策略 `[subagents] delegation`
 

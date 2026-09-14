@@ -31,6 +31,32 @@ impl TaskStatus {
     }
 }
 
+/// Who owns a started command or task.
+///
+/// `Workspace` marks a long-lived service the user explicitly asked to keep
+/// running. It survives the task that started it and is stopped explicitly.
+/// This is an ownership fact, not a permission.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifetime {
+    #[default]
+    Task,
+    Workspace,
+}
+
+impl TaskLifetime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
+fn default_task_lifetime() -> TaskLifetime {
+    TaskLifetime::Task
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
@@ -156,6 +182,9 @@ pub struct BackgroundTaskSummary {
     pub status: TaskStatus,
     #[serde(default)]
     pub is_backgrounded: bool,
+    /// `task` or `workspace`: who owns the started work.
+    #[serde(default = "default_task_lifetime")]
+    pub lifetime: TaskLifetime,
     pub description: String,
     pub created_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]

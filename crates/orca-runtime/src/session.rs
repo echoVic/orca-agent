@@ -631,6 +631,10 @@ impl InteractiveSession {
         }
     }
 
+    pub(crate) fn set_task_registry(&mut self, registry: TaskRegistry) {
+        self.task_registry = registry;
+    }
+
     pub fn task_registry(&self) -> &TaskRegistry {
         &self.task_registry
     }

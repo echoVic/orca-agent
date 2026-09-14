@@ -4,17 +4,39 @@ use chrono::Local;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 use orca_tools::schema::{ToolPolicy, canonical_tool_definitions};
 
+#[cfg(test)]
 pub fn build_system_prompt(cwd: &Path) -> String {
+    build_system_prompt_for_tools(cwd, None)
+}
+
+pub fn build_system_prompt_for_tools(cwd: &Path, allowed_tools: Option<&[String]>) -> String {
     let shell = ShellResolver::for_current_host()
         .resolve_from_environment()
         .ok();
-    build_system_prompt_with_shell(cwd, shell.as_ref())
+    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools)
 }
 
+#[cfg(test)]
 pub fn build_system_prompt_with_shell(cwd: &Path, shell: Option<&ShellSpec>) -> String {
-    let tools = render_tool_prompt_section();
-    let shell_environment = render_shell_environment(shell);
-    let shell_guidance = render_shell_guidance(shell);
+    build_system_prompt_with_shell_and_tools(cwd, shell, None)
+}
+
+fn build_system_prompt_with_shell_and_tools(
+    cwd: &Path,
+    shell: Option<&ShellSpec>,
+    allowed_tools: Option<&[String]>,
+) -> String {
+    let tools = render_tool_prompt_section(allowed_tools);
+    let shell_allowed = tool_allowed(allowed_tools, "bash");
+    let shell_environment = if shell_allowed {
+        render_shell_environment(shell)
+    } else {
+        "Shell tool: unavailable for this role; use the advertised read-only file tools".to_string()
+    };
+    let command_guidance = render_command_guidance(shell_allowed);
+    let shell_guidance = shell_allowed
+        .then(|| render_shell_guidance(shell))
+        .unwrap_or("");
     format!(
         r#"You are Orca, an expert software engineering agent running in a terminal-based coding assistant. You are precise, safe, and helpful.
 
@@ -94,14 +116,14 @@ Start validation as specific as possible to the code you changed, then broaden:
 
 {tools}
 
-Use `bash` for tests, builds, project scripts, and complex shell-only tasks. It executes commands in the resolved host shell shown above; the tool name is protocol-stable and does not promise Bash syntax. For file inspection, prefer `read_file`, `glob`, and `grep`.
+{command_guidance}
 {shell_guidance}
 
 When using `web_search` for requests about latest news, recent updates, current status, today, this week, this month, or "最新/最近/今天", include a `fresh_days` value that matches the requested recency instead of relying on the query text alone. Examples: use `fresh_days: 1` for today/current breakage, `fresh_days: 7` for this week/recent updates, and `fresh_days: 30` for latest news or recent releases unless the user asks for a broader range.
 
 ## Dynamic workflows
 
-For natural-language workflow requests, including requests that mention workflow, workflows, ultracode, multi-agent orchestration, parallel agents, or large multi-phase audits, call WorkflowDraft first unless the user already provided an explicit script, scriptPath, name, or draftId. The draft script must include export const meta with name, description, and phases, and should keep intermediate data inside workflow state/script variables instead of flooding the main conversation. Show the generated preview to the user. Then launch the approved draft with Workflow using draftId, or use Workflow directly for explicit script/scriptPath/name/draftId launches. Saved workflows can be launched with Workflow using name and args.
+For requests that explicitly ask for a workflow, ultracode, a reusable orchestration, or a multi-phase process whose later phases depend on earlier results, call WorkflowDraft first unless the user already provided an explicit script, scriptPath, name, or draftId. Do not route an ordinary parallel investigation, code review, or handful of independent branches through Workflow; use direct `subagent` calls for those. The draft script must include export const meta with name, description, and phases, and should keep intermediate data inside workflow state/script variables instead of flooding the main conversation. Show the generated preview to the user. Then launch the approved draft with Workflow using draftId, or use Workflow directly for explicit script/scriptPath/name/draftId launches. Saved workflows can be launched with Workflow using name and args.
 
 Valid workflow scripts use exactly one of these shapes:
 - Auto mode: `export const meta = {{ name, description, phases: [{{ name, tasks: [{{ prompt: "..." }}] }}] }}`. Every task must be an object with a non-empty `prompt`.
@@ -109,7 +131,7 @@ Valid workflow scripts use exactly one of these shapes:
 
 Do not export `run`, `async function run`, helper functions, or arbitrary symbols. The workflow host only supports `export const meta`, `export const phases`, `export const args`, and `export default`.
 
-For long-running delegated work outside Workflow, prefer `subagent` with `"mode":"async"` so progress appears in `task_list` and results can be checked with `subagent_status`; use sync only for short child tasks where blocking the main turn is acceptable. If a subagent result has `output_next_offset`, call `subagent_status` again with that `offset` to recover the next page. Workflow runs may set `tokenBudget`; the final notification reports `total`, `spent`, and `remaining`, and each child reserves available run capacity before it starts so concurrent launches cannot claim the same tokens.
+For delegated work outside Workflow, `subagent` accepts a bounded task and quickly returns its `task_id`. There is no mode parameter. A queued response means the task was accepted; do not submit it again. While it runs, continue independent work. Use `task_wait` when its result is needed, `task_read_output` to retrieve evidence, `subagent_message` for new guidance, and `task_stop` to cancel it. A wait timeout does not stop execution. Workflow runs may set `tokenBudget`; the final notification reports `total`, `spent`, and `remaining`, and each child reserves available run capacity before it starts so concurrent launches cannot claim the same tokens.
 
 ## Safety Rules
 1. NEVER execute destructive commands (rm -rf /, rm -rf ~, mkfs, dd if=/dev/zero, etc.).
@@ -127,7 +149,30 @@ If there's a logical next step you can help with, suggest it briefly."#,
         os = std::env::consts::OS,
         today = Local::now().format("%Y-%m-%d"),
         tools = tools,
+        command_guidance = command_guidance,
     )
+}
+
+fn render_command_guidance(shell_allowed: bool) -> &'static str {
+    if shell_allowed {
+        r#"## Running commands
+
+Every shell command goes through `bash`. Command syntax follows the host shell named in the environment section above, not the tool name.
+
+`bash` starts the command once and then returns. The returned `task_id` is how you keep observing it:
+
+- `state: "running"` means the command is still executing. Continue with the same `task_id`; never start it a second time.
+- `yield_time_ms` only controls how long this call waits before handing control back. It never stops the command.
+- `timeout_ms` is the only caller-side limit on how long the command may run. Set it only when you actually need an execution deadline.
+- `task_read_output` reads more output using the cursor you pass, `task_send_input` types into a `pty` task, `task_wait` blocks until a task changes state or finishes, and `task_stop` stops one.
+- Long-running commands notify you when they finish. If you have independent work, keep doing it. When you must have the result, use `task_wait` — do not use `sleep` or repeated short polling to wait for a task you started.
+
+For file inspection, prefer `read_file`, `glob`, and `grep`."#
+    } else {
+        r#"## Inspecting files
+
+Use only the tools advertised above. This role has no shell or process execution tool. Use `read_file`, `glob`, and `grep` for source inspection and never attempt `bash` or another command tool."#
+    }
 }
 
 fn render_shell_environment(shell: Option<&ShellSpec>) -> String {
@@ -151,10 +196,17 @@ fn render_shell_guidance(shell: Option<&ShellSpec>) -> &'static str {
     }
 }
 
-fn render_tool_prompt_section() -> String {
+fn tool_allowed(allowed_tools: Option<&[String]>, name: &str) -> bool {
+    allowed_tools.is_none_or(|allowed| allowed.iter().any(|tool| tool == name))
+}
+
+fn render_tool_prompt_section(allowed_tools: Option<&[String]>) -> String {
     let registry = orca_tools::registry::default_tool_registry();
     let mut output = String::new();
-    for tool in canonical_tool_definitions(&ToolPolicy::base(), registry) {
+    for tool in canonical_tool_definitions(&ToolPolicy::base(), registry)
+        .into_iter()
+        .filter(|tool| tool_allowed(allowed_tools, &tool.name))
+    {
         output.push_str(&format!("\n### {}\n{}\n", tool.name, tool.description));
     }
     output
@@ -196,11 +248,39 @@ mod tests {
     }
 
     #[test]
-    fn prompt_keeps_bash_for_tests_and_builds() {
+    fn prompt_names_bash_as_the_single_command_entry_point() {
         let prompt = build_system_prompt(std::path::Path::new("/repo"));
 
         assert!(prompt.contains("### bash"));
-        assert!(prompt.contains("tests, builds, project scripts"));
+        assert!(prompt.contains("Every shell command goes through `bash`"));
+        assert!(prompt.contains("`task_wait`"));
+        assert!(prompt.contains("never start it a second time"));
+    }
+
+    #[test]
+    fn restricted_prompt_only_advertises_effective_tools() {
+        let allowed = vec![
+            "read_file".to_string(),
+            "glob".to_string(),
+            "grep".to_string(),
+        ];
+        let prompt = build_system_prompt_for_tools(std::path::Path::new("/repo"), Some(&allowed));
+
+        assert!(prompt.contains("### read_file"));
+        assert!(prompt.contains("### glob"));
+        assert!(prompt.contains("### grep"));
+        assert!(!prompt.contains("### bash"));
+        assert!(!prompt.contains("Every shell command goes through `bash`"));
+        assert!(prompt.contains("This role has no shell or process execution tool"));
+    }
+
+    #[test]
+    fn prompt_separates_waiting_from_the_execution_deadline() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(prompt.contains("`yield_time_ms` only controls how long this call waits"));
+        assert!(prompt.contains("`timeout_ms` is the only caller-side limit"));
+        assert!(prompt.contains("do not use `sleep` or repeated short polling"));
     }
 
     #[test]
@@ -212,7 +292,10 @@ mod tests {
 
         assert!(prompt.contains("Active shell: powershell"));
         assert!(prompt.contains("PowerShell 7 syntax"));
-        assert!(prompt.contains("tool name is protocol-stable"));
+        assert!(
+            prompt
+                .contains("Command syntax follows the host shell named in the environment section")
+        );
         assert!(prompt.contains("Unix utilities are not guaranteed"));
     }
 
@@ -252,13 +335,16 @@ mod tests {
     fn prompt_routes_dynamic_workflows_through_preview_drafts() {
         let prompt = build_system_prompt(std::path::Path::new("/repo"));
 
-        assert!(prompt.contains("For natural-language workflow requests"));
+        assert!(prompt.contains("explicitly ask for a workflow"));
         assert!(prompt.contains("call WorkflowDraft first"));
+        assert!(prompt.contains("Do not route an ordinary parallel investigation"));
+        assert!(prompt.contains("use direct `subagent` calls"));
         assert!(prompt.contains("Then launch the approved draft with Workflow using draftId"));
         assert!(prompt.contains("Do not export `run`"));
         assert!(prompt.contains("tasks: [{ prompt:"));
-        assert!(prompt.contains("long-running delegated work"));
-        assert!(prompt.contains(r#""mode":"async""#));
+        assert!(prompt.contains("quickly returns its `task_id`"));
+        assert!(!prompt.contains(r#""mode":"async""#));
+        assert!(prompt.contains("do not submit it again"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
 use orca_core::conversation::{
@@ -397,13 +398,65 @@ pub async fn call_streaming_async(
     }
 }
 
+/// Runs a bounded, tool-free completion through the same streaming transport
+/// and parser as a normal turn. The bounded request disables thinking and the
+/// retry loop that can otherwise extend a concise finalization request.
+pub async fn call_streaming_async_bounded(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: &CancelToken,
+    max_tokens: u32,
+    timeout: Duration,
+    mut on_step: impl FnMut(&ProviderStep),
+) -> ProviderResponse {
+    let mut config = config.clone();
+    config.tools_override = Some(Vec::new());
+    let request = request_chat_streaming_with_budget(
+        conversation,
+        &config,
+        cancel,
+        &mut on_step,
+        Some(max_tokens.clamp(1, 2_048)),
+        true,
+    );
+    match tokio::time::timeout(timeout.max(Duration::from_millis(1)), request).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let (error, usage) = error.into_provider_error();
+            let step = ProviderStep::Error(error);
+            on_step(&step);
+            ProviderResponse {
+                steps: vec![step],
+                assistant_content: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage,
+            }
+        }
+        Err(_) => {
+            let content = format!(
+                "Status: partial\nResult: the read-only investigation reached its {timeout:?} final-report deadline after evidence collection. Use the completed tool evidence already attached to this task; unresolved claims remain open."
+            );
+            let step = ProviderStep::MessageDelta(content.clone());
+            on_step(&step);
+            ProviderResponse {
+                steps: vec![step],
+                assistant_content: Some(content),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            }
+        }
+    }
+}
+
 async fn request_chat_streaming(
     conversation: &Conversation,
     config: &ProviderConfig,
     cancel: &CancelToken,
     on_step: &mut impl FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, DeepSeekRequestError> {
-    request_chat_streaming_with_budget(conversation, config, cancel, on_step, None).await
+    request_chat_streaming_with_budget(conversation, config, cancel, on_step, None, false).await
 }
 
 /// Runs a bounded auxiliary completion through the production serializer, SSE
@@ -432,6 +485,7 @@ pub fn call_summary(
                     cancel,
                     &mut |_| {},
                     Some(max_tokens.clamp(1, 2_048)),
+                    false,
                 ))
             })
             .join()
@@ -457,6 +511,7 @@ async fn request_chat_streaming_with_budget(
     cancel: &CancelToken,
     on_step: &mut impl FnMut(&ProviderStep),
     summary_budget: Option<u32>,
+    accept_truncated_partial: bool,
 ) -> Result<ProviderResponse, DeepSeekRequestError> {
     let api_key = config.api_key.as_deref().ok_or_else(|| {
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
@@ -578,8 +633,11 @@ async fn request_chat_streaming_with_budget(
 
         merge_usage(&mut accumulated_usage, stream_result.usage);
 
+        let bounded_summary_truncated = accept_truncated_partial
+            && summary_budget.is_some()
+            && stream_result.finish_reason.as_deref() == Some("length");
         match stream_result.finish_reason.as_deref() {
-            Some("length") => {
+            Some("length") if !bounded_summary_truncated => {
                 return Err(DeepSeekRequestError::with_usage(
                     length_finish_reason_error(),
                     accumulated_usage,
@@ -629,11 +687,14 @@ async fn request_chat_streaming_with_budget(
             Some(stream_result.reasoning)
         };
 
-        let assistant_content = if stream_result.content.is_empty() {
+        let mut assistant_content = if stream_result.content.is_empty() {
             None
         } else {
             Some(stream_result.content)
         };
+        if bounded_summary_truncated && let Some(content) = assistant_content.as_mut() {
+            content.push_str("\n\n[Partial report: runtime output limit reached.]");
+        }
 
         if !assistant_message_has_payload(assistant_content.as_deref(), &raw_calls_for_history)
             && !steps
@@ -2198,6 +2259,103 @@ mod tests {
         );
         // Terminal error: exactly one request, no retry.
         assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_streaming_accepts_length_as_a_partial_report() {
+        let truncated = "data: {\"choices\":[{\"delta\":{\"content\":\"partial report\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8,\"prompt_cache_hit_tokens\":6}}\n\n\
+                         data: [DONE]\n\n";
+        let (base_url, bodies) = spawn_streaming_response_sequence_server(vec![truncated]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("summarize evidence".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+
+        let response = request_chat_streaming_with_budget(
+            &conversation,
+            &config,
+            &cancel,
+            &mut |_| {},
+            Some(256),
+            true,
+        )
+        .await
+        .expect("bounded completion should preserve a useful partial report");
+
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("partial report\n\n[Partial report: runtime output limit reached.]")
+        );
+        let bodies = bodies.lock().expect("captured request body");
+        let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(body["max_tokens"], 256);
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_streaming_deadline_returns_a_partial_terminal_report() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _ = read_http_request_body(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still working\"},\"finish_reason\":null}]}\n\n",
+                )
+                .expect("write response prefix");
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let mut conversation = Conversation::new();
+        conversation.add_user("summarize evidence".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some("deepseek-flash".to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+        };
+        let cancel = CancelToken::new();
+        let mut emitted = Vec::new();
+
+        let response = call_streaming_async_bounded(
+            &conversation,
+            &config,
+            &cancel,
+            256,
+            Duration::from_millis(40),
+            |step| emitted.push(step.clone()),
+        )
+        .await;
+
+        assert!(response.tool_calls.is_empty());
+        assert!(
+            response
+                .assistant_content
+                .as_deref()
+                .is_some_and(|content| content.contains("Status: partial"))
+        );
+        assert!(emitted
+            .iter()
+            .any(|step| matches!(step, ProviderStep::MessageDelta(text) if text.contains("final-report deadline"))));
+        assert!(
+            !emitted
+                .iter()
+                .any(|step| matches!(step, ProviderStep::Error(_)))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

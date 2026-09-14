@@ -1,8 +1,8 @@
 # File-Defined Subagents
 
 Custom agents provide reusable instructions and a narrower tool policy for the
-`subagent` tool. Built-ins (`general`, `code_reviewer`, `test_writer`, `debugger`,
-and `documenter`) retain their existing behavior.
+`subagent` tool. Built-ins (`general`, `explorer`, `code_reviewer`, `test_writer`,
+`debugger`, and `documenter`) retain their existing behavior.
 
 ## Definition
 
@@ -86,10 +86,20 @@ catalog. For example:
 }
 ```
 
-`mode` defaults to `sync`. `"mode": "async"` uses the existing detached-worker
-path, requiring persistent task ownership and an actor-owned operation fence.
-Use `subagent_status` or `task_list` to observe it. A cost-budgeted parent
-continues to require sync mode.
+`subagent` has one submission protocol and no model-facing `mode` field. It
+quickly returns an accepted `task_id`; capacity pressure returns `queued`
+instead of a tool failure. Use `task_wait`, `task_read_output`, `task_list`, and
+`task_stop` to observe and control the task. Finite parent budgets use the same
+path through a durable child reservation.
+
+Built-in read-only roles (`explorer` and `code_reviewer`) have runtime-owned
+evidence limits. After 6 model turns or 8 started tool calls, Orca closes the
+unstarted remainder of the current tool batch and asks for one tool-free final
+report. That report is capped at 1024 output tokens and a 90-second total
+deadline; a truncation or deadline returns an explicit partial report rather
+than leaving the task running. A delegated parent enters the same final-report
+phase after all direct children settle only when its user request explicitly
+says both that the work is read-only and that files must not be edited.
 
 Isolation defaults to `none`: custom agents use the current checkout.
 Definitions cannot request isolation or enable worktrees. The existing explicit
@@ -176,19 +186,18 @@ Checkpoint integrity, frozen compatibility, prompt idempotency, live-owner
 exclusion, and compare-and-swap revision checks still apply. Unrecorded callers
 and other continuation paths retain exact parent-task matching.
 
-Sync and async attempts can resume in either execution mode. For a detached
+Every resumed attempt uses the same task submission protocol. For a detached
 source, the committed child-start and task-upsert batch must identify one
 unambiguous admitted parent operation. Its task owner must match the original
 task, attempt, and revision. When the latest attempt is detached, its current
 binding must additionally match the committed authority digest and exact parent
 fence. A superseded detached binding is not used as historical proof.
 
-The original sync admission records continuation revision 1, after acquiring
-its lease. Original async admission records revision 0, before spawning and
-acquiring the worker. Recovery checks the exact revision for each mode rather
-than accepting an arbitrary preceding attempt. An active worker still excludes
-a competing resume, and the existing cost-budget restriction on async mode
-continues to apply.
+Inline and detached worker admissions record their continuation at different
+safe boundaries. Recovery checks the exact persisted revision for the recorded
+worker path instead of accepting an arbitrary preceding attempt. An active
+worker still excludes a competing resume. Finite parent budgets are supported
+through the same durable child reservation and settlement path.
 
 The freeze covers the agent definition and delegated permissions, not all
 project files, memory, hooks, or tools' external state. Those retain their

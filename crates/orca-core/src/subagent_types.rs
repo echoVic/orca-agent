@@ -378,6 +378,13 @@ const BUILTIN_AGENTS: &[BuiltinAgentDescriptor] = &[
             "write_file",
             "git_status",
             "web_search",
+            "subagent",
+            "subagent_message",
+            "task_list",
+            "task_wait",
+            "task_read_output",
+            "task_send_input",
+            "task_stop",
         ],
         forbidden: &[],
         context: RoleContextPolicy::Fresh,
@@ -410,6 +417,11 @@ const BUILTIN_AGENTS: &[BuiltinAgentDescriptor] = &[
             "list_files",
             "grep",
             "bash",
+            "task_list",
+            "task_wait",
+            "task_read_output",
+            "task_send_input",
+            "task_stop",
             "edit",
             "write_file",
         ],
@@ -428,7 +440,18 @@ const BUILTIN_AGENTS: &[BuiltinAgentDescriptor] = &[
         aliases: &["debug"],
         when_to_use: "reproducing and root-causing a failure, including instrumented runs and fault injection",
         avoid_when: "reviewing code that already works, or broad exploratory reading with no failure to explain",
-        tools: &["read_file", "list_files", "grep", "bash", "write_file"],
+        tools: &[
+            "read_file",
+            "list_files",
+            "grep",
+            "bash",
+            "write_file",
+            "task_list",
+            "task_wait",
+            "task_read_output",
+            "task_send_input",
+            "task_stop",
+        ],
         forbidden: &[],
         context: RoleContextPolicy::Fresh,
         deliverables: &[
@@ -609,7 +632,7 @@ mod tests {
         for descriptor in builtin_agents().iter().filter(|d| d.is_read_only()) {
             for tool in descriptor.tools {
                 assert!(
-                    !matches!(*tool, "bash" | "edit" | "write_file" | "exec_command"),
+                    !matches!(*tool, "bash" | "edit" | "write_file"),
                     "{} claims read-only but declares {tool}",
                     descriptor.name
                 );

@@ -11,6 +11,8 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentRequest {
+    #[serde(default)]
+    pub budget_reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
     pub description: String,
     pub prompt: String,
     pub subagent_type: SubagentType,
@@ -20,6 +22,12 @@ pub struct SubagentRequest {
     pub schema: Option<Value>,
     #[serde(default)]
     pub resume_from: Option<String>,
+    /// Optional absolute execution deadline in milliseconds from now.
+    ///
+    /// Unlike a wait, a deadline includes queueing and suspension time and is
+    /// not reset by a resume. `None` means no deadline.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
     #[serde(default)]
     pub delegation: Option<DelegationSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,7 +75,8 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         .filter(|model| orca_core::model::validate_model(model).is_ok());
     let mode = match extract_subagent_field(tool_request, "mode").as_deref() {
         Some("async") => SubagentMode::Async,
-        _ => SubagentMode::Sync,
+        Some("sync") => SubagentMode::Sync,
+        _ => SubagentMode::Async,
     };
     let isolation = match extract_subagent_field(tool_request, "isolation").as_deref() {
         Some("worktree") => SubagentIsolation::Worktree,
@@ -77,8 +86,14 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
     let resume_from = extract_subagent_field(tool_request, "resume_from")
         .map(|selector| selector.trim().to_string())
         .filter(|selector| !selector.is_empty());
+    // 0 would mean both "expire now" and "no deadline", so it is rejected by
+    // the caller rather than guessed at here.
+    let deadline_ms = extract_subagent_json_field(tool_request, "deadline_ms")
+        .and_then(|value| value.as_u64())
+        .filter(|deadline| *deadline > 0);
 
     SubagentRequest {
+        budget_reservation: None,
         description,
         prompt,
         subagent_type,
@@ -87,6 +102,7 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         isolation,
         schema,
         resume_from,
+        deadline_ms,
         delegation: None,
         frozen_agent: None,
     }
@@ -127,6 +143,9 @@ pub(crate) fn freeze_agent_request(
     mcp: &McpRegistry,
     request: &mut SubagentRequest,
 ) -> Result<(), String> {
+    if request.frozen_agent.is_some() {
+        return Ok(());
+    }
     let SubagentType::Custom(name) = &request.subagent_type else {
         return Ok(());
     };
@@ -289,7 +308,7 @@ mod tests {
         assert_eq!(result.prompt, "review src/main.rs for bugs");
         assert_eq!(result.subagent_type, SubagentType::CodeReviewer);
         assert_eq!(result.model.as_deref(), Some("deepseek-v4-pro"));
-        assert_eq!(result.mode, SubagentMode::Sync);
+        assert_eq!(result.mode, SubagentMode::Async);
         assert_eq!(result.isolation, SubagentIsolation::Worktree);
         assert_eq!(result.schema, Some(serde_json::json!({ "type": "string" })));
     }

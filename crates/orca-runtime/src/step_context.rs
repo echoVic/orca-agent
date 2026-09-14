@@ -7,7 +7,7 @@ use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::RunStatus;
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolRequest, ToolResult};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::extension::RuntimeExtensionContext;
@@ -155,23 +155,32 @@ impl RuntimeSamplingRequestState {
         );
         record_tool_result_for_agent(conversation, history_writer, result, emit_deltas)?;
 
+        let terminal_continuation_violation = tool_request.name
+            == orca_core::tool_types::ToolName::Subagent
+            && result
+                .error
+                .as_deref()
+                .is_some_and(is_terminal_continuation_violation);
         if matches!(status, RunStatus::ApprovalRequired | RunStatus::Cancelled)
             || result.status == orca_core::tool_types::ToolStatus::Indeterminate
+            || terminal_continuation_violation
         {
             return Ok(RuntimeToolResultRecordOutcome::Return {
                 status,
                 error: result.error.clone(),
             });
         }
-        if status == RunStatus::Failed && tool_request.name == ToolName::Subagent {
-            return Ok(RuntimeToolResultRecordOutcome::Return {
-                status: RunStatus::Failed,
-                error: Some(result.error.clone().unwrap_or_default()),
-            });
-        }
-
         Ok(RuntimeToolResultRecordOutcome::Continue)
     }
+}
+
+pub(crate) fn is_terminal_continuation_violation(error: &str) -> bool {
+    error.contains("continuation_parent_mismatch")
+        || error.contains("continuation parent mismatch")
+        || error.contains("continuation task binding mismatch")
+        || error.contains("continuation fence mismatch")
+        || error.contains("attempt fence mismatch")
+        || error.contains("continuation lease epoch mismatch")
 }
 
 impl<'a> RuntimeStepSnapshot<'a> {

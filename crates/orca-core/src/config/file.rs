@@ -1009,16 +1009,56 @@ command = "echo done"
         let toml = r#"
 [subagents]
 max_depth = 3
-max_parallel = 6
+max_investigation_turns = 5
+max_investigation_tool_calls = 7
+max_running = 8
+max_queued = 64
+max_live_tasks = 128
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.subagents.max_depth, 3);
-        assert_eq!(config.subagents.max_parallel, 6);
-        // A config written before the delegation policy existed keeps today's
-        // behavior instead of silently becoming proactive.
+        assert_eq!(config.subagents.max_running(), 8);
+        assert_eq!(config.subagents.max_queued(), 64);
+        assert_eq!(config.subagents.max_live_tasks(), 128);
+        assert_eq!(config.subagents.max_investigation_turns, 5);
+        assert_eq!(config.subagents.max_investigation_tool_calls, 7);
+        // The delegation policy defaults to adaptive now.
         assert_eq!(
             config.subagents.delegation,
-            crate::subagent_config::DelegationPolicy::Explicit
+            crate::subagent_config::DelegationPolicy::Adaptive
+        );
+    }
+
+    #[test]
+    fn subagent_limits_use_the_documented_defaults_when_omitted() {
+        let config: FileConfig = toml::from_str("[subagents]\nmax_depth = 2\n").unwrap();
+        assert_eq!(config.subagents.max_running(), 32);
+        assert_eq!(config.subagents.max_queued(), 256);
+        assert_eq!(config.subagents.max_live_tasks(), 512);
+        assert_eq!(config.subagents.max_investigation_turns, 6);
+        assert_eq!(config.subagents.max_investigation_tool_calls, 8);
+    }
+
+    #[test]
+    fn subagent_limits_reject_non_positive_values() {
+        let config: FileConfig =
+            toml::from_str("[subagents]\nmax_running = 0\nmax_queued = 0\nmax_live_tasks = 0\n")
+                .unwrap();
+        let normalized = config.subagents.normalized();
+        assert_eq!(normalized.max_running(), 1);
+        assert_eq!(normalized.max_queued(), 1);
+        assert_eq!(normalized.max_live_tasks(), 1);
+    }
+
+    #[test]
+    fn max_parallel_is_gone_without_an_alias() {
+        // The old key must not silently survive as a second capacity control.
+        let config: FileConfig =
+            toml::from_str("[subagents]\nmax_parallel = 6\n").expect("unknown keys are ignored");
+        assert_eq!(
+            config.subagents.max_running(),
+            32,
+            "the retired key must not change the scope limit"
         );
     }
 
@@ -1077,7 +1117,38 @@ shell_timeout_secs = 0
             normalized.output_truncation,
             crate::tool_types::ToolOutputTruncation::bytes(1)
         );
-        assert_eq!(normalized.shell_timeout_secs, 1);
+        // 0 keeps its meaning for the command policy: no administrator cap.
+        // Commands have no default execution deadline, so a namespace must opt
+        // in explicitly.
+        assert_eq!(normalized.shell_timeout_secs, 0);
+    }
+
+    #[test]
+    fn shell_timeout_secs_is_an_explicit_administrator_cap() {
+        let toml = r#"
+[tools]
+shell_timeout_secs = 900
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.tools.normalized().shell_timeout_secs, 900);
+
+        // Default config carries no cap at all.
+        assert_eq!(
+            crate::config::ToolConfig::default().shell_timeout_secs,
+            0,
+            "no command may be bounded by a value the caller never set"
+        );
+
+        // A value above the supported maximum is still clamped.
+        let toml = r#"
+[tools]
+shell_timeout_secs = 999999
+"#;
+        let config: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.tools.normalized().shell_timeout_secs,
+            crate::config::ToolConfig::MAX_SHELL_TIMEOUT_SECS
+        );
     }
 
     #[test]

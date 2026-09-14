@@ -129,7 +129,7 @@ fn grep_emits_completed_tool_event_with_matches() {
 }
 
 #[test]
-fn suggest_denies_bash_in_jsonl_mode() {
+fn suggest_bash_is_denied_or_fails_closed_without_a_sandbox() {
     let _guard = tool_cli_test_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
@@ -145,13 +145,31 @@ fn suggest_denies_bash_in_jsonl_mode() {
         .output()
         .expect("run orca");
 
-    assert_eq!(output.status.code(), Some(3));
-
     let events = parse_jsonl(&output.stdout);
+    let completed = find_event(&events, "tool.call.completed");
+    if completed["payload"]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("no OS-enforced sandbox backend on this host"))
+    {
+        // Enforcement can reject before approval on a host that forbids
+        // nested sandboxes. This is a distinct safe outcome, not an approval.
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(completed["payload"]["name"], "bash");
+        assert_eq!(completed["payload"]["status"], "failed");
+        assert_eq!(completed["payload"]["task"]["status"], "failed");
+        assert!(completed["payload"]["output"].is_null());
+        assert!(completed["payload"]["exit_code"].is_null());
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "approval.resolved")
+        );
+        return;
+    }
+    assert_eq!(output.status.code(), Some(3));
     let resolved = find_event(&events, "approval.resolved");
     assert_eq!(resolved["payload"]["decision"], "deny");
 
-    let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
     assert_eq!(completed["payload"]["status"], "denied");
     assert_eq!(completed["payload"]["task"]["kind"], "shell");
@@ -183,7 +201,24 @@ fn full_auto_allows_bash_tool() {
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
     assert_eq!(completed["payload"]["status"], "completed");
-    assert_eq!(completed["payload"]["output"], "hi");
+    // `bash` answers with the command's task envelope: the bytes are in
+    // `output`, and the state, exit code, and stop reason travel with them so
+    // a caller never has to infer how the command ended.
+    let envelope: Value = serde_json::from_str(
+        completed["payload"]["output"]
+            .as_str()
+            .expect("bash returns its task envelope as json"),
+    )
+    .expect("bash task envelope");
+    assert_eq!(envelope["output"], "hi");
+    assert_eq!(envelope["state"], "completed");
+    assert_eq!(envelope["exit_code"], 0);
+    assert_eq!(envelope["return_reason"], "terminal_observed");
+    assert!(
+        envelope["task_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
 }
 
 #[test]
@@ -251,7 +286,14 @@ fn full_auto_bash_persists_runtime_shell_task_record() {
     let events = parse_jsonl(&output.stdout);
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["status"], "completed");
-    assert_eq!(completed["payload"]["output"], "persisted-shell-task");
+    let envelope: Value = serde_json::from_str(
+        completed["payload"]["output"]
+            .as_str()
+            .expect("bash returns its task envelope as json"),
+    )
+    .expect("bash task envelope");
+    assert_eq!(envelope["output"], "persisted-shell-task");
+    assert_eq!(envelope["state"], "completed");
 
     let project_sessions_root = workspace.join(".orca").join("task-sessions");
     assert!(
@@ -325,9 +367,31 @@ output_truncation = { mode = "tokens", limit = 12 }
     assert_eq!(completed["payload"]["name"], "bash");
     assert_eq!(completed["payload"]["status"], "completed");
     assert_eq!(completed["payload"]["truncated"], true);
-    let text = completed["payload"]["output"].as_str().unwrap();
-    assert!(text.contains("Warning: truncated tool output"));
-    assert!(text.contains("Original token count:"));
+    // A capped page is not a lost result. The command envelope carries the
+    // cursor that continues it, so the caller reads the rest instead of
+    // receiving a text warning and no way to ask for more.
+    let envelope: Value = serde_json::from_str(
+        completed["payload"]["output"]
+            .as_str()
+            .expect("bash returns its task envelope as json"),
+    )
+    .expect("bash task envelope");
+    assert!(
+        envelope["next_cursor"]
+            .as_u64()
+            .is_some_and(|cursor| cursor > 0),
+        "a truncated page names where to continue: {envelope}"
+    );
+    assert_eq!(
+        envelope["eof"], false,
+        "bytes remain after the page: {envelope}"
+    );
+    assert!(
+        envelope["output"]
+            .as_str()
+            .is_some_and(|page| page.contains("alpha beta gamma")),
+        "the page still carries the start of the output: {envelope}"
+    );
 
     let tasks = events
         .iter()

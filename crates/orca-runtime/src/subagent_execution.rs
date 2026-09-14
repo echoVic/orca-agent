@@ -17,7 +17,8 @@ use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunError, HookRunner};
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
-    RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind, RuntimeTaskStatus,
+    RuntimePermissionRequestHandler, RuntimeSessionLifecycle, RuntimeTaskKind,
+    RuntimeTaskLifecycle, RuntimeTaskStatus,
 };
 use crate::memory::MemoryBlock;
 use crate::runtime_subagent_call::{RuntimeSubagentCallOutput, RuntimeSubagentInvocation};
@@ -80,6 +81,10 @@ pub(crate) struct RuntimeSubagentBatchToolTurnRuntime<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) root_task_id: Option<&'a str>,
+    /// The task that is dispatching these children. It is their parent in the
+    /// task tree, which is what makes a nested parent's wait visible as
+    /// `waiting_children` instead of looking like a busy grandchild of root.
+    pub(crate) parent_task_id: Option<&'a str>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) activity_ingress:
         Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
@@ -117,9 +122,15 @@ pub(crate) fn should_run_subagent_batch(
 ) -> bool {
     tool_request.name == tool_types::ToolName::Subagent
         && subagent_depth < config.subagents.max_depth
-        && config.subagents.max_parallel > 1
+        && batch_window_width(config) > 1
         && config.budget.max_cost_usd_micros.is_none()
         && is_batchable_subagent_request(tool_request)
+}
+
+/// Synchronous internal callers share the scope ceiling; there is no second
+/// fixed-width pool. Model submissions are nonblocking and use the dispatcher.
+fn batch_window_width(config: &RunConfig) -> usize {
+    config.subagents.max_running().max(1)
 }
 
 pub(crate) fn collect_subagent_batch(
@@ -127,7 +138,7 @@ pub(crate) fn collect_subagent_batch(
     tool_requests: &[tool_types::ToolRequest],
     start: usize,
 ) -> usize {
-    let max_end = (start + config.subagents.max_parallel).min(tool_requests.len());
+    let max_end = (start + batch_window_width(config)).min(tool_requests.len());
     let mut end = start;
     while end < max_end && is_batchable_subagent_request(&tool_requests[end]) {
         end += 1;
@@ -155,10 +166,12 @@ pub(crate) fn record_subagent_batch_results(
         }
 
         if terminal.is_none()
-            && matches!(
-                status,
-                RunStatus::ApprovalRequired | RunStatus::Failed | RunStatus::Cancelled
-            )
+            && (matches!(status, RunStatus::ApprovalRequired | RunStatus::Cancelled)
+                || result.status == tool_types::ToolStatus::Indeterminate
+                || result
+                    .error
+                    .as_deref()
+                    .is_some_and(crate::step_context::is_terminal_continuation_violation))
         {
             terminal = Some((status, result.error.clone()));
         }
@@ -212,6 +225,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         cancel,
         task_registry,
         root_task_id,
+        parent_task_id,
         workflow_ipc,
         activity_ingress,
         permission_handler,
@@ -233,6 +247,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         cancel,
         task_registry,
         root_task_id,
+        parent_task_id,
         workflow_ipc,
         child_executor,
         permission_handler,
@@ -295,6 +310,7 @@ fn execute_subagent_batch(
     cancel: &CancelToken,
     task_registry: &TaskRegistry,
     root_task_id: Option<&str>,
+    parent_task_id: Option<&str>,
     workflow_ipc: Option<&WorkflowIpcContext>,
     child_executor: ChildAgentExecutor<io::Sink>,
     permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
@@ -316,7 +332,13 @@ fn execute_subagent_batch(
         (0..tool_requests.len()).map(|_| None).collect();
     let mut event_error = None;
     let tool_calls = RuntimeToolCallRuntime::for_normal_execution();
-    let mut runtime = tool_calls.start_subagent_batch(cancel);
+    let mut runtime = tool_calls.start_subagent_batch(
+        cancel,
+        task_registry,
+        config.subagents.limits,
+        parent_task_id,
+        root_task_id,
+    );
     let batch_id = uuid::Uuid::now_v7().to_string();
 
     for (idx, tool_request) in tool_requests.iter().enumerate() {
@@ -484,7 +506,20 @@ fn execute_subagent_batch(
         }
     }
 
-    for (idx, output) in runtime.finish() {
+    // A queued child is announced when it actually starts, which may be after
+    // the dispatch loop has finished looking at it.
+    let mut publish_late =
+        |_index: usize, task: &RuntimeTaskLifecycle, tool_id: &str, description: &str| {
+            if !emit_deltas || agent_controller.is_some() {
+                return Ok(());
+            }
+            sink.emit(task.attach_to_event(events.subagent_started(tool_id, description)))
+        };
+    let (finished, finish_error) = runtime.finish(&mut publish_late);
+    if event_error.is_none() {
+        event_error = finish_error;
+    }
+    for (idx, output) in finished {
         runtime_outputs[idx] = Some(output);
     }
     for (idx, output) in runtime_outputs.into_iter().enumerate() {
@@ -619,10 +654,98 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
     tool_types::ToolResult,
     Option<orca_core::budget::BudgetUsage>,
 )> {
-    let request = subagent::with_delegation_snapshot(
+    let mut request = subagent::with_delegation_snapshot(
         subagent::create_subagent_request(tool_request),
         orca_core::config::DelegationSnapshot::from_config(config),
     );
+    if cancel.is_cancelled() {
+        return Ok((
+            tool_types::ToolResult::cancelled_before_start(tool_request, "parent cancelled"),
+            None,
+        ));
+    }
+    request.budget_reservation = task_registry.take_child_budget(root_task_id, &tool_request.id);
+    if let Some(binding) = &request.budget_reservation
+        && binding.settled_without_submission()?
+    {
+        return Ok((
+            tool_types::ToolResult::failed_before_start(
+                tool_request,
+                "this submission was already settled before starting; submit a new tool call to retry",
+                None,
+            ),
+            None,
+        ));
+    }
+    if let Some(binding) = &request.budget_reservation
+        && let Some(id) = binding.bound_task()?
+    {
+        let record = task_registry.get(&id).ok_or_else(|| {
+            io::Error::other("accepted child task is unavailable; refusing duplicate execution")
+        })?;
+        if record.parent_task_id.as_deref() != root_task_id {
+            return Err(io::Error::other(
+                "child budget belongs to a different parent",
+            ));
+        }
+        let mut payload = crate::task_view::TaskView::of_task(task_registry, &record).to_json();
+        payload["accepted"] = serde_json::json!(true);
+        payload["replayed"] = serde_json::json!(true);
+        let result = if record.status.is_active() {
+            tool_types::ToolResult::running(tool_request, payload.to_string(), false)
+        } else {
+            tool_types::ToolResult::completed(tool_request, payload.to_string(), false)
+        };
+        return Ok((result, None));
+    }
+    if let Some(selector) = request.resume_from.as_deref() {
+        let parent_fence = activity_ingress
+            .as_ref()
+            .and_then(|ingress| ingress.parent_fence());
+        let source = crate::agent_continuation::ChildAgentCoordinator::new(task_registry.clone())
+            .and_then(|coordinator| {
+                coordinator.validate_resume_admission(
+                    selector,
+                    root_task_id.map(str::to_owned),
+                    parent_fence.as_ref(),
+                )
+            });
+        match source {
+            Ok(source) => {
+                if let Err(error) = crate::runtime_subagent_call::validate_resume_overrides(
+                    tool_request,
+                    &request.subagent_type,
+                    request.model.as_deref(),
+                    request.isolation,
+                    &source,
+                ) {
+                    return Ok((
+                        tool_types::ToolResult::failed_before_start(tool_request, error, None),
+                        None,
+                    ));
+                }
+            }
+            Err(error) => {
+                return Ok((
+                    tool_types::ToolResult::failed_before_start(
+                        tool_request,
+                        crate::runtime_subagent_call::continuation_error(
+                            "failed to validate child continuation before admission",
+                            &error,
+                        ),
+                        None,
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+    if let Err(error) = subagent::freeze_agent_request(config, cwd, mcp_registry, &mut request) {
+        return Ok((
+            tool_types::ToolResult::failed_before_start(tool_request, error, None),
+            None,
+        ));
+    }
     let description = request.description.clone();
 
     if subagent_depth >= config.subagents.max_depth {
@@ -642,21 +765,26 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         ));
     }
 
-    if request.mode == SubagentMode::Async && config.budget.max_cost_usd_micros.is_some() {
-        let error = "async subagents are unavailable while a cost budget is active; use sync mode so usage can be admitted and reconciled in the parent turn";
-        emit_rejected_subagent_lifecycle(
-            events,
-            sink,
-            tool_request,
-            &description,
-            error,
-            emit_deltas,
-            event_error,
-        );
+    let child_config = config_for_remaining_subagent_budget(config, cost_tracker, child_budget);
+    if request.mode == SubagentMode::Async
+        && !child_config.budget.to_spec().is_unlimited()
+        && request.budget_reservation.is_none()
+    {
         return Ok((
-            tool_types::ToolResult::failed(tool_request, error, None),
+            tool_types::ToolResult::failed_before_start(
+                tool_request,
+                "a finite child budget requires a durable parent reservation",
+                None,
+            ),
             None,
         ));
+    }
+    if let Some(wall_ms) = child_config.budget.max_wall_time_ms {
+        request.deadline_ms = Some(
+            request
+                .deadline_ms
+                .map_or(wall_ms, |current| current.min(wall_ms)),
+        );
     }
 
     let has_parent_fence = activity_ingress
@@ -672,10 +800,13 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
             .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
     });
     if request.mode == SubagentMode::Async
+        && !task_registry.is_process_local()
+        && has_parent_fence
+        && activity_ingress.is_some()
         && (agent_controller.is_none() || has_parent_fence || custom_agent)
     {
         let launch = launch_async_subagent(AsyncSubagentLaunchContext {
-            config,
+            config: &child_config,
             cwd,
             tool_request,
             request,
@@ -693,7 +824,6 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         }
         return Ok((launch.result, None));
     }
-    let child_config = config_for_remaining_subagent_budget(config, cost_tracker, child_budget);
     let invocation = RuntimeSubagentInvocation::snapshot(
         tool_request.clone(),
         request,
@@ -710,7 +840,11 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         permission_handler,
         task_registry,
         root_task_id,
-        agent_controller.clone(),
+        if child_config.budget.to_spec().is_unlimited() {
+            agent_controller.clone()
+        } else {
+            None
+        },
         tool_request.id.clone(),
         1,
     );
@@ -925,7 +1059,8 @@ mod tests {
             raw_arguments: Some(
                 serde_json::json!({
                     "description": format!("inspect {id}"),
-                    "prompt": format!("inspect {id}")
+                    "prompt": format!("inspect {id}"),
+                    "mode": "sync"
                 })
                 .to_string(),
             ),
@@ -961,7 +1096,7 @@ mod tests {
     #[test]
     fn batch_plan_stops_at_async_request_boundary() {
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 3;
+        subagents.limits.max_running = 3;
         let config = config(subagents);
         let async_request = tool_types::ToolRequest {
             raw_arguments: Some(
@@ -983,7 +1118,10 @@ mod tests {
     #[test]
     fn budget_mode_disables_parallel_subagent_batching() {
         let subagents = SubagentConfig {
-            max_parallel: 3,
+            limits: orca_core::subagent_config::SubagentLimits {
+                max_running: 3,
+                ..Default::default()
+            },
             ..SubagentConfig::default()
         };
         let mut config = config(subagents);
@@ -1017,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn record_subagent_batch_results_records_tools_and_returns_failure() {
+    fn record_subagent_batch_results_returns_plain_failure_to_the_model() {
         let request = subagent_request("failed");
         let result = tool_types::ToolResult::failed(&request, "child failed", None);
         let mut conversation = orca_core::conversation::Conversation::new();
@@ -1030,20 +1168,43 @@ mod tests {
         )
         .expect("records subagent batch result");
 
-        match outcome {
-            super::SubagentBatchRecordOutcome::Return { status, error } => {
-                assert_eq!(status, RunStatus::Failed);
-                assert_eq!(error.as_deref(), Some("child failed"));
-            }
-            super::SubagentBatchRecordOutcome::Continue => {
-                panic!("failed subagent batch should request early return")
-            }
-        }
+        assert!(matches!(
+            outcome,
+            super::SubagentBatchRecordOutcome::Continue
+        ));
         assert_eq!(conversation.messages.len(), 1);
     }
 
     #[test]
-    fn record_subagent_batch_results_records_executed_suffix_before_returning_first_failure() {
+    fn record_subagent_batch_results_terminalizes_continuation_ownership_violation() {
+        let request = subagent_request("resume");
+        let result = tool_types::ToolResult::failed(
+            &request,
+            "continuation_parent_mismatch: attempted cross-session resume",
+            None,
+        );
+        let mut conversation = orca_core::conversation::Conversation::new();
+
+        let outcome = super::record_subagent_batch_results(
+            &mut conversation,
+            None,
+            vec![(RunStatus::Failed, result)],
+            true,
+        )
+        .expect("record continuation violation");
+
+        assert!(matches!(
+            outcome,
+            super::SubagentBatchRecordOutcome::Return {
+                status: RunStatus::Failed,
+                ..
+            }
+        ));
+        assert_eq!(conversation.messages.len(), 1);
+    }
+
+    #[test]
+    fn record_subagent_batch_results_records_all_siblings_after_plain_failure() {
         let first_request = subagent_request("first");
         let failed_request = subagent_request("failed");
         let third_request = subagent_request("third");
@@ -1080,10 +1241,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            super::SubagentBatchRecordOutcome::Return {
-                status: RunStatus::Failed,
-                error: Some(ref error),
-            } if error == "child failed"
+            super::SubagentBatchRecordOutcome::Continue
         ));
         assert_eq!(conversation.messages.len(), 3);
         assert_eq!(
@@ -1152,7 +1310,7 @@ mod tests {
     fn run_subagent_batch_tool_turn_executes_and_records_results() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 2;
+        subagents.limits.max_running = 2;
         let config = config(subagents);
         let mut events = EventFactory::new("subagent-batch-turn".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
@@ -1193,6 +1351,7 @@ mod tests {
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
+                    parent_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
@@ -1344,7 +1503,7 @@ mod tests {
     fn hosted_request(id: &str, description: &str, prompt: &str) -> tool_types::ToolRequest {
         tool_types::ToolRequest {
             raw_arguments: Some(
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": description,
                     "prompt": prompt,
                 })
@@ -1385,6 +1544,7 @@ mod tests {
             &mut cost_tracker,
             &cancel,
             &task_registry,
+            None,
             None,
             None,
             unexpected_child_executor::<io::Sink>,
@@ -1525,7 +1685,7 @@ mod tests {
     fn subagent_batch_cancellation_stops_blocked_hook_and_unstarted_sibling() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 2;
+        subagents.limits.max_running = 2;
         let config = config(subagents);
         let mut events = EventFactory::new("subagent-batch-hook-cancel".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
@@ -1574,6 +1734,7 @@ mod tests {
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
+                    parent_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
@@ -1608,7 +1769,7 @@ mod tests {
     fn subagent_batch_joins_started_worker_before_event_io_error_returns() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 2;
+        subagents.limits.max_running = 2;
         let config = config(subagents);
         let mut events = EventFactory::new("subagent-batch-event-error".to_string());
         let mut sink = EventSink::new(FailThirdFlush::default(), OutputFormat::Text);
@@ -1650,6 +1811,7 @@ mod tests {
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
+                    parent_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
@@ -1687,7 +1849,7 @@ mod tests {
     fn subagent_batch_panic_is_indeterminate_and_closes_lifecycle_event() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 2;
+        subagents.limits.max_running = 2;
         let config = config(subagents);
         let mut events = EventFactory::new("subagent-batch-panic".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
@@ -1728,6 +1890,7 @@ mod tests {
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
+                    parent_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
@@ -1809,7 +1972,7 @@ mod tests {
         let config = config(SubagentConfig::default());
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "cleanup failure",
                     "prompt": "cleanup failure",
                     "isolation": "worktree"
@@ -1883,7 +2046,7 @@ mod tests {
         let config = config(SubagentConfig::default());
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "panic cleanup",
                     "prompt": "panic cleanup",
                     "isolation": "worktree"
@@ -1950,7 +2113,7 @@ mod tests {
     fn subagent_batch_preserves_cancelled_child_terminals() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 2;
+        subagents.limits.max_running = 2;
         let config = config(subagents);
         let mut events = EventFactory::new("subagent-batch-cancelled".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
@@ -1994,6 +2157,7 @@ mod tests {
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
+                    parent_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,
@@ -2031,7 +2195,7 @@ mod tests {
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "inspect injected",
                     "prompt": "inspect injected"
                 })
@@ -2089,7 +2253,7 @@ mod tests {
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "inspect bridge",
                     "prompt": "child-permission-request"
                 })
@@ -2199,7 +2363,15 @@ mod tests {
 
         assert_eq!(result.status, tool_types::ToolStatus::Completed);
         assert!(result.error.is_none());
-        assert!(task_registry.list().is_empty());
+        // Every launch is a task in the tree even on the legacy observer path:
+        // the submitted record is adopted, marked running, and settled, so it
+        // neither leaks a queue position nor hides its execution lease.
+        let tasks = task_registry.list();
+        assert_eq!(tasks.len(), 1, "one child, one task record");
+        assert_eq!(
+            tasks[0].status,
+            orca_core::task_types::TaskStatus::Completed
+        );
         host.shutdown().expect("shutdown runtime host");
     }
 
@@ -2262,14 +2434,33 @@ mod tests {
         )
         .expect("hosted async route result");
 
-        assert_eq!(result.status, tool_types::ToolStatus::Completed);
-        assert!(result.error.is_none());
-        assert!(
-            result
-                .output
-                .as_deref()
-                .is_some_and(|output| output.contains("thread_id"))
-        );
+        assert_eq!(result.status, tool_types::ToolStatus::Running);
+        let handle: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        let id = handle["task_id"].as_str().expect("submission handle");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let task = task_registry.get(id).expect("accepted task");
+            if !matches!(
+                task.status,
+                orca_core::task_types::TaskStatus::Queued
+                    | orca_core::task_types::TaskStatus::Running
+            ) {
+                assert_eq!(
+                    task.status,
+                    orca_core::task_types::TaskStatus::Completed,
+                    "{:?}",
+                    task.error
+                );
+                assert!(task.subagent_child_thread_id.is_some());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background child did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         host.shutdown().expect("shutdown runtime host");
     }
 
@@ -2353,7 +2544,7 @@ mod tests {
         let config = config(SubagentConfig::default());
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "wait until stopped",
                     "prompt": "mock_stream_delay_ms 30000"
                 })
@@ -2371,6 +2562,7 @@ mod tests {
             0,
         ));
         let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let observed_activity = activity_ingress.clone();
         let parent_cancel = CancelToken::new();
         let cleanup_cancel = parent_cancel.clone();
         let (result_tx, result_rx) = mpsc::channel();
@@ -2417,6 +2609,17 @@ mod tests {
         let task_id = loop {
             if let Some(task) = task_registry.list().into_iter().next()
                 && task.status == orca_core::task_types::TaskStatus::Running
+                && observed_activity
+                    .events
+                    .lock()
+                    .expect("surface activity")
+                    .iter()
+                    .any(|event| {
+                        matches!(
+                            event.payload,
+                            crate::child_agent_types::SubagentActivityPayload::ChildThreadBound { .. }
+                        )
+                    })
             {
                 break task.id;
             }
@@ -2464,7 +2667,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let release_marker = cwd.path().join("release-sibling");
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 2;
+        subagents.limits.max_running = 2;
         let config = config(subagents);
         let requests = vec![
             hosted_request(
@@ -2553,11 +2756,254 @@ mod tests {
         );
     }
 
+    /// A cancelled batch still answers for every child it accepted.
+    ///
+    /// The children that never got a lease must come back as not started, not
+    /// as a missing result, and their records must be closed instead of
+    /// keeping a queue position after the turn is gone.
+    #[test]
+    fn a_cancelled_batch_reports_queued_children_as_not_started() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.limits.max_running = 1;
+        subagents.limits.max_queued = 8;
+        let config = config(subagents);
+        let requests = (0..3)
+            .map(|index| {
+                hosted_request(
+                    &format!("blocked-{index}"),
+                    &format!("blocked child {index}"),
+                    "mock_stream_delay_ms 10000",
+                )
+            })
+            .collect::<Vec<_>>();
+        let task_registry = TaskRegistry::new("hosted-batch-cancel".to_string());
+        let worker_registry = task_registry.clone();
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "hosted-batch-cancel".to_string(),
+            "hosted-batch-cancel".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let parent_cancel = CancelToken::new();
+        let worker_cancel = parent_cancel.clone();
+        let cwd_path = cwd.path().to_path_buf();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let result = execute_hosted_batch_for_test(
+                config,
+                cwd_path,
+                requests,
+                worker_cancel,
+                worker_registry,
+                activity_ingress,
+                controller,
+            );
+            let _ = result_tx.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while task_registry.list().len() < 3 || task_registry.active_subagent_lease_count() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the batch never reached one running child: {:?}",
+                task_registry.list()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        parent_cancel.cancel();
+
+        let execution = match result_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(execution) => execution,
+            Err(error) => panic!("cancelled batch did not finish: {error}"),
+        };
+        worker.join().expect("join hosted batch");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert_eq!(execution.results.len(), 3, "every child answers");
+        assert!(
+            execution
+                .results
+                .iter()
+                .all(|(status, _)| *status == RunStatus::Cancelled),
+            "a cancelled turn cancels the children it accepted: {:?}",
+            execution
+                .results
+                .iter()
+                .map(|(status, result)| (*status, result.status))
+                .collect::<Vec<_>>()
+        );
+        let statuses = task_registry
+            .list()
+            .into_iter()
+            .map(|task| task.status)
+            .collect::<Vec<_>>();
+        assert!(
+            statuses
+                .iter()
+                .all(|status| !orca_core::task_types::TaskStatus::is_active(*status)),
+            "no child is left live after the batch: {statuses:?}"
+        );
+        assert_eq!(task_registry.active_subagent_lease_count(), 0);
+    }
+
+    /// A synchronous batch is one caller, not one pool.
+    ///
+    /// The children compete for the same leases as everything else: past the
+    /// limit they are accepted and recorded as waiting, no worker is spawned
+    /// for them, and each freed lease admits exactly one more.
+    #[test]
+    fn a_sync_batch_beyond_the_running_limit_queues_children_until_a_lease_frees() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut subagents = SubagentConfig::default();
+        subagents.limits.max_running = 2;
+        subagents.limits.max_queued = 16;
+        let config = config(subagents);
+        let markers = (0..4)
+            .map(|index| cwd.path().join(format!("release-{index}")))
+            .collect::<Vec<_>>();
+        let requests = (0..4)
+            .map(|index| {
+                hosted_request(
+                    &format!("queued-{index}"),
+                    &format!("queued child {index}"),
+                    &format!("mock_stream_release_marker {}", markers[index].display()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let task_registry = TaskRegistry::new("hosted-batch-queue".to_string());
+        let worker_registry = task_registry.clone();
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.handle(),
+            "hosted-batch-queue".to_string(),
+            "hosted-batch-queue".to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let parent_cancel = CancelToken::new();
+        let worker_cancel = parent_cancel.clone();
+        let cwd_path = cwd.path().to_path_buf();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let result = execute_hosted_batch_for_test(
+                config,
+                cwd_path,
+                requests,
+                worker_cancel,
+                worker_registry,
+                activity_ingress,
+                controller,
+            );
+            let _ = result_tx.send(result);
+        });
+
+        let statuses = |registry: &TaskRegistry| {
+            registry
+                .list()
+                .into_iter()
+                .map(|task| task.status)
+                .collect::<Vec<_>>()
+        };
+        let running = |registry: &TaskRegistry| {
+            statuses(registry)
+                .into_iter()
+                .filter(|status| *status == orca_core::task_types::TaskStatus::Running)
+                .count()
+        };
+        let completed = |registry: &TaskRegistry| {
+            statuses(registry)
+                .into_iter()
+                .filter(|status| *status == orca_core::task_types::TaskStatus::Completed)
+                .count()
+        };
+        let wait_until = |condition: &dyn Fn() -> bool, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !condition() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // Two children hold the two leases; the other two are accepted and
+        // waiting, with nothing started for them.
+        wait_until(
+            &|| running(&task_registry) == 2 && task_registry.list().len() == 4,
+            "two running children and two accepted ones",
+        );
+        let queued = task_registry
+            .list()
+            .into_iter()
+            .filter(|task| task.status == orca_core::task_types::TaskStatus::Queued)
+            .collect::<Vec<_>>();
+        assert_eq!(queued.len(), 2, "the rest wait instead of failing");
+        for task in &queued {
+            let record = task_registry.get(&task.id).expect("record");
+            assert_eq!(
+                record.wait_reason,
+                Some(crate::task_view::WaitReason::ExecutionCapacity),
+                "a queued child says why it waits"
+            );
+            assert!(
+                record.started_at_ms.is_none(),
+                "queued work must not have started: {record:?}"
+            );
+        }
+        assert_eq!(
+            task_registry.active_subagent_lease_count(),
+            2,
+            "accepted work that has not started holds no lease"
+        );
+
+        // Each released child returns exactly one lease to the queue.
+        for (index, marker) in markers.iter().enumerate() {
+            std::fs::write(marker, "release\n").expect("release child");
+            let settled = index + 1;
+            wait_until(
+                &|| completed(&task_registry) >= settled,
+                "a released child to finish",
+            );
+            assert!(
+                task_registry.active_subagent_lease_count() <= 2,
+                "the batch never exceeds the scope's running limit"
+            );
+        }
+
+        let execution = match result_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(execution) => execution,
+            Err(error) => {
+                parent_cancel.cancel();
+                panic!("queued batch did not finish: {error}");
+            }
+        };
+        worker.join().expect("join hosted batch");
+        host.shutdown().expect("shutdown runtime host");
+
+        assert!(
+            execution
+                .results
+                .iter()
+                .all(|(status, _)| *status == RunStatus::Success),
+            "every accepted child eventually ran: {:?}",
+            execution
+                .results
+                .iter()
+                .map(|(status, result)| (*status, result.status))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(completed(&task_registry), 4);
+        assert_eq!(task_registry.active_subagent_lease_count(), 0);
+    }
+
     #[test]
     fn parent_cancellation_propagates_to_every_hosted_child() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 2;
+        subagents.limits.max_running = 2;
         let config = config(subagents);
         let requests = vec![
             hosted_request("cancel-a", "cancel child a", "mock_stream_delay_ms 10000"),
@@ -2625,7 +3071,7 @@ mod tests {
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "schema child",
                     "prompt": "mock_silent_final",
                     "schema": { "type": "number" }
@@ -2707,14 +3153,14 @@ mod tests {
     }
 
     #[test]
-    fn hosted_sync_resume_rejects_before_child_launch() {
+    fn invalid_hosted_resume_is_rejected_before_admission() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let config = config(SubagentConfig::default());
         let mut events = EventFactory::new("hosted-resume-rejection".to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "resume child",
                     "prompt": "mock_silent_final",
                     "resume_from": "missing-continuation"
@@ -2772,13 +3218,15 @@ mod tests {
             result.terminal().started,
             tool_types::ToolInvocationStarted::No
         );
+        assert!(result.error.as_deref().is_some_and(|error| {
+            error.contains("failed to validate child continuation before admission")
+        }));
+        let tasks = task_registry.list();
         assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| { error.contains("hosted_sync_resume_unsupported") })
+            tasks.is_empty(),
+            "invalid continuation must never be accepted: {tasks:?}"
         );
-        assert!(task_registry.list().is_empty());
+        assert!(task_registry.active_subagent_lease_count() == 0);
         assert!(activity_ingress.events.lock().unwrap().is_empty());
     }
 
@@ -3136,7 +3584,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_mode_rejects_async_subagent_before_task_launch() {
+    fn finite_async_budget_requires_durable_parent_reservation() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut config = config(SubagentConfig::default());
         config.budget.max_cost_usd_micros = Some(1_000_000);
@@ -3190,10 +3638,134 @@ mod tests {
             result
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("cost budget is active"))
+                .is_some_and(|error| error.contains("durable parent reservation"))
         );
         assert!(task_registry.list().is_empty());
         assert_eq!(cost_tracker.totals(), Default::default());
+    }
+
+    #[test]
+    fn finite_async_child_settles_durable_budget_before_publishing_completion() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let mut config = config(SubagentConfig::default());
+        config.budget.max_cost_usd_micros = Some(1_000_000);
+        let mut events = EventFactory::new("subagent-budget-async".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "inspect later",
+                    "prompt": "inspect later",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+            ..subagent_request("budget-async")
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("subagent-budget-async".to_string());
+        let mut operation = crate::operation_context::OperationContext::for_tests(
+            config.budget.to_spec(),
+            "async-budget-receipt",
+        );
+        let lease = operation
+            .background_child_lease(Default::default(), 1, &request.id)
+            .unwrap()
+            .unwrap();
+        task_registry.set_child_budget(
+            None,
+            &request.id,
+            lease.durable_reservation().unwrap().clone(),
+        );
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            true,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            receipt_child_executor::<io::Sink>,
+            &mut event_error,
+            Some(lease.spec()),
+        )
+        .expect("budget-rejected subagent tool");
+
+        assert_eq!(result.status, tool_types::ToolStatus::Running);
+        assert!(_receipt.is_none(), "submission is not a completed bill");
+        let payload: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().unwrap()).unwrap();
+        let id = payload["task_id"].as_str().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let record = task_registry.get(id).unwrap();
+            if !record.status.is_active() {
+                assert_eq!(
+                    record.status,
+                    orca_core::task_types::TaskStatus::Completed,
+                    "{:?}",
+                    record.error
+                );
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "child did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        operation.refresh_child_budgets().unwrap();
+        assert_eq!(operation.controller.usage().cost_usd_micros, 700);
+        assert_eq!(operation.controller.usage().tool_calls, 3);
+        assert_eq!(operation.controller.usage().turns, 2);
+        operation.refresh_child_budgets().unwrap();
+        assert_eq!(operation.controller.usage().cost_usd_micros, 700);
+        task_registry.set_child_budget(
+            None,
+            &request.id,
+            lease.durable_reservation().unwrap().clone(),
+        );
+        let (replayed, _) = super::execute_subagent_tool(
+            &config,
+            cwd.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            true,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            unexpected_child_executor::<io::Sink>,
+            &mut event_error,
+            Some(lease.spec()),
+        )
+        .expect("replayed accepted child");
+        assert_eq!(replayed.status, tool_types::ToolStatus::Completed);
+        let replayed: serde_json::Value =
+            serde_json::from_str(replayed.output.as_deref().unwrap()).unwrap();
+        assert_eq!(replayed["task_id"], id);
+        assert_eq!(replayed["replayed"], true);
+        assert_eq!(task_registry.list().len(), 1);
     }
 
     #[test]
@@ -3363,7 +3935,7 @@ mod tests {
             &config,
             cwd.path(),
             &registry,
-            serde_json::json!({
+            serde_json::json!({"mode": "sync",
                 "description": "inspect", "prompt": "First request", "subagent_type": "audit"
             }),
         );
@@ -3399,7 +3971,7 @@ mod tests {
                 &config,
                 cwd.path(),
                 &registry,
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "continue", "prompt": "Continue the same conversation", "resume_from": selector
                 }),
             );
@@ -3424,7 +3996,7 @@ mod tests {
             &config,
             cwd.path(),
             &registry,
-            serde_json::json!({
+            serde_json::json!({"mode": "sync",
                 "description": "conflict", "prompt": "Continue", "resume_from": selector,
                 "model": "deepseek-v4-pro"
             }),
@@ -3442,7 +4014,7 @@ mod tests {
             &config,
             cwd.path(),
             &registry,
-            serde_json::json!({
+            serde_json::json!({"mode": "sync",
                 "description": "narrowed", "prompt": "Continue", "resume_from": selector
             }),
         );
@@ -3475,7 +4047,7 @@ mod tests {
                 &config,
                 cwd.path(),
                 &registry,
-                serde_json::json!({
+                serde_json::json!({"mode": "sync",
                     "description": "inspect", "prompt": "Inspect", "subagent_type": name
                 }),
             );
@@ -3511,7 +4083,7 @@ mod tests {
     fn batch_persistence_failure_preserves_completed_child_receipts() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let mut subagents = SubagentConfig::default();
-        subagents.max_parallel = 2;
+        subagents.limits.max_running = 2;
         let config = config(subagents);
         let mut events = EventFactory::new("subagent-batch-receipt-survival".to_string());
         let mut sink = EventSink::new(FailThirdFlush::default(), OutputFormat::Text);
@@ -3552,6 +4124,7 @@ mod tests {
                     cancel: &cancel,
                     task_registry: &task_registry,
                     root_task_id: None,
+                    parent_task_id: None,
                     workflow_ipc: None,
                     activity_ingress: None,
                     permission_handler: None,

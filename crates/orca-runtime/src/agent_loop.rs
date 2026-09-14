@@ -77,6 +77,13 @@ pub(crate) fn run_agent_loop(
             orca_core::config::HistoryMode::Disabled
         ),
     )?;
+    operation.attach_task_scope(
+        loop_state.runtime.task_registry,
+        turn_context
+            .task_id
+            .as_deref()
+            .or(turn_context.root_task_id),
+    );
     let setup = RuntimeTurnSetupStep::new().prepare(
         config,
         subagent_depth,
@@ -149,6 +156,7 @@ pub(crate) fn run_agent_loop(
         if result.status == orca_core::event_schema::RunStatus::ApprovalRequired {
             return Ok(outcome);
         }
+        operation.refresh_child_budgets()?;
         if let OperationTerminal::Completed { usage } = &mut result.terminal {
             *usage = operation.controller.usage();
         }
@@ -227,6 +235,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         )
         .with_turn_id(runtime.turn_id.clone().unwrap_or_else(TurnId::new))
         .with_root_task_id(runtime.root_task_id)
+        .with_task_id(runtime.child_task_id)
         .with_services(
             runtime.instructions,
             runtime.memory,

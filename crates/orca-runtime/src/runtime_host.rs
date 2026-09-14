@@ -2341,6 +2341,8 @@ pub struct RuntimeThreadStartRequest {
     agent_root_thread_id: Option<String>,
     agent_depth: u32,
     agent_type: Option<orca_core::subagent_types::SubagentType>,
+    agent_task_id: Option<String>,
+    agent_task_registry: Option<TaskRegistry>,
     mcp_registry: Option<McpRegistry>,
     prepared_record_meta: Option<SessionMeta>,
     prepared_runtime_thread_id: Option<String>,
@@ -2352,6 +2354,46 @@ pub struct RuntimeThreadStartRequest {
 }
 
 impl RuntimeThreadStartRequest {
+    fn restore_agent_scope_from_meta(
+        &mut self,
+        meta: &SessionMeta,
+    ) -> Result<(), RuntimeHostError> {
+        if self.agent_type.is_some() {
+            return Ok(());
+        }
+        let Some(scope) = meta.agent_scope.as_ref() else {
+            return Ok(());
+        };
+        let registry = TaskRegistry::attach_for_cwd(
+            scope.task_registry_session_id.clone(),
+            std::path::Path::new(&meta.cwd),
+        );
+        let task =
+            registry
+                .get(&scope.task_id)
+                .ok_or_else(|| RuntimeHostError::ThreadStartFailed {
+                    message: format!(
+                        "subagent thread metadata references missing task {}",
+                        scope.task_id
+                    ),
+                })?;
+        if task.task_type != orca_core::task_types::TaskType::Subagent
+            || task.subagent_child_thread_id.as_deref() != Some(meta.session_id.as_str())
+        {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "subagent thread metadata does not match its durable task binding"
+                    .to_string(),
+            });
+        }
+        self.parent_thread_id.clone_from(&meta.parent_id);
+        self.agent_root_thread_id = Some(scope.root_thread_id.clone());
+        self.agent_depth = scope.depth;
+        self.agent_type = Some(scope.subagent_type.clone());
+        self.agent_task_id = Some(scope.task_id.clone());
+        self.agent_task_registry = Some(registry);
+        Ok(())
+    }
+
     pub fn new(mut config: RunConfig, title: impl Into<String>) -> Self {
         config.additional_working_directories.retain(|directory| {
             directory.source != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
@@ -2365,6 +2407,8 @@ impl RuntimeThreadStartRequest {
             agent_root_thread_id: None,
             agent_depth: 0,
             agent_type: None,
+            agent_task_id: None,
+            agent_task_registry: None,
             mcp_registry: None,
             prepared_record_meta: None,
             prepared_runtime_thread_id: None,
@@ -2389,11 +2433,15 @@ impl RuntimeThreadStartRequest {
         root_thread_id: impl Into<String>,
         depth: u32,
         agent_type: orca_core::subagent_types::SubagentType,
+        agent_task_id: String,
+        agent_task_registry: TaskRegistry,
     ) -> Self {
         self.parent_thread_id = Some(parent_thread_id.into());
         self.agent_root_thread_id = Some(root_thread_id.into());
         self.agent_depth = depth;
         self.agent_type = Some(agent_type);
+        self.agent_task_id = Some(agent_task_id);
+        self.agent_task_registry = Some(agent_task_registry);
         self
     }
 
@@ -2477,7 +2525,7 @@ impl RuntimeThreadStartRequest {
                 message: format!("failed to acquire attached surface owner lease: {error:?}"),
             })?;
             self.config.subagents.max_depth = 0;
-            self.config.subagents.max_parallel = 1;
+            self.config.subagents.limits.max_running = 1;
             self.prepared_runtime_thread_id = Some(thread_id.clone());
             return Ok(PreparedRuntimeThreadStart {
                 request: self,
@@ -2542,6 +2590,25 @@ impl RuntimeThreadStartRequest {
                     self.config.additional_working_directories.clone(),
                 );
                 meta.parent_id.clone_from(&self.parent_thread_id);
+                if let (
+                    Some(root_thread_id),
+                    Some(subagent_type),
+                    Some(task_id),
+                    Some(task_registry),
+                ) = (
+                    self.agent_root_thread_id.as_ref(),
+                    self.agent_type.as_ref(),
+                    self.agent_task_id.as_ref(),
+                    self.agent_task_registry.as_ref(),
+                ) {
+                    meta.agent_scope = Some(crate::thread_store::StoredAgentScope {
+                        root_thread_id: root_thread_id.clone(),
+                        depth: self.agent_depth,
+                        subagent_type: subagent_type.clone(),
+                        task_id: task_id.clone(),
+                        task_registry_session_id: task_registry.session_id().to_string(),
+                    });
+                }
                 let path =
                     crate::history::prospective_session_path(&meta.session_id, meta.created_at);
                 let thread_id = meta.session_id.clone();
@@ -2557,6 +2624,7 @@ impl RuntimeThreadStartRequest {
                             message: error.to_string(),
                         })?,
                 };
+                self.restore_agent_scope_from_meta(&transcript.meta)?;
                 let thread_id = transcript.meta.session_id.clone();
                 let path = transcript.path.clone();
                 self.preloaded = Some(transcript);
@@ -4116,6 +4184,8 @@ impl RuntimeHostHandle {
         root_thread_id: &str,
         depth: u32,
         agent_type: orca_core::subagent_types::SubagentType,
+        agent_task_id: String,
+        agent_task_registry: TaskRegistry,
         config: RunConfig,
         title: impl Into<String>,
     ) -> Result<RuntimeThreadHandle, RuntimeHostError> {
@@ -4125,6 +4195,8 @@ impl RuntimeHostHandle {
                 root_thread_id,
                 depth,
                 agent_type,
+                agent_task_id,
+                agent_task_registry,
             ),
         )
     }
@@ -5217,6 +5289,8 @@ struct PreparedStartedRuntimeThread {
     agent_root_thread_id: Option<String>,
     agent_depth: u32,
     agent_type: Option<orca_core::subagent_types::SubagentType>,
+    agent_task_id: Option<String>,
+    agent_task_registry: Option<TaskRegistry>,
     surface_owner: Option<PreparedSurfaceOwner>,
     ephemeral_reservation_timeout: Duration,
     #[cfg(test)]
@@ -5226,11 +5300,6 @@ struct PreparedStartedRuntimeThread {
 fn prepare_and_start_runtime_thread(
     request: RuntimeThreadStartRequest,
 ) -> Result<PreparedStartedRuntimeThread, RuntimeHostError> {
-    let actor_title = request.title.clone();
-    let parent_thread_id = request.parent_thread_id.clone();
-    let agent_root_thread_id = request.agent_root_thread_id.clone();
-    let agent_depth = request.agent_depth;
-    let agent_type = request.agent_type.clone();
     let ephemeral_reservation_timeout = request.ephemeral_reservation_timeout;
     #[cfg(test)]
     let ephemeral_close_commit_failures = request.ephemeral_close_commit_failures;
@@ -5239,6 +5308,13 @@ fn prepare_and_start_runtime_thread(
         surface_owner,
         resume_scope_replacement,
     } = request.prepare()?;
+    let actor_title = request.title.clone();
+    let parent_thread_id = request.parent_thread_id.clone();
+    let agent_root_thread_id = request.agent_root_thread_id.clone();
+    let agent_depth = request.agent_depth;
+    let agent_type = request.agent_type.clone();
+    let agent_task_id = request.agent_task_id.clone();
+    let agent_task_registry = request.agent_task_registry.clone();
     let actor_config = request.config.clone();
     let thread = request
         .start()
@@ -5274,6 +5350,8 @@ fn prepare_and_start_runtime_thread(
         agent_root_thread_id,
         agent_depth,
         agent_type,
+        agent_task_id,
+        agent_task_registry,
         surface_owner,
         ephemeral_reservation_timeout,
         #[cfg(test)]
@@ -5364,6 +5442,8 @@ async fn run_host_supervisor(
                     agent_root_thread_id,
                     agent_depth,
                     agent_type,
+                    agent_task_id,
+                    agent_task_registry,
                     surface_owner,
                     ephemeral_reservation_timeout,
                     #[cfg(test)]
@@ -5387,6 +5467,9 @@ async fn run_host_supervisor(
                 }
                 let thread_id = thread.thread_id().to_string();
                 let session_id = thread.session().session_id().map(str::to_string);
+                if let Some(registry) = agent_task_registry {
+                    thread.session_mut().set_task_registry(registry);
+                }
                 let task_registry = thread.session().task_registry().clone();
                 let mcp_registry = thread.session().mcp_registry().clone();
                 let mut startup_warnings = thread
@@ -5482,6 +5565,8 @@ async fn run_host_supervisor(
                         .insert(crate::agent_controller::AgentThreadPolicy {
                             subagent_type,
                             depth: agent_depth,
+                            task_id: agent_task_id,
+                            continued_task: Arc::new(Mutex::new(None)),
                         });
                 }
                 let actor_handle = handle.clone();
@@ -18549,6 +18634,18 @@ impl ThreadActor {
                     request.task_id = None;
                     request.main_session_task_id = None;
                 }
+                if state
+                    .thread
+                    .thread_extensions()
+                    .get::<crate::agent_controller::AgentThreadPolicy>()
+                    .is_some()
+                {
+                    // The delegated task is the canonical execution identity.
+                    // A hosted child must not create a second main-session task
+                    // or publish an early terminal independently of its owner.
+                    request.task_description = None;
+                    request.main_session_task_id = None;
+                }
                 if request.allows_goal_tools() && state.thread.session().session_id().is_none() {
                     self.state = Some(state);
                     let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
@@ -18612,11 +18709,11 @@ impl ThreadActor {
                     .active_task()
                     .map(|task| task.id().to_string());
                 let main_session_task_id = request.main_session_task_id.clone();
+                let task_registry = state.thread.session().task_registry().clone();
                 let root_task_id = main_session_task_id
                     .clone()
-                    .unwrap_or_else(|| format!("operation-root-{:?}", operation_id));
+                    .unwrap_or_else(|| format!("session-root-{}", task_registry.session_id()));
                 request.root_task_id = Some(root_task_id.clone());
-                let task_registry = state.thread.session().task_registry().clone();
                 let steer_handle = ThreadSteerHandle::default();
                 let execution_policy = RuntimeExecutionPolicyHandle::new(config.clone(), 0);
                 let goal_turn = request.surface_goal_turn.take();
@@ -24959,6 +25056,46 @@ mod tests {
             terminal_notifications: false,
             auto_memory: false,
         }
+    }
+
+    #[test]
+    fn cold_start_restores_subagent_role_depth_and_parent_task_scope() {
+        let cwd = tempfile::tempdir().unwrap();
+        crate::history::with_redirected_orca_home("cold-agent-scope", |_| {
+            let registry = TaskRegistry::new_for_cwd("parent-task-session".into(), cwd.path());
+            let task = registry.create_subagent("cold child".into(), Some("general".into()));
+            registry
+                .bind_subagent_thread(&task.id, "child-thread")
+                .unwrap();
+            let mut meta = crate::history::create_meta(cwd.path(), "mock", None, "cold child");
+            meta.session_id = "child-thread".into();
+            meta.parent_id = Some("parent-thread".into());
+            meta.agent_scope = Some(crate::thread_store::StoredAgentScope {
+                root_thread_id: "root-thread".into(),
+                depth: 2,
+                subagent_type: orca_core::subagent_types::SubagentType::General,
+                task_id: task.id.clone(),
+                task_registry_session_id: registry.session_id().to_string(),
+            });
+
+            let mut request = RuntimeThreadStartRequest::new(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                "restore child",
+            );
+            request.restore_agent_scope_from_meta(&meta).unwrap();
+
+            assert_eq!(request.agent_root_thread_id.as_deref(), Some("root-thread"));
+            assert_eq!(request.agent_depth, 2);
+            assert_eq!(
+                request.agent_type,
+                Some(orca_core::subagent_types::SubagentType::General)
+            );
+            assert_eq!(request.agent_task_id.as_deref(), Some(task.id.as_str()));
+            assert_eq!(
+                request.agent_task_registry.as_ref().unwrap().session_id(),
+                registry.session_id()
+            );
+        });
     }
 
     #[test]

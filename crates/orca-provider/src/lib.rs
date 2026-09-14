@@ -229,6 +229,39 @@ pub fn start_streaming(
     config: &ProviderConfig,
     cancel: CancelToken,
 ) -> ProviderStreamingCall {
+    start_streaming_with_output_budget(kind, conversation, config, cancel, None, None)
+}
+
+/// Starts a normal provider stream with a bounded completion budget. DeepSeek
+/// uses its production bounded-summary request path (thinking disabled and at
+/// most 2,048 tokens); providers without a bounded path keep their normal
+/// deterministic behavior.
+pub fn start_streaming_bounded(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: CancelToken,
+    max_output_tokens: u32,
+    timeout: Duration,
+) -> ProviderStreamingCall {
+    start_streaming_with_output_budget(
+        kind,
+        conversation,
+        config,
+        cancel,
+        Some(max_output_tokens.clamp(1, 2_048)),
+        Some(timeout),
+    )
+}
+
+fn start_streaming_with_output_budget(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: CancelToken,
+    max_output_tokens: Option<u32>,
+    bounded_timeout: Option<Duration>,
+) -> ProviderStreamingCall {
     let conversation = conversation.clone();
     let config = config.clone();
     let worker_cancel = cancel.clone();
@@ -250,11 +283,13 @@ pub fn start_streaming(
                 }
             };
             let step_cancel = worker_cancel.clone();
-            runtime.block_on(call_streaming_async(
+            runtime.block_on(call_streaming_async_with_output_budget(
                 kind,
                 &conversation,
                 &config,
                 &worker_cancel,
+                max_output_tokens,
+                bounded_timeout,
                 move |step| {
                     let _ = send_worker_step(&step_tx, &step_cancel, step);
                 },
@@ -285,6 +320,19 @@ pub async fn call_streaming_async(
     conversation: &Conversation,
     config: &ProviderConfig,
     cancel: &CancelToken,
+    on_step: impl FnMut(&ProviderStep) + Send,
+) -> ProviderResponse {
+    call_streaming_async_with_output_budget(kind, conversation, config, cancel, None, None, on_step)
+        .await
+}
+
+async fn call_streaming_async_with_output_budget(
+    kind: ProviderKind,
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    cancel: &CancelToken,
+    max_output_tokens: Option<u32>,
+    bounded_timeout: Option<Duration>,
     mut on_step: impl FnMut(&ProviderStep) + Send,
 ) -> ProviderResponse {
     match kind {
@@ -470,9 +518,22 @@ pub async fn call_streaming_async(
             }
             response
         }
-        ProviderKind::DeepSeek => {
-            deepseek_http::call_streaming_async(conversation, config, cancel, on_step).await
-        }
+        ProviderKind::DeepSeek => match max_output_tokens {
+            Some(max_output_tokens) => {
+                deepseek_http::call_streaming_async_bounded(
+                    conversation,
+                    config,
+                    cancel,
+                    max_output_tokens,
+                    bounded_timeout.expect("bounded output requires a bounded timeout"),
+                    on_step,
+                )
+                .await
+            }
+            None => {
+                deepseek_http::call_streaming_async(conversation, config, cancel, on_step).await
+            }
+        },
     }
 }
 
@@ -1157,9 +1218,10 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
     }
 
     if prompt.trim() == "subagent batch schema_fail" {
-        let mut first = parse_mock_prompt("subagent schema_ok").expect("schema ok request");
+        let mut first = parse_mock_prompt("subagent sync schema_ok").expect("schema ok request");
         first.id = "mock-tool-1".to_string();
-        let mut second = parse_mock_prompt("subagent schema_fail").expect("schema fail request");
+        let mut second =
+            parse_mock_prompt("subagent sync schema_fail").expect("schema fail request");
         second.id = "mock-tool-2".to_string();
         let steps = vec![
             ProviderStep::ToolCall(first.clone()),
@@ -1187,11 +1249,12 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
     }
 
     if prompt.trim() == "subagent batch terminal_boundary" {
-        let mut first = parse_mock_prompt("subagent schema_fail").expect("schema fail request");
+        let mut first =
+            parse_mock_prompt("subagent sync schema_fail").expect("schema fail request");
         first.id = "mock-tool-1".to_string();
-        let mut second = parse_mock_prompt("subagent schema_ok").expect("schema ok request");
+        let mut second = parse_mock_prompt("subagent sync schema_ok").expect("schema ok request");
         second.id = "mock-tool-2".to_string();
-        let mut third = parse_mock_prompt("subagent schema_ok").expect("schema ok request");
+        let mut third = parse_mock_prompt("subagent sync schema_ok").expect("schema ok request");
         third.id = "mock-tool-3".to_string();
         let requests = vec![first, second, third];
         let tool_calls = requests
@@ -1384,6 +1447,8 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         };
         let (mode, description) = if let Some(description) = rest.strip_prefix("async ") {
             (Some("async"), description.trim())
+        } else if let Some(description) = rest.strip_prefix("sync ") {
+            (Some("sync"), description.trim())
         } else {
             (None, rest)
         };
@@ -1424,14 +1489,14 @@ fn parse_mock_prompt(prompt: &str) -> Option<ToolRequest> {
         });
     }
 
-    if let Some(rest) = prompt.strip_prefix("subagent_status ") {
-        let agent_id = rest.trim();
+    if let Some(rest) = prompt.strip_prefix("task_read_output ") {
+        let task_id = rest.trim();
         return Some(ToolRequest {
             id: "mock-tool-1".to_string(),
-            name: ToolName::SubagentStatus,
+            name: ToolName::TaskReadOutput,
             action: ActionKind::Read,
-            target: Some(agent_id.to_string()),
-            raw_arguments: Some(serde_json::json!({ "agent_id": agent_id }).to_string()),
+            target: Some(task_id.to_string()),
+            raw_arguments: Some(serde_json::json!({ "task_id": task_id }).to_string()),
         });
     }
 
@@ -1858,7 +1923,7 @@ mod tests {
 
     #[test]
     fn mock_prompt_parses_subagent_schema() {
-        let request = parse_mock_prompt("subagent schema_fail").expect("tool request");
+        let request = parse_mock_prompt("subagent sync schema_fail").expect("tool request");
         assert_eq!(request.name, ToolName::Subagent);
 
         let arguments: serde_json::Value =

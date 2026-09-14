@@ -68,6 +68,20 @@ pub struct StoredSessionHealthIssue {
     pub offset: Option<u64>,
 }
 
+/// Durable identity for a thread that executes a subagent task.
+///
+/// This is intentionally metadata rather than an in-memory UI hint: opening
+/// the child transcript in a fresh process must reconstruct the same role,
+/// depth and parent task registry before the first turn can run.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StoredAgentScope {
+    pub root_thread_id: String,
+    pub depth: u32,
+    pub subagent_type: orca_core::subagent_types::SubagentType,
+    pub task_id: String,
+    pub task_registry_session_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionMeta {
@@ -80,6 +94,8 @@ pub struct SessionMeta {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_scope: Option<StoredAgentScope>,
     #[serde(default)]
     pub forked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -912,5 +928,36 @@ mod tests {
         .expect("legacy session metadata");
 
         assert!(metadata.metadata_writable_directories.is_empty());
+        assert!(metadata.agent_scope.is_none());
+    }
+
+    #[test]
+    fn subagent_scope_round_trips_in_session_metadata() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "session_id": "child-thread",
+            "cwd": "/workspace",
+            "provider": "mock",
+            "model": null,
+            "title": "child",
+            "created_at": "2026-07-28T00:00:00Z",
+            "parent_id": "parent-thread",
+            "agent_scope": {
+                "root_thread_id": "root-thread",
+                "depth": 2,
+                "subagent_type": "general",
+                "task_id": "task-child",
+                "task_registry_session_id": "parent-session"
+            }
+        });
+        let metadata: SessionMeta = serde_json::from_value(value).unwrap();
+        let scope = metadata.agent_scope.as_ref().unwrap();
+        assert_eq!(scope.depth, 2);
+        assert_eq!(scope.task_id, "task-child");
+        assert_eq!(scope.task_registry_session_id, "parent-session");
+        assert_eq!(
+            serde_json::to_value(&metadata).unwrap()["agent_scope"]["root_thread_id"],
+            "root-thread"
+        );
     }
 }

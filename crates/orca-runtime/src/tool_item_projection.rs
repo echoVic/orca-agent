@@ -1081,8 +1081,12 @@ pub(crate) struct UnifiedExecProjection {
     pub(crate) truncated: Value,
 }
 
+/// Projects a command tool result into the terminal transcript item.
+///
+/// Every command now reports the same shape regardless of which task tool
+/// produced it, so one projection covers starts, reads, waits, and input.
 pub(crate) fn unified_exec_projection(tool: &str, content: &str) -> Option<UnifiedExecProjection> {
-    if !matches!(tool, "exec_command" | "write_stdin") {
+    if !matches!(tool, "bash" | "task_read_output" | "task_send_input") {
         return None;
     }
     let content = content
@@ -1989,7 +1993,7 @@ mod tests {
     fn unified_exec_completion_projects_inner_process_status_and_output() {
         let mut item = persisted_command_execution_started_item(
             "tool-exec",
-            "exec_command",
+            "bash",
             Value::from("cargo test"),
         );
         let content = serde_json::json!({

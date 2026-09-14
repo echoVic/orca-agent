@@ -273,6 +273,8 @@ pub(crate) struct ChildAgentRuntime<'a, W: io::Write> {
     pub lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
     pub task_registry: Option<&'a TaskRegistry>,
     pub root_task_id: Option<&'a str>,
+    /// This child's own durable task id, when it has one.
+    pub child_task_id: Option<&'a str>,
     pub checkpoint_observer: Option<&'a dyn ChildAgentCheckpointSink>,
     /// Owned because child execution may cross a worker boundary. The value
     /// is already scoped to this child attempt by the synchronous invoker.
@@ -296,6 +298,11 @@ pub(crate) struct ChildAgentRuntimeContext<'a, W: io::Write> {
     pub lifecycle: Option<&'a mut RuntimeSessionLifecycle>,
     pub task_registry: Option<&'a TaskRegistry>,
     pub root_task_id: Option<&'a str>,
+    /// This child's own durable task id, when it has one.
+    ///
+    /// `root_task_id` names the tree's owner (for a child, its parent); the
+    /// child needs its own identity to read guidance addressed to it.
+    pub child_task_id: Option<&'a str>,
     pub checkpoint_observer: Option<&'a dyn ChildAgentCheckpointSink>,
     pub permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
     pub turn_id: Option<TurnId>,
@@ -316,6 +323,7 @@ impl<'a, W: io::Write> ChildAgentRuntime<'a, W> {
             lifecycle: context.lifecycle,
             task_registry: context.task_registry,
             root_task_id: context.root_task_id,
+            child_task_id: context.child_task_id,
             checkpoint_observer: context.checkpoint_observer,
             permission_handler: context.permission_handler,
             turn_id: context.turn_id,

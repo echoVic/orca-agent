@@ -78,6 +78,9 @@ pub struct RuntimeTaskActor<'a> {
 
 pub(crate) fn run_status_from_tool_status(status: ToolStatus) -> RunStatus {
     match status {
+        // Yielding a still-running command is a normal turn outcome; the
+        // command's own lifecycle is tracked separately from the tool call.
+        ToolStatus::Running => RunStatus::Success,
         ToolStatus::Completed => RunStatus::Success,
         ToolStatus::Denied => RunStatus::ApprovalRequired,
         ToolStatus::Cancelled => RunStatus::Cancelled,
@@ -227,6 +230,11 @@ pub(crate) struct RuntimeTurnContext<'a> {
     pub(crate) cwd: &'a Path,
     pub(crate) prompt: &'a str,
     pub(crate) subagent_depth: u32,
+    /// This agent's own durable task id, when it has one.
+    ///
+    /// `root_task_id` names the tree's owner, which for a child is its parent;
+    /// a child needs its own identity to read guidance addressed to it.
+    pub(crate) task_id: Option<String>,
     pub(crate) emit_deltas: bool,
     pub(crate) subagent_type: &'a SubagentType,
     pub(crate) root_task_id: Option<&'a str>,
@@ -379,42 +387,12 @@ pub trait RuntimeWorkflowIpc {
     fn list_tasks(&self, name: &str) -> Result<Value, String>;
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct RuntimeSubagentStatusRecord {
-    pub id: String,
-    pub status: String,
-    pub description: String,
-    pub agent_type: Option<String>,
-    pub created_at_ms: i64,
-    pub started_at_ms: Option<i64>,
-    pub completed_at_ms: Option<i64>,
-    pub output: Option<String>,
-    pub error: Option<String>,
-    pub usage: Option<RuntimeUsageTotals>,
-    pub subagent_current_activity: Option<String>,
-    pub subagent_activity_history: Vec<orca_core::task_types::SubagentActivityEntry>,
-    pub subagent_child_thread_id: Option<String>,
-    pub subagent_batch_id: Option<String>,
-    pub subagent_batch_size: Option<u32>,
-    pub subagent_turn: Option<u32>,
-    pub last_activity_at_ms: Option<i64>,
-    pub continuation_id: Option<String>,
-    pub continuation_attempt_id: Option<String>,
-    pub continuation_checkpoint_id: Option<String>,
-    pub continuation_resumable: bool,
-    pub continuation_indeterminate: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RuntimeUsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
     pub estimated_cost_usd: f64,
-}
-
-pub trait RuntimeSubagentStatusLookup {
-    fn subagent_status_record(&self, agent_id: &str) -> Option<RuntimeSubagentStatusRecord>;
 }
 
 impl<'a> RuntimeTaskActor<'a> {
@@ -979,6 +957,12 @@ impl<'a> AgentLoopContext<'a> {
         self
     }
 
+    /// Records this agent's own durable task id on the turn context.
+    pub(crate) fn with_task_id(mut self, task_id: Option<&str>) -> Self {
+        self.turn_context = self.turn_context.with_task_id(task_id);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn turn_deps(&self) -> RuntimeTurnDeps<'a> {
         self.turn_deps.expect("agent loop turn deps")
@@ -1230,6 +1214,7 @@ impl<'a> RuntimeTurnContext<'a> {
             cwd,
             prompt,
             subagent_depth,
+            task_id: None,
             emit_deltas,
             subagent_type,
             root_task_id: None,
@@ -1266,6 +1251,12 @@ impl<'a> RuntimeTurnContext<'a> {
 
     pub(crate) fn with_root_task_id(mut self, root_task_id: Option<&'a str>) -> Self {
         self.root_task_id = root_task_id;
+        self
+    }
+
+    /// Records this agent's own durable task id.
+    pub(crate) fn with_task_id(mut self, task_id: Option<&str>) -> Self {
+        self.task_id = task_id.map(str::to_string);
         self
     }
 

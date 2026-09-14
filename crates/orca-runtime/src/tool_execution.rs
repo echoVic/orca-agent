@@ -1692,7 +1692,9 @@ fn retain_first_io_error(slot: &mut Option<io::Error>, result: io::Result<()>) {
 
 fn tool_call_outcome_for_result(result: &tool_types::ToolResult) -> ToolCallOutcome {
     match result.status {
-        tool_types::ToolStatus::Completed => ToolCallOutcome::Completed,
+        tool_types::ToolStatus::Running | tool_types::ToolStatus::Completed => {
+            ToolCallOutcome::Completed
+        }
         tool_types::ToolStatus::Failed => ToolCallOutcome::Failed {
             started: result.terminal().started,
         },

@@ -535,12 +535,24 @@ impl RuntimeProviderTurnStep {
         let (mut response, response_identity) = loop {
             completed_attempts = completed_attempts.saturating_add(1);
             let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
-            let mut stream = orca_provider::start_streaming(
-                input.provider,
-                &model_conversation,
-                input.provider_config,
-                input.cancel.clone(),
-            );
+            let mut stream =
+                if crate::investigation_convergence::summary_prompt_present(&model_conversation) {
+                    orca_provider::start_streaming_bounded(
+                        input.provider,
+                        &model_conversation,
+                        input.provider_config,
+                        input.cancel.clone(),
+                        crate::investigation_convergence::FINAL_REPORT_MAX_TOKENS,
+                        crate::investigation_convergence::FINAL_REPORT_TIMEOUT,
+                    )
+                } else {
+                    orca_provider::start_streaming(
+                        input.provider,
+                        &model_conversation,
+                        input.provider_config,
+                        input.cancel.clone(),
+                    )
+                };
             let mut step_batcher = ProviderStepBatcher::new(
                 input.turn_context.provider_response_ingress(),
                 &response_identity,

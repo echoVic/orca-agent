@@ -17,7 +17,7 @@ use orca_core::tool_types::{
 use orca_mcp::{McpElicitationHandler, McpRegistry, McpRequestError, client::McpCallOutput};
 
 use crate::{
-    bash, edit, external, git, glob, grep, list_files, read_file, skills, update_goal, update_plan,
+    edit, external, git, glob, grep, list_files, read_file, skills, update_goal, update_plan,
     web_search, write_file,
 };
 
@@ -597,16 +597,53 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         cooperative_builtin_spec(
             "bash",
-            "Execute a command in the resolved host shell. Use for running tests, builds, git operations, etc.",
+            "Start one shell command. The command is owned by the runtime task system from              process start: this call waits at most `yield_time_ms` and then returns, and a \
+             command that is still running keeps running. Use `task_read_output` to read more, \
+             `task_send_input` to type into a pty, `task_wait` to block on completion, and \
+             `task_stop` to stop it. The command runs in the resolved host shell named in the \
+             environment section, so use that shell's syntax rather than assuming a POSIX \
+             shell from the tool name. This is the only command entry point.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute"
+                        "description": "The shell command to run, in the host shell dialect named in the environment section"
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Working directory. Relative paths resolve from the workspace directory; the resolved path is checked against the workspace."
+                    },
+                    "terminal": {
+                        "type": "string",
+                        "enum": ["pipe", "pty"],
+                        "description": "pipe (default) captures stdout/stderr separately and closes stdin. Use pty for interactive programs and REPLs that need input."
+                    },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 30000,
+                        "description": "How long this call waits before returning. Defaults to 1000. 0 returns as soon as the process is registered. Elapsing never stops the command."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional execution deadline in milliseconds, measured from process start. Omit for no extra deadline. This limits how long the process may run; yield_time_ms limits only this call."
+                    },
+                    "lifetime": {
+                        "type": "string",
+                        "enum": ["task", "workspace"],
+                        "description": "task (default) ties the command to this task: it must finish or be handed off before the task is done. workspace is only for long-lived services the user asked to keep running. This changes ownership, not permissions."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20000,
+                        "description": "Approximate token budget for the output returned by this call. Defaults to 2000. It does not limit how long the command runs."
                     }
                 },
-                "required": ["command"]
+                "required": ["command"],
+                "additionalProperties": false
             }),
             CapabilitySet::shell_execute(),
             ToolExposure::Direct,
@@ -614,91 +651,6 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             false,
         ),
         BuiltinExecutor::Bash,
-    ));
-    registry.register(BuiltinTool::new(
-        cooperative_builtin_spec(
-            "exec_command",
-            "Start a command in the runtime-owned terminal service. Returns a session_id when the command is still running so it can be continued with write_stdin.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "cmd": {
-                        "type": "string",
-                        "description": "The shell command to execute"
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": "Optional working directory. Relative paths are resolved from the current workspace directory."
-                    },
-                    "tty": {
-                        "type": "boolean",
-                        "description": "Allocate a PTY for interactive programs such as vim, REPLs, and terminal UIs. Defaults to false."
-                    },
-                    "yield_time_ms": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 30000,
-                        "description": "How long to wait before returning. Defaults to 10000ms. A running command is not terminated when this elapses."
-                    },
-                    "max_output_tokens": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 20000,
-                        "description": "Maximum output returned by this call, measured approximately in model tokens. Defaults to 2000."
-                    }
-                },
-                "required": ["cmd"],
-                "additionalProperties": false
-            }),
-            CapabilitySet::shell_execute(),
-            ToolExposure::Direct,
-            RendererHint::Shell,
-            false,
-        ),
-        BuiltinExecutor::ExecCommand,
-    ));
-    registry.register(BuiltinTool::new(
-        cooperative_builtin_spec(
-            "write_stdin",
-            "Write characters to a running exec_command session, or poll it by omitting chars. Set output_offset for an idempotent archived byte-offset page, including after completion or restart. Control characters such as Ctrl-U may be sent with their Unicode escape.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": {
-                        "type": "string",
-                        "description": "The session_id returned by exec_command"
-                    },
-                    "chars": {
-                        "type": "string",
-                        "description": "Characters to write. Omit to poll without writing."
-                    },
-                    "output_offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Read one archived page at this byte offset without advancing the automatic cursor. Use 0 to start and next_output_offset to continue. Cannot be combined with nonempty chars; yield_time_ms is ignored. Retention may omit an earlier prefix; offsets beyond output_bytes_total are invalid."
-                    },
-                    "yield_time_ms": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 30000,
-                        "description": "How long to wait for output after writing or polling. Defaults to 250ms when writing and 5000ms when polling."
-                    },
-                    "max_output_tokens": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 20000,
-                        "description": "Maximum output returned by this call, measured approximately in model tokens. Defaults to 2000."
-                    }
-                },
-                "required": ["session_id"],
-                "additionalProperties": false
-            }),
-            CapabilitySet::new(vec![ToolCapability::TerminalTransport]),
-            ToolExposure::Direct,
-            RendererHint::Shell,
-            false,
-        ),
-        BuiltinExecutor::WriteStdin,
     ));
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
@@ -827,11 +779,6 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                         ],
                         "description": "Optional model override for this child agent. auto uses Orca's router, flash is faster, pro is stronger for deep reasoning."
                     },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["sync", "async"],
-                        "description": "sync blocks until completion. Use async for long-running delegated work; it launches the child in the background, makes progress visible in task_list, and returns an agent_id for subagent_status."
-                    },
                     "isolation": {
                         "type": "string",
                         "enum": ["none", "worktree"],
@@ -844,6 +791,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "resume_from": {
                         "type": "string",
                         "description": "Optional continuation id returned by a prior subagent completion, or a compatible agent_id. Resuming appends prompt to the same child conversation and inherits the source subagent_type, model, isolation, cwd, and worktree; explicitly conflicting values fail closed."
+                    },
+                    "deadline_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional absolute execution deadline in milliseconds from now. Unlike a wait, it includes queueing and suspension time, it is never reset by a resume, and descendants cannot outlive it. Omit for no deadline."
                     }
                 },
                 "required": ["description", "prompt"]
@@ -854,39 +806,6 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             false,
         ),
         BuiltinExecutor::Subagent,
-    ));
-    registry.register(BuiltinTool::new(
-        safe_local_read_builtin_spec(
-            "subagent_status",
-            "Query the status and result of an async subagent by agent_id. Text results are paged so large durable worker results can be recovered with offset and limit.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": {
-                        "type": "string",
-                        "description": "The agent_id returned by subagent with mode async"
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Optional character offset into text output. Use output_next_offset from the previous response to continue reading."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 32000,
-                        "description": "Optional maximum number of output characters to return. Defaults to 12000."
-                    }
-                },
-                "required": ["agent_id"],
-                "additionalProperties": false
-            }),
-            CapabilitySet::new(vec![ToolCapability::TaskRead]),
-            ToolExposure::Direct,
-            RendererHint::Agent,
-            true,
-        ),
-        BuiltinExecutor::SubagentStatus,
     ));
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
@@ -930,6 +849,162 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             false,
         ),
         BuiltinExecutor::TaskStop,
+    ));
+    registry.register(BuiltinTool::new(
+        safe_local_read_builtin_spec(
+            "task_read_output",
+            "Read already-produced output from a task started by bash (or another background task). \
+             Reads use the cursor you pass, so two readers never steal each other's output and a \
+             repeated cursor returns the same bytes. This never consumes or advances a shared cursor \
+             and never changes the task.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id returned by bash, task_list, or a completion notification"
+                    },
+                    "cursor": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Byte offset to read from. Omit to read from the cursor this task last reported to you. Use next_cursor from the previous response to continue."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20000,
+                        "description": "Approximate token budget for this read. Defaults to 2000."
+                    }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::TaskRead]),
+            ToolExposure::Direct,
+            RendererHint::Shell,
+            true,
+        ),
+        BuiltinExecutor::TaskReadOutput,
+    ));
+    registry.register(BuiltinTool::new(
+        conservative_builtin_spec(
+            "task_send_input",
+            "Write data to the standard input of a task started by bash with terminal \"pty\". \
+             Send eof to close stdin. This changes the running command's input, so it is not a read.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id of a pty task started by bash"
+                    },
+                    "chars": {
+                        "type": "string",
+                        "description": "Characters to write. Control characters may be sent with their Unicode escape, for example \\u0003 for Ctrl-C."
+                    },
+                    "eof": {
+                        "type": "boolean",
+                        "description": "Close the task's standard input after writing. Defaults to false."
+                    },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 30000,
+                        "description": "How long to wait for output produced by this input. Defaults to 250."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20000,
+                        "description": "Approximate token budget for the output returned by this call. Defaults to 2000."
+                    }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::TaskControl]),
+            ToolExposure::Direct,
+            RendererHint::Shell,
+            false,
+        ),
+        BuiltinExecutor::TaskSendInput,
+    ));
+    registry.register(BuiltinTool::new(
+        conservative_builtin_spec(
+            "subagent_message",
+            "Send guidance to a child agent that is still running. The message joins the child's \
+             conversation before its next model request; it is not a new task and does not start a \
+             new attempt. Sending takes no execution slot, so a saturated scope can still be \
+             steered. A child that already finished must be resumed with resume_from instead.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id of the running child agent, from subagent or task_list"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Guidance for the child. State what changed or what to do differently; the child keeps its original brief and reports conflicts."
+                    }
+                },
+                "required": ["task_id", "message"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::TaskControl]),
+            ToolExposure::Direct,
+            RendererHint::Agent,
+            false,
+        ),
+        BuiltinExecutor::SubagentMessage,
+    ));
+    registry.register(BuiltinTool::new(
+        safe_local_read_builtin_spec(
+            "task_wait",
+            "Wait until one or more tasks change state or finish. Waiting never stops, restarts, or \
+             consumes a task, and a timeout returns the current state with everything still running. \
+             Use this instead of sleep or repeated short polling when you must have a result.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Task ids to wait for. The call returns as soon as any of them changes state."
+                    },
+                    "until": {
+                        "type": "string",
+                        "enum": ["state_change", "terminal"],
+                        "description": "terminal (default) waits for a task to finish. state_change also returns on a non-terminal change such as an approval request."
+                    },
+                    "condition": {
+                        "type": "string",
+                        "enum": ["any", "all"],
+                        "description": "Complete when any or all targets are terminal. Defaults to all."
+                    },
+                    "wait_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 60000,
+                        "description": "How long to wait. Defaults to 30000, maximum 60000. On timeout every task keeps running."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20000,
+                        "description": "Approximate token budget for the returned output tails. Defaults to 2000."
+                    }
+                },
+                "required": ["task_ids"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::new(vec![ToolCapability::TaskRead]),
+            ToolExposure::Direct,
+            RendererHint::Shell,
+            true,
+        ),
+        BuiltinExecutor::TaskWait,
     ));
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
@@ -1801,23 +1876,31 @@ impl Tool for BuiltinTool {
             }
             BuiltinExecutor::Glob => glob::execute(request, ctx.cwd, ctx.max_output_bytes()),
             BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes()),
-            BuiltinExecutor::Bash => bash::execute_with_policy_roots_or_cancel_with_profile(
+            // `bash` is the single command entry point and is always executed
+            // by the runtime-owned terminal service, which owns process
+            // identity, lifetime, and output retention. This arm is the
+            // fail-closed fallback for a caller that bypassed the runtime.
+            BuiltinExecutor::Bash => ToolResult::failed(
                 request,
-                ctx.cwd,
-                &ctx.additional_working_directories,
-                ctx.output_truncation,
-                ctx.shell_timeout,
-                ctx.execution_profile,
-                || ctx.is_cancelled(),
-            ),
-            BuiltinExecutor::ExecCommand => ToolResult::failed(
-                request,
-                "exec_command must be executed by the runtime terminal service",
+                "bash must be executed by the runtime terminal service",
                 None,
             ),
-            BuiltinExecutor::WriteStdin => ToolResult::failed(
+            BuiltinExecutor::TaskReadOutput => ToolResult::failed(
                 request,
-                "write_stdin must be executed by the runtime terminal service",
+                "task_read_output must be executed by the runtime terminal service",
+                None,
+            ),
+            BuiltinExecutor::TaskSendInput => ToolResult::failed(
+                request,
+                "task_send_input must be executed by the runtime terminal service",
+                None,
+            ),
+            BuiltinExecutor::TaskWait => {
+                ToolResult::failed(request, "task_wait must be executed by the runtime", None)
+            }
+            BuiltinExecutor::SubagentMessage => ToolResult::failed(
+                request,
+                "subagent_message must be executed by the runtime",
                 None,
             ),
             BuiltinExecutor::Edit => {
@@ -1833,11 +1916,6 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::Subagent => ToolResult::failed(
                 request,
                 "subagent tool must be executed by the runtime",
-                None,
-            ),
-            BuiltinExecutor::SubagentStatus => ToolResult::failed(
-                request,
-                "subagent_status tool must be executed by the runtime",
                 None,
             ),
             BuiltinExecutor::TaskList => ToolResult::failed(
@@ -1907,14 +1985,15 @@ enum BuiltinExecutor {
     Glob,
     Grep,
     Bash,
-    ExecCommand,
-    WriteStdin,
+    TaskReadOutput,
+    TaskSendInput,
+    TaskWait,
+    SubagentMessage,
     Edit,
     WriteFile,
     GitStatus,
     WebSearch,
     Subagent,
-    SubagentStatus,
     TaskList,
     TaskStop,
     WorkflowDraft,
@@ -2339,7 +2418,6 @@ mod tests {
             "glob",
             "grep",
             "git_status",
-            "subagent_status",
             "task_list",
             "workflow_read_messages",
             "workflow_list_tasks",
@@ -2442,8 +2520,9 @@ mod tests {
                 "list_skills",
                 "read_file",
                 "read_skill",
-                "subagent_status",
                 "task_list",
+                "task_read_output",
+                "task_wait",
                 "workflow_list_tasks",
                 "workflow_read_messages",
             ]
@@ -2736,24 +2815,67 @@ mod tests {
     }
 
     #[test]
-    fn unified_exec_tools_are_model_visible_and_serialized() {
+    fn bash_is_the_only_model_visible_command_entry_point() {
         let registry = default_tool_registry();
-        let exec = registry.resolve("exec_command").expect("exec_command");
-        let write = registry.resolve("write_stdin").expect("write_stdin");
 
-        assert!(exec.tool.spec().exposure.is_model_visible());
-        assert!(write.tool.spec().exposure.is_model_visible());
-        assert_eq!(exec.tool.action_kind(), ActionKind::Shell);
-        assert_eq!(write.tool.action_kind(), ActionKind::Read);
         assert!(
-            !exec
-                .tool
-                .is_concurrent_safe(&request(ToolName::ExecCommand, r#"{"cmd":"sleep 1"}"#,))
+            registry.resolve("exec_command").is_none(),
+            "exec_command must not survive as a second start entry point"
         );
-        assert!(!write.tool.is_concurrent_safe(&request(
-            ToolName::WriteStdin,
-            r#"{"session_id":"shell-1"}"#,
-        )));
+        assert!(
+            registry.resolve("write_stdin").is_none(),
+            "write_stdin mixed writing with reading and waiting"
+        );
+
+        let bash = registry.resolve("bash").expect("bash");
+        assert!(bash.tool.spec().exposure.is_model_visible());
+        assert_eq!(bash.tool.action_kind(), ActionKind::Shell);
+        assert!(
+            !bash
+                .tool
+                .is_concurrent_safe(&request(ToolName::Bash, r#"{"command":"sleep 1"}"#,))
+        );
+
+        let command_starters = registry
+            .model_visible_tools()
+            .filter(|tool| tool.action_kind() == ActionKind::Shell)
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            command_starters,
+            vec!["bash".to_string()],
+            "exactly one model-visible tool may start a process"
+        );
+    }
+
+    #[test]
+    fn bash_schema_separates_waiting_from_the_execution_deadline() {
+        let registry = default_tool_registry();
+        let bash = registry.get("bash").expect("bash");
+        let properties = bash.spec().input_schema["properties"]
+            .as_object()
+            .expect("bash properties");
+
+        for field in [
+            "command",
+            "workdir",
+            "terminal",
+            "yield_time_ms",
+            "timeout_ms",
+            "lifetime",
+            "max_output_tokens",
+        ] {
+            assert!(properties.contains_key(field), "bash is missing {field}");
+        }
+        assert!(
+            !properties.contains_key("run_in_background"),
+            "every command can outlive the call; a background flag would imply otherwise"
+        );
+        assert_eq!(
+            bash.spec().input_schema["required"],
+            json!(["command"]),
+            "only the command itself is required"
+        );
     }
 
     #[test]
@@ -2770,12 +2892,22 @@ mod tests {
         assert!(workflow.spec().input_schema["properties"]["tokenBudget"].is_object());
 
         let subagent = registry.get("subagent").expect("subagent tool");
-        let subagent_mode_description =
-            subagent.spec().input_schema["properties"]["mode"]["description"]
-                .as_str()
-                .expect("subagent mode description");
-        assert!(subagent_mode_description.contains("long-running"));
-        assert!(subagent_mode_description.contains("task_list"));
+        let properties = subagent.spec().input_schema["properties"]
+            .as_object()
+            .expect("subagent properties");
+        assert!(
+            !properties.contains_key("mode"),
+            "submission has one protocol; sync and async are not a model choice"
+        );
+        assert!(
+            properties.contains_key("deadline_ms"),
+            "a caller-set execution deadline is part of the submission contract"
+        );
+        let deadline = properties["deadline_ms"]["description"]
+            .as_str()
+            .expect("deadline description");
+        assert!(deadline.contains("queueing"), "{deadline}");
+        assert!(deadline.contains("never reset by a resume"), "{deadline}");
     }
 
     #[test]

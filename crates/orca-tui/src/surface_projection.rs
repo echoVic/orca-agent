@@ -7,8 +7,8 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::goal_types::ThreadGoal;
 use orca_core::plan_types::{PlanItem, PlanStatus};
 use orca_core::task_types::{
-    BackgroundTaskSummary, PendingToolCallSummary, TaskStatus, TaskType, WorkflowAgentTaskSummary,
-    WorkflowPhaseTaskSummary, WorkflowTaskProgress,
+    BackgroundTaskSummary, PendingToolCallSummary, TaskLifetime, TaskStatus, TaskType,
+    WorkflowAgentTaskSummary, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
 };
 use orca_core::workflow_types::{WorkflowAgentStatus, WorkflowRunStatus};
 use orca_runtime::surface::{
@@ -1519,6 +1519,7 @@ pub(crate) fn workflow_task_summaries(
                 task_type: task_type(task.task_type),
                 status: task_status(task.status),
                 is_backgrounded: task.backgrounded,
+                lifetime: TaskLifetime::Task,
                 description: task.description.as_str().to_string(),
                 created_at_ms: task.created_at.get(),
                 started_at_ms: task.started_at.map(UnixMillis::get),

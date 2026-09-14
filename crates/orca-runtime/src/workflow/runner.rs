@@ -172,6 +172,14 @@ pub struct WorkflowRunner {
     state: WorkflowStateStore,
     child_executor: ChildAgentExecutor<SharedEventBuffer>,
     progress_ingress: Option<Arc<dyn RuntimeWorkflowProgressIngress>>,
+    parent_budget: Option<crate::child_budget_ledger::ChildBudgetReservation>,
+    parent_budget_receipt: Arc<Mutex<WorkflowParentBudgetReceipt>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkflowParentBudgetReceipt {
+    usage: orca_core::budget::BudgetUsage,
+    complete: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -182,6 +190,8 @@ struct WorkflowExecutionCounters {
     settled_tokens: u64,
     reserved_tokens: u64,
     token_budget: Option<u64>,
+    settled_budget: orca_core::budget::BudgetUsage,
+    reserved_budget: orca_core::budget::BudgetUsage,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +224,7 @@ struct WorkflowChildAgentCallOutput {
     tool_events: Vec<WorkflowEvidenceToolEvent>,
     task: Option<WorkflowTaskLifecycleEvidence>,
     continuation: TaskContinuationSummary,
+    budget_usage: Option<orca_core::budget::BudgetUsage>,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +236,7 @@ struct WorkflowChildAgentCallError {
     tool_events: Vec<WorkflowEvidenceToolEvent>,
     task: Option<WorkflowTaskLifecycleEvidence>,
     continuation: Option<TaskContinuationSummary>,
+    budget_usage: Option<orca_core::budget::BudgetUsage>,
 }
 
 enum WorkflowChildWorktree {
@@ -338,6 +350,7 @@ impl From<io::Error> for WorkflowChildAgentCallError {
             tool_events: Vec::new(),
             task: None,
             continuation: None,
+            budget_usage: None,
         }
     }
 }
@@ -383,6 +396,7 @@ impl Write for SharedEventBuffer {
 #[derive(Debug)]
 struct WorkflowExecutionGate {
     token_budget: Option<u64>,
+    parent_budget: Option<orca_core::budget::BudgetSpec>,
     counters: Mutex<WorkflowExecutionCounters>,
     condvar: Condvar,
 }
@@ -391,6 +405,7 @@ impl WorkflowExecutionGate {
     fn new() -> Self {
         Self {
             token_budget: None,
+            parent_budget: None,
             counters: Mutex::new(WorkflowExecutionCounters::default()),
             condvar: Condvar::new(),
         }
@@ -405,9 +420,15 @@ impl WorkflowExecutionGate {
         };
         Self {
             token_budget: Some(token_budget),
+            parent_budget: None,
             counters: Mutex::new(counters),
             condvar: Condvar::new(),
         }
+    }
+
+    fn with_parent_budget(mut self, budget: Option<orca_core::budget::BudgetSpec>) -> Self {
+        self.parent_budget = budget;
+        self
     }
 
     fn begin_agent(
@@ -421,7 +442,7 @@ impl WorkflowExecutionGate {
             .counters
             .lock()
             .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
-        let reservation_tokens = loop {
+        let (reservation_tokens, budget_spec) = loop {
             if counters.total_agents >= max_agents_per_run {
                 return Err(io::Error::other(format!(
                     "maximum workflow agent count {max_agents_per_run} exceeded"
@@ -435,8 +456,19 @@ impl WorkflowExecutionGate {
                 continue;
             }
 
+            let budget_spec = match self.reserve_parent_budget(&counters, max_agents_per_run) {
+                Ok(spec) => spec,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    counters = self
+                        .condvar
+                        .wait(counters)
+                        .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let Some(token_budget) = self.token_budget else {
-                break 0;
+                break (0, budget_spec);
             };
             let settled_remaining = token_budget.saturating_sub(counters.settled_tokens);
             if settled_remaining == 0 {
@@ -451,7 +483,7 @@ impl WorkflowExecutionGate {
                 .max(1)
                 .min(settled_remaining);
             if requested <= available {
-                break requested;
+                break (requested, budget_spec);
             }
 
             counters = self
@@ -462,14 +494,97 @@ impl WorkflowExecutionGate {
         counters.total_agents += 1;
         counters.active_agents += 1;
         counters.reserved_tokens = counters.reserved_tokens.saturating_add(reservation_tokens);
+        if let Some(spec) = budget_spec {
+            counters
+                .reserved_budget
+                .merge(crate::child_budget_ledger::reserved(spec));
+        }
         counters.max_observed_concurrent_agents = counters
             .max_observed_concurrent_agents
             .max(counters.active_agents);
         Ok(WorkflowAgentPermit {
             gate: Arc::clone(self),
             reservation_tokens,
+            budget_spec,
             settled: false,
         })
+    }
+
+    fn reserve_parent_budget(
+        &self,
+        counters: &WorkflowExecutionCounters,
+        max_agents_per_run: u32,
+    ) -> io::Result<Option<orca_core::budget::BudgetSpec>> {
+        let Some(limit) = self.parent_budget else {
+            return Ok(None);
+        };
+        let budget_state = |max: Option<u64>, settled: u64, reserved: u64| match max {
+            Some(max) if settled >= max => 2,
+            Some(max) if settled.saturating_add(reserved) >= max => 1,
+            _ => 0,
+        };
+        let states = [
+            budget_state(
+                limit.max_turns.map(u64::from),
+                u64::from(counters.settled_budget.turns),
+                u64::from(counters.reserved_budget.turns),
+            ),
+            budget_state(
+                limit.max_tool_calls.map(u64::from),
+                u64::from(counters.settled_budget.tool_calls),
+                u64::from(counters.reserved_budget.tool_calls),
+            ),
+            budget_state(
+                limit.max_cost_usd_micros,
+                counters.settled_budget.cost_usd_micros,
+                counters.reserved_budget.cost_usd_micros,
+            ),
+        ];
+        if states.contains(&2) {
+            return Err(io::Error::other("workflow parent budget is exhausted"));
+        }
+        if states.contains(&1) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "workflow parent budget is temporarily reserved",
+            ));
+        }
+        let slots = u64::from(
+            max_agents_per_run
+                .saturating_sub(counters.total_agents)
+                .max(1),
+        );
+        let share = |max: Option<u64>, settled: u64, reserved: u64| {
+            max.map(|max| {
+                let remaining = max.saturating_sub(settled.saturating_add(reserved));
+                if remaining == 0 {
+                    0
+                } else {
+                    (remaining / slots).max(1)
+                }
+            })
+        };
+        let spec = orca_core::budget::BudgetSpec {
+            max_turns: share(
+                limit.max_turns.map(u64::from),
+                u64::from(counters.settled_budget.turns),
+                u64::from(counters.reserved_budget.turns),
+            )
+            .map(|value| value as u32),
+            max_tool_calls: share(
+                limit.max_tool_calls.map(u64::from),
+                u64::from(counters.settled_budget.tool_calls),
+                u64::from(counters.reserved_budget.tool_calls),
+            )
+            .map(|value| value as u32),
+            max_cost_usd_micros: share(
+                limit.max_cost_usd_micros,
+                counters.settled_budget.cost_usd_micros,
+                counters.reserved_budget.cost_usd_micros,
+            ),
+            max_wall_time_ms: limit.max_wall_time_ms,
+        };
+        Ok(Some(spec))
     }
 
     fn finish_agent(&self) {
@@ -499,6 +614,35 @@ impl WorkflowExecutionGate {
         Ok(())
     }
 
+    fn settle_agent_budget(
+        &self,
+        spec: Option<orca_core::budget::BudgetSpec>,
+        usage: orca_core::budget::BudgetUsage,
+    ) -> io::Result<()> {
+        let mut counters = self
+            .counters
+            .lock()
+            .map_err(|_| io::Error::other("workflow execution counters poisoned"))?;
+        if let Some(spec) = spec {
+            let reserved = crate::child_budget_ledger::reserved(spec);
+            counters.reserved_budget.turns = counters
+                .reserved_budget
+                .turns
+                .saturating_sub(reserved.turns);
+            counters.reserved_budget.tool_calls = counters
+                .reserved_budget
+                .tool_calls
+                .saturating_sub(reserved.tool_calls);
+            counters.reserved_budget.cost_usd_micros = counters
+                .reserved_budget
+                .cost_usd_micros
+                .saturating_sub(reserved.cost_usd_micros);
+            counters.settled_budget.merge(usage);
+        }
+        self.condvar.notify_all();
+        Ok(())
+    }
+
     fn is_exhausted(&self) -> io::Result<bool> {
         let counters = self
             .counters
@@ -524,6 +668,7 @@ impl WorkflowExecutionGate {
 struct WorkflowAgentPermit {
     gate: Arc<WorkflowExecutionGate>,
     reservation_tokens: u64,
+    budget_spec: Option<orca_core::budget::BudgetSpec>,
     settled: bool,
 }
 
@@ -532,9 +677,19 @@ impl WorkflowAgentPermit {
         (self.reservation_tokens > 0).then_some(self.reservation_tokens)
     }
 
-    fn settle_usage(&mut self, tokens: u64) -> io::Result<()> {
+    fn budget_spec(&self) -> Option<orca_core::budget::BudgetSpec> {
+        self.budget_spec
+    }
+
+    fn settle_usage(
+        &mut self,
+        tokens: u64,
+        budget_usage: Option<orca_core::budget::BudgetUsage>,
+    ) -> io::Result<()> {
         if !self.settled {
             self.gate.settle_agent(self.reservation_tokens, tokens)?;
+            self.gate
+                .settle_agent_budget(self.budget_spec, budget_usage.unwrap_or_default())?;
             self.settled = true;
         }
         Ok(())
@@ -545,6 +700,9 @@ impl Drop for WorkflowAgentPermit {
     fn drop(&mut self) {
         if !self.settled {
             let _ = self.gate.settle_agent(self.reservation_tokens, 0);
+            let _ = self
+                .gate
+                .settle_agent_budget(self.budget_spec, Default::default());
         }
         self.gate.finish_agent();
     }
@@ -562,6 +720,53 @@ impl WorkflowRunner {
             state,
             child_executor: execute_child_agent_loop,
             progress_ingress: None,
+            parent_budget: None,
+            parent_budget_receipt: Arc::new(Mutex::new(WorkflowParentBudgetReceipt {
+                usage: orca_core::budget::BudgetUsage::default(),
+                complete: true,
+            })),
+        }
+    }
+
+    pub(crate) fn with_parent_budget(
+        mut self,
+        reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
+    ) -> Self {
+        self.parent_budget = reservation;
+        self
+    }
+
+    fn record_parent_budget_usage(&self, usage: Option<orca_core::budget::BudgetUsage>) {
+        let mut receipt = self
+            .parent_budget_receipt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match usage {
+            Some(usage) => receipt.usage.merge(usage),
+            None => receipt.complete = false,
+        }
+    }
+
+    fn settle_parent_budget(&self) -> io::Result<()> {
+        let Some(reservation) = self.parent_budget.as_ref() else {
+            return Ok(());
+        };
+        let receipt = *self
+            .parent_budget_receipt
+            .lock()
+            .map_err(|_| io::Error::other("workflow parent budget receipt poisoned"))?;
+        if receipt.complete {
+            reservation.settle(receipt.usage)?;
+        }
+        Ok(())
+    }
+
+    fn fail_before_workflow_start(&self, error: io::Error) -> io::Error {
+        match self.settle_parent_budget() {
+            Ok(()) => error,
+            Err(settlement) => io::Error::other(format!(
+                "{error}; failed to release the unstarted workflow budget: {settlement}"
+            )),
         }
     }
 
@@ -636,9 +841,20 @@ impl WorkflowRunner {
             created_at_ms: _,
             prepared,
         } = launch;
-        let resumed_spent =
-            self.resumed_spent_tokens(prepared.request.input.resume_from_run_id.as_deref())?;
-        self.activate_prepared_run(&prepared)?;
+        let resumed_spent = self
+            .resumed_spent_tokens(prepared.request.input.resume_from_run_id.as_deref())
+            .map_err(|error| self.fail_before_workflow_start(error))?;
+        self.activate_prepared_run(&prepared)
+            .map_err(|error| self.fail_before_workflow_start(error))?;
+        if let Some(reservation) = &self.parent_budget {
+            reservation
+                .bind_task(&task_id)
+                .map_err(|error| self.fail_before_workflow_start(error))?;
+            self.tasks
+                .bind_child_budget(&task_id, reservation.clone())
+                .map_err(io::Error::other)
+                .map_err(|error| self.fail_before_workflow_start(error))?;
+        }
         let output = WorkflowOutput {
             status: "async_launched".to_string(),
             task_id: task_id.clone(),
@@ -655,17 +871,36 @@ impl WorkflowRunner {
                 .token_budget
                 .map(|total| WorkflowTokenBudget::from_total_and_spent(total, resumed_spent)),
         };
-        self.state.write_worker_record(
-            &run_id,
-            &WorkflowWorkerRecord {
-                pid: std::process::id(),
-                active: true,
-                started_at_ms: now_ms(),
-                completed_at_ms: None,
-            },
-        )?;
+        self.state
+            .write_worker_record(
+                &run_id,
+                &WorkflowWorkerRecord {
+                    pid: std::process::id(),
+                    active: true,
+                    started_at_ms: now_ms(),
+                    completed_at_ms: None,
+                },
+            )
+            .map_err(|error| self.fail_before_workflow_start(error))?;
         let runner = self.clone();
-        let handle = thread::spawn(move || runner.execute_prepared(prepared));
+        let worker_task_id = task_id.clone();
+        let handle = thread::Builder::new()
+            .name(format!("orca-workflow-{run_id}"))
+            .spawn(move || {
+                let result = runner.execute_prepared(prepared);
+                if let Err(error) = runner.settle_parent_budget() {
+                    let _ = runner.tasks.fail(
+                        &worker_task_id,
+                        format!("workflow parent budget settlement failed: {error}"),
+                    );
+                    return Err(error);
+                }
+                result
+            })
+            .map_err(|error| {
+                let _ = self.state.mark_worker_exited(&run_id);
+                self.fail_before_workflow_start(error)
+            })?;
 
         Ok(WorkflowBackgroundLaunch {
             task_id,
@@ -984,12 +1219,15 @@ impl WorkflowRunner {
         let mut failed_error = None;
         let mut completed_result = None;
         let resumed_spent = self.resumed_spent_tokens(resume_from.as_deref())?;
-        let gate = Arc::new(match request.input.token_budget {
-            Some(token_budget) => {
-                WorkflowExecutionGate::with_token_budget_and_spent(token_budget, resumed_spent)
-            }
-            None => WorkflowExecutionGate::new(),
-        });
+        let gate = Arc::new(
+            (match request.input.token_budget {
+                Some(token_budget) => {
+                    WorkflowExecutionGate::with_token_budget_and_spent(token_budget, resumed_spent)
+                }
+                None => WorkflowExecutionGate::new(),
+            })
+            .with_parent_budget(self.parent_budget.as_ref().map(|budget| budget.spec)),
+        );
         let ipc_paths = WorkflowHostIpcPaths {
             mailbox_path: self.state.mailbox_path(&run_id),
             task_lists_path: self.state.task_lists_path(&run_id),
@@ -1431,9 +1669,13 @@ impl WorkflowRunner {
                 continuation_selector
                     .as_ref()
                     .map(|continuation| continuation.continuation_id.as_str()),
+                permit.budget_spec(),
             ) {
                 Ok(child_output) => {
-                    permit.settle_usage(child_output.usage.total_tokens())?;
+                    permit.settle_usage(
+                        child_output.usage.total_tokens(),
+                        child_output.budget_usage,
+                    )?;
                     if gate.is_exhausted()? {
                         workflow_cancel.cancel();
                     }
@@ -1523,9 +1765,12 @@ impl WorkflowRunner {
                         tool_events,
                         task,
                         continuation,
+                        budget_usage,
                     } = error;
-                    permit
-                        .settle_usage(usage.map(UsageTotals::total_tokens).unwrap_or_default())?;
+                    permit.settle_usage(
+                        usage.map(UsageTotals::total_tokens).unwrap_or_default(),
+                        budget_usage,
+                    )?;
                     if gate.is_exhausted()? {
                         workflow_cancel.cancel();
                     }
@@ -1709,6 +1954,7 @@ impl WorkflowRunner {
         execution_policy: &WorkflowAgentExecutionPolicy,
         cancel: &CancelToken,
         resume_from: Option<&str>,
+        child_budget: Option<orca_core::budget::BudgetSpec>,
     ) -> Result<WorkflowChildAgentCallOutput, WorkflowChildAgentCallError> {
         let cwd = self
             .config
@@ -1744,15 +1990,36 @@ impl WorkflowRunner {
                     crate::subagent::SubagentIsolation::None
                 }
             });
-        let child_task = self.tasks.create_subagent_with_parent(
-            format!("workflow {}", call.call_path),
-            Some("workflow".to_string()),
-            Some(workflow_task_id.to_string()),
-        );
-        let child_task_id = child_task.id;
-        self.tasks
-            .mark_running(&child_task_id)
-            .map_err(|error| workflow_continuation_error(error))?;
+        let scope = self.tasks.execution_scope(&self.config.subagents.limits);
+        let submission = scope
+            .submit_subagent(
+                format!("workflow {}", call.call_path),
+                Some("workflow".to_string()),
+                Some(workflow_task_id.to_string()),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(|error| workflow_continuation_error(error.message()))?;
+        let child_task_id = submission.task_id;
+        loop {
+            if cancel.is_cancelled()
+                || self.tasks.is_cancelled(&child_task_id)
+                || self.tasks.deadline_expired(&child_task_id)
+            {
+                let _ = self.tasks.stop(
+                    &child_task_id,
+                    "workflow child cancelled before execution".into(),
+                );
+                return Err(workflow_continuation_error(
+                    "workflow child cancelled before execution".into(),
+                ));
+            }
+            if scope.acquire(&child_task_id, chrono::Utc::now().timestamp_millis())
+                == crate::execution_scope::Admission::Started
+            {
+                break;
+            }
+            scope.wait_for_capacity(Some(cancel), std::time::Duration::from_millis(50));
+        }
         let worktree_execution = prepare_workflow_child_worktree(source.as_ref(), isolation, cwd)
             .map_err(|error| {
             let _ = self.tasks.fail(&child_task_id, error.clone());
@@ -1760,8 +2027,11 @@ impl WorkflowRunner {
         })?;
         let child_cwd = worktree_execution.cwd().to_path_buf();
         let worktree_binding = worktree_execution.binding();
-        let (workflow_child_config, mcp_registry) =
+        let (mut workflow_child_config, mcp_registry) =
             Self::workflow_child_runtime_parts(&self.config, &self.delegation);
+        if let Some(child_budget) = child_budget {
+            workflow_child_config.budget = orca_core::config::BudgetConfig::from_spec(child_budget);
+        }
         let effective_model = workflow_child_config.model.as_option();
         let effective_cwd = child_cwd.display().to_string();
         let (compatibility_model, compatibility_hash) = match compute_resumable_model_compatibility(
@@ -1914,6 +2184,7 @@ impl WorkflowRunner {
                 lifecycle: Some(&mut lifecycle),
                 task_registry: Some(&self.tasks),
                 root_task_id: Some(&child_task_id),
+                child_task_id: Some(&child_task_id),
                 checkpoint_observer: Some(&checkpoint_observer),
                 permission_handler: None,
                 turn_id: None,
@@ -1925,6 +2196,7 @@ impl WorkflowRunner {
         let (result, child_cost_tracker) = match child {
             Ok(result) => result,
             Err(payload) => {
+                self.record_parent_budget_usage(None);
                 let mut message = format!(
                     "Workflow child panicked after execution started: {}. Inspect external state before retrying.",
                     panic_payload_message(payload)
@@ -1956,9 +2228,12 @@ impl WorkflowRunner {
                         .finish_task(RunStatus::Failed)
                         .map(workflow_task_lifecycle_evidence),
                     continuation,
+                    budget_usage: None,
                 });
             }
         };
+        self.record_parent_budget_usage(result.budget_usage);
+        let budget_usage = result.budget_usage;
         let task = lifecycle
             .finish_task(result.status)
             .map(workflow_task_lifecycle_evidence)
@@ -2002,6 +2277,7 @@ impl WorkflowRunner {
                             tool_events,
                             task,
                             continuation: Some(continuation),
+                            budget_usage,
                         });
                     }
                 }
@@ -2028,6 +2304,7 @@ impl WorkflowRunner {
                     tool_events,
                     task,
                     continuation,
+                    budget_usage,
                 })
             }
             _ => {
@@ -2070,6 +2347,7 @@ impl WorkflowRunner {
                     tool_events,
                     task,
                     continuation: Some(continuation),
+                    budget_usage,
                 })
             }
         }
@@ -2550,6 +2828,7 @@ fn workflow_continuation_error(message: String) -> WorkflowChildAgentCallError {
         tool_events: Vec::new(),
         task: None,
         continuation: None,
+        budget_usage: None,
     }
 }
 
@@ -3429,7 +3708,7 @@ mod tests {
         let policy = WorkflowAgentExecutionPolicy {
             max_agent_retries: 1,
             max_agent_tokens: None,
-            allowed_tools: Some(vec!["shell".to_string()]),
+            allowed_tools: Some(vec!["bash".to_string()]),
             tool_policy_label: Some("test-policy".to_string()),
         };
         let call = AgentCall {
@@ -3448,6 +3727,7 @@ mod tests {
                 &workflow_ipc,
                 &policy,
                 &cancel,
+                None,
                 None,
             )
             .expect("injected child executor should satisfy workflow agent call");
@@ -3506,13 +3786,13 @@ mod tests {
     fn workflow_execution_gate_stops_new_agents_at_run_token_budget() {
         let gate = Arc::new(WorkflowExecutionGate::with_token_budget_and_spent(100, 0));
         let mut first = gate.begin_agent(10, 2, None).expect("first agent");
-        first.settle_usage(80).expect("record first usage");
+        first.settle_usage(80, None).expect("record first usage");
         drop(first);
 
         let mut second = gate
             .begin_agent(10, 2, None)
             .expect("80 percent warning threshold must not stop work");
-        second.settle_usage(20).expect("record second usage");
+        second.settle_usage(20, None).expect("record second usage");
         drop(second);
 
         let error = gate
@@ -3548,7 +3828,7 @@ mod tests {
 
             assert!(started_rx.recv_timeout(Duration::from_millis(25)).is_err());
             first
-                .settle_usage(40)
+                .settle_usage(40, None)
                 .expect("settle the first agent usage");
             drop(first);
 
@@ -3562,6 +3842,261 @@ mod tests {
         let counters = gate.snapshot().expect("read gate counters");
         assert_eq!(counters.settled_tokens, 40);
         assert_eq!(counters.reserved_tokens, 0);
+    }
+
+    #[test]
+    fn workflow_parent_budget_waits_for_temporary_reservations_and_reuses_release() {
+        let gate = Arc::new(WorkflowExecutionGate::new().with_parent_budget(Some(
+            orca_core::budget::BudgetSpec {
+                max_turns: Some(2),
+                ..Default::default()
+            },
+        )));
+        let mut first = gate.begin_agent(4, 4, None).unwrap();
+        let second = gate.begin_agent(4, 4, None).unwrap();
+        assert_eq!(first.budget_spec().unwrap().max_turns, Some(1));
+        assert_eq!(second.budget_spec().unwrap().max_turns, Some(1));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker_gate = Arc::clone(&gate);
+        let worker = std::thread::spawn(move || {
+            let permit = worker_gate.begin_agent(4, 4, None).unwrap();
+            started_tx.send(permit.budget_spec()).unwrap();
+            permit
+        });
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err()
+        );
+        first.settle_usage(0, Some(Default::default())).unwrap();
+        drop(first);
+        assert_eq!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .max_turns,
+            Some(1)
+        );
+        drop(second);
+        drop(worker.join().unwrap());
+    }
+
+    #[test]
+    fn workflow_parent_budget_settles_exact_aggregate_and_keeps_missing_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = orca_core::budget::BudgetSpec {
+            max_turns: Some(10),
+            max_tool_calls: Some(20),
+            max_cost_usd_micros: Some(30_000),
+            ..Default::default()
+        };
+        let limit = orca_core::budget::BudgetSpec {
+            max_turns: Some(20),
+            max_tool_calls: Some(40),
+            max_cost_usd_micros: Some(60_000),
+            ..Default::default()
+        };
+        let settled_path = root.path().join("settled.json");
+        let settled = crate::child_budget_ledger::ChildBudgetReservation::reserve(
+            settled_path.clone(),
+            "workflow-settled".into(),
+            spec,
+            limit,
+            Default::default(),
+        )
+        .unwrap();
+        let runner = WorkflowRunner::new(
+            test_run_config(),
+            TaskRegistry::new("workflow-budget-aggregate".into()),
+            root.path().join("session"),
+        )
+        .with_parent_budget(Some(settled));
+        runner.record_parent_budget_usage(Some(orca_core::budget::BudgetUsage {
+            turns: 2,
+            tool_calls: 3,
+            cost_usd_micros: 4_000,
+            wall_time_ms: 0,
+        }));
+        runner.record_parent_budget_usage(Some(orca_core::budget::BudgetUsage {
+            turns: 1,
+            tool_calls: 2,
+            cost_usd_micros: 5_000,
+            wall_time_ms: 0,
+        }));
+        runner.settle_parent_budget().unwrap();
+        assert_eq!(
+            crate::child_budget_ledger::entries(&settled_path)
+                .unwrap()
+                .get("workflow-settled")
+                .unwrap()
+                .receipt,
+            Some(orca_core::budget::BudgetUsage {
+                turns: 3,
+                tool_calls: 5,
+                cost_usd_micros: 9_000,
+                wall_time_ms: 0,
+            })
+        );
+
+        let missing_path = root.path().join("missing.json");
+        let missing = crate::child_budget_ledger::ChildBudgetReservation::reserve(
+            missing_path.clone(),
+            "workflow-missing".into(),
+            spec,
+            limit,
+            Default::default(),
+        )
+        .unwrap();
+        let runner = WorkflowRunner::new(
+            test_run_config(),
+            TaskRegistry::new("workflow-budget-missing".into()),
+            root.path().join("missing-session"),
+        )
+        .with_parent_budget(Some(missing));
+        runner.record_parent_budget_usage(None);
+        runner.settle_parent_budget().unwrap();
+        assert!(
+            crate::child_budget_ledger::entries(&missing_path)
+                .unwrap()
+                .get("workflow-missing")
+                .unwrap()
+                .receipt
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workflow_child_execution_settles_its_receipt_into_the_parent_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(root.path().to_path_buf());
+        let spec = orca_core::budget::BudgetSpec {
+            max_turns: Some(4),
+            max_tool_calls: Some(5),
+            max_cost_usd_micros: Some(6_000),
+            ..Default::default()
+        };
+        let ledger = root.path().join("children.json");
+        let reservation = crate::child_budget_ledger::ChildBudgetReservation::reserve(
+            ledger.clone(),
+            "workflow-e2e".into(),
+            spec,
+            spec,
+            Default::default(),
+        )
+        .unwrap();
+        let tasks = TaskRegistry::new("workflow-budget-e2e".into());
+        let workflow = tasks.create_workflow(
+            "workflow-run-e2e".into(),
+            "budgeted".into(),
+            "budgeted".into(),
+            1,
+        );
+        reservation.bind_task(&workflow.id).unwrap();
+        tasks
+            .bind_child_budget(&workflow.id, reservation.clone())
+            .unwrap();
+        let runner =
+            WorkflowRunner::new(config, tasks.clone(), root.path().join("workflow-session"))
+                .with_child_executor(budgeted_workflow_child_executor)
+                .with_parent_budget(Some(reservation.clone()));
+        let call = AgentCall {
+            call_id: "budgeted-call".into(),
+            call_path: "main.agent".into(),
+            phase: Some("main".into()),
+            prompt: "budgeted child".into(),
+            opts: Value::Null,
+        };
+        runner
+            .run_child_agent_call(
+                &workflow.id,
+                &call,
+                &WorkflowIpcContext::new(),
+                &WorkflowAgentExecutionPolicy {
+                    max_agent_retries: 0,
+                    max_agent_tokens: None,
+                    allowed_tools: None,
+                    tool_policy_label: None,
+                },
+                &CancelToken::new(),
+                None,
+                Some(spec),
+            )
+            .unwrap();
+        runner.settle_parent_budget().unwrap();
+
+        assert_eq!(
+            reservation.bound_task().unwrap().as_deref(),
+            Some(workflow.id.as_str())
+        );
+        assert_eq!(
+            crate::child_budget_ledger::entries(&ledger)
+                .unwrap()
+                .get("workflow-e2e")
+                .unwrap()
+                .receipt,
+            Some(orca_core::budget::BudgetUsage {
+                turns: 1,
+                tool_calls: 2,
+                cost_usd_micros: 300,
+                wall_time_ms: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_failure_before_worker_start_refunds_parent_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("unstarted-workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'unstarted', description: 'unstarted', phases: [] };\nexport default 'done';",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(root.path().to_path_buf());
+        let spec = orca_core::budget::BudgetSpec {
+            max_turns: Some(2),
+            ..Default::default()
+        };
+        let ledger = root.path().join("children.json");
+        let reservation = crate::child_budget_ledger::ChildBudgetReservation::reserve(
+            ledger.clone(),
+            "workflow-unstarted".into(),
+            spec,
+            spec,
+            Default::default(),
+        )
+        .unwrap();
+        let runner = WorkflowRunner::new(
+            config,
+            TaskRegistry::new("workflow-unstarted".into()),
+            root.path().join("workflow-session"),
+        )
+        .with_parent_budget(Some(reservation));
+        let corrupt_resume = root
+            .path()
+            .join("workflow-session/workflow-runs/missing-run");
+        fs::create_dir_all(&corrupt_resume).unwrap();
+        fs::write(corrupt_resume.join("agent-cache.json"), b"{invalid").unwrap();
+
+        let error = runner
+            .launch_background(WorkflowLaunchRequest::from(WorkflowInput {
+                script_path: Some(script.display().to_string()),
+                resume_from_run_id: Some("missing-run".into()),
+                ..Default::default()
+            }))
+            .expect_err("missing resume state must fail before worker start");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            crate::child_budget_ledger::entries(&ledger)
+                .unwrap()
+                .get("workflow-unstarted")
+                .unwrap()
+                .receipt,
+            Some(Default::default())
+        );
     }
 
     #[test]
@@ -3653,6 +4188,7 @@ mod tests {
                     &policy,
                     &cancel,
                     None,
+                    None,
                 )
             });
             thread::sleep(Duration::from_millis(100));
@@ -3739,7 +4275,7 @@ mod tests {
         assert_eq!(request.prompt, "inspect injected runner");
         assert_eq!(
             request.allowed_tools.as_ref().map(|tools| tools.as_slice()),
-            Some(vec!["shell".to_string()].as_slice())
+            Some(vec!["bash".to_string()].as_slice())
         );
         assert_eq!(request.tool_policy_label.as_deref(), Some("test-policy"));
         assert!(request.workflow_ipc.is_some());
@@ -3748,6 +4284,29 @@ mod tests {
             final_message: Some("injected workflow child result".to_string()),
             error: None,
             budget_usage: None,
+        })
+    }
+
+    fn budgeted_workflow_child_executor(
+        config: &RunConfig,
+        request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, SharedEventBuffer>,
+        _cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        assert_eq!(request.prompt, "budgeted child");
+        assert_eq!(config.budget.max_turns, Some(4));
+        assert_eq!(config.budget.max_tool_calls, Some(5));
+        assert_eq!(config.budget.max_cost_usd_micros, Some(6_000));
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("budgeted result".into()),
+            error: None,
+            budget_usage: Some(orca_core::budget::BudgetUsage {
+                turns: 1,
+                tool_calls: 2,
+                cost_usd_micros: 300,
+                wall_time_ms: 9,
+            }),
         })
     }
 

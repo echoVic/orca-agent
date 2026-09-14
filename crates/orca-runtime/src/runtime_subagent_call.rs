@@ -37,6 +37,7 @@ use crate::child_agent_types::{
 };
 use crate::child_permission::{ChildPermissionHandler, ChildPermissionIdentity};
 use crate::cost::CostTracker;
+use crate::execution_scope::Admission;
 use crate::hooks::HookRunner;
 use crate::instructions::ProjectInstructions;
 use crate::lifecycle::{
@@ -76,6 +77,12 @@ pub(crate) struct RuntimeSubagentInvocation {
     pub(crate) agent_controller: Option<Arc<AgentController>>,
     pub(crate) batch_id: String,
     pub(crate) batch_size: u32,
+    /// The durable task record this invocation was submitted as.
+    ///
+    /// Set by the admission step that created it. The worker adopts this
+    /// record instead of creating a second one, so the task the model can see
+    /// and the task that consumes capacity are the same task.
+    pub(crate) submitted_task_id: Option<String>,
 }
 
 /// Synchronous child delivery boundary. The child retains the source event on
@@ -254,6 +261,7 @@ impl RuntimeSubagentInvocation {
             agent_controller,
             batch_id,
             batch_size,
+            submitted_task_id: None,
         }
     }
 }
@@ -284,16 +292,271 @@ struct RuntimeSubagentWorker {
     join: thread::JoinHandle<RuntimeSubagentCallOutput>,
 }
 
+/// A child that was accepted and is waiting for an execution lease.
+///
+/// A queued child has no thread and no process: everything it needs to start
+/// later lives here, and nothing about it exists in the operating system until
+/// the scope grants it a lease.
+struct PendingSubagentWorker {
+    index: usize,
+    invocation: Box<RuntimeSubagentInvocation>,
+    task_id: String,
+    tool_id: String,
+    description: String,
+}
+
+/// What starting one child produced.
+struct SpawnOutcome {
+    /// The child never started; the caller reports this in place of a result.
+    immediate: Option<RuntimeSubagentCallOutput>,
+    /// The started event could not be delivered.
+    event_error: Option<io::Error>,
+}
+
 pub(crate) struct RuntimeSubagentBatch {
     cancel: CancelToken,
+    registry: TaskRegistry,
+    limits: orca_core::subagent_config::SubagentLimits,
+    /// The task that dispatched these children: their parent in the task tree.
+    /// `None` when the root session dispatches, in which case the children
+    /// hang off the root task.
+    parent_task_id: Option<String>,
+    /// The root task, used as the parent when the dispatcher is the root.
+    root_task_id: Option<String>,
     workers: Vec<RuntimeSubagentWorker>,
+    pending: Vec<PendingSubagentWorker>,
+}
+
+/// How long a waiting batch sleeps before looking again.
+///
+/// Wakeups come from the scope arbiter on every capacity change; this only
+/// bounds how long a missed announcement, a panicking worker, or a cancelled
+/// parent can go unnoticed. It is not a deadline and never cancels work.
+const BATCH_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn enqueue_accepted_subagent(
+    mut invocation: RuntimeSubagentInvocation,
+    id: String,
+) -> io::Result<()> {
+    let registry = invocation.task_registry.clone();
+    let limits = invocation.config.subagents.limits;
+    let mut budget_guard = crate::child_budget_ledger::PendingChildBudget::new(
+        invocation.request.budget_reservation.clone(),
+    );
+    invocation.submitted_task_id = Some(id.clone());
+    invocation.request.mode = crate::subagent::SubagentMode::Sync;
+    if invocation.request.resume_from.is_some() {
+        invocation.agent_controller = None;
+    }
+    let worker_registry = registry.clone();
+    let worker_id = id.clone();
+    registry
+        .scope_arbiter()
+        .enqueue(registry.clone(), id, limits, move || {
+            if let Err(error) = worker_registry.mark_subagent_execution_started(&worker_id) {
+                let _ = worker_registry.fail(&worker_id, error);
+                return;
+            }
+            budget_guard.start();
+            let cancel = worker_registry
+                .get(&worker_id)
+                .map(|task| task.control.cancel.clone())
+                .unwrap_or_default();
+            let mut lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{worker_id}"));
+            let started = lifecycle.start_task(RuntimeTaskKind::Subagent).clone();
+            let output = run_subagent_worker(invocation, lifecycle, started, cancel);
+            if let Some(reservation) = &budget_guard.reservation {
+                let receipt = output.child_budget_usage.or_else(|| {
+                    (output.result.terminal().started
+                        == orca_core::tool_types::ToolInvocationStarted::No)
+                        .then_some(orca_core::budget::BudgetUsage::default())
+                });
+                if let Some(usage) = receipt
+                    && let Err(error) = reservation.settle(usage)
+                {
+                    let _ = worker_registry.fail(
+                        &worker_id,
+                        format!("child budget settlement failed: {error}"),
+                    );
+                }
+            }
+            if let Some(error) = output.event_error {
+                let _ = worker_registry.fail(&worker_id, error);
+            }
+        })
+}
+
+/// Reattach durable, never-started launch intents to the process-local
+/// dispatcher before the owner asks the model for more work.
+///
+/// A task whose execution-start bit was persisted is deliberately excluded:
+/// after a crash its side effects are indeterminate and replay would violate
+/// at-most-once execution. Policy is also revalidated at recovery time. Any
+/// change fails closed instead of silently retaining revoked permissions or
+/// expanding the original delegation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recover_queued_subagent_launches(
+    config: &RunConfig,
+    mcp_registry: &McpRegistry,
+    hooks: &HookRunner,
+    child_executor: ChildAgentExecutor<io::Sink>,
+    activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
+    permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+    task_registry: &TaskRegistry,
+    owner: Option<&str>,
+    agent_controller: Option<Arc<AgentController>>,
+) -> io::Result<usize> {
+    let launches = task_registry
+        .queued_subagent_launches(owner)
+        .map_err(io::Error::other)?;
+    let current_policy = DelegationSnapshot::from_config(config);
+    let mut recovered = 0;
+    for (task_id, intent) in launches {
+        if !queued_policy_is_unchanged(&intent.request, &current_policy) {
+            task_registry
+                .fail(
+                    &task_id,
+                    "queued subagent policy changed before execution; submit it again under the current policy"
+                        .into(),
+                )
+                .map_err(io::Error::other)?;
+            continue;
+        }
+        let instructions = crate::instructions::load_for_cwd_or_default(&intent.cwd);
+        let memory = crate::memory::load_for_cwd(&intent.cwd);
+        let invocation = RuntimeSubagentInvocation::snapshot(
+            intent.tool_request,
+            intent.request,
+            config,
+            &intent.cwd,
+            &instructions,
+            &memory,
+            mcp_registry,
+            hooks,
+            None,
+            intent.child_depth,
+            child_executor,
+            activity_ingress.clone(),
+            permission_handler.clone(),
+            task_registry,
+            owner,
+            agent_controller.clone(),
+            intent.batch_id,
+            intent.batch_size,
+        );
+        enqueue_accepted_subagent(invocation, task_id)?;
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
+fn queued_policy_is_unchanged(request: &SubagentRequest, current: &DelegationSnapshot) -> bool {
+    request.delegation.as_ref() == Some(current)
 }
 
 impl RuntimeToolCallRuntime {
-    pub(crate) fn start_subagent_batch(&self, cancel: &CancelToken) -> RuntimeSubagentBatch {
+    pub(crate) fn start_subagent_batch(
+        &self,
+        cancel: &CancelToken,
+        registry: &TaskRegistry,
+        limits: orca_core::subagent_config::SubagentLimits,
+        parent_task_id: Option<&str>,
+        root_task_id: Option<&str>,
+    ) -> RuntimeSubagentBatch {
         RuntimeSubagentBatch {
             cancel: cancel.clone(),
+            registry: registry.clone(),
+            limits: limits.normalized(),
+            parent_task_id: parent_task_id.map(str::to_string),
+            root_task_id: root_task_id.map(str::to_string),
             workers: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn submit_background_subagent(
+        &self,
+        invocation: RuntimeSubagentInvocation,
+    ) -> RuntimeSubagentExecution {
+        let registry = invocation.task_registry.clone();
+        let limits = invocation.config.subagents.limits;
+        let tool_request = invocation.tool_request.clone();
+        let description = invocation.request.description.clone();
+        let launch_intent = crate::tasks::QueuedSubagentLaunchIntent {
+            schema_version: crate::tasks::QueuedSubagentLaunchIntent::SCHEMA_VERSION,
+            tool_request: tool_request.clone(),
+            request: invocation.request.clone(),
+            cwd: invocation.cwd.clone(),
+            child_depth: invocation.child_depth,
+            batch_id: invocation.batch_id.clone(),
+            batch_size: invocation.batch_size,
+        };
+        let submission = registry
+            .execution_scope(&limits)
+            .submit_subagent_with_intent(
+                description.clone(),
+                serialized_subagent_type(&invocation.request.subagent_type),
+                invocation.root_task_id.clone(),
+                now_unix_ms(),
+                Some(launch_intent),
+            );
+        let result = match submission {
+            Err(error) => ToolResult::failed_before_start(&tool_request, error.message(), None),
+            Ok(submission) if submission.cancelled => {
+                ToolResult::cancelled_before_start(&tool_request, "parent cancelled")
+            }
+            Ok(submission) => {
+                let id = submission.task_id;
+                registry.mark_subagent_result_pending(&id);
+                if let Some(reservation) = &invocation.request.budget_reservation {
+                    if let Err(error) = reservation.bind_task(&id).and_then(|_| {
+                        registry
+                            .bind_child_budget(&id, reservation.clone())
+                            .map_err(io::Error::other)
+                    }) {
+                        let _ = registry.fail(&id, error.to_string());
+                        return RuntimeSubagentExecution {
+                            output: failed_before_start(invocation, error.to_string()),
+                            event_error: None,
+                        };
+                    }
+                }
+                if let Some(ms) = invocation.request.deadline_ms {
+                    registry.set_deadline_at(
+                        &id,
+                        now_unix_ms().saturating_add(ms.min(i64::MAX as u64) as i64),
+                        "caller deadline",
+                    );
+                }
+                let status = if submission.admission == Admission::Started {
+                    "running"
+                } else {
+                    "queued"
+                };
+                let payload = serde_json::json!({"task_id": id, "agent_id": id, "accepted": true, "status": status});
+                let scheduled = enqueue_accepted_subagent(invocation, id.clone());
+                match scheduled {
+                    Ok(()) => ToolResult::running(&tool_request, payload.to_string(), false),
+                    Err(error) => {
+                        let _ = registry.fail(&id, error.to_string());
+                        ToolResult::failed_before_start(&tool_request, error.to_string(), None)
+                    }
+                }
+            }
+        };
+        RuntimeSubagentExecution {
+            output: RuntimeSubagentCallOutput {
+                tool_request,
+                description,
+                result,
+                task: None,
+                status: RunStatus::Success,
+                event_output: None,
+                event_error: None,
+                cost_tracker: CostTracker::new(None),
+                child_budget_usage: None,
+            },
+            event_error: None,
         }
     }
 
@@ -303,11 +566,36 @@ impl RuntimeToolCallRuntime {
         cancel: &CancelToken,
         publish_started: impl FnOnce(&RuntimeTaskLifecycle) -> io::Result<()>,
     ) -> RuntimeSubagentExecution {
-        let mut batch = self.start_subagent_batch(cancel);
-        let admission = batch.admit(0, invocation, publish_started);
+        if invocation.request.mode == crate::subagent::SubagentMode::Async {
+            if cancel.is_cancelled() {
+                return RuntimeSubagentExecution {
+                    output: cancelled_before_start(invocation),
+                    event_error: None,
+                };
+            }
+            return self.submit_background_subagent(invocation);
+        }
+        let mut publish_started = Some(publish_started);
+        let registry = invocation.task_registry.clone();
+        let limits = invocation.config.subagents.limits;
+        let root_task_id = invocation.root_task_id.clone();
+        let mut batch =
+            self.start_subagent_batch(cancel, &registry, limits, None, root_task_id.as_deref());
+        let admission = batch.admit(0, invocation, |task| match publish_started.take() {
+            Some(publish) => publish(task),
+            None => Ok(()),
+        });
         let mut output = admission.immediate.map(|(_, output)| output);
-        let event_error = admission.event_error;
-        if let Some((_, completed)) = batch.finish().into_iter().next() {
+        let mut event_error = admission.event_error;
+        let (completed, late_error) =
+            batch.finish(&mut |_, task, _, _| match publish_started.take() {
+                Some(publish) => publish(task),
+                None => Ok(()),
+            });
+        if event_error.is_none() {
+            event_error = late_error;
+        }
+        if let Some((_, completed)) = completed.into_iter().next() {
             output = Some(completed);
         }
         RuntimeSubagentExecution {
@@ -323,6 +611,12 @@ pub(crate) struct RuntimeSubagentExecution {
 }
 
 impl RuntimeSubagentBatch {
+    /// Accepts one child, then starts it or leaves it queued.
+    ///
+    /// The record is created before any capacity is reserved, so an accepted
+    /// child is observable and steerable while it waits, and a restart can
+    /// rebuild the queue from it. A capacity refusal creates nothing: it is a
+    /// boundary, not a queue position.
     pub(crate) fn admit(
         &mut self,
         index: usize,
@@ -346,18 +640,133 @@ impl RuntimeSubagentBatch {
                 event_error: None,
             };
         }
-        let mut lifecycle =
-            RuntimeSessionLifecycle::new(format!("subagent-{}", invocation.tool_request.id));
-        let started_task = lifecycle.start_task(RuntimeTaskKind::Subagent).clone();
-        if let Err(error) = publish_started(&started_task) {
+        let scope = self.registry.execution_scope(&self.limits);
+        let parent = self
+            .parent_task_id
+            .clone()
+            .or_else(|| self.root_task_id.clone());
+        let launch_intent = crate::tasks::QueuedSubagentLaunchIntent {
+            schema_version: crate::tasks::QueuedSubagentLaunchIntent::SCHEMA_VERSION,
+            tool_request: invocation.tool_request.clone(),
+            request: invocation.request.clone(),
+            cwd: invocation.cwd.clone(),
+            child_depth: invocation.child_depth,
+            batch_id: invocation.batch_id.clone(),
+            batch_size: invocation.batch_size,
+        };
+        let submission = match scope.submit_subagent_with_intent(
+            invocation.request.description.clone(),
+            serialized_subagent_type(&invocation.request.subagent_type),
+            parent,
+            now_unix_ms(),
+            Some(launch_intent),
+        ) {
+            Ok(submission) => submission,
+            Err(refusal) => {
+                return RuntimeSubagentAdmission {
+                    immediate: Some((index, failed_before_start(invocation, refusal.message()))),
+                    event_error: None,
+                };
+            }
+        };
+        let task_id = submission.task_id;
+        // The deadline is armed at submission, so a child that expires while
+        // it is queued is stopped instead of being started late.
+        arm_subagent_deadline(&self.registry, &task_id, invocation.request.deadline_ms);
+        let tool_id = invocation.tool_request.id.clone();
+        let description = invocation.request.description.clone();
+        if submission.cancelled {
+            // The tree was already cancelled, so this child can never run; the
+            // submission already settled its record.
             return RuntimeSubagentAdmission {
                 immediate: Some((
                     index,
-                    failed_before_start(
-                        invocation,
-                        "subagent dispatch stopped because its started event could not be delivered",
-                    ),
+                    cancelled_task_output(invocation, &self.registry, &task_id),
                 )),
+                event_error: None,
+            };
+        }
+        let mut once = Some(publish_started);
+        let mut publish =
+            |_index: usize, task: &RuntimeTaskLifecycle, _: &str, _: &str| match once.take() {
+                Some(publish) => publish(task),
+                None => Ok(()),
+            };
+        match submission.admission {
+            Admission::Started => {
+                let outcome = self.spawn(
+                    index,
+                    invocation,
+                    task_id,
+                    tool_id,
+                    description,
+                    &mut publish,
+                );
+                RuntimeSubagentAdmission {
+                    immediate: outcome.immediate.map(|output| (index, output)),
+                    event_error: outcome.event_error,
+                }
+            }
+            Admission::Queued => {
+                self.pending.push(PendingSubagentWorker {
+                    index,
+                    invocation: Box::new(invocation),
+                    task_id,
+                    tool_id,
+                    description,
+                });
+                RuntimeSubagentAdmission {
+                    immediate: None,
+                    event_error: None,
+                }
+            }
+        }
+    }
+
+    /// Starts one child that holds a lease.
+    ///
+    /// A child that could not be started is reported through
+    /// [`SpawnOutcome::immediate`]; a started child is joined later, from
+    /// [`RuntimeSubagentBatch::finish`].
+    fn spawn(
+        &mut self,
+        index: usize,
+        mut invocation: RuntimeSubagentInvocation,
+        task_id: String,
+        tool_id: String,
+        description: String,
+        publish_started: &mut dyn FnMut(usize, &RuntimeTaskLifecycle, &str, &str) -> io::Result<()>,
+    ) -> SpawnOutcome {
+        if let Err(error) = self.registry.mark_subagent_execution_started(&task_id) {
+            let _ = self.registry.fail(&task_id, error.clone());
+            return SpawnOutcome {
+                immediate: Some(failed_before_start(invocation, error)),
+                event_error: None,
+            };
+        }
+        invocation.request.mode = crate::subagent::SubagentMode::Sync;
+        let mut lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{tool_id}"));
+        let started_task = lifecycle.start_task(RuntimeTaskKind::Subagent).clone();
+        if let Err(error) = publish_started(index, &started_task, &tool_id, &description) {
+            let message = "subagent dispatch stopped because its started event could not be \
+                           delivered";
+            let _ = self.registry.fail(&task_id, message.to_string());
+            return SpawnOutcome {
+                immediate: Some(RuntimeSubagentCallOutput {
+                    result: ToolResult::failed_before_start(
+                        &invocation.tool_request,
+                        message,
+                        None,
+                    ),
+                    tool_request: invocation.tool_request.clone(),
+                    description: invocation.request.description.clone(),
+                    task: Some(started_task.with_status(RuntimeTaskStatus::Failed)),
+                    status: RunStatus::Failed,
+                    event_output: None,
+                    event_error: Some(message.to_string()),
+                    cost_tracker: CostTracker::new(None),
+                    child_budget_usage: None,
+                }),
                 event_error: Some(error),
             };
         }
@@ -384,21 +793,19 @@ impl RuntimeSubagentBatch {
                 });
             if let Err(error) = watcher {
                 let message = format!("failed to watch parent cancellation: {error}");
-                return RuntimeSubagentAdmission {
-                    immediate: Some((
-                        index,
-                        RuntimeSubagentCallOutput {
-                            result: ToolResult::failed_before_start(&panic_request, &message, None),
-                            tool_request: panic_request,
-                            description: panic_description,
-                            task: Some(panic_task.with_status(RuntimeTaskStatus::Failed)),
-                            status: RunStatus::Failed,
-                            event_output: None,
-                            event_error: Some(message),
-                            cost_tracker: CostTracker::new(None),
-                            child_budget_usage: None,
-                        },
-                    )),
+                let _ = self.registry.fail(&task_id, message.clone());
+                return SpawnOutcome {
+                    immediate: Some(RuntimeSubagentCallOutput {
+                        result: ToolResult::failed_before_start(&panic_request, &message, None),
+                        tool_request: panic_request,
+                        description: panic_description,
+                        task: Some(panic_task.with_status(RuntimeTaskStatus::Failed)),
+                        status: RunStatus::Failed,
+                        event_output: None,
+                        event_error: Some(message),
+                        cost_tracker: CostTracker::new(None),
+                        child_budget_usage: None,
+                    }),
                     event_error: None,
                 };
             }
@@ -412,6 +819,10 @@ impl RuntimeSubagentBatch {
             .agent_controller
             .as_ref()
             .map(|_| worker_cancel.clone());
+        // The worker adopts the record this batch submitted instead of
+        // creating its own, so capacity accounting and the model's view of the
+        // task describe the same task.
+        invocation.submitted_task_id = Some(task_id.clone());
         let join = match thread::Builder::new()
             .name(format!("orca-subagent-{}", tool_request.id))
             .spawn(move || {
@@ -430,21 +841,19 @@ impl RuntimeSubagentBatch {
             Err(error) => {
                 watcher_cancel.cancel();
                 let message = format!("failed to start subagent worker: {error}");
-                return RuntimeSubagentAdmission {
-                    immediate: Some((
-                        index,
-                        RuntimeSubagentCallOutput {
-                            tool_request: panic_request.clone(),
-                            description: panic_description,
-                            task: Some(panic_task.with_status(RuntimeTaskStatus::Failed)),
-                            status: RunStatus::Failed,
-                            result: ToolResult::failed_before_start(&panic_request, &message, None),
-                            event_output: None,
-                            event_error: Some(message),
-                            cost_tracker: CostTracker::new(None),
-                            child_budget_usage: None,
-                        },
-                    )),
+                let _ = self.registry.fail(&task_id, message.clone());
+                return SpawnOutcome {
+                    immediate: Some(RuntimeSubagentCallOutput {
+                        tool_request: panic_request.clone(),
+                        description: panic_description,
+                        task: Some(panic_task.with_status(RuntimeTaskStatus::Failed)),
+                        status: RunStatus::Failed,
+                        result: ToolResult::failed_before_start(&panic_request, &message, None),
+                        event_output: None,
+                        event_error: Some(message),
+                        cost_tracker: CostTracker::new(None),
+                        child_budget_usage: None,
+                    }),
                     event_error: None,
                 };
             }
@@ -456,46 +865,292 @@ impl RuntimeSubagentBatch {
             started_task: panic_task,
             join,
         });
-        RuntimeSubagentAdmission {
+        SpawnOutcome {
             immediate: None,
             event_error: None,
         }
     }
 
-    pub(crate) fn finish(self) -> Vec<(usize, RuntimeSubagentCallOutput)> {
-        self.workers
-            .into_iter()
-            .map(|worker| {
-                let output = match worker.join.join() {
-                    Ok(output) => output,
-                    Err(payload) => {
-                        let error = format!(
-                            "Subagent worker panicked after execution started: {}. Inspect external state before retrying.",
-                            panic_payload_message(payload)
-                        );
-                        RuntimeSubagentCallOutput {
-                            result: ToolResult::indeterminate_after_start(
-                                &worker.tool_request,
-                                &error,
-                            ),
-                            tool_request: worker.tool_request,
-                            description: worker.description,
-                            task: Some(
-                                worker
-                                    .started_task
-                                    .with_status(RuntimeTaskStatus::Failed),
-                            ),
-                            status: RunStatus::Failed,
-                            event_output: None,
-                            event_error: Some(error),
-                            cost_tracker: CostTracker::new(None),
-            child_budget_usage: None,
-                        }
+    /// Waits for every child, admitting queued ones as leases free.
+    ///
+    /// A parent that blocks here gives up its own execution lease first, and
+    /// takes one again before it continues: waiting is not running, and coming
+    /// back from a wait is not a way around the capacity bound. That is what
+    /// lets a tree make progress when every running task is a parent waiting
+    /// for a descendant.
+    pub(crate) fn finish(
+        &mut self,
+        publish_started: &mut dyn FnMut(usize, &RuntimeTaskLifecycle, &str, &str) -> io::Result<()>,
+    ) -> (Vec<(usize, RuntimeSubagentCallOutput)>, Option<io::Error>) {
+        // The scope borrows a registry handle of its own so the wait loop can
+        // still take `&mut self` to start and reap children.
+        let registry = self.registry.clone();
+        let scope = registry.execution_scope(&self.limits);
+        let mut completed: Vec<(usize, RuntimeSubagentCallOutput)> = Vec::new();
+        let mut event_error = None;
+        let waiting_parent = self
+            .parent_task_id
+            .clone()
+            .filter(|_| !self.pending.is_empty() || !self.workers.is_empty());
+        if let Some(parent) = waiting_parent.as_ref() {
+            self.registry
+                .requeue_for_resume(parent, crate::task_view::WaitReason::Dependency);
+        }
+        loop {
+            self.collect_finished(&mut completed);
+            let mut started = Vec::new();
+            self.start_pending(&scope, publish_started, &mut started, &mut event_error);
+            completed.extend(started);
+            if self.workers.is_empty() && self.pending.is_empty() {
+                break;
+            }
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            let _ = scope.wait_for_capacity(Some(&self.cancel), BATCH_WAIT_SLICE);
+        }
+        self.collect_finished(&mut completed);
+        for worker in std::mem::take(&mut self.workers) {
+            completed.push((worker.index, join_worker(worker)));
+        }
+        // Every accepted child has a result, including one that never got a
+        // lease: the batch reports it as not started and closes the record, so
+        // it neither looks runnable later nor leaves a queue position behind.
+        for item in std::mem::take(&mut self.pending) {
+            if let Some(output) = self.abandoned_output(&item) {
+                completed.push((item.index, output));
+                continue;
+            }
+            let _ = self.registry.stop(
+                &item.task_id,
+                "the batch ended before this task could start".to_string(),
+            );
+            completed.push((item.index, not_started_output(&item)));
+        }
+        if let Some(parent) = waiting_parent.as_ref() {
+            self.wait_for_parent_lease(&scope, parent);
+        }
+        (completed, event_error)
+    }
+
+    /// Starts whatever pending children the scope will admit now.
+    ///
+    /// A child that was stopped, cancelled, or whose deadline passed while it
+    /// waited is reported instead of started: a queued task never begins after
+    /// the reason it was waiting has expired.
+    fn start_pending(
+        &mut self,
+        scope: &crate::execution_scope::ExecutionScope<'_>,
+        publish_started: &mut dyn FnMut(usize, &RuntimeTaskLifecycle, &str, &str) -> io::Result<()>,
+        started: &mut Vec<(usize, RuntimeSubagentCallOutput)>,
+        event_error: &mut Option<io::Error>,
+    ) {
+        let mut pending = Vec::new();
+        for item in std::mem::take(&mut self.pending) {
+            if let Some(output) = self.abandoned_output(&item) {
+                started.push((item.index, output));
+                continue;
+            }
+            match scope.acquire(&item.task_id, now_unix_ms()) {
+                Admission::Started => {
+                    let PendingSubagentWorker {
+                        index,
+                        invocation,
+                        task_id,
+                        tool_id,
+                        description,
+                    } = item;
+                    let outcome = self.spawn(
+                        index,
+                        *invocation,
+                        task_id,
+                        tool_id,
+                        description,
+                        publish_started,
+                    );
+                    if event_error.is_none() {
+                        *event_error = outcome.event_error;
                     }
-                };
-                (worker.index, output)
-            })
-            .collect()
+                    if let Some(output) = outcome.immediate {
+                        started.push((index, output));
+                    }
+                }
+                Admission::Queued => pending.push(item),
+            }
+        }
+        self.pending = pending;
+    }
+
+    /// The result for a queued child that must not start.
+    fn abandoned_output(&self, item: &PendingSubagentWorker) -> Option<RuntimeSubagentCallOutput> {
+        let record = self.registry.get(&item.task_id)?;
+        let cancelled = record.control.cancel.is_cancelled()
+            || matches!(record.status, orca_core::task_types::TaskStatus::Cancelled);
+        let stopped = matches!(
+            record.status,
+            orca_core::task_types::TaskStatus::Stopped
+                | orca_core::task_types::TaskStatus::Completed
+                | orca_core::task_types::TaskStatus::Failed
+        );
+        if !cancelled && !stopped {
+            return None;
+        }
+        let reason = record
+            .error
+            .clone()
+            .or(record.result.clone())
+            .unwrap_or_else(|| "the task was closed before it started".to_string());
+        let (status, result) = if cancelled {
+            (
+                RunStatus::Cancelled,
+                ToolResult::cancelled_before_start(&item.invocation.tool_request, &reason),
+            )
+        } else {
+            (
+                RunStatus::Failed,
+                ToolResult::failed_before_start(&item.invocation.tool_request, &reason, None),
+            )
+        };
+        Some(RuntimeSubagentCallOutput {
+            tool_request: item.invocation.tool_request.clone(),
+            description: item.invocation.request.description.clone(),
+            task: None,
+            status,
+            result,
+            event_output: None,
+            event_error: None,
+            cost_tracker: CostTracker::new(None),
+            child_budget_usage: None,
+        })
+    }
+
+    fn collect_finished(&mut self, completed: &mut Vec<(usize, RuntimeSubagentCallOutput)>) {
+        let mut remaining = Vec::new();
+        for worker in std::mem::take(&mut self.workers) {
+            if worker.join.is_finished() {
+                completed.push((worker.index, join_worker(worker)));
+            } else {
+                remaining.push(worker);
+            }
+        }
+        self.workers = remaining;
+    }
+
+    /// Takes a lease again before the parent continues past the wait.
+    ///
+    /// The parent is `queued` while it waits, so nothing else has to infer
+    /// that it is awake; it becomes `running` only when the scope admits it.
+    fn wait_for_parent_lease(
+        &self,
+        scope: &crate::execution_scope::ExecutionScope<'_>,
+        parent: &str,
+    ) {
+        loop {
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            match self.registry.get(parent) {
+                // The parent was stopped while it waited: the caller's own
+                // loop reports the cancellation instead of resuming.
+                None => return,
+                Some(record)
+                    if record.control.cancel.is_cancelled()
+                        || matches!(
+                            record.status,
+                            orca_core::task_types::TaskStatus::Stopped
+                                | orca_core::task_types::TaskStatus::Completed
+                                | orca_core::task_types::TaskStatus::Failed
+                                | orca_core::task_types::TaskStatus::Cancelled
+                        ) =>
+                {
+                    return;
+                }
+                Some(_) => {}
+            }
+            if scope.acquire(parent, now_unix_ms()) == Admission::Started {
+                return;
+            }
+            let _ = scope.wait_for_capacity(Some(&self.cancel), BATCH_WAIT_SLICE);
+        }
+    }
+}
+
+impl Drop for RuntimeSubagentBatch {
+    /// Nothing queued by this batch is left behind when it goes away.
+    ///
+    /// A child that was accepted but never started is stopped with a reason,
+    /// so it neither holds a queue position forever nor looks runnable after
+    /// the turn that submitted it has ended.
+    fn drop(&mut self) {
+        for item in std::mem::take(&mut self.pending) {
+            let _ = self.registry.stop(
+                &item.task_id,
+                "the submitting turn ended before this task could start".to_string(),
+            );
+        }
+    }
+}
+
+fn join_worker(worker: RuntimeSubagentWorker) -> RuntimeSubagentCallOutput {
+    match worker.join.join() {
+        Ok(output) => output,
+        Err(payload) => {
+            let error = format!(
+                "Subagent worker panicked after execution started: {}. Inspect external state before retrying.",
+                panic_payload_message(payload)
+            );
+            RuntimeSubagentCallOutput {
+                result: ToolResult::indeterminate_after_start(&worker.tool_request, &error),
+                tool_request: worker.tool_request,
+                description: worker.description,
+                task: Some(worker.started_task.with_status(RuntimeTaskStatus::Failed)),
+                status: RunStatus::Failed,
+                event_output: None,
+                event_error: Some(error),
+                cost_tracker: CostTracker::new(None),
+                child_budget_usage: None,
+            }
+        }
+    }
+}
+
+/// The result for a child that was accepted and never started.
+fn not_started_output(item: &PendingSubagentWorker) -> RuntimeSubagentCallOutput {
+    let message = "the task was accepted but did not start before the submitting turn ended";
+    RuntimeSubagentCallOutput {
+        result: ToolResult::cancelled_before_start(&item.invocation.tool_request, message),
+        tool_request: item.invocation.tool_request.clone(),
+        description: item.invocation.request.description.clone(),
+        task: None,
+        status: RunStatus::Cancelled,
+        event_output: None,
+        event_error: None,
+        cost_tracker: CostTracker::new(None),
+        child_budget_usage: None,
+    }
+}
+
+fn cancelled_task_output(
+    invocation: RuntimeSubagentInvocation,
+    registry: &TaskRegistry,
+    task_id: &str,
+) -> RuntimeSubagentCallOutput {
+    let message = registry
+        .get(task_id)
+        .and_then(|record| record.error.or(record.result))
+        .unwrap_or_else(|| {
+            "the task tree was already cancelled when this task was submitted".to_string()
+        });
+    RuntimeSubagentCallOutput {
+        result: ToolResult::cancelled_before_start(&invocation.tool_request, &message),
+        tool_request: invocation.tool_request,
+        description: invocation.request.description,
+        task: None,
+        status: RunStatus::Cancelled,
+        event_output: None,
+        event_error: None,
+        cost_tracker: CostTracker::new(None),
+        child_budget_usage: None,
     }
 }
 
@@ -517,6 +1172,7 @@ fn run_threaded_agent_worker(
         batch_size,
         task_registry,
         root_task_id,
+        submitted_task_id,
         ..
     } = invocation;
     let controller = agent_controller.expect("threaded agent branch requires controller");
@@ -525,12 +1181,19 @@ fn run_threaded_agent_worker(
         crate::subagent::SubagentMode::Sync => AgentRunMode::Sync,
         crate::subagent::SubagentMode::Async => AgentRunMode::Async,
     };
-    let (surface_activity, permission_handler, registry_task_id) = if mode == AgentRunMode::Sync
+    let (surface_activity, permission_handler, registry_task_id, launch_cancel) = if mode
+        == AgentRunMode::Sync
         && activity_ingress.is_some()
         && request.isolation == SubagentIsolation::None
     {
         if request.resume_from.is_some() {
             let message = "hosted_sync_resume_unsupported: synchronous hosted subagents cannot resume a continuation";
+            // The task was already accepted when this invocation was
+            // submitted, so a rejection here has to settle it: a record left
+            // behind would keep a queue position for work that never ran.
+            if let Some(task_id) = submitted_task_id.as_deref() {
+                let _ = task_registry.fail(task_id, message.to_string());
+            }
             return RuntimeSubagentCallOutput {
                 result: ToolResult::failed_before_start(&tool_request, message, None),
                 tool_request,
@@ -543,14 +1206,24 @@ fn run_threaded_agent_worker(
                 child_budget_usage: None,
             };
         }
-        let registry_task = task_registry.create_subagent_with_parent(
-            description.clone(),
-            serialized_subagent_type(&request.subagent_type),
-            root_task_id.clone(),
-        );
-        let registry_task_id = registry_task.id.clone();
+        // The admission step already recorded this task; adopting its id is
+        // what keeps one child from becoming two records. Only a caller that
+        // bypassed admission creates its own record here.
+        let registry_task_id = match submitted_task_id {
+            Some(task_id) => task_id,
+            None => {
+                let registry_task = task_registry.create_subagent_with_parent(
+                    description.clone(),
+                    serialized_subagent_type(&request.subagent_type),
+                    root_task_id.clone(),
+                );
+                arm_subagent_deadline(&task_registry, &registry_task.id, request.deadline_ms);
+                registry_task.id
+            }
+        };
         if let Err(error) = task_registry.mark_running(&registry_task_id) {
             let message = format!("failed to mark threaded subagent task running: {error}");
+            let _ = task_registry.fail(&registry_task_id, message.clone());
             return RuntimeSubagentCallOutput {
                 result: ToolResult::failed_before_start(&tool_request, &message, None),
                 tool_request,
@@ -563,19 +1236,26 @@ fn run_threaded_agent_worker(
                 child_budget_usage: None,
             };
         }
-        // Task controls are durable and may arrive through a different actor
-        // than this synchronous worker. Bridge the canonical registry cancel
-        // bit to the hosted child's cancel token so `task_stop` interrupts the
-        // real child instead of only changing a mirror row.
+        // Execute against the canonical task's own cancel token. `task_stop`
+        // flips this exact token, so there is no polling race between marking
+        // the task running and installing a cancellation watcher.
+        let task_cancel = task_registry
+            .get(&registry_task_id)
+            .expect("threaded subagent task exists after mark_running")
+            .control
+            .cancel;
+        // Parent cancellation remains a separate one-way edge. Stopping this
+        // child must never cancel its parent or a sibling.
         let registry_for_cancel = task_registry.clone();
-        let task_cancel = cancel.clone();
+        let parent_cancel = cancel.clone();
+        let watcher_task_cancel = task_cancel.clone();
         let task_id_for_cancel = registry_task_id.clone();
         let watcher = std::thread::Builder::new()
             .name(format!("orca-agent-cancel-{}", task_id_for_cancel))
             .spawn(move || {
                 loop {
-                    if registry_for_cancel.is_cancelled(&task_id_for_cancel) {
-                        task_cancel.cancel();
+                    if parent_cancel.is_cancelled() {
+                        watcher_task_cancel.cancel();
                         break;
                     }
                     let terminal =
@@ -625,6 +1305,7 @@ fn run_threaded_agent_worker(
                     Some(activity.surface_activity),
                     permission_handler,
                     Some(registry_task_id),
+                    task_cancel,
                 )
             }
             Err(error) => {
@@ -644,7 +1325,15 @@ fn run_threaded_agent_worker(
             }
         }
     } else {
-        (None, permission_handler, None)
+        // Without a surface ingress the child still is a task in this tree:
+        // admission recorded it, so it has to be marked running here. A record
+        // left `queued` while the child actually executes would keep a queue
+        // position it is not using and hide the lease it does hold.
+        let registry_task_id = submitted_task_id.map(|task_id| {
+            let _ = task_registry.mark_running(&task_id);
+            task_id
+        });
+        (None, permission_handler, registry_task_id, cancel.clone())
     };
     let launch_surface_activity = surface_activity.clone();
     let registry_agent_id = registry_task_id
@@ -652,13 +1341,14 @@ fn run_threaded_agent_worker(
         .unwrap_or_else(|| tool_request.id.clone());
     let launch = controller.launch(AgentLaunchRequest {
         agent_id: registry_agent_id,
+        task_registry: task_registry.clone(),
         description: description.clone(),
         prompt: request.prompt,
         model: request.model,
         subagent_type: request.subagent_type,
         mode,
         config: config.clone(),
-        cancel,
+        cancel: launch_cancel,
         // Subagents never inherit an interactive approval handler. The parent's
         // `RuntimeApprovalHandler` exists only as a non-'static borrow scoped to
         // the parent turn, so it cannot cross this worker boundary; the legacy
@@ -674,8 +1364,11 @@ fn run_threaded_agent_worker(
 
     match launch {
         Ok(launch) => {
+            if let Some(id) = registry_task_id.as_deref() {
+                let _ = task_registry.bind_subagent_thread(id, &launch.thread_id);
+            }
             let mut status = launch.status;
-            let output = if launch.running {
+            let mut output = if launch.running {
                 let agent_id = registry_task_id
                     .as_deref()
                     .unwrap_or(tool_request.id.as_str());
@@ -692,9 +1385,17 @@ fn run_threaded_agent_worker(
                     .unwrap_or_else(|| format!("agent {} completed", tool_request.id))
             };
             let schema_error = if status == RunStatus::Success {
-                request.schema.as_ref().and_then(|schema| {
-                    validate_subagent_output_schema(&description, Some(schema), &output).err()
-                })
+                match validate_subagent_output_schema(
+                    &description,
+                    request.schema.as_ref(),
+                    &output,
+                ) {
+                    Ok(normalized) => {
+                        output = normalized;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
             } else {
                 None
             };
@@ -937,8 +1638,10 @@ fn run_subagent_worker(
         agent_controller: _,
         batch_id: _,
         batch_size: _,
+        submitted_task_id,
     } = invocation;
     let SubagentRequest {
+        budget_reservation: _,
         description,
         prompt,
         subagent_type: requested_subagent_type,
@@ -947,6 +1650,7 @@ fn run_subagent_worker(
         isolation: requested_isolation,
         schema,
         resume_from,
+        deadline_ms,
         delegation,
         frozen_agent,
     } = request;
@@ -963,12 +1667,20 @@ fn run_subagent_worker(
         .and_then(|source| source.as_ref())
         .map(|source| source.compatibility.subagent_type.clone())
         .or_else(|| serialized_subagent_type(&requested_subagent_type));
-    let registry_task = task_registry.create_subagent_with_parent(
-        description.clone(),
-        task_agent_type,
-        root_task_id.clone(),
-    );
-    let registry_task_id = registry_task.id.clone();
+    // Adopt the record created at admission when there is one; see the
+    // thread-backed path for why a second record must not be created.
+    let registry_task_id = match submitted_task_id {
+        Some(task_id) => task_id,
+        None => {
+            let registry_task = task_registry.create_subagent_with_parent(
+                description.clone(),
+                task_agent_type,
+                root_task_id.clone(),
+            );
+            arm_subagent_deadline(&task_registry, &registry_task.id, deadline_ms);
+            registry_task.id
+        }
+    };
     if let Err(error) = task_registry.mark_running(&registry_task_id) {
         return sync_setup_failure(
             tool_request,
@@ -1494,6 +2206,7 @@ fn execute_acquired_sync_subagent(
             lifecycle: Some(&mut lifecycle),
             task_registry: Some(&task_registry),
             root_task_id: root_task_id.as_deref(),
+            child_task_id: Some(registry_task_id.as_str()),
             checkpoint_observer: Some(&checkpoint_observer),
             permission_handler: child_permission_handler,
             turn_id: Some(child_turn_id),
@@ -1660,6 +2373,25 @@ fn prepare_sync_worktree(
             .map(SyncWorktreeExecution::Fresh)
             .map_err(|error| format!("failed to create subagent worktree: {error}")),
     }
+}
+
+/// Records a caller-supplied execution deadline on a freshly created task.
+///
+/// The registry clamps it to the ancestors' deadlines, so a descendant can
+/// never outlive the work that spawned it.
+fn arm_subagent_deadline(task_registry: &TaskRegistry, task_id: &str, deadline_ms: Option<u64>) {
+    let Some(deadline_ms) = deadline_ms else {
+        return;
+    };
+    let deadline_at_ms = now_unix_ms().saturating_add(deadline_ms.min(i64::MAX as u64) as i64);
+    let _ = task_registry.set_deadline_at(task_id, deadline_at_ms, "caller deadline_ms");
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 pub(crate) fn serialized_subagent_type(subagent_type: &SubagentType) -> Option<String> {
@@ -2011,6 +2743,19 @@ fn settle_registry_task(
     registry_task_id: &str,
     footer_projection: Option<&ContinuationProjection>,
 ) {
+    // Persist the receipt before making the task terminal/claimable. Otherwise
+    // the parent could finish after seeing the result but before seeing its bill.
+    if let Some(reservation) = task_registry
+        .get(registry_task_id)
+        .and_then(|task| task.budget_reservation)
+        && let Some(usage) = output.child_budget_usage
+        && let Err(error) = reservation.settle(usage)
+    {
+        let message = format!("child budget settlement failed: {error}");
+        output.result = ToolResult::indeterminate_after_start(&output.tool_request, &message);
+        output.status = RunStatus::Failed;
+        output.event_error = Some(message);
+    }
     let usage = Some(output.cost_tracker.totals());
     let settlement = match output.status {
         RunStatus::Success => task_registry.complete_with_usage(
@@ -2210,24 +2955,27 @@ fn finish_child_output(
             let mut output = child
                 .final_message
                 .unwrap_or_else(|| "(subagent completed without a final message)".to_string());
-            if let Err(mut error) = validate_subagent_output_schema(&description, schema, &output) {
-                append_worktree_outcome(&mut error, worktree.as_ref());
-                return RuntimeSubagentCallOutput {
-                    result: ToolResult::failed_after_start(
-                        &tool_request,
-                        format!("Subagent status: Failed\n\n{error}"),
-                        None,
-                    ),
-                    tool_request,
-                    description,
-                    task: Some(completed_task.with_status(RuntimeTaskStatus::Failed)),
-                    status: RunStatus::Failed,
-                    event_output: Some(output),
-                    event_error: Some(error),
-                    cost_tracker,
-                    child_budget_usage: child.budget_usage,
-                };
-            }
+            output = match validate_subagent_output_schema(&description, schema, &output) {
+                Ok(normalized) => normalized,
+                Err(mut error) => {
+                    append_worktree_outcome(&mut error, worktree.as_ref());
+                    return RuntimeSubagentCallOutput {
+                        result: ToolResult::failed_after_start(
+                            &tool_request,
+                            format!("Subagent status: Failed\n\n{error}"),
+                            None,
+                        ),
+                        tool_request,
+                        description,
+                        task: Some(completed_task.with_status(RuntimeTaskStatus::Failed)),
+                        status: RunStatus::Failed,
+                        event_output: Some(output),
+                        event_error: Some(error),
+                        cost_tracker,
+                        child_budget_usage: child.budget_usage,
+                    };
+                }
+            };
             append_worktree_outcome(&mut output, worktree.as_ref());
             RuntimeSubagentCallOutput {
                 result: ToolResult::completed(
@@ -2345,14 +3093,36 @@ pub(crate) fn validate_subagent_output_schema(
     description: &str,
     schema: Option<&Value>,
     output: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let Some(schema) = schema else {
-        return Ok(());
+        return Ok(output.to_string());
     };
     let value = serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.to_string()));
-    validate_json_schema_subset(schema, &value, "$").map_err(|error| {
-        format!("subagent output schema validation failed for {description}: {error}")
-    })
+    match validate_json_schema_subset(schema, &value, "$") {
+        Ok(()) => Ok(output.to_string()),
+        Err(outer_error) => {
+            // Some providers occasionally serialize a structured response one
+            // extra time, yielding a JSON string whose contents are the object
+            // requested by the schema. Accept exactly that lossless transport
+            // variation, but only when the decoded value itself validates.
+            let Value::String(encoded) = value else {
+                return Err(format!(
+                    "subagent output schema validation failed for {description}: {outer_error}"
+                ));
+            };
+            let Ok(decoded) = serde_json::from_str::<Value>(&encoded) else {
+                return Err(format!(
+                    "subagent output schema validation failed for {description}: {outer_error}"
+                ));
+            };
+            validate_json_schema_subset(schema, &decoded, "$").map_err(|error| {
+                format!("subagent output schema validation failed for {description}: {error}")
+            })?;
+            serde_json::to_string(&decoded).map_err(|error| {
+                format!("subagent output schema normalization failed for {description}: {error}")
+            })
+        }
+    }
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -2395,6 +3165,37 @@ mod tests {
                 .push(event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn output_schema_normalizes_one_extra_json_string_layer() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["file"],
+            "properties": {"file": {"type": "string"}}
+        });
+        let value = serde_json::json!({"file": "src/lib.rs"});
+        let encoded = serde_json::to_string(&value.to_string()).expect("encode transport string");
+
+        let normalized = validate_subagent_output_schema("inspect", Some(&schema), &encoded)
+            .expect("valid encoded object");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&normalized).expect("normalized json"),
+            value
+        );
+    }
+
+    #[test]
+    fn output_schema_preserves_a_valid_json_string() {
+        let schema = serde_json::json!({"type": "string"});
+        let output = r#""already valid""#;
+
+        assert_eq!(
+            validate_subagent_output_schema("inspect", Some(&schema), output)
+                .expect("valid string"),
+            output
+        );
     }
 
     #[test]
@@ -2605,5 +3406,37 @@ mod tests {
             .unwrap_err()
             .contains("explicit model conflicts")
         );
+    }
+
+    #[test]
+    fn queued_launch_policy_revalidation_rejects_revocation_and_expansion() {
+        let original = crate::runtime_tool_call::tests::test_config();
+        let snapshot = DelegationSnapshot::from_config(&original);
+        let tool_request = ToolRequest {
+            id: "queued-policy".into(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({"description":"queued","prompt":"inspect"}).to_string(),
+            ),
+        };
+        let mut request = crate::subagent::create_subagent_request(&tool_request);
+        request.delegation = Some(snapshot.clone());
+        assert!(queued_policy_is_unchanged(&request, &snapshot));
+
+        let mut revoked = original.clone();
+        revoked.subagents.delegation = orca_core::subagent_config::DelegationPolicy::Off;
+        assert!(!queued_policy_is_unchanged(
+            &request,
+            &DelegationSnapshot::from_config(&revoked)
+        ));
+
+        let mut expanded = original;
+        expanded.subagents.delegation = orca_core::subagent_config::DelegationPolicy::Explicit;
+        assert!(!queued_policy_is_unchanged(
+            &request,
+            &DelegationSnapshot::from_config(&expanded)
+        ));
     }
 }

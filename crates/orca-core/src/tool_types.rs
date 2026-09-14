@@ -14,13 +14,14 @@ pub enum ToolName {
     Glob,
     Grep,
     Bash,
-    ExecCommand,
-    WriteStdin,
+    TaskReadOutput,
+    SubagentMessage,
+    TaskSendInput,
+    TaskWait,
     Edit,
     WriteFile,
     GitStatus,
     Subagent,
-    SubagentStatus,
     TaskList,
     TaskStop,
     WorkflowDraft,
@@ -64,13 +65,14 @@ impl ToolName {
             "glob" => Self::Glob,
             "grep" => Self::Grep,
             "bash" => Self::Bash,
-            "exec_command" => Self::ExecCommand,
-            "write_stdin" => Self::WriteStdin,
+            "task_read_output" => Self::TaskReadOutput,
+            "subagent_message" => Self::SubagentMessage,
+            "task_send_input" => Self::TaskSendInput,
+            "task_wait" => Self::TaskWait,
             "edit" => Self::Edit,
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
             "subagent" => Self::Subagent,
-            "subagent_status" => Self::SubagentStatus,
             "task_list" => Self::TaskList,
             "task_stop" => Self::TaskStop,
             "WorkflowDraft" | "workflow_draft" => Self::WorkflowDraft,
@@ -126,13 +128,14 @@ impl ToolName {
             Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Bash => "bash",
-            Self::ExecCommand => "exec_command",
-            Self::WriteStdin => "write_stdin",
+            Self::TaskReadOutput => "task_read_output",
+            Self::SubagentMessage => "subagent_message",
+            Self::TaskSendInput => "task_send_input",
+            Self::TaskWait => "task_wait",
             Self::Edit => "edit",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::Subagent => "subagent",
-            Self::SubagentStatus => "subagent_status",
             Self::TaskList => "task_list",
             Self::TaskStop => "task_stop",
             Self::WorkflowDraft => "WorkflowDraft",
@@ -174,13 +177,14 @@ impl ToolName {
             Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Bash => "bash",
-            Self::ExecCommand => "exec_command",
-            Self::WriteStdin => "write_stdin",
+            Self::TaskReadOutput => "task_read_output",
+            Self::SubagentMessage => "subagent_message",
+            Self::TaskSendInput => "task_send_input",
+            Self::TaskWait => "task_wait",
             Self::Edit => "edit",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::Subagent => "subagent",
-            Self::SubagentStatus => "subagent_status",
             Self::TaskList => "task_list",
             Self::TaskStop => "task_stop",
             Self::WorkflowDraft => "WorkflowDraft",
@@ -224,13 +228,14 @@ impl ToolName {
             "glob" => Self::Glob,
             "grep" => Self::Grep,
             "bash" => Self::Bash,
-            "exec_command" => Self::ExecCommand,
-            "write_stdin" => Self::WriteStdin,
+            "task_read_output" => Self::TaskReadOutput,
+            "subagent_message" => Self::SubagentMessage,
+            "task_send_input" => Self::TaskSendInput,
+            "task_wait" => Self::TaskWait,
             "edit" => Self::Edit,
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
             "subagent" => Self::Subagent,
-            "subagent_status" => Self::SubagentStatus,
             "task_list" => Self::TaskList,
             "task_stop" => Self::TaskStop,
             "WorkflowDraft" | "workflow_draft" => Self::WorkflowDraft,
@@ -272,7 +277,6 @@ impl ToolName {
                 | Self::Glob
                 | Self::Grep
                 | Self::GitStatus
-                | Self::SubagentStatus
                 | Self::TaskList
                 | Self::WorkflowReadMessages
                 | Self::WorkflowListTasks
@@ -330,7 +334,6 @@ pub enum ToolCapability {
     WorkflowRun,
     TaskRead,
     TaskControl,
-    TerminalTransport,
     PlanUpdate,
     GoalUpdate,
     UserInputRequest,
@@ -472,6 +475,8 @@ pub struct ToolControlSemantics {
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultKind {
     Success,
+    /// Started but not terminated; distinct from both success and failure.
+    Running,
     Empty,
     NoMatches,
     Truncated,
@@ -496,6 +501,7 @@ impl ToolResultKind {
             Self::Success | Self::Empty | Self::NoMatches | Self::Truncated => {
                 ToolStatus::Completed
             }
+            Self::Running => ToolStatus::Running,
             Self::PermissionDenied => ToolStatus::Denied,
             Self::InvalidInput | Self::RuntimeError => ToolStatus::Failed,
             Self::Cancelled => ToolStatus::Cancelled,
@@ -539,6 +545,11 @@ pub struct ToolRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
+    /// The side effect started and has not terminated yet.
+    ///
+    /// A command that is still executing must never be reported as completed or
+    /// successful: `exit_code` stays empty and the caller keeps observing it.
+    Running,
     Completed,
     Failed,
     Denied,
@@ -550,6 +561,7 @@ pub enum ToolStatus {
 impl ToolStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Denied => "denied",
@@ -722,6 +734,7 @@ impl<'de> Deserialize<'de> for ToolTerminal {
 
 fn default_kind_for_status(status: ToolStatus) -> ToolResultKind {
     match status {
+        ToolStatus::Running => ToolResultKind::Running,
         ToolStatus::Completed => ToolResultKind::Success,
         ToolStatus::Failed | ToolStatus::NotImplemented => ToolResultKind::RuntimeError,
         ToolStatus::Denied => ToolResultKind::PermissionDenied,
@@ -783,6 +796,29 @@ impl ToolResult {
 
     pub fn set_truncated(&mut self, truncated: bool) {
         self.terminal.truncated = truncated;
+    }
+
+    /// A tool call that started work which is still running.
+    ///
+    /// This is deliberately not `completed`: the side effect has not
+    /// terminated, so there is no exit code and no success claim. The caller
+    /// observes the work through its task identity.
+    pub fn running(request: &ToolRequest, output: String, truncated: bool) -> Self {
+        Self {
+            id: request.id.clone(),
+            name: request.name.clone(),
+            output: Some(output),
+            terminal: ToolTerminal::new(
+                ToolStatus::Running,
+                None,
+                None,
+                truncated,
+                ToolResultKind::Running,
+                ToolTerminalSource::Observed,
+                ToolInvocationStarted::Yes,
+            ),
+            file_change_preview: None,
+        }
     }
 
     pub fn completed(request: &ToolRequest, output: String, truncated: bool) -> Self {

@@ -429,6 +429,7 @@ pub fn create_meta(cwd: &Path, provider: &str, model: Option<String>, prompt: &s
         title: title_from_prompt(prompt),
         created_at: now,
         parent_id: None,
+        agent_scope: None,
         forked: false,
         approval_mode: None,
         active_permission_profile: None,

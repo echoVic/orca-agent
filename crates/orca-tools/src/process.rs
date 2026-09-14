@@ -303,7 +303,6 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
     should_cancel: impl Fn() -> bool,
     max_retained_bytes_per_stream: usize,
 ) -> io::Result<CommandOutput> {
-    let child_pid = child.id();
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -339,7 +338,6 @@ pub fn wait_for_child_output_with_timeout_or_cancel_and_limit(
     let status = wait_for_child_and_readers(
         &mut child,
         &process_job,
-        child_pid,
         timeout,
         should_cancel,
         || stdout_handle.is_finished() && stderr_handle.is_finished(),
@@ -405,7 +403,6 @@ where
     T: Send + 'static,
     F: FnMut(&mut T, BoundedLine<'_>) -> io::Result<()> + Send + 'static,
 {
-    let child_pid = child.id();
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -439,7 +436,6 @@ where
     let status = wait_for_child_and_readers(
         &mut child,
         &process_job,
-        child_pid,
         timeout,
         should_cancel,
         || stdout_handle.is_finished() && stderr_handle.is_finished(),
@@ -471,7 +467,6 @@ where
 fn wait_for_child_and_readers(
     child: &mut Child,
     process_job: &ProcessJob,
-    child_pid: u32,
     timeout: Duration,
     should_cancel: impl Fn() -> bool,
     readers_finished: impl Fn() -> bool,
@@ -484,7 +479,7 @@ fn wait_for_child_and_readers(
 
     loop {
         if status.is_none() {
-            status = try_observe_child_exit(child, process_job, child_pid, reader_stop)?;
+            status = try_observe_child_exit(child, process_job, reader_stop)?;
         }
         if let Some(exit_status) = status
             && readers_finished()
@@ -493,7 +488,7 @@ fn wait_for_child_and_readers(
         }
         if should_cancel() {
             if status.is_none() {
-                status = try_observe_child_exit(child, process_job, child_pid, reader_stop)?;
+                status = try_observe_child_exit(child, process_job, reader_stop)?;
             }
             let termination = if status.is_some() {
                 CommandTermination::Exited
@@ -509,7 +504,7 @@ fn wait_for_child_and_readers(
         }
         if Instant::now() >= deadline {
             if status.is_none() {
-                status = try_observe_child_exit(child, process_job, child_pid, reader_stop)?;
+                status = try_observe_child_exit(child, process_job, reader_stop)?;
             }
             let termination = if status.is_some() {
                 CommandTermination::Exited
@@ -530,7 +525,6 @@ fn wait_for_child_and_readers(
 fn try_observe_child_exit(
     child: &mut Child,
     process_job: &ProcessJob,
-    child_pid: u32,
     reader_stop: &AtomicBool,
 ) -> io::Result<Option<ExitStatus>> {
     match child.try_wait() {
@@ -538,7 +532,7 @@ fn try_observe_child_exit(
             // Retire the process-group lease while the PID still identifies
             // this operation, then release readers held by escaped descendants.
             let _ = process_job.terminate(1);
-            kill_process_group_by_pid(child_pid);
+            kill_process_group_by_pid(child);
             reader_stop.store(true, Ordering::Release);
             Ok(Some(exit_status))
         }
@@ -1043,36 +1037,57 @@ fn child_setup_error<T>(
 
 pub fn terminate_child_tree(child: &mut Child, process_job: &ProcessJob) {
     let _ = process_job.terminate(1);
-    kill_process_group_by_pid(child.id());
+    kill_process_group_by_pid(child);
     let _ = child.kill();
 }
 
 pub fn kill_child_tree(child: &mut Child) {
-    kill_process_group_by_pid(child.id());
+    kill_process_group_by_pid(child);
     let _ = child.kill();
 }
 
-fn kill_process_group_by_pid(pid: u32) {
+fn kill_process_group_by_pid(child: &mut Child) {
     #[cfg(unix)]
-    kill_process_group(pid);
+    kill_process_group(child);
     #[cfg(not(unix))]
-    let _ = pid;
+    let _ = child;
 }
 
+/// How long a stopped process tree may take to exit on SIGTERM before it is
+/// killed outright. Long enough for a shell to forward the signal to its
+/// children and run a trap; short enough that a stop stays responsive.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const PROCESS_GROUP_TERM_POLL: Duration = Duration::from_millis(20);
+
+/// Stops a whole process group, preferring a graceful exit.
+///
+/// SIGTERM first so shells, build tools, and test runners can clean up their
+/// own children, then SIGKILL for anything still alive after the grace period.
+/// The grace period ends early as soon as the process is observed to be gone,
+/// and neither signal can undo side effects a command already produced.
+#[cfg(unix)]
+fn kill_process_group(child: &mut Child) {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
 
     const SIGTERM: i32 = 15;
     const SIGKILL: i32 = 9;
-    let pgid = -(pid as i32);
+    let pgid = -(child.id() as i32);
     let terminated = unsafe { kill(pgid, SIGTERM) } == 0;
     if !terminated {
         return;
     }
-    thread::sleep(Duration::from_millis(50));
+    let deadline = Instant::now() + PROCESS_GROUP_TERM_GRACE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(PROCESS_GROUP_TERM_POLL),
+            Err(_) => break,
+        }
+    }
     unsafe {
         let _ = kill(pgid, SIGKILL);
     }

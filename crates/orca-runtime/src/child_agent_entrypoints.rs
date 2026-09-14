@@ -105,12 +105,28 @@ where
             // so the advertised schema, the child prompt, and the hard rejection
             // path all read the same list. A caller ceiling can only narrow it.
             let mut allowed = role_tool_ceiling(builtin);
+            if matches!(builtin, SubagentType::General) && request.workflow_ipc.is_some() {
+                allowed.extend(
+                    [
+                        "workflow_send_message",
+                        "workflow_read_messages",
+                        "workflow_clear_messages",
+                        "workflow_create_task_list",
+                        "workflow_claim_task",
+                        "workflow_complete_task",
+                        "workflow_list_tasks",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned),
+                );
+            }
             if let Some(ceiling) = &request.allowed_tools {
                 allowed.retain(|tool| ceiling.contains(tool));
             }
             request.allowed_tools = Some(allowed);
-            request.tool_policy_label =
-                Some(format!("role '{}' tool policy", builtin.identifier()));
+            request
+                .tool_policy_label
+                .get_or_insert_with(|| format!("role '{}' tool policy", builtin.identifier()));
         }
     }
     child_config.model = child_config

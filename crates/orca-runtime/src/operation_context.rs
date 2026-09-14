@@ -24,6 +24,7 @@ use crate::thread_store::orca_home;
 pub(crate) struct OperationContext {
     pub(crate) controller: BudgetController,
     pub(crate) journal: ExecutionJournal,
+    task_scope: Option<(crate::tasks::TaskRegistry, Option<String>)>,
 }
 
 impl OperationContext {
@@ -100,7 +101,54 @@ impl OperationContext {
                 unix_ms().saturating_sub(started_at_ms),
             ),
             journal,
+            task_scope: None,
         })
+    }
+
+    pub(crate) fn attach_task_scope(
+        &mut self,
+        registry: &crate::tasks::TaskRegistry,
+        owner: Option<&str>,
+    ) {
+        self.task_scope = Some((registry.clone(), owner.map(str::to_owned)));
+    }
+
+    /// Stop descendants before committing the parent's terminal bill. Started
+    /// children retain their reservation until they report actual consumption;
+    /// missing receipts survive as unsettled reservations across a restart.
+    fn settle_children_for_stop(&mut self) -> io::Result<()> {
+        if let Some((registry, owner)) = self.task_scope.clone() {
+            let children: Vec<_> = registry
+                .records_snapshot()
+                .map_err(io::Error::other)?
+                .into_iter()
+                .filter(|record| {
+                    record.task_type == orca_core::task_types::TaskType::Subagent
+                        && record.parent_task_id == owner
+                        && record.status.is_active()
+                })
+                .collect();
+            for child in &children {
+                registry
+                    .request_stop_tree(&child.id)
+                    .map_err(io::Error::other)?;
+                if child.started_at_ms.is_none()
+                    && let Some(binding) = &child.budget_reservation
+                {
+                    binding.settle(BudgetUsage::default())?;
+                }
+            }
+            while children.iter().any(|child| {
+                registry
+                    .get(&child.id)
+                    .is_some_and(|record| record.status.is_active())
+            }) {
+                registry
+                    .scope_arbiter()
+                    .wait(None, std::time::Duration::from_millis(50));
+            }
+        }
+        self.refresh_child_budgets()
     }
 
     /// Reopens an existing operation journal at its exact path (the
@@ -129,6 +177,7 @@ impl OperationContext {
     /// Journal persistence faults propagate as `io::Error`; budget exhaustion
     /// returns `Err(stop)`.
     pub(crate) fn admit_turn(&mut self, turn_id: &str) -> io::Result<Result<(), BudgetStop>> {
+        self.refresh_child_budgets()?;
         let admitted = self.controller.admit_turn();
         match admitted {
             Ok(()) => {
@@ -160,6 +209,7 @@ impl OperationContext {
         tool_call_id: &str,
         tool_name: &str,
     ) -> io::Result<Result<(), BudgetStop>> {
+        self.refresh_child_budgets()?;
         let admitted = self.controller.admit_tool_call();
         match admitted {
             Ok(()) => {
@@ -238,6 +288,85 @@ impl OperationContext {
         self.append_budget_usage("", None)?;
         self.journal.flush()?;
         Ok(result)
+    }
+
+    fn child_budget_path(&self) -> PathBuf {
+        self.journal.path().with_extension("children.json")
+    }
+
+    pub(crate) fn refresh_child_budgets(&mut self) -> io::Result<()> {
+        let path = self.child_budget_path();
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut reserved = BudgetUsage::default();
+        self.controller
+            .set_external_reservations(BudgetUsage::default());
+        for (id, entry) in crate::child_budget_ledger::entries(&path)? {
+            if entry.accounted {
+                continue;
+            }
+            if let Some(receipt) = entry.receipt {
+                let accounting_id = format!("child-receipt:{id}");
+                if !self.journal.has_budget_accounting_id(&accounting_id) {
+                    let _ = self.controller.merge_child_usage(receipt);
+                    self.append_budget_usage("", Some(accounting_id))?;
+                    self.journal.flush()?;
+                }
+                crate::child_budget_ledger::acknowledge(&path, &id)?;
+            } else {
+                reserved.merge(crate::child_budget_ledger::reserved(entry.spec));
+            }
+        }
+        self.controller.set_external_reservations(reserved);
+        Ok(())
+    }
+
+    pub(crate) fn background_child_lease(
+        &mut self,
+        requested: BudgetSpec,
+        siblings: usize,
+        id: &str,
+    ) -> io::Result<Result<crate::budget_controller::BudgetLease, BudgetStop>> {
+        self.refresh_child_budgets()?;
+        // Provider tool ids can repeat in later responses. The durable tool
+        // admission ordinal identifies this execution, including its replay.
+        let id = self
+            .journal
+            .committed()
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                JournalRecord::ToolStarted {
+                    tool_call_id,
+                    ordinal,
+                    ..
+                } if tool_call_id == id => Some(format!("{id}:{ordinal}")),
+                _ => None,
+            })
+            .unwrap_or_else(|| id.to_string());
+        if let Some(binding) = crate::child_budget_ledger::ChildBudgetReservation::existing(
+            self.child_budget_path(),
+            id.clone(),
+        )? {
+            return Ok(Ok(crate::budget_controller::BudgetLease::from_durable(
+                binding,
+            )));
+        }
+        let mut lease = match self.controller.background_child_lease(requested, siblings) {
+            Ok(lease) => lease,
+            Err(stop) => return Ok(Err(stop)),
+        };
+        let reservation = crate::child_budget_ledger::ChildBudgetReservation::reserve(
+            self.child_budget_path(),
+            id,
+            *lease.spec(),
+            *self.controller.spec(),
+            self.controller.usage(),
+        )?;
+        lease.attach_durable(reservation);
+        self.refresh_child_budgets()?;
+        Ok(Ok(lease))
     }
 
     pub(crate) fn merge_child_usage(
@@ -324,6 +453,7 @@ impl OperationContext {
         task_plan: Option<&str>,
         stop: BudgetStop,
     ) -> io::Result<OperationTerminal> {
+        self.settle_children_for_stop()?;
         let checkpoint_id = format!("{events_run_id}-budget-stop");
         // 1. The session/conversation checkpoint with the real durable
         //    message boundary comes first; the resume boundary must exist
@@ -399,10 +529,20 @@ impl OperationContext {
     pub(crate) fn commit_terminal(
         &mut self,
         turn_id: &str,
-        terminal: OperationTerminal,
+        mut terminal: OperationTerminal,
     ) -> io::Result<()> {
         if self.journal.has_terminal() {
             return Ok(());
+        }
+        if !matches!(terminal, OperationTerminal::Completed { .. }) {
+            self.settle_children_for_stop()?;
+        } else {
+            self.refresh_child_budgets()?;
+        }
+        if let OperationTerminal::Completed { usage } | OperationTerminal::Stopped { usage, .. } =
+            &mut terminal
+        {
+            *usage = self.controller.usage();
         }
         self.journal
             .append_durable(JournalRecord::OperationTerminal {
@@ -473,6 +613,172 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::*;
     use orca_core::budget::StopReason;
+
+    #[test]
+    fn child_reservations_distinguish_replayed_and_reused_provider_call_ids() {
+        let mut parent = OperationContext::for_tests(BudgetSpec::default(), "child-call-identity");
+        parent
+            .admit_tool_call("turn", "same-id", "subagent")
+            .unwrap()
+            .unwrap();
+        let first = parent
+            .background_child_lease(Default::default(), 1, "same-id")
+            .unwrap()
+            .unwrap();
+        let replay = parent
+            .background_child_lease(Default::default(), 1, "same-id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.durable_reservation().unwrap().id,
+            replay.durable_reservation().unwrap().id
+        );
+        first
+            .durable_reservation()
+            .unwrap()
+            .bind_task("first-child")
+            .unwrap();
+        first
+            .durable_reservation()
+            .unwrap()
+            .settle(BudgetUsage::default())
+            .unwrap();
+        parent
+            .record_tool_completed("turn", "same-id", "completed", None)
+            .unwrap();
+        parent
+            .admit_tool_call("turn", "same-id", "subagent")
+            .unwrap()
+            .unwrap();
+        let next = parent
+            .background_child_lease(Default::default(), 1, "same-id")
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            first.durable_reservation().unwrap().id,
+            next.durable_reservation().unwrap().id
+        );
+    }
+
+    #[test]
+    fn parent_budget_stop_settles_started_child_before_committing_terminal_usage() {
+        let mut parent = OperationContext::for_tests(
+            BudgetSpec {
+                max_cost_usd_micros: Some(1_000),
+                ..Default::default()
+            },
+            "stop-child-accounting",
+        );
+        let registry = crate::tasks::TaskRegistry::new("stop-child-accounting".into());
+        parent.attach_task_scope(&registry, None);
+        let lease = parent
+            .background_child_lease(Default::default(), 1, "call-stop-child")
+            .unwrap()
+            .unwrap();
+        let binding = lease.durable_reservation().unwrap().clone();
+        let child = registry
+            .execution_scope(&Default::default())
+            .submit_subagent("child".into(), None, None, 1)
+            .unwrap();
+        binding.bind_task(&child.task_id).unwrap();
+        registry
+            .bind_child_budget(&child.task_id, binding.clone())
+            .unwrap();
+        let worker_registry = registry.clone();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !worker_registry.is_cancelled(&child.task_id) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "parent did not stop child"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            binding
+                .settle(BudgetUsage {
+                    cost_usd_micros: 50,
+                    tool_calls: 2,
+                    turns: 1,
+                    wall_time_ms: 10,
+                })
+                .unwrap();
+            worker_registry
+                .stop_with_usage(&child.task_id, "cancelled".into(), None)
+                .unwrap();
+        });
+        // Provider bills can arrive after an admission or cancellation decision.
+        let stop = parent.controller.record_cost_usd_micros(1_001).unwrap_err();
+        let terminal = parent
+            .commit_budget_stop_with_boundary("turn", "run", None, &Default::default(), None, stop)
+            .unwrap();
+        worker.join().unwrap();
+        let usage = terminal.usage().unwrap();
+        assert_eq!(usage.cost_usd_micros, 1_051);
+        assert_eq!(usage.tool_calls, 2);
+        assert_eq!(
+            parent
+                .journal
+                .latest_budget_usage()
+                .unwrap()
+                .cost_usd_micros,
+            1_051
+        );
+        assert_eq!(registry.execution_scope(&Default::default()).running(), 0);
+    }
+
+    #[test]
+    fn background_budget_receipt_is_merged_once_across_parent_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("operation.jsonl");
+        let spec = BudgetSpec {
+            max_cost_usd_micros: Some(1_000),
+            ..Default::default()
+        };
+        let mut parent = OperationContext::open_at(path.clone(), spec, "durable-child").unwrap();
+        let lease = parent
+            .background_child_lease(BudgetSpec::default(), 1, "call-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.spec().max_cost_usd_micros, Some(900));
+        let reservation = lease.durable_reservation().unwrap().clone();
+        reservation.bind_task("child-1").unwrap();
+        drop(lease);
+        drop(parent);
+        let mut parent = OperationContext::open_at(path.clone(), spec, "durable-child").unwrap();
+        parent.refresh_child_budgets().unwrap();
+        assert!(
+            parent
+                .background_child_lease(BudgetSpec::default(), 1, "call-2")
+                .unwrap()
+                .is_err()
+        );
+        reservation
+            .settle(BudgetUsage {
+                cost_usd_micros: 350,
+                tool_calls: 2,
+                turns: 1,
+                wall_time_ms: 99,
+            })
+            .unwrap();
+        parent.refresh_child_budgets().unwrap();
+        assert_eq!(parent.controller.usage().cost_usd_micros, 350);
+        assert_eq!(parent.controller.usage().tool_calls, 2);
+        drop(parent);
+        let mut parent = OperationContext::open_at(path, spec, "durable-child").unwrap();
+        parent.refresh_child_budgets().unwrap();
+        assert_eq!(parent.controller.usage().cost_usd_micros, 350);
+        assert_eq!(parent.controller.usage().tool_calls, 2);
+        assert_eq!(parent.controller.usage().turns, 1);
+        assert_eq!(
+            parent
+                .background_child_lease(BudgetSpec::default(), 1, "call-3")
+                .unwrap()
+                .unwrap()
+                .spec()
+                .max_cost_usd_micros,
+            Some(550)
+        );
+    }
 
     #[test]
     fn stateless_budget_stop_commits_non_resumable_terminal_without_boundary() {

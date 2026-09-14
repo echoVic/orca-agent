@@ -94,7 +94,10 @@ mod tests {
             workflows: WorkflowConfig::default(),
             subagents: SubagentConfig {
                 max_depth: 1,
-                max_parallel: 3,
+                limits: orca_core::subagent_config::SubagentLimits {
+                    max_running: 3,
+                    ..Default::default()
+                },
                 ..SubagentConfig::default()
             },
             tools: ToolConfig {
@@ -130,7 +133,7 @@ mod tests {
             raw_arguments: Some(
                 json!({
                     "description": format!("inspect {id}"),
-                    "prompt": format!("inspect {id}")
+                    "prompt": format!("inspect {id}"), "mode": "sync"
                 })
                 .to_string(),
             ),

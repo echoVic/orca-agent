@@ -286,6 +286,13 @@ impl TurnPermissionOverlayDelta {
 }
 
 impl TurnPermissionOverlay {
+    /// Test-only grant hook: production grants arrive through the permission
+    /// handler and are merged, never injected directly.
+    #[cfg(test)]
+    pub(crate) fn grant_additional_working_directory(&mut self, root: PathBuf) {
+        self.additional_working_directories.push(root);
+    }
+
     pub fn additional_working_directories(&self) -> &[PathBuf] {
         &self.additional_working_directories
     }
@@ -406,29 +413,6 @@ impl TurnPermissionOverlay {
         }
         Ok(response)
     }
-
-    /// Function intent contract:
-    ///
-    /// - Input: a permission request whose caller has proven no external tool
-    ///   side effect occurred, plus the current turn overlay.
-    /// - Output: the normal response while preserving existing merge, scope,
-    ///   and strict-auto-review behavior.
-    /// - Errors: forwards handler errors without mutating the overlay.
-    /// - State changes and external calls: the handler may durably checkpoint
-    ///   the request; this overlay changes only after an allowed response.
-    pub(crate) fn request_and_merge_pre_side_effect(
-        &mut self,
-        handler: &dyn RuntimePermissionRequestHandler,
-        request: RuntimePermissionRequest,
-    ) -> io::Result<RuntimePermissionResponse> {
-        let response = handler.request_permissions_pre_side_effect(&request, self)?;
-        if response.decision == PermissionResponseDecision::Allow {
-            self.merge_permissions(&response.permissions);
-            self.merge_strict_auto_review(response.strict_auto_review);
-        }
-        Ok(response)
-    }
-
     pub(crate) fn merge_permissions(&mut self, permissions: &RequestPermissionProfile) {
         if let Some(file_system) = permissions.file_system.as_ref()
             && let Some(write_roots) = file_system.write.as_ref()

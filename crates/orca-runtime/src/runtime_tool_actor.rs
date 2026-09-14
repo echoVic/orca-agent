@@ -192,10 +192,15 @@ impl RuntimeToolActorContext {
         cancel: Option<&CancelToken>,
         permission_handler: Option<&dyn RuntimePermissionRequestHandler>,
     ) -> ToolResult {
+        // Every command tool shares one runtime-owned terminal service: the
+        // starter that creates a command and the readers, writers, and waiters
+        // that observe it must reach the same supervisor.
         let terminal_service = matches!(
             request.name,
-            orca_core::tool_types::ToolName::ExecCommand
-                | orca_core::tool_types::ToolName::WriteStdin
+            orca_core::tool_types::ToolName::Bash
+                | orca_core::tool_types::ToolName::TaskReadOutput
+                | orca_core::tool_types::ToolName::TaskSendInput
+                | orca_core::tool_types::ToolName::TaskWait
         )
         .then(|| task_registry)
         .flatten()

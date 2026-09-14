@@ -94,6 +94,7 @@ fn runtime<'a>(
         lifecycle: None,
         task_registry: None,
         root_task_id: None,
+        child_task_id: None,
         checkpoint_observer: None,
         permission_handler: None,
         turn_id: None,
@@ -138,6 +139,7 @@ fn child_runtime_retains_owned_permission_handler() {
         lifecycle: None,
         task_registry: None,
         root_task_id: None,
+        child_task_id: None,
         checkpoint_observer: None,
         permission_handler: Some(handler),
         turn_id: Some(TurnId::new()),
@@ -983,6 +985,85 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
         .expect("child loop returns an exact budget receipt");
     assert_eq!(budget_usage.turns, 2);
     assert_eq!(budget_usage.tool_calls, 1);
+}
+
+#[test]
+fn read_only_child_converges_to_a_tool_free_summary_turn() {
+    let request = ChildAgentRequest::new(
+        "mock_repeat_read 100".to_string(),
+        SubagentType::Explorer,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let mut runtime_config = config(None);
+    runtime_config.subagents.max_investigation_turns = 20;
+    runtime_config.subagents.max_investigation_tool_calls = 2;
+    let mut tracker = CostTracker::new(None);
+    let mut tool_count = 0;
+
+    let result = run_child_agent_loop_with_tool_executor(
+        &runtime_config,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+            lease: None,
+        },
+        |_setup, _cancel, tool_request| {
+            tool_count += 1;
+            assert_eq!(tool_request.name, ToolName::ReadFile);
+            ChildAgentToolExecution {
+                should_stop: false,
+                result: ToolResult::completed(tool_request, "evidence".to_string(), false),
+                child_cost: None,
+            }
+        },
+    )
+    .expect("read-only child should soft-land with a final report");
+
+    assert_eq!(result.status, RunStatus::Success);
+    assert_eq!(tool_count, 2);
+    let usage = result.budget_usage.expect("exact child usage");
+    assert_eq!(usage.tool_calls, 2);
+    assert_eq!(usage.turns, 3);
+    assert!(result.final_message.is_some());
+}
+
+#[test]
+fn hosted_child_kernel_enforces_read_only_convergence() {
+    let request = ChildAgentRequest::new(
+        "mock_repeat_read 100".to_string(),
+        SubagentType::Explorer,
+        None,
+        1,
+        false,
+    );
+    let mut runtime_config = config(None);
+    runtime_config.subagents.max_investigation_turns = 20;
+    runtime_config.subagents.max_investigation_tool_calls = 2;
+    let cancel = CancelToken::new();
+    let mut events = EventFactory::new("hosted-convergence".to_string());
+    let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+    let mut runtime = runtime(
+        &mut sink,
+        &mut events,
+        &cancel,
+        crate::agent_loop::execute_child_agent_loop::<Cursor<Vec<u8>>>,
+    );
+
+    let (result, _) = run_child_agent(&runtime_config, &request, &mut runtime);
+
+    assert_eq!(result.status, RunStatus::Success, "{:?}", result.error);
+    assert!(result.final_message.is_some());
+    let usage = result.budget_usage.expect("hosted child usage");
+    assert!(usage.tool_calls <= 2, "{usage:?}");
+    assert_eq!(usage.turns, 3);
 }
 
 #[test]

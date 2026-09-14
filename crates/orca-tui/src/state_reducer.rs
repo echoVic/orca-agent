@@ -1225,7 +1225,7 @@ fn format_argument_bytes(bytes: usize) -> String {
 fn is_panel_owned_tool_progress_name(name: &str) -> bool {
     matches!(
         name,
-        "subagent" | "subagent_status" | "task_list" | "update_plan"
+        "subagent" | "task_list" | "task_wait" | "task_read_output" | "update_plan"
     )
 }
 

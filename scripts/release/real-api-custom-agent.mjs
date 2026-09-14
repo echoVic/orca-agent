@@ -9,11 +9,10 @@ import path from "node:path";
 const bin = path.resolve(process.argv[2] ?? "target/debug/orca");
 let root;
 
-async function run(cwd, env, prompt, session, mode) {
+async function run(cwd, env, prompt, session) {
   const args = ["exec", "--cwd", cwd, "--mode", "full-auto", "--model", "deepseek-flash",
     "--output-format", "jsonl", "--save-history", "--max-turns", "8", "--max-tool-calls", "8",
-    "--max-wall-time-secs", "120"];
-  if (mode === "sync") args.push("--max-cost-usd", "0.20");
+    "--max-wall-time-secs", "120", "--max-cost-usd", "0.20"];
   if (session) args.push("--resume", session);
   args.push(prompt);
   const child = spawn(bin, args, { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -39,21 +38,32 @@ async function run(cwd, env, prompt, session, mode) {
   }
 }
 
-function childResult(events, mode) {
+function childResult(events) {
   const calls = events.filter(event => event.type === "tool.call.completed"
     && event.payload.name === "subagent");
   assert.equal(calls.length, 1, "must invoke exactly one custom subagent");
-  assert.equal(calls[0].payload.status, "completed");
-  const output = calls[0].payload.output;
-  let continuation;
-  if (mode === "async") {
-    const launch = JSON.parse(output);
-    assert.equal(launch.status, "async_launched");
-    continuation = launch.continuation_id;
-  } else {
-    continuation = output.split("\n")
-      .find(line => line.startsWith("resume_from="))?.slice("resume_from=".length).trim();
+  assert.equal(calls[0].payload.status, "running");
+  const launch = JSON.parse(calls[0].payload.output);
+  assert.equal(launch.accepted, true);
+  const taskId = launch.task_id;
+  assert.ok(taskId, "accepted subagent must return task_id");
+  const waits = events.filter(event => event.type === "tool.call.completed"
+    && event.payload.name === "task_wait");
+  const task = [...waits].reverse().flatMap(event => {
+    const payload = JSON.parse(event.payload.output);
+    return payload.tasks ?? [];
+  }).find(item => item.task_id === taskId && item.status === "completed");
+  assert.ok(task, `task_wait did not return completed task ${taskId}`);
+  let output = task.result;
+  if (typeof output === "string") {
+    try {
+      const envelope = JSON.parse(output);
+      output = envelope.output ?? output;
+    } catch {}
   }
+  assert.equal(typeof output, "string", "completed task must expose string output");
+  const continuation = output.split("\n")
+    .find(line => line.startsWith("resume_from="))?.slice("resume_from=".length).trim();
   assert.ok(continuation, `missing continuation in child result: ${output.slice(-1400)}`);
   const session = events.find(event => event.type === "session.completed")?.payload.session_id;
   assert.ok(session, "the parent must be recorded");
@@ -141,16 +151,13 @@ try {
   let identity;
   let original;
   let previous;
-  for (const mode of ["sync", "sync", "async", "async", "sync"]) {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
     const selector = identity
       ? `resume_from ${identity.continuation}; do not specify subagent_type or model`
       : "subagent_type contract-proof";
-    const completion = mode === "async"
-      ? "After launch, poll subagent_status with the returned agent_id until completed, then relay the child reply. Do not end your turn before the child completes."
-      : "After the subagent returns, relay its reply exactly.";
-    const prompt = `Call the subagent tool exactly once with ${selector}, description Verify frozen instructions, prompt "Return the exact identifier defined in your system instructions. Do not inspect tasks or files and do not call tools.", mode ${mode}. Use no tools other than subagent and subagent_status. ${completion}`;
-    const events = await run(cwd, env, prompt, identity?.session, mode);
-    const next = childResult(events, mode);
+    const prompt = `Call the subagent tool exactly once with ${selector}, description Verify frozen instructions, and prompt "Return the exact identifier defined in your system instructions. Do not inspect tasks or files and do not call tools." Do not attach an output schema. After the accepted task returns, use task_wait until it is terminal, then relay its reply exactly. Use no tools other than subagent and task_wait.`;
+    const events = await run(cwd, env, prompt, identity?.session);
+    const next = childResult(events);
     if (identity) assert.deepEqual(next, identity);
     identity = next;
     const record = verifyCheckpoint(home, identity, token, original, previous);
@@ -159,9 +166,9 @@ try {
       rmSync(definition);
     }
     previous = record;
-    console.log(`Custom agent real API: ${mode} completed, frozen checkpoint verified`);
+    console.log(`Custom agent real API: attempt ${attempt} completed, frozen checkpoint verified`);
   }
-  console.log("Custom agent real API: discovery, deleted definition, sync/sync, sync/async, async/async, async/sync separate-process recovery verified");
+  console.log("Custom agent real API: discovery, deleted definition, and five separate-process resumptions verified through the unified task protocol");
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;

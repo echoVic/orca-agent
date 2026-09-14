@@ -199,13 +199,14 @@ fn prepare_child_agent_system_conversation(
     memory: &MemoryBlock,
 ) -> Conversation {
     let mut conversation = Conversation::new();
-    let mut system_prompt = agent_common::build_agent_system_prompt(
+    let mut system_prompt = agent_common::build_agent_system_prompt_for_tools(
         cwd,
         request.depth,
         &request.subagent_type,
         Some(instructions),
         config.approval_mode,
         Some(memory),
+        request.allowed_tools.as_deref(),
     );
     if let Some(definition) = &config.subagents.effective_definition {
         system_prompt.push_str("\n\n");

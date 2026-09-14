@@ -895,6 +895,7 @@ mod tests {
             task_type,
             status: TaskStatus::Running,
             is_backgrounded: false,
+            lifetime: orca_core::task_types::TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms: 1,
             started_at_ms: Some(1),

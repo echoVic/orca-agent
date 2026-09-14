@@ -268,6 +268,7 @@ mod tests {
                 title: "preserved conversation".to_string(),
                 created_at: chrono::Utc::now(),
                 parent_id: None,
+                agent_scope: None,
                 forked: false,
                 approval_mode: None,
                 active_permission_profile: None,

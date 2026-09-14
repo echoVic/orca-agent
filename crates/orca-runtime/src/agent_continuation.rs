@@ -2618,6 +2618,37 @@ impl ChildAgentCoordinator {
         Ok(prepared)
     }
 
+    /// Read-only admission validation. The launcher repeats these checks under
+    /// the continuation CAS before starting; accepting a queue entry is not an
+    /// authorization to bypass later ownership changes.
+    pub(crate) fn validate_resume_admission(
+        &self,
+        selector: &str,
+        parent_task_id: Option<String>,
+        parent_fence: Option<&crate::runtime_surface::SurfaceOperationFence>,
+    ) -> Result<PreparedContinuation, AgentContinuationError> {
+        let prepared = self.prepared(selector)?;
+        let record = self
+            .store
+            .load_record(&prepared.continuation_id)?
+            .ok_or(AgentContinuationError::NotFound)?;
+        let mut input = ResumeContinuationInput {
+            selector: selector.to_owned(),
+            parent_task_id,
+            task_id: prepared.latest_task_id.clone(),
+            prompt_id: AgentPromptId::new(),
+            compatibility: prepared.compatibility.clone(),
+        };
+        if record.parent_task_id != input.parent_task_id {
+            self.validate_recorded_parent_recovery(&record, &input, parent_fence)?;
+            input.parent_task_id = record.parent_task_id.clone();
+        }
+        validate_resume_request(&record, &input)?;
+        reject_live_owner(&record, continuation_now_ms())?;
+        ensure_record_resumable(&record)?;
+        Ok(prepared)
+    }
+
     /// Validates parent, compatibility, workspace, checkpoint, owner, and prompt idempotency before preparing one new Resuming/Prepared attempt; it persists the new attempt and then installs its task projection without rolling back a committed record on projection failure.
     pub(crate) fn prepare_resume(
         &self,

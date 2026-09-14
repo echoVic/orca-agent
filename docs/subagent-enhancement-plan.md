@@ -3,7 +3,7 @@
 **日期**: 2026-06-16  
 **目标**: 参考 Claude Code 的 Agent 工具，增强 Orca 的 subagent 功能
 
-> **状态更新（2026-06-26）**: 本文最初是实现方案，后续章节中的代码结构和 checklist 保留为历史设计记录。当前代码已经支持默认嵌套深度 2、批量并行 `max_parallel = 6`、`model` 覆盖、`mode: "async"`、`subagent_status`、headless/`exec` worker-backed 持久 async handles、TUI session-local async handles、`isolation: "worktree"`、专用 `subagent_type`、可选 `schema` 校验，以及 completed async usage/timestamp/status 查询。最新对标状态以 `docs/agent-workflow-benchmark.md` 和 contract tests 为准。
+> **状态更新（2026-09-14）**: 本文及后续 checklist 是历史设计记录，其中的 `max_parallel`、`mode` 和 `subagent_status` 已被统一任务协议取代。当前实现与真实模型验收以 `docs/subagent-runtime-optimization-plan.md`、`docs/subagent-runtime-optimization-progress.md` 和 contract tests 为准。
 
 ---
 

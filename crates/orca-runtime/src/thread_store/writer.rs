@@ -1320,6 +1320,45 @@ impl SessionWriter {
         )))
     }
 
+    /// Atomically append a stable system delivery once. The identity is carried
+    /// in the system envelope, so reopening the transcript also restores dedup.
+    pub(crate) fn append_system_delivery_once(&mut self, content: &str) -> io::Result<bool> {
+        let mut records = self
+            .conversation_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = acquire_file_lock(&self.path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        repair_incomplete_final_record(&mut file)?;
+        // Re-read while holding the transcript lock: independently reopened
+        // writers must deduplicate against disk, not their cached ledgers.
+        for record in iter_records(&self.path)? {
+            if let SessionRecord::Message {
+                message:
+                    StoredMessage::System {
+                        content: existing, ..
+                    },
+                ..
+            } = record?
+                && existing == content
+            {
+                return Ok(false);
+            }
+        }
+        let record = StoredConversationRecord::identified(
+            ConversationItemId::new(),
+            TurnId::new(),
+            StoredMessage::from(&Message::pinned_system(content.to_owned())),
+        );
+        let line = encode_record_line(&self.path, &record.as_session_record())?;
+
+        file.write_all(&line)?;
+        file.flush()?;
+        file.sync_data()?;
+        records.push(record);
+        Ok(true)
+    }
+
     pub(crate) fn append_detached_message(&mut self, message: &Message) -> io::Result<()> {
         self.append_conversation_record(StoredConversationRecord::identified(
             ConversationItemId::new(),
@@ -1774,6 +1813,7 @@ mod tests {
             title: "resume usage".to_string(),
             created_at: Utc::now(),
             parent_id: None,
+            agent_scope: None,
             forked: false,
             approval_mode: None,
             active_permission_profile: None,
@@ -2822,5 +2862,23 @@ mod tests {
             let error = read_records(path.path()).expect_err("terminal metadata must fail closed");
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+    #[test]
+    fn system_delivery_is_deduplicated_across_independently_opened_writers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let meta = crate::history::create_meta(root.path(), "mock", None, "delivery");
+        write_record(&path, &SessionRecord::Meta(meta)).unwrap();
+        let mut first = SessionWriter::append_to_existing(path.clone()).unwrap();
+        let mut second = SessionWriter::append_to_existing(path.clone()).unwrap();
+        let content = "[Task delivery id=child-1 revision=1] result";
+        assert!(first.append_system_delivery_once(content).unwrap());
+        assert!(!second.append_system_delivery_once(content).unwrap());
+        drop(first);
+        drop(second);
+        let mut reopened = SessionWriter::append_to_existing(path.clone()).unwrap();
+        assert!(!reopened.append_system_delivery_once(content).unwrap());
+        assert_eq!(read_transcript(&path).unwrap().messages.iter().filter(|message|
+            matches!(message, Message::System { content: text, .. } if text == content)).count(), 1);
     }
 }

@@ -284,6 +284,7 @@ pub(crate) fn execute_workflow_tool(
     child_executor: ChildAgentExecutor<SharedEventBuffer>,
     wait_for_background_workflows: bool,
     workflow_ingress: Option<&dyn RuntimeWorkflowLifecycleIngress>,
+    parent_budget: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) -> io::Result<tool_types::ToolResult> {
     if !config.workflows.enabled {
         return Ok(tool_types::ToolResult::failed(
@@ -303,7 +304,8 @@ pub(crate) fn execute_workflow_tool(
     let input = parse_workflow_input(tool_request)?;
     let session_dir = task_registry.workflow_session_dir(cwd)?;
     let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
-        .with_child_executor(child_executor);
+        .with_child_executor(child_executor)
+        .with_parent_budget(parent_budget);
     let prepared = runner.prepare_background(WorkflowLaunchRequest::from(input))?;
     let task_id = prepared.task_id.clone();
     let run_id = prepared.run_id.clone();
@@ -416,6 +418,7 @@ pub(crate) fn execute_workflow_draft_action_tool(
     child_executor: ChildAgentExecutor<SharedEventBuffer>,
     wait_for_background_workflows: bool,
     workflow_ingress: Option<&dyn RuntimeWorkflowLifecycleIngress>,
+    parent_budget: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) -> io::Result<tool_types::ToolResult> {
     if !config.workflows.enabled {
         return Ok(tool_types::ToolResult::failed(
@@ -442,7 +445,8 @@ pub(crate) fn execute_workflow_draft_action_tool(
     let output = match input.action.as_str() {
         "run" => {
             let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
-                .with_child_executor(child_executor);
+                .with_child_executor(child_executor)
+                .with_parent_budget(parent_budget);
             let prepared =
                 runner.prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
                     draft_id: Some(input.draft_id.clone()),
@@ -1000,6 +1004,7 @@ export const meta = {
             unused_child_executor,
             true,
             None,
+            None,
         )
         .unwrap();
 
@@ -1055,6 +1060,7 @@ export const meta = {
             unused_child_executor,
             true,
             None,
+            None,
         )
         .unwrap();
 
@@ -1103,6 +1109,7 @@ export const meta = {
             unused_child_executor,
             true,
             Some(&ingress),
+            None,
         )
         .unwrap();
         observe_background_workflows(
@@ -1168,6 +1175,7 @@ export const meta = {
             unused_child_executor,
             true,
             Some(&ingress),
+            None,
         )
         .unwrap();
 
@@ -1365,6 +1373,7 @@ export const meta = {
             unused_child_executor,
             false,
             Some(&ingress),
+            None,
         )
         .unwrap();
 
