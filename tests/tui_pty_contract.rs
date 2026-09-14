@@ -93,7 +93,7 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
         "TUI did not advance to the runtime-owned tool approval",
     );
     process.write(b"1").expect("approve bash once");
-    assert_screen_shows(
+    assert_screen_shows_wrapped_token(
         &process,
         &mut output,
         PERMISSION_SENTINEL,
@@ -555,6 +555,34 @@ fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &st
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if screen_contains(output, expected) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "{failure}; reconstructed screen=\n{}",
+                reconstruct_screen(output)
+            );
+        }
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+}
+
+fn assert_screen_shows_wrapped_token(
+    process: &PtyProcess,
+    output: &mut Vec<u8>,
+    expected: &str,
+    failure: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let compact: String = reconstruct_screen(output)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        if compact.contains(expected) {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
