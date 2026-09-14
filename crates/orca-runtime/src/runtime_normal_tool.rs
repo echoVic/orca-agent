@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use orca_core::tool_types::{ToolName, ToolResult};
 use serde::Deserialize;
 
+use crate::network_proxy::RuntimeNetworkBlockDecision;
 use crate::protocol::PermissionResponseDecision;
 use crate::runtime_permission::{
     RuntimePermissionEvaluation, RuntimePermissionOrigin, RuntimePermissionPolicy,
@@ -11,7 +12,9 @@ use crate::runtime_permission::{
 use crate::runtime_state::PermissionRuntimeState;
 use crate::runtime_tool_call::{RuntimeNormalToolInvocation, RuntimeNormalToolWorkerContext};
 use crate::shell_session::ShellTerminalMode;
-use crate::terminal_service::{ExecutionDeadline, TerminalExecRequest, TerminalServiceOutput};
+use crate::terminal_service::{
+    ExecutionDeadline, TerminalExecRequest, TerminalServiceOutput, merge_terminal_output,
+};
 
 pub(crate) const DEFAULT_YIELD_TIME_MS: u64 = 1_000;
 const MAX_YIELD_TIME_MS: u64 = 30_000;
@@ -214,46 +217,55 @@ fn execute_bash(
             execution_deadline = Some(inherited);
         }
     }
-    let cancel = context.cancel;
-    let output_handler = &mut context.output_handler;
-    let mut run = |permission_overlay: &crate::runtime_permission::TurnPermissionOverlay| {
-        service.exec(
-            TerminalExecRequest {
-                lifetime,
-                command,
-                cwd: &cwd,
-                additional_roots: &invocation.additional_roots,
-                config: &invocation.config,
-                permission_overlay,
-                terminal,
-                execution_deadline,
-                #[cfg(test)]
-                sandbox_override: None,
-            },
-            yield_time(args.yield_time_ms, DEFAULT_YIELD_TIME_MS),
-            max_command_output_bytes(invocation, args.max_output_tokens),
-            || cancel.is_cancelled(),
-            &mut |chunk: &str| {
-                if let Some(handler) = output_handler.as_deref_mut() {
-                    handler(chunk);
-                }
-            },
-        )
-    };
-    let mut output = run(context.permission_overlay);
-    if let Ok(first) = &output
-        && let Some(block) = &first.network_block
-    {
+    let wait = yield_time(args.yield_time_ms, DEFAULT_YIELD_TIME_MS);
+    let max_output_bytes = max_command_output_bytes(invocation, args.max_output_tokens);
+    let mut next_output = service.exec(
+        TerminalExecRequest {
+            lifetime,
+            command,
+            cwd: &cwd,
+            additional_roots: &invocation.additional_roots,
+            config: &invocation.config,
+            permission_overlay: context.permission_overlay,
+            terminal,
+            execution_deadline,
+            #[cfg(test)]
+            sandbox_override: None,
+        },
+        wait,
+        max_output_bytes,
+        || context.cancel.is_cancelled(),
+        &mut |chunk: &str| {
+            if let Some(handler) = context.output_handler.as_deref_mut() {
+                handler(chunk);
+            }
+        },
+    );
+    let mut aggregate = None;
+    loop {
+        let mut output = match next_output {
+            Ok(output) => output,
+            Err(error) => return terminal_output_result(invocation, Err(error)),
+        };
+        let network_block = output.network_block.take();
+        let session_id = output.session_id.clone();
+        let task_id = output.task_id.clone();
+        merge_terminal_output(&mut aggregate, output);
+        let Some(block) = network_block else {
+            break;
+        };
         match RuntimePermissionPolicy::network_block_evaluation(
             &invocation.request.id,
             RuntimePermissionOrigin::Bash,
-            block,
+            &block,
         ) {
             RuntimePermissionEvaluation::Deny { reason, .. } => {
+                deny_blocked_network_request(service, &session_id, &task_id);
                 return ToolResult::denied(&invocation.request, reason);
             }
             RuntimePermissionEvaluation::Request(decision) => {
                 let Some(handler) = context.permission_handler else {
+                    deny_blocked_network_request(service, &session_id, &task_id);
                     return ToolResult::denied(
                         &invocation.request,
                         decision
@@ -269,6 +281,7 @@ fn execute_bash(
                 ) {
                     Ok(response) => response,
                     Err(error) => {
+                        deny_blocked_network_request(service, &session_id, &task_id);
                         return ToolResult::failed_after_start(
                             &invocation.request,
                             error.to_string(),
@@ -277,16 +290,46 @@ fn execute_bash(
                     }
                 };
                 if response.decision == PermissionResponseDecision::Deny {
+                    deny_blocked_network_request(service, &session_id, &task_id);
                     return ToolResult::denied(
                         &invocation.request,
                         "permission request denied".to_string(),
                     );
                 }
-                output = run(context.permission_overlay);
+                if let Err(error) = service
+                    .resolve_network_permission(&session_id, RuntimeNetworkBlockDecision::Allow)
+                {
+                    let _ = service.stop_task(&task_id);
+                    return ToolResult::failed_after_start(
+                        &invocation.request,
+                        error.to_string(),
+                        None,
+                    );
+                }
+                next_output = service.continue_session(
+                    &session_id,
+                    wait,
+                    max_output_bytes,
+                    || context.cancel.is_cancelled(),
+                    &mut |chunk: &str| {
+                        if let Some(handler) = context.output_handler.as_deref_mut() {
+                            handler(chunk);
+                        }
+                    },
+                );
             }
         }
     }
-    terminal_output_result(invocation, output.map(Some))
+    terminal_output_result(invocation, Ok(aggregate))
+}
+
+fn deny_blocked_network_request(
+    service: &crate::terminal_service::TerminalService,
+    session_id: &str,
+    task_id: &str,
+) {
+    let _ = service.resolve_network_permission(session_id, RuntimeNetworkBlockDecision::Deny);
+    let _ = service.stop_task(task_id);
 }
 
 /// Reads already-produced output using a caller-owned cursor.
