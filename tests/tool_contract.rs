@@ -200,7 +200,13 @@ fn full_auto_allows_bash_tool() {
     let events = parse_jsonl(&output.stdout);
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
-    assert_eq!(completed["payload"]["status"], "completed");
+    assert!(
+        matches!(
+            completed["payload"]["status"].as_str(),
+            Some("running" | "completed")
+        ),
+        "a capped first page may return before the process exit is observed: {completed}"
+    );
     // `bash` answers with the command's task envelope: the bytes are in
     // `output`, and the state, exit code, and stop reason travel with them so
     // a caller never has to infer how the command ended.

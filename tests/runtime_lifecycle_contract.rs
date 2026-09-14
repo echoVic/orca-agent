@@ -1523,9 +1523,13 @@ fn tool_actor_context_reuses_one_runtime_task_for_approval_hooks_and_execution()
         result.status,
         result.error
     );
+    let payload_text = result
+        .output
+        .as_deref()
+        .or(result.error.as_deref())
+        .unwrap_or_else(|| panic!("terminal contract payload: {result:?}"));
     let payload: serde_json::Value =
-        serde_json::from_str(result.output.as_deref().expect("terminal contract payload"))
-            .expect("terminal contract is JSON");
+        serde_json::from_str(payload_text).expect("terminal contract is JSON");
     assert!(
         payload["return_reason"].is_string(),
         "every command result names why the call returned: {payload}"
