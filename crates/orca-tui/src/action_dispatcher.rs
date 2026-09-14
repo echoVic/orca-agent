@@ -36,6 +36,11 @@ pub(crate) struct TuiActionDispatcher {
     interaction_ack_rx: Receiver<InteractionResponseAck>,
 }
 
+struct DispatcherPending {
+    commands: VecDeque<UserAction>,
+    event: Option<TuiEvent>,
+}
+
 impl TuiActionDispatcher {
     pub(crate) fn spawn(
         action_rx: Receiver<UserAction>,
@@ -110,20 +115,38 @@ fn run_dispatcher(
     // Keep the frozen mutation inventory's historical receiver name while the
     // concrete value is the runtime-surface-only control.
     let controller = surface_control;
-    let mut backlog = VecDeque::with_capacity(backlog_capacity);
+    let mut pending = DispatcherPending {
+        commands: VecDeque::with_capacity(backlog_capacity),
+        event: None,
+    };
     'dispatch: loop {
-        while let Some(action) = backlog.pop_front() {
+        if let Some(event) = pending.event.take() {
+            match event_tx.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => {
+                    pending.event = Some(event);
+                    crossbeam_channel::select! {
+                        recv(shutdown_rx) -> _ => break,
+                        default(Duration::from_millis(2)) => {}
+                    }
+                    continue;
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+
+        while let Some(action) = pending.commands.pop_front() {
             match command_tx.try_send(action) {
                 Ok(()) => {}
                 Err(TrySendError::Full(action)) => {
-                    backlog.push_front(action);
+                    pending.commands.push_front(action);
                     break;
                 }
                 Err(TrySendError::Disconnected(_)) => break 'dispatch,
             }
         }
 
-        if backlog.is_empty() {
+        if pending.commands.is_empty() {
             crossbeam_channel::select! {
                 recv(shutdown_rx) -> _ => break,
                 recv(action_rx) -> action => {
@@ -134,7 +157,7 @@ fn run_dispatcher(
                         &event_tx,
                         &interaction_ack_tx,
                         &controller,
-                        &mut backlog,
+                        &mut pending,
                         backlog_capacity,
                     ) {
                         break;
@@ -152,7 +175,7 @@ fn run_dispatcher(
                         &event_tx,
                         &interaction_ack_tx,
                         &controller,
-                        &mut backlog,
+                        &mut pending,
                         backlog_capacity,
                     ) {
                         break;
@@ -171,7 +194,7 @@ fn route_action(
     event_tx: &Sender<TuiEvent>,
     interaction_ack_tx: &Sender<InteractionResponseAck>,
     surface_control: &TuiSurfaceTaskControl,
-    backlog: &mut VecDeque<UserAction>,
+    pending: &mut DispatcherPending,
     backlog_capacity: usize,
 ) -> bool {
     // See `run_dispatcher`: this alias is typed surface presentation state, not
@@ -194,11 +217,18 @@ fn route_action(
                 Err(TrySendError::Disconnected(_)) => return false,
             }
         }
-        UserAction::Interrupt => {
-            if let Err(error) = controller.interrupt_current() {
-                let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
+        UserAction::Interrupt => match controller.interrupt_current() {
+            Ok(_) => {}
+            Err(error) => {
+                if !deliver_dispatcher_outcome(
+                    event_tx,
+                    &mut pending.event,
+                    TuiEvent::OperationRejected(error.to_string()),
+                ) {
+                    return false;
+                }
             }
-        }
+        },
         UserAction::BackgroundCurrentTurn => {
             controller.request_background_current();
         }
@@ -228,7 +258,7 @@ fn route_action(
                         images,
                     },
                     command_tx,
-                    backlog,
+                    &mut pending.commands,
                     backlog_capacity,
                 ) {
                     EnqueueResult::Queued => {}
@@ -263,7 +293,7 @@ fn route_action(
                 Ok(None) => match enqueue_action(
                     UserAction::PromptQueueControl(action),
                     command_tx,
-                    backlog,
+                    &mut pending.commands,
                     backlog_capacity,
                 ) {
                     EnqueueResult::Queued => {}
@@ -283,7 +313,12 @@ fn route_action(
         UserAction::GoalPause => match controller.pause_current_goal() {
             Ok(true) => {}
             Ok(false) => {
-                match enqueue_action(UserAction::GoalPause, command_tx, backlog, backlog_capacity) {
+                match enqueue_action(
+                    UserAction::GoalPause,
+                    command_tx,
+                    &mut pending.commands,
+                    backlog_capacity,
+                ) {
                     EnqueueResult::Queued => {}
                     EnqueueResult::Disconnected => return false,
                     EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
@@ -298,14 +333,18 @@ fn route_action(
                 Ok(Some(projection)) => {
                     let _ =
                         event_tx.try_send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
-                    let _ = event_tx.try_send(TuiEvent::Notice(format!(
-                        "Task stop requested for {task_id}."
-                    )));
+                    if !deliver_dispatcher_outcome(
+                        event_tx,
+                        &mut pending.event,
+                        TuiEvent::Notice(format!("Task stop requested for {task_id}.")),
+                    ) {
+                        return false;
+                    }
                 }
                 Ok(None) => match enqueue_action(
                     UserAction::StopTask { task_id },
                     command_tx,
-                    backlog,
+                    &mut pending.commands,
                     backlog_capacity,
                 ) {
                     EnqueueResult::Queued => {}
@@ -313,7 +352,13 @@ fn route_action(
                     EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
                 },
                 Err(error) => {
-                    let _ = event_tx.try_send(TuiEvent::Error(error));
+                    if !deliver_dispatcher_outcome(
+                        event_tx,
+                        &mut pending.event,
+                        TuiEvent::Error(error),
+                    ) {
+                        return false;
+                    }
                 }
             }
         }
@@ -336,7 +381,7 @@ fn route_action(
             } else {
                 false
             };
-            match enqueue_action(action, command_tx, backlog, backlog_capacity) {
+            match enqueue_action(action, command_tx, &mut pending.commands, backlog_capacity) {
                 EnqueueResult::Queued => {}
                 EnqueueResult::Disconnected => return false,
                 EnqueueResult::Overflow(action) => {
@@ -349,6 +394,22 @@ fn route_action(
         }
     }
     true
+}
+
+fn deliver_dispatcher_outcome(
+    event_tx: &Sender<TuiEvent>,
+    pending_event: &mut Option<TuiEvent>,
+    event: TuiEvent,
+) -> bool {
+    debug_assert!(pending_event.is_none());
+    match event_tx.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Full(event)) => {
+            *pending_event = Some(event);
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
 }
 
 fn interaction_response_ack(
@@ -883,6 +944,97 @@ mod tests {
             event_rx.recv_timeout(Duration::from_secs(1)),
             Ok(TuiEvent::OperationRejected(message))
                 if message.contains("typed surface cancel")
+        ));
+
+        dispatcher.shutdown().expect("shutdown dispatcher");
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ORCA_HOME", value) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
+    #[test]
+    fn full_event_mailbox_retains_dispatcher_outcome_until_drain() {
+        let _env = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let host = RuntimeHost::start().expect("runtime host");
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let thread = host
+            .start_thread(config, "retained dispatcher outcome")
+            .expect("runtime thread");
+        let typed_thread = thread.typed_surface();
+        let surface = typed_thread.surface();
+        let attachment = match surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::SubmitOperation,
+                SurfaceCapability::ControlBoundOperation,
+            ]),
+            interaction_capabilities: BTreeSet::new(),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            AttachResult::Denied { reason } => {
+                panic!("attach typed TUI surface denied: {reason:?}")
+            }
+            AttachResult::Unavailable { reason } => {
+                panic!("attach typed TUI surface unavailable: {reason:?}")
+            }
+            _ => panic!("attach typed TUI surface returned a non-fresh result"),
+        };
+        let operation_id = SurfaceOperationId::try_from_bytes([
+            0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 9,
+        ])
+        .expect("surface operation id");
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        control
+            .begin_surface_activation()
+            .expect("arm typed surface activation");
+        control
+            .install_surface(attachment.client.clone(), operation_id)
+            .expect("install typed surface operation");
+        let _ = surface.detach(
+            &attachment.client,
+            DetachRequest {
+                request_id: SurfaceRequestId::new(),
+            },
+        );
+
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::bounded::<TuiEvent>(1);
+        event_tx
+            .send(TuiEvent::Notice("occupy event mailbox".to_string()))
+            .expect("fill event mailbox");
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+        raw_tx.send(UserAction::Interrupt).expect("queue interrupt");
+        raw_tx
+            .send(UserAction::Submit("delivery barrier".to_string()))
+            .expect("queue delivery barrier");
+        assert!(
+            command_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "later command overtook the retained dispatcher outcome"
+        );
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::Notice(message)) if message == "occupy event mailbox"
+        ));
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::OperationRejected(message))
+                if message.contains("typed surface cancel")
+        ));
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(UserAction::Submit(prompt)) if prompt == "delivery barrier"
         ));
 
         dispatcher.shutdown().expect("shutdown dispatcher");
