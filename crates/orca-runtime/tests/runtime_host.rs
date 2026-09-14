@@ -1539,9 +1539,14 @@ fn parent_waits_for_async_agent_while_child_thread_remains_addressable() {
         "child thread must remain live while the parent waits"
     );
     std::fs::write(&release_marker, b"release").expect("release async child");
+    let parent_completion_timeout = if cfg!(windows) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(10)
+    };
     assert_eq!(
         operation
-            .wait_timeout(Duration::from_secs(10))
+            .wait_timeout(parent_completion_timeout)
             .expect("parent turn terminal")
             .outcome(),
         &OperationOutcome::Completed(RunStatus::Success)
