@@ -478,15 +478,30 @@ impl TerminalService {
             }
             merge_terminal_output(&mut aggregate, output);
             remaining_output_bytes = remaining_output_bytes.saturating_sub(observed_output);
-            if status != "running"
-                || network_blocked
+            if status != "running" {
+                return Ok(aggregate.expect("terminal poll always produces output metadata"));
+            }
+            if should_cancel() {
+                let task_id = aggregate
+                    .as_ref()
+                    .expect("terminal poll always produces output metadata")
+                    .task_id
+                    .clone();
+                let _ = self.stop_task(&task_id)?;
+                let terminal = self.poll_once(session_id, remaining_output_bytes.max(1), None)?;
+                merge_terminal_output(&mut aggregate, terminal);
+                if let Some(output) = aggregate.as_mut() {
+                    output.network_block = None;
+                }
+                return Ok(aggregate.expect("terminal cancellation produces output metadata"));
+            }
+            if network_blocked
                 || (return_on_output
                     && aggregate
                         .as_ref()
                         .is_some_and(|output| !output.output.is_empty()))
                 || remaining_output_bytes == 0
                 || Instant::now() >= deadline
-                || should_cancel()
             {
                 return Ok(aggregate.expect("terminal poll always produces output metadata"));
             }
@@ -1603,6 +1618,30 @@ mod tests {
 
         assert_ne!(stopped.status, "running", "{stopped:?}");
         assert_eq!(stopped.termination, "cancelled", "{stopped:?}");
+    }
+
+    #[test]
+    fn exec_cancellation_stops_the_running_process_before_returning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, _) = service(temp.path());
+        let overlay = TurnPermissionOverlay::default();
+
+        let output = start(
+            &service,
+            request(
+                host_long_running_command(),
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+            ),
+            Duration::from_secs(5),
+            8 * 1024,
+            || true,
+        )
+        .expect("cancel long command");
+
+        assert_eq!(output.status, "stopped", "{output:?}");
+        assert_eq!(output.termination, "cancelled", "{output:?}");
     }
 
     #[test]

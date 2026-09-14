@@ -2034,9 +2034,6 @@ fn server_mode_interrupt_cancels_active_pre_model_hook_wait() {
 
 #[test]
 fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
-    if !sandbox_backend_available() {
-        return;
-    }
     let workspace = tempdir().expect("workspace");
     let invocation_marker = workspace.path().join("bash-invocation-started");
     let command_marker = workspace
@@ -2046,11 +2043,7 @@ fn server_mode_interrupt_cancels_active_bash_tool_wait_and_accepts_next_turn() {
         .join("bash-invocation-started");
     let home = workspace.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
-    std::fs::write(
-        home.join("config.toml"),
-        "mode = \"suggest\"\n[[permissions.rules]]\ntool = \"bash\"\npattern = \"**\"\ndecision = \"allow\"\n",
-    )
-    .expect("write config");
+    std::fs::write(home.join("config.toml"), "mode = \"full-auto\"\n").expect("write config");
     let mut child = orca_command()
         .args([
             "--mode",
@@ -10046,30 +10039,6 @@ fn sandbox_seatbelt_available() -> bool {
         )
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-}
-
-fn sandbox_backend_available() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        // The server harness provisions the native AppContainer capability
-        // store before spawning each Windows test process.
-        true
-    }
-    #[cfg(target_os = "macos")]
-    {
-        sandbox_seatbelt_available()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        matches!(
-            orca_tools::sandbox::enforcement_state(),
-            orca_core::capability::EnforcementState::Enforced
-        )
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
     }
