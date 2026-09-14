@@ -200,13 +200,7 @@ fn full_auto_allows_bash_tool() {
     let events = parse_jsonl(&output.stdout);
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
-    assert!(
-        matches!(
-            completed["payload"]["status"].as_str(),
-            Some("running" | "completed")
-        ),
-        "a capped first page may return before the process exit is observed: {completed}"
-    );
+    assert_eq!(completed["payload"]["status"], "completed");
     // `bash` answers with the command's task envelope: the bytes are in
     // `output`, and the state, exit code, and stop reason travel with them so
     // a caller never has to infer how the command ended.
@@ -371,7 +365,13 @@ output_truncation = { mode = "tokens", limit = 12 }
     let events = parse_jsonl(&output.stdout);
     let completed = find_event(&events, "tool.call.completed");
     assert_eq!(completed["payload"]["name"], "bash");
-    assert_eq!(completed["payload"]["status"], "completed");
+    assert!(
+        matches!(
+            completed["payload"]["status"].as_str(),
+            Some("running" | "completed")
+        ),
+        "a capped first page may return before the process exit is observed: {completed}"
+    );
     assert_eq!(completed["payload"]["truncated"], true);
     // A capped page is not a lost result. The command envelope carries the
     // cursor that continues it, so the caller reads the rest instead of
