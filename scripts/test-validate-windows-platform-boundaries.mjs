@@ -961,9 +961,21 @@ const terminalStopFixture = terminalServiceSource.slice(
 );
 assert.ok(
   terminalStopFixture.includes("Duration::from_secs(10)") &&
-    terminalStopFixture.includes("printf ready; sleep 30"),
+    terminalStopFixture.includes("host_long_running_command()"),
   "Windows shell cancellation must stay bounded well below the fixture's natural completion",
 );
+for (const marker of [
+  "fn host_long_running_command()",
+  "ShellResolver::for_current_host()",
+  "ShellKind::Cmd",
+  "Start-Sleep -Seconds 30",
+  "ping 127.0.0.1 -n 31",
+]) {
+  assert.ok(
+    terminalServiceSource.includes(marker),
+    `terminal stop fixture must follow the resolved host shell: ${marker}`,
+  );
+}
 const bashToolSource = readNormalizedSource("crates/orca-tools/src/bash.rs");
 const noisyCancelFixture = bashToolSource.slice(
   bashToolSource.indexOf(

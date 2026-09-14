@@ -1121,6 +1121,22 @@ fn termination_label(termination: ShellSessionTermination) -> &'static str {
 mod tests {
     use super::*;
 
+    fn host_long_running_command() -> &'static str {
+        match orca_platform::shell::ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .expect("resolve host shell")
+            .kind()
+        {
+            orca_platform::shell::ShellKind::Posix | orca_platform::shell::ShellKind::GitBash => {
+                "printf ready; sleep 30"
+            }
+            orca_platform::shell::ShellKind::PowerShell(_) => {
+                "Write-Host -NoNewline 'ready'; Start-Sleep -Seconds 30"
+            }
+            orca_platform::shell::ShellKind::Cmd => "echo ready & ping 127.0.0.1 -n 31 > nul",
+        }
+    }
+
     fn service(cwd: &Path) -> (TerminalService, TaskRegistry) {
         let registry = TaskRegistry::new_persistent(
             format!("terminal-test-{}", uuid::Uuid::new_v4()),
@@ -1362,14 +1378,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, _) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
+        let command = host_long_running_command();
         let started = start(
             &service,
-            request(
-                "printf ready; sleep 30",
-                temp.path(),
-                &overlay,
-                ShellTerminalMode::pipe(),
-            ),
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
             Duration::from_millis(50),
             8 * 1024,
             || false,
@@ -1426,14 +1438,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, registry) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
+        let command = host_long_running_command();
         let started = start(
             &service,
-            request(
-                "printf ready; sleep 30",
-                temp.path(),
-                &overlay,
-                ShellTerminalMode::pipe(),
-            ),
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
             Duration::from_millis(50),
             8 * 1024,
             || false,
