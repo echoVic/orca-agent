@@ -52,8 +52,9 @@ identity and is no longer part of the model contract.
 
 Two independent time concepts replace the single timeout:
 
-- `yield_time_ms` (default 1000, 0–30000) bounds only how long the call waits.
-  Its expiry returns `running` and leaves the process untouched.
+- `yield_time_ms` (default 10000 for `pipe`, 1000 for `pty`, 0–30000) bounds
+  only how long the call waits. Its expiry returns `running` and leaves the
+  process untouched. The shorter PTY default keeps interactive input responsive.
 - `timeout_ms` (default none, positive only) is an execution deadline measured
   from process start. It is the only caller-side limit on process lifetime.
   0 is rejected because it would mean both "expire now" and "no limit".

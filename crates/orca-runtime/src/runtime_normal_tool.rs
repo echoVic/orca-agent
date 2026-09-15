@@ -16,7 +16,8 @@ use crate::terminal_service::{
     ExecutionDeadline, TerminalExecRequest, TerminalServiceOutput, merge_terminal_output,
 };
 
-pub(crate) const DEFAULT_YIELD_TIME_MS: u64 = 1_000;
+const DEFAULT_PIPE_YIELD_TIME_MS: u64 = 10_000;
+const DEFAULT_PTY_YIELD_TIME_MS: u64 = 1_000;
 const MAX_YIELD_TIME_MS: u64 = 30_000;
 const DEFAULT_WRITE_YIELD_TIME_MS: u64 = 250;
 const DEFAULT_WAIT_TIME_MS: u64 = 30_000;
@@ -129,9 +130,12 @@ fn execute_bash(
         Ok(cwd) => cwd,
         Err(error) => return ToolResult::invalid_input(&invocation.request, error),
     };
-    let terminal = match args.terminal.as_deref() {
-        None | Some("pipe") => ShellTerminalMode::pipe(),
-        Some("pty") => ShellTerminalMode::pty(Some(120), Some(30)),
+    let (terminal, default_yield_time_ms) = match args.terminal.as_deref() {
+        None | Some("pipe") => (ShellTerminalMode::pipe(), DEFAULT_PIPE_YIELD_TIME_MS),
+        Some("pty") => (
+            ShellTerminalMode::pty(Some(120), Some(30)),
+            DEFAULT_PTY_YIELD_TIME_MS,
+        ),
         Some(other) => {
             return ToolResult::invalid_input(
                 &invocation.request,
@@ -217,7 +221,7 @@ fn execute_bash(
             execution_deadline = Some(inherited);
         }
     }
-    let wait = yield_time(args.yield_time_ms, DEFAULT_YIELD_TIME_MS);
+    let wait = yield_time(args.yield_time_ms, default_yield_time_ms);
     let max_output_bytes = max_command_output_bytes(invocation, args.max_output_tokens);
     let mut next_output = service.exec(
         TerminalExecRequest {

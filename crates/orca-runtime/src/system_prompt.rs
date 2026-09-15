@@ -161,6 +161,7 @@ Every shell command goes through `bash`. Command syntax follows the host shell n
 
 `bash` starts the command once and then returns. The returned `task_id` is how you keep observing it:
 
+- Ordinary pipe commands wait up to 10 seconds by default and return sooner when they finish. PTY commands default to 1 second so interactive input stays responsive.
 - `state: "running"` means the command is still executing. Continue with the same `task_id`; never start it a second time.
 - `yield_time_ms` only controls how long this call waits before handing control back. It never stops the command.
 - `timeout_ms` is the only caller-side limit on how long the command may run. Set it only when you actually need an execution deadline.
@@ -279,6 +280,7 @@ mod tests {
         let prompt = build_system_prompt(std::path::Path::new("/repo"));
 
         assert!(prompt.contains("`yield_time_ms` only controls how long this call waits"));
+        assert!(prompt.contains("Ordinary pipe commands wait up to 10 seconds by default"));
         assert!(prompt.contains("`timeout_ms` is the only caller-side limit"));
         assert!(prompt.contains("do not use `sleep` or repeated short polling"));
     }

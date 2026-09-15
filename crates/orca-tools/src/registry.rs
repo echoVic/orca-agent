@@ -623,7 +623,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 30000,
-                        "description": "How long this call waits before returning. Defaults to 1000. 0 returns as soon as the process is registered. Elapsing never stops the command."
+                        "description": "How long this call waits before returning. Defaults to 10000 for pipe commands and 1000 for pty commands. 0 returns as soon as the process is registered. Elapsing never stops the command."
                     },
                     "timeout_ms": {
                         "type": "integer",
@@ -2875,6 +2875,21 @@ mod tests {
             bash.spec().input_schema["required"],
             json!(["command"]),
             "only the command itself is required"
+        );
+        let yield_description = properties["yield_time_ms"]["description"]
+            .as_str()
+            .expect("yield_time_ms description");
+        assert!(
+            yield_description.contains("pipe") && yield_description.contains("10000"),
+            "ordinary pipe commands should advertise the longer inline wait: {yield_description}"
+        );
+        assert!(
+            yield_description.contains("pty") && yield_description.contains("1000"),
+            "interactive pty commands should preserve the short default: {yield_description}"
+        );
+        assert!(
+            yield_description.contains("0 returns"),
+            "explicit immediate yielding should remain documented: {yield_description}"
         );
     }
 

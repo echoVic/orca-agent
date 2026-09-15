@@ -68,6 +68,66 @@ fn host_long_running_command() -> &'static str {
     }
 }
 
+fn host_delayed_output_command() -> &'static str {
+    match orca_platform::shell::ShellResolver::for_current_host()
+        .resolve_from_environment()
+        .expect("resolve host shell")
+        .kind()
+    {
+        orca_platform::shell::ShellKind::Posix | orca_platform::shell::ShellKind::GitBash => {
+            "sleep 2; printf default-yield-completed"
+        }
+        orca_platform::shell::ShellKind::PowerShell(_) => {
+            "Start-Sleep -Seconds 2; Write-Host -NoNewline default-yield-completed"
+        }
+        orca_platform::shell::ShellKind::Cmd => {
+            "ping 127.0.0.1 -n 3 > nul && echo default-yield-completed"
+        }
+    }
+}
+
+fn execute_bash_for_yield_test(
+    id: &str,
+    command: &str,
+    terminal: Option<&str>,
+    yield_time_ms: Option<u64>,
+) -> ToolResult {
+    let config = danger_full_access_config();
+    let mut context = RuntimeToolActorContext::new(id);
+    let task_registry = TaskRegistry::new(id.to_string());
+    let mut arguments = serde_json::json!({
+        "command": command,
+        "timeout_ms": 15_000,
+    });
+    if let Some(terminal) = terminal {
+        arguments["terminal"] = serde_json::json!(terminal);
+    }
+    if let Some(yield_time_ms) = yield_time_ms {
+        arguments["yield_time_ms"] = serde_json::json!(yield_time_ms);
+    }
+    let request = ToolRequest {
+        id: id.to_string(),
+        name: ToolName::Bash,
+        action: ActionKind::Shell,
+        target: Some(command.to_string()),
+        raw_arguments: Some(arguments.to_string()),
+    };
+
+    context.execute_normal_tool_with_roots_and_cancel(
+        &config,
+        &request,
+        std::env::current_dir().expect("cwd").as_path(),
+        &[],
+        &McpRegistry::default(),
+        &[],
+        ToolConfig::default().output_truncation,
+        ToolConfig::default().shell_timeout_secs,
+        Some(&task_registry),
+        None,
+        None,
+    )
+}
+
 #[test]
 fn reported_session_triggers_soft_compaction() {
     // Exact JSONL bytes reproduce the released session incident contract.
@@ -1631,6 +1691,86 @@ fn tool_actor_context_cancels_normal_tool_before_admission_without_shell_task() 
         result.terminal().started,
         orca_core::tool_types::ToolInvocationStarted::No
     );
+}
+
+#[test]
+fn omitted_yield_waits_for_an_ordinary_pipe_command_to_finish_inline() {
+    let result = execute_bash_for_yield_test(
+        "tool-default-yield",
+        host_delayed_output_command(),
+        None,
+        None,
+    );
+
+    assert_eq!(
+        result.status,
+        orca_core::tool_types::ToolStatus::Completed,
+        "an ordinary command should finish in the initial bash call: {result:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        result
+            .output
+            .as_deref()
+            .expect("completed bash result should contain its task envelope"),
+    )
+    .expect("terminal contract is JSON");
+    assert_eq!(payload["return_reason"], "terminal_observed");
+    assert!(
+        payload["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("default-yield-completed")),
+        "unexpected command output: {payload}"
+    );
+}
+
+#[test]
+fn omitted_yield_keeps_pty_commands_responsive() {
+    let result = execute_bash_for_yield_test(
+        "tool-default-pty-yield",
+        host_long_running_command(),
+        Some("pty"),
+        None,
+    );
+
+    assert_eq!(
+        result.status,
+        orca_core::tool_types::ToolStatus::Running,
+        "an interactive command should yield before the long-running process finishes: {result:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        result
+            .output
+            .as_deref()
+            .expect("running bash result should contain its task envelope"),
+    )
+    .expect("terminal contract is JSON");
+    assert_eq!(payload["return_reason"], "yield_elapsed");
+    assert_eq!(payload["terminal"], "pty");
+}
+
+#[test]
+fn explicit_nonzero_yield_overrides_the_pipe_default() {
+    let result = execute_bash_for_yield_test(
+        "tool-explicit-yield",
+        host_long_running_command(),
+        None,
+        Some(250),
+    );
+
+    assert_eq!(
+        result.status,
+        orca_core::tool_types::ToolStatus::Running,
+        "an explicit short yield should override the longer pipe default: {result:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        result
+            .output
+            .as_deref()
+            .expect("running bash result should contain its task envelope"),
+    )
+    .expect("terminal contract is JSON");
+    assert_eq!(payload["return_reason"], "yield_elapsed");
+    assert_eq!(payload["terminal"], "pipe");
 }
 
 #[test]
