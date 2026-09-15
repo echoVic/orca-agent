@@ -377,6 +377,57 @@ async fn call_streaming_async_with_output_budget(
                     usage: None,
                 };
             }
+            if let Some((key, recovers_after_retry)) =
+                conversation.last_user_message().and_then(|prompt| {
+                    let prompt = prompt.trim();
+                    prompt
+                        .strip_prefix("mock_stream_closed_once ")
+                        .map(|key| (key, true))
+                        .or_else(|| {
+                            prompt
+                                .strip_prefix("mock_stream_closed_always ")
+                                .map(|key| (key, false))
+                        })
+                })
+            {
+                if !recovers_after_retry || mock_flaky_once_should_fail(key) {
+                    let partial = ProviderStep::ReasoningDelta(
+                        "Mock truncated attempt emitted partial reasoning.".to_string(),
+                    );
+                    let error = ProviderStep::Error(ProviderError::new(
+                        ProviderErrorKind::StreamClosed,
+                        format!("mock truncated stream requested for {key}"),
+                    ));
+                    on_step(&partial);
+                    on_step(&error);
+                    return ProviderResponse {
+                        steps: vec![partial, error],
+                        assistant_content: None,
+                        assistant_reasoning: None,
+                        tool_calls: Vec::new(),
+                        usage: Some(Usage {
+                            input_tokens: 101,
+                            output_tokens: 17,
+                            cache_tokens: 9,
+                        }),
+                    };
+                }
+                let message =
+                    format!("Mock runtime completed after truncated stream recovery for {key}.");
+                let completed = ProviderStep::MessageDelta(message.clone());
+                on_step(&completed);
+                return ProviderResponse {
+                    steps: vec![completed],
+                    assistant_content: Some(message),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(Usage {
+                        input_tokens: 103,
+                        output_tokens: 19,
+                        cache_tokens: 10,
+                    }),
+                };
+            }
             if let Some((release_marker, tool_prompt)) =
                 mock_stream_tool_release_marker(conversation)
             {

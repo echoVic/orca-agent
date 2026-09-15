@@ -1,9 +1,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orca_core::cancel::CancelToken;
-use orca_core::provider_types::ProviderError;
+use orca_core::provider_types::{ProviderError, ProviderErrorKind};
 
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+const STREAM_CLOSED_MAX_ATTEMPTS: u32 = 2;
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(8);
 const DEFAULT_JITTER_FACTOR: f64 = 0.1;
@@ -40,7 +41,12 @@ impl ProviderRetryPolicy {
         error: &ProviderError,
         completed_attempts: u32,
     ) -> ProviderRetryDecision {
-        if !error.is_retryable() || completed_attempts >= self.max_attempts {
+        let max_attempts = if error.kind == ProviderErrorKind::StreamClosed {
+            STREAM_CLOSED_MAX_ATTEMPTS
+        } else {
+            self.max_attempts
+        };
+        if !error.is_retryable() || completed_attempts >= max_attempts {
             return ProviderRetryDecision::Stop;
         }
         ProviderRetryDecision::RetryAfter(self.backoff(completed_attempts - 1))
@@ -103,7 +109,6 @@ mod tests {
     fn permanent_or_unsafe_errors_do_not_retry_bits_spec_ut() {
         let policy = ProviderRetryPolicy::default();
         for kind in [
-            ProviderErrorKind::StreamClosed,
             ProviderErrorKind::MalformedResponse,
             ProviderErrorKind::ContextExceeded,
             ProviderErrorKind::Cancelled,
@@ -114,5 +119,17 @@ mod tests {
                 ProviderRetryDecision::Stop
             );
         }
+    }
+
+    #[test]
+    fn truncated_streams_retry_once_but_do_not_loop_indefinitely() {
+        let policy = ProviderRetryPolicy::default();
+        let error = ProviderError::new(ProviderErrorKind::StreamClosed, "truncated");
+
+        assert!(matches!(
+            policy.decide(&error, 1),
+            ProviderRetryDecision::RetryAfter(_)
+        ));
+        assert_eq!(policy.decide(&error, 2), ProviderRetryDecision::Stop);
     }
 }

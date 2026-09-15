@@ -1101,18 +1101,18 @@ fn provider_recovery_discards_superseded_stream_before_completing_response() {
 }
 
 #[test]
-fn transient_provider_attempt_is_discarded_and_retried_with_new_response_identity() {
+fn truncated_provider_attempt_is_discarded_and_retried_with_new_response_identity() {
     let cwd = tempfile::tempdir().unwrap();
     let host = RuntimeHost::start().expect("start runtime host");
     let thread = host
         .start_thread(
             test_config(cwd.path().to_path_buf(), HistoryMode::Record),
-            "retry transient provider attempt",
+            "retry truncated provider attempt",
         )
         .expect("start recorded runtime thread");
     let surface = thread.surface();
     let attachment = fresh_interaction_attachment(&surface);
-    let prompt = format!("mock_stream_flaky_once {}", uuid::Uuid::new_v4());
+    let prompt = format!("mock_stream_closed_once {}", uuid::Uuid::new_v4());
     let reserved = committed_value(
         attachment
             .client
@@ -1140,7 +1140,7 @@ fn transient_provider_attempt_is_discarded_and_retried_with_new_response_identit
     let snapshot = fresh_snapshot(&surface);
     assert!(snapshot.assistant_streams.iter().any(|stream| {
         stream.channel == AssistantChannel::Reasoning
-            && stream.text.as_str() == "Mock transient attempt emitted partial reasoning."
+            && stream.text.as_str() == "Mock truncated attempt emitted partial reasoning."
             && stream.state == SurfaceAssistantStreamState::Discarded
     }));
     assert!(snapshot.assistant_streams.iter().any(|stream| {
@@ -1148,15 +1148,92 @@ fn transient_provider_attempt_is_discarded_and_retried_with_new_response_identit
             && stream
                 .text
                 .as_str()
-                .contains("Mock runtime completed after stream recovery")
+                .contains("Mock runtime completed after truncated stream recovery")
             && stream.state == SurfaceAssistantStreamState::Completed
     }));
     assert!(!snapshot.items.iter().any(|item| matches!(
         item,
         SurfaceItem::AssistantReasoning { summary, content, .. }
-            if summary.as_str().contains("transient attempt")
-                || content.as_str().contains("transient attempt")
+            if summary.as_str().contains("truncated attempt")
+                || content.as_str().contains("truncated attempt")
     )));
+    let usage = snapshot
+        .operation_history
+        .last()
+        .and_then(|operation| operation.terminal.as_ref())
+        .map(|terminal| terminal.usage.clone())
+        .expect("completed operation keeps merged provider usage");
+    assert_eq!(usage.input_tokens, 204);
+    assert_eq!(usage.output_tokens, 36);
+    assert_eq!(usage.cache_tokens, 19);
+    host.shutdown().unwrap();
+}
+
+#[test]
+fn exhausted_truncated_provider_retries_keep_usage_in_the_failed_terminal() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().expect("start runtime host");
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "account exhausted truncated provider retries",
+        )
+        .expect("start recorded runtime thread");
+    let surface = thread.surface();
+    let attachment = fresh_interaction_attachment(&surface);
+    let prompt = format!("mock_stream_closed_always {}", uuid::Uuid::new_v4());
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, &prompt),
+            )
+            .unwrap(),
+    );
+    let operation_id = reserved.operation_id.clone();
+    let _ = committed_value(
+        attachment
+            .client
+            .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+
+    let snapshot = fresh_snapshot(&surface);
+    assert_eq!(
+        snapshot
+            .assistant_streams
+            .iter()
+            .filter(|stream| {
+                stream.channel == AssistantChannel::Reasoning
+                    && stream.text.as_str() == "Mock truncated attempt emitted partial reasoning."
+                    && stream.state == SurfaceAssistantStreamState::Discarded
+            })
+            .count(),
+        2
+    );
+    let terminal = snapshot
+        .operation_history
+        .last()
+        .and_then(|operation| operation.terminal.as_ref())
+        .expect("failed operation has a terminal record");
+    assert!(matches!(
+        terminal.terminal,
+        OperationTerminal::Failed {
+            class: FailureClass::Provider,
+            ..
+        }
+    ));
+    assert_eq!(terminal.usage.input_tokens, 202);
+    assert_eq!(terminal.usage.output_tokens, 34);
+    assert_eq!(terminal.usage.cache_tokens, 18);
     host.shutdown().unwrap();
 }
 

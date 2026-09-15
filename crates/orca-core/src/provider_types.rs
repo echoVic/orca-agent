@@ -64,10 +64,13 @@ impl ProviderError {
     }
 
     pub fn is_retryable(&self) -> bool {
+        // The runtime discards an incomplete provider attempt before retrying,
+        // so a stream that closes before its terminal marker is replay-safe.
         matches!(
             self.kind,
             ProviderErrorKind::Transport
                 | ProviderErrorKind::Timeout
+                | ProviderErrorKind::StreamClosed
                 | ProviderErrorKind::Server
                 | ProviderErrorKind::RateLimit
                 | ProviderErrorKind::EmptyResponse

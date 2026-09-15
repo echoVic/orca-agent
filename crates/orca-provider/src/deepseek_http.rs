@@ -595,7 +595,7 @@ async fn request_chat_streaming_with_budget(
         let mut emitted_step = false;
         let mut emitted_reasoning = false;
 
-        let stream_result = match crate::streaming::parse_sse_response(
+        let stream_result = match crate::streaming::parse_sse_response_with_partial(
             response,
             cancel,
             crate::http_client::streaming_idle_read_timeout(),
@@ -621,13 +621,18 @@ async fn request_chat_streaming_with_budget(
                 if !emitted_step
                     && summary_budget.is_none()
                     && stream_integrity_retries < STREAM_INTEGRITY_RETRIES
-                    && crate::streaming::is_stream_integrity_error(&error) =>
+                    && crate::streaming::is_stream_integrity_error(&error.message) =>
             {
+                merge_usage(&mut accumulated_usage, error.usage);
                 stream_integrity_retries += 1;
                 continue;
             }
             Err(error) => {
-                return Err(DeepSeekRequestError::with_usage(error, accumulated_usage));
+                merge_usage(&mut accumulated_usage, error.usage);
+                return Err(DeepSeekRequestError::with_usage(
+                    error.message,
+                    accumulated_usage,
+                ));
             }
         };
 
@@ -2673,7 +2678,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_integrity_error_after_visible_delta_does_not_retry() {
-        let premature = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let premature = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":4,\"prompt_cache_hit_tokens\":8}}\n\n";
         let replacement = "data: {\"choices\":[{\"delta\":{\"content\":\"replacement\"},\"finish_reason\":\"stop\"}]}\n\n\
                            data: [DONE]\n\n";
         let (base_url, bodies) =
@@ -2701,7 +2707,14 @@ mod tests {
         .expect_err("a visible partial response must not be replayed transparently");
 
         assert_eq!(error.message, "stream ended before terminal marker");
-        assert_eq!(error.usage, None);
+        assert_eq!(
+            error.usage,
+            Some(Usage {
+                input_tokens: 13,
+                output_tokens: 4,
+                cache_tokens: 8,
+            })
+        );
         assert_eq!(bodies.lock().expect("lock captured bodies").len(), 1);
         assert_eq!(deltas, vec!["partial"]);
     }

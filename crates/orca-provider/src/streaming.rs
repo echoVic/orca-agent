@@ -70,6 +70,27 @@ pub struct StreamResult {
     pub usage: Option<Usage>,
 }
 
+#[derive(Debug)]
+pub(crate) struct StreamParseError {
+    pub(crate) message: String,
+    pub(crate) usage: Option<Usage>,
+}
+
+impl StreamParseError {
+    fn with_usage(message: impl Into<String>, usage: Option<Usage>) -> Self {
+        Self {
+            message: message.into(),
+            usage,
+        }
+    }
+}
+
+impl std::fmt::Display for StreamParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StreamUsage {
     prompt_tokens: Option<u64>,
@@ -134,12 +155,12 @@ pub fn parse_sse_stream<R: Read>(
     accumulator.finish()
 }
 
-pub(crate) async fn parse_sse_response(
+pub(crate) async fn parse_sse_response_with_partial(
     mut response: reqwest::Response,
     cancel: &CancelToken,
     idle_timeout: Duration,
     mut on_delta: impl FnMut(StreamEvent),
-) -> Result<StreamResult, String> {
+) -> Result<StreamResult, StreamParseError> {
     let mut accumulator = StreamAccumulator::default();
     let mut buffer = Vec::new();
 
@@ -147,7 +168,7 @@ pub(crate) async fn parse_sse_response(
         let next = tokio::select! {
             biased;
             _ = crate::http_client::wait_for_cancel(cancel) => {
-                return Err("cancelled".to_string());
+                return Err(StreamParseError::with_usage("cancelled", accumulator.usage));
             }
             result = tokio::time::timeout(idle_timeout, response.chunk()) => result,
         };
@@ -157,31 +178,47 @@ pub(crate) async fn parse_sse_response(
             Ok(Ok(None)) => {
                 if !buffer.is_empty() {
                     buffer.push(b'\n');
-                    let _ = process_complete_lines(
-                        &mut buffer,
-                        cancel,
-                        &mut accumulator,
-                        &mut on_delta,
-                    )?;
+                    if let Err(error) =
+                        process_complete_lines(&mut buffer, cancel, &mut accumulator, &mut on_delta)
+                    {
+                        return Err(StreamParseError::with_usage(error, accumulator.usage));
+                    }
                 }
-                return accumulator.finish();
+                let usage = accumulator.usage;
+                return match accumulator.finish() {
+                    Ok(result) => Ok(result),
+                    Err(error) => Err(StreamParseError::with_usage(error, usage)),
+                };
             }
             Ok(Err(error)) => {
                 if cancel.is_cancelled() {
-                    return Err("cancelled".to_string());
+                    return Err(StreamParseError::with_usage("cancelled", accumulator.usage));
                 }
-                return Err(format!("stream read error: {error}"));
+                return Err(StreamParseError::with_usage(
+                    format!("stream read error: {error}"),
+                    accumulator.usage,
+                ));
             }
             Err(_) => {
-                return Err(format!(
-                    "stream read error: idle read timed out after {idle_timeout:?}"
+                return Err(StreamParseError::with_usage(
+                    format!("stream read error: idle read timed out after {idle_timeout:?}"),
+                    accumulator.usage,
                 ));
             }
         };
 
         buffer.extend_from_slice(&chunk);
-        if process_complete_lines(&mut buffer, cancel, &mut accumulator, &mut on_delta)? {
-            return accumulator.finish();
+        if let Err(error) =
+            process_complete_lines(&mut buffer, cancel, &mut accumulator, &mut on_delta)
+        {
+            return Err(StreamParseError::with_usage(error, accumulator.usage));
+        }
+        if accumulator.saw_done {
+            let usage = accumulator.usage;
+            return match accumulator.finish() {
+                Ok(result) => Ok(result),
+                Err(error) => Err(StreamParseError::with_usage(error, usage)),
+            };
         }
     }
 }
@@ -484,6 +521,46 @@ mod tests {
         assert_eq!(error, "stream ended before terminal marker");
     }
 
+    #[tokio::test]
+    async fn partial_eof_keeps_usage_for_the_runtime_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind SSE server");
+        let address = listener.local_addr().expect("server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept SSE client");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+                      data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":4,\"prompt_cache_hit_tokens\":8}}\n\n",
+                )
+                .expect("write partial stream");
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .expect("open SSE response");
+        let cancel = CancelToken::new();
+
+        let error =
+            parse_sse_response_with_partial(response, &cancel, Duration::from_secs(1), |_| {})
+                .await
+                .expect_err("missing terminal marker must fail");
+
+        server.join().expect("SSE server");
+        assert_eq!(error.message, "stream ended before terminal marker");
+        assert_eq!(
+            error.usage,
+            Some(Usage {
+                input_tokens: 13,
+                output_tokens: 4,
+                cache_tokens: 8,
+            })
+        );
+    }
+
     #[test]
     fn invalid_utf8_stream_error_is_retryable_before_visible_output() {
         assert!(is_stream_integrity_error(
@@ -638,11 +715,15 @@ mod tests {
             .expect("open stalled SSE response");
         let cancel = CancelToken::new();
 
-        let error = parse_sse_response(response, &cancel, Duration::from_millis(20), |_| {})
-            .await
-            .expect_err("stalled body must time out");
+        let error =
+            parse_sse_response_with_partial(response, &cancel, Duration::from_millis(20), |_| {})
+                .await
+                .expect_err("stalled body must time out");
 
         server.join().expect("stalled SSE server");
-        assert_eq!(error, "stream read error: idle read timed out after 20ms");
+        assert_eq!(
+            error.message,
+            "stream read error: idle read timed out after 20ms"
+        );
     }
 }
