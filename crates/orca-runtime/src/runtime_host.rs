@@ -1784,7 +1784,7 @@ struct RuntimeSurfaceProviderResponseIngress {
 impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseIngress {
     fn commit_response(
         &self,
-        response: &crate::model_response::RuntimeModelResponse,
+        response: &mut crate::model_response::RuntimeModelResponse,
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         send_thread_command_retrying_full(
@@ -1796,12 +1796,16 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
             },
         )
         .map_err(surface_semantic_ingress_send_error)?;
-        reply_rx.recv().map_err(|_| {
+        let committed = reply_rx.recv().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "runtime semantic ingress actor closed before commit acknowledgement",
             )
-        })?
+        })??;
+        // Later stages (the conversation, the tool results) must use the names
+        // the surface stored, not the provider's originals.
+        *response = committed;
+        Ok(())
     }
 
     fn commit_provider_failure(
@@ -4866,7 +4870,9 @@ enum ThreadCommand {
     SurfaceCommitProviderResponse {
         fence: surface::SurfaceOperationFence,
         response: crate::model_response::RuntimeModelResponse,
-        reply: SyncSender<io::Result<()>>,
+        /// Answers with the response the surface recorded, whose tool calls may
+        /// have been renamed to keep their ids unique for the session (#67).
+        reply: SyncSender<io::Result<crate::model_response::RuntimeModelResponse>>,
     },
     SurfaceCommitProviderFailure {
         fence: surface::SurfaceOperationFence,
@@ -23994,7 +24000,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed generation installs provider response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: Vec::new(),
                     assistant_content: Some("checkpoint retry succeeded".to_string()),
@@ -24035,7 +24041,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,
@@ -24088,7 +24094,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,

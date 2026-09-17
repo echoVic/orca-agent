@@ -2995,7 +2995,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: Vec::new(),
                     assistant_content: Some("typed update".to_string()),
@@ -3031,7 +3031,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,
@@ -3086,7 +3086,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,
@@ -3140,7 +3140,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,
@@ -3217,7 +3217,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,
@@ -3280,7 +3280,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,
@@ -3346,7 +3346,7 @@ mod tests {
                     turn_request
                         .provider_response_ingress()
                         .expect("typed ACP operation provides response ingress")
-                        .commit_response(&RuntimeModelResponse::new(
+                        .commit_response(&mut RuntimeModelResponse::new(
                             ProviderResponse {
                                 steps: vec![ProviderStep::ToolCall(tool.clone())],
                                 assistant_content: None,
@@ -3459,7 +3459,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,
@@ -3512,7 +3512,7 @@ mod tests {
             let ingress = turn_request
                 .provider_response_ingress()
                 .expect("typed ACP operation provides response ingress");
-            ingress.commit_response(&RuntimeModelResponse::new(
+            ingress.commit_response(&mut RuntimeModelResponse::new(
                 ProviderResponse {
                     steps: vec![ProviderStep::ToolCall(tool.clone())],
                     assistant_content: None,

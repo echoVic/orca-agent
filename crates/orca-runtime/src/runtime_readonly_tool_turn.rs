@@ -386,7 +386,7 @@ mod tests {
     }
 
     impl RuntimeProviderResponseIngress for RecordingReadonlyBatchIngress {
-        fn commit_response(&self, _response: &RuntimeModelResponse) -> io::Result<()> {
+        fn commit_response(&self, _response: &mut RuntimeModelResponse) -> io::Result<()> {
             Ok(())
         }
 
