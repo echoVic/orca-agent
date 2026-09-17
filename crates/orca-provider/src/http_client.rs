@@ -20,7 +20,12 @@ const MAX_BACKOFF_MS: u64 = 60_000;
 const BACKOFF_FACTOR: f64 = 2.0;
 const JITTER_FACTOR: f64 = 0.1;
 
-const RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
+/// 429 (rate limit) and every server-side 5xx are transient. Providers and the CDNs in front
+/// of them emit codes no allow-list can enumerate — Cloudflare alone uses 520-526 and 598 —
+/// and a 5xx that is *not* transient simply fails the retry loop with the last response.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
 
 static CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
     BlockingClient::builder()
@@ -58,7 +63,7 @@ pub fn execute_with_retry(
         match result {
             Ok(resp) => {
                 let status = resp.status();
-                if !RETRYABLE_STATUS_CODES.contains(&status.as_u16()) {
+                if !is_retryable_status(status.as_u16()) {
                     return resp
                         .error_for_status()
                         .map_err(|e| format!("request error: {e}"));
@@ -99,7 +104,7 @@ pub async fn execute_streaming_with_retry(
         match result {
             Ok(resp) => {
                 let status = resp.status();
-                if !RETRYABLE_STATUS_CODES.contains(&status.as_u16()) {
+                if !is_retryable_status(status.as_u16()) {
                     if status.is_client_error() || status.is_server_error() {
                         let body = response_text_with_cancel(resp, cancel).await?;
                         return Err(format!("request error ({status}): {body}"));
@@ -239,6 +244,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Instant;
+
+    #[test]
+    fn gateway_5xx_codes_outside_the_old_allow_list_are_retryable() {
+        // The retired allow-list was [429, 500, 502, 503, 504]; Cloudflare's 520-526 and
+        // other gateway codes aborted the session instead of retrying (issue #68).
+        for status in [429, 500, 501, 502, 503, 504, 507, 520, 521, 522, 523, 524, 525, 526, 598] {
+            assert!(is_retryable_status(status), "{status} must be retryable");
+        }
+        for status in [400, 401, 403, 404, 409, 413, 422, 499] {
+            assert!(!is_retryable_status(status), "{status} must not be retried");
+        }
+    }
 
     #[test]
     fn backoff_increases_exponentially() {
