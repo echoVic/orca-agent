@@ -1864,6 +1864,30 @@ mod tests {
     }
 
     #[test]
+    fn turn_start_string_input_shorthand_delivers_the_prompt() {
+        let submission = Submission::decode(
+            r#"{"id":"t","method":"turn/start","params":{"threadId":"thread-1","input":"deliver this"}}"#,
+        )
+        .expect("string input shorthand must decode");
+        let ClientOp::Submit { prompt, .. } = submission.op else {
+            panic!("expected a plain submit");
+        };
+        assert_eq!(prompt, "deliver this");
+    }
+
+    #[test]
+    fn turn_start_block_input_still_delivers_the_prompt() {
+        let submission = Submission::decode(
+            r#"{"id":"t","method":"turn/start","params":{"threadId":"thread-1","input":[{"type":"text","text":"blocks"}]}}"#,
+        )
+        .expect("block input must decode");
+        let ClientOp::Submit { prompt, .. } = submission.op else {
+            panic!("expected a plain submit");
+        };
+        assert_eq!(prompt, "blocks");
+    }
+
+    #[test]
     fn submission_decodes_atomic_mention_input() {
         let submission = Submission::decode(
             r#"{"id":"turn","method":"turn/start","params":{"threadId":"thread-1","input":[{"type":"text","text":"read "},{"type":"mention","name":"same.txt","target":{"type":"file","root":"/tmp/two","path":"same.txt","kind":"file"}}]}}"#,

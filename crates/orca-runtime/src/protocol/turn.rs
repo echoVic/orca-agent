@@ -17,11 +17,13 @@ pub(super) fn turn_start_input_from_params(params: Option<WireParams>) -> TurnSt
             bindings: MentionBindings::default(),
         };
     };
-    let Some(WireInputParam::Items(input)) = params.input else {
-        return TurnStartInput {
-            prompt: String::new(),
-            bindings: MentionBindings::default(),
-        };
+    // `input` accepts either a block list or the bare-string shorthand; both must deliver the
+    // text. Treating the shorthand as "no input" started an empty turn (and billed it) while
+    // every other method on this surface (`thread/queue/add`, `command/exec`) honours it.
+    let input = match params.input {
+        Some(WireInputParam::Items(items)) => items,
+        Some(WireInputParam::Text(text)) => vec![WireUserInput::Text { text }],
+        None => Vec::new(),
     };
     let mut prompt = String::new();
     let mut bindings = Vec::new();
