@@ -465,8 +465,17 @@ pub(super) struct WireTerminalSize {
 
 impl Submission {
     pub fn decode(line: &str) -> Result<Self, DecodeError> {
-        let wire = serde_json::from_str::<WireSubmission>(line).map_err(|error| DecodeError {
+        // Read the id from the raw value first: a type error in one params field must not
+        // swallow the caller's request id, because clients correlate replies by it and would
+        // otherwise wait for an answer that has already been sent under `id: null`.
+        let raw = serde_json::from_str::<Value>(line).map_err(|error| DecodeError {
             id: Value::Null,
+            message: format!("invalid request: {error}"),
+        })?;
+        let request_id = raw.get("id").cloned().unwrap_or(Value::Null);
+        // Second parse (rather than `from_value`) so serde keeps reporting line/column.
+        let wire = serde_json::from_str::<WireSubmission>(line).map_err(|error| DecodeError {
+            id: request_id,
             message: format!("invalid request: {error}"),
         })?;
         match (wire.op.as_deref(), wire.method.as_deref()) {
@@ -1552,6 +1561,30 @@ fn parse_app_server_approval_policy(value: &str) -> orca_core::approval_types::A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_preserves_the_request_id_when_params_are_malformed() {
+        for line in [
+            r#"{"id":"c-limit","method":"thread/list","params":{"limit":"ten"}}"#,
+            r#"{"id":"c-params","method":"thread/start","params":[]}"#,
+            r#"{"id":"c-decision","method":"permission/respond","params":{"requestId":"x","decision":"maybe"}}"#,
+            r#"{"id":"c-thread","method":"turn/start","params":{"threadId":42,"input":[]}}"#,
+            r#"{"id":7,"method":"thread/list","params":{"limit":"ten"}}"#,
+        ] {
+            let error = Submission::decode(line).expect_err("malformed params must be refused");
+            let expected = serde_json::from_str::<Value>(line).unwrap()["id"].clone();
+            assert_eq!(error.id, expected, "id lost for {line}");
+        }
+    }
+
+    #[test]
+    fn decode_reports_a_null_id_only_when_the_line_has_none() {
+        for line in ["{oops", "null", "[]", r#"{"method":"thread/start","params":{}}"#] {
+            let error = Submission::decode(line).expect_err("unparsable line must be refused");
+            assert_eq!(error.id, Value::Null, "unexpected id for {line}");
+        }
+    }
+
     use std::collections::BTreeMap;
 
     use crate::protocol::{
