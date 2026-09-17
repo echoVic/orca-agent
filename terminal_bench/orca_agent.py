@@ -30,6 +30,13 @@ BUDGET_ENV = {
     "max-wall-time-secs": "ORCA_MAX_WALL_TIME_SECS",
 }
 
+#: Budget for the install step. Harbor's agent-setup timeout defaults to a fixed
+#: 360 s, which an `apt-get update` on a slow image used to exhaust before Orca
+#: ever started (issue #60); the adapter asks Harbor for more and overrides the
+#: per-exec timeout, and `--agent-setup-timeout-multiplier` remains available for
+#: images that need even longer.
+DEFAULT_SETUP_TIMEOUT_SEC = 900
+
 
 def _load_api_key() -> str:
     """Read DEEPSEEK_API_KEY from ~/.orca/auth.json, fall back to env."""
@@ -62,6 +69,20 @@ def _terminal_summary(events: list[dict]) -> dict:
 class OrcaInstalledAgent(BaseInstalledAgent):
     """Orca coding agent adapter for Harbor / Terminal-Bench."""
 
+    def __init__(
+        self,
+        *args,
+        override_setup_timeout_sec: int | float | None = None,
+        **kwargs,
+    ):
+        """Accept Harbor's setup-budget override (and an env equivalent)."""
+        self._install_exec_timeout_sec = int(
+            override_setup_timeout_sec
+            or os.environ.get("ORCA_AGENT_SETUP_TIMEOUT_SEC")
+            or DEFAULT_SETUP_TIMEOUT_SEC
+        )
+        super().__init__(*args, **kwargs)
+
     @staticmethod
     def name() -> str:
         return "orca"
@@ -80,13 +101,38 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         return parts[1] if len(parts) >= 2 else None
 
     async def install(self, environment: BaseEnvironment) -> None:
+        # The mounted binary is the only hard requirement, so it is copied in a
+        # step of its own: a slow package mirror can then never leave the trial
+        # without an `orca` to run.
         await self.exec_as_root(
             environment,
             command=(
-                "apt-get update && apt-get install -y git ripgrep"
-                " && cp /mnt/orca-bin/orca /usr/local/bin/orca"
+                "cp /mnt/orca-bin/orca /usr/local/bin/orca"
                 " && chmod +x /usr/local/bin/orca"
             ),
+            timeout_sec=self._install_exec_timeout_sec,
+        )
+        # `git` and `ripgrep` are conveniences, not prerequisites: Orca's own
+        # tools do not need them and the agent can install whatever a task
+        # requires through its own shell tool, whose budget is far larger than
+        # Harbor's fixed 360 s setup budget. Provision them best-effort — skip
+        # when present, retry the index, and never fail the setup step — because
+        # the unconditional `apt-get update` used to abort trials on slow images
+        # (issue #60) and an interrupted dpkg leaves the verifier's own install
+        # broken (issue #65).
+        await self.exec_as_root(
+            environment,
+            command=(
+                "export DEBIAN_FRONTEND=noninteractive; "
+                "if command -v git >/dev/null 2>&1 && command -v rg >/dev/null 2>&1; "
+                "then echo 'orca-adapter: git and ripgrep already present'; exit 0; fi; "
+                "apt-get update -o Acquire::Retries=5 "
+                "|| echo 'orca-adapter: apt-get update failed, continuing without it'; "
+                "apt-get install -y --no-install-recommends -o Acquire::Retries=5 git ripgrep "
+                "|| echo 'orca-adapter: git/ripgrep install failed, continuing'; "
+                "exit 0"
+            ),
+            timeout_sec=self._install_exec_timeout_sec,
         )
 
     @with_prompt_template
