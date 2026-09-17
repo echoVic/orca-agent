@@ -493,8 +493,7 @@ fn handle_inbound(
 
         match method.as_str() {
             "initialize" => {
-                let result = decode::<InitializeRequest>(params)
-                    .map_err(agent_client_protocol::Error::into_internal_error);
+                let result = decode_request::<InitializeRequest>(params);
                 let result = match result {
                     Ok(args) => Agent::initialize(agent.as_ref(), args).await,
                     Err(error) => Err(error),
@@ -502,8 +501,7 @@ fn handle_inbound(
                 Ok(response_completion(facade, request_id, result))
             }
             "authenticate" => {
-                let result = decode::<AuthenticateRequest>(params)
-                    .map_err(agent_client_protocol::Error::into_internal_error);
+                let result = decode_request::<AuthenticateRequest>(params);
                 let result = match result {
                     Ok(args) => Agent::authenticate(agent.as_ref(), args).await,
                     Err(error) => Err(error),
@@ -511,8 +509,7 @@ fn handle_inbound(
                 Ok(response_completion(facade, request_id, result))
             }
             "session/new" => {
-                let result = decode::<NewSessionRequest>(params)
-                    .map_err(agent_client_protocol::Error::into_internal_error);
+                let result = decode_request::<NewSessionRequest>(params);
                 let result = match result {
                     Ok(args) => Agent::new_session(agent.as_ref(), args).await,
                     Err(error) => Err(error),
@@ -520,8 +517,7 @@ fn handle_inbound(
                 Ok(response_completion(facade, request_id, result))
             }
             "session/load" => {
-                let result = decode::<LoadSessionRequest>(params)
-                    .map_err(agent_client_protocol::Error::into_internal_error);
+                let result = decode_request::<LoadSessionRequest>(params);
                 let result = match result {
                     Ok(args) => Agent::load_session(agent.as_ref(), args).await,
                     Err(error) => Err(error),
@@ -633,8 +629,7 @@ fn handle_inbound(
             | "orca.dev/session/queue/reorder"
             | "orca.dev/session/queue/pause"
             | "orca.dev/session/queue/start") => {
-                let result = decode::<AcpPromptQueueParams>(params)
-                    .map_err(agent_client_protocol::Error::into_internal_error)
+                let result = decode_request::<AcpPromptQueueParams>(params)
                     .and_then(|params| {
                         let parse_id = |value: Option<String>| {
                             crate::prompt_queue::QueuedSubmissionId::parse(
@@ -718,6 +713,32 @@ fn handle_inbound(
             }
         }
     })
+}
+
+/// Decode a request's `params`, reporting a client mistake as `-32602 Invalid params`
+/// (with the field-level cause) instead of `-32603 Internal error`. Four methods used the
+/// internal-error mapping, so a malformed request looked like an agent fault.
+fn decode_request<T: DeserializeOwned>(
+    params: Value,
+) -> Result<T, agent_client_protocol::Error> {
+    decode::<T>(params)
+        .map_err(|error| agent_client_protocol::Error::invalid_params().data(error.to_string()))
+}
+
+#[cfg(test)]
+mod decode_request_tests {
+    use super::*;
+    use agent_client_protocol::InitializeRequest;
+
+    #[test]
+    fn malformed_params_report_invalid_params_not_internal_error() {
+        for params in [serde_json::json!("not-an-object"), serde_json::json!([]) ] {
+            let error = decode_request::<InitializeRequest>(params)
+                .expect_err("malformed params must be refused");
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+            assert!(error.data.is_some(), "field-level cause should be attached");
+        }
+    }
 }
 
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
