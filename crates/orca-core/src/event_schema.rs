@@ -428,6 +428,7 @@ impl EventFactory {
         approval_mode: &str,
         provider: &str,
         verifier: Option<&str>,
+        warnings: &[String],
     ) -> EventDraft {
         self.make(
             EventType::SessionStarted,
@@ -435,7 +436,11 @@ impl EventFactory {
                 "cwd": cwd,
                 "approval_mode": approval_mode,
                 "provider": provider,
-                "verifier": verifier
+                "verifier": verifier,
+                // Start-up conditions the run cannot fix on its own (untrusted workspace →
+                // read-only sandbox, shell unavailable, MCP servers that failed to start).
+                // Stream-only consumers previously saw none of them (issue #73).
+                "warnings": warnings
             }),
         )
     }
@@ -1471,7 +1476,7 @@ mod tests {
     #[test]
     fn session_started_payload_structure() {
         let mut f = EventFactory::new("run-1".to_string());
-        let e = f.session_started("/tmp", "read-only", "mock", None);
+        let e = f.session_started("/tmp", "read-only", "mock", None, &[]);
         assert_eq!(e.event_type, EventType::SessionStarted);
         assert_eq!(e.payload["cwd"], "/tmp");
         assert_eq!(e.payload["approval_mode"], "read-only");

@@ -5522,12 +5522,9 @@ async fn run_host_supervisor(
                         continue;
                     }
                 }
-                if let Some(warning) =
-                    crate::shell_readiness::ShellReadiness::for_config(&actor_config)
-                        .startup_warning()
-                {
-                    startup_warnings.push(warning);
-                }
+                startup_warnings.extend(
+                    crate::shell_readiness::ShellReadiness::run_startup_warnings(&actor_config),
+                );
                 let startup_warnings = Arc::new(startup_warnings);
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
@@ -21996,11 +21993,13 @@ fn run_headless_session(
     let cwd = cwd_path.display().to_string();
     let mut sink = EventSink::new(writer, config.output_format)
         .with_optional_observer(request.event_observer());
+    let startup_warnings = crate::shell_readiness::ShellReadiness::run_startup_warnings(config);
     sink.emit(events.session_started(
         &cwd,
         config.approval_mode.as_str(),
         config.provider.as_str(),
         config.verifier.as_deref(),
+        &startup_warnings,
     ))?;
     if let Err(error) = thread.session().hooks().run(
         HookEvent::SessionStart,
