@@ -92,3 +92,10 @@ The installed adapter writes Orca's raw JSONL output to the trial's
 `agent/trajectory.jsonl` artifact for `harbor analyze` and `harbor view`.
 Command output is not assigned to `AgentContext`: Harbor 0.20.0 does not define
 an `output` field, and adding one aborts the trial before verifier execution.
+
+The trajectory is persisted on **every** exit path. Harbor discards the
+`ExecResult` when the command exits non-zero and when the exec is killed at the
+task timeout, so the adapter also tees the stream to `/tmp/orca-trajectory.jsonl`
+inside the container and downloads it after the run. `agent/execution_metadata.json`
+records the real `exit_code`, `trajectory_bytes`, and a `trajectory_persisted`
+flag, so a 0-byte artifact is visible instead of being reported as success.
