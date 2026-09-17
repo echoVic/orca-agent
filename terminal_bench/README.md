@@ -47,6 +47,27 @@ The API key is read from `~/.orca/auth.json` (`DEEPSEEK_API_KEY` field). Falls b
 |----------|---------|-------------|
 | `ORCA_BASE_URL` | `https://api.deepseek.com` | API endpoint |
 | `ORCA_MODEL` | `deepseek-flash` | Model to use |
+| `ORCA_REASONING_EFFORT` / `DEEPSEEK_REASONING_EFFORT` | Orca's own default (`max`) | Reasoning effort forwarded into the container: `low`, `high`, or `max` |
+| `ORCA_PROVIDER` | configuration default | Provider override forwarded into the container |
+
+## Model latency and the timeout class
+
+TB2 task budgets are fixed (`[agent] timeout_sec` = 900–3600 s) and the median trial
+spends ~60 % of its wall clock inside model generation, so token volume per turn — not
+tool latency — is what decides the timeout class (issue #64). Two consequences for
+benchmark runs:
+
+- Use the reasoning-effort lever above to A/B latency under one budget. Measured on the
+  same 16 tasks, `ORCA_REASONING_EFFORT=low` cut `video-processing` from 1295 s /
+  135 k output tokens to 297 s / 32 k at the same reward, `mcmc-sampling-stan` from
+  1773 s / 72 k to 683 s / 10 k, and turned `gcode-to-text` (900 s timeout) into a pass
+  in 735 s — but it also lost `model-extraction-relu-logits` and `qemu-alpine-ssh`, so
+  the lever has to be measured per task rather than assumed to be free.
+- `agent/execution_metadata.json` records `duration_seconds` plus the largest `usage`
+  counters (`turns`, `output_tokens`, `input_tokens`, `cache_tokens`, `cost_usd_micros`)
+  seen in the stream, which exist even for a trial killed at the task timeout, because
+  the task status events carry the running totals.
+
 
 ## Why musl?
 

@@ -186,6 +186,61 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             self.assertIn("--max-turns 5", captured["command"])
             self.assertIn("--max-cost-usd 0.5", captured["command"])
 
+    def test_run_forwards_the_reasoning_effort_lever(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = orca_agent.OrcaInstalledAgent()
+            agent.logs_dir = Path(directory)
+            captured = {}
+
+            async def fake_exec(environment, command, env):
+                captured["env"] = env
+                return SimpleNamespace(stdout="", stderr="")
+
+            agent.exec_as_agent = fake_exec
+            with patch.dict(
+                os.environ,
+                {"ORCA_REASONING_EFFORT": "low", "ORCA_PROVIDER": "deepseek"},
+            ):
+                asyncio.run(agent.run("finish the task", SimpleNamespace(), orca_agent.AgentContext()))
+
+            self.assertEqual(captured["env"]["ORCA_REASONING_EFFORT"], "low")
+            self.assertEqual(captured["env"]["ORCA_PROVIDER"], "deepseek")
+            metadata = json.loads(
+                (Path(directory) / "execution_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(metadata["provider"]["ORCA_REASONING_EFFORT"], "low")
+            self.assertEqual(metadata["provider"]["ORCA_PROVIDER"], "deepseek")
+
+    def test_run_records_wall_clock_and_usage_for_a_killed_trial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = orca_agent.OrcaInstalledAgent()
+            agent.logs_dir = Path(directory)
+            # A killed trial has no `session.completed`, only running totals.
+            stdout = (
+                '{"type":"turn.started","payload":{}}\n'
+                '{"type":"task.status.updated","payload":{"task":{"usage":'
+                '{"turns":47,"output_tokens":150970,"input_tokens":9000000,'
+                '"cost_usd_micros":123456}}}}\n'
+            )
+            agent.exec_as_agent = AsyncMock(
+                return_value=SimpleNamespace(stdout=stdout, stderr="")
+            )
+
+            asyncio.run(agent.run("finish the task", SimpleNamespace(), orca_agent.AgentContext()))
+
+            metadata = json.loads(
+                (Path(directory) / "execution_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertIsNotNone(metadata["duration_seconds"])
+            self.assertGreaterEqual(metadata["duration_seconds"], 0)
+            self.assertEqual(metadata["usage"]["turns"], 47)
+            self.assertEqual(metadata["usage"]["output_tokens"], 150970)
+            self.assertEqual(metadata["usage"]["cost_usd_micros"], 123456)
+
     def test_external_run_does_not_extend_context(self) -> None:
         environment = SimpleNamespace(
             exec=AsyncMock(return_value=SimpleNamespace(stdout="completed\n"))
