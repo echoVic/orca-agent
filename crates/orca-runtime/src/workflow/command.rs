@@ -712,6 +712,19 @@ fn spawn_workflow_worker(
         }
     };
 
+    // The worker is long-lived and detached, so its stderr cannot be a pipe the launcher
+    // closes: send it to a per-session log the launcher can quote when startup fails.
+    let worker_log = workflow_session_root(cwd).join(&session_id).join("worker.log");
+    let worker_stderr = worker_log
+        .parent()
+        .map(|parent| std::fs::create_dir_all(parent))
+        .transpose()
+        .ok()
+        .flatten()
+        .and_then(|()| std::fs::File::create(&worker_log).ok())
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
+
     let mut command = ProcessCommand::new(current_exe);
     let has_api_key = api_key.is_some();
     command
@@ -722,7 +735,7 @@ fn spawn_workflow_worker(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(worker_stderr)
         .arg("workflow")
         .arg("worker")
         .arg("--cwd")
@@ -789,8 +802,28 @@ fn spawn_workflow_worker(
     let mut first_line = String::new();
     match reader.read_line(&mut first_line) {
         Ok(0) => {
-            let _ = child.wait();
-            eprintln!("orca: workflow worker exited before reporting launch output");
+            let status = child.wait().ok();
+            // The worker's own stderr is the only place the real cause appears (missing
+            // script, unreadable config, no node, …); quote it instead of a bare message.
+            let cause = worker_log
+                .exists()
+                .then(|| std::fs::read_to_string(&worker_log).unwrap_or_default())
+                .unwrap_or_default();
+            let cause = cause
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("no diagnostic output")
+                .trim()
+                .to_string();
+            let status = status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "unknown status".to_string());
+            eprintln!(
+                "orca: workflow worker exited before reporting launch output ({status}): {cause} \
+                 (log: {})",
+                worker_log.display()
+            );
             1
         }
         Ok(_) => {
@@ -863,15 +896,22 @@ fn workflow_input_for_launch(
     args: Option<Value>,
     resume_from_run_id: Option<String>,
 ) -> WorkflowInput {
+    // Hand over an absolute path: a relative one was resolved by the *worker*, whose cwd is
+    // the launch directory, so `orca --cwd <project> workflow run scripts/x.js` from anywhere
+    // else failed with the generic "worker exited before reporting launch output" (issue #82).
     let script_path = PathBuf::from(script_or_name);
+    let resolved_script = if script_path.is_absolute() {
+        Some(script_path)
+    } else {
+        let joined = cwd.join(&script_path);
+        joined.exists().then_some(joined)
+    };
     WorkflowInput {
         draft_id: None,
-        script_path: if script_path.is_absolute() || cwd.join(script_or_name).exists() {
-            Some(script_or_name.to_string())
-        } else {
-            None
-        },
-        name: if script_path.is_absolute() || cwd.join(script_or_name).exists() {
+        script_path: resolved_script
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        name: if resolved_script.is_some() {
             None
         } else {
             Some(script_or_name.to_string())
