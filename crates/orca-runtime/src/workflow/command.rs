@@ -64,6 +64,7 @@ pub enum WorkflowCommandRequest {
     },
     Source {
         name: String,
+        cwd: Option<PathBuf>,
     },
     Stop {
         task_id: String,
@@ -160,7 +161,7 @@ pub fn run(request: WorkflowCommandRequest) -> i32 {
         WorkflowCommandRequest::Run(request) => run_workflow_command(request),
         WorkflowCommandRequest::List(request) => workflow_list_command(request),
         WorkflowCommandRequest::Show { task_id } => workflow_show_command(&task_id),
-        WorkflowCommandRequest::Source { name } => workflow_source_command(&name),
+        WorkflowCommandRequest::Source { name, cwd } => workflow_source_command(&name, cwd),
         WorkflowCommandRequest::Stop { task_id } => workflow_stop_command(&task_id),
         WorkflowCommandRequest::Pause { task_id } => workflow_pause_command(&task_id),
         WorkflowCommandRequest::Resume { run_id } => workflow_resume_command(&run_id),
@@ -317,15 +318,20 @@ fn workflow_show_command(task_id: &str) -> i32 {
     }
 }
 
-fn workflow_source_command(name: &str) -> i32 {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let user_workflow_dir = dirs::home_dir()
-        .map(|home| home.join(".orca").join("workflows"))
-        .unwrap_or_else(|| PathBuf::from(".orca/workflows"));
+fn workflow_source_command(name: &str, cwd: Option<PathBuf>) -> i32 {
+    // `--cwd` is the workspace; the process directory is only a fallback. The user workflow
+    // directory comes from the *active* Orca home (`ORCA_HOME` → `~/.orca`), the same place
+    // the workflow worker resolves it from — otherwise `source` cannot show what `run` executes.
+    let cwd = cwd
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let config_dir = orca_core::config::folder_trust::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".orca"));
+    let user_workflow_dir = config_dir.join("workflows");
     let path = match find_saved_workflow(&cwd, name, &user_workflow_dir) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("orca: workflow source '{name}' not found: {error}");
+            eprintln!("orca: workflow source '{name}': {error}");
             return 1;
         }
     };
