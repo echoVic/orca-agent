@@ -79,7 +79,8 @@ pub(super) fn settings_startup_warnings(
 ) -> Vec<String> {
     let mut config = base_config.clone();
     config.cwd = Some(settings.cwd.as_path().to_path_buf());
-    let readiness = crate::shell_readiness::ShellReadiness::for_surface_settings(base_config, settings);
+    let readiness =
+        crate::shell_readiness::ShellReadiness::for_surface_settings(base_config, settings);
     readiness
         .startup_warning()
         .into_iter()
