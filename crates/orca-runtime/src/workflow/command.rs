@@ -539,6 +539,24 @@ fn workflow_restart_command(
                 }
             };
             let launch_cwd = PathBuf::from(&record.cwd);
+            // Resolve credentials the way the launch path does. The run record deliberately
+            // stores no key (the legacy field is only populated for pre-sanitised records), so
+            // passing `run.legacy_api_key` alone started a worker whose every agent failed with
+            // "DEEPSEEK_API_KEY is required" — while the same environment could launch a run.
+            let api_key = match build_workflow_run_config(
+                &app_version,
+                &launch_cwd,
+                record.provider,
+                record.model.clone(),
+                None,
+                record.base_url.clone(),
+            ) {
+                Ok(config) => config.api_key.or(run.legacy_api_key.clone()),
+                Err(error) => {
+                    eprintln!("orca: {error}");
+                    return 1;
+                }
+            };
             let mut input = record.input;
             input.resume_from_run_id = Some(run.state.run_id.clone());
             input.restart_phase = restart_phase;
@@ -548,7 +566,7 @@ fn workflow_restart_command(
                 app_version,
                 record.provider,
                 record.model,
-                run.legacy_api_key,
+                api_key,
                 record.base_url,
                 record.capabilities,
                 &input,
