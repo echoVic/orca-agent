@@ -107,12 +107,18 @@ class OrcaInstalledAgent(BaseInstalledAgent):
             if (value := os.environ.get(var)) is not None:
                 budget_flags.append(f" --{arg} {shlex.quote(value)}")
 
+        # `--` terminates option parsing so an instruction that begins with a
+        # hyphen stays data. Terminal-Bench 2.0 ships one such task
+        # (`pytorch-model-recovery`: "- You are given a PyTorch state
+        # dictionary ..."): without the separator clap reads the prompt as an
+        # unknown option, `orca exec` exits 2 before the session starts, and the
+        # trial is recorded as an agent error (issue #61).
         cmd = (
             f"orca exec"
             f" --mode full-auto"
             f" --output-format jsonl"
             f"{''.join(budget_flags)}"
-            f" {shlex.quote(instruction)}"
+            f" -- {shlex.quote(instruction)}"
         )
 
         logs_dir = Path(self.logs_dir)
