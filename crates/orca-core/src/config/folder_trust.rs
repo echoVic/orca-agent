@@ -100,8 +100,37 @@ fn trust_file_path_in(config_dir: &Path) -> PathBuf {
 /// Canonicalize a path for use as a stable trust key. Falls back to a
 /// lexical absolute form when the path does not yet exist on disk.
 fn trust_key(path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| absolutize(path));
-    canonical.to_string_lossy().into_owned()
+    canonicalize_as_far_as_possible(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Canonical form that does not depend on whether `path` itself exists: canonicalize the
+/// nearest existing ancestor (resolving symlinks and platform mappings such as macOS'
+/// `/tmp` → `/private/tmp`) and append the remaining components lexically.
+///
+/// The previous form fell back to a purely lexical path when the directory was missing, so a
+/// decision recorded before `mkdir` never matched the lookup made afterwards (issue #75).
+fn canonicalize_as_far_as_possible(path: &Path) -> PathBuf {
+    let absolute = absolutize(path);
+    let mut candidate = absolute.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = candidate.canonicalize() {
+            let mut resolved = canonical;
+            for component in tail.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        match (candidate.parent(), candidate.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                candidate = parent;
+            }
+            _ => return absolute,
+        }
+    }
 }
 
 fn absolutize(path: &Path) -> PathBuf {
@@ -160,14 +189,20 @@ pub fn trust_level_with_config_dir(path: &Path, config_dir: &Path) -> Option<Tru
 }
 
 fn trust_level_in(store: &TrustFile, path: &Path) -> Option<TrustLevel> {
-    let target = PathBuf::from(trust_key(path));
+    // Both spellings are consulted: `trust_key` (canonical-as-far-as-possible) and the purely
+    // lexical form, so entries recorded by older versions — which used the lexical key for
+    // paths that did not exist yet — keep applying (issue #75).
+    let targets = [PathBuf::from(trust_key(path)), absolutize(path)];
     // Exact match wins; otherwise the nearest recorded ancestor applies. An
     // explicit `Untrusted` on a closer ancestor overrides a `Trusted` further
     // up the tree.
     let mut best: Option<(usize, TrustLevel)> = None;
     for (key, entry) in &store.folders {
         let key_path = PathBuf::from(key);
-        if target == key_path || target.starts_with(&key_path) {
+        if targets
+            .iter()
+            .any(|target| target == &key_path || target.starts_with(&key_path))
+        {
             let depth = key_path.components().count();
             if best.map(|(d, _)| depth > d).unwrap_or(true) {
                 best = Some((depth, entry.level));
@@ -233,6 +268,44 @@ mod tests {
             trust_level_with_config_dir(Path::new("/some/unknown/project"), home.path()),
             None
         );
+    }
+
+    #[test]
+    fn trust_survives_the_directory_appearing() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("not-created-yet/deeper");
+        set_trust_with_config_dir(&project, home.path(), TrustLevel::Trusted).unwrap();
+        assert!(is_trusted_with_config_dir(&project, home.path()), "before mkdir");
+
+        fs::create_dir_all(&project).unwrap();
+        assert!(
+            is_trusted_with_config_dir(&project, home.path()),
+            "the decision must still apply once the directory exists"
+        );
+        assert!(is_trusted_with_config_dir(
+            &project.join("child"),
+            home.path()
+        ));
+    }
+
+    #[test]
+    fn lexical_entries_from_older_stores_still_apply() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("legacy");
+        // The shape an older version wrote for a path that did not exist yet.
+        let legacy_key = absolutize(&project).to_string_lossy().into_owned();
+        let mut store = TrustFile::default();
+        store
+            .folders
+            .insert(legacy_key, TrustEntry { level: TrustLevel::Trusted });
+        save_path(&trust_file_path_in(home.path()), &store).unwrap();
+
+        fs::create_dir_all(&project).unwrap();
+        assert!(is_trusted_with_config_dir(&project, home.path()));
+        assert!(is_trusted_with_config_dir(
+            &project.join("nested"),
+            home.path()
+        ));
     }
 
     #[test]
