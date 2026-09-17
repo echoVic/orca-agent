@@ -5688,7 +5688,7 @@ impl ThreadActor {
                     }),
                 ) => {
                     let message = surface::SafeDiagnosticText::try_new(
-                        "foreground operation requires approval",
+                        "permission request denied by the client",
                     )
                     .expect("fixed diagnostic is bounded");
                     (
