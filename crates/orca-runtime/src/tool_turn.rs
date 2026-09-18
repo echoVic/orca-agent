@@ -1625,7 +1625,7 @@ mod tests {
     impl RuntimeProviderResponseIngress for FailingToolResultIngress {
         fn commit_response(
             &self,
-            _response: &crate::model_response::RuntimeModelResponse,
+            _response: &mut crate::model_response::RuntimeModelResponse,
         ) -> io::Result<()> {
             Ok(())
         }
