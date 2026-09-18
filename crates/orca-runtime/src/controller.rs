@@ -1551,10 +1551,14 @@ fn run_inner<W: io::Write>(
     _options: ControllerRunOptions,
     transport: Option<HeadlessInteractionTransport>,
 ) -> io::Result<i32> {
-    let prompt = if config.prompt.trim().is_empty() {
+    // The instruction is delivered byte-exact: trimming here silently rewrote every prompt
+    // that ended with a newline (all Terminal-Bench instructions do). `orca exec` now rejects
+    // a whitespace-only argument before this point, so the placeholder is only reachable for
+    // programmatic callers that genuinely pass an empty prompt.
+    let prompt = if config.prompt.is_empty() {
         "(empty prompt)".to_string()
     } else {
-        config.prompt.trim().to_string()
+        config.prompt.clone()
     };
 
     let host = RuntimeHost::start().map_err(runtime_host_io_error)?;
@@ -1570,8 +1574,13 @@ fn run_inner<W: io::Write>(
     let interrupted = Arc::new(AtomicI32::new(0));
     let finished = Arc::new(AtomicBool::new(false));
     install_termination_signal_handler(&thread, Arc::clone(&interrupted), Arc::clone(&finished));
-    for error in thread.startup_warnings() {
-        eprintln!("orca: warning: {error}");
+    // Machine consumers of `--output-format jsonl` treat a non-empty stderr as
+    // a failed run, so the warnings travel in `session.started.warnings` there
+    // (the ACP surface surfaces the same list). Text mode keeps them on stderr.
+    if config.output_format != OutputFormat::Jsonl {
+        for error in thread.startup_warnings() {
+            eprintln!("orca: warning: {error}");
+        }
     }
     if let Some(exit_code) = interrupted_exit_code(&interrupted) {
         // The signal arrived before the turn was admitted: stop here instead of

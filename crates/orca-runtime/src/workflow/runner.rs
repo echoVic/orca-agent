@@ -1446,19 +1446,41 @@ impl WorkflowRunner {
         workflow_limits: &orca_core::config::WorkflowConfig,
         workflow_cancel: &CancelToken,
     ) -> io::Result<HostCommand> {
+        let hash = input_hash(&call.prompt, &call.opts);
         if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
+            self.record_cancelled_agent(
+                run_id,
+                task_id,
+                transcript_dir,
+                &call,
+                &hash,
+                1,
+                1,
+                &[],
+                now_ms(),
+            )?;
             return Ok(HostCommand::AgentError {
                 call_id: call.call_id,
                 error: STOP_REQUESTED_ERROR.to_string(),
             });
         }
         if self.wait_while_paused(run_id, task_id, workflow_cancel)? {
+            self.record_cancelled_agent(
+                run_id,
+                task_id,
+                transcript_dir,
+                &call,
+                &hash,
+                1,
+                1,
+                &[],
+                now_ms(),
+            )?;
             return Ok(HostCommand::AgentError {
                 call_id: call.call_id,
                 error: STOP_REQUESTED_ERROR.to_string(),
             });
         }
-        let hash = input_hash(&call.prompt, &call.opts);
         if let Some(resume_run_id) = resume_from
             && !call_path_matches_phase(&call.call_path, restart_phase)
         {
@@ -1967,16 +1989,25 @@ impl WorkflowRunner {
                 &error,
             ))
         })?;
-        let source = resume_from
-            .map(|selector| coordinator.prepared(selector))
-            .transpose()
-            .map_err(|error| {
-                workflow_continuation_error(continuation_error(
-                    "failed to resolve workflow continuation",
-                    &error,
-                ))
-            })?
-            .filter(|source| source.parent_task_id.as_deref() == Some(workflow_task_id));
+        let source = match resume_from {
+            Some(selector) => match coordinator.prepared(selector) {
+                Ok(source) => Some(source),
+                // A restart hands us the continuation recorded for a *failed* agent. When that
+                // record is gone (the agent died before committing one, or the store was
+                // pruned) the honest behaviour is to run the agent fresh — failing the whole
+                // restarted workflow made `restart-failed` useless for exactly the case it
+                // exists for. Every other error (corrupt/incompatible/active) stays fatal.
+                Err(AgentContinuationError::NotFound) => None,
+                Err(error) => {
+                    return Err(workflow_continuation_error(continuation_error(
+                        "failed to resolve workflow continuation",
+                        &error,
+                    )));
+                }
+            },
+            None => None,
+        }
+        .filter(|source| source.parent_task_id.as_deref() == Some(workflow_task_id));
         let resume_from = source
             .as_ref()
             .map(|source| source.continuation_id.to_string());

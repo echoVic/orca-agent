@@ -293,13 +293,17 @@ fn record_identity(
 
 fn assert_orca_home_contains_only_folder_trust(home: &Path) {
     let entries = directory_entries(home, "isolated ORCA_HOME");
+    // `folder_trust.toml.lock` is the empty advisory lock the trust store takes
+    // around its read-modify-write so concurrent `orca trust add|remove` calls
+    // cannot lose a decision (issue #81). It carries no state of its own.
     assert_eq!(
         entries,
         vec![
             "agent-events.jsonl".to_string(),
-            "folder_trust.toml".to_string()
+            "folder_trust.toml".to_string(),
+            "folder_trust.toml.lock".to_string()
         ],
-        "stateless submit may persist only trust and the agent lifecycle journal"
+        "stateless submit may persist only trust, its lock, and the agent lifecycle journal"
     );
 }
 

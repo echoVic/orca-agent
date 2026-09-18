@@ -47,6 +47,27 @@ The API key is read from `~/.orca/auth.json` (`DEEPSEEK_API_KEY` field). Falls b
 |----------|---------|-------------|
 | `ORCA_BASE_URL` | `https://api.deepseek.com` | API endpoint |
 | `ORCA_MODEL` | `deepseek-flash` | Model to use |
+| `ORCA_REASONING_EFFORT` / `DEEPSEEK_REASONING_EFFORT` | Orca's own default (`max`) | Reasoning effort forwarded into the container: `low`, `high`, or `max` |
+| `ORCA_PROVIDER` | configuration default | Provider override forwarded into the container |
+
+## Model latency and the timeout class
+
+TB2 task budgets are fixed (`[agent] timeout_sec` = 900–3600 s) and the median trial
+spends ~60 % of its wall clock inside model generation, so token volume per turn — not
+tool latency — is what decides the timeout class (issue #64). Two consequences for
+benchmark runs:
+
+- Use the reasoning-effort lever above to A/B latency under one budget. Measured on the
+  same 16 tasks, `ORCA_REASONING_EFFORT=low` cut `video-processing` from 1295 s /
+  135 k output tokens to 297 s / 32 k at the same reward, `mcmc-sampling-stan` from
+  1773 s / 72 k to 683 s / 10 k, and turned `gcode-to-text` (900 s timeout) into a pass
+  in 735 s — but it also lost `model-extraction-relu-logits` and `qemu-alpine-ssh`, so
+  the lever has to be measured per task rather than assumed to be free.
+- `agent/execution_metadata.json` records `duration_seconds` plus the largest `usage`
+  counters (`turns`, `output_tokens`, `input_tokens`, `cache_tokens`, `cost_usd_micros`)
+  seen in the stream, which exist even for a trial killed at the task timeout, because
+  the task status events carry the running totals.
+
 
 ## Why musl?
 
@@ -92,3 +113,34 @@ The installed adapter writes Orca's raw JSONL output to the trial's
 `agent/trajectory.jsonl` artifact for `harbor analyze` and `harbor view`.
 Command output is not assigned to `AgentContext`: Harbor 0.20.0 does not define
 an `output` field, and adding one aborts the trial before verifier execution.
+
+The trajectory is persisted on **every** exit path. Harbor discards the
+`ExecResult` when the command exits non-zero and when the exec is killed at the
+task timeout, so the adapter also tees the stream to `/tmp/orca-trajectory.jsonl`
+inside the container and downloads it after the run. `agent/execution_metadata.json`
+records the real `exit_code`, `trajectory_bytes`, and a `trajectory_persisted`
+flag, so a 0-byte artifact is visible instead of being reported as success.
+
+## Quarantined tasks
+
+Some dataset tasks cannot be scored no matter what the agent does, so they are excluded
+from reported means instead of silently entering the score as a 0. The list lives in
+[`quarantine.json`](quarantine.json); each entry records the task, the reason, and the
+evidence path.
+
+| Task | Why |
+|------|-----|
+| `terminal-bench/qemu-startup` | The task image's pinned Debian `bullseye-security` packages (`libcurl4`, `libnghttp2-14`) have been superseded, so the verifier's own `apt-get install` 404s and `/tests/test.sh` aborts (`curl: command not found`, `uvx: command not found`) before it can score. See `jobs/regression-20260916/qemu-startup__fLTBLJS/verifier/test-stdout.txt`. |
+
+Exclude quarantined tasks from a run with Harbor's own filter:
+
+```bash
+harbor run -d "terminal-bench/terminal-bench-2" \
+  --agent "terminal_bench.orca_agent:OrcaInstalledAgent" \
+  --exclude-task-name "terminal-bench/qemu-startup" \
+  --mounts '[{"type":"bind","source":"'"$(pwd)"'/target/x86_64-unknown-linux-musl/release","target":"/mnt/orca-bin","read_only":true}]'
+```
+
+This is an upstream `terminal-bench-2` image defect, not an Orca one: the adapter's own
+package step cannot repair a task's `test.sh`, and the image re-installs unconditionally.
+Remove an entry once the dataset pins a working image.

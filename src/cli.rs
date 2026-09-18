@@ -393,8 +393,15 @@ struct WorkflowWorkerArgs {
     input_json: String,
 }
 
-impl From<WorkflowArgs> for orca_runtime::workflow::command::WorkflowCommandRequest {
-    fn from(args: WorkflowArgs) -> Self {
+impl WorkflowArgs {
+    /// Build the workflow request, folding in the global `--cwd` so every workflow
+    /// subcommand resolves against the workspace the user asked for.
+    fn into_request(
+        self,
+        global_cwd: Option<PathBuf>,
+    ) -> orca_runtime::workflow::command::WorkflowCommandRequest {
+        let args = self;
+        let global_cwd = global_cwd;
         use orca_runtime::workflow::command::{
             WorkflowCommandRequest, WorkflowListRequest, WorkflowRunRequest, WorkflowWorkerRequest,
         };
@@ -402,7 +409,7 @@ impl From<WorkflowArgs> for orca_runtime::workflow::command::WorkflowCommandRequ
         match args.command {
             WorkflowCommand::Run(args) => WorkflowCommandRequest::Run(WorkflowRunRequest {
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
-                cwd: args.cwd,
+                cwd: args.cwd.or(global_cwd.clone()),
                 provider: args.provider,
                 model: args.model,
                 api_key: args.api_key,
@@ -417,7 +424,10 @@ impl From<WorkflowArgs> for orca_runtime::workflow::command::WorkflowCommandRequ
                 status: args.status,
             }),
             WorkflowCommand::Show { task_id } => WorkflowCommandRequest::Show { task_id },
-            WorkflowCommand::Source { name } => WorkflowCommandRequest::Source { name },
+            WorkflowCommand::Source { name } => WorkflowCommandRequest::Source {
+                name,
+                cwd: global_cwd.clone(),
+            },
             WorkflowCommand::Stop { task_id } => WorkflowCommandRequest::Stop { task_id },
             WorkflowCommand::Pause { task_id } => WorkflowCommandRequest::Pause { task_id },
             WorkflowCommand::Resume { run_id } => WorkflowCommandRequest::Resume { run_id },
@@ -809,7 +819,9 @@ pub fn run() -> i32 {
                 1
             }
         },
-        Some(Command::Workflow(args)) => orca_runtime::workflow::command::run(args.into()),
+        Some(Command::Workflow(args)) => {
+            orca_runtime::workflow::command::run(args.into_request(cli.cwd))
+        }
         Some(Command::Trust(args)) => orca_runtime::command::trust::run(args.into()),
         Some(Command::SubagentWorker(args)) => {
             orca_runtime::command::launch::run_subagent_worker(args.into())

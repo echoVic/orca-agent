@@ -365,21 +365,6 @@ fn enqueue_accepted_subagent(
             let mut lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{worker_id}"));
             let started = lifecycle.start_task(RuntimeTaskKind::Subagent).clone();
             let output = run_subagent_worker(invocation, lifecycle, started, cancel);
-            if let Some(reservation) = &budget_guard.reservation {
-                let receipt = output.child_budget_usage.or_else(|| {
-                    (output.result.terminal().started
-                        == orca_core::tool_types::ToolInvocationStarted::No)
-                        .then_some(orca_core::budget::BudgetUsage::default())
-                });
-                if let Some(usage) = receipt
-                    && let Err(error) = reservation.settle(usage)
-                {
-                    let _ = worker_registry.fail(
-                        &worker_id,
-                        format!("child budget settlement failed: {error}"),
-                    );
-                }
-            }
             if let Some(error) = output.event_error {
                 let _ = worker_registry.fail(&worker_id, error);
             }
@@ -1641,7 +1626,7 @@ fn run_subagent_worker(
         submitted_task_id,
     } = invocation;
     let SubagentRequest {
-        budget_reservation: _,
+        budget_reservation,
         description,
         prompt,
         subagent_type: requested_subagent_type,
@@ -1946,6 +1931,7 @@ fn run_subagent_worker(
             cancel,
             registry_task_id.clone(),
             config.output_format,
+            budget_reservation.clone(),
         )
     }));
     match execution {
@@ -1973,6 +1959,7 @@ fn run_subagent_worker(
                 &task_registry,
                 &registry_task_id,
                 true,
+                budget_reservation.clone(),
             )
         }
     }
@@ -2009,6 +1996,7 @@ fn execute_acquired_sync_subagent(
     cancel: CancelToken,
     registry_task_id: String,
     output_format: orca_core::config::OutputFormat,
+    durable_reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) -> RuntimeSubagentCallOutput {
     let continuation_start = if is_resume {
         let Some(checkpoint) = prepared.checkpoint.clone() else {
@@ -2028,6 +2016,7 @@ fn execute_acquired_sync_subagent(
                 &task_registry,
                 &registry_task_id,
                 false,
+                durable_reservation.clone(),
             );
         };
         match ChildAgentContinuationStart::new(
@@ -2055,6 +2044,7 @@ fn execute_acquired_sync_subagent(
                     &task_registry,
                     &registry_task_id,
                     false,
+                    durable_reservation.clone(),
                 );
             }
         }
@@ -2093,6 +2083,7 @@ fn execute_acquired_sync_subagent(
                 &task_registry,
                 &registry_task_id,
                 false,
+                durable_reservation.clone(),
             );
         }
     };
@@ -2115,6 +2106,7 @@ fn execute_acquired_sync_subagent(
                 &task_registry,
                 &registry_task_id,
                 false,
+                durable_reservation.clone(),
             );
         }
     };
@@ -2174,6 +2166,7 @@ fn execute_acquired_sync_subagent(
             &task_registry,
             &registry_task_id,
             false,
+            durable_reservation.clone(),
         );
     }
     let child_permission_handler = permission_handler.map(|parent| {
@@ -2268,6 +2261,7 @@ fn execute_acquired_sync_subagent(
         &task_registry,
         &registry_task_id,
         panicked,
+        durable_reservation.clone(),
     );
     let terminal_status = match output.status {
         RunStatus::Success => SurfaceSubagentTerminalStatus::Completed,
@@ -2597,6 +2591,7 @@ fn finalize_started_sync_subagent(
     task_registry: &TaskRegistry,
     registry_task_id: &str,
     panicked: bool,
+    durable_reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) -> RuntimeSubagentCallOutput {
     let shared_revision = Arc::new(Mutex::new(lease.revision));
     finalize_started_sync_subagent_with_revision(
@@ -2607,9 +2602,11 @@ fn finalize_started_sync_subagent(
         task_registry,
         registry_task_id,
         panicked,
+        durable_reservation,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_started_sync_subagent_with_revision(
     mut output: RuntimeSubagentCallOutput,
     coordinator: &ChildAgentCoordinator,
@@ -2618,6 +2615,7 @@ fn finalize_started_sync_subagent_with_revision(
     task_registry: &TaskRegistry,
     registry_task_id: &str,
     panicked: bool,
+    durable_reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) -> RuntimeSubagentCallOutput {
     let expected_revision = coordinator
         .projection(lease.continuation_id.as_str())
@@ -2660,6 +2658,7 @@ fn finalize_started_sync_subagent_with_revision(
                 task_registry,
                 registry_task_id,
                 footer_projection.as_ref(),
+                durable_reservation,
             );
             return output;
         }
@@ -2670,6 +2669,7 @@ fn finalize_started_sync_subagent_with_revision(
         task_registry,
         registry_task_id,
         Some(&projection),
+        durable_reservation,
     );
     output
 }
@@ -2742,13 +2742,28 @@ fn settle_registry_task(
     task_registry: &TaskRegistry,
     registry_task_id: &str,
     footer_projection: Option<&ContinuationProjection>,
+    durable_reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) {
     // Persist the receipt before making the task terminal/claimable. Otherwise
     // the parent could finish after seeing the result but before seeing its bill.
-    if let Some(reservation) = task_registry
-        .get(registry_task_id)
-        .and_then(|task| task.budget_reservation)
-        && let Some(usage) = output.child_budget_usage
+    //
+    // Settle the durable reservation owned by the invocation (not the registry
+    // clone) so the file-ledger write shares the terminal transition's
+    // happens-before chain. Relying only on `task.budget_reservation` (read back
+    // from the registry) leaves a window on slow filesystems where the parent
+    // observes `Completed` before the receipt flush is visible.
+    let receipt = output.child_budget_usage.or_else(|| {
+        (output.result.terminal().started
+            == orca_core::tool_types::ToolInvocationStarted::No)
+            .then_some(orca_core::budget::BudgetUsage::default())
+    });
+    if let Some(reservation) = durable_reservation
+        .or_else(|| {
+            task_registry
+                .get(registry_task_id)
+                .and_then(|task| task.budget_reservation)
+        })
+        && let Some(usage) = receipt
         && let Err(error) = reservation.settle(usage)
     {
         let message = format!("child budget settlement failed: {error}");

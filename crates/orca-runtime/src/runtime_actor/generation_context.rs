@@ -660,7 +660,7 @@ fn normalize_provider_response(
     })
 }
 
-fn validated_response_id(
+pub(crate) fn validated_response_id(
     response: &RuntimeModelResponse,
     label: &str,
 ) -> io::Result<surface::UuidV7> {
