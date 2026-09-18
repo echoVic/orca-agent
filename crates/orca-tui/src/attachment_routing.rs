@@ -513,11 +513,12 @@ mod tests {
                     && matches!(attached.event, TuiEvent::SessionAttachmentActivated)
         ));
         parent_tx.send(approval("newer")).unwrap();
-        for _ in 0..100 {
-            if routing.lock().unwrap().deferred_parent_events.len() == 1 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while routing.lock().unwrap().deferred_parent_events.len() < 1 {
+            if std::time::Instant::now() > deadline {
                 break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(routing.lock().unwrap().deferred_parent_events.len(), 1);
 
