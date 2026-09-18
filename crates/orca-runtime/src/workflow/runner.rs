@@ -1446,19 +1446,41 @@ impl WorkflowRunner {
         workflow_limits: &orca_core::config::WorkflowConfig,
         workflow_cancel: &CancelToken,
     ) -> io::Result<HostCommand> {
+        let hash = input_hash(&call.prompt, &call.opts);
         if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
+            self.record_cancelled_agent(
+                run_id,
+                task_id,
+                transcript_dir,
+                &call,
+                &hash,
+                1,
+                1,
+                &[],
+                now_ms(),
+            )?;
             return Ok(HostCommand::AgentError {
                 call_id: call.call_id,
                 error: STOP_REQUESTED_ERROR.to_string(),
             });
         }
         if self.wait_while_paused(run_id, task_id, workflow_cancel)? {
+            self.record_cancelled_agent(
+                run_id,
+                task_id,
+                transcript_dir,
+                &call,
+                &hash,
+                1,
+                1,
+                &[],
+                now_ms(),
+            )?;
             return Ok(HostCommand::AgentError {
                 call_id: call.call_id,
                 error: STOP_REQUESTED_ERROR.to_string(),
             });
         }
-        let hash = input_hash(&call.prompt, &call.opts);
         if let Some(resume_run_id) = resume_from
             && !call_path_matches_phase(&call.call_path, restart_phase)
         {
