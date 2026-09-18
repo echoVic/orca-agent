@@ -17003,6 +17003,17 @@ impl ThreadActor {
         }
     }
 
+    /// Seal the resident surface hub so no new attachments can observe a live
+    /// pre-close snapshot. Idempotent: calling it again is a no-op. Called both
+    /// before delivering `ThreadShutdownAck::Complete` (so a caller observing
+    /// shutdown completion cannot race a fresh attach) and as a post-loop safety
+    /// net for break paths that never send an ack.
+    fn seal_resident_surface(&self, reason: surface::SurfaceSubscriptionSealReason) {
+        if let Some(resident) = self.resident_surface.0.as_ref() {
+            resident.hub.seal_subscriptions(reason);
+        }
+    }
+
     async fn run(
         mut self,
         mut command_rx: tokio_mpsc::Receiver<ThreadCommand>,
@@ -17290,6 +17301,15 @@ impl ThreadActor {
                                     Ok(()) => ThreadShutdownAck::Complete,
                                     Err(error) => ThreadShutdownAck::Failed(error),
                                 };
+                                if matches!(ack, ThreadShutdownAck::Complete) {
+                                    // Seal the surface hub *before* delivering the ack so a
+                                    // caller that observes shutdown completion immediately cannot
+                                    // race a fresh attachment that still reads the pre-close
+                                    // snapshot. Without this, `shutdown()` can return while the
+                                    // hub still reports `ready`, and a subsequent `read_snapshot`
+                                    // attaches successfully instead of failing closed.
+                                    self.seal_resident_surface(subscription_seal_reason);
+                                }
                                 let _ = reply.send(ack);
                             }
                             break;
@@ -17483,6 +17503,9 @@ impl ThreadActor {
                                         Ok(()) => ThreadShutdownAck::Complete,
                                         Err(error) => ThreadShutdownAck::Failed(error),
                                     };
+                                    if matches!(ack, ThreadShutdownAck::Complete) {
+                                        self.seal_resident_surface(subscription_seal_reason);
+                                    }
                                     let _ = reply.send(ack);
                                 }
                                 break;
@@ -17571,6 +17594,9 @@ impl ThreadActor {
                                     Ok(()) => ThreadShutdownAck::Complete,
                                     Err(error) => ThreadShutdownAck::Failed(error),
                                 };
+                                if matches!(ack, ThreadShutdownAck::Complete) {
+                                    self.seal_resident_surface(subscription_seal_reason);
+                                }
                                 let _ = reply.send(ack);
                             }
                             break;
@@ -17626,9 +17652,7 @@ impl ThreadActor {
                 }
             }
         }
-        if let Some(resident) = self.resident_surface.0.as_ref() {
-            resident.hub.seal_subscriptions(subscription_seal_reason);
-        }
+        self.seal_resident_surface(subscription_seal_reason);
         if let Some(state) = self.state.as_ref() {
             state
                 .thread
