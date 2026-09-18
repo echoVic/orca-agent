@@ -1967,16 +1967,25 @@ impl WorkflowRunner {
                 &error,
             ))
         })?;
-        let source = resume_from
-            .map(|selector| coordinator.prepared(selector))
-            .transpose()
-            .map_err(|error| {
-                workflow_continuation_error(continuation_error(
-                    "failed to resolve workflow continuation",
-                    &error,
-                ))
-            })?
-            .filter(|source| source.parent_task_id.as_deref() == Some(workflow_task_id));
+        let source = match resume_from {
+            Some(selector) => match coordinator.prepared(selector) {
+                Ok(source) => Some(source),
+                // A restart hands us the continuation recorded for a *failed* agent. When that
+                // record is gone (the agent died before committing one, or the store was
+                // pruned) the honest behaviour is to run the agent fresh — failing the whole
+                // restarted workflow made `restart-failed` useless for exactly the case it
+                // exists for. Every other error (corrupt/incompatible/active) stays fatal.
+                Err(AgentContinuationError::NotFound) => None,
+                Err(error) => {
+                    return Err(workflow_continuation_error(continuation_error(
+                        "failed to resolve workflow continuation",
+                        &error,
+                    )));
+                }
+            },
+            None => None,
+        }
+        .filter(|source| source.parent_task_id.as_deref() == Some(workflow_task_id));
         let resume_from = source
             .as_ref()
             .map(|source| source.continuation_id.to_string());
