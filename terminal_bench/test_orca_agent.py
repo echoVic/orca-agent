@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import sys
 import tempfile
 import types
@@ -185,6 +186,29 @@ class OrcaInstalledAgentTests(unittest.TestCase):
 
             self.assertIn("--max-turns 5", captured["command"])
             self.assertIn("--max-cost-usd 0.5", captured["command"])
+
+    def test_run_keeps_a_hyphen_leading_instruction_out_of_option_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = orca_agent.OrcaInstalledAgent()
+            agent.logs_dir = Path(directory)
+            captured = {}
+
+            async def fake_exec(environment, command, env):
+                captured["command"] = command
+                return SimpleNamespace(stdout="", stderr="")
+
+            agent.exec_as_agent = fake_exec
+            # The exact shape of terminal-bench/pytorch-model-recovery's prompt.
+            instruction = "- You are given a PyTorch state dictionary (/app/weights.pt)"
+            asyncio.run(
+                agent.run(instruction, SimpleNamespace(), orca_agent.AgentContext())
+            )
+
+            command = captured["command"]
+            self.assertIn(f" -- {shlex.quote(instruction)}", command)
+            self.assertTrue(command.endswith(shlex.quote(instruction)))
+            # `--` must come after the flags, not before them.
+            self.assertLess(command.index("--mode full-auto"), command.index(" -- "))
 
     def test_external_run_does_not_extend_context(self) -> None:
         environment = SimpleNamespace(
