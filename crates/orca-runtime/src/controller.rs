@@ -2,7 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI32, Ordering},
     mpsc,
 };
 use std::time::Duration;
@@ -44,7 +44,7 @@ use crate::runtime_conversation_bootstrap::AgentConversationContext;
 use crate::runtime_execution_policy::RuntimeExecutionPolicyHandle;
 use crate::runtime_host::{
     HeadlessInteractionCheckpoint, HeadlessOperationHandle, HeadlessSurfaceSession, RuntimeHost,
-    RuntimeHostError, RuntimeThreadStartRequest,
+    RuntimeHostError, RuntimeThreadHandle, RuntimeThreadStartRequest,
 };
 use crate::runtime_surface::{
     FailureClass as SurfaceFailureClass, OperationTerminal as SurfaceOperationTerminal,
@@ -63,6 +63,11 @@ use crate::workflow_execution::{BackgroundWorkflowRun, observe_background_workfl
 const HOSTED_EVENT_RELAY_CAPACITY: usize = 1;
 const HOSTED_EVENT_RELAY_POLL: Duration = Duration::from_millis(10);
 const DEFAULT_HEADLESS_INTERACTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a signal-interrupted headless run may spend stopping task-owned
+/// commands and committing its terminal record before it is killed outright.
+const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(10);
+/// Poll interval used while waiting for an interrupted run to finish cleanup.
+const INTERRUPT_GRACE_POLL: Duration = Duration::from_millis(25);
 
 pub trait HeadlessInteractionHandler: Send + Sync + 'static {
     fn handle(
@@ -1342,6 +1347,156 @@ impl ThreadTurnToolMode {
     }
 }
 
+/// Termination signals a headless run reacts to.
+///
+/// The headless entry point used to keep the default disposition: SIGINT (Ctrl-C
+/// in a wrapper script) and SIGTERM (CI cancel, job timeout) killed the process
+/// outright, so task-owned child commands survived the agent and the session
+/// stream ended without a terminal record. The runtime already stops those
+/// commands and commits a terminal when an operation is interrupted — the path
+/// `task_stop`, budget deadlines and ordinary session end all use — so a signal
+/// now trips that cancellation instead of the default handler.
+enum TerminationSignals {
+    #[cfg(unix)]
+    Unix {
+        interrupt: tokio::signal::unix::Signal,
+        terminate: tokio::signal::unix::Signal,
+    },
+    #[cfg(not(unix))]
+    Console,
+}
+
+impl TerminationSignals {
+    fn install() -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let interrupt = signal(SignalKind::interrupt()).ok()?;
+            let terminate = signal(SignalKind::terminate()).ok()?;
+            Some(Self::Unix {
+                interrupt,
+                terminate,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Some(Self::Console)
+        }
+    }
+
+    /// Resolve with the number of the signal that asked this run to stop.
+    async fn next(&mut self) -> Option<i32> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix {
+                interrupt,
+                terminate,
+            } => tokio::select! {
+                received = interrupt.recv() => received.map(|()| SIGINT),
+                received = terminate.recv() => received.map(|()| SIGTERM),
+            },
+            #[cfg(not(unix))]
+            Self::Console => tokio::signal::ctrl_c().await.ok().map(|()| SIGINT),
+        }
+    }
+}
+
+/// Signal numbers whose conventional exit codes are reported by the wrapper.
+const SIGINT: i32 = 2;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+
+fn signal_exit_code(signal: i32) -> i32 {
+    128 + signal
+}
+
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        SIGINT => "SIGINT",
+        #[cfg(unix)]
+        SIGTERM => "SIGTERM",
+        _ => "termination signal",
+    }
+}
+
+/// Exit code the wrapper expects when `interrupted` recorded a signal.
+fn interrupted_exit_code(interrupted: &AtomicI32) -> Option<i32> {
+    match interrupted.load(Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal_exit_code(signal)),
+    }
+}
+
+/// Trip the runtime's cancellation path when the process is asked to stop.
+///
+/// `interrupted` records the signal that arrived so the run reports the
+/// conventional exit code, and `finished` is set once the terminal record and
+/// the output are committed, which retires the grace period. A second signal
+/// always exits immediately: the grace period exists to let cleanup stop
+/// task-owned commands, not to trap an impatient operator.
+fn install_termination_signal_handler(
+    thread: &RuntimeThreadHandle,
+    interrupted: Arc<AtomicI32>,
+    finished: Arc<AtomicBool>,
+) {
+    let thread = thread.clone();
+    let _ = std::thread::Builder::new()
+        .name("orca-signal".to_string())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Some(mut signals) = TerminationSignals::install() else {
+                    return;
+                };
+                let Some(signal) = signals.next().await else {
+                    return;
+                };
+                interrupted.store(signal, Ordering::SeqCst);
+                eprintln!(
+                    "orca: received {}; stopping the running operation",
+                    signal_name(signal)
+                );
+                if let Err(error) = thread.interrupt_active() {
+                    eprintln!("orca: could not stop the running operation: {error}");
+                }
+                let grace = tokio::time::sleep(INTERRUPT_GRACE_PERIOD);
+                tokio::pin!(grace);
+                loop {
+                    tokio::select! {
+                        () = &mut grace => {
+                            if !finished.load(Ordering::SeqCst) {
+                                eprintln!(
+                                    "orca: cleanup did not finish within {}s; exiting",
+                                    INTERRUPT_GRACE_PERIOD.as_secs()
+                                );
+                                std::process::exit(signal_exit_code(signal));
+                            }
+                            return;
+                        }
+                        second = signals.next() => {
+                            let signal = second.unwrap_or(signal);
+                            eprintln!(
+                                "orca: received a second {}; exiting immediately",
+                                signal_name(signal)
+                            );
+                            std::process::exit(signal_exit_code(signal));
+                        }
+                        () = tokio::time::sleep(INTERRUPT_GRACE_POLL) => {
+                            if finished.load(Ordering::SeqCst) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+}
+
 pub fn run(config: RunConfig) -> i32 {
     let stdout = io::stdout();
     let options = ControllerRunOptions::for_run_config(&config);
@@ -1416,6 +1571,9 @@ fn run_inner<W: io::Write>(
     let thread = host
         .start_thread_with_request(start_request)
         .map_err(runtime_host_io_error)?;
+    let interrupted = Arc::new(AtomicI32::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    install_termination_signal_handler(&thread, Arc::clone(&interrupted), Arc::clone(&finished));
     // Machine consumers of `--output-format jsonl` treat a non-empty stderr as
     // a failed run, so the warnings travel in `session.started.warnings` there
     // (the ACP surface surfaces the same list). Text mode keeps them on stderr.
@@ -1423,6 +1581,12 @@ fn run_inner<W: io::Write>(
         for error in thread.startup_warnings() {
             eprintln!("orca: warning: {error}");
         }
+    }
+    if let Some(exit_code) = interrupted_exit_code(&interrupted) {
+        // The signal arrived before the turn was admitted: stop here instead of
+        // starting work the operator has already cancelled.
+        let _ = host.shutdown();
+        return Ok(exit_code);
     }
     let mut headless = thread.attach_headless_surface(transport.is_some())?;
     let (relay_tx, relay_rx) = mpsc::sync_channel(HOSTED_EVENT_RELAY_CAPACITY);
@@ -1447,8 +1611,12 @@ fn run_inner<W: io::Write>(
     };
     let terminal = terminal?;
     let status = headless_operation_status(&terminal);
-    let exit_code = headless_operation_exit_code(&terminal);
+    // A signal-requested cancellation reports the conventional signal code,
+    // whatever status the interrupted operation happened to reach.
+    let exit_code = interrupted_exit_code(&interrupted)
+        .unwrap_or_else(|| headless_operation_exit_code(&terminal));
     shutdown?;
+    finished.store(true, Ordering::SeqCst);
     if config.desktop_notifications {
         let _ = crate::notify::notify("Orca", &format!("Session {}", status.as_str()));
     }
