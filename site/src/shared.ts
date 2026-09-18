@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.4.31";
+export const releaseVersion = "v0.4.32";
 
 export const releases = [
+  {
+    version: "v0.4.32",
+    date: "2026-09-18",
+    title: "Hardening fixes across runtime, protocol, and terminal-bench",
+    body: "Twenty-seven fixes harden protocol edge cases, trust-store concurrency, sandbox guards, ACP error reporting, provider retries, workflow restart recovery, and terminal-bench adapter reliability. Includes SIGINT/SIGTERM cancellation for headless runs, trajectory persistence on every exit path, and a reasoning-effort lever for A/B benchmark arms.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.4.32",
+  },
   {
     version: "v0.4.31",
     date: "2026-09-14",

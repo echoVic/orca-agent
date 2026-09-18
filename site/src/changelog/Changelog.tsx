@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.32":
+        "Twenty-seven hardening fixes across protocol edge cases, trust-store concurrency, sandbox guards, ACP error reporting, provider 5xx retries, workflow restart recovery, and terminal-bench adapter reliability. Headless runs now cancel on SIGINT/SIGTERM; trajectories persist on every exit path; the reasoning-effort lever enables A/B benchmark arms; and the untrusted-workspace warning explains instead of failing.",
       "v0.4.31":
         "Unifies direct, nested, Workflow, hosted, and resumed child agents under one durable execution scope with queued admission, persistent budget receipts, restart-safe result delivery, and shared task controls. Bash now owns long-running commands through the same task lifecycle; network grants resume the blocked proxy connection without replaying prior shell side effects, and cancellation, timeout, and exit terminals remain truthful.",
       "v0.4.30":
@@ -672,6 +674,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.4.32":
+        "二十七项加固修复覆盖协议边界、信任存储并发、沙箱守卫、ACP 错误上报、提供商 5xx 重试、工作流重启恢复和 terminal-bench 适配器可靠性。无头运行现在在 SIGINT/SIGTERM 时取消；轨迹在所有退出路径上持久化；reasoning-effort 杠杆支持 A/B 基准；不可信工作区改为提示而非直接失败。",
       "v0.4.31":
         "将直接、嵌套、Workflow、托管与恢复后的子代理统一到一个持久执行作用域，提供排队准入、持久预算回执、可恢复结果投递和共享任务控制面；bash 长命令也纳入同一任务生命周期，网络授权会恢复被阻塞的原连接而不重放此前的 shell 副作用，并保留准确的取消、超时和退出终态。",
       "v0.4.30":
