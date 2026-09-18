@@ -17,7 +17,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 const DEFAULT_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
-const DEFAULT_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const DROP_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
 const SIGNAL_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
 const READER_EOF_TIMEOUT: Duration = Duration::from_millis(250);

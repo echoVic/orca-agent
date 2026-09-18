@@ -768,6 +768,7 @@ impl RuntimeProviderResponseStep {
         input: RuntimeProviderResponseInput<'_, W>,
         executors: RuntimeProviderResponseExecutors,
     ) -> io::Result<RuntimeProviderResponseOutcome> {
+        let mut response = response;
         let RuntimeProviderResponseInput {
             step_context,
             sampling_state,
@@ -789,7 +790,10 @@ impl RuntimeProviderResponseStep {
         } = executors;
         let step_snapshot = step_context.snapshot();
         if let Some(ingress) = step_snapshot.turn_context.provider_response_ingress() {
-            ingress.commit_response(&response)?;
+            // The ingress answers with the names the surface recorded: a tool
+            // call whose provider id the session already used is renamed there
+            // (issue #67), and the conversation must use the same name.
+            ingress.commit_response(&mut response)?;
         }
         let completed_response = response.completed();
         let response = response.response;
@@ -1168,7 +1172,7 @@ mod tests {
     struct FailingProviderStepIngress;
 
     impl crate::runtime_surface::RuntimeProviderResponseIngress for FailingProviderStepIngress {
-        fn commit_response(&self, _response: &RuntimeModelResponse) -> io::Result<()> {
+        fn commit_response(&self, _response: &mut RuntimeModelResponse) -> io::Result<()> {
             Ok(())
         }
 
@@ -1194,7 +1198,7 @@ mod tests {
     }
 
     impl crate::runtime_surface::RuntimeProviderResponseIngress for RecordingProviderStepIngress {
-        fn commit_response(&self, _response: &RuntimeModelResponse) -> io::Result<()> {
+        fn commit_response(&self, _response: &mut RuntimeModelResponse) -> io::Result<()> {
             Ok(())
         }
 

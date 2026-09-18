@@ -62,7 +62,9 @@ fn exec_reads_prompt_from_piped_stdin_when_prompt_is_omitted() {
 
     let events = parse_jsonl(&output.stdout);
     let turn_started = find_event(&events, "turn.started");
-    assert_eq!(turn_started["payload"]["prompt"], "prompt from stdin");
+    // The prompt reaches the model byte-exact, including the newline that came
+    // from stdin (issue #66).
+    assert_eq!(turn_started["payload"]["prompt"], "prompt from stdin\n");
 }
 
 #[test]
@@ -84,7 +86,10 @@ fn exec_dash_prompt_reads_piped_stdin_as_prompt() {
 
     let events = parse_jsonl(&output.stdout);
     let turn_started = find_event(&events, "turn.started");
-    assert_eq!(turn_started["payload"]["prompt"], "dash prompt from stdin");
+    assert_eq!(
+        turn_started["payload"]["prompt"],
+        "dash prompt from stdin\n"
+    );
 }
 
 #[test]

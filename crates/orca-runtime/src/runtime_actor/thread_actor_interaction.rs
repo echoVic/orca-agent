@@ -1014,7 +1014,10 @@ impl ThreadActor {
             .as_ref()
             .is_some_and(|network| network.enabled.is_some() || !network.domains.is_empty())
         {
-            return Err("session scope cannot persist network grants without a runtime policy");
+            return Err(
+                "session-scoped network grants are not supported for model-requested permissions; \
+                 re-send with scope=turn",
+            );
         }
         let network = next.effective.network_permissions.clone();
 

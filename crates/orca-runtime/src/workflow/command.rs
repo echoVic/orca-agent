@@ -64,6 +64,7 @@ pub enum WorkflowCommandRequest {
     },
     Source {
         name: String,
+        cwd: Option<PathBuf>,
     },
     Stop {
         task_id: String,
@@ -160,7 +161,7 @@ pub fn run(request: WorkflowCommandRequest) -> i32 {
         WorkflowCommandRequest::Run(request) => run_workflow_command(request),
         WorkflowCommandRequest::List(request) => workflow_list_command(request),
         WorkflowCommandRequest::Show { task_id } => workflow_show_command(&task_id),
-        WorkflowCommandRequest::Source { name } => workflow_source_command(&name),
+        WorkflowCommandRequest::Source { name, cwd } => workflow_source_command(&name, cwd),
         WorkflowCommandRequest::Stop { task_id } => workflow_stop_command(&task_id),
         WorkflowCommandRequest::Pause { task_id } => workflow_pause_command(&task_id),
         WorkflowCommandRequest::Resume { run_id } => workflow_resume_command(&run_id),
@@ -317,15 +318,20 @@ fn workflow_show_command(task_id: &str) -> i32 {
     }
 }
 
-fn workflow_source_command(name: &str) -> i32 {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let user_workflow_dir = dirs::home_dir()
-        .map(|home| home.join(".orca").join("workflows"))
-        .unwrap_or_else(|| PathBuf::from(".orca/workflows"));
+fn workflow_source_command(name: &str, cwd: Option<PathBuf>) -> i32 {
+    // `--cwd` is the workspace; the process directory is only a fallback. The user workflow
+    // directory comes from the *active* Orca home (`ORCA_HOME` → `~/.orca`), the same place
+    // the workflow worker resolves it from — otherwise `source` cannot show what `run` executes.
+    let cwd = cwd
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let config_dir = orca_core::config::folder_trust::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".orca"));
+    let user_workflow_dir = config_dir.join("workflows");
     let path = match find_saved_workflow(&cwd, name, &user_workflow_dir) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("orca: workflow source '{name}' not found: {error}");
+            eprintln!("orca: workflow source '{name}': {error}");
             return 1;
         }
     };
@@ -539,6 +545,24 @@ fn workflow_restart_command(
                 }
             };
             let launch_cwd = PathBuf::from(&record.cwd);
+            // Resolve credentials the way the launch path does. The run record deliberately
+            // stores no key (the legacy field is only populated for pre-sanitised records), so
+            // passing `run.legacy_api_key` alone started a worker whose every agent failed with
+            // "DEEPSEEK_API_KEY is required" — while the same environment could launch a run.
+            let api_key = match build_workflow_run_config(
+                &app_version,
+                &launch_cwd,
+                record.provider,
+                record.model.clone(),
+                None,
+                record.base_url.clone(),
+            ) {
+                Ok(config) => config.api_key.or(run.legacy_api_key.clone()),
+                Err(error) => {
+                    eprintln!("orca: {error}");
+                    return 1;
+                }
+            };
             let mut input = record.input;
             input.resume_from_run_id = Some(run.state.run_id.clone());
             input.restart_phase = restart_phase;
@@ -548,7 +572,7 @@ fn workflow_restart_command(
                 app_version,
                 record.provider,
                 record.model,
-                run.legacy_api_key,
+                api_key,
                 record.base_url,
                 record.capabilities,
                 &input,
@@ -706,6 +730,19 @@ fn spawn_workflow_worker(
         }
     };
 
+    // The worker is long-lived and detached, so its stderr cannot be a pipe the launcher
+    // closes: send it to a per-session log the launcher can quote when startup fails.
+    let worker_log = workflow_session_root(cwd).join(&session_id).join("worker.log");
+    let worker_stderr = worker_log
+        .parent()
+        .map(|parent| std::fs::create_dir_all(parent))
+        .transpose()
+        .ok()
+        .flatten()
+        .and_then(|()| std::fs::File::create(&worker_log).ok())
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
+
     let mut command = ProcessCommand::new(current_exe);
     let has_api_key = api_key.is_some();
     command
@@ -716,7 +753,7 @@ fn spawn_workflow_worker(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(worker_stderr)
         .arg("workflow")
         .arg("worker")
         .arg("--cwd")
@@ -783,8 +820,28 @@ fn spawn_workflow_worker(
     let mut first_line = String::new();
     match reader.read_line(&mut first_line) {
         Ok(0) => {
-            let _ = child.wait();
-            eprintln!("orca: workflow worker exited before reporting launch output");
+            let status = child.wait().ok();
+            // The worker's own stderr is the only place the real cause appears (missing
+            // script, unreadable config, no node, …); quote it instead of a bare message.
+            let cause = worker_log
+                .exists()
+                .then(|| std::fs::read_to_string(&worker_log).unwrap_or_default())
+                .unwrap_or_default();
+            let cause = cause
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("no diagnostic output")
+                .trim()
+                .to_string();
+            let status = status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "unknown status".to_string());
+            eprintln!(
+                "orca: workflow worker exited before reporting launch output ({status}): {cause} \
+                 (log: {})",
+                worker_log.display()
+            );
             1
         }
         Ok(_) => {
@@ -857,15 +914,22 @@ fn workflow_input_for_launch(
     args: Option<Value>,
     resume_from_run_id: Option<String>,
 ) -> WorkflowInput {
+    // Hand over an absolute path: a relative one was resolved by the *worker*, whose cwd is
+    // the launch directory, so `orca --cwd <project> workflow run scripts/x.js` from anywhere
+    // else failed with the generic "worker exited before reporting launch output" (issue #82).
     let script_path = PathBuf::from(script_or_name);
+    let resolved_script = if script_path.is_absolute() {
+        Some(script_path)
+    } else {
+        let joined = cwd.join(&script_path);
+        joined.exists().then_some(joined)
+    };
     WorkflowInput {
         draft_id: None,
-        script_path: if script_path.is_absolute() || cwd.join(script_or_name).exists() {
-            Some(script_or_name.to_string())
-        } else {
-            None
-        },
-        name: if script_path.is_absolute() || cwd.join(script_or_name).exists() {
+        script_path: resolved_script
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        name: if resolved_script.is_some() {
             None
         } else {
             Some(script_or_name.to_string())

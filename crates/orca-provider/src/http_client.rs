@@ -20,7 +20,12 @@ const MAX_BACKOFF_MS: u64 = 60_000;
 const BACKOFF_FACTOR: f64 = 2.0;
 const JITTER_FACTOR: f64 = 0.1;
 
-const RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
+/// 429 (rate limit) and every server-side 5xx are transient. Providers and the CDNs in front
+/// of them emit codes no allow-list can enumerate — Cloudflare alone uses 520-526 and 598 —
+/// and a 5xx that is *not* transient simply fails the retry loop with the last response.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
 
 static CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
     BlockingClient::builder()
@@ -58,7 +63,7 @@ pub fn execute_with_retry(
         match result {
             Ok(resp) => {
                 let status = resp.status();
-                if !RETRYABLE_STATUS_CODES.contains(&status.as_u16()) {
+                if !is_retryable_status(status.as_u16()) {
                     return resp
                         .error_for_status()
                         .map_err(|e| format!("request error: {e}"));
@@ -99,7 +104,7 @@ pub async fn execute_streaming_with_retry(
         match result {
             Ok(resp) => {
                 let status = resp.status();
-                if !RETRYABLE_STATUS_CODES.contains(&status.as_u16()) {
+                if !is_retryable_status(status.as_u16()) {
                     if status.is_client_error() || status.is_server_error() {
                         let body = response_text_with_cancel(resp, cancel).await?;
                         return Err(format!("request error ({status}): {body}"));
@@ -239,6 +244,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Instant;
+
+    #[test]
+    fn gateway_5xx_codes_outside_the_old_allow_list_are_retryable() {
+        // The retired allow-list was [429, 500, 502, 503, 504]; Cloudflare's 520-526 and
+        // other gateway codes aborted the session instead of retrying (issue #68).
+        for status in [429, 500, 501, 502, 503, 504, 507, 520, 521, 522, 523, 524, 525, 526, 598] {
+            assert!(is_retryable_status(status), "{status} must be retryable");
+        }
+        for status in [400, 401, 403, 404, 409, 413, 422, 499] {
+            assert!(!is_retryable_status(status), "{status} must not be retried");
+        }
+    }
 
     #[test]
     fn backoff_increases_exponentially() {
@@ -440,8 +457,31 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let index = server_requests.fetch_add(1, Ordering::SeqCst);
-                        let mut request = [0u8; 4 * 1024];
-                        let _ = stream.read(&mut request);
+                        // The accepted socket inherits the listener's non-blocking
+                        // mode, so a bare `read()` here returns immediately and we
+                        // would reply, then close, before the client's request has
+                        // actually arrived. Closing a socket that still has unread
+                        // request bytes in its receive buffer emits a TCP RST rather
+                        // than a graceful FIN; on Windows reqwest surfaces that RST
+                        // as a transport error instead of the retryable status under
+                        // test, so the exhaustion path reports "request failed..."
+                        // instead of "max retries exceeded". Flip the stream to
+                        // blocking and wait (bounded by the server deadline) for the
+                        // request headers: this both orders the reply after the request
+                        // and drains the request so the close is graceful.
+                        let _ = stream.set_nonblocking(false);
+                        let read_timeout = deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(Duration::from_millis(50));
+                        let _ = stream.set_read_timeout(Some(read_timeout));
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 1024];
+                        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => request.extend_from_slice(&chunk[..read]),
+                            }
+                        }
                         let response = if index < retryable_count {
                             format!(
                                 "HTTP/1.1 {status_line}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

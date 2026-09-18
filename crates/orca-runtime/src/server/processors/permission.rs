@@ -4,6 +4,19 @@ use serde_json::{Value, json};
 
 use super::super::*;
 
+/// `code: message` for an uncommitted interaction mutation, so a refused *grant* is reported
+/// as such rather than as an expired request.
+fn uncommitted_mutation_reason(mutation: &crate::surface::UncommittedMutation) -> String {
+    use crate::surface::UncommittedMutation;
+    let error = match mutation {
+        UncommittedMutation::Invalid { error, .. } => error.error(),
+        UncommittedMutation::Stale { error, .. } => error.error(),
+        UncommittedMutation::Unavailable { error, .. } => error.error(),
+        UncommittedMutation::CommitFailed { error, .. } => error.error(),
+    };
+    format!("{:?}: {}", error.code, error.message.as_str())
+}
+
 pub(in crate::server::router) fn is_permission_operation(op: &ClientOp) -> bool {
     matches!(op, ClientOp::PermissionRespond { .. })
 }
@@ -194,12 +207,16 @@ fn run_permission_respond<W: Write>(
                     )),
                 );
             }
-            Ok(crate::surface::MutationReply::Uncommitted { .. }) => {
+            Ok(crate::surface::MutationReply::Uncommitted { mutation }) => {
+                // The request can be perfectly live while the *grant itself* is refused (e.g. a
+                // session-scoped network grant has no runtime policy to persist into). Reporting
+                // "no longer active" misattributed the cause and hid the reason (issue #74).
                 return protocol::write_server_event(
                     writer,
                     &id,
                     ServerEvent::error(format!(
-                        "permission request is no longer active: {request_id}"
+                        "permission response rejected: {} ({request_id})",
+                        uncommitted_mutation_reason(&mutation)
                     )),
                 );
             }
