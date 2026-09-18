@@ -819,9 +819,6 @@ fn run_workflow_agent_worker<F>(
         let Ok(call) = received else {
             return;
         };
-        if abort.load(Ordering::Acquire) {
-            continue;
-        }
 
         let call_id = call.call_id.clone();
         let command =
