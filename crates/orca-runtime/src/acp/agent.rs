@@ -33,7 +33,7 @@ use crate::surface::{
     AcpRequestId, AssistantPatch, AttachResult, CanonicalMime, CanonicalPath, CanonicalUri,
     DisplayText, FreshAttachRequest, MutationReply, NonEmptyText, NonEmptyVec, NotAdmittedReason,
     OperationBudget, OperationIngressCorrelation, OperationKind, OperationRequestIntent,
-    OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
+    FailureClass, OperationSettingsPreparation, OperationTerminal, ReplayabilityRequest,
     RuntimeSurfaceClientHandle, RuntimeSurfaceHandle, RuntimeSurfaceHostHandle, SequenceNumber,
     Sha256Digest, SurfaceAllowDeny, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability,
     SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceEvent, SurfaceImageDetail,
@@ -2671,6 +2671,13 @@ pub(super) fn terminal_to_stop_reason(terminal: &OperationTerminal) -> Result<St
         OperationTerminal::NotAdmitted { reason } => {
             Err(format!("ACP operation was not admitted: {reason:?}"))
         }
+        // A permission the *client* declined is a decision, not an agent failure: report the
+        // ACP-idiomatic `Refusal` stop reason so an IDE does not surface "-32603 Internal
+        // error" (and does not retry) for something its user chose.
+        OperationTerminal::Failed {
+            class: FailureClass::LegacyApprovalRequired,
+            ..
+        } => Ok(StopReason::Refusal),
         OperationTerminal::Failed { message, .. }
         | OperationTerminal::Panicked { message }
         | OperationTerminal::JoinFailed { message } => Err(message.as_str().to_string()),
