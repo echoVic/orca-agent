@@ -909,7 +909,12 @@ impl RuntimeShellSessionManager {
         ));
         let mut session = self.take_session(id)?;
         let tasks = session.tasks.clone();
-        if wait_for_process_exit(&mut session, Duration::from_millis(150))?.is_some() {
+        // A user-initiated cancellation must stop the active child promptly and
+        // return the turn to the caller; skip the observation grace window and
+        // kill the tree outright. The graceful SIGTERM grace is reserved for
+        // deadline-style stops where cleanup matters more than latency.
+        let immediate_cancel = termination == ShellSessionTermination::Cancelled;
+        if !immediate_cancel && wait_for_process_exit(&mut session, Duration::from_millis(150))?.is_some() {
             let status = session.finish_after_exit()?;
             // A deadline remains authoritative after it expires. An ordinary
             // kill preserves a process exit already observed during the grace
@@ -934,7 +939,11 @@ impl RuntimeShellSessionManager {
             }
             return Ok(output);
         }
-        session.terminate_child_tree();
+        if immediate_cancel {
+            session.terminate_child_tree_immediate();
+        } else {
+            session.terminate_child_tree();
+        }
         let status = session.child.wait()?;
         session.join_readers();
         let output = session.output(
@@ -1350,6 +1359,12 @@ impl ShellSession {
         #[cfg(not(windows))]
         self.child.kill();
     }
+
+    fn terminate_child_tree_immediate(&mut self) {
+        let _ = self.process_job.terminate(137);
+        #[cfg(not(windows))]
+        self.child.kill_immediate();
+    }
 }
 
 impl Drop for ShellSession {
@@ -1467,6 +1482,27 @@ impl ShellChild {
     fn kill(&mut self) {
         match self {
             Self::Process(child) => orca_tools::process::kill_child_tree(child),
+            #[cfg(windows)]
+            Self::WindowsSandbox(child) => {
+                let _ = child.kill();
+            }
+            #[cfg(windows)]
+            Self::WindowsSandboxPty(child) => {
+                let _ = child.kill();
+            }
+            #[cfg(windows)]
+            Self::WindowsPty(child) => {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    /// Force-kill the tree immediately without the graceful SIGTERM grace.
+    /// Used for user-initiated cancellation where the turn must be accepted
+    /// back quickly.
+    fn kill_immediate(&mut self) {
+        match self {
+            Self::Process(child) => orca_tools::process::kill_child_tree_immediate(child),
             #[cfg(windows)]
             Self::WindowsSandbox(child) => {
                 let _ = child.kill();
