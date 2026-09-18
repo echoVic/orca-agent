@@ -347,7 +347,7 @@ impl RuntimeShellSessionManager {
         let cleanup_tasks = tasks.clone();
         let task_id = task.id.clone();
         let result = (|| {
-            let shell = ShellResolver::for_current_host()
+            let shell = ShellResolver::for_current_host_in(command.cwd.clone())
                 .resolve_from_environment()
                 .map_err(io::Error::other)?;
             // An argv request is launched directly by the native adapter on
@@ -1206,8 +1206,8 @@ fn session_command_spec(
             "command argv must not be empty",
         )
     })?;
-    let program =
-        orca_platform::shell::resolve_program(program).unwrap_or_else(|| PathBuf::from(program));
+    let program = orca_platform::shell::resolve_program_in(program, Some(&command.cwd))
+        .unwrap_or_else(|| PathBuf::from(program));
     Ok(orca_platform::shell::CommandSpec {
         program,
         args: args.iter().map(OsString::from).collect(),
@@ -1219,8 +1219,8 @@ fn direct_command(argv: &[String], cwd: &std::path::Path) -> std::process::Comma
     let (program, args) = argv
         .split_first()
         .expect("validated command/exec argv must not be empty");
-    let program =
-        orca_platform::shell::resolve_program(program).unwrap_or_else(|| PathBuf::from(program));
+    let program = orca_platform::shell::resolve_program_in(program, Some(cwd))
+        .unwrap_or_else(|| PathBuf::from(program));
     let mut command = std::process::Command::new(program);
     command.args(args).current_dir(cwd);
     command

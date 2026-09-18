@@ -105,6 +105,18 @@ impl ShellResolver<fn(&str) -> Option<PathBuf>> {
     pub fn for_current_host() -> Self {
         Self::new(HostPlatform::current(), find_executable)
     }
+
+    /// Like [`Self::for_current_host`], but the executable guard also rejects anything inside
+    /// `workspace` — which is the directory the caller actually runs in, and is frequently not
+    /// the process working directory (`orca exec --cwd …` from elsewhere).
+    pub fn for_current_host_in(
+        workspace: impl Into<PathBuf>,
+    ) -> ShellResolver<impl Fn(&str) -> Option<PathBuf>> {
+        let workspace = workspace.into();
+        ShellResolver::new(HostPlatform::current(), move |candidate: &str| {
+            find_executable_in(candidate, Some(&workspace))
+        })
+    }
 }
 
 fn windows_override_kind(value: &str) -> Result<ShellKind, PlatformError> {
@@ -124,25 +136,43 @@ fn windows_override_kind(value: &str) -> Result<ShellKind, PlatformError> {
 }
 
 fn find_executable(candidate: &str) -> Option<PathBuf> {
+    find_executable_in(candidate, None)
+}
+
+/// Resolve `candidate` on `PATH`, refusing anything that lives inside the process working
+/// directory *or* inside `workspace` (the caller's actual project root).
+///
+/// Both roots are checked on purpose: the process cwd is a shadowing vector of its own, and a
+/// workspace passed via `--cwd` is the directory whose executables the guard is really about
+/// (issue #71 — a repository-supplied `sh` used to win whenever the two differed).
+fn find_executable_in(candidate: &str, workspace: Option<&Path>) -> Option<PathBuf> {
     let candidate_path = Path::new(candidate);
     if candidate_path.components().count() > 1 {
         return absolute_existing_path(candidate_path);
     }
-    let current_directory = env::current_dir().ok();
+    let mut guard_roots: Vec<PathBuf> = Vec::new();
+    if let Some(current_directory) = env::current_dir().ok() {
+        guard_roots.push(current_directory);
+    }
+    if let Some(workspace) = workspace {
+        guard_roots.push(workspace.to_path_buf());
+    }
     let from_path = env::var_os("PATH")
         .into_iter()
         .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
         .find_map(|directory| {
             let candidate_path = directory.join(candidate);
-            if current_directory
-                .as_deref()
-                .is_some_and(|cwd| is_current_directory_executable(&candidate_path, cwd))
+            if guard_roots
+                .iter()
+                .any(|root| is_current_directory_executable(&candidate_path, root))
             {
                 return None;
             }
             absolute_existing_path(&candidate_path)
         });
-    from_path.or_else(|| find_standard_windows_executable(candidate, current_directory.as_deref()))
+    from_path.or_else(|| {
+        find_standard_windows_executable(candidate, guard_roots.first().map(PathBuf::as_path))
+    })
 }
 
 #[cfg(windows)]
@@ -218,10 +248,15 @@ fn standard_windows_executable_candidates(
 /// `.cmd`/`.bat` launchers exposed through `PATHEXT` (for example npm's
 /// `npx.cmd`).
 pub fn resolve_program(program: &str) -> Option<PathBuf> {
+    resolve_program_in(program, None)
+}
+
+/// Like [`resolve_program`], with the workspace root added to the shadowing guard.
+pub fn resolve_program_in(program: &str, workspace: Option<&Path>) -> Option<PathBuf> {
     if program.contains('/') || program.contains('\\') {
         return None;
     }
-    let resolved = find_executable(program);
+    let resolved = find_executable_in(program, workspace);
     #[cfg(windows)]
     {
         resolved.or_else(|| {
@@ -235,7 +270,7 @@ pub fn resolve_program(program: &str) -> Option<PathBuf> {
                         .collect::<Vec<_>>()
                 })
                 .map(|extension| format!("{program}{extension}"))
-                .find_map(|candidate| find_executable(&candidate))
+                .find_map(|candidate| find_executable_in(&candidate, workspace))
         })
     }
     #[cfg(not(windows))]
@@ -288,6 +323,47 @@ fn absolute_existing_path(path: &Path) -> Option<PathBuf> {
             env::current_dir().ok().map(|cwd| cwd.join(path))
         }
     })
+}
+
+#[cfg(all(test, not(windows)))]
+mod workspace_guard_tests {
+    use super::{find_executable_in, resolve_program_in};
+
+    #[test]
+    fn workspace_executable_is_not_resolved_even_when_the_process_cwd_differs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bin = workspace.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let shim = bin.join("orca-guard-probe");
+        std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let previous = std::env::var_os("PATH").unwrap_or_default();
+        let mut entries = vec![bin.clone()];
+        entries.extend(std::env::split_paths(&previous));
+        let patched_path = std::env::join_paths(entries).unwrap();
+
+        // SAFETY: the variable is restored before the test returns.
+        unsafe { std::env::set_var("PATH", &patched_path) };
+        let guarded = find_executable_in("orca-guard-probe", Some(workspace.path()));
+        let unguarded = find_executable_in("orca-guard-probe", None);
+
+        unsafe { std::env::set_var("PATH", &previous) };
+
+        assert!(
+            guarded.is_none(),
+            "an executable inside the configured workspace must be rejected"
+        );
+        assert!(
+            unguarded.is_some(),
+            "the guard is scoped to the workspace root and the process cwd"
+        );
+        assert!(resolve_program_in("orca-guard-probe", Some(workspace.path())).is_none());
+    }
 }
 
 #[cfg(all(test, windows))]
