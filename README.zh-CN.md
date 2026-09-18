@@ -79,6 +79,10 @@ Orca 会输出准确的 `orca --resume <SESSION_ID>` 恢复命令。
 集中展示普通子代理、后台命令、监控任务和 Workflow child；`/agents` 是它的别名，
 `/workflows` 则保留 Workflow 专用运行树。使用 `/trust` 管理当前目录的沙箱权限。
 
+### 在 Pilion Browser 中使用 Orca
+
+[Pilion Browser](https://github.com/echoVic/pilion-browser) 是一个作为 ACP 客户端的桌面浏览器。在它的 Agent 面板中选择 **Orca**，Pilion 会以 `orca --mode=acp` 启动 Orca、转发 `DEEPSEEK_API_KEY`，并把自己的标签页作为 MCP 工具（`browser_snapshot`、`browser_screenshot`、导航、点击、输入）交给 Orca 操作，支持操作前确认和人工接管。macOS、Windows、Linux 安装包见 [Pilion Releases](https://github.com/echoVic/pilion-browser/releases)。
+
 ## 核心能力
 
 - 直接适配 DeepSeek 的推理和工具调用语义，支持 SSE 流式输出、前缀缓存友好提示词、
