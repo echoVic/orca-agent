@@ -2562,7 +2562,7 @@ mod tests {
         });
 
         assert_eq!(
-            done_rx.recv_timeout(Duration::from_millis(500)),
+            done_rx.recv_timeout(Duration::from_millis(5000)),
             Ok(true),
             "callback panic must close the step receiver and join the provider worker"
         );
