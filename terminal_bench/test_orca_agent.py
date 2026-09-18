@@ -34,6 +34,9 @@ def _install_harbor_stubs() -> None:
     class BaseEnvironment:
         pass
 
+    class NonZeroAgentExitCodeError(RuntimeError):
+        pass
+
     class AgentContext:
         __slots__ = (
             "n_input_tokens",
@@ -47,6 +50,9 @@ def _install_harbor_stubs() -> None:
     modules["harbor.agents.base"].BaseAgent = BaseAgent
     modules["harbor.agents.installed.base"].BaseInstalledAgent = BaseInstalledAgent
     modules["harbor.agents.installed.base"].with_prompt_template = lambda fn: fn
+    modules["harbor.agents.installed.base"].NonZeroAgentExitCodeError = (
+        NonZeroAgentExitCodeError
+    )
     modules["harbor.environments.base"].BaseEnvironment = BaseEnvironment
     modules["harbor.models.agent.context"].AgentContext = AgentContext
     sys.modules.update(modules)
@@ -117,12 +123,18 @@ class OrcaInstalledAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             agent = orca_agent.OrcaInstalledAgent()
             agent.logs_dir = Path(directory)
-            agent.exec_as_agent = AsyncMock(
-                return_value=SimpleNamespace(stdout='{"type":"turn.completed"}\n', stderr="")
+            environment = SimpleNamespace(
+                exec=AsyncMock(
+                    return_value=SimpleNamespace(
+                        stdout='{"type":"turn.completed"}\n',
+                        stderr="",
+                        return_code=0,
+                    )
+                )
             )
             context = orca_agent.AgentContext()
 
-            asyncio.run(agent.run("finish the task", SimpleNamespace(), context))
+            asyncio.run(agent.run("finish the task", environment, context))
 
             expected = '{"type":"turn.completed"}\n'
             self.assertFalse(hasattr(context, "output"))
@@ -136,28 +148,36 @@ class OrcaInstalledAgentTests(unittest.TestCase):
                 )
             )
             self.assertEqual(metadata["budget"], {})
+            self.assertEqual(metadata["exit_code"], 0)
             self.assertEqual(metadata["terminal"]["status"], None)
+            self.assertTrue(metadata["trajectory_persisted"])
+            self.assertEqual(metadata["trajectory_bytes"], len(expected))
 
-    def test_run_persists_terminal_metadata_and_stderr_on_nonzero_exit(self) -> None:
+    def test_run_persists_trajectory_and_raises_on_nonzero_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent = orca_agent.OrcaInstalledAgent()
             agent.logs_dir = Path(directory)
-            agent.exec_as_agent = AsyncMock(
-                return_value=SimpleNamespace(
-                    exit_code=4,
-                    stdout=(
-                        '{"type":"session.started","seq":0}\n'
-                        '{"type":"session.completed","payload":{"status":"budget_exhausted",'
-                        '"terminal":{"stopped":{"reason":{"turn_budget":{"max_turns":3}},'
-                        '"usage":{"turns":3,"tool_calls":0,"cost_usd_micros":0,'
-                        '"wall_time_ms":0},"checkpoint_id":"cp-1","resumable":true}}}}\n'
-                    ),
-                    stderr="headless budget stop\n",
+            stdout = (
+                '{"type":"session.started","seq":0}\n'
+                '{"type":"session.completed","payload":{"status":"budget_exhausted",'
+                '"terminal":{"stopped":{"reason":{"turn_budget":{"max_turns":3}},'
+                '"usage":{"turns":3,"tool_calls":0,"cost_usd_micros":0,'
+                '"wall_time_ms":0},"checkpoint_id":"cp-1","resumable":true}}}}\n'
+            )
+            environment = SimpleNamespace(
+                exec=AsyncMock(
+                    return_value=SimpleNamespace(
+                        stdout=stdout,
+                        stderr="headless budget stop\n",
+                        return_code=4,
+                    )
                 )
             )
-            context = orca_agent.AgentContext()
 
-            asyncio.run(agent.run("finish the task", SimpleNamespace(), context))
+            with self.assertRaises(orca_agent.NonZeroAgentExitCodeError):
+                asyncio.run(
+                    agent.run("finish the task", environment, orca_agent.AgentContext())
+                )
 
             metadata = json.loads(
                 (Path(directory) / "execution_metadata.json").read_text(
@@ -173,21 +193,67 @@ class OrcaInstalledAgentTests(unittest.TestCase):
                 ],
                 3,
             )
+            # The trajectory must be on disk *before* the error propagates.
+            self.assertEqual(
+                (Path(directory) / "trajectory.jsonl").read_text(encoding="utf-8"),
+                stdout,
+            )
             self.assertTrue(metadata["trajectory_persisted"])
+            self.assertEqual(metadata["trajectory_bytes"], len(stdout))
             self.assertEqual(
                 (Path(directory) / "stderr.txt").read_text(encoding="utf-8"),
                 "headless budget stop\n",
             )
 
+    def test_run_recovers_the_stream_when_the_exec_result_is_discarded(self) -> None:
+        """A killed/timed-out exec has no ExecResult; the container copy remains."""
+        with tempfile.TemporaryDirectory() as directory:
+            agent = orca_agent.OrcaInstalledAgent()
+            agent.logs_dir = Path(directory)
+            on_disk = (
+                '{"type":"session.started","seq":0}\n'
+                '{"type":"session.completed","payload":{"status":"cancelled",'
+                '"terminal":{"cancelled":{}}}}\n'
+            )
+
+            async def download_file(source, destination):
+                self.assertEqual(source, "/tmp/orca-trajectory.jsonl")
+                Path(destination).write_text(on_disk, encoding="utf-8")
+
+            environment = SimpleNamespace(
+                exec=AsyncMock(side_effect=TimeoutError("agent timed out")),
+                download_file=AsyncMock(side_effect=download_file),
+            )
+
+            with self.assertRaises(TimeoutError):
+                asyncio.run(
+                    agent.run("finish the task", environment, orca_agent.AgentContext())
+                )
+
+            metadata = json.loads(
+                (Path(directory) / "execution_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                (Path(directory) / "trajectory.jsonl").read_text(encoding="utf-8"),
+                on_disk,
+            )
+            self.assertEqual(metadata["trajectory_bytes"], len(on_disk))
+            self.assertTrue(metadata["trajectory_persisted"])
+            self.assertEqual(metadata["terminal"]["status"], "cancelled")
+
     def test_run_persists_metadata_even_when_execution_raises(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent = orca_agent.OrcaInstalledAgent()
             agent.logs_dir = Path(directory)
-            agent.exec_as_agent = AsyncMock(side_effect=RuntimeError("agent crashed"))
+            environment = SimpleNamespace(
+                exec=AsyncMock(side_effect=RuntimeError("agent crashed"))
+            )
             context = orca_agent.AgentContext()
 
             with self.assertRaises(RuntimeError):
-                asyncio.run(agent.run("finish the task", SimpleNamespace(), context))
+                asyncio.run(agent.run("finish the task", environment, context))
 
             metadata = json.loads(
                 (Path(directory) / "execution_metadata.json").read_text(
@@ -196,7 +262,9 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             )
             self.assertEqual(metadata["exit_code"], None)
             self.assertIn("error", metadata)
-            self.assertTrue(metadata["trajectory_persisted"])
+            # No output was produced, so the flag must report the truth.
+            self.assertFalse(metadata["trajectory_persisted"])
+            self.assertEqual(metadata["trajectory_bytes"], 0)
             self.assertEqual(
                 (Path(directory) / "trajectory.jsonl").read_text(encoding="utf-8"),
                 "",
@@ -210,11 +278,10 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             agent.logs_dir = Path(directory)
             captured = {}
 
-            async def fake_exec(environment, command, env):
+            async def fake_exec(command, env):
                 captured["command"] = command
-                return SimpleNamespace(stdout="", stderr="")
+                return SimpleNamespace(stdout="", stderr="", return_code=0)
 
-            agent.exec_as_agent = fake_exec
             with patch.dict(
                 os.environ,
                 {"ORCA_MAX_TURNS": "5", "ORCA_MAX_COST_USD": "0.5"},
@@ -222,9 +289,9 @@ class OrcaInstalledAgentTests(unittest.TestCase):
                 importlib.reload(orca_agent)
                 agent_2 = orca_agent.OrcaInstalledAgent()
                 agent_2.logs_dir = Path(directory)
-                agent_2.exec_as_agent = fake_exec
+                environment = SimpleNamespace(exec=fake_exec)
                 asyncio.run(
-                    agent_2.run("finish the task", SimpleNamespace(), orca_agent.AgentContext())
+                    agent_2.run("finish the task", environment, orca_agent.AgentContext())
                 )
 
             self.assertIn("--max-turns 5", captured["command"])
