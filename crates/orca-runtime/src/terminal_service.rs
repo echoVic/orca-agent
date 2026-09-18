@@ -702,7 +702,12 @@ impl TerminalServiceState {
         max_output_bytes: usize,
         output_offset: Option<usize>,
     ) -> io::Result<TerminalServiceOutput> {
-        self.reap()?;
+        // Do not call reap() here: joining output reader threads and persisting
+        // task-registry records is slow enough to block the supervisor for
+        // hundreds of milliseconds, which causes poll_once() to blow past the
+        // caller's yield_time deadline.  The maintenance loop after each command
+        // already runs reap(), so completed-session bookkeeping happens in the
+        // background without delaying Poll responses.
         let (task_id, cursor, requested_terminal, effective_terminal, terminal) =
             if let Some(session) = self.sessions.get(session_id) {
                 (
