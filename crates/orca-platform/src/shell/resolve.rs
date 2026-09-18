@@ -316,13 +316,37 @@ fn absolute_existing_path(path: &Path) -> Option<PathBuf> {
     if !path.is_file() {
         return None;
     }
-    std::fs::canonicalize(path).ok().or_else(|| {
-        if path.is_absolute() {
-            Some(path.to_path_buf())
-        } else {
-            env::current_dir().ok().map(|cwd| cwd.join(path))
-        }
-    })
+    // Keep the path that was found instead of its canonical target. BusyBox-style multicall
+    // binaries pick their applet from argv[0], so canonicalising `/bin/sh` (a symlink to
+    // `/bin/busybox`) made every shell command run as `/bin/busybox -c …` and fail with
+    // `-c: applet not found` (exit 127) — issue #70. The kernel still resolves the symlink at
+    // exec time and argv[0] keeps the invoked name.
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod multicall_shell_tests {
+    use super::absolute_existing_path;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn symlinked_shell_keeps_its_invoked_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let multicall = dir.path().join("busybox");
+        std::fs::write(&multicall, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&multicall, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sh = dir.path().join("sh");
+        symlink(&multicall, &sh).unwrap();
+
+        // BusyBox decides its applet from argv[0]; resolving `/bin/sh` to `/bin/busybox`
+        // turned `-c` into an applet lookup (issue #70).
+        assert_eq!(absolute_existing_path(&sh), Some(sh.clone()));
+        assert_ne!(absolute_existing_path(&sh), Some(multicall));
+    }
 }
 
 #[cfg(all(test, not(windows)))]
