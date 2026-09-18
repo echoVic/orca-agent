@@ -162,12 +162,12 @@ pub fn resolve_prompt(
     mut stdin: impl Read,
 ) -> Result<String, String> {
     let force_stdin = prompt_args.len() == 1 && prompt_args[0] == "-";
-    let has_prompt = !prompt_args.is_empty() && !force_stdin;
-    let prompt = if has_prompt {
-        prompt_args.join(" ")
-    } else {
-        String::new()
-    };
+    let joined = prompt_args.join(" ");
+    // A whitespace-only argument is a caller error, not an instruction: treat it exactly
+    // like a missing prompt so the run fails fast (or falls back to stdin) instead of
+    // starting a billed turn whose user message is a placeholder.
+    let has_prompt = !prompt_args.is_empty() && !force_stdin && !joined.trim().is_empty();
+    let prompt = if has_prompt { joined } else { String::new() };
 
     if force_stdin || !has_prompt {
         if stdin_is_terminal {
@@ -271,6 +271,31 @@ mod tests {
         assert_eq!(
             resolve_prompt(Vec::new(), false, io::Cursor::new("from pipe")).unwrap(),
             "from pipe"
+        );
+    }
+
+    #[test]
+    fn rejects_whitespace_only_argument_prompt() {
+        assert_eq!(
+            resolve_prompt(vec!["   \n".into()], true, io::empty()).unwrap_err(),
+            "No prompt provided. Either specify one as an argument or pipe the prompt into stdin."
+        );
+    }
+
+    #[test]
+    fn whitespace_only_argument_falls_back_to_piped_stdin() {
+        assert_eq!(
+            resolve_prompt(vec![String::new()], false, io::Cursor::new("from pipe")).unwrap(),
+            "from pipe"
+        );
+    }
+
+    #[test]
+    fn preserves_argument_prompt_bytes_exactly() {
+        let prompt = "\n  indented opening line\nbody\n".to_string();
+        assert_eq!(
+            resolve_prompt(vec![prompt.clone()], true, io::empty()).unwrap(),
+            prompt
         );
     }
 
