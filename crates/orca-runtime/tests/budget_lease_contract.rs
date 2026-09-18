@@ -11,7 +11,7 @@
 
 use orca_core::approval_rules::PermissionRules;
 use orca_core::approval_types::ApprovalMode;
-use orca_core::budget::{BudgetSpec, BudgetUsage, StopReason};
+use orca_core::budget::{BudgetSpec, StopReason};
 use orca_core::config::{
     HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName, ToolConfig,
     WorkflowConfig,
@@ -273,7 +273,13 @@ fn budget_lease_reports_usage_and_spec() {
             ..BudgetSpec::default()
         })
         .expect("child lease");
-    assert_eq!(lease.usage(), BudgetUsage::default());
+    // wall_time_ms is elapsed since lease creation and is inherently
+    // timing-dependent (1 ms on slower runners); assert the deterministic
+    // counters instead of a full-struct equality with default().
+    let initial = lease.usage();
+    assert_eq!(initial.turns, 0);
+    assert_eq!(initial.tool_calls, 0);
+    assert_eq!(initial.cost_usd_micros, 0);
     lease.admit_turn().expect("turn 1");
     lease.admit_tool_call().expect("tool 1");
     let usage = lease.usage();
