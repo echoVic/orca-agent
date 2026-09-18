@@ -77,9 +77,14 @@ pub(super) fn settings_startup_warnings(
     base_config: &RunConfig,
     settings: &crate::surface::SurfaceRuntimeSettings,
 ) -> Vec<String> {
-    crate::shell_readiness::ShellReadiness::for_surface_settings(base_config, settings)
+    let mut config = base_config.clone();
+    config.cwd = Some(settings.cwd.as_path().to_path_buf());
+    let readiness =
+        crate::shell_readiness::ShellReadiness::for_surface_settings(base_config, settings);
+    readiness
         .startup_warning()
         .into_iter()
+        .chain(crate::shell_readiness::ShellReadiness::untrusted_workspace_warning(&config))
         .collect()
 }
 pub(crate) const ORCA_ACP_INTERACTION_CAPABILITIES_META_KEY: &str =

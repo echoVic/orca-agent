@@ -5522,12 +5522,9 @@ async fn run_host_supervisor(
                         continue;
                     }
                 }
-                if let Some(warning) =
-                    crate::shell_readiness::ShellReadiness::for_config(&actor_config)
-                        .startup_warning()
-                {
-                    startup_warnings.push(warning);
-                }
+                startup_warnings.extend(
+                    crate::shell_readiness::ShellReadiness::run_startup_warnings(&actor_config),
+                );
                 let startup_warnings = Arc::new(startup_warnings);
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
@@ -17003,6 +17000,17 @@ impl ThreadActor {
         }
     }
 
+    /// Seal the resident surface hub so no new attachments can observe a live
+    /// pre-close snapshot. Idempotent: calling it again is a no-op. Called both
+    /// before delivering `ThreadShutdownAck::Complete` (so a caller observing
+    /// shutdown completion cannot race a fresh attach) and as a post-loop safety
+    /// net for break paths that never send an ack.
+    fn seal_resident_surface(&self, reason: surface::SurfaceSubscriptionSealReason) {
+        if let Some(resident) = self.resident_surface.0.as_ref() {
+            resident.hub.seal_subscriptions(reason);
+        }
+    }
+
     async fn run(
         mut self,
         mut command_rx: tokio_mpsc::Receiver<ThreadCommand>,
@@ -17290,6 +17298,15 @@ impl ThreadActor {
                                     Ok(()) => ThreadShutdownAck::Complete,
                                     Err(error) => ThreadShutdownAck::Failed(error),
                                 };
+                                if matches!(ack, ThreadShutdownAck::Complete) {
+                                    // Seal the surface hub *before* delivering the ack so a
+                                    // caller that observes shutdown completion immediately cannot
+                                    // race a fresh attachment that still reads the pre-close
+                                    // snapshot. Without this, `shutdown()` can return while the
+                                    // hub still reports `ready`, and a subsequent `read_snapshot`
+                                    // attaches successfully instead of failing closed.
+                                    self.seal_resident_surface(subscription_seal_reason);
+                                }
                                 let _ = reply.send(ack);
                             }
                             break;
@@ -17483,6 +17500,9 @@ impl ThreadActor {
                                         Ok(()) => ThreadShutdownAck::Complete,
                                         Err(error) => ThreadShutdownAck::Failed(error),
                                     };
+                                    if matches!(ack, ThreadShutdownAck::Complete) {
+                                        self.seal_resident_surface(subscription_seal_reason);
+                                    }
                                     let _ = reply.send(ack);
                                 }
                                 break;
@@ -17571,6 +17591,9 @@ impl ThreadActor {
                                     Ok(()) => ThreadShutdownAck::Complete,
                                     Err(error) => ThreadShutdownAck::Failed(error),
                                 };
+                                if matches!(ack, ThreadShutdownAck::Complete) {
+                                    self.seal_resident_surface(subscription_seal_reason);
+                                }
                                 let _ = reply.send(ack);
                             }
                             break;
@@ -17626,9 +17649,7 @@ impl ThreadActor {
                 }
             }
         }
-        if let Some(resident) = self.resident_surface.0.as_ref() {
-            resident.hub.seal_subscriptions(subscription_seal_reason);
-        }
+        self.seal_resident_surface(subscription_seal_reason);
         if let Some(state) = self.state.as_ref() {
             state
                 .thread
@@ -21996,11 +22017,13 @@ fn run_headless_session(
     let cwd = cwd_path.display().to_string();
     let mut sink = EventSink::new(writer, config.output_format)
         .with_optional_observer(request.event_observer());
+    let startup_warnings = crate::shell_readiness::ShellReadiness::run_startup_warnings(config);
     sink.emit(events.session_started(
         &cwd,
         config.approval_mode.as_str(),
         config.provider.as_str(),
         config.verifier.as_deref(),
+        &startup_warnings,
     ))?;
     if let Err(error) = thread.session().hooks().run(
         HookEvent::SessionStart,
@@ -23532,10 +23555,35 @@ mod tests {
             );
             let _ = start_tx.send(result);
         });
-        let started_thread = start_rx
-            .recv_timeout(Duration::from_millis(250))
-            .expect("blocked session listing stalled the host supervisor")
-            .expect("unrelated runtime thread failed to start");
+        // Wait for the concurrently started thread on a hard deadline rather
+        // than a tight wall-clock budget. Session listing is already offloaded
+        // to a blocking pool (`dispatch_host_store` -> `spawn_blocking`) and
+        // skips non-regular entries via dirent d_type, so it cannot block the
+        // host supervisor's control loop; the warm start_thread round-trip
+        // (command -> spawn_blocking prepare -> PreparedThreadStart -> reply)
+        // completes in ~100ms. On a cold or loaded CI runner that round-trip
+        // can exceed 250ms due to runtime/SQLite spin-up and CPU contention,
+        // which turned the old fixed 250ms budget into an intermittent
+        // failure. A genuine supervisor block (the regression this guards
+        // against) never replies, so the deadline still fails loudly instead
+        // of flaking on scheduling jitter.
+        const SUPERVISOR_RESPONSIVE_START_BUDGET: Duration = Duration::from_secs(5);
+        let start_deadline = Instant::now() + SUPERVISOR_RESPONSIVE_START_BUDGET;
+        let started_thread = loop {
+            let Some(remaining) = start_deadline.checked_duration_since(Instant::now())
+            else {
+                panic!("blocked session listing stalled the host supervisor");
+            };
+            match start_rx.recv_timeout(remaining) {
+                Ok(result) => {
+                    break result.expect("unrelated runtime thread failed to start");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("unrelated runtime thread failed to start");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        };
         let started_thread_id = started_thread.thread_id().to_string();
 
         let page = list_rx

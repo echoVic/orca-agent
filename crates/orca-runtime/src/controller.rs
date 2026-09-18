@@ -1416,8 +1416,13 @@ fn run_inner<W: io::Write>(
     let thread = host
         .start_thread_with_request(start_request)
         .map_err(runtime_host_io_error)?;
-    for error in thread.startup_warnings() {
-        eprintln!("orca: warning: {error}");
+    // Machine consumers of `--output-format jsonl` treat a non-empty stderr as
+    // a failed run, so the warnings travel in `session.started.warnings` there
+    // (the ACP surface surfaces the same list). Text mode keeps them on stderr.
+    if config.output_format != OutputFormat::Jsonl {
+        for error in thread.startup_warnings() {
+            eprintln!("orca: warning: {error}");
+        }
     }
     let mut headless = thread.attach_headless_surface(transport.is_some())?;
     let (relay_tx, relay_rx) = mpsc::sync_channel(HOSTED_EVENT_RELAY_CAPACITY);
