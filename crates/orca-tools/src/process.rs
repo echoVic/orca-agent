@@ -1046,19 +1046,6 @@ pub fn kill_child_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// Force-kill a process tree immediately, skipping the graceful SIGTERM grace.
-///
-/// This is for user-initiated cancellation: promptness matters more than
-/// letting a shell forward the signal to its children or run an exit trap.
-/// A non-interactive shell waiting on a foreground child does not act on
-/// SIGTERM until that child finishes, so the graceful path can wait out the
-/// whole child lifetime; SIGKILL to the group ends the tree right away.
-pub fn kill_child_tree_immediate(child: &mut Child) {
-    #[cfg(unix)]
-    kill_process_group_immediate(child);
-    let _ = child.kill();
-}
-
 fn kill_process_group_by_pid(child: &mut Child) {
     #[cfg(unix)]
     kill_process_group(child);
@@ -1101,20 +1088,6 @@ fn kill_process_group(child: &mut Child) {
             Err(_) => break,
         }
     }
-    unsafe {
-        let _ = kill(pgid, SIGKILL);
-    }
-}
-
-/// SIGKILL the whole process group with no graceful grace. Used by
-/// cancellation paths that must end the tree immediately.
-#[cfg(unix)]
-fn kill_process_group_immediate(child: &mut Child) {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    const SIGKILL: i32 = 9;
-    let pgid = -(child.id() as i32);
     unsafe {
         let _ = kill(pgid, SIGKILL);
     }
