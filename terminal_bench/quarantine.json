@@ -1,0 +1,21 @@
+{
+  "quarantined": [
+    {
+      "task": "terminal-bench/qemu-startup",
+      "issue": "65",
+      "reason": "Unscorable: the task image's pinned Debian bullseye-security packages have been superseded, so the verifier's own `apt-get install` 404s and /tests/test.sh aborts before it can score. The agent phase completes normally, but the trial is recorded as a 0.",
+      "evidence": [
+        "jobs/regression-20260916/qemu-startup__fLTBLJS/verifier/test-stdout.txt",
+        "jobs/regression-20260916/qemu-startup__fLTBLJS/verifier/reward.txt"
+      ],
+      "detail": [
+        "Err:2 http://deb.debian.org/debian-security bullseye-security/main amd64 libnghttp2-14 ... 404 Not Found",
+        "Err:5 http://deb.debian.org/debian-security bullseye-security/main amd64 libcurl4 ... 404 Not Found",
+        "/tests/test.sh: line 8: curl: command not found",
+        "/tests/test.sh: line 19: uvx: command not found"
+      ],
+      "added": "2026-09-17",
+      "upstream": "terminal-bench-2 dataset defect (task image), not an Orca defect; the adapter's own package step cannot repair a task's test.sh"
+    }
+  ]
+}

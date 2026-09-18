@@ -92,3 +92,27 @@ The installed adapter writes Orca's raw JSONL output to the trial's
 `agent/trajectory.jsonl` artifact for `harbor analyze` and `harbor view`.
 Command output is not assigned to `AgentContext`: Harbor 0.20.0 does not define
 an `output` field, and adding one aborts the trial before verifier execution.
+
+## Quarantined tasks
+
+Some dataset tasks cannot be scored no matter what the agent does, so they are excluded
+from reported means instead of silently entering the score as a 0. The list lives in
+[`quarantine.json`](quarantine.json); each entry records the task, the reason, and the
+evidence path.
+
+| Task | Why |
+|------|-----|
+| `terminal-bench/qemu-startup` | The task image's pinned Debian `bullseye-security` packages (`libcurl4`, `libnghttp2-14`) have been superseded, so the verifier's own `apt-get install` 404s and `/tests/test.sh` aborts (`curl: command not found`, `uvx: command not found`) before it can score. See `jobs/regression-20260916/qemu-startup__fLTBLJS/verifier/test-stdout.txt`. |
+
+Exclude quarantined tasks from a run with Harbor's own filter:
+
+```bash
+harbor run -d "terminal-bench/terminal-bench-2" \
+  --agent "terminal_bench.orca_agent:OrcaInstalledAgent" \
+  --exclude-task-name "terminal-bench/qemu-startup" \
+  --mounts '[{"type":"bind","source":"'"$(pwd)"'/target/x86_64-unknown-linux-musl/release","target":"/mnt/orca-bin","read_only":true}]'
+```
+
+This is an upstream `terminal-bench-2` image defect, not an Orca one: the adapter's own
+package step cannot repair a task's `test.sh`, and the image re-installs unconditionally.
+Remove an entry once the dataset pins a working image.

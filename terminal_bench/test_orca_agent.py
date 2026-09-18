@@ -274,6 +274,24 @@ class OrcaInstalledAgentTests(unittest.TestCase):
         self.assertNotIn("--filter-difficulty", readme)
         self.assertIn("--include-task-name", readme)
 
+    def test_quarantine_list_is_documented_and_usable(self) -> None:
+        directory = Path(__file__).parent
+        quarantine = json.loads(
+            (directory / "quarantine.json").read_text(encoding="utf-8")
+        )
+        entries = quarantine["quarantined"]
+        self.assertTrue(entries, "the quarantine list must not be empty")
+
+        readme = (directory / "README.md").read_text(encoding="utf-8")
+        for entry in entries:
+            # Each entry must carry a reason and the evidence a reader can check.
+            self.assertTrue(entry["task"].startswith("terminal-bench/"))
+            self.assertTrue(entry["reason"])
+            self.assertTrue(entry["evidence"])
+            # ... and be listed in the README with the exclusion flag to use.
+            self.assertIn(entry["task"], readme)
+        self.assertIn("--exclude-task-name", readme)
+
 
 if __name__ == "__main__":
     unittest.main()
