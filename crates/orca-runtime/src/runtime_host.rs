@@ -23527,10 +23527,35 @@ mod tests {
             );
             let _ = start_tx.send(result);
         });
-        let started_thread = start_rx
-            .recv_timeout(Duration::from_millis(250))
-            .expect("blocked session listing stalled the host supervisor")
-            .expect("unrelated runtime thread failed to start");
+        // Wait for the concurrently started thread on a hard deadline rather
+        // than a tight wall-clock budget. Session listing is already offloaded
+        // to a blocking pool (`dispatch_host_store` -> `spawn_blocking`) and
+        // skips non-regular entries via dirent d_type, so it cannot block the
+        // host supervisor's control loop; the warm start_thread round-trip
+        // (command -> spawn_blocking prepare -> PreparedThreadStart -> reply)
+        // completes in ~100ms. On a cold or loaded CI runner that round-trip
+        // can exceed 250ms due to runtime/SQLite spin-up and CPU contention,
+        // which turned the old fixed 250ms budget into an intermittent
+        // failure. A genuine supervisor block (the regression this guards
+        // against) never replies, so the deadline still fails loudly instead
+        // of flaking on scheduling jitter.
+        const SUPERVISOR_RESPONSIVE_START_BUDGET: Duration = Duration::from_secs(5);
+        let start_deadline = Instant::now() + SUPERVISOR_RESPONSIVE_START_BUDGET;
+        let started_thread = loop {
+            let Some(remaining) = start_deadline.checked_duration_since(Instant::now())
+            else {
+                panic!("blocked session listing stalled the host supervisor");
+            };
+            match start_rx.recv_timeout(remaining) {
+                Ok(result) => {
+                    break result.expect("unrelated runtime thread failed to start");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("unrelated runtime thread failed to start");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        };
         let started_thread_id = started_thread.thread_id().to_string();
 
         let page = list_rx
