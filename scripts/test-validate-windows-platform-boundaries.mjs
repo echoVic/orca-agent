@@ -737,6 +737,12 @@ for (const [job, label] of [
 ]) {
   const runnerBuild = "cargo build -p orca-windows-runner --locked";
   const fullSuite = "cargo nextest run --workspace --all-targets --locked";
+  const resourceSensitiveFilter =
+    "binary(=task_output_store) | binary(=subagent_recovery_contract) | binary(=subagent_contract) | binary(=session_server_contract) | test(/^acp::supervisor::tests::/)";
+  const resourceSensitiveGate =
+    `cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0 -E '${resourceSensitiveFilter}'`;
+  const remainingSuiteGate =
+    `cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0 -E 'not (${resourceSensitiveFilter})'`;
   assert.ok(
     job.includes(runnerBuild),
     `Windows ${label} CI must materialize the async-worker runner before integration tests`,
@@ -744,6 +750,18 @@ for (const [job, label] of [
   assert.ok(
     job.indexOf(runnerBuild) < job.indexOf(fullSuite),
     `Windows ${label} CI must build the runner before the full test suite`,
+  );
+  assert.ok(
+    job.includes(resourceSensitiveGate),
+    `Windows ${label} CI must run process- and persistence-heavy contracts in an isolated gate`,
+  );
+  assert.ok(
+    job.includes(remainingSuiteGate),
+    `Windows ${label} CI must exclude the serial contracts from the remaining parallel suite`,
+  );
+  assert.ok(
+    job.indexOf(resourceSensitiveGate) < job.indexOf(remainingSuiteGate),
+    `Windows ${label} CI must settle resource-sensitive contracts before the remaining suite`,
   );
 }
 const nextestConfig = readFileSync(
