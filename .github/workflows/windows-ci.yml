@@ -108,6 +108,13 @@ jobs:
           cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
       - name: Build the Windows async subagent runner
         run: cargo build -p orca-windows-runner --locked
+      - name: Run resource-sensitive Windows contracts
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0 -E 'binary(=task_output_store) | binary(=subagent_recovery_contract) | binary(=subagent_contract) | binary(=session_server_contract) | test(/^acp::supervisor::tests::/)'
       - name: Run the full Windows test suite
         timeout-minutes: 75
         env:
@@ -117,7 +124,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0
           cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass --retries 0
-          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0 -E 'not (binary(=task_output_store) | binary(=subagent_recovery_contract) | binary(=subagent_contract) | binary(=session_server_contract) | test(/^acp::supervisor::tests::/))'
 
   native-arm64:
     runs-on: windows-11-arm
@@ -177,6 +184,13 @@ jobs:
           cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
       - name: Build the native ARM64 async subagent runner
         run: cargo build -p orca-windows-runner --locked
+      - name: Run resource-sensitive native ARM64 contracts
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0 -E 'binary(=task_output_store) | binary(=subagent_recovery_contract) | binary(=subagent_contract) | binary(=session_server_contract) | test(/^acp::supervisor::tests::/)'
       - name: Run the full native ARM64 test suite
         timeout-minutes: 75
         env:
@@ -186,4 +200,4 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0
           cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass --retries 0
-          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0 -E 'not (binary(=task_output_store) | binary(=subagent_recovery_contract) | binary(=subagent_contract) | binary(=session_server_contract) | test(/^acp::supervisor::tests::/))'
