@@ -223,7 +223,7 @@ impl ThreadOperationExecutor for ToolApprovalExecutor {
         turn_request
             .provider_response_ingress()
             .expect("typed generation installs provider response ingress")
-            .commit_response(&provider_response_for_tool(
+            .commit_response(&mut provider_response_for_tool(
                 &tool,
                 request.turn_id().clone(),
             ))?;
@@ -262,7 +262,7 @@ impl ThreadOperationExecutor for ToolCompletionExecutor {
         let ingress = turn_request
             .provider_response_ingress()
             .expect("typed generation installs semantic ingress");
-        ingress.commit_response(&provider_response_for_tool(
+        ingress.commit_response(&mut provider_response_for_tool(
             &tool,
             request.turn_id().clone(),
         ))?;
@@ -291,7 +291,7 @@ impl ThreadOperationExecutor for FailedToolCompletionExecutor {
         let ingress = turn_request
             .provider_response_ingress()
             .expect("typed generation installs semantic ingress");
-        ingress.commit_response(&provider_response_for_tool(
+        ingress.commit_response(&mut provider_response_for_tool(
             &tool,
             request.turn_id().clone(),
         ))?;
@@ -320,7 +320,7 @@ impl ThreadOperationExecutor for WrongToolCompletionExecutor {
         let ingress = turn_request
             .provider_response_ingress()
             .expect("typed generation installs semantic ingress");
-        ingress.commit_response(&provider_response_for_tool(
+        ingress.commit_response(&mut provider_response_for_tool(
             &tool,
             request.turn_id().clone(),
         ))?;
@@ -356,7 +356,7 @@ impl ThreadOperationExecutor for NonShellToolCompletionExecutor {
         let ingress = turn_request
             .provider_response_ingress()
             .expect("typed generation installs semantic ingress");
-        ingress.commit_response(&provider_response_for_tool(
+        ingress.commit_response(&mut provider_response_for_tool(
             &tool,
             request.turn_id().clone(),
         ))?;
@@ -396,7 +396,7 @@ impl ThreadOperationExecutor for ReadonlyBatchCompletionExecutor {
         let ingress = turn_request
             .provider_response_ingress()
             .expect("typed generation installs semantic ingress");
-        ingress.commit_response(&provider_response_for_tools(
+        ingress.commit_response(&mut provider_response_for_tools(
             &requests,
             request.turn_id().clone(),
         ))?;
@@ -431,7 +431,7 @@ impl ThreadOperationExecutor for AssistantStreamingExecutor {
             ProviderStep::ReasoningDelta("nk".to_string()),
         ];
         ingress.commit_provider_steps(&identity, &steps)?;
-        ingress.commit_response(&RuntimeModelResponse::from_parts(
+        ingress.commit_response(&mut RuntimeModelResponse::from_parts(
             ProviderResponse {
                 steps: Vec::new(),
                 assistant_content: Some("hello".to_string()),
@@ -469,7 +469,7 @@ impl ThreadOperationExecutor for RecoveredAssistantStreamingExecutor {
             &identity,
             &ProviderStep::MessageDelta("recovered".to_string()),
         )?;
-        ingress.commit_response(&RuntimeModelResponse::from_parts(
+        ingress.commit_response(&mut RuntimeModelResponse::from_parts(
             ProviderResponse {
                 steps: Vec::new(),
                 assistant_content: Some("recovered".to_string()),
@@ -553,7 +553,7 @@ impl ThreadOperationExecutor for PermissionExecutor {
         turn_request
             .provider_response_ingress()
             .expect("typed generation installs provider response ingress")
-            .commit_response(&provider_response_for_tool(
+            .commit_response(&mut provider_response_for_tool(
                 &tool,
                 request.turn_id().clone(),
             ))?;
@@ -594,7 +594,7 @@ impl ThreadOperationExecutor for NetworkPermissionExecutor {
         turn_request
             .provider_response_ingress()
             .expect("typed generation installs provider response ingress")
-            .commit_response(&provider_response_for_tool(
+            .commit_response(&mut provider_response_for_tool(
                 &tool,
                 request.turn_id().clone(),
             ))?;
@@ -639,7 +639,7 @@ impl ThreadOperationExecutor for BlockingResolvedToolApprovalExecutor {
         turn_request
             .provider_response_ingress()
             .unwrap()
-            .commit_response(&provider_response_for_tool(
+            .commit_response(&mut provider_response_for_tool(
                 &tool,
                 request.turn_id().clone(),
             ))?;
@@ -678,7 +678,7 @@ impl ThreadOperationExecutor for BlockingResolvedPermissionExecutor {
         turn_request
             .provider_response_ingress()
             .unwrap()
-            .commit_response(&provider_response_for_tool(
+            .commit_response(&mut provider_response_for_tool(
                 &tool,
                 request.turn_id().clone(),
             ))?;

@@ -311,21 +311,65 @@ fn bwrap_path(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn find_bwrap_on_path(path_var: &OsStr, cwd: &Path) -> Option<PathBuf> {
-    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     std::env::split_paths(path_var).find_map(|dir| {
         let candidate = if dir.is_absolute() {
             dir.join("bwrap")
         } else {
-            cwd.join(dir).join("bwrap")
+            cwd.join(&dir).join("bwrap")
         };
         let absolute = candidate
             .canonicalize()
             .unwrap_or_else(|_| candidate.clone());
-        if candidate.starts_with(cwd) || absolute.starts_with(&canonical_cwd) {
+        if workspace_can_shadow_bwrap(cwd, &dir, &candidate, &absolute) {
             return None;
         }
         is_executable_file(&absolute).then_some(absolute)
     })
+}
+
+/// Directories that belong to the system rather than to the workspace: a `bwrap` found here is
+/// installed, so the workspace cannot have supplied it.
+const SYSTEM_BINARY_DIRS: &[&str] = &["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin"];
+
+fn is_system_binary_dir(dir: &Path) -> bool {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    SYSTEM_BINARY_DIRS
+        .iter()
+        .any(|system| Path::new(system) == canonical)
+}
+
+/// True when the candidate could have been supplied by the workspace itself.
+///
+/// A raw ancestry test against `cwd` also rejects installed binaries whenever `cwd` is an
+/// ancestor of theirs: with `cwd = "/"` — the default working directory of many containers and
+/// CI jobs — every absolute path is "inside" the workspace, so `bwrap` was never probed and
+/// `orca doctor` blamed a missing backend (issue #69). System binary directories are trusted,
+/// and a filesystem root carries no ancestry information at all.
+fn workspace_can_shadow_bwrap(
+    cwd: &Path,
+    path_dir: &Path,
+    candidate: &Path,
+    absolute: &Path,
+) -> bool {
+    if is_system_binary_dir(path_dir) {
+        return false;
+    }
+    if cwd.parent().is_none() {
+        return false;
+    }
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    candidate.starts_with(cwd) || absolute.starts_with(&canonical_cwd)
+}
+
+/// Make a test fixture executable. Unix file modes are the only way to do it,
+/// and the platform-operation inventory counts every direct Unix API use in
+/// this file, so keep exactly one of them here.
+#[cfg(all(test, unix))]
+fn make_executable_fixture(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[cfg(unix)]
@@ -761,15 +805,10 @@ mod tests {
         let external = tempfile::tempdir().unwrap();
         for dir in [workspace.path(), external.path()] {
             let binary = dir.join("bwrap");
-            std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-
-                let mut permissions = binary.metadata().unwrap().permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(binary, permissions).unwrap();
-            }
+            make_executable_fixture(&binary);
+            #[cfg(not(unix))]
+            std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
         }
         let path = std::env::join_paths([workspace.path(), external.path()]).unwrap();
 
@@ -777,6 +816,51 @@ mod tests {
             find_bwrap_on_path(&path, workspace.path()),
             Some(external.path().join("bwrap").canonicalize().unwrap())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_at_the_filesystem_root_does_not_hide_an_installed_bwrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bwrap = bin.join("bwrap");
+        make_executable_fixture(&bwrap);
+        let path_var = OsStr::new(bin.as_os_str());
+
+        // cwd == "/" used to reject every candidate because every path starts with it.
+        let resolved = find_bwrap_on_path(path_var, Path::new("/"))
+            .expect("an installed bwrap must still be found when cwd is the filesystem root");
+        assert_eq!(resolved.file_name().unwrap(), "bwrap");
+        assert_eq!(
+            resolved,
+            bwrap.canonicalize().unwrap_or(bwrap),
+            "the resolved path is the discovered executable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_supplied_bwrap_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("project");
+        let bin = workspace.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bwrap = bin.join("bwrap");
+        make_executable_fixture(&bwrap);
+
+        assert_eq!(
+            find_bwrap_on_path(OsStr::new(bin.as_os_str()), &workspace),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_directories_are_recognized() {
+        assert!(is_system_binary_dir(Path::new("/usr/bin")));
+        assert!(is_system_binary_dir(Path::new("/bin")));
+        assert!(!is_system_binary_dir(Path::new("/tmp/somewhere")));
     }
 
     #[test]

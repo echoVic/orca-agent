@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub use command::CommandSpec;
-pub use resolve::{ShellResolver, resolve_program};
+pub use resolve::{ShellResolver, resolve_program, resolve_program_in};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PowerShellEdition {

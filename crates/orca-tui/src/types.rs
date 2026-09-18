@@ -1,5 +1,7 @@
 use crossbeam_channel as mpsc;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+#[cfg(any(test, debug_assertions))]
+use std::collections::HashMap;
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

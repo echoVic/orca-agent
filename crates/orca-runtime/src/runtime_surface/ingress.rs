@@ -118,7 +118,7 @@ pub trait RuntimeSubagentActivityIngress: Send + Sync + std::fmt::Debug {
 }
 
 pub trait RuntimeProviderResponseIngress: Send + Sync + std::fmt::Debug {
-    fn commit_response(&self, response: &RuntimeModelResponse) -> io::Result<()>;
+    fn commit_response(&self, response: &mut RuntimeModelResponse) -> io::Result<()>;
     fn commit_provider_attempt_failure(
         &self,
         _identity: &ModelResponseIdentity,

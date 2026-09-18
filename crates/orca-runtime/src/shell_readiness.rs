@@ -114,6 +114,42 @@ impl ShellReadiness {
         Some(format!("{detail}. {remediation}"))
     }
 
+    /// Warn when the workspace has no trust decision and the effective default profile is
+    /// therefore read-only. Without this the only symptom is the shell's own
+    /// `Read-only file system`, which reads like a permission bug rather than a missing trust
+    /// decision (issue #73).
+    /// Every start-up warning that can be derived from the run config, in the order they are
+    /// shown. Used both for the session handle and for the headless `session.started` payload,
+    /// so the stream and the terminal agree.
+    pub(crate) fn run_startup_warnings(config: &RunConfig) -> Vec<String> {
+        Self::for_config(config)
+            .startup_warning()
+            .into_iter()
+            .chain(Self::untrusted_workspace_warning(config))
+            .collect()
+    }
+
+    pub(crate) fn untrusted_workspace_warning(config: &RunConfig) -> Option<String> {
+        let cwd = config
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if orca_core::config::folder_trust::is_trusted(&cwd) {
+            return None;
+        }
+        let sandbox = crate::server::bash_sandbox_for_cwd(config, &cwd).ok()?;
+        if !matches!(sandbox.mode, ShellSandboxMode::ReadOnly { .. }) {
+            return None;
+        }
+        Some(format!(
+            "Workspace {} is untrusted: shell commands run sandboxed read-only, so writes fail \
+             with `Read-only file system`. Run `orca trust add --cwd {}` (after reviewing the \
+             folder) to allow changes, or select a trusted-host permission profile.",
+            cwd.display(),
+            cwd.display()
+        ))
+    }
+
     pub(crate) fn startup_warning(&self) -> Option<String> {
         self.failure_message().map(|reason| {
             format!(

@@ -306,7 +306,7 @@ impl ThreadOperationExecutor for AcpTestExecutor {
             TestBehavior::EmitMessageAndComplete { message } => {
                 let turn_request = request.thread_turn_request(generation);
                 if let Some(ingress) = turn_request.provider_response_ingress() {
-                    ingress.commit_response(&RuntimeModelResponse::new(
+                    ingress.commit_response(&mut RuntimeModelResponse::new(
                         ProviderResponse {
                             steps: Vec::new(),
                             assistant_content: Some(message),

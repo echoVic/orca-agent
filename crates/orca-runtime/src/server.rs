@@ -401,6 +401,20 @@ pub fn run(config: ServerConfig) -> i32 {
     }
 }
 
+/// Errors that mean the client connection itself is gone; everything else is a
+/// request-scoped failure and must be reported without closing the server.
+fn is_connection_failure(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::WriteZero
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn run_with_io<R: BufRead, W: Write + Send + 'static>(
     config: ServerConfig,
     mut reader: R,
@@ -427,10 +441,25 @@ fn run_with_io<R: BufRead, W: Write + Send + 'static>(
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 if let Err(error) = handle_line(&config, &mut state, trimmed, Arc::clone(&writer)) {
-                    close_trigger = JsonlSupervisorCloseTrigger::Io(
-                        JsonlSupervisorIoFailure::WriteFailed(error.to_string()),
-                    );
-                    return Err(error);
+                    if is_connection_failure(&error) {
+                        close_trigger = JsonlSupervisorCloseTrigger::Io(
+                            JsonlSupervisorIoFailure::WriteFailed(error.to_string()),
+                        );
+                        return Err(error);
+                    }
+                    // A request that failed must answer that request and leave the
+                    // connection (and every other thread on it) alive: one bad line used to
+                    // terminate the whole server, including unrelated in-flight turns.
+                    let request_id = serde_json::from_str::<Value>(trimmed)
+                        .ok()
+                        .and_then(|value| value.get("id").cloned())
+                        .unwrap_or(Value::Null);
+                    let mut writer = writer.lock().map_err(lock_error)?;
+                    protocol::write_server_event(
+                        &mut *writer,
+                        &request_id,
+                        ServerEvent::error(error.to_string()),
+                    )?;
                 }
             }
             line.clear();
@@ -2425,7 +2454,13 @@ fn run_thread_resume<W: Write>(
             &id,
             ServerEvent::error(format!("unknown thread: {thread_id}")),
         ),
-        Err(error) => Err(error),
+        // Resuming a session that cannot be started (missing, archived, malformed) is a
+        // per-request condition: answer this client and keep serving the other threads.
+        Err(error) => protocol::write_server_event(
+            writer,
+            &id,
+            ServerEvent::error(format!("failed to resume thread {thread_id}: {error}")),
+        ),
     }
 }
 

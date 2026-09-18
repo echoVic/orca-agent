@@ -202,23 +202,42 @@ fn find_saved_workflow_in(
     user_workflow_dir: &Path,
     config_dir: Option<&Path>,
 ) -> io::Result<PathBuf> {
+    let mut untrusted: Option<PathBuf> = None;
     for ancestor in cwd.ancestors() {
         let candidate = ancestor
             .join(".orca")
             .join("workflows")
             .join(format!("{name}.js"));
-        if candidate.exists()
-            && config_dir.is_some_and(|config_dir| {
-                orca_core::config::folder_trust::is_trusted_with_config_dir(ancestor, config_dir)
-            })
-        {
+        if !candidate.exists() {
+            continue;
+        }
+        if config_dir.is_some_and(|config_dir| {
+            orca_core::config::folder_trust::is_trusted_with_config_dir(ancestor, config_dir)
+        }) {
             return Ok(candidate);
         }
+        // Remember it: a workflow that exists but is gated is a trust problem, not a typo.
+        untrusted.get_or_insert_with(|| candidate.clone());
     }
 
     let user_candidate = user_workflow_dir.join(format!("{name}.js"));
     if user_candidate.exists() {
         return Ok(user_candidate);
+    }
+
+    if let Some(path) = untrusted {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "workflow script `{name}` exists at {} but that workspace is not trusted \
+                 (run `orca trust add --cwd {}`)",
+                path.display(),
+                path.parent()
+                    .and_then(|workflows| workflows.parent())
+                    .map(|workspace| workspace.display().to_string())
+                    .unwrap_or_else(|| path.display().to_string())
+            ),
+        ));
     }
 
     Err(io::Error::new(
@@ -1203,6 +1222,35 @@ mod tests {
             )
             .unwrap(),
             project_script
+        );
+    }
+
+    #[test]
+    fn untrusted_project_workflow_explains_the_trust_gate() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_workflows = project.path().join(".orca/workflows");
+        std::fs::create_dir_all(&project_workflows).unwrap();
+        let project_script = project_workflows.join("audit.js");
+        std::fs::write(&project_script, "project").unwrap();
+        // No user-level workflow: the project one is the only candidate and it is gated.
+        let user_workflows = home.path().join("workflows");
+
+        let error = find_saved_workflow_with_config_dir(
+            project.path(),
+            "audit",
+            &user_workflows,
+            home.path(),
+        )
+        .expect_err("an untrusted project workflow must not resolve");
+        let message = error.to_string();
+        assert!(
+            message.contains("is not trusted") && message.contains("orca trust add"),
+            "unhelpful error: {message}"
+        );
+        assert!(
+            message.contains(&project.path().display().to_string()),
+            "error should name the workspace: {message}"
         );
     }
 }

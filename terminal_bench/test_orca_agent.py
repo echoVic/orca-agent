@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import sys
 import tempfile
 import types
@@ -73,6 +74,49 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             capture_output=True,
             check=True,
             text=True,
+        )
+
+    def test_install_copies_the_binary_before_the_optional_packages(self) -> None:
+        agent = orca_agent.OrcaInstalledAgent()
+        agent.exec_as_root = AsyncMock(
+            return_value=SimpleNamespace(stdout="", stderr="", return_code=0)
+        )
+
+        asyncio.run(agent.install(SimpleNamespace()))
+
+        first, second = agent.exec_as_root.await_args_list
+        copy_command = first.kwargs["command"]
+        package_command = second.kwargs["command"]
+
+        # The binary is in place before anything can block on the network.
+        self.assertIn("cp /mnt/orca-bin/orca /usr/local/bin/orca", copy_command)
+        self.assertNotIn("apt-get", copy_command)
+
+        # The package step never fails the trial and never runs when unneeded.
+        self.assertIn("command -v git", package_command)
+        self.assertIn("command -v rg", package_command)
+        self.assertIn("Acquire::Retries=5", package_command)
+        self.assertIn("--no-install-recommends", package_command)
+        self.assertIn("|| echo", package_command)
+        self.assertTrue(package_command.rstrip().endswith("exit 0"))
+
+        for call in (first, second):
+            self.assertEqual(
+                call.kwargs["timeout_sec"], orca_agent.DEFAULT_SETUP_TIMEOUT_SEC
+            )
+        self.assertGreater(orca_agent.DEFAULT_SETUP_TIMEOUT_SEC, 360)
+
+    def test_install_honours_an_explicit_setup_budget(self) -> None:
+        agent = orca_agent.OrcaInstalledAgent(override_setup_timeout_sec=1500)
+        agent.exec_as_root = AsyncMock(
+            return_value=SimpleNamespace(stdout="", stderr="", return_code=0)
+        )
+
+        asyncio.run(agent.install(SimpleNamespace()))
+
+        self.assertEqual(
+            [call.kwargs["timeout_sec"] for call in agent.exec_as_root.await_args_list],
+            [1500, 1500],
         )
 
     def test_run_persists_trajectory_without_extending_context(self) -> None:
@@ -253,6 +297,29 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             self.assertIn("--max-turns 5", captured["command"])
             self.assertIn("--max-cost-usd 0.5", captured["command"])
 
+    def test_run_keeps_a_hyphen_leading_instruction_out_of_option_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = orca_agent.OrcaInstalledAgent()
+            agent.logs_dir = Path(directory)
+            captured = {}
+
+            async def fake_exec(environment, command, env):
+                captured["command"] = command
+                return SimpleNamespace(stdout="", stderr="")
+
+            agent.exec_as_agent = fake_exec
+            # The exact shape of terminal-bench/pytorch-model-recovery's prompt.
+            instruction = "- You are given a PyTorch state dictionary (/app/weights.pt)"
+            asyncio.run(
+                agent.run(instruction, SimpleNamespace(), orca_agent.AgentContext())
+            )
+
+            command = captured["command"]
+            self.assertIn(f" -- {shlex.quote(instruction)}", command)
+            self.assertTrue(command.endswith(shlex.quote(instruction)))
+            # `--` must come after the flags, not before them.
+            self.assertLess(command.index("--mode full-auto"), command.index(" -- "))
+
     def test_external_run_does_not_extend_context(self) -> None:
         environment = SimpleNamespace(
             exec=AsyncMock(return_value=SimpleNamespace(stdout="completed\n"))
@@ -273,6 +340,24 @@ class OrcaInstalledAgentTests(unittest.TestCase):
 
         self.assertNotIn("--filter-difficulty", readme)
         self.assertIn("--include-task-name", readme)
+
+    def test_quarantine_list_is_documented_and_usable(self) -> None:
+        directory = Path(__file__).parent
+        quarantine = json.loads(
+            (directory / "quarantine.json").read_text(encoding="utf-8")
+        )
+        entries = quarantine["quarantined"]
+        self.assertTrue(entries, "the quarantine list must not be empty")
+
+        readme = (directory / "README.md").read_text(encoding="utf-8")
+        for entry in entries:
+            # Each entry must carry a reason and the evidence a reader can check.
+            self.assertTrue(entry["task"].startswith("terminal-bench/"))
+            self.assertTrue(entry["reason"])
+            self.assertTrue(entry["evidence"])
+            # ... and be listed in the README with the exclusion flag to use.
+            self.assertIn(entry["task"], readme)
+        self.assertIn("--exclude-task-name", readme)
 
 
 if __name__ == "__main__":

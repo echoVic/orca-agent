@@ -1805,7 +1805,7 @@ impl ThreadActor {
         active: &mut ActiveOperation,
         fence: surface::SurfaceOperationFence,
         response: &crate::model_response::RuntimeModelResponse,
-    ) -> io::Result<()> {
+    ) -> io::Result<crate::model_response::RuntimeModelResponse> {
         if active.surface_operation.as_ref() != Some(&fence) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1819,14 +1819,34 @@ impl ThreadActor {
             ));
         }
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        // A tool-call id only has to be unique inside one response, but the
+        // surface keys a tool by its id for the whole session. Rename the calls
+        // that reuse an id from an *earlier* response (a provider deriving ids
+        // deterministically, a relay, or a replayed turn) before they reach the
+        // reducer, and hand the renamed response back so the conversation and
+        // the tool results use the same names (issue #67).
+        let mut response = response.clone();
+        let response_id = crate::runtime_actor::generation_context::validated_response_id(
+            &response,
+            "provider response",
+        )?;
+        let turn_id = response.identity.turn_id.clone();
+        response.rename_repeated_tool_call_ids(|id| {
+            snapshot.tools.iter().any(|tool| {
+                tool.request.tool_call_id.as_str() == id
+                    && (tool.request.source_response_id.as_ref() != Some(&response_id)
+                        || tool.request.turn_id != turn_id)
+            })
+        });
         let events = self
             .generation_context_controller
-            .provider_response_events(&snapshot, &fence, response)?;
+            .provider_response_events(&snapshot, &fence, &response)?;
         if events.is_empty() {
-            return Ok(());
+            return Ok(response);
         }
         let batch = self.surface_event_batch_with_commit_id(events, None);
-        self.commit_surface_generation_batch_with_retry(fence, &batch)
+        self.commit_surface_generation_batch_with_retry(fence, &batch)?;
+        Ok(response)
     }
 
     pub(super) fn commit_surface_plan_update(
