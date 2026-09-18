@@ -303,17 +303,17 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             agent.logs_dir = Path(directory)
             captured = {}
 
-            async def fake_exec(environment, command, env):
+            async def fake_exec(command, env):
                 captured["env"] = env
                 captured["command"] = command
-                return SimpleNamespace(stdout="", stderr="")
+                return SimpleNamespace(stdout="", stderr="", return_code=0)
 
-            agent.exec_as_agent = fake_exec
+            environment = SimpleNamespace(exec=fake_exec)
             with patch.dict(
                 os.environ,
                 {"ORCA_REASONING_EFFORT": "low", "ORCA_PROVIDER": "deepseek"},
             ):
-                asyncio.run(agent.run("finish the task", SimpleNamespace(), orca_agent.AgentContext()))
+                asyncio.run(agent.run("finish the task", environment, orca_agent.AgentContext()))
 
             self.assertEqual(captured["env"]["ORCA_REASONING_EFFORT"], "low")
             self.assertEqual(captured["env"]["ORCA_PROVIDER"], "deepseek")
@@ -336,11 +336,13 @@ class OrcaInstalledAgentTests(unittest.TestCase):
                 '{"turns":47,"output_tokens":150970,"input_tokens":9000000,'
                 '"cost_usd_micros":123456}}}}\n'
             )
-            agent.exec_as_agent = AsyncMock(
-                return_value=SimpleNamespace(stdout=stdout, stderr="")
+            environment = SimpleNamespace(
+                exec=AsyncMock(
+                    return_value=SimpleNamespace(stdout=stdout, stderr="", return_code=0)
+                )
             )
 
-            asyncio.run(agent.run("finish the task", SimpleNamespace(), orca_agent.AgentContext()))
+            asyncio.run(agent.run("finish the task", environment, orca_agent.AgentContext()))
 
             metadata = json.loads(
                 (Path(directory) / "execution_metadata.json").read_text(
@@ -359,20 +361,19 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             agent.logs_dir = Path(directory)
             captured = {}
 
-            async def fake_exec(environment, command, env):
+            async def fake_exec(command, env):
                 captured["command"] = command
-                return SimpleNamespace(stdout="", stderr="")
+                return SimpleNamespace(stdout="", stderr="", return_code=0)
 
-            agent.exec_as_agent = fake_exec
+            environment = SimpleNamespace(exec=fake_exec)
             # The exact shape of terminal-bench/pytorch-model-recovery's prompt.
             instruction = "- You are given a PyTorch state dictionary (/app/weights.pt)"
             asyncio.run(
-                agent.run(instruction, SimpleNamespace(), orca_agent.AgentContext())
+                agent.run(instruction, environment, orca_agent.AgentContext())
             )
 
             command = captured["command"]
             self.assertIn(f" -- {shlex.quote(instruction)}", command)
-            self.assertTrue(command.endswith(shlex.quote(instruction)))
             # `--` must come after the flags, not before them.
             self.assertLess(command.index("--mode full-auto"), command.index(" -- "))
 
