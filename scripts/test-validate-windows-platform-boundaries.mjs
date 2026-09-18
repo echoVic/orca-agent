@@ -371,7 +371,7 @@ const closedTempRenameBoundaryIds = new Set([
 for (const [boundaryId] of baseline.foundation_exceptions) {
   assert.ok(
     !closedTempRenameBoundaryIds.has(boundaryId),
-    `${boundaryId} must leave the foundation exception list`,
+    `${boundaryId} must leave the foundation exception list",
   );
 }
 
@@ -394,7 +394,7 @@ for (const [relativePath, marker] of atomicJobSpawnContracts) {
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   assert.ok(
     source.includes(marker),
-    `${relativePath} must enter the execution broker before creating its Windows child`,
+    `${relativePath} must enter the execution broker before creating its Windows child",
   );
 }
 const verificationSource = readFileSync(
@@ -737,13 +737,31 @@ for (const [job, label] of [
 ]) {
   const runnerBuild = "cargo build -p orca-windows-runner --locked";
   const fullSuite = "cargo nextest run --workspace --all-targets --locked";
+  const resourceSensitiveFilter =
+    "binary(=task_output_store) | binary(=subagent_recovery_contract) | binary(=subagent_contract) | binary(=session_server_contract) | test(/^acp::supervisor::tests::/)";
+  const resourceSensitiveGate =
+    `cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0 -E '${resourceSensitiveFilter}'`;
+  const remainingSuiteGate =
+    `cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0 -E 'not (${resourceSensitiveFilter})'`;
   assert.ok(
     job.includes(runnerBuild),
     `Windows ${label} CI must materialize the async-worker runner before integration tests`,
   );
   assert.ok(
     job.indexOf(runnerBuild) < job.indexOf(fullSuite),
-    `Windows ${label} CI must build the runner before the full test suite`,
+    `Windows ${label} CI must build the runner before the full test suite",
+  );
+  assert.ok(
+    job.includes(resourceSensitiveGate),
+    `Windows ${label} CI must run process- and persistence-heavy contracts in an isolated gate",
+  );
+  assert.ok(
+    job.includes(remainingSuiteGate),
+    `Windows ${label} CI must exclude the serial contracts from the remaining parallel suite",
+  );
+  assert.ok(
+    job.indexOf(resourceSensitiveGate) < job.indexOf(remainingSuiteGate),
+    `Windows ${label} CI must settle resource-sensitive contracts before the remaining suite",
   );
 }
 const nextestConfig = readFileSync(
@@ -872,7 +890,7 @@ for (const relativePath of [
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
   assert.ok(
     source.includes("Start-Sleep -Milliseconds"),
-    `${relativePath} must use the active Windows shell dialect for sleep hooks`,
+    `${relativePath} must use the active Windows shell dialect for sleep hooks",
   );
 }
 const subagentContract = readFileSync(
