@@ -22824,7 +22824,11 @@ mod tests {
         "ORCA_RUNTIME_HOST_DURABLE_PROVIDER_OUTCOME_RECOVERY_CHILD";
     const RESERVATION_TERMINAL_FAILURE_CHILD_ENV: &str =
         "ORCA_RUNTIME_HOST_RESERVATION_TERMINAL_FAILURE_CHILD";
-    const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    // The cold-restart contract re-executes itself as a child process for every
+    // approval mode; on a shared runner a child can need more than five seconds
+    // to publish its durable provider outcome, which turned the seed phase into
+    // an intermittent failure.
+    const SURFACE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
     fn subagent_activity_dedupe_cache_evicts_oldest_entry() {
