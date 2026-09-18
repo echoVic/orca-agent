@@ -96,6 +96,10 @@ for recorded sessions by default; use `/remember` for explicit user or project
 facts. See [Memory](docs/memory.md) for capture, recall, storage, privacy, and
 deletion.
 
+### Use Orca from Pilion Browser
+
+[Pilion Browser](https://github.com/echoVic/pilion-browser) is a desktop browser that works as an ACP client. Choose **Orca** in its Agent panel: Pilion launches `orca --mode=acp`, forwards `DEEPSEEK_API_KEY`, and exposes its own tabs to Orca as MCP tools (`browser_snapshot`, `browser_screenshot`, navigate, click, type) with approval-before-action and human takeover. Installers for macOS, Windows and Linux are on the [Pilion releases page](https://github.com/echoVic/pilion-browser/releases).
+
 ## What it does
 
 - Uses DeepSeek's reasoning and tool-use semantics directly, with SSE streaming,
