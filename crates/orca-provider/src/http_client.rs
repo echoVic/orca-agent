@@ -440,8 +440,31 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let index = server_requests.fetch_add(1, Ordering::SeqCst);
-                        let mut request = [0u8; 4 * 1024];
-                        let _ = stream.read(&mut request);
+                        // The accepted socket inherits the listener's non-blocking
+                        // mode, so a bare `read()` here returns immediately and we
+                        // would reply, then close, before the client's request has
+                        // actually arrived. Closing a socket that still has unread
+                        // request bytes in its receive buffer emits a TCP RST rather
+                        // than a graceful FIN; on Windows reqwest surfaces that RST
+                        // as a transport error instead of the retryable status under
+                        // test, so the exhaustion path reports "request failed..."
+                        // instead of "max retries exceeded". Flip the stream to
+                        // blocking and wait (bounded by the server deadline) for the
+                        // request headers: this both orders the reply after the request
+                        // and drains the request so the close is graceful.
+                        let _ = stream.set_nonblocking(false);
+                        let read_timeout = deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(Duration::from_millis(50));
+                        let _ = stream.set_read_timeout(Some(read_timeout));
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 1024];
+                        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => request.extend_from_slice(&chunk[..read]),
+                            }
+                        }
                         let response = if index < retryable_count {
                             format!(
                                 "HTTP/1.1 {status_line}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
