@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-09-19",
+  "definition": {
+    "tb2_mean": "Harbor aggregation over every scheduled trial; a trial without a verifier reward counts as 0",
+    "tb2_mean_scored_only": "mean over the trials that produced a verifier reward",
+    "l1": "scripts/eval/sweep.sh suites, no network or API key required"
+  },
+  "entries": [
+    {
+      "date": "2026-09-15",
+      "source_commit": "3aa4efdfa",
+      "version": "v0.4.31",
+      "tasks": 89,
+      "settings": { "attempts": 1, "concurrency": 3, "environment_build_timeout_multiplier": 2.0 },
+      "tb2_mean": 0.494,
+      "tb2_passed": 44,
+      "report": "docs/reports/2026-09-15-terminal-bench-2-v0.4.31.md"
+    },
+    {
+      "date": "2026-09-16",
+      "source_commit": "48fa0a458",
+      "version": "v0.4.31+fixes",
+      "tasks": 88,
+      "excluded_tasks": ["terminal-bench/qemu-startup"],
+      "settings": { "attempts": 1, "concurrency": 3, "environment_build_timeout_multiplier": 2.0 },
+      "tb2_mean": 0.727,
+      "tb2_mean_infra_corrected": 0.761,
+      "report": "docs/reports/2026-09-16-terminal-bench-2-v0.4.31-fixed.md"
+    },
+    {
+      "date": "2026-09-19",
+      "source_commit": "5970b40c",
+      "version": "v0.4.32",
+      "tasks": 88,
+      "excluded_tasks": ["terminal-bench/qemu-startup"],
+      "settings": { "attempts": 1, "concurrency": 6 },
+      "tb2_mean": 0.7955,
+      "tb2_mean_scored_only": 0.8434,
+      "tb2_passed": 70,
+      "tb2_scored": 83,
+      "tb2_errored": 19,
+      "exceptions": {
+        "AgentTimeoutError": 13,
+        "EnvironmentStartTimeoutError": 4,
+        "NonZeroAgentExitCodeError": 1,
+        "RuntimeError": 1
+      },
+      "infra_reruns": {
+        "tasks": 5,
+        "verifier_passed": 5,
+        "mean_if_counted": 0.8523
+      },
+      "l1": { "suites": 24, "failed": 0 },
+      "issues_filed": [114, 115],
+      "report": "docs/reports/2026-09-19-v0.4.32-evaluation.md",
+      "summary": "docs/reports/2026-09-19-tb2-v0432-summary.json"
+    }
+  ]
+}
