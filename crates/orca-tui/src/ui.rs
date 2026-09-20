@@ -2805,18 +2805,45 @@ fn current_time_ms() -> i64 {
 }
 
 fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
-    let cyan = Style::default().fg(theme.border);
+    let whale = Style::default().fg(theme.border);
+    let water = Style::default().fg(theme.plan_mode);
     let text = Style::default().fg(theme.text);
     let muted = Style::default().fg(theme.muted);
 
-    vec![
-        Line::from(""),
-        Line::from(Span::styled("   ___                ", cyan)),
-        Line::from(Span::styled("  / _ \\ _ __ ___ __ _ ", cyan)),
-        Line::from(Span::styled(" | | | | '__/ __/ _` |", cyan)),
-        Line::from(Span::styled(" | |_| | | | (_| (_| |", cyan)),
+    // The terminal mark is a compact braille rendering of the same spraying
+    // whale used by the site icon, so the startup screen keeps the product's
+    // actual silhouette instead of a generic whale emoji or blob.
+    let whale_art = [
+        r"             ⢀⣤⣶⣶⣶⣶⣄⢀⣤⣶",
+        r"           ⡠⠾⠿⠿⢿⣿⠻⠿⢻⣿⠿⠋",
+        r"                 ⣿⣿",
+        r"               ⢀⣀⣿⣿⡀    ⢠⡄",
+        r"    ⣀⣤⣴⣶⣶⣿⣿⣿⣶⣾⣿⣿⣿⣿⠋     ⣿⣿⣶⣤⡀    ⣀⣠⣦",
+        r"  ⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣄   ⢻⣿⣿⣿⣿⣴⣿⣿⣿⣿⣿⠇",
+        r"⢀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀ ⠙⠻⣿⣿⣿⣿⣿⠿⠟⠁",
+        r"⣼⣿⡏⠉⠉⠉⠉⠙⠛⠻⢿⣿⣿⣿⣿⣿⣿⣿⡿⠛⠻⢿⣿⣿⣷⣦⣼⣿⣿⣿",
+        r"⣿⣿⣧        ⠈⠙⠿⣿⣿⣿⣿⣿⣹⡆ ⠙⢿⣿⣿⣿⣿⣿⠏",
+        r"⢸⣿⣿⣆          ⠈⠻⣿⣿⣿⣿⣿⣦⣤⣴⣿⣿⣿⣿⡟",
+        r" ⠻⣿⣿⣧⡀          ⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠋",
+        r"  ⠙⢿⣿⣿⣶⣄⡀  ⠘⢿⣷⣦⣄  ⠙⢿⣿⣿⣿⣿⣿⣟⠁",
+        r"    ⠉⠻⢿⣿⣿⣷⣶⣶⣾⣿⣿⣿⣿⣶⣤⣤⣬⣿⠿⠿⣿⣿⣿⡷⠆",
+        r"       ⠈⠉⠛⠻⠿⠿⠿⠿⠿⠿⠿⠛⠋⠉",
+    ];
+
+    let mut lines = vec![Line::from("")];
+    for (index, art_line) in whale_art.into_iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!("  {art_line}"),
+            if index < 2 { water } else { whale },
+        )));
+    }
+    lines.extend([
+        Line::from(Span::styled("   ___                ", whale)),
+        Line::from(Span::styled("  / _ \\ _ __ ___ __ _ ", whale)),
+        Line::from(Span::styled(" | | | | '__/ __/ _` |", whale)),
+        Line::from(Span::styled(" | |_| | | | (_| (_| |", whale)),
         Line::from(vec![
-            Span::styled("  \\___/|_|  \\___\\__,_|", cyan),
+            Span::styled("  \\___/|_|  \\___\\__,_|", whale),
             Span::styled(format!("  v{}", state.app_version), muted),
         ]),
         Line::from(""),
@@ -2847,7 +2874,8 @@ fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
             muted,
         )),
         Line::from(""),
-    ]
+    ]);
+    lines
 }
 
 /// Render the lines for a contiguous slice of messages. Used both to flush a settled
@@ -7482,6 +7510,45 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("v9.8.7-test"));
+    }
+
+    #[test]
+    fn welcome_lines_show_a_spraying_whale_mark() {
+        let (tx, _rx) = mpsc::unbounded();
+        let state = AppState::new(
+            tx,
+            "0.0.0".to_string(),
+            "deepseek".to_string(),
+            "/tmp/project".to_string(),
+        );
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+
+        let rendered = build_welcome_lines(&state, &theme)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("⣴") && rendered.contains("⣿"),
+            "whale mark missing: {rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .filter(|line| line.contains('⣿'))
+                .any(|line| line.chars().count() >= 30),
+            "whale mark should have a relaxed horizontal silhouette: {rendered}"
+        );
+        assert!(
+            rendered.contains("   ___"),
+            "brand wordmark missing: {rendered}"
+        );
     }
 
     #[test]
