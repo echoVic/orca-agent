@@ -122,6 +122,17 @@ impl ExecutionBroker {
         self.launch_inner(command, capability, None, false, false)
     }
 
+    /// Launch an ordinary workload without tying its process boundary to the
+    /// lifetime of this broker's owner. The caller must retain a durable
+    /// ownership record and provide an explicit stop path for the child.
+    pub fn launch_detached(
+        &self,
+        command: Command,
+        capability: EffectiveCapability,
+    ) -> Result<BrokerLaunch, LaunchError> {
+        self.launch_inner(command, capability, None, false, true)
+    }
+
     pub fn launch_named(
         &self,
         command: Command,

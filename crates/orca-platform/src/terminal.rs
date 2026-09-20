@@ -162,7 +162,15 @@ mod windows {
         cols: Option<u16>,
         rows: Option<u16>,
     ) -> io::Result<SpawnedWindowsPty> {
-        spawn_windows_pty_with_job(command, cols, rows, None)
+        spawn_windows_pty_with_job(command, cols, rows, None, false)
+    }
+
+    pub fn spawn_windows_pty_detached(
+        command: &Command,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> io::Result<SpawnedWindowsPty> {
+        spawn_windows_pty_with_job(command, cols, rows, None, true)
     }
 
     pub fn spawn_windows_pty_named(
@@ -171,7 +179,7 @@ mod windows {
         rows: Option<u16>,
         name: &str,
     ) -> io::Result<SpawnedWindowsPty> {
-        spawn_windows_pty_with_job(command, cols, rows, Some(name))
+        spawn_windows_pty_with_job(command, cols, rows, Some(name), false)
     }
 
     fn spawn_windows_pty_with_job(
@@ -179,9 +187,14 @@ mod windows {
         cols: Option<u16>,
         rows: Option<u16>,
         job_name: Option<&str>,
+        detached: bool,
     ) -> io::Result<SpawnedWindowsPty> {
         let pty = PtyPipeSet::new(cols, rows)?;
-        let process_job = ProcessJob::create_unassigned(job_name)?;
+        let process_job = if detached {
+            ProcessJob::create_unassigned_detached(job_name)?
+        } else {
+            ProcessJob::create_unassigned(job_name)?
+        };
         let mut attributes = ProcessAttributeList::new(2)?;
         attributes.set_pseudo_console(pty.console.raw())?;
         attributes.set_job(process_job.raw_handle())?;
@@ -623,7 +636,7 @@ mod windows {
 #[cfg(windows)]
 pub use windows::{
     PtyExitStatus, SpawnedWindowsPty, WindowsPtyChild, WindowsPtyInput, spawn_windows_pty,
-    spawn_windows_pty_named, windows_pty_supported,
+    spawn_windows_pty_detached, spawn_windows_pty_named, windows_pty_supported,
 };
 
 pub fn native_pty_supported() -> bool {

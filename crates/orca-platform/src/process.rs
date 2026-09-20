@@ -21,6 +21,16 @@ impl ProcessJob {
         })
     }
 
+    /// Creates an unattached Windows Job Object without kill-on-close. The
+    /// caller owns the process lifetime and must provide an explicit stop
+    /// path before dropping the returned job.
+    #[cfg(windows)]
+    pub fn create_unassigned_detached(name: Option<&str>) -> io::Result<Self> {
+        Ok(Self {
+            platform: platform::ProcessJob::create_detached(name)?,
+        })
+    }
+
     #[cfg(windows)]
     pub fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
         self.platform.raw_handle()
@@ -397,6 +407,10 @@ mod platform {
 
         pub(super) fn spawn_detached(command: &mut Command) -> io::Result<(Child, Self)> {
             Self::spawn_with_lifetime(command, None, false)
+        }
+
+        pub(super) fn create_detached(name: Option<&str>) -> io::Result<Self> {
+            Self::create_with_lifetime(name, false)
         }
 
         fn spawn_with_lifetime(
