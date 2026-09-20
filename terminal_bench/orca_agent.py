@@ -209,18 +209,15 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         # killed at the task timeout, so the in-container copy is the only
         # trajectory that survives both paths (issue #59).
         trajectory_in_container = "/tmp/orca-trajectory.jsonl"
-        # `--` terminates option parsing so an instruction that begins with a
-        # hyphen stays data. Terminal-Bench 2.0 ships one such task
-        # (`pytorch-model-recovery`: "- You are given a PyTorch state
-        # dictionary ..."): without the separator clap reads the prompt as an
-        # unknown option, `orca exec` exits 2 before the session starts, and the
-        # trial is recorded as an agent error (issue #61).
+        # Feed the instruction through stdin instead of putting it in Orca's
+        # positional argv. A task is allowed to inspect and match process
+        # command lines; keeping its text out of the Orca argv prevents a
+        # cleanup command from matching and killing this session (issue #114).
         cmd = (
-            f"orca exec"
+            f"printf '%s' {shlex.quote(instruction)} | orca exec"
             f" --mode full-auto"
             f" --output-format jsonl"
             f"{''.join(budget_flags)}"
-            f" -- {shlex.quote(instruction)}"
             f" 2>&1 | tee {trajectory_in_container}"
         )
 

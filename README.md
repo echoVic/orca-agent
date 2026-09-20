@@ -52,6 +52,7 @@ export DEEPSEEK_API_KEY=sk-...
 
 orca                                      # open the TUI
 orca exec "fix the failing test"          # run headlessly
+printf '%s' "$INSTRUCTION" | orca exec   # keep arbitrary prompt text out of argv
 orca exec --verifier "cargo test" "fix it" # verify before finishing
 orca exec resume SESSION_ID "continue"    # resume a headless session
 orca exec resume --last "continue"        # resume the most recent session
@@ -60,6 +61,10 @@ orca --mode=acp                           # connect an ACP client
 orca --resume [SESSION_ID]                # resume a saved conversation
 orca --fork SESSION_ID                    # fork a saved conversation
 ```
+
+The positional prompt form remains supported. When the prompt may contain
+tokens that a task later searches for or kills in the process table, pipe it on
+stdin so it is not exposed in `orca`'s command line.
 
 Development builds also provide opt-in [shared ACP sessions](docs/acp-daemon.md)
 on Unix (`orca daemon`, `orca attach`, and `orca acp-bridge`),

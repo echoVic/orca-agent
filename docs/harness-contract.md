@@ -10,6 +10,16 @@ The contract covers: a headless command, a versioned JSONL event stream, approva
 orca exec [options] <prompt>
 ```
 
+The prompt may also be read from stdin by omitting the positional argument (or
+passing `-`). This is the safer form for arbitrary or untrusted text because a
+positional prompt is visible in the `orca` process arguments:
+
+```sh
+printf '%s' "$INSTRUCTION" | orca exec [options]
+```
+
+Both forms produce the same headless session and JSONL contract.
+
 Options:
 
 - `--output-format text|jsonl` — Output format (default: text)
