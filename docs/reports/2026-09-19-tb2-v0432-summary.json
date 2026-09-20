@@ -14,7 +14,7 @@
       "terminal-bench/qemu-startup"
     ],
     "environment_build_timeout_multiplier": null,
-    "note": "mean_reward averages the trials that produced a verifier reward (Harbor's own denominator); pass_rate_of_all_trials uses every scheduled trial."
+    "note": "mean_reward uses every scheduled trial as the denominator (Harbor's own definition; a trial without a reward counts as 0); mean_reward_scored_only averages only the trials that produced a verifier reward."
   },
   "totals": {
     "trials": 88,

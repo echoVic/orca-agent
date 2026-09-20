@@ -91,7 +91,9 @@ def run_case(binary_dir: Path, port: int, command: str, trust: bool, timeout: fl
         details.append(parsed)
     detail = next((item for item in details if item.get("output")), details[0] if details else {})
     lowered = result.stdout.lower()
-    detail["_mentions_trust"] = "trust" in lowered or "read-only" in lowered and "warning" in lowered
+    detail["_mentions_trust"] = "warning" in lowered and (
+        "trust" in lowered or "read-only" in lowered
+    )
     return detail
 
 

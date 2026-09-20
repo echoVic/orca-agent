@@ -72,10 +72,15 @@ def main() -> int:
 
     checks: list[tuple[str, bool, str, str]] = []
     results: list[dict] = []
+    skipped: list[tuple[str, str]] = []
 
     def record(name: str, ok: bool, detail: str, issue: str = "") -> None:
         checks.append((name, ok, detail, issue))
         results.append({"case": name, "ok": ok, "detail": detail, "issue": issue})
+
+    def record_skip(name: str, detail: str) -> None:
+        skipped.append((name, detail))
+        results.append({"case": name, "ok": None, "skipped": True, "detail": detail, "issue": ""})
 
     def run(label: str, cli: list[str], prompt: str, timeout: float = 300.0) -> subprocess.CompletedProcess:
         completed = subprocess.run(
@@ -156,8 +161,8 @@ def main() -> int:
                 issue="" if denied.returncode == 3 else "blocked by #85",
             )
         else:
-            record("denied action in jsonl → 3 / approval_required", True,
-                   "skipped: no Linux binary for the sandboxed container", issue="")
+            record_skip("denied action in jsonl → 3 / approval_required",
+                        "skipped: no Linux binary for the sandboxed container")
 
         # `--max-tool-calls 0` is rejected as invalid ("must be a positive integer",
         # exit 1); a one-turn budget with a tool call is the way to reach the stop path.
@@ -190,6 +195,8 @@ def main() -> int:
 
     (out_dir / "checks.jsonl").write_text("\n".join(json.dumps(item) for item in results) + "\n")
     failures = 0
+    for name, detail in skipped:
+        print(f"[INFO] {name:<46} {detail}")
     for name, ok, detail, issue in checks:
         failures += 0 if ok else 1
         suffix = f" — {issue}" if issue and not ok else ""

@@ -687,7 +687,8 @@ def effective_fail_to_pass(sha: str) -> list[str]:
     baseline_not_passing: set[str] = set()
     baseline_passing: set[str] = set()
     baseline_output = ""
-    for path in sorted(RESULTS.glob(f"{sha}-*/result.json"), reverse=True):
+    # `run()` stores artifacts under a ten-character SHA prefix.
+    for path in sorted(RESULTS.glob(f"{sha[:10]}-*/result.json"), reverse=True):
         row = json.loads(path.read_text(encoding="utf-8"))
         if "baseline_not_passing" in row or "baseline_failures" in row:
             baseline_not_passing = set(row.get("baseline_not_passing") or row.get("baseline_failures") or [])

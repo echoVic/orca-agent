@@ -302,7 +302,7 @@ def main() -> int:
             }
             results.append(record)
             marker = {"PASS": "PASS", "FAIL": "FAIL", "INFO": "INFO"}[status]
-            usage = result.get("usage") or {}
+            usage = result.get("provider_usage") or {}
             print(
                 f"[{marker}] {scenario['name']:<28} status={result.get('status')!s:<8} "
                 f"exit={result.get('exit_code')!s:<5} attempts={attempts:<2} "

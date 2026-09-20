@@ -142,8 +142,9 @@ def protocol(args: argparse.Namespace, trials_raw: list[dict], run_dir: Path) ->
         "excluded_tasks": args.exclude,
         "environment_build_timeout_multiplier": args.build_timeout_multiplier,
         "note": (
-            "mean_reward averages the trials that produced a verifier reward "
-            "(Harbor's own denominator); pass_rate_of_all_trials uses every scheduled trial."
+            "mean_reward uses every scheduled trial as the denominator (Harbor's own "
+            "definition; a trial without a reward counts as 0); mean_reward_scored_only "
+            "averages only the trials that produced a verifier reward."
         ),
     }
 

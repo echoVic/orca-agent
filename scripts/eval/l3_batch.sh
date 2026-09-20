@@ -56,7 +56,8 @@ COMMON=(--build-timeout "$BUILD_TIMEOUT" --verify-timeout "$VERIFY_TIMEOUT")
 [[ $FORCE -eq 1 ]] && COMMON+=(--force)
 
 latest_result() { # newest result.json for this sha, if any
-  ls -td jobs/eval-repo-tasks/"$1"-*/ 2>/dev/null | while read -r dir; do
+  local prefix="${1:0:10}"
+  ls -td jobs/eval-repo-tasks/"$prefix"-*/ 2>/dev/null | while read -r dir; do
     [[ -f "$dir/result.json" ]] && { echo "$dir/result.json"; break; }
   done
 }

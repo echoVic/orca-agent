@@ -51,7 +51,7 @@
         "verifier_passed": 5,
         "mean_if_counted": 0.8523
       },
-      "l1": { "suites": 24, "failed": 0 },
+      "l1": { "runs": 26, "unique_suites": 24, "failed": 0, "note": "sandbox_probe.py runs in default and privileged modes" },
       "issues_filed": [114, 115],
       "report": "docs/reports/2026-09-19-v0.4.32-evaluation.md",
       "summary": "docs/reports/2026-09-19-tb2-v0432-summary.json"

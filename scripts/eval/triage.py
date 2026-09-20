@@ -125,6 +125,9 @@ def main() -> int:
         f"- trials: {len(trials)} (scored {len(scored)})",
         f"- pass: {len(passed)} · fail: {len(failed)} · error: {len(errored)}",
         f"- accuracy: {(len(passed) / len(scored)):.4f} of scored, "
+        f"{len(passed) / len(trials):.4f} of all trials"
+        if scored
+        else "- accuracy: n/a of scored (no verifier rewards), "
         f"{len(passed) / len(trials):.4f} of all trials",
         f"- trajectories preserved: {len(trials) - len(lost)}/{len(trials)}",
         f"- median turns: {median('turns')} · tool calls: {median('tool_calls')} · "

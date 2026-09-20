@@ -111,6 +111,9 @@ def render(job: str, baseline: str | None) -> str:
         f"- trials: {len(ordered)} (scored {len(scored)})",
         f"- pass: **{len(passed)}** · fail: {len(scored) - len(passed)} · error: {len(errored)}",
         f"- accuracy: {len(passed) / len(scored):.4f} of scored, "
+        f"{len(passed) / len(ordered):.4f} of all trials"
+        if scored
+        else "- accuracy: n/a of scored (no verifier rewards), "
         f"{len(passed) / len(ordered):.4f} of all trials",
         f"- trajectories preserved: {len(preserved)}/{len(ordered)}",
         f"- median turns: {median(ordered, 'turns')} · tool calls: {median(ordered, 'tool_calls')} · "
