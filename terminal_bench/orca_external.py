@@ -58,11 +58,11 @@ class OrcaExternalAgent(BaseAgent):
         orca_bin = os.environ.get("ORCA_BIN", "orca")
 
         cmd = (
-            f"DEEPSEEK_API_KEY={shlex.quote(_load_api_key())}"
+            f"printf '%s' {shlex.quote(instruction)} |"
+            f" DEEPSEEK_API_KEY={shlex.quote(_load_api_key())}"
             f" {shlex.quote(orca_bin)} exec"
             f" --mode full-auto"
             f" --output-format jsonl"
-            f" {shlex.quote(instruction)}"
         )
 
         result = await environment.exec(cmd)

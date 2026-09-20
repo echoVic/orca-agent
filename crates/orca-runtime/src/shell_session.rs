@@ -19,7 +19,9 @@ use orca_platform::shell::PowerShellEdition;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 use orca_platform::terminal::native_pty_supported;
 #[cfg(windows)]
-use orca_platform::terminal::{WindowsPtyChild, WindowsPtyInput, spawn_windows_pty};
+use orca_platform::terminal::{
+    WindowsPtyChild, WindowsPtyInput, spawn_windows_pty, spawn_windows_pty_detached,
+};
 #[cfg(windows)]
 use orca_windows_sandbox::{
     CapabilityStore, SandboxFilesystemMode, SandboxSpawnRequest, SandboxedChild, SandboxedPty,
@@ -301,10 +303,25 @@ impl RuntimeShellSessionManager {
         command: ShellSessionCommand,
         metadata_writable_directories: Vec<PathBuf>,
     ) -> io::Result<ShellSessionHandle> {
-        self.spawn_with_task_registry_and_metadata_roots(
+        self.spawn_with_task_registry_and_metadata_roots_inner(
             command,
             metadata_writable_directories,
             self.tasks.clone(),
+            false,
+        )
+    }
+
+    pub(crate) fn spawn_with_metadata_roots_and_lifetime(
+        &mut self,
+        command: ShellSessionCommand,
+        metadata_writable_directories: Vec<PathBuf>,
+        lifetime: TaskLifetime,
+    ) -> io::Result<ShellSessionHandle> {
+        self.spawn_with_task_registry_and_metadata_roots_inner(
+            command,
+            metadata_writable_directories,
+            self.tasks.clone(),
+            lifetime == TaskLifetime::Workspace,
         )
     }
 
@@ -313,7 +330,7 @@ impl RuntimeShellSessionManager {
         command: ShellSessionCommand,
         tasks: TaskRegistry,
     ) -> io::Result<ShellSessionHandle> {
-        self.spawn_with_task_registry_and_metadata_roots(command, Vec::new(), tasks)
+        self.spawn_with_task_registry_and_metadata_roots_inner(command, Vec::new(), tasks, false)
     }
 
     pub(crate) fn spawn_with_task_registry_and_metadata_roots(
@@ -321,6 +338,21 @@ impl RuntimeShellSessionManager {
         command: ShellSessionCommand,
         metadata_writable_directories: Vec<PathBuf>,
         tasks: TaskRegistry,
+    ) -> io::Result<ShellSessionHandle> {
+        self.spawn_with_task_registry_and_metadata_roots_inner(
+            command,
+            metadata_writable_directories,
+            tasks,
+            false,
+        )
+    }
+
+    fn spawn_with_task_registry_and_metadata_roots_inner(
+        &mut self,
+        command: ShellSessionCommand,
+        metadata_writable_directories: Vec<PathBuf>,
+        tasks: TaskRegistry,
+        detached: bool,
     ) -> io::Result<ShellSessionHandle> {
         let storage_root = tasks.output_storage_root()?;
         let foreign_scope = tasks.session_id() != self.tasks.session_id()
@@ -399,6 +431,7 @@ impl RuntimeShellSessionManager {
                     &shell,
                     &broker,
                     &capability,
+                    detached,
                 );
                 let (
                     child,
@@ -530,7 +563,7 @@ impl RuntimeShellSessionManager {
             let stdio = configure_shell_stdio(&mut process, requested_terminal)?;
             let effective_terminal = stdio.effective_terminal();
             let initialized =
-                spawn_configured_shell_with_broker(process, stdio, &broker, capability);
+                spawn_configured_shell_with_broker(process, stdio, &broker, capability, detached);
             let (child, process_job, stdin, stdout_reader, stderr_reader, capability_receipt) =
                 match initialized {
                     Ok(initialized) => initialized,
@@ -959,6 +992,22 @@ impl RuntimeShellSessionManager {
         }
     }
 
+    /// Stops sessions owned by the task which started them.
+    ///
+    /// Workspace-owned services outlive the task and therefore survive
+    /// implicit runtime/session teardown. Missing task records are treated as
+    /// task-owned so an unknown ownership state cannot leak a process.
+    pub(crate) fn terminate_task_owned(&mut self) {
+        let ids = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| (!session.is_workspace_owned()).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        for id in ids {
+            let _ = self.terminate(&id, ShellSessionTermination::Cancelled, true);
+        }
+    }
+
     fn finish_terminal_session(
         &mut self,
         id: &str,
@@ -1072,6 +1121,7 @@ fn spawn_windows_sandbox(
     shell: &ShellSpec,
     broker: &ExecutionBroker,
     capability: &EffectiveCapability,
+    detached: bool,
 ) -> io::Result<(
     ShellChild,
     ProcessJob,
@@ -1144,7 +1194,12 @@ fn spawn_windows_sandbox(
     };
     let terminal = resolve_terminal_support(command.terminal, native_pty_supported())?;
     if let ShellTerminalMode::Pty { cols, rows } = terminal {
-        let mut child = SandboxedPty::spawn(request(), cols, rows).map_err(io::Error::other)?;
+        let mut child = if detached {
+            SandboxedPty::spawn_detached(request(), cols, rows)
+        } else {
+            SandboxedPty::spawn(request(), cols, rows)
+        }
+        .map_err(io::Error::other)?;
         let process_job = child.take_process_job()?;
         let (input, output) = child.take_pty()?;
         return Ok((
@@ -1158,7 +1213,12 @@ fn spawn_windows_sandbox(
         ));
     }
 
-    let mut child = SandboxedChild::spawn(request()).map_err(io::Error::other)?;
+    let mut child = if detached {
+        SandboxedChild::spawn_detached(request())
+    } else {
+        SandboxedChild::spawn(request())
+    }
+    .map_err(io::Error::other)?;
     let process_job = child.take_process_job()?;
     let (stdin, stdout, stderr) = child.take_stdio()?;
     Ok((
@@ -1227,11 +1287,21 @@ fn direct_command(argv: &[String], cwd: &std::path::Path) -> std::process::Comma
 }
 impl Drop for RuntimeShellSessionManager {
     fn drop(&mut self) {
-        self.terminate_all();
+        // Runtime/session teardown must preserve services whose task
+        // explicitly transferred ownership to the workspace. Explicit
+        // callers still use `terminate_all` when they intend to stop every
+        // session.
+        self.terminate_task_owned();
     }
 }
 
 impl ShellSession {
+    fn is_workspace_owned(&self) -> bool {
+        self.tasks
+            .get(&self.task_id)
+            .is_some_and(|task| task.lifetime == TaskLifetime::Workspace)
+    }
+
     fn join_readers(&mut self) {
         self.terminate_child_tree();
         let _ = self.child.wait();
@@ -1355,7 +1425,9 @@ impl ShellSession {
 impl Drop for ShellSession {
     fn drop(&mut self) {
         self.stdin.close();
-        self.join_readers();
+        if !self.is_workspace_owned() {
+            self.join_readers();
+        }
     }
 }
 
@@ -1766,6 +1838,7 @@ fn spawn_configured_shell_with_broker(
     stdio: ShellStdio,
     broker: &ExecutionBroker,
     capability: EffectiveCapability,
+    detached: bool,
 ) -> io::Result<(
     ShellChild,
     ProcessJob,
@@ -1779,7 +1852,11 @@ fn spawn_configured_shell_with_broker(
         let ShellStdio::WindowsPty { cols, rows } = stdio else {
             unreachable!("matched ConPTY stdio")
         };
-        let spawned = spawn_windows_pty(&process, cols, rows)?;
+        let spawned = if detached {
+            spawn_windows_pty_detached(&process, cols, rows)
+        } else {
+            spawn_windows_pty(&process, cols, rows)
+        }?;
         return Ok((
             ShellChild::WindowsPty(spawned.child),
             spawned.process_job,
@@ -1791,14 +1868,27 @@ fn spawn_configured_shell_with_broker(
     }
 
     let launched = if capability.process_class == CapabilityProcessClass::UserTrustedIntegration {
-        broker.launch_user_trusted(
-            process,
-            capability.request_id.clone(),
-            capability.cwd.clone(),
-            capability.capabilities.clone(),
-        )
+        if detached {
+            broker.launch_user_trusted_detached(
+                process,
+                capability.request_id.clone(),
+                capability.cwd.clone(),
+                capability.capabilities.clone(),
+            )
+        } else {
+            broker.launch_user_trusted(
+                process,
+                capability.request_id.clone(),
+                capability.cwd.clone(),
+                capability.capabilities.clone(),
+            )
+        }
     } else {
-        broker.launch(process, capability)
+        if detached {
+            broker.launch_detached(process, capability)
+        } else {
+            broker.launch(process, capability)
+        }
     }
     .map_err(shell_launch_error)?;
     let receipt = launched.receipt.clone();
@@ -2437,7 +2527,7 @@ mod tests {
         .expect("resolve shell capability");
         let broker = ExecutionBroker::new(EnforcementState::Enforced);
         let (child, process_job, stdin, stdout_reader, stderr_reader, _receipt) =
-            spawn_configured_shell_with_broker(process, stdio, &broker, capability)
+            spawn_configured_shell_with_broker(process, stdio, &broker, capability, false)
                 .expect("spawn configured shell");
         let output_store = TaskOutputStore::new();
         let reader_stop = Arc::new(AtomicBool::new(false));

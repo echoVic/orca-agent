@@ -114,6 +114,13 @@ The installed adapter writes Orca's raw JSONL output to the trial's
 Command output is not assigned to `AgentContext`: Harbor 0.20.0 does not define
 an `output` field, and adding one aborts the trial before verifier execution.
 
+Both adapters pipe each task instruction to `orca exec` on stdin. This keeps the
+instruction out of the Orca process's positional arguments, so task cleanup
+commands that match `/proc` or the process table cannot match the session on a
+token from its own instruction. Direct CLI callers can continue using
+`orca exec -- "..."`; stdin is the safer form for untrusted or arbitrary task
+text.
+
 The trajectory is persisted on **every** exit path. Harbor discards the
 `ExecResult` when the command exits non-zero and when the exec is killed at the
 task timeout, so the adapter also tees the stream to `/tmp/orca-trajectory.jsonl`

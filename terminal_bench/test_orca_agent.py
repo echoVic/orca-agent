@@ -355,7 +355,7 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             self.assertEqual(metadata["usage"]["output_tokens"], 150970)
             self.assertEqual(metadata["usage"]["cost_usd_micros"], 123456)
 
-    def test_run_keeps_a_hyphen_leading_instruction_out_of_option_parsing(self) -> None:
+    def test_run_pipes_a_hyphen_leading_instruction_via_stdin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent = orca_agent.OrcaInstalledAgent()
             agent.logs_dir = Path(directory)
@@ -373,13 +373,23 @@ class OrcaInstalledAgentTests(unittest.TestCase):
             )
 
             command = captured["command"]
-            self.assertIn(f" -- {shlex.quote(instruction)}", command)
-            # `--` must come after the flags, not before them.
-            self.assertLess(command.index("--mode full-auto"), command.index(" -- "))
+            quoted_instruction = shlex.quote(instruction)
+            self.assertIn(f"printf '%s' {quoted_instruction} | orca exec", command)
+            # The instruction is delivered through stdin, so it must not be the
+            # positional argument after the Orca command.
+            orca_argv = command[command.index("orca exec") :]
+            self.assertNotIn(quoted_instruction, orca_argv)
+            self.assertLess(command.index("printf '%s'"), command.index("orca exec"))
 
     def test_external_run_does_not_extend_context(self) -> None:
+        captured = {}
+
+        async def fake_exec(command):
+            captured["command"] = command
+            return SimpleNamespace(stdout="completed\n")
+
         environment = SimpleNamespace(
-            exec=AsyncMock(return_value=SimpleNamespace(stdout="completed\n"))
+            exec=fake_exec,
         )
         context = orca_external.AgentContext()
 
@@ -390,7 +400,11 @@ class OrcaInstalledAgentTests(unittest.TestCase):
         )
 
         self.assertFalse(hasattr(context, "output"))
-        environment.exec.assert_awaited_once()
+        command = captured["command"]
+        quoted_instruction = shlex.quote("finish the task")
+        self.assertIn(f"printf '%s' {quoted_instruction} |", command)
+        orca_argv = command[command.index("orca exec") :]
+        self.assertNotIn(quoted_instruction, orca_argv)
 
     def test_readme_uses_supported_harbor_filters(self) -> None:
         readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")

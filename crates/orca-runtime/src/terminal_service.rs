@@ -577,9 +577,11 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
                 deadline_after,
                 response,
             }) => {
-                let result = state
-                    .manager
-                    .spawn_with_metadata_roots(*command, metadata_writable_directories);
+                let result = state.manager.spawn_with_metadata_roots_and_lifetime(
+                    *command,
+                    metadata_writable_directories,
+                    lifetime,
+                );
                 if let Ok(handle) = &result {
                     if lifetime == crate::tasks::TaskLifetime::Workspace
                         && !state.manager.mark_task_lifetime(&handle.task_id, lifetime)
@@ -662,14 +664,14 @@ fn run_terminal_supervisor(task_registry: TaskRegistry, receiver: Receiver<Termi
             }
             Ok(TerminalCommand::Shutdown { response }) => {
                 state.deny_pending_network_requests();
-                state.manager.terminate_all();
+                state.manager.terminate_task_owned();
                 let _ = response.send(());
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 state.deny_pending_network_requests();
-                state.manager.terminate_all();
+                state.manager.terminate_task_owned();
                 break;
             }
         }
@@ -1382,6 +1384,22 @@ mod tests {
         overlay: &'a TurnPermissionOverlay,
         terminal: ShellTerminalMode,
     ) -> TerminalExecRequest<'a> {
+        request_with_lifetime(
+            command,
+            cwd,
+            overlay,
+            terminal,
+            crate::tasks::TaskLifetime::Task,
+        )
+    }
+
+    fn request_with_lifetime<'a>(
+        command: &'a str,
+        cwd: &'a Path,
+        overlay: &'a TurnPermissionOverlay,
+        terminal: ShellTerminalMode,
+        lifetime: crate::tasks::TaskLifetime,
+    ) -> TerminalExecRequest<'a> {
         let config = Box::leak(Box::new(
             crate::command::config::assemble_run_config(
                 crate::command::config::RunConfigRequest::new("0.0.0-test", cwd.to_path_buf()),
@@ -1390,7 +1408,7 @@ mod tests {
             .expect("test config"),
         ));
         TerminalExecRequest {
-            lifetime: crate::tasks::TaskLifetime::Task,
+            lifetime,
             command,
             cwd,
             additional_roots: &[],
@@ -1829,6 +1847,41 @@ mod tests {
         assert!(
             !marker.exists(),
             "background child survived service shutdown"
+        );
+    }
+
+    #[test]
+    fn drop_leaves_workspace_service_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("workspace-survived");
+        let overlay = TurnPermissionOverlay::default();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 500; Set-Content -Path workspace-survived -Value survived"
+        } else {
+            "sleep 0.5; printf survived > workspace-survived"
+        };
+        let (service, _) = service(temp.path());
+        let started = start(
+            &service,
+            request_with_lifetime(
+                command,
+                temp.path(),
+                &overlay,
+                ShellTerminalMode::pipe(),
+                crate::tasks::TaskLifetime::Workspace,
+            ),
+            Duration::from_millis(50),
+            8 * 1024,
+            || false,
+        )
+        .expect("start workspace service");
+        assert_eq!(started.status, "running", "{started:?}");
+
+        drop(service);
+        thread::sleep(Duration::from_millis(900));
+        assert!(
+            marker.exists(),
+            "workspace-owned command was killed by service shutdown"
         );
     }
 

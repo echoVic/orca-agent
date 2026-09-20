@@ -66,9 +66,24 @@ pub struct SandboxedPtyInput {
 
 impl SandboxedChild {
     pub fn spawn(request: SandboxSpawnRequest<'_>) -> Result<Self, WindowsSandboxError> {
+        Self::spawn_with_lifetime(request, false)
+    }
+
+    pub fn spawn_detached(request: SandboxSpawnRequest<'_>) -> Result<Self, WindowsSandboxError> {
+        Self::spawn_with_lifetime(request, true)
+    }
+
+    fn spawn_with_lifetime(
+        request: SandboxSpawnRequest<'_>,
+        detached: bool,
+    ) -> Result<Self, WindowsSandboxError> {
         let (restricted, appcontainer) = prepare_spawn_security(&request)?;
         let mut pipes = PipeSet::new()?;
-        let job = ProcessJob::create_unassigned(None)?;
+        let job = if detached {
+            ProcessJob::create_unassigned_detached(None)?
+        } else {
+            ProcessJob::create_unassigned(None)?
+        };
         let mut attributes = ProcessAttributeList::new(2 + u32::from(appcontainer.is_some()))?;
         attributes.set_handle_list(vec![
             pipes.child_stdin,
@@ -93,8 +108,15 @@ impl SandboxedChild {
             },
             lpAttributeList: attributes.as_mut_ptr(),
         };
-        let process =
-            spawn_with_security(&request, restricted.as_ref(), &startup, true, false, job)?;
+        let process = spawn_with_security(
+            &request,
+            restricted.as_ref(),
+            &startup,
+            true,
+            false,
+            job,
+            detached,
+        )?;
         pipes.close_child_ends();
         Ok(Self {
             process,
@@ -147,9 +169,30 @@ impl SandboxedPty {
         cols: Option<u16>,
         rows: Option<u16>,
     ) -> Result<Self, WindowsSandboxError> {
+        Self::spawn_with_lifetime(request, cols, rows, false)
+    }
+
+    pub fn spawn_detached(
+        request: SandboxSpawnRequest<'_>,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<Self, WindowsSandboxError> {
+        Self::spawn_with_lifetime(request, cols, rows, true)
+    }
+
+    fn spawn_with_lifetime(
+        request: SandboxSpawnRequest<'_>,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        detached: bool,
+    ) -> Result<Self, WindowsSandboxError> {
         let (restricted, appcontainer) = prepare_spawn_security(&request)?;
         let pty = PtyPipeSet::new(cols, rows)?;
-        let job = ProcessJob::create_unassigned(None)?;
+        let job = if detached {
+            ProcessJob::create_unassigned_detached(None)?
+        } else {
+            ProcessJob::create_unassigned(None)?
+        };
         let mut attributes = ProcessAttributeList::new(2 + u32::from(appcontainer.is_some()))?;
         attributes.set_pseudo_console(pty.console.raw())?;
         attributes.set_job(job.raw_handle())?;
@@ -170,8 +213,15 @@ impl SandboxedPty {
             },
             lpAttributeList: attributes.as_mut_ptr(),
         };
-        let process =
-            spawn_with_security(&request, restricted.as_ref(), &startup, false, true, job)?;
+        let process = spawn_with_security(
+            &request,
+            restricted.as_ref(),
+            &startup,
+            false,
+            true,
+            job,
+            detached,
+        )?;
         let (input, output) = pty.into_io();
         Ok(Self {
             process,
@@ -215,7 +265,9 @@ impl SandboxedPty {
 
 impl Drop for SandboxedPty {
     fn drop(&mut self) {
-        let _ = self.kill();
+        if !self.process.detached {
+            let _ = self.kill();
+        }
     }
 }
 
@@ -267,6 +319,7 @@ struct SandboxedProcess {
     process: OwnedHandle,
     job: Option<ProcessJob>,
     pid: u32,
+    detached: bool,
 }
 
 impl SandboxedProcess {
@@ -313,7 +366,9 @@ impl SandboxedProcess {
 
 impl Drop for SandboxedChild {
     fn drop(&mut self) {
-        let _ = self.kill();
+        if !self.process.detached {
+            let _ = self.kill();
+        }
     }
 }
 
@@ -347,6 +402,7 @@ fn spawn_with_security(
     inherit_handles: bool,
     use_pseudo_console: bool,
     job: ProcessJob,
+    detached: bool,
 ) -> Result<SandboxedProcess, WindowsSandboxError> {
     let (application, mut command_line) = launch_command(request.program, request.args)?;
     let application_name = wide_path(&application);
@@ -405,6 +461,7 @@ fn spawn_with_security(
         process,
         job: Some(job),
         pid: info.dwProcessId,
+        detached,
     })
 }
 
