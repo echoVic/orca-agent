@@ -168,6 +168,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
             );
         }
     }
+    if state.panel_mode == PanelMode::Conversation {
+        render_jump_to_bottom_pill(frame, state, theme);
+    }
     render_status(frame, chunks[7], state, theme);
 
     if state.user_input_dialog.is_none()
@@ -1607,33 +1610,57 @@ pub(crate) fn render_live_messages(
             0,
         );
     }
+}
 
-    // Floating "jump to bottom" pill, shown while the user has scrolled away
-    // from the tail (auto-follow disarmed). While detached it doubles as an
-    // unread indicator: messages landing below bump `unseen_messages`.
-    // Clicking it re-arms follow and clears the count.
-    if !state.viewport.auto_scroll && viewport.total_height > visible_height && area.height > 0 {
-        let label = match state.viewport.unseen_messages {
-            0 => " Jump to bottom (click) ↓ ".to_string(),
-            1 => " 1 new message (click) ↓ ".to_string(),
-            count => format!(" {count} new messages (click) ↓ "),
-        };
-        let pill_width = UnicodeWidthStr::width(label.as_str()) as u16;
-        if area.width >= pill_width {
-            let pill = Rect {
+/// Floating "jump to bottom" pill, shown while the user has scrolled away
+/// from the tail (auto-follow disarmed). While detached it doubles as an
+/// unread indicator: messages landing below bump `unseen_messages`. Clicking
+/// it re-arms follow and clears the count.
+///
+/// Drawn from `render()` after both the transcript and the input row are on
+/// screen, so it can sit on top of whichever is showing: right-aligned on
+/// the composer's (or another input widget's) top rule, or — only when the
+/// input row is hidden entirely (approval / plan-approval dialogs) — centered
+/// on the transcript's last row, same as before. A live copy notice on the
+/// composer rule wins over the pill for that frame rather than sharing cells.
+fn render_jump_to_bottom_pill(frame: &mut Frame, state: &mut AppState, theme: &Theme) {
+    let detached =
+        !state.viewport.auto_scroll && state.viewport.total_lines > state.viewport.visible_height;
+    if !detached || state.copy_notice_at(std::time::Instant::now()).is_some() {
+        return;
+    }
+    let label = match state.viewport.unseen_messages {
+        0 => " Jump to bottom (click) ↓ ".to_string(),
+        1 => " 1 new message (click) ↓ ".to_string(),
+        count => format!(" {count} new messages (click) ↓ "),
+    };
+    let pill_width = UnicodeWidthStr::width(label.as_str()) as u16;
+    let pill = if let Some(input_area) = state.viewport.input_area {
+        (input_area.height >= 3 && pill_width + 2 < input_area.width).then(|| Rect {
+            x: input_area.x + input_area.width - pill_width - 2,
+            y: input_area.y,
+            width: pill_width,
+            height: 1,
+        })
+    } else {
+        state.viewport.transcript_area.and_then(|area| {
+            (area.height > 0 && area.width >= pill_width).then(|| Rect {
                 x: area.x + (area.width - pill_width) / 2,
                 y: area.y + area.height - 1,
                 width: pill_width,
                 height: 1,
-            };
-            frame.render_widget(Clear, pill);
-            frame.render_widget(
-                Paragraph::new(Span::styled(label, theme.selection_style().fg(theme.text))),
-                pill,
-            );
-            state.viewport.jump_to_bottom_area = Some(pill);
-        }
-    }
+            })
+        })
+    };
+    let Some(pill) = pill else {
+        return;
+    };
+    frame.render_widget(Clear, pill);
+    frame.render_widget(
+        Paragraph::new(Span::styled(label, theme.selection_style().fg(theme.text))),
+        pill,
+    );
+    state.viewport.jump_to_bottom_area = Some(pill);
 }
 
 fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -9545,7 +9572,7 @@ mod tests {
     }
 
     #[test]
-    fn jump_to_bottom_pill_clears_the_cells_it_covers() {
+    fn jump_to_bottom_pill_sits_on_the_composer_rule_when_scrolled_up() {
         let mut state = test_state();
         for index in 0..40 {
             state.push_message(ChatMessage::Assistant(format!(
@@ -9563,23 +9590,76 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .unwrap();
+
         let pill = state.viewport.jump_to_bottom_area.expect("pill");
-        let buffer = terminal.backend().buffer();
-        let row: String = (0..80)
-            .map(|x| buffer[(x, pill.y)].symbol().to_string())
-            .collect();
-        let left = &row[..usize::from(pill.x)];
-        assert!(
-            !left.trim().is_empty(),
-            "transcript text should remain left of the pill: {row:?}"
+        let input_area = state.viewport.input_area.expect("composer area");
+        assert_eq!(
+            pill.y, input_area.y,
+            "pill should sit on the composer's top rule"
         );
-        let inside: String = (pill.x..pill.x + pill.width)
+
+        let buffer = terminal.backend().buffer();
+        let pill_row: String = (pill.x..pill.x + pill.width)
             .map(|x| buffer[(x, pill.y)].symbol().to_string())
             .collect();
-        assert!(inside.contains("Jump to bottom"), "{inside:?}");
+        assert!(pill_row.contains("Jump to bottom"), "{pill_row:?}");
+
+        let transcript_area = state.viewport.transcript_area.expect("transcript area");
+        let last_transcript_row = transcript_area.y + transcript_area.height - 1;
+        let transcript_row: String = (0..80)
+            .map(|x| buffer[(x, last_transcript_row)].symbol().to_string())
+            .collect();
         assert!(
-            !inside.contains('x'),
-            "pill must not show text through: {inside:?}"
+            !transcript_row.trim().is_empty(),
+            "transcript's last row should still show transcript text: {transcript_row:?}"
+        );
+        assert!(
+            !transcript_row.contains("Jump to bottom"),
+            "pill must not be drawn over the transcript: {transcript_row:?}"
+        );
+    }
+
+    #[test]
+    fn jump_to_bottom_pill_falls_back_below_the_transcript_when_the_composer_is_hidden() {
+        let mut state = test_state();
+        for index in 0..40 {
+            state.push_message(ChatMessage::Assistant(format!(
+                "{} line {index}",
+                "x".repeat(70)
+            )));
+        }
+        state.viewport.auto_scroll = false;
+        state.viewport.scroll_offset = 0;
+        state.update(TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "approval-1"),
+            tool: "bash".to_string(),
+            target: Some("cargo test".to_string()),
+            preview: None,
+        });
+        assert_eq!(state.status, AppStatus::WaitingApproval);
+
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+
+        assert!(
+            state.viewport.input_area.is_none(),
+            "composer should be hidden behind the approval dialog"
+        );
+        let pill = state.viewport.jump_to_bottom_area.expect("pill");
+        let transcript_area = state.viewport.transcript_area.expect("transcript area");
+        assert!(
+            pill.x >= transcript_area.x
+                && pill.y >= transcript_area.y
+                && pill.x + pill.width <= transcript_area.x + transcript_area.width
+                && pill.y + pill.height <= transcript_area.y + transcript_area.height,
+            "pill {pill:?} should fall back inside the transcript area {transcript_area:?} \
+             when the composer is hidden"
         );
     }
 
