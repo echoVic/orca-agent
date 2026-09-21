@@ -1068,6 +1068,7 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
 
     let inner_width = usize::from(inner.width);
     let filtered = state.filtered_session_indices();
+    let loaded = state.session_picker_sessions.len();
     let hidden = state.hidden_test_session_count();
 
     let mut lines = Vec::new();
@@ -1081,13 +1082,18 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
             Style::default().fg(theme.text),
         )
     };
-    let count_text = if hidden > 0 {
+    let hidden_suffix = if hidden > 0 {
+        format!(" · {hidden} test sessions hidden")
+    } else {
+        String::new()
+    };
+    let count_text = if state.session_picker_backfill_complete {
+        format!("{} sessions{hidden_suffix}", filtered.len())
+    } else {
         format!(
-            "{} sessions · {hidden} test sessions hidden",
+            "{} of {loaded} · indexing history…{hidden_suffix}",
             filtered.len()
         )
-    } else {
-        format!("{} sessions", filtered.len())
     };
     lines.push(Line::from(vec![
         Span::styled("⌕ ", theme.accent_style()),
@@ -1125,6 +1131,7 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
     let rows = state.session_picker_rows();
     let browsing = state.session_picker_phase == SessionPickerPhase::Browsing;
     let selected_index = state.session_picker_selected;
+    let query = state.session_picker_query.to_lowercase();
     let visible_rows: Vec<&SessionPickerRow> = if browsing {
         rows.iter().collect()
     } else {
@@ -1175,15 +1182,27 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
                     relative_time(session.updated_at, now),
                     session.provider
                 );
-                let mut line = crate::chrome::option_line(
-                    theme,
-                    selected,
-                    "",
-                    &title,
-                    title_width,
-                    &detail,
-                    inner_width,
-                );
+                let mut line = if query.is_empty() {
+                    crate::chrome::option_line(
+                        theme,
+                        selected,
+                        "",
+                        &title,
+                        title_width,
+                        &detail,
+                        inner_width,
+                    )
+                } else {
+                    session_row_with_highlight(
+                        theme,
+                        selected,
+                        &title,
+                        &query,
+                        title_width,
+                        &detail,
+                        inner_width,
+                    )
+                };
                 if session.health != StoredSessionHealth::Healthy {
                     line.spans.push(Span::styled(
                         format!("  [{:?}]", session.health),
@@ -1298,6 +1317,80 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
         .wrap(Wrap { trim: false })
         .scroll((scroll_offset, 0));
     frame.render_widget(paragraph, inner);
+}
+
+/// Same geometry and styling as `chrome::option_line` called with an empty
+/// key, but the label is `title` with the first case-insensitive occurrence
+/// of `needle` highlighted (via `highlight_match`) instead of one plain span.
+/// Used instead of `option_line` only while a search query is active, so the
+/// match stays visible; kept in lock-step with `option_line`'s width math so
+/// the detail column lines up whether or not a query is active.
+fn session_row_with_highlight(
+    theme: &Theme,
+    selected: bool,
+    title: &str,
+    needle: &str,
+    title_width: usize,
+    detail: &str,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected {
+        crate::chrome::MARK_SELECTED
+    } else {
+        crate::chrome::MARK_IDLE
+    };
+    let marker_style = if selected {
+        theme.accent_style().add_modifier(Modifier::BOLD)
+    } else {
+        theme.muted_style()
+    };
+    let label_style = if selected {
+        theme
+            .selection_style()
+            .fg(theme.text)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    // Mirrors option_line's `used` math: marker (1) + trailing space (1) +
+    // an empty key cell (0) + the padded label (title_width) + "  " (2).
+    let used = UnicodeWidthStr::width(marker) + 1 + title_width + 2;
+    let detail = truncate_to_display_width(detail, width.saturating_sub(used));
+
+    let mut spans = vec![Span::styled(format!("{marker} "), marker_style)];
+    spans.extend(highlight_match(title, needle, label_style, theme));
+    let padding = title_width.saturating_sub(UnicodeWidthStr::width(title));
+    if padding > 0 {
+        // Padding shares the label style so a selected row's highlight
+        // background still fills the column, matching `option_line`.
+        spans.push(Span::styled(" ".repeat(padding), label_style));
+    }
+    spans.push(Span::styled(format!("  {detail}"), theme.muted_style()));
+    Line::from(spans)
+}
+
+/// Split `text` into styled spans, highlighting the first case-insensitive
+/// occurrence of `needle` with the theme warning color. Empty needle returns
+/// the whole text in `base` style.
+fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
+    if needle.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let lower = text.to_lowercase();
+    let Some(start) = lower.find(needle) else {
+        return vec![Span::styled(text.to_string(), base)];
+    };
+    let end = start + needle.len();
+    let hl = base.fg(theme.warning).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled(text[..start].to_string(), base));
+    }
+    spans.push(Span::styled(text[start..end].to_string(), hl));
+    if end < text.len() {
+        spans.push(Span::styled(text[end..].to_string(), base));
+    }
+    spans
 }
 
 fn confirmation_line<'a>(selected: usize, confirm_label: &'a str, theme: &Theme) -> Line<'a> {
@@ -8607,6 +8700,117 @@ mod tests {
         let other_group_pos = rendered.find("other").expect("other project group label");
         assert!(current_group_pos < other_group_pos);
         assert!(rendered.contains("current project"));
+    }
+
+    #[test]
+    fn session_picker_header_reports_indexing_until_backfill_completes() {
+        let mut state = test_state();
+        state.status = AppStatus::SessionPicker;
+        state.session_picker_sessions = vec![session_summary("session-1", "One")];
+        state.session_picker_backfill_complete = false;
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let render_header = |state: &mut AppState| -> String {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
+                .expect("test backend");
+            terminal
+                .draw(|frame| render(frame, state, &textarea, &theme))
+                .expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        let indexing = render_header(&mut state);
+        assert!(indexing.contains("1 of 1 · indexing history…"));
+
+        state.session_picker_backfill_complete = true;
+        let complete = render_header(&mut state);
+        assert!(!complete.contains("indexing history…"));
+        assert!(complete.contains("1 sessions"));
+    }
+
+    /// Cells for one row of a rendered session-picker frame, used to compare
+    /// column geometry and per-cell style without depending on byte offsets
+    /// (several glyphs the picker uses, e.g. `›` and `·`, are multi-byte).
+    fn session_picker_row_cells(
+        state: &mut AppState,
+        theme: &Theme,
+        textarea: &TextArea,
+        row: u16,
+    ) -> Vec<ratatui::buffer::Cell> {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, state, textarea, theme))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].clone())
+            .collect()
+    }
+
+    fn find_cell_column(cells: &[ratatui::buffer::Cell], needle: &str) -> usize {
+        let needle_symbols: Vec<String> = needle.chars().map(|ch| ch.to_string()).collect();
+        cells
+            .windows(needle_symbols.len())
+            .position(|window| {
+                window
+                    .iter()
+                    .zip(needle_symbols.iter())
+                    .all(|(cell, symbol)| cell.symbol() == symbol)
+            })
+            .unwrap_or_else(|| panic!("{needle:?} not found in row"))
+    }
+
+    #[test]
+    fn session_picker_query_highlight_keeps_the_same_column_geometry_as_plain_rows() {
+        let mut state = test_state();
+        state.status = AppStatus::SessionPicker;
+        state.session_picker_sessions = vec![session_summary("session-1", "Deploy pipeline fix")];
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+
+        // Rows: border(0), query(1), hints(2), blank(3), group header(4),
+        // the one session (5).
+        let plain_cells = session_picker_row_cells(&mut state, &theme, &textarea, 5);
+        state.session_picker_query = "pipeline".to_string();
+        let highlighted_cells = session_picker_row_cells(&mut state, &theme, &textarea, 5);
+
+        let plain_col = find_cell_column(&plain_cells, "deepseek");
+        let highlighted_col = find_cell_column(&highlighted_cells, "deepseek");
+        assert_eq!(
+            plain_col, highlighted_col,
+            "the provider/time column must start at the same place whether or not a query is active"
+        );
+    }
+
+    #[test]
+    fn session_picker_query_match_is_highlighted_in_the_warning_style() {
+        let mut state = test_state();
+        state.status = AppStatus::SessionPicker;
+        state.session_picker_sessions = vec![session_summary("session-1", "Deploy pipeline fix")];
+        state.session_picker_query = "pipeline".to_string();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+
+        let cells = session_picker_row_cells(&mut state, &theme, &textarea, 5);
+        let match_col = find_cell_column(&cells, "pipeline");
+        for offset in 0.."pipeline".len() {
+            assert_eq!(
+                cells[match_col + offset].fg,
+                theme.warning,
+                "column {} (inside the match) should carry the highlight color",
+                match_col + offset
+            );
+        }
+        // The title text right before the match keeps the plain title style.
+        assert_ne!(cells[match_col - 1].fg, theme.warning);
     }
 
     #[test]
