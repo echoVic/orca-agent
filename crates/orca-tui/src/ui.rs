@@ -92,7 +92,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         InputRegion::Hidden => 0,
         InputRegion::Composer => composer_layout
             .as_ref()
-            .map(|layout| composer_input_height(frame.area().width, textarea, layout))
+            .map(composer_input_height)
             .unwrap_or(0),
         InputRegion::Interaction => state
             .user_input_dialog
@@ -161,7 +161,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
         InputRegion::Hidden => {}
         InputRegion::Composer => {
             state.viewport.input_area = Some(chunks[6]);
-            render_input(
+            render_composer(
                 frame,
                 chunks[6],
                 textarea,
@@ -3442,7 +3442,35 @@ fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
     }
 }
 
-fn render_input(
+/// `" › "`: three columns, replacing the composer's left border.
+pub(crate) const COMPOSER_PROMPT: &str = " › ";
+const COMPOSER_PROMPT_WIDTH: u16 = 3;
+
+/// The editable cells of the composer: below the top rule, right of the prompt,
+/// above the bottom rule.
+pub(crate) fn composer_inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(COMPOSER_PROMPT_WIDTH),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(COMPOSER_PROMPT_WIDTH),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+/// The composer owns the keyboard (and so draws its accent rule) whenever no
+/// other surface is modal over it.
+fn composer_focused(state: &AppState) -> bool {
+    state.config_dialog.is_none()
+        && state.full_access_confirmation.is_none()
+        && state.plan_approval_dialog.is_none()
+        && !state.show_shortcuts
+        && state.image_viewer.is_none()
+        && !state.transcript.search.open
+}
+
+/// Draws the composer as two horizontal rules around a `›` prompt and the
+/// textarea content, replacing the old bordered " Input " block.
+fn render_composer(
     frame: &mut Frame,
     area: Rect,
     textarea: &TextArea,
@@ -3451,12 +3479,49 @@ fn render_input(
     theme: &Theme,
     show_hardware_cursor: bool,
 ) {
+    if area.height < 3 || area.width <= COMPOSER_PROMPT_WIDTH {
+        return;
+    }
+    let focused = composer_focused(state);
+    let rule = crate::chrome::rule_line(theme, area.width, focused);
+    frame.render_widget(
+        Paragraph::new(rule.clone()),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(rule),
+        Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+    );
+    let prompt_style = if focused {
+        theme.accent_style()
+    } else {
+        theme.dim_style()
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(COMPOSER_PROMPT, prompt_style)),
+        Rect::new(area.x, area.y + 1, COMPOSER_PROMPT_WIDTH, 1),
+    );
+    // Transient "copied N chars" feedback sits on the right end of the top rule.
+    if let Some(notice) = state.copy_notice_at(std::time::Instant::now()) {
+        let text = if notice.local_only {
+            format!(" copied {} chars (local clipboard only) ", notice.chars)
+        } else {
+            format!(" copied {} chars to clipboard ", notice.chars)
+        };
+        let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
+        if text_width + 2 < area.width {
+            frame.render_widget(
+                Paragraph::new(Span::styled(text, Style::default().fg(theme.approval))),
+                Rect::new(area.x + area.width - text_width - 2, area.y, text_width, 1),
+            );
+        }
+    }
     render_textarea_surface(
         frame,
-        area,
+        composer_inner(area),
         textarea,
         Some(layout),
-        state.copy_notice_at(std::time::Instant::now()),
+        None,
         theme,
         show_hardware_cursor,
     );
@@ -3597,20 +3662,10 @@ fn render_textarea_block_and_notice(
     inner
 }
 
-fn composer_input_height(
-    area_width: u16,
-    textarea: &TextArea,
-    layout: &TextareaVisualLayout,
-) -> u16 {
-    let input_lines = layout.lines.len().max(1) as u16;
-    let block_extra = textarea
-        .block()
-        .map(|block| {
-            let outer = Rect::new(0, 0, area_width, u16::MAX);
-            u16::MAX.saturating_sub(block.inner(outer).height)
-        })
-        .unwrap_or(0);
-    input_lines.saturating_add(block_extra)
+/// Total composer height: the visible textarea lines plus the top and bottom
+/// rules.
+fn composer_input_height(layout: &TextareaVisualLayout) -> u16 {
+    (layout.lines.len().max(1) as u16).saturating_add(2)
 }
 
 fn composer_visual_layout(
@@ -3618,15 +3673,8 @@ fn composer_visual_layout(
     textarea: &TextArea,
     theme: &Theme,
 ) -> TextareaVisualLayout {
-    let inner_width = textarea_inner_width(area_width, textarea) as usize;
+    let inner_width = usize::from(area_width.saturating_sub(COMPOSER_PROMPT_WIDTH)).max(1);
     textarea_visual_layout_with_selection(textarea, inner_width, theme.selection_style())
-}
-
-fn textarea_inner_width(area_width: u16, textarea: &TextArea) -> u16 {
-    textarea
-        .block()
-        .map(|block| block.inner(Rect::new(0, 0, area_width, 1)).width)
-        .unwrap_or(area_width)
 }
 
 struct TextareaVisualLayout {
@@ -5260,17 +5308,14 @@ pub(crate) fn session_picker_hit_index(state: &AppState, row: u16) -> Option<usi
 }
 
 /// Map a click inside the composer to a `(row, col)` cursor position in the
-/// textarea, replicating `render_input`'s wrap and scroll behavior.
+/// textarea, replicating `render_composer`'s wrap and scroll behavior.
 pub(crate) fn composer_click_target(
     textarea: &TextArea,
     area: Rect,
     column: u16,
     row: u16,
 ) -> Option<(u16, u16)> {
-    let inner = textarea
-        .block()
-        .map(|block| block.inner(area))
-        .unwrap_or(area);
+    let inner = composer_inner(area);
     if inner.is_empty() || !inner.contains(ratatui::layout::Position::new(column, row)) {
         return None;
     }
@@ -8406,13 +8451,8 @@ mod tests {
 查看完整的可视化报告，支持响应式布局，手机和桌面均可阅读。"#
                 .to_string();
 
-        let mut textarea = TextArea::default();
-        textarea.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Input "),
-        );
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
         for (width, height) in [
             (90, 24),
             (120, 32),
@@ -8456,8 +8496,8 @@ mod tests {
                 "completed answer tail should be visible immediately at {width}x{height}, not only after the next prompt"
             );
             assert!(
-                rendered.contains("Input"),
-                "composer should remain pinned below the transcript at {width}x{height}"
+                rendered.contains("─"),
+                "composer rule should remain pinned below the transcript at {width}x{height}"
             );
         }
     }
@@ -9785,7 +9825,11 @@ mod tests {
         state.replace_workflow_tasks_for_test(vec![task]);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let textarea = TextArea::default();
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(52, 12))
+        // Height 14, not 12: the composer is now always 3 rows (top rule,
+        // prompt, bottom rule) regardless of the textarea's own block, so the
+        // workspace panel needs the same two extra rows it always effectively
+        // rendered under to keep every hint line visible.
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(52, 14))
             .expect("test backend");
 
         terminal
@@ -10598,12 +10642,47 @@ mod tests {
 
     #[test]
     fn composer_layout_counts_soft_wrapped_visual_lines() {
-        let mut textarea = TextArea::from(vec!["alpha bravo charlie".to_string()]);
-        textarea.set_block(Block::default().borders(Borders::ALL));
+        let textarea = TextArea::from(vec!["alpha bravo charlie".to_string()]);
         let theme = Theme::named(ThemeName::Dark);
 
         let layout = composer_visual_layout(12, &textarea, &theme);
-        assert_eq!(composer_input_height(12, &textarea, &layout), 5);
+        assert_eq!(composer_input_height(&layout), 5);
+    }
+
+    #[test]
+    fn composer_renders_two_rules_and_a_prompt_without_side_borders() {
+        let mut state = test_state();
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let input = state.viewport.input_area.expect("composer area");
+        assert_eq!(input.height, 3);
+        let row = |y: u16| -> String {
+            (0..input.width)
+                .map(|x| buffer[(input.x + x, y)].symbol().to_string())
+                .collect()
+        };
+        assert_eq!(row(input.y), "─".repeat(60));
+        assert_eq!(row(input.y + 2), "─".repeat(60));
+        assert!(row(input.y + 1).starts_with(" › "));
+        assert!(!row(input.y + 1).contains('│'));
+        assert!(!format!("{:?}", buffer).contains("Input"));
+    }
+
+    #[test]
+    fn composer_click_target_accounts_for_prompt_and_top_rule() {
+        let textarea = TextArea::from(["hello world"]);
+        let area = Rect::new(0, 20, 60, 3);
+        assert_eq!(composer_click_target(&textarea, area, 3, 21), Some((0, 0)));
+        assert_eq!(composer_click_target(&textarea, area, 9, 21), Some((0, 6)));
+        assert_eq!(composer_click_target(&textarea, area, 9, 20), None);
+        assert_eq!(composer_click_target(&textarea, area, 1, 21), None);
     }
 
     #[test]
@@ -10730,11 +10809,15 @@ mod tests {
             let mut textarea = TextArea::from([grapheme]);
             textarea.move_cursor(tui_textarea::CursorMove::Forward);
             let layout = textarea_visual_layout(&textarea, width);
-            let area = Rect::new(10, 5, width as u16, 1);
+            // `composer_click_target` always carves the prompt/rule chrome out of
+            // `area`; pad the outer rect so the resulting inner rect keeps the
+            // same width x 1 shape this test exercises, then click its origin.
+            let area = Rect::new(10, 5, width as u16 + 3, 1 + 2);
+            let inner = composer_inner(area);
 
             assert_eq!(layout.cursor_display_col, 0, "{grapheme:?}");
             assert_eq!(
-                composer_click_target(&textarea, area, area.x, area.y),
+                composer_click_target(&textarea, area, inner.x, inner.y),
                 Some((0, 1)),
                 "{grapheme:?}"
             );
@@ -10800,8 +10883,10 @@ mod tests {
             layout.lines[0].spans.last().unwrap().style,
             textarea.cursor_style()
         );
+        let area = Rect::new(0, 0, 4 + 3, 1 + 2);
+        let inner = composer_inner(area);
         assert_eq!(
-            composer_click_target(&textarea, Rect::new(0, 0, 4, 1), 0, 0),
+            composer_click_target(&textarea, area, inner.x, inner.y),
             Some((0, 1))
         );
     }
@@ -10838,8 +10923,10 @@ mod tests {
         assert_eq!(start_layout.lines[0].to_string(), text);
         assert_eq!(start_layout.cursor_display_col, 0);
         assert_eq!(after_mark_layout.cursor_display_col, 0);
+        let click_area = Rect::new(0, 0, 4 + 3, 1 + 2);
+        let click_inner = composer_inner(click_area);
         assert_eq!(
-            composer_click_target(&textarea, Rect::new(0, 0, 4, 1), 0, 0),
+            composer_click_target(&textarea, click_area, click_inner.x, click_inner.y),
             Some((0, 1))
         );
         let area = Rect::new(0, 0, 4, 1);
@@ -10908,9 +10995,9 @@ mod tests {
 
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(5, 7));
+            .assert_cursor_position(Position::new(7, 7));
         assert!(
-            terminal.backend().buffer()[(5, 7)]
+            terminal.backend().buffer()[(7, 7)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -10932,9 +11019,9 @@ mod tests {
 
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(3, 7));
+            .assert_cursor_position(Position::new(7, 7));
         assert!(
-            terminal.backend().buffer()[(3, 7)]
+            terminal.backend().buffer()[(7, 7)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -10958,7 +11045,7 @@ mod tests {
                 .draw(|frame| render(frame, &mut state, &textarea, &theme))
                 .unwrap();
 
-            let cursor = Position::new(1, 7);
+            let cursor = Position::new(3, 7);
             assert_eq!(textarea.cursor(), (0, 1), "{grapheme:?}");
             assert_eq!(textarea.lines(), &[grapheme.to_string()], "{grapheme:?}");
             terminal.backend_mut().assert_cursor_position(cursor);
@@ -11069,9 +11156,9 @@ mod tests {
 
             terminal
                 .backend_mut()
-                .assert_cursor_position(Position::new(1, 7));
+                .assert_cursor_position(Position::new(3, 7));
             assert!(
-                terminal.backend().buffer()[(1, 7)]
+                terminal.backend().buffer()[(3, 7)]
                     .modifier
                     .contains(Modifier::REVERSED),
                 "{status:?}"
@@ -11112,7 +11199,7 @@ mod tests {
 
             terminal
                 .backend_mut()
-                .assert_cursor_position(Position::new(1, 7));
+                .assert_cursor_position(Position::new(3, 7));
         }
     }
 
@@ -11139,7 +11226,7 @@ mod tests {
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .unwrap();
 
-        let cursor = Position::new(1, 13);
+        let cursor = Position::new(3, 13);
         terminal.backend_mut().assert_cursor_position(cursor);
         let cursor_cell = &terminal.backend().buffer()[cursor];
         assert_eq!(cursor_cell.symbol(), " ");
@@ -11180,7 +11267,7 @@ mod tests {
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .unwrap();
 
-        let cursor = Position::new(1, 13);
+        let cursor = Position::new(3, 13);
         terminal.backend_mut().assert_cursor_position(cursor);
         let cursor_cell = &terminal.backend().buffer()[cursor];
         assert_eq!(cursor_cell.symbol(), " ");
@@ -11215,8 +11302,8 @@ mod tests {
 
             terminal
                 .backend_mut()
-                .assert_cursor_position(Position::new(1, 7));
-            let cursor_cell = &terminal.backend().buffer()[(1, 7)];
+                .assert_cursor_position(Position::new(3, 7));
+            let cursor_cell = &terminal.backend().buffer()[(3, 7)];
             let cursor_style = cursor_cell.style();
             assert_eq!(cursor_style.fg, Some(cursor_color), "{mode:?}");
             assert_eq!(cursor_style.bg, Some(Color::Reset), "{mode:?}");
@@ -11471,7 +11558,7 @@ mod tests {
                 .filter(|event| matches!(event, CursorEvent::Move(_)))
                 .copied()
                 .collect::<Vec<_>>(),
-            [CursorEvent::Move(Position::new(1, 7))],
+            [CursorEvent::Move(Position::new(3, 7))],
             "{first_idle_events:?}"
         );
 
@@ -11530,7 +11617,7 @@ mod tests {
                 .filter(|event| matches!(event, CursorEvent::Move(_)))
                 .copied()
                 .collect::<Vec<_>>(),
-            [CursorEvent::Move(Position::new(1, 7))],
+            [CursorEvent::Move(Position::new(3, 7))],
             "{second_idle_events:?}"
         );
     }
@@ -11551,8 +11638,10 @@ mod tests {
             layout.lines[0].spans.last().unwrap().style,
             textarea.cursor_style()
         );
+        let click_area = Rect::new(0, 0, 10 + 3, 1 + 2);
+        let click_inner = composer_inner(click_area);
         assert_eq!(
-            composer_click_target(&textarea, Rect::new(0, 0, 10, 1), 2, 0),
+            composer_click_target(&textarea, click_area, click_inner.x + 2, click_inner.y),
             Some((0, 3))
         );
         let area = Rect::new(0, 0, 10, 1);
@@ -11720,17 +11809,29 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let mut masked = crate::composer_textarea::make_setup_textarea(&theme);
         masked.insert_str("密钥abc");
-        let area = Rect::new(10, 5, 4, 5);
-        let inner = masked.block().unwrap().inner(area);
+        // `composer_click_target` now derives its hit-test rect from
+        // `composer_inner` alone, independent of the textarea's own (setup-only)
+        // block; the old ALL-borders block turned a 4x5 outer area into a 2x3
+        // inner one, so pad a fresh outer area to make `composer_inner` yield
+        // that same 2x3 shape the masked field wrapped into before.
+        let area = Rect::new(10, 5, 2 + 3, 3 + 2);
+        let inner = composer_inner(area);
         assert_eq!(
             composer_click_target(&masked, area, inner.x + 1, inner.y + 1),
             Some((0, 3))
         );
 
         let cjk = TextArea::from(["界a"]);
-        let area = Rect::new(0, 0, 6, 1);
-        assert_eq!(composer_click_target(&cjk, area, 1, 0), Some((0, 0)));
-        assert_eq!(composer_click_target(&cjk, area, 2, 0), Some((0, 1)));
+        let area = Rect::new(0, 0, 6 + 3, 1 + 2);
+        let inner = composer_inner(area);
+        assert_eq!(
+            composer_click_target(&cjk, area, inner.x + 1, inner.y),
+            Some((0, 0))
+        );
+        assert_eq!(
+            composer_click_target(&cjk, area, inner.x + 2, inner.y),
+            Some((0, 1))
+        );
     }
 
     #[test]
@@ -11738,22 +11839,25 @@ mod tests {
         for grapheme in ["👍🏽", "👨‍👩‍👧‍👦", "1️⃣"] {
             let text = format!("{grapheme}x");
             let textarea = TextArea::from([text.as_str()]);
-            let area = Rect::new(0, 0, 6, 1);
+            let area = Rect::new(0, 0, 6 + 3, 1 + 2);
+            let inner = composer_inner(area);
             assert_eq!(
-                composer_click_target(&textarea, area, 1, 0),
+                composer_click_target(&textarea, area, inner.x + 1, inner.y),
                 Some((0, 0)),
                 "{grapheme:?}"
             );
             assert_eq!(
-                composer_click_target(&textarea, area, 2, 0),
+                composer_click_target(&textarea, area, inner.x + 2, inner.y),
                 Some((0, grapheme.chars().count() as u16)),
                 "{grapheme:?}"
             );
 
             let wrapped_text = grapheme.repeat(2);
             let wrapped = TextArea::from([wrapped_text.as_str()]);
+            let wrapped_area = Rect::new(0, 0, 2 + 3, 2 + 2);
+            let wrapped_inner = composer_inner(wrapped_area);
             assert_eq!(
-                composer_click_target(&wrapped, Rect::new(0, 0, 2, 2), 0, 1),
+                composer_click_target(&wrapped, wrapped_area, wrapped_inner.x, wrapped_inner.y + 1),
                 Some((0, grapheme.chars().count() as u16)),
                 "{grapheme:?}"
             );
@@ -11762,16 +11866,19 @@ mod tests {
 
     #[test]
     fn composer_click_maps_word_wrap_and_synthetic_cursor_rows() {
+        let area = Rect::new(0, 0, 6 + 3, 2 + 2);
+        let inner = composer_inner(area);
+
         let wrapped = TextArea::from(["alpha bravo"]);
         assert_eq!(
-            composer_click_target(&wrapped, Rect::new(0, 0, 6, 2), 0, 1),
+            composer_click_target(&wrapped, area, inner.x, inner.y + 1),
             Some((0, 6))
         );
 
         let mut exact = TextArea::from(["abcdef"]);
         exact.move_cursor(tui_textarea::CursorMove::End);
         assert_eq!(
-            composer_click_target(&exact, Rect::new(0, 0, 6, 2), 0, 1),
+            composer_click_target(&exact, area, inner.x, inner.y + 1),
             Some((0, 6))
         );
     }
@@ -12459,14 +12566,9 @@ mod tests {
             .join("\n");
         state.transcript.messages.push(ChatMessage::Assistant(body));
         state.viewport.auto_scroll = true;
-        // Real composer carries a bordered "Input" block (3 rows tall), like make_textarea.
-        let mut textarea = TextArea::default();
-        textarea.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Input "),
-        );
+        // Real composer: two rules around a prompt (3 rows tall), like make_textarea.
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
         let h = 24u16;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, h))
             .expect("test backend");
@@ -12479,7 +12581,7 @@ mod tests {
         let has = |needle: &str| (0..h).any(|y| row_text(y).contains(needle));
 
         assert!(
-            has("Input"),
+            has("─"),
             "input box must stay visible when the transcript overflows"
         );
         assert!(

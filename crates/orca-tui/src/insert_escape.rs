@@ -45,7 +45,7 @@ pub(crate) fn resolve_pending_insert_escape_before_routing(
     }
     match vim_state.resolve_pending_insert_escape(&Input::from(event.clone()), now, textarea) {
         PendingInsertEscapeFlow::Consumed => {
-            vim_state.configure_block(textarea, theme);
+            vim_state.configure_textarea(textarea, theme);
             PendingInsertEscapeRouting::Consumed
         }
         PendingInsertEscapeFlow::Flushed => {

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use orca_core::config::VimInsertEscapeSequence;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::Block;
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 
 use crate::theme::Theme;
@@ -148,6 +148,7 @@ impl VimState {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn title(&self) -> &'static str {
         if !self.enabled {
             " Input "
@@ -160,13 +161,22 @@ impl VimState {
         }
     }
 
-    pub fn configure_block(&self, textarea: &mut TextArea<'_>, theme: &Theme) {
-        textarea.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(self.title())
-                .border_style(Style::default().fg(theme.border)),
-        );
+    /// Label for the status bar; `None` when vim mode is off.
+    pub fn status_label(&self) -> Option<&'static str> {
+        if !self.enabled {
+            return None;
+        }
+        Some(match self.mode {
+            VimMode::Insert => "INSERT",
+            VimMode::Normal => "NORMAL",
+            VimMode::Visual => "VISUAL",
+        })
+    }
+
+    /// The composer has no block any more: the rules and prompt are drawn by
+    /// `ui::render_composer`. Only the cursor style follows the vim mode.
+    pub fn configure_textarea(&self, textarea: &mut TextArea<'_>, theme: &Theme) {
+        textarea.set_block(Block::default());
         let cursor_color = match self.mode {
             VimMode::Insert => theme.border,
             VimMode::Normal => theme.warning,
@@ -203,7 +213,7 @@ impl VimState {
             VimMode::Insert
         };
         textarea.cancel_selection();
-        self.configure_block(textarea, theme);
+        self.configure_textarea(textarea, theme);
     }
 
     pub fn handle(&mut self, input: Input, textarea: &mut TextArea<'_>, theme: &Theme) -> bool {
@@ -225,7 +235,7 @@ impl VimState {
             VimMode::Insert => self.handle_insert_at(input, textarea, now),
             VimMode::Normal | VimMode::Visual => self.handle_command(input, textarea),
         };
-        self.configure_block(textarea, theme);
+        self.configure_textarea(textarea, theme);
         changed
     }
 

@@ -57,11 +57,9 @@ pub(crate) fn make_textarea_with_text_at_cursor<'a>(
 }
 
 fn configure_textarea(textarea: &mut TextArea, vim_state: &VimState, theme: &Theme) {
-    textarea.set_placeholder_text(
-        "Type a message…  / commands · @ files · $ skills  (Alt+Enter newline)",
-    );
+    textarea.set_placeholder_text("Message Orca…  / commands · @ files · $ skills");
     textarea.set_cursor_line_style(ratatui::style::Style::default());
-    vim_state.configure_block(textarea, theme);
+    vim_state.configure_textarea(textarea, theme);
 }
 
 pub(crate) fn textarea_text(textarea: &TextArea) -> String {

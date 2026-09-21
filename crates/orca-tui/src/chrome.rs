@@ -125,7 +125,6 @@ pub(crate) fn option_line(
 
 /// A horizontal rule the width of the area; accent when the surface owns the
 /// keyboard, dim otherwise.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rule_line(theme: &Theme, width: u16, focused: bool) -> Line<'static> {
     let style = if focused {
         theme.accent_style()

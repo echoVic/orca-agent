@@ -1575,13 +1575,17 @@ mod tests {
     #[test]
     fn composer_click_positions_cursor_and_drag_selects() {
         let mut state = state_with_transcript();
-        state.viewport.input_area = Some(Rect::new(0, 20, 40, 2));
+        // `composer_click_target` now always reserves the top/bottom rule rows
+        // and the 3-column ` › ` prompt, so the outer input area needs 2 extra
+        // rows (height 4, not 2) and every click lands 3 columns / 1 row past
+        // where it would inside the old bordered composer.
+        state.viewport.input_area = Some(Rect::new(0, 20, 40, 4));
         let mut textarea = TextArea::from(["hello world", "second line"]);
         let now = Instant::now();
 
         // Click on row 1, column 6 → cursor jumps there.
         let flow = super::handle_mouse_event(
-            &mouse_at(MouseEventKind::Down(MouseButton::Left), 6, 21),
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 9, 22),
             &mut state,
             &mut textarea,
             now,
@@ -1592,13 +1596,13 @@ mod tests {
 
         // Drag to column 11 on the same row: an in-composer selection forms.
         super::handle_mouse_event(
-            &mouse_at(MouseEventKind::Drag(MouseButton::Left), 11, 21),
+            &mouse_at(MouseEventKind::Drag(MouseButton::Left), 14, 22),
             &mut state,
             &mut textarea,
             now,
         );
         super::handle_mouse_event(
-            &mouse_at(MouseEventKind::Up(MouseButton::Left), 11, 21),
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), 14, 22),
             &mut state,
             &mut textarea,
             now,
@@ -1612,13 +1616,13 @@ mod tests {
 
         // A plain click (no drag) leaves no selection behind.
         super::handle_mouse_event(
-            &mouse_at(MouseEventKind::Down(MouseButton::Left), 2, 20),
+            &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 21),
             &mut state,
             &mut textarea,
             now,
         );
         super::handle_mouse_event(
-            &mouse_at(MouseEventKind::Up(MouseButton::Left), 2, 20),
+            &mouse_at(MouseEventKind::Up(MouseButton::Left), 5, 21),
             &mut state,
             &mut textarea,
             now,
