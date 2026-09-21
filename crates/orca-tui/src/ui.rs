@@ -4275,33 +4275,36 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
         ));
     }
 
-    // Right zone, highest priority first: model · effort · ctx · tokens · cost · ? help.
-    let mut right: Vec<Span<'static>> = vec![Span::styled(
-        format!(
-            "{}{separator}{}",
-            displayed_model_name(&state.model_name),
-            state.reasoning_effort.as_str()
-        ),
-        theme.muted_style(),
-    )];
-    if state.context_limit_tokens() > 0 {
-        right.push(context_cell(state, theme));
-    }
+    // Right zone, highest priority first: `? help` › `ctx N%` › model ·
+    // effort (truncated to an 8-cell floor before it is dropped) › tokens ·
+    // cost (the first thing dropped).
+    let mut model_text = format!(
+        "{}{separator}{}",
+        displayed_model_name(&state.model_name),
+        state.reasoning_effort.as_str()
+    );
+    let context_span = (state.context_limit_tokens() > 0).then(|| context_cell(state, theme));
+    let context_width = context_span
+        .as_ref()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .unwrap_or(0);
     let usage = state.usage();
-    if usage.total_tokens() > 0 {
-        right.push(Span::styled(
+    let usage_span = (usage.total_tokens() > 0).then(|| {
+        Span::styled(
             format!(
                 "{separator}{}{separator}{}",
                 format_token_count(usage.total_tokens()),
                 format_cost(usage.estimated_cost_usd)
             ),
             theme.muted_style(),
-        ));
-    }
-    right.push(Span::styled(
-        format!("{separator}? help "),
-        theme.muted_style(),
-    ));
+        )
+    });
+    let usage_width = usage_span
+        .as_ref()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .unwrap_or(0);
+    let help_text = format!("{separator}? help ");
+    let help_width = UnicodeWidthStr::width(help_text.as_str());
 
     let span_width = |spans: &[Span<'static>]| -> usize {
         spans
@@ -4310,12 +4313,58 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
             .sum()
     };
     let left_width = span_width(&left);
-    let mut right_width = span_width(&right);
-    // Drop tokens/cost, then context, then effort before ever touching the chip.
-    while left_width + right_width + 2 > width && right.len() > 1 {
-        right.remove(right.len() - 2);
-        right_width = span_width(&right);
+
+    // Total right-zone width for a given state of the shrinkable cells.
+    let total = |model_width: usize, has_context: bool, has_usage: bool| {
+        left_width
+            + model_width
+            + if has_context { context_width } else { 0 }
+            + if has_usage { usage_width } else { 0 }
+            + help_width
+            + 2
+    };
+
+    const MODEL_MIN_WIDTH: usize = 8;
+    let mut has_context = context_span.is_some();
+    let mut has_usage = usage_span.is_some();
+    let mut has_model = true;
+    let mut model_width = UnicodeWidthStr::width(model_text.as_str());
+
+    // 1. Drop tokens/cost first.
+    if has_usage && total(model_width, has_context, has_usage) > width {
+        has_usage = false;
     }
+    // 2. Truncate model · effort down to the 8-cell floor.
+    if total(model_width, has_context, has_usage) > width {
+        let reserved = left_width + help_width + 2 + if has_context { context_width } else { 0 };
+        let floor = MODEL_MIN_WIDTH.min(model_width);
+        let budget = width.saturating_sub(reserved).max(floor);
+        if budget < model_width {
+            model_text = truncate_to_display_width(&model_text, budget);
+            model_width = UnicodeWidthStr::width(model_text.as_str());
+        }
+    }
+    // 3. Drop context entirely.
+    if has_context && total(model_width, has_context, has_usage) > width {
+        has_context = false;
+    }
+    // 4. Drop model · effort entirely — only once context is already gone.
+    if has_model && total(model_width, has_context, has_usage) > width {
+        has_model = false;
+    }
+
+    let mut right: Vec<Span<'static>> = Vec::new();
+    if has_model {
+        right.push(Span::styled(model_text, theme.muted_style()));
+    }
+    if has_context {
+        right.push(context_span.expect("has_context implies context_span is Some"));
+    }
+    if has_usage {
+        right.push(usage_span.expect("has_usage implies usage_span is Some"));
+    }
+    right.push(Span::styled(help_text, theme.muted_style()));
+    let right_width = span_width(&right);
 
     // Middle zone: cwd · branch, only when there is room for at least 12 cells.
     let mut spans = left;
@@ -8739,14 +8788,24 @@ mod tests {
         assert!(!narrow.contains("git:"));
         assert!(narrow.contains("? help"));
 
-        // Narrowest: context itself is dropped and the workspace cell is
-        // gone, but the mode chip, model/effort and the help hint never are.
-        let narrowest = status_line(&state, &theme, 46).to_string();
+        // Narrower still: the model · effort cell truncates (ending in `…`)
+        // rather than disappearing, and context keeps showing in full.
+        let narrower = status_line(&state, &theme, 46).to_string();
+        assert!(narrower.contains("auto-edit"));
+        assert!(narrower.contains("ctx 75%"));
+        assert!(!narrower.contains("8.7k"));
+        assert!(!narrower.contains("git:"));
+        assert!(narrower.contains('…'), "{narrower}");
+        assert!(narrower.contains("? help"));
+
+        // Narrowest: context itself is dropped and the model cell disappears
+        // entirely, but the mode chip and the help hint never do.
+        let narrowest = status_line(&state, &theme, 32).to_string();
         assert!(narrowest.contains("auto-edit"));
         assert!(!narrowest.contains("ctx"));
         assert!(!narrowest.contains("git:"));
         assert!(!narrowest.contains("blade-deepseek"));
-        assert!(narrowest.contains("deepseek · max"));
+        assert!(!narrowest.contains("deepseek"));
         assert!(narrowest.contains("? help"));
     }
 
@@ -8785,10 +8844,9 @@ mod tests {
 
     #[test]
     fn status_line_reserves_known_context_before_truncating_a_long_model() {
-        // The three-zone layout never mid-word-truncates the model/effort
-        // cell: a span that does not fit is dropped whole, not garbled. An
-        // oversized model name therefore disappears entirely at narrow
-        // widths, and reappears in full (never partial) once there is room.
+        // Context is protected ahead of the model/effort cell: a known `ctx
+        // N%` keeps showing even when the model name is too long to fit, and
+        // the model cell truncates (ending in `…`) rather than vanishing.
         let mut state = test_state();
         state.model_name = "a-very-long-model-name-that-would-fill-the-footer".to_string();
         set_surface_context(&mut state, 250, 1_000);
@@ -8798,11 +8856,14 @@ mod tests {
 
         let narrow = status_line(&state, &theme, 46).to_string();
         assert!(narrow.contains("auto-edit"));
+        assert!(narrow.contains("ctx 75%"), "{narrow}");
         assert!(
-            !narrow.contains("a-very-long-model-name"),
-            "an oversized model cell should be dropped, not truncated into view: {narrow}"
+            narrow.contains('…'),
+            "an oversized model cell should truncate, not vanish: {narrow}"
         );
-        assert!(!narrow.contains("ctx"));
+        assert!(!narrow.contains("a-very-long-model-name-that-would-fill-the-footer"));
+        assert!(!narrow.contains("~/workspace"));
+        assert!(!narrow.contains("git:main"));
         assert!(narrow.contains("? help"));
         assert!(UnicodeWidthStr::width(narrow.as_str()) <= 46);
 
