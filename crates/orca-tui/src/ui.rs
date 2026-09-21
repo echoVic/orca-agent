@@ -331,29 +331,6 @@ fn main_layout(
     .split(area)
 }
 
-/// A `width`×`height` rect centered inside `area`, clamped so it never extends past
-/// `area`'s bounds.
-///
-/// Floating popups (setup, approval dialog, shortcuts, panel overlays) are positioned by
-/// centering within `frame.area()`. Under the inline viewport, `frame.area()` does NOT start
-/// at `(0, 0)` — its origin is wherever the viewport is anchored (e.g. `y: 31`). Computing the
-/// offset as `(area.height - height) / 2` alone yields a coordinate relative to `(0, 0)`, so
-/// the popup lands *above* the viewport's buffer and `Buffer::index_of` panics with "index
-/// outside of buffer". Adding `area.x`/`area.y` keeps the popup inside the actual buffer; the
-/// final `clamp`/`min` guarantees it stays in bounds even when `width`/`height` exceed `area`.
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    Rect {
-        x,
-        y,
-        width,
-        height,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputRegion {
     Hidden,
@@ -4946,29 +4923,33 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
 
 fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let area = frame.area();
-    let width = 58u16.min(area.width.saturating_sub(4));
-    let max_height = area.height.saturating_sub(4);
+    let width = 78u16.min(area.width.saturating_sub(4));
+    // The true content width inside the panel's left/right border cells;
+    // `shortcut_lines` sizes its wrapped action column to fit exactly.
+    let inner_width = usize::from(width.saturating_sub(2));
     let scopes = active_shortcut_scopes(state);
-    let lines = shortcuts::shortcut_lines(&scopes);
-    let height = ((lines.len() as u16) + 2).min(max_height).max(3);
-    let popup_area = centered_rect(area, width, height);
-
-    frame.render_widget(Clear, popup_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Shortcuts ")
-        .border_style(Style::default().fg(theme.border));
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(paragraph, popup_area);
+    let mut lines = shortcuts::shortcut_lines(&scopes, theme, inner_width);
+    lines.push(Line::from(""));
+    lines.push(crate::chrome::hint_line(
+        theme,
+        inner_width,
+        &[("?", "or Esc close")],
+    ));
+    let popup = crate::chrome::dialog_rect(
+        area,
+        width,
+        lines.len() as u16,
+        area.height.saturating_sub(4),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(crate::chrome::panel_block(theme, "Help", theme.border)),
+        popup,
+    );
 }
 
 fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
-    match state.status {
+    let mut scopes = match state.status {
         AppStatus::Idle => vec![
             ShortcutScope::Global,
             ShortcutScope::Editor,
@@ -4988,7 +4969,11 @@ fn active_shortcut_scopes(state: &AppState) -> Vec<ShortcutScope> {
             ShortcutScope::Idle,
         ],
         AppStatus::Setup | AppStatus::SessionPicker => vec![ShortcutScope::Global],
+    };
+    if state.image_viewer.is_some() {
+        scopes.push(ShortcutScope::ImageViewer);
     }
+    scopes
 }
 
 /// The scrolled item window both popup menus (slash, mention) use: the
@@ -5112,54 +5097,61 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
     let (items, selected, title): (Vec<(&str, &str)>, usize, &str) =
         if let Some(sub) = &menu.sub_menu {
             let items: Vec<(&str, &str)> = sub.items.iter().map(|s| (s.as_str(), "")).collect();
-            (items, sub.selected, &sub.title)
+            (items, sub.selected, sub.title.as_str())
         } else {
             let items: Vec<(&str, &str)> = menu
                 .items
                 .iter()
                 .map(|i| (i.command.as_str(), i.description.as_str()))
                 .collect();
-            (items, menu.selected, " Commands ")
+            (items, menu.selected, "Commands")
         };
 
-    let Some(geometry) = popup_geometry(frame.area(), input_area, items.len(), selected, false)
+    let Some(geometry) = popup_geometry(frame.area(), input_area, items.len(), selected, true)
     else {
         return;
     };
 
     frame.render_widget(Clear, geometry.area);
+    let inner_width = usize::from(geometry.area.width.saturating_sub(2));
+    let command_width = items
+        .iter()
+        .map(|(cmd, _)| UnicodeWidthStr::width(*cmd))
+        .max()
+        .unwrap_or(0);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, (cmd, desc)) in items[geometry.start..geometry.end].iter().enumerate() {
-        let item_index = geometry.start + i;
-        let prefix = if item_index == selected { "▸ " } else { "  " };
-        let style = if item_index == selected {
-            Style::default()
-                .fg(theme.border)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text)
-        };
-
-        if desc.is_empty() {
-            lines.push(Line::from(Span::styled(format!("{prefix}{cmd}"), style)));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{prefix}{cmd}"), style),
-                Span::styled(format!("  {desc}"), Style::default().fg(theme.muted)),
-            ]));
-        }
+    let mut lines: Vec<Line> = items[geometry.start..geometry.end]
+        .iter()
+        .enumerate()
+        .map(|(i, (cmd, desc))| {
+            let item_index = geometry.start + i;
+            crate::chrome::option_line(
+                theme,
+                item_index == selected,
+                "",
+                cmd,
+                command_width,
+                desc,
+                inner_width,
+            )
+        })
+        .collect();
+    if geometry.show_status {
+        lines.push(crate::chrome::hint_line(
+            theme,
+            inner_width,
+            &[("↑↓", "move"), ("Enter", "run"), ("Esc", "close")],
+        ));
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(title)
-        .border_style(Style::default().fg(theme.border));
-
+    let block = crate::chrome::panel_block(theme, title, theme.border);
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, geometry.area);
 }
+
+/// Kind column every mention row starts with: a fixed width so the display
+/// text lines up regardless of `file`/`skill`/`plugin`/`resource`.
+const MENTION_KIND_WIDTH: usize = 8;
 
 fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppState, theme: &Theme) {
     let candidates = &state.mention.candidates;
@@ -5180,6 +5172,7 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
     };
 
     frame.render_widget(Clear, geometry.area);
+    let inner_width = usize::from(geometry.area.width.saturating_sub(2));
 
     let mut lines: Vec<Line> = candidates
         .iter()
@@ -5187,20 +5180,32 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
         .skip(geometry.start)
         .take(geometry.end.saturating_sub(geometry.start))
         .map(|(i, candidate)| {
-            let prefix = if i == state.mention.selected {
-                "▸ "
+            let selected = i == state.mention.selected;
+            let marker = if selected {
+                crate::chrome::MARK_SELECTED
             } else {
-                "  "
+                crate::chrome::MARK_IDLE
             };
-            let style = if i == state.mention.selected {
+            let style = if selected {
                 Style::default()
                     .fg(theme.border)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text)
             };
-            let sigil = state.mention.sigil.map_or('@', |sigil| sigil.as_char());
-            let mut spans = vec![Span::styled(format!("{prefix}{sigil}"), style)];
+            let kind_color = match candidate.kind {
+                orca_runtime::mentions::MentionKind::File => theme.plan_mode,
+                orca_runtime::mentions::MentionKind::Skill => theme.warning,
+                orca_runtime::mentions::MentionKind::Plugin
+                | orca_runtime::mentions::MentionKind::Resource => theme.approval,
+            };
+            let mut spans = vec![
+                Span::styled(format!("{marker} "), style),
+                Span::styled(
+                    format!("{:<MENTION_KIND_WIDTH$}", candidate.kind.label()),
+                    Style::default().fg(kind_color),
+                ),
+            ];
             for (index, ch) in candidate.display.chars().enumerate() {
                 let matched = candidate.indices.binary_search(&(index as u32)).is_ok();
                 let char_style = if matched {
@@ -5212,36 +5217,31 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
                 };
                 spans.push(Span::styled(ch.to_string(), char_style));
             }
+            let used = UnicodeWidthStr::width(marker)
+                + 1
+                + MENTION_KIND_WIDTH
+                + UnicodeWidthStr::width(candidate.display.as_str())
+                + 2;
+            let description =
+                truncate_to_display_width(&candidate.description, inner_width.saturating_sub(used));
             spans.push(Span::styled(
-                if skills_only {
-                    format!("  {}", candidate.description)
-                } else {
-                    format!("  [{}] {}", candidate.kind.label(), candidate.description)
-                },
-                Style::default().fg(theme.muted),
+                format!("  {description}"),
+                theme.muted_style(),
             ));
             Line::from(spans)
         })
         .collect();
     if geometry.show_status
-        && let Some((text, color)) = status
+        && let Some((text, _color)) = status
     {
-        lines.push(Line::from(Span::styled(
-            format!("  {text}"),
-            Style::default().fg(color),
-        )));
+        lines.push(Line::from(Span::styled(text, theme.dim_style())));
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(if skills_only {
-            " Skills "
-        } else {
-            " Mentions "
-        })
-        .border_style(Style::default().fg(theme.border));
-
+    let block = crate::chrome::panel_block(
+        theme,
+        if skills_only { "Skills" } else { "Mentions" },
+        theme.border,
+    );
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, geometry.area);
 }
@@ -5251,10 +5251,10 @@ fn mention_popup_status(state: &AppState) -> Option<(String, Color)> {
     if state.mention.sigil == Some(orca_runtime::mentions::MentionSigil::Dollar) {
         Some((
             if candidates.is_empty() {
-                "No matching skills".to_string()
+                "⋯ No matching skills".to_string()
             } else {
                 format!(
-                    "{}/{} · ↑↓ select · PgUp/PgDn page · Home/End · Enter insert · Esc close",
+                    "⋯ {}/{} · ↑↓ select · PgUp/PgDn page · Home/End · Enter insert · Esc close",
                     state.mention.selected.saturating_add(1),
                     candidates.len()
                 )
@@ -5277,17 +5277,18 @@ fn mention_status_text(
     candidates_empty: bool,
 ) -> Option<(String, Color)> {
     match phase {
-        SearchPhase::Searching => Some(("Searching files…".to_string(), Color::DarkGray)),
-        SearchPhase::Scanning => {
-            Some((format!("Scanning… {scanned_paths} paths"), Color::DarkGray))
-        }
-        SearchPhase::Refreshing => Some(("Refreshing…".to_string(), Color::DarkGray)),
+        SearchPhase::Searching => Some(("⋯ Searching files…".to_string(), Color::DarkGray)),
+        SearchPhase::Scanning => Some((
+            format!("⋯ Scanning… {scanned_paths} paths"),
+            Color::DarkGray,
+        )),
+        SearchPhase::Refreshing => Some(("⋯ Refreshing…".to_string(), Color::DarkGray)),
         SearchPhase::Complete if candidates_empty => {
-            Some(("No matches".to_string(), Color::DarkGray))
+            Some(("⋯ No matches".to_string(), Color::DarkGray))
         }
         SearchPhase::Complete => None,
-        SearchPhase::Incomplete { .. } => Some(("Search incomplete".to_string(), Color::Red)),
-        SearchPhase::Stopping => Some(("Stopping search…".to_string(), Color::DarkGray)),
+        SearchPhase::Incomplete { .. } => Some(("⋯ Search incomplete".to_string(), Color::Red)),
+        SearchPhase::Stopping => Some(("⋯ Stopping search…".to_string(), Color::DarkGray)),
     }
 }
 
@@ -8844,7 +8845,7 @@ mod tests {
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("/command-08"));
-        assert!(rendered.contains("▸ /command-19"));
+        assert!(rendered.contains("› /command-19"));
         assert!(!rendered.contains("/command-00"));
 
         state.slash_menu = None;
@@ -8869,9 +8870,78 @@ mod tests {
             })
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("@file-08.rs"));
-        assert!(rendered.contains("▸ @file-19.rs"));
-        assert!(!rendered.contains("@file-00.rs"));
+        assert!(rendered.contains("file-08.rs"));
+        assert!(rendered.contains("› file    file-19.rs"));
+        assert!(!rendered.contains("file-00.rs"));
+    }
+
+    #[test]
+    fn help_panel_is_wide_enough_for_its_longest_key_and_hints_the_alias() {
+        let mut state = test_state();
+        state.show_shortcuts = true;
+        let frame = frame_string(&mut state, 110, 34);
+        assert!(frame.contains("╭ Help"), "{frame}");
+        assert!(
+            !frame.contains("alt+b/fmove"),
+            "key column must not run into the action: {frame}"
+        );
+        assert!(frame.contains("? or Esc close"), "{frame}");
+    }
+
+    #[test]
+    fn slash_menu_aligns_descriptions_in_a_column() {
+        let mut state = test_state();
+        state.slash_menu = Some(SlashMenu {
+            items: vec![
+                SlashMenuItem {
+                    command: "/new".into(),
+                    description: "Start a new conversation".into(),
+                },
+                SlashMenuItem {
+                    command: "/compact".into(),
+                    description: "Compress conversation context".into(),
+                },
+            ],
+            selected: 0,
+            sub_menu: None,
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        let new_row = frame.lines().find(|l| l.contains("/new")).unwrap();
+        let compact_row = frame.lines().find(|l| l.contains("/compact")).unwrap();
+        // Compare display columns, not byte offsets: the selected row's `›`
+        // marker is a 3-byte UTF-8 char while the idle rows' space is 1 byte,
+        // so `str::find` alone would report misaligned columns for a layout
+        // that is visually aligned.
+        let new_col = UnicodeWidthStr::width(&new_row[..new_row.find("Start").unwrap()]);
+        let compact_col =
+            UnicodeWidthStr::width(&compact_row[..compact_row.find("Compress").unwrap()]);
+        assert_eq!(new_col, compact_col, "{frame}");
+        assert!(frame.contains("› /new"), "{frame}");
+    }
+
+    #[test]
+    fn mention_popup_shows_kind_column_and_truncates_with_an_ellipsis() {
+        let mut state = test_state();
+        state.mention.phase = Some(SearchPhase::Complete);
+        state.mention.sigil = Some(orca_runtime::mentions::MentionSigil::At);
+        state.mention.candidates = vec![orca_runtime::mentions::MentionCandidate {
+            id: "1".into(),
+            kind: orca_runtime::mentions::MentionKind::Skill,
+            display: "brainstorming".into(),
+            description: "You MUST use this before any creative work - creating features, \
+                           building components, adding functionality"
+                .into(),
+            score: 1,
+            indices: vec![],
+            target: orca_runtime::mentions::MentionTarget::Skill {
+                id: "brainstorming".into(),
+                path: std::path::PathBuf::from("/skills/brainstorming/SKILL.md"),
+            },
+        }];
+        let frame = frame_string(&mut state, 80, 20);
+        let row = frame.lines().find(|l| l.contains("brainstorming")).unwrap();
+        assert!(row.contains("skill   brainstorming"), "{row}");
+        assert!(row.trim_end().ends_with("…│"), "{row}");
     }
 
     #[test]
@@ -8912,11 +8982,11 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Skills"));
-        assert!(rendered.contains("▸ $skill-12"));
+        assert!(rendered.contains("› skill   skill-12"));
         assert!(rendered.contains("Skill description 12"));
         assert!(rendered.contains("13/25"));
         assert!(rendered.contains("PgUp/PgDn page"));
-        assert!(!rendered.contains("$skill-00"));
+        assert!(!rendered.contains("skill-00"));
         assert!(!rendered.contains("[skill]"));
     }
 
@@ -8981,19 +9051,19 @@ mod tests {
     fn mention_popup_reports_every_streaming_phase() {
         assert_eq!(
             mention_status_text(&SearchPhase::Searching, 0, true),
-            Some(("Searching files…".to_string(), Color::DarkGray))
+            Some(("⋯ Searching files…".to_string(), Color::DarkGray))
         );
         assert_eq!(
             mention_status_text(&SearchPhase::Scanning, 42, false),
-            Some(("Scanning… 42 paths".to_string(), Color::DarkGray))
+            Some(("⋯ Scanning… 42 paths".to_string(), Color::DarkGray))
         );
         assert_eq!(
             mention_status_text(&SearchPhase::Refreshing, 42, false),
-            Some(("Refreshing…".to_string(), Color::DarkGray))
+            Some(("⋯ Refreshing…".to_string(), Color::DarkGray))
         );
         assert_eq!(
             mention_status_text(&SearchPhase::Complete, 42, true),
-            Some(("No matches".to_string(), Color::DarkGray))
+            Some(("⋯ No matches".to_string(), Color::DarkGray))
         );
         assert_eq!(
             mention_status_text(
@@ -9003,11 +9073,11 @@ mod tests {
                 42,
                 false,
             ),
-            Some(("Search incomplete".to_string(), Color::Red))
+            Some(("⋯ Search incomplete".to_string(), Color::Red))
         );
         assert_eq!(
             mention_status_text(&SearchPhase::Stopping, 42, false),
-            Some(("Stopping search…".to_string(), Color::DarkGray))
+            Some(("⋯ Stopping search…".to_string(), Color::DarkGray))
         );
         assert_eq!(mention_status_text(&SearchPhase::Complete, 42, false), None);
     }
@@ -12223,9 +12293,10 @@ mod tests {
         assert!(cursor_cell.modifier.contains(Modifier::REVERSED));
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("Commands"));
-        assert!(rendered.contains("/command-02"));
-        assert!(rendered.contains("▸ /command-11"));
-        assert!(!rendered.contains("/command-01"));
+        assert!(rendered.contains("/command-03"));
+        assert!(rendered.contains("› /command-11"));
+        assert!(!rendered.contains("/command-02"));
+        assert!(rendered.contains("↑↓ move · Enter run · Esc close"));
     }
 
     #[test]
@@ -12264,9 +12335,9 @@ mod tests {
         assert!(cursor_cell.modifier.contains(Modifier::REVERSED));
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("Mentions"));
-        assert!(rendered.contains("@file-03.rs"));
-        assert!(rendered.contains("▸ @file-11.rs"));
-        assert!(!rendered.contains("@file-02.rs"));
+        assert!(rendered.contains("file-03.rs"));
+        assert!(rendered.contains("› file    file-11.rs"));
+        assert!(!rendered.contains("file-02.rs"));
         assert!(rendered.contains("Scanning… 42 paths"));
     }
 
@@ -13510,43 +13581,6 @@ mod tests {
 
         assert_eq!(used_rows, 3);
         assert_eq!(measured_rows("aa bb-cc-dd", 6), used_rows);
-    }
-
-    #[test]
-    fn centered_rect_stays_inside_a_non_origin_inline_viewport() {
-        use ratatui::layout::Rect;
-        // Reproduces the approval-dialog panic: under the inline viewport the frame area is
-        // anchored below the origin (the real crash had `Rect{x:0,y:31,width:90,height:24}`).
-        // A popup centered relative to (0,0) lands above the buffer and panics in
-        // `Buffer::index_of`. `centered_rect` must keep the popup fully inside `area`.
-        let area = Rect::new(0, 31, 90, 24);
-        let popup = centered_rect(area, 64, 12);
-        assert!(
-            popup.y >= area.y,
-            "popup top {} above viewport {}",
-            popup.y,
-            area.y
-        );
-        assert!(
-            popup.bottom() <= area.bottom(),
-            "popup bottom {} past viewport {}",
-            popup.bottom(),
-            area.bottom()
-        );
-        assert!(popup.right() <= area.right());
-        assert!(popup.x >= area.x);
-    }
-
-    #[test]
-    fn centered_rect_clamps_oversized_popup_to_area() {
-        use ratatui::layout::Rect;
-        // A popup larger than the (small) inline viewport must shrink to fit, never overflow.
-        let area = Rect::new(0, 10, 40, 6);
-        let popup = centered_rect(area, 64, 20);
-        assert_eq!(popup.width, area.width);
-        assert_eq!(popup.height, area.height);
-        assert!(popup.bottom() <= area.bottom());
-        assert!(popup.right() <= area.right());
     }
 
     #[test]

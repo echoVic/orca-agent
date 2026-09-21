@@ -1,6 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
+
+use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShortcutScope {
@@ -9,6 +12,7 @@ pub enum ShortcutScope {
     Idle,
     Running,
     Approval,
+    ImageViewer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,40 +524,79 @@ pub fn shortcut_hints() -> impl Iterator<Item = ResolvedShortcutHint> {
     })
 }
 
-pub fn shortcut_lines(scopes: &[ShortcutScope]) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+pub fn shortcut_lines(scopes: &[ShortcutScope], theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let sections = [
         (ShortcutScope::Global, "Global"),
         (ShortcutScope::Editor, "Editor"),
         (ShortcutScope::Idle, "Composer"),
         (ShortcutScope::Running, "Running"),
         (ShortcutScope::Approval, "Approval"),
+        (ShortcutScope::ImageViewer, "Image viewer"),
     ];
-
-    for (section_scope, title) in sections {
-        if !scopes.is_empty() && !scopes.contains(&section_scope) {
+    let active = |scope: ShortcutScope| scopes.is_empty() || scopes.contains(&scope);
+    let key_width = shortcut_hints()
+        .filter(|hint| active(hint.scope))
+        .map(|hint| UnicodeWidthStr::width(hint.keys))
+        .max()
+        .unwrap_or(0);
+    let indent = 2;
+    let action_col = indent + key_width + 3;
+    let action_width = width.saturating_sub(action_col).max(8);
+    let mut lines = Vec::new();
+    for (scope, title) in sections {
+        if !active(scope) {
             continue;
         }
-
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(
-            title,
-            Style::default().fg(Color::Cyan),
+            title.to_string(),
+            theme.accent_style().add_modifier(Modifier::BOLD),
         )));
-        for hint in shortcut_hints().filter(|hint| hint.scope == section_scope) {
+        for hint in shortcut_hints().filter(|hint| hint.scope == scope) {
+            let mut rows = wrap_words(hint.action, action_width).into_iter();
+            let first = rows.next().unwrap_or_default();
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {:<18}", hint.keys),
-                    Style::default().fg(Color::Yellow),
+                    format!("{}{:<key_width$}   ", " ".repeat(indent), hint.keys),
+                    Style::default().fg(theme.text),
                 ),
-                Span::styled(hint.action, Style::default().fg(Color::White)),
+                Span::styled(first, theme.muted_style()),
             ]));
+            for row in rows {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(action_col)),
+                    Span::styled(row, theme.muted_style()),
+                ]));
+            }
         }
     }
-
     lines
+}
+
+/// Wraps `text` on whitespace only, so a single long token (e.g. a hyphenated
+/// word) never splits mid-token the way a generic wrapper that also breaks on
+/// `-`/`/` would.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate_width = UnicodeWidthStr::width(current.as_str())
+            + usize::from(!current.is_empty())
+            + UnicodeWidthStr::width(word);
+        if !current.is_empty() && candidate_width > width {
+            rows.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
 }
 
 pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
@@ -618,7 +661,7 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
         action: "open image preview",
     },
     ShortcutHint {
-        scope: ShortcutScope::Global,
+        scope: ShortcutScope::ImageViewer,
         keys: "+/- · arrows · 0",
         action: "zoom, pan, or fit image",
     },
@@ -751,6 +794,9 @@ fn scope_has_registered_binding(scope: ShortcutScope) -> bool {
         ShortcutScope::Idle => !IDLE_BINDINGS.is_empty(),
         ShortcutScope::Running => !RUNNING_BINDINGS.is_empty(),
         ShortcutScope::Approval => !APPROVAL_BINDINGS.is_empty(),
+        // Image viewer keys are handled directly in composer_image_actions,
+        // not through one of this file's KeyBinding resolver tables.
+        ShortcutScope::ImageViewer => false,
     }
 }
 
@@ -792,6 +838,8 @@ fn c0_control_char_to_ctrl_char(ch: char) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use orca_core::config::ThemeName;
+
     use super::*;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -1096,11 +1144,50 @@ mod tests {
     #[test]
     fn shortcut_hints_are_backed_by_registered_bindings() {
         for hint in shortcut_hints() {
+            // Image viewer keys are handled directly in composer_image_actions,
+            // not resolved through this file's KeyBinding tables, so they have
+            // no resolver binding to point back to.
+            if hint.scope == ShortcutScope::ImageViewer {
+                continue;
+            }
             assert!(
                 hint.has_registered_binding,
                 "shortcut hint '{}' in {:?} must be backed by a resolver binding",
                 hint.keys, hint.scope
             );
         }
+    }
+
+    fn theme() -> Theme {
+        Theme::named(ThemeName::Dark)
+    }
+
+    #[test]
+    fn shortcut_lines_align_keys_in_one_column_and_wrap_with_hanging_indent() {
+        let theme = theme();
+        let lines = shortcut_lines(&[ShortcutScope::Editor], &theme, 40);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text[0], "Editor");
+        assert!(
+            text.iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 40),
+            "{text:?}"
+        );
+        assert!(
+            text[1].starts_with("  "),
+            "keys are indented two cells: {:?}",
+            text[1]
+        );
+        let action_col = lines[1].spans[0].content.len();
+        assert!(
+            text.iter()
+                .skip(2)
+                .any(|row| row.starts_with(&" ".repeat(action_col)) && !row.trim().is_empty()),
+            "expected a wrapped continuation row with hanging indent: {text:?}"
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.border));
     }
 }
