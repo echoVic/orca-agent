@@ -1,7 +1,7 @@
 use crossbeam_channel as mpsc;
-use std::collections::VecDeque;
 #[cfg(any(test, debug_assertions))]
 use std::collections::HashMap;
+use std::collections::VecDeque;
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -471,6 +471,10 @@ pub struct AppState {
     pub(crate) turn_diagnostic_seen: bool,
     pub tick: u64,
     pub(crate) edit_highlights: EditHighlightState,
+    /// Current vim mode label for the status bar (e.g. `"NORMAL"`), kept in
+    /// sync with the composer's `VimState` by `sync_vim_mode_label`. `None`
+    /// when vim mode is off.
+    pub vim_mode_label: Option<&'static str>,
 }
 
 pub trait ScrollAmount {
@@ -712,6 +716,7 @@ impl AppState {
             tick: 0,
             viewport: ViewportState::default(),
             edit_highlights: EditHighlightState::default(),
+            vim_mode_label: None,
         }
     }
 

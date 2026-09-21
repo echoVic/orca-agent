@@ -223,7 +223,6 @@ impl Theme {
         Style::default().fg(self.border)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn muted_style(&self) -> Style {
         Style::default().fg(self.muted)
     }

@@ -4,6 +4,7 @@ use tui_textarea::TextArea;
 
 use crate::action_dispatcher::InteractionResponseAck;
 use crate::bridge;
+use crate::composer_input_actions::sync_vim_mode_label;
 use crate::composer_textarea::make_textarea_with_text;
 use crate::protocol::{TuiEvent, UserAction};
 use crate::terminal_presentation::{TerminalNotification, TerminalPresentation};
@@ -58,6 +59,7 @@ pub(crate) fn handle_interaction_response_ack(
                 {
                     vim_state.flush_pending_insert_escape(textarea);
                     vim_state.reset_insert(textarea, theme);
+                    sync_vim_mode_label(state, vim_state);
                     *textarea = make_textarea_with_text(&visible_text, vim_state, theme);
                     state.reset_history_navigation();
                 }
@@ -167,6 +169,7 @@ pub(crate) fn handle_runtime_event(
     if let Some(composer) = state.take_ready_queued_composer_state() {
         vim_state.flush_pending_insert_escape(textarea);
         vim_state.reset_insert(textarea, theme);
+        sync_vim_mode_label(state, vim_state);
         *textarea = make_textarea_with_text(&composer.visible_text, vim_state, theme);
         state.mention_bindings = composer.mention_bindings;
         state.atomic_skill_tokens.clear();
@@ -188,6 +191,7 @@ pub(crate) fn handle_runtime_event(
     if let Some(prompt) = restored_composer {
         vim_state.flush_pending_insert_escape(textarea);
         vim_state.reset_insert(textarea, theme);
+        sync_vim_mode_label(state, vim_state);
         let prompt = restored_images.as_ref().map_or(prompt.clone(), |images| {
             crate::composer_images::ComposerImageState::visible_text_with_attachments(
                 &prompt, images,
@@ -206,6 +210,7 @@ pub(crate) fn handle_runtime_event(
     if new_session_started {
         vim_state.flush_pending_insert_escape(textarea);
         vim_state.reset_insert(textarea, theme);
+        sync_vim_mode_label(state, vim_state);
         *textarea = make_textarea_with_text("", vim_state, theme);
         state.composer_images.clear_attachments();
     }

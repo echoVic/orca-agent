@@ -9,6 +9,7 @@ use crate::composer_image_actions::handle_composer_image_preview_key;
 use crate::composer_images::DeferredImageSubmit;
 use crate::composer_input_actions::{
     apply_composer_key_input, handle_composer_editor_shortcut, insert_composer_newline,
+    sync_vim_mode_label,
 };
 use crate::composer_textarea::{
     MAX_USER_INPUT_TEXT_CHARS, expand_pending_pastes, make_textarea, make_textarea_with_text,
@@ -65,6 +66,7 @@ pub(crate) fn enqueue_composer_follow_up(
     state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
     vim_state.reset_insert(textarea, theme);
+    sync_vim_mode_label(state, vim_state);
     *textarea = make_textarea(vim_state, theme);
     true
 }
@@ -113,6 +115,7 @@ pub(crate) fn enqueue_composer_follow_up_to_runtime(
     state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
     vim_state.reset_insert(textarea, theme);
+    sync_vim_mode_label(state, vim_state);
     *textarea = make_textarea(vim_state, theme);
     true
 }
@@ -294,6 +297,7 @@ fn reset_after_running_slash(
     state.atomic_skill_tokens.clear();
     state.reset_history_navigation();
     vim_state.reset_insert(textarea, theme);
+    sync_vim_mode_label(state, vim_state);
     *textarea = match outcome {
         SlashOutcome::Continue => make_textarea(vim_state, theme),
         SlashOutcome::Prefill(value) => make_textarea_with_text(&value, vim_state, theme),

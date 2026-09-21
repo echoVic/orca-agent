@@ -43,24 +43,11 @@ use crate::workspace_status::{GitIdentity, compact_cwd};
 
 /// What the user sees for the model: an unset/auto selection shows the model
 /// it routes to by default, so the welcome screen and status bar never read "auto".
-#[allow(dead_code)] // consumed by the status bar and welcome screen in later tasks
 pub(crate) fn displayed_model_name(model_name: &str) -> &str {
     if model_name == orca_core::model::AUTO_MODEL {
         orca_core::model::FLASH_MODEL
     } else {
         model_name
-    }
-}
-
-#[cfg(test)]
-mod displayed_model_tests {
-    #[test]
-    fn auto_displays_as_flash_and_explicit_models_pass_through() {
-        assert_eq!(super::displayed_model_name("auto"), "deepseek-flash");
-        assert_eq!(
-            super::displayed_model_name("deepseek-v4-pro"),
-            "deepseek-v4-pro"
-        );
     }
 }
 
@@ -4211,7 +4198,7 @@ fn workspace_status_spans(
     theme: &Theme,
     available_width: usize,
 ) -> Vec<Span<'static>> {
-    let separator = "  ·  ";
+    let separator = " · ";
     let separator_width = UnicodeWidthStr::width(separator);
     if available_width <= separator_width {
         return Vec::new();
@@ -4224,10 +4211,7 @@ fn workspace_status_spans(
         .unwrap_or(0);
 
     let make_spans = |cwd: String, git: Option<String>| {
-        let mut spans = vec![Span::styled(
-            format!("{separator}{cwd}"),
-            Style::default().fg(theme.muted),
-        )];
+        let mut spans = vec![Span::styled(cwd, Style::default().fg(theme.muted))];
         if let Some(git) = git {
             spans.push(Span::styled(
                 format!("{separator}{git}"),
@@ -4260,96 +4244,93 @@ fn workspace_status_spans(
 }
 
 fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+    let separator = " · ";
+    // Left zone: mode chip (or side-conversation label) plus vim mode.
+    let mut left: Vec<Span<'static>> = vec![Span::raw(" ")];
     if state.side_conversation_active()
         && let Some(side) = state.side_conversation.as_ref()
     {
-        let label = format!(
-            " Side from main · {} · Ctrl+/ to switch · Ctrl+C to close",
-            side.parent_status.label()
-        );
-        return Line::from(Span::styled(
-            truncate_to_display_width(&label, width),
+        left.push(Span::styled(
+            format!("Side · {} · Ctrl+/ back", side.parent_status.label()),
             Style::default().fg(theme.plan_mode),
         ));
-    }
-    if state.side_conversation_available() {
-        let label = " Main · Side available · Ctrl+/ to switch";
-        return Line::from(Span::styled(
-            truncate_to_display_width(label, width),
-            Style::default().fg(theme.plan_mode),
+    } else {
+        left.push(Span::styled(
+            format!("⇧Tab {}", state.approval_mode.as_str()),
+            Style::default()
+                .fg(approval_mode_color(state.approval_mode, theme))
+                .add_modifier(Modifier::BOLD),
         ));
-    }
-    let separator = "  ·  ";
-    let mode_prefix = separator;
-    let mode_value = state.approval_mode.as_str();
-    let mode_width = UnicodeWidthStr::width(mode_prefix) + UnicodeWidthStr::width(mode_value);
-    let context = (state.context_limit_tokens() > 0).then(|| context_cell(state, theme));
-    let reserved_context_width = context
-        .as_ref()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .filter(|context_width| mode_width + context_width <= width)
-        .unwrap_or(0);
-    let model = format!(
-        " {} ({})",
-        state.model_name,
-        state.reasoning_effort.as_str()
-    );
-    let model = truncate_to_display_width(
-        &model,
-        width
-            .saturating_sub(mode_width)
-            .saturating_sub(reserved_context_width),
-    );
-    let mut used = UnicodeWidthStr::width(model.as_str()) + mode_width;
-    let mut spans = vec![
-        Span::styled(model, Style::default().fg(theme.muted)),
-        Span::styled(mode_prefix, Style::default().fg(theme.muted)),
-        Span::styled(
-            mode_value,
-            Style::default().fg(approval_mode_color(state.approval_mode, theme)),
-        ),
-    ];
-
-    if let Some(context) = context {
-        let context_width = UnicodeWidthStr::width(context.content.as_ref());
-        if used + context_width <= width {
-            used += context_width;
-            spans.push(context);
+        if state.side_conversation_available() {
+            left.push(Span::styled(
+                "  Side · Ctrl+/".to_string(),
+                Style::default().fg(theme.plan_mode),
+            ));
         }
     }
-
-    for span in workspace_status_spans(state, theme, width.saturating_sub(used)) {
-        used += UnicodeWidthStr::width(span.content.as_ref());
-        spans.push(span);
+    if let Some(label) = state.vim_mode_label {
+        left.push(Span::styled(
+            format!("  {label}"),
+            Style::default().fg(theme.warning),
+        ));
     }
 
-    let mut lower_priority = Vec::new();
-    // Session cost only appears once there is something to report; a fresh
-    // session keeps the bar clean instead of showing zeros.
+    // Right zone, highest priority first: model · effort · ctx · tokens · cost · ? help.
+    let mut right: Vec<Span<'static>> = vec![Span::styled(
+        format!(
+            "{}{separator}{}",
+            displayed_model_name(&state.model_name),
+            state.reasoning_effort.as_str()
+        ),
+        theme.muted_style(),
+    )];
+    if state.context_limit_tokens() > 0 {
+        right.push(context_cell(state, theme));
+    }
     let usage = state.usage();
     if usage.total_tokens() > 0 {
-        lower_priority.push(Span::styled(
+        right.push(Span::styled(
             format!(
-                "{separator}{} tokens{separator}{}",
+                "{separator}{}{separator}{}",
                 format_token_count(usage.total_tokens()),
-                format_cost(usage.estimated_cost_usd),
+                format_cost(usage.estimated_cost_usd)
             ),
-            Style::default().fg(theme.muted),
+            theme.muted_style(),
         ));
     }
-    lower_priority.push(Span::styled(
-        format!("{separator}F1 shortcuts"),
-        Style::default().fg(theme.muted),
+    right.push(Span::styled(
+        format!("{separator}? help "),
+        theme.muted_style(),
     ));
 
-    for span in lower_priority {
-        let span_width = UnicodeWidthStr::width(span.content.as_ref());
-        if used + span_width <= width {
-            used += span_width;
-            spans.push(span);
-        }
+    let span_width = |spans: &[Span<'static>]| -> usize {
+        spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    };
+    let left_width = span_width(&left);
+    let mut right_width = span_width(&right);
+    // Drop tokens/cost, then context, then effort before ever touching the chip.
+    while left_width + right_width + 2 > width && right.len() > 1 {
+        right.remove(right.len() - 2);
+        right_width = span_width(&right);
     }
 
+    // Middle zone: cwd · branch, only when there is room for at least 12 cells.
+    let mut spans = left;
+    let available = width.saturating_sub(left_width + right_width);
+    let middle = workspace_status_spans(state, theme, available.saturating_sub(4));
+    let middle_width = span_width(&middle);
+    if middle_width > 0 && available >= middle_width + 4 {
+        let gap = (available - middle_width) / 2;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(middle);
+        spans.push(Span::raw(" ".repeat(available - middle_width - gap)));
+    } else {
+        spans.push(Span::raw(" ".repeat(available)));
+    }
+    spans.extend(right);
     Line::from(spans)
 }
 
@@ -4627,10 +4608,7 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
     } else {
         theme.error
     };
-    Span::styled(
-        format!("  ·  context {percent}%"),
-        Style::default().fg(color),
-    )
+    Span::styled(format!(" · ctx {percent}%"), Style::default().fg(color))
 }
 
 fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
@@ -8514,7 +8492,7 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
 
-        assert_eq!(cell.content.as_ref(), "  ·  context 100%");
+        assert_eq!(cell.content.as_ref(), " · ctx 100%");
         assert_eq!(cell.style.fg, Some(theme.success));
     }
 
@@ -8525,7 +8503,7 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
         // 25% of the window used means 75% remains.
-        assert_eq!(cell.content.as_ref(), "  ·  context 75%");
+        assert_eq!(cell.content.as_ref(), " · ctx 75%");
         assert_eq!(cell.style.fg, Some(theme.success));
     }
 
@@ -8535,7 +8513,7 @@ mod tests {
         set_surface_context(&mut state, 1_200, 1_000);
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let cell = context_cell(&state, &theme);
-        assert_eq!(cell.content.as_ref(), "  ·  context 0%");
+        assert_eq!(cell.content.as_ref(), " · ctx 0%");
         assert_eq!(cell.style.fg, Some(theme.error));
     }
 
@@ -8579,6 +8557,59 @@ mod tests {
         }
     }
 
+    fn status_text(state: &AppState, width: usize) -> String {
+        status_line(state, &Theme::named(ThemeName::Dark), width)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn auto_displays_as_flash_and_explicit_models_pass_through() {
+        assert_eq!(displayed_model_name("auto"), "deepseek-flash");
+        assert_eq!(displayed_model_name("deepseek-v4-pro"), "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn status_line_has_mode_chip_left_and_model_usage_right() {
+        let mut state = test_state();
+        state.approval_mode = ApprovalMode::AutoEdit;
+        state.reasoning_effort = orca_core::config::ReasoningEffort::Max;
+        state.model_name = "auto".to_string();
+        let text = status_text(&state, 120);
+        assert!(text.starts_with(" ⇧Tab auto-edit"), "{text}");
+        assert!(text.trim_end().ends_with("? help"), "{text}");
+        assert!(text.contains("deepseek-flash · max"), "{text}");
+        assert!(!text.contains("F1"), "{text}");
+        let line = status_line(&state, &Theme::named(ThemeName::Dark), 120);
+        assert_eq!(
+            line.spans[1].style.fg,
+            Some(Theme::named(ThemeName::Dark).approval)
+        );
+    }
+
+    #[test]
+    fn status_line_drops_workspace_before_mode_and_model_when_narrow() {
+        let mut state = test_state();
+        state.cwd = "/Users/someone/very/long/project/path/that/keeps/going".to_string();
+        let wide = status_text(&state, 140);
+        assert!(wide.contains("very/long"), "{wide}");
+        let narrow = status_text(&state, 60);
+        assert!(narrow.starts_with(" ⇧Tab"), "{narrow}");
+        assert!(narrow.contains("? help"), "{narrow}");
+        assert!(!narrow.contains("very/long"), "{narrow}");
+    }
+
+    #[test]
+    fn status_line_shows_vim_mode_label_next_to_the_chip() {
+        let mut state = test_state();
+        state.approval_mode = ApprovalMode::Suggest;
+        state.vim_mode_label = Some("NORMAL");
+        let text = status_text(&state, 120);
+        assert!(text.contains("⇧Tab suggest  NORMAL"), "{text}");
+    }
+
     #[test]
     fn status_line_renders_each_approval_mode_in_its_semantic_color() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -8590,26 +8621,17 @@ mod tests {
         ] {
             let mut state = test_state();
             state.approval_mode = mode;
-            let width = 180u16;
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1))
-                .expect("test backend");
-            terminal
-                .draw(|frame| {
-                    let area = frame.area();
-                    render_status(frame, area, &state, &theme);
-                })
-                .expect("draw");
-
-            let buffer = terminal.backend().buffer();
-            let row = (0..width)
-                .map(|x| buffer[(x, 0)].symbol())
-                .collect::<String>();
-            let marker = format!("  ·  {}", mode.as_str());
-            let marker_start = row.find(&marker).expect("mode should be visible");
-            let value_x = (marker_start + "  ·  ".len()) as u16;
+            let line = status_line(&state, &theme, 180);
+            // spans[0] is the leading gutter space, spans[1] is the mode chip.
             assert_eq!(
-                buffer[(value_x, 0)].fg,
-                approval_mode_color(mode, &theme),
+                line.spans[1].content.as_ref(),
+                format!("⇧Tab {}", mode.as_str()),
+                "wrong chip text for {}",
+                mode.as_str()
+            );
+            assert_eq!(
+                line.spans[1].style.fg,
+                Some(approval_mode_color(mode, &theme)),
                 "wrong status color for {}",
                 mode.as_str()
             );
@@ -8628,14 +8650,14 @@ mod tests {
                 .into_iter()
                 .map(|span| span.content.into_owned())
                 .collect::<String>(),
-            "  ·  ~/Documents/GitHub/blade-deepseek  ·  git:feature/footer"
+            "~/Documents/GitHub/blade-deepseek · git:feature/footer"
         );
         assert_eq!(
             workspace_status_spans(&state, &theme, 46)
                 .into_iter()
                 .map(|span| span.content.into_owned())
                 .collect::<String>(),
-            "  ·  ~/…/blade-deepseek  ·  git:feature/footer"
+            "~/…/blade-deepseek · git:feature/footer"
         );
     }
 
@@ -8652,7 +8674,7 @@ mod tests {
             .into_iter()
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(text.starts_with("  ·  "));
+        assert!(!text.is_empty(), "cwd should still be shown without git");
         assert!(!text.contains("git:"));
         assert!(UnicodeWidthStr::width(text.as_str()) <= 18);
         assert_eq!(text.contains('👍'), text.contains('🏽'));
@@ -8693,24 +8715,39 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let wide = status_line(&state, &theme, 180).to_string();
-        assert!(wide.contains("context 75%"));
+        assert!(wide.contains("ctx 75%"));
         assert!(wide.contains("~/Documents/GitHub/blade-deepseek"));
         assert!(wide.contains("git:feature/footer"));
-        assert!(wide.contains("8.7k tokens"));
-        assert!(wide.contains("F1 shortcuts"));
+        assert!(wide.contains("8.7k"));
+        assert!(wide.contains("? help"));
 
+        // The workspace cell loses its git segment before the right zone
+        // gives up anything: context and usage both survive.
         let medium = status_line(&state, &theme, 92).to_string();
-        assert!(medium.contains("context 75%"));
+        assert!(medium.contains("ctx 75%"));
         assert!(medium.contains("blade-deepseek"), "{medium}");
-        assert!(medium.contains("git:feature/footer"));
-        assert!(!medium.contains("tokens"));
-        assert!(!medium.contains("shortcuts"));
+        assert!(!medium.contains("git:"));
+        assert!(medium.contains("8.7k"));
+        assert!(medium.contains("? help"));
 
-        let narrow = status_line(&state, &theme, 46).to_string();
+        // Narrower still: usage (tokens/cost) is the first thing dropped from
+        // the right zone; context survives a while longer.
+        let narrow = status_line(&state, &theme, 60).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("context 75%"));
+        assert!(narrow.contains("ctx 75%"));
+        assert!(!narrow.contains("8.7k"));
         assert!(!narrow.contains("git:"));
-        assert!(!narrow.contains("blade-deepseek"));
+        assert!(narrow.contains("? help"));
+
+        // Narrowest: context itself is dropped and the workspace cell is
+        // gone, but the mode chip, model/effort and the help hint never are.
+        let narrowest = status_line(&state, &theme, 46).to_string();
+        assert!(narrowest.contains("auto-edit"));
+        assert!(!narrowest.contains("ctx"));
+        assert!(!narrowest.contains("git:"));
+        assert!(!narrowest.contains("blade-deepseek"));
+        assert!(narrowest.contains("deepseek · max"));
+        assert!(narrowest.contains("? help"));
     }
 
     #[test]
@@ -8742,12 +8779,16 @@ mod tests {
         assert!(
             status_line(&state, &theme, 100)
                 .to_string()
-                .contains("context 60%")
+                .contains("ctx 60%")
         );
     }
 
     #[test]
     fn status_line_reserves_known_context_before_truncating_a_long_model() {
+        // The three-zone layout never mid-word-truncates the model/effort
+        // cell: a span that does not fit is dropped whole, not garbled. An
+        // oversized model name therefore disappears entirely at narrow
+        // widths, and reappears in full (never partial) once there is room.
         let mut state = test_state();
         state.model_name = "a-very-long-model-name-that-would-fill-the-footer".to_string();
         set_surface_context(&mut state, 250, 1_000);
@@ -8755,13 +8796,24 @@ mod tests {
         state.workspace_git = Some(GitIdentity::Branch("main".to_string()));
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let text = status_line(&state, &theme, 46).to_string();
+        let narrow = status_line(&state, &theme, 46).to_string();
+        assert!(narrow.contains("auto-edit"));
+        assert!(
+            !narrow.contains("a-very-long-model-name"),
+            "an oversized model cell should be dropped, not truncated into view: {narrow}"
+        );
+        assert!(!narrow.contains("ctx"));
+        assert!(narrow.contains("? help"));
+        assert!(UnicodeWidthStr::width(narrow.as_str()) <= 46);
 
-        assert!(text.contains("auto-edit"));
-        assert!(text.contains("context 75%"));
-        assert!(!text.contains("~/workspace"));
-        assert!(!text.contains("git:main"));
-        assert!(UnicodeWidthStr::width(text.as_str()) <= 46);
+        let wide = status_line(&state, &theme, 120).to_string();
+        assert!(wide.contains("auto-edit"));
+        assert!(wide.contains("a-very-long-model-name-that-would-fill-the-footer · max"));
+        assert!(wide.contains("ctx 75%"));
+        assert!(wide.contains("~/workspace"));
+        assert!(wide.contains("git:main"));
+        assert!(wide.contains("? help"));
+        assert!(UnicodeWidthStr::width(wide.as_str()) <= 120);
     }
 
     #[test]
@@ -8792,19 +8844,21 @@ mod tests {
         );
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let narrow = status_line(&state, &theme, 46).to_string();
+        // Usage (tokens/cost) is the first thing the right zone drops; the
+        // mode chip, context and the help hint all survive at this width.
+        let narrow = status_line(&state, &theme, 60).to_string();
         assert!(narrow.contains("auto-edit"));
-        assert!(narrow.contains("context 75%"));
-        assert!(!narrow.contains("tokens"));
-        assert!(!narrow.contains("shortcuts"));
+        assert!(narrow.contains("ctx 75%"));
+        assert!(!narrow.contains("8.7k"));
+        assert!(narrow.contains("? help"));
 
         let wide = status_line(&state, &theme, 180).to_string();
         // Token counts humanize (8664 → 8.7k) and sub-cent costs keep 4 decimals.
-        assert!(wide.contains("8.7k tokens"));
+        assert!(wide.contains("8.7k"));
         assert!(wide.contains("$0.0039"));
         // Drag-to-copy is native now; the old shift+drag hint is gone.
         assert!(!wide.contains("shift+drag"));
-        assert!(wide.contains("shortcuts"));
+        assert!(wide.contains("? help"));
     }
 
     #[test]
@@ -8813,9 +8867,10 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
         let text = status_line(&state, &theme, 180).to_string();
-        assert!(!text.contains("tokens"));
+        // A fresh session has neither a known context budget nor usage yet.
+        assert!(!text.contains("ctx"));
         assert!(!text.contains('$'));
-        assert!(text.contains("shortcuts"));
+        assert!(text.contains("? help"));
     }
 
     #[test]

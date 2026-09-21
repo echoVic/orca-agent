@@ -7,6 +7,7 @@ use orca_core::config::RunConfig;
 
 use crate::commands;
 use crate::composer_images::{ComposerImageState, DeferredImageSubmit};
+use crate::composer_input_actions::sync_vim_mode_label;
 use crate::composer_textarea::{
     MAX_USER_INPUT_TEXT_CHARS, expand_pending_pastes, make_textarea, make_textarea_with_text,
     textarea_text,
@@ -87,7 +88,7 @@ pub(crate) fn handle_idle_submit(
                 state.composer_images.clear_attachments();
                 state.mention_bindings.clear();
                 state.atomic_skill_tokens.clear();
-                reset_composer_after_submit(textarea, vim_state, theme);
+                reset_composer_after_submit(textarea, vim_state, theme, state);
                 return true;
             }
             SlashOutcome::Prefill(value) => {
@@ -109,7 +110,7 @@ pub(crate) fn handle_idle_submit(
         state.composer_images.clear_attachments();
         state.mention_bindings.clear();
         state.atomic_skill_tokens.clear();
-        reset_composer_after_submit(textarea, vim_state, theme);
+        reset_composer_after_submit(textarea, vim_state, theme, state);
         return true;
     }
 
@@ -187,7 +188,7 @@ pub(crate) fn handle_idle_submit(
     state.composer_images.clear_attachments();
     state.mention_bindings.clear();
     state.atomic_skill_tokens.clear();
-    reset_composer_after_submit(textarea, vim_state, theme);
+    reset_composer_after_submit(textarea, vim_state, theme, state);
     true
 }
 
@@ -228,8 +229,14 @@ pub(crate) fn submit_pending_user_input_response(
     true
 }
 
-fn reset_composer_after_submit(textarea: &mut TextArea, vim_state: &mut VimState, theme: &Theme) {
+fn reset_composer_after_submit(
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+    state: &mut AppState,
+) {
     vim_state.reset_insert(textarea, theme);
+    sync_vim_mode_label(state, vim_state);
     *textarea = make_textarea(vim_state, theme);
 }
 

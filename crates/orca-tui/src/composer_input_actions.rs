@@ -56,14 +56,23 @@ pub(crate) fn composer_editor_shortcut_is_active(
     composer_has_text: bool,
     vim_state: &VimState,
 ) -> bool {
+    let insert_like = !vim_state.enabled || vim_state.mode == crate::vim::VimMode::Insert;
     match resolve_shortcut(ShortcutContext::Editor, key) {
         Some(ShortcutAction::Editor(EditorShortcut::VimEscape)) => vim_state.enabled,
-        Some(ShortcutAction::Editor(_)) => {
-            (!vim_state.enabled || vim_state.mode == crate::vim::VimMode::Insert)
-                && composer_has_text
+        Some(ShortcutAction::Editor(_)) => insert_like && composer_has_text,
+        // A printable character with text already present is always typed,
+        // never treated as a global shortcut (this is what makes `?` safe).
+        _ => {
+            composer_has_text
+                && insert_like
+                && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+                && matches!(key.code, KeyCode::Char(_))
         }
-        _ => false,
     }
+}
+
+pub(crate) fn sync_vim_mode_label(state: &mut AppState, vim_state: &VimState) {
+    state.vim_mode_label = vim_state.status_label();
 }
 
 pub(crate) fn handle_composer_editor_shortcut(
@@ -198,6 +207,7 @@ pub(crate) fn apply_composer_key_input(
     } else {
         textarea.input(Input::from(normalized_event))
     };
+    sync_vim_mode_label(state, vim_state);
     if changed {
         state.composer_images.reconcile(&textarea_text(textarea));
         state
@@ -362,6 +372,21 @@ mod tests {
         }
         let textarea = make_textarea_with_text_at_cursor(text, cursor, &vim, &theme);
         (state, config, theme, vim, textarea)
+    }
+
+    #[test]
+    fn question_mark_is_typed_when_the_composer_has_text() {
+        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(composer_editor_shortcut_is_active(
+            key,
+            true,
+            &VimState::new(false)
+        ));
+        assert!(!composer_editor_shortcut_is_active(
+            key,
+            false,
+            &VimState::new(false)
+        ));
     }
 
     #[test]

@@ -160,6 +160,10 @@ const GLOBAL_BINDINGS: &[(GlobalShortcut, KeyBinding)] = &[
         KeyBinding::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
     ),
     (
+        GlobalShortcut::ToggleShortcuts,
+        KeyBinding::new(KeyCode::Char('?'), KeyModifiers::NONE),
+    ),
+    (
         GlobalShortcut::ScrollBottom,
         KeyBinding::new(KeyCode::End, KeyModifiers::CONTROL),
     ),
@@ -565,8 +569,8 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Global,
-        keys: "F1 / ctrl+k",
-        action: "show shortcuts; ctrl+k requires empty input",
+        keys: "? / F1 / ctrl+k",
+        action: "show this help (input must be empty)",
     },
     ShortcutHint {
         scope: ShortcutScope::Global,
@@ -918,6 +922,14 @@ mod tests {
                 && hint.keys == "ctrl+f"
                 && hint.has_registered_binding
         }));
+    }
+
+    #[test]
+    fn question_mark_toggles_help() {
+        assert_eq!(
+            global_shortcut(key(KeyCode::Char('?'), KeyModifiers::NONE)),
+            Some(GlobalShortcut::ToggleShortcuts)
+        );
     }
 
     #[test]
