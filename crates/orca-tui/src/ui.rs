@@ -838,7 +838,7 @@ fn render_full_access_confirmation(frame: &mut Frame, state: &AppState, theme: &
     let Some(confirmation) = state.full_access_confirmation.as_ref() else {
         return;
     };
-    let popup = crate::chrome::dialog_rect(frame.area(), 72, 8, 14);
+    let popup = crate::chrome::dialog_rect(frame.area(), 72, 9, 14);
     frame.render_widget(Clear, popup);
     let inner_width = usize::from(popup.width.saturating_sub(4));
 
@@ -859,6 +859,10 @@ fn render_full_access_confirmation(frame: &mut Frame, state: &AppState, theme: &
         )),
         Line::from(Span::styled(
             "The active task will use this authority from its next tool call.",
+            Style::default().fg(theme.text),
+        )),
+        Line::from(Span::styled(
+            "Tools already running keep the policy they started with.",
             Style::default().fg(theme.text),
         )),
         Line::from(""),
@@ -1654,7 +1658,7 @@ fn render_jump_to_bottom_pill(frame: &mut Frame, state: &mut AppState, theme: &T
 /// is nothing to list yet, so an empty view doesn't pad a whole screen of
 /// blank space under a single sentence.
 fn render_empty_tasks_notice(frame: &mut Frame, area: Rect, theme: &Theme, title: &str) {
-    let popup = crate::chrome::dialog_rect(area, 60, 3, 5);
+    let popup = crate::chrome::dialog_rect(area, 64, 3, 5);
     frame.render_widget(Clear, popup);
     let content = vec![
         Line::from(""),
@@ -7005,6 +7009,7 @@ mod tests {
         assert!(rendered.contains("Enable Full Access?"));
         assert!(rendered.contains("OS sandbox restrictions"));
         assert!(rendered.contains("next tool call"));
+        assert!(rendered.contains("Tools already running keep the policy they started with."));
         assert!(rendered.contains("› Cancel"));
     }
 
@@ -7585,6 +7590,10 @@ mod tests {
         let frame = frame_string(&mut state, 100, 30);
         assert!(frame.contains("No tasks yet"), "{frame}");
         assert!(frame.contains("Esc back"), "{frame}");
+        assert!(
+            frame.contains("No tasks yet · they appear here when background work starts"),
+            "notice text must not be clipped: {frame}"
+        );
         let box_rows = frame.lines().filter(|line| line.contains('│')).count();
         assert!(box_rows <= 5, "{frame}");
     }
