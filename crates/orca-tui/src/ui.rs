@@ -4417,16 +4417,24 @@ fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> Color {
 /// First activity row used by focused unit tests. Production rendering uses the full
 /// bounded stack returned by `activity_lines`.
 #[cfg(test)]
-fn activity_line(state: &AppState, theme: &Theme) -> Option<(String, ratatui::style::Color)> {
-    activity_lines(state, theme).into_iter().next()
+fn activity_line(state: &AppState, theme: &Theme) -> Option<String> {
+    activity_lines(state, theme).into_iter().next().map(|line| {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    })
 }
 
 const MAX_DEFAULT_SUBAGENTS: usize = 4;
 
-fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::style::Color)> {
+fn activity_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if state.composer_images.is_paste_in_flight() {
-        lines.push(("● reading image...".to_string(), theme.warning));
+        lines.push(Line::from(Span::styled(
+            " ● reading image...".to_string(),
+            Style::default().fg(theme.warning),
+        )));
     } else if let Some(line) = foreground_activity_line(state, theme) {
         lines.push(line);
     }
@@ -4445,13 +4453,42 @@ fn activity_lines(state: &AppState, theme: &Theme) -> Vec<(String, ratatui::styl
     lines
 }
 
-fn foreground_activity_line(
-    state: &AppState,
-    theme: &Theme,
-) -> Option<(String, ratatui::style::Color)> {
+/// Name and target of the tool currently executing in the live pane, if any.
+fn current_tool_label(state: &AppState) -> Option<String> {
+    state
+        .transcript
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            ChatMessage::ToolCall {
+                name,
+                target,
+                status,
+                ..
+            } if matches!(status.as_str(), "running" | "receiving") => {
+                let name = name.strip_suffix("_file").unwrap_or(name);
+                Some(match target {
+                    Some(target) => format!("{name} {}", truncate_to_display_width(target, 48)),
+                    None => name.to_string(),
+                })
+            }
+            _ => None,
+        })
+}
+
+fn stream_phase_label(state: &AppState) -> &'static str {
+    match state.transcript.messages.last() {
+        Some(ChatMessage::Reasoning(_)) => "thinking",
+        Some(ChatMessage::AssistantChunk { .. }) | Some(ChatMessage::Assistant(_)) => "writing",
+        _ => "working",
+    }
+}
+
+fn foreground_activity_line(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
+    let spinner = spinner_frame(state.tick);
     match &state.status {
-        AppStatus::Idle => None,
-        AppStatus::Setup | AppStatus::SessionPicker => None,
+        AppStatus::Idle | AppStatus::Setup | AppStatus::SessionPicker => None,
         AppStatus::Running => {
             let live_elapsed = state
                 .running_started_at
@@ -4464,11 +4501,29 @@ fn foreground_activity_line(
                 .unwrap_or_default();
             let elapsed =
                 format_elapsed_compact(persisted_goal_elapsed.saturating_add(live_elapsed));
-            Some((format!("● running {elapsed}"), theme.warning))
+            let detail =
+                current_tool_label(state).unwrap_or_else(|| stream_phase_label(state).to_string());
+            Some(Line::from(vec![
+                Span::styled(
+                    format!(" {spinner} Running {elapsed}"),
+                    Style::default().fg(theme.warning),
+                ),
+                Span::styled(format!(" · {detail}"), theme.muted_style()),
+                Span::styled(" · Esc interrupt".to_string(), theme.dim_style()),
+            ]))
         }
-        AppStatus::Compacting => Some(("● Compacting context...".to_string(), theme.warning)),
-        AppStatus::WaitingApproval => Some(("● approval".to_string(), theme.approval)),
-        AppStatus::WaitingUserInput => Some(("● input".to_string(), theme.approval)),
+        AppStatus::Compacting => Some(Line::from(Span::styled(
+            format!(" {spinner} Compacting context…"),
+            Style::default().fg(theme.warning),
+        ))),
+        AppStatus::WaitingApproval => Some(Line::from(Span::styled(
+            " ● Waiting for your approval".to_string(),
+            Style::default().fg(theme.approval),
+        ))),
+        AppStatus::WaitingUserInput => Some(Line::from(Span::styled(
+            " ● Waiting for your answer".to_string(),
+            Style::default().fg(theme.approval),
+        ))),
     }
 }
 
@@ -4477,7 +4532,10 @@ fn background_task_activity_lines(
     theme: &Theme,
     tick: u64,
     selected_task_id: Option<&str>,
-) -> Vec<(String, ratatui::style::Color)> {
+) -> Vec<Line<'static>> {
+    let activity_row = |text: String, color: Color| -> Line<'static> {
+        Line::from(Span::styled(format!(" {text}"), Style::default().fg(color)))
+    };
     let mut lines = Vec::new();
     let visible_subagents = tasks
         .iter()
@@ -4500,7 +4558,7 @@ fn background_task_activity_lines(
             header.push_str(&format!(" · {attention} attention"));
         }
         header.push_str(" · /agents view");
-        lines.push((
+        lines.push(activity_row(
             header,
             if attention > 0 {
                 theme.approval
@@ -4508,7 +4566,7 @@ fn background_task_activity_lines(
                 theme.warning
             },
         ));
-        lines.push(("  ○ Main [default]".to_string(), theme.text));
+        lines.push(activity_row("  ○ Main [default]".to_string(), theme.text));
 
         for task in visible_subagents.iter().take(MAX_DEFAULT_SUBAGENTS) {
             let selected = selected_task_id == Some(task.id.as_str());
@@ -4526,7 +4584,7 @@ fn background_task_activity_lines(
             } else {
                 selection
             };
-            lines.push((format!("  {marker} {name} · {status}"), color));
+            lines.push(activity_row(format!("  {marker} {name} · {status}"), color));
             let detail = if task.subagent_current_activity.is_some() {
                 subagent_progress_label_with_activity_limit(task, Some(64))
             } else {
@@ -4540,13 +4598,16 @@ fn background_task_activity_lines(
                 detail.push(elapsed_label(task));
                 detail.join(", ")
             };
-            lines.push((format!("    {detail}"), theme.muted));
+            lines.push(activity_row(format!("    {detail}"), theme.muted));
         }
         let overflow = visible_subagents
             .len()
             .saturating_sub(MAX_DEFAULT_SUBAGENTS);
         if overflow > 0 {
-            lines.push((format!("  +{overflow} more · /tasks manage"), theme.muted));
+            lines.push(activity_row(
+                format!("  +{overflow} more · /tasks manage"),
+                theme.muted,
+            ));
         }
     }
 
@@ -4592,32 +4653,18 @@ fn background_task_activity_lines(
     } else {
         theme.warning
     };
-    lines.push((format!("● {}", labels.join(" · ")), color));
+    lines.push(activity_row(format!("● {}", labels.join(" · ")), color));
     lines
 }
 
-fn render_activity(
-    frame: &mut Frame,
-    area: Rect,
-    activity_lines: &[(String, ratatui::style::Color)],
-) {
+fn render_activity(frame: &mut Frame, area: Rect, activity_lines: &[Line<'static>]) {
     if area.height == 0 {
         return;
     }
     // First row stays blank as a spacer between the transcript tail and the indicator.
     let mut lines = vec![Line::from("")];
     let visible_rows = usize::from(area.height.saturating_sub(1));
-    lines.extend(
-        activity_lines
-            .iter()
-            .take(visible_rows)
-            .map(|(text, color)| {
-                Line::from(Span::styled(
-                    format!(" {text}"),
-                    Style::default().fg(*color),
-                ))
-            }),
-    );
+    lines.extend(activity_lines.iter().take(visible_rows).cloned());
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
 }
@@ -9218,15 +9265,47 @@ mod tests {
     }
 
     #[test]
+    fn running_activity_line_names_the_current_tool_and_how_to_interrupt() {
+        let mut state = test_state();
+        state.status = AppStatus::Running;
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(12));
+        state.tick = 0;
+        state.push_message(ChatMessage::ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            target: Some("cargo test -p orca-tui".into()),
+            status: "running".into(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        });
+        let text = activity_line(&state, &Theme::named(ThemeName::Dark)).expect("activity");
+        assert_eq!(
+            text,
+            " ⠋ Running 12s · bash cargo test -p orca-tui · Esc interrupt"
+        );
+    }
+
+    #[test]
+    fn running_activity_line_without_a_tool_reports_the_stream_phase() {
+        let mut state = test_state();
+        state.status = AppStatus::Running;
+        state.running_started_at = Some(Instant::now() - Duration::from_secs(3));
+        state.push_message(ChatMessage::Reasoning("hmm".into()));
+        let text = activity_line(&state, &Theme::named(ThemeName::Dark)).expect("activity");
+        assert_eq!(text, " ⠋ Running 3s · thinking · Esc interrupt");
+    }
+
+    #[test]
     fn running_activity_line_shows_elapsed_time() {
         let mut state = test_state();
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         state.status = AppStatus::Running;
         state.running_started_at = Some(Instant::now() - Duration::from_secs(65));
 
-        let (text, color) = activity_line(&state, &theme).expect("running shows an activity line");
-        assert_eq!(text, "● running 1m 05s");
-        assert_eq!(color, theme.warning);
+        let text = activity_line(&state, &theme).expect("running shows an activity line");
+        assert_eq!(text, " ⠋ Running 1m 05s · working · Esc interrupt");
     }
 
     #[test]
@@ -9240,10 +9319,9 @@ mod tests {
         )));
         state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
 
-        let (text, color) = activity_line(&state, &theme).expect("running shows an activity line");
+        let text = activity_line(&state, &theme).expect("running shows an activity line");
 
-        assert_eq!(text, "● running 13m 10s");
-        assert_eq!(color, theme.warning);
+        assert_eq!(text, " ⠋ Running 13m 10s · working · Esc interrupt");
     }
 
     #[test]
@@ -9256,7 +9334,7 @@ mod tests {
             13 * 60,
         )));
         state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
-        let first = activity_line(&state, &theme).unwrap().0;
+        let first = activity_line(&state, &theme).unwrap();
 
         state.update(TuiEvent::SessionCompleted {
             status: "success".to_string(),
@@ -9270,10 +9348,10 @@ mod tests {
             task: None,
         });
         state.running_started_at = Some(Instant::now() - Duration::from_secs(5));
-        let second = activity_line(&state, &theme).unwrap().0;
+        let second = activity_line(&state, &theme).unwrap();
 
-        assert_eq!(first, "● running 13m 10s");
-        assert_eq!(second, "● running 13m 25s");
+        assert_eq!(first, " ⠋ Running 13m 10s · working · Esc interrupt");
+        assert_eq!(second, " ⠋ Running 13m 25s · working · Esc interrupt");
     }
 
     #[test]
@@ -9291,7 +9369,10 @@ mod tests {
             state.replace_current_goal_for_test(Some(goal_with_elapsed(status, 13 * 60)));
             state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
 
-            assert_eq!(activity_line(&state, &theme).unwrap().0, "● running 10s");
+            assert_eq!(
+                activity_line(&state, &theme).unwrap(),
+                " ⠋ Running 10s · working · Esc interrupt"
+            );
         }
     }
 
@@ -9303,7 +9384,10 @@ mod tests {
         state.replace_current_goal_for_test(Some(goal_with_elapsed(ThreadGoalStatus::Active, -20)));
         state.running_started_at = Some(Instant::now() - Duration::from_secs(10));
 
-        assert_eq!(activity_line(&state, &theme).unwrap().0, "● running 10s");
+        assert_eq!(
+            activity_line(&state, &theme).unwrap(),
+            " ⠋ Running 10s · working · Esc interrupt"
+        );
     }
 
     #[test]
@@ -9312,11 +9396,9 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         state.status = AppStatus::Compacting;
 
-        let (text, color) =
-            activity_line(&state, &theme).expect("compacting shows an activity line");
+        let text = activity_line(&state, &theme).expect("compacting shows an activity line");
 
-        assert_eq!(text, "● Compacting context...");
-        assert_eq!(color, theme.warning);
+        assert_eq!(text, " ⠋ Compacting context…");
     }
 
     #[test]
@@ -9347,7 +9429,12 @@ mod tests {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
         let rendered = activity_lines(&state, &theme)
             .into_iter()
-            .map(|(line, _)| line)
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -9372,12 +9459,10 @@ mod tests {
             status: "success".to_string(),
         });
 
-        let (text, color) =
-            activity_line(&state, &theme).expect("active background task remains visible");
+        let text = activity_line(&state, &theme).expect("active background task remains visible");
 
         assert_eq!(state.status, AppStatus::Idle);
-        assert_eq!(text, "● 1 background task running");
-        assert_eq!(color, theme.warning);
+        assert_eq!(text, " ● 1 background task running");
     }
 
     #[test]
@@ -9399,10 +9484,9 @@ mod tests {
         state.status = AppStatus::Idle;
         state.replace_workflow_tasks_for_test(vec![running, approval]);
 
-        let (text, color) = activity_line(&state, &theme).expect("task attention remains visible");
+        let text = activity_line(&state, &theme).expect("task attention remains visible");
 
-        assert_eq!(text, "● 1 background task running · 1 needs approval");
-        assert_eq!(color, theme.approval);
+        assert_eq!(text, " ● 1 background task running · 1 needs approval");
     }
 
     #[test]
@@ -9466,17 +9550,25 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lines = background_task_activity_lines(&tasks, &theme, 0, None);
+        let lines: Vec<String> = background_task_activity_lines(&tasks, &theme, 0, None)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
 
         assert_eq!(lines.len(), 11);
-        assert_eq!(lines[0].0, "● Agents 5 active · /agents view");
-        assert!(lines[1].0.contains("Main [default]"));
-        assert!(lines[2].0.contains("agent 1"));
-        assert!(lines[3].0.starts_with("    "));
-        assert!(lines[8].0.contains("agent 4"));
-        assert!(lines[9].0.starts_with("    "));
-        assert_eq!(lines[10].0, "  +1 more · /tasks manage");
-        assert!(lines.iter().all(|(line, _)| !line.contains("agent 5")));
+        assert_eq!(lines[0], " ● Agents 5 active · /agents view");
+        assert!(lines[1].contains("Main [default]"));
+        assert!(lines[2].contains("agent 1"));
+        assert!(lines[3].starts_with("    "));
+        assert!(lines[8].contains("agent 4"));
+        assert!(lines[9].starts_with("    "));
+        assert_eq!(lines[10], "   +1 more · /tasks manage");
+        assert!(lines.iter().all(|line| !line.contains("agent 5")));
     }
 
     #[test]
