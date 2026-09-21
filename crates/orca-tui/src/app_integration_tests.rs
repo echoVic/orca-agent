@@ -165,6 +165,52 @@ fn pending_insert_escape_preflight_precedes_shortcuts_only_after_sequence_starte
 }
 
 #[test]
+fn pending_insert_escape_consumption_syncs_the_vim_mode_label() {
+    // Regression: the two-character escape (e.g. "jj") exits Insert mode
+    // from inside `resolve_pending_insert_escape_before_routing`'s
+    // `Consumed` arm, which the live router returns from immediately —
+    // never reaching `apply_composer_key_input`'s own sync call. The status
+    // bar must not keep showing INSERT after the sequence completes.
+    let theme = Theme::named(ThemeName::Dark);
+    let sequence = VimInsertEscapeSequence::parse("jj").unwrap();
+    let started = Instant::now();
+    let mut vim = VimState::with_insert_escape(true, Some(sequence));
+    vim.mode = crate::vim::VimMode::Insert;
+    let mut textarea = TextArea::default();
+    let mut state = test_state().0;
+    state.vim_mode_label = Some("INSERT");
+    let config = test_config(HistoryMode::Disabled);
+
+    let first = Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    resolve_pending_insert_escape_before_routing(
+        &first,
+        started,
+        &mut vim,
+        &mut textarea,
+        &mut state,
+        &config,
+        &theme,
+    );
+    vim.handle_at(vim_insert_input('j'), &mut textarea, &theme, started);
+
+    let second = Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(
+        resolve_pending_insert_escape_before_routing(
+            &second,
+            started + Duration::from_millis(1),
+            &mut vim,
+            &mut textarea,
+            &mut state,
+            &config,
+            &theme,
+        ),
+        PendingInsertEscapeRouting::Consumed,
+    );
+    assert_eq!(vim.mode, crate::vim::VimMode::Normal);
+    assert_eq!(state.vim_mode_label, Some("NORMAL"));
+}
+
+#[test]
 fn pending_insert_escape_flushes_before_submit_and_paste_ownership() {
     let theme = Theme::named(ThemeName::Dark);
     let started = Instant::now();

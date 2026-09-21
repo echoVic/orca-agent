@@ -6,7 +6,7 @@
 use ratatui::crossterm::event::{Event, KeyEventKind};
 use std::time::Instant;
 
-use crate::composer_input_actions::refresh_input_menus;
+use crate::composer_input_actions::{refresh_input_menus, sync_vim_mode_label};
 use crate::theme::Theme;
 use crate::types::AppState;
 use crate::vim::{PendingInsertEscapeFlow, VimState};
@@ -46,6 +46,7 @@ pub(crate) fn resolve_pending_insert_escape_before_routing(
     match vim_state.resolve_pending_insert_escape(&Input::from(event.clone()), now, textarea) {
         PendingInsertEscapeFlow::Consumed => {
             vim_state.configure_textarea(textarea, theme);
+            sync_vim_mode_label(state, vim_state);
             PendingInsertEscapeRouting::Consumed
         }
         PendingInsertEscapeFlow::Flushed => {
