@@ -14,6 +14,7 @@ mod background_tasks;
 pub mod bridge;
 mod capability_backend;
 mod channels;
+mod chrome;
 pub mod cli;
 mod clipboard;
 mod clipboard_image;

@@ -219,6 +219,23 @@ impl Theme {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn accent_style(&self) -> Style {
+        Style::default().fg(self.border)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn muted_style(&self) -> Style {
+        Style::default().fg(self.muted)
+    }
+
+    /// Secondary chrome (rails, rule when unfocused, trailing hints): muted plus
+    /// DIM so it recedes even on 16-color terminals.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn dim_style(&self) -> Style {
+        Style::default().fg(self.muted).add_modifier(Modifier::DIM)
+    }
+
     pub(crate) fn search_match_style(self) -> Style {
         match self.color_level {
             TerminalColorLevel::Monochrome => Style::default().add_modifier(Modifier::UNDERLINED),
