@@ -14367,20 +14367,20 @@ mod tests {
         let mut state = golden_state();
         state.push_message(ChatMessage::User("跑一下测试".into()));
         state.status = AppStatus::WaitingApproval;
+        // Built through the production constructor rather than a hand-rolled
+        // `options` vec, so this golden can never enshrine an ordering the
+        // real app cannot produce (`bash` isn't in `DYNAMIC_TARGET_TOOLS`, so
+        // a target here always yields `[Once, AlwaysTarget, AlwaysTool, Deny]`).
+        let target = "cargo test -p orca-tui";
         state.approval_dialog = Some(ApprovalDialog {
             id: "1".into(),
             interaction: None,
             tool: "bash".into(),
-            target: Some("cargo test -p orca-tui".into()),
+            target: Some(target.into()),
             permission_kind: None,
             background_task_id: None,
             selected: 0,
-            options: vec![
-                ApprovalOption::Once,
-                ApprovalOption::AlwaysTool,
-                ApprovalOption::AlwaysTarget,
-                ApprovalOption::Deny,
-            ],
+            options: ApprovalDialog::options_for("bash", Some(target)),
             diff: None,
         });
         assert_golden("approval", &frame_string(&mut state, 100, 30));

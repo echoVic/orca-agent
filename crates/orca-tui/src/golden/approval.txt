@@ -12,8 +12,8 @@
               │cargo test -p orca-tui                                                │
               │                                                                      │
               │› 1  Allow once               run it now                              │
-              │  3  Allow bash this session  skip approval for this tool until you…  │
               │  2  Allow this exact call    remember only this exact call           │
+              │  3  Allow bash this session  skip approval for this tool until you…  │
               │  4  Deny                     ask Orca for another way                │
               │                                                                      │
               │↑↓ move · 1-4 pick · Enter confirm · Esc deny · PgUp/PgDn preview     │

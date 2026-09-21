@@ -2,3 +2,4 @@ tests/fixtures/jsonl-v0.2.50/*.jsonl text eol=lf
 docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-* text eol=lf
 docs/superpowers/plans/2026-07-21-runtime-owned-typed-surface-implementation.md text eol=lf
 crates/orca-runtime/src/workflow/host.mjs text eol=lf
+crates/orca-tui/src/golden/*.txt text eol=lf
