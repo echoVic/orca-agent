@@ -18,9 +18,7 @@ pub(crate) const MARK_SELECTED: &str = "›";
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MARK_IDLE: &str = " ";
 /// Transcript gutter: one leading space, a one-cell glyph, two spaces.
-#[allow(dead_code)] // consumed by the transcript gutter in later tasks
 pub(crate) const GUTTER_WIDTH: usize = 4;
-#[allow(dead_code)] // consumed by the transcript gutter in later tasks
 pub(crate) const GUTTER_CONTINUATION: &str = "    ";
 #[cfg_attr(not(test), allow(dead_code))]
 const RULE: &str = "─";
@@ -135,7 +133,6 @@ pub(crate) fn rule_line(theme: &Theme, width: u16, focused: bool) -> Line<'stati
 }
 
 /// Role gutter for transcript rows: `" ›  "`, `" ●  "`, always four cells.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn gutter(theme: &Theme, glyph: &str, color: Color) -> Span<'static> {
     let _ = theme;
     Span::styled(format!(" {glyph}  "), Style::default().fg(color))

@@ -1180,7 +1180,7 @@ fn expand_toggle_only_affects_live_tools_not_flushed_ones() {
     state.transcript.flushed_count = state.transcript.messages.len();
 
     // The flushed tool is frozen: `e` finds nothing in the (empty) live pane.
-    assert!(!state.toggle_latest_tool_output());
+    assert!(!state.toggle_latest_expandable());
     let ChatMessage::ToolCall { expanded, .. } = &state.transcript.messages[0] else {
         panic!("expected flushed tool call");
     };
@@ -1192,7 +1192,7 @@ fn expand_toggle_only_affects_live_tools_not_flushed_ones() {
         name: "grep".to_string(),
         target: Some("b".to_string()),
     });
-    assert!(state.toggle_latest_tool_output());
+    assert!(state.toggle_latest_expandable());
     let ChatMessage::ToolCall { expanded, .. } = state.transcript.messages.last().unwrap() else {
         panic!("expected live tool call");
     };
@@ -2473,7 +2473,7 @@ fn clearing_receiving_progress_preserves_finalized_prefix_boundaries() {
 }
 
 #[test]
-fn toggle_latest_tool_output_flips_expanded_state() {
+fn toggle_latest_expandable_flips_expanded_state() {
     let mut state = state();
 
     state.update(TuiEvent::ToolRequested {
@@ -2482,7 +2482,7 @@ fn toggle_latest_tool_output_flips_expanded_state() {
         target: None,
     });
 
-    assert!(state.toggle_latest_tool_output());
+    assert!(state.toggle_latest_expandable());
     match &state.transcript.messages[0] {
         ChatMessage::ToolCall { expanded, .. } => assert!(*expanded),
         other => panic!("expected tool call, got {other:?}"),
@@ -5352,13 +5352,22 @@ fn touch_mutate_and_replace_cancel_only_their_exact_pending_message() {
 #[test]
 fn replacing_non_tool_message_keeps_unrelated_edit_pending() {
     let (_directory, mut state) = configured_edit_state();
-    state.push_message(ChatMessage::Reasoning("old".to_string()));
+    state.push_message(ChatMessage::Reasoning {
+        text: "old".to_string(),
+        expanded: false,
+    });
     submit_live_edit(&mut state, "edit-a", "src/item.py", EDIT_DIFF);
     let job = state
         .pending_edit_highlight_job("edit-a")
         .expect("pending edit");
 
-    assert!(state.replace_message(0, ChatMessage::Reasoning("new".to_string())));
+    assert!(state.replace_message(
+        0,
+        ChatMessage::Reasoning {
+            text: "new".to_string(),
+            expanded: false,
+        }
+    ));
 
     assert_eq!(
         state

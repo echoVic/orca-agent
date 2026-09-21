@@ -24,6 +24,7 @@ use orca_runtime::history::{SessionSummary, StoredSessionHealth};
 use orca_runtime::surface::{TaskTranscriptItem, TaskTranscriptToolStatus};
 
 use crate::agent_workspace::AgentWorkspaceRow;
+use crate::chrome::{GUTTER_CONTINUATION, GUTTER_WIDTH};
 use crate::diagnostics::{DiagnosticContext, DiagnosticLevel, TuiDiagnostic};
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::protocol::TaskTranscriptResult;
@@ -1511,7 +1512,16 @@ pub(crate) fn render_live_messages(
                 let refined = AppState::refined_diff_styles_for_message(
                     revisions, highlights, index, message,
                 );
-                build_lines_for_message(message, theme, width, tick, force_expand, refined)
+                let previous = index.checked_sub(1).and_then(|i| messages.get(i));
+                build_lines_for_message_after(
+                    previous,
+                    message,
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                    refined,
+                )
             },
         );
         requested_scroll = outcome.adjusted_scroll.unwrap_or(requested_scroll);
@@ -2905,8 +2915,10 @@ pub(crate) fn build_lines_for_messages(
     force_expand: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut previous: Option<&ChatMessage> = None;
     for msg in messages {
-        lines.extend(build_lines_for_message(
+        lines.extend(build_lines_for_message_after(
+            previous,
             msg,
             theme,
             width,
@@ -2914,10 +2926,15 @@ pub(crate) fn build_lines_for_messages(
             force_expand,
             None,
         ));
+        previous = Some(msg);
     }
     lines
 }
 
+/// `build_lines_for_message_after` with no preceding message: no leading
+/// blank row, and a streamed `AssistantChunk` is always treated as the first
+/// chunk of its turn.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_lines_for_message(
     message: &ChatMessage,
     theme: &Theme,
@@ -2926,9 +2943,79 @@ pub(crate) fn build_lines_for_message(
     force_expand: bool,
     refined_diff: Option<&crate::diff_highlight::RefinedDiffStyles>,
 ) -> Vec<Line<'static>> {
+    build_lines_for_message_after(
+        None,
+        message,
+        theme,
+        width,
+        tick,
+        force_expand,
+        refined_diff,
+    )
+}
+
+/// Whether `message` starts with a blank separator row. Decided from the
+/// previous message's kind only: kinds never change once a later message
+/// exists, so the per-message render cache stays valid.
+fn leading_blank(previous: Option<&ChatMessage>, message: &ChatMessage) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let previous_ends_blank = matches!(
+        previous,
+        ChatMessage::AssistantChunk {
+            trailing_blank: true,
+            ..
+        }
+    );
+    if previous_ends_blank {
+        return false;
+    }
+    match message {
+        ChatMessage::User(_)
+        | ChatMessage::Diagnostic(_)
+        | ChatMessage::Error(_)
+        | ChatMessage::System(_)
+        | ChatMessage::ProposedPlan(_)
+        | ChatMessage::PlanUpdate { .. } => true,
+        ChatMessage::Assistant(_) | ChatMessage::AssistantChunk { .. } => matches!(
+            previous,
+            ChatMessage::ToolCall { .. }
+                | ChatMessage::Diagnostic(_)
+                | ChatMessage::Error(_)
+                | ChatMessage::System(_)
+                | ChatMessage::User(_)
+                | ChatMessage::Image(_)
+        ),
+        ChatMessage::ToolCall { .. } => matches!(
+            previous,
+            ChatMessage::Assistant(_)
+                | ChatMessage::AssistantChunk { .. }
+                | ChatMessage::Reasoning { .. }
+                | ChatMessage::User(_)
+        ),
+        ChatMessage::Reasoning { .. } | ChatMessage::Image(_) => false,
+    }
+}
+
+/// Render the lines for one message, given the message immediately before it
+/// in the transcript (`None` when it opens the slice being rendered).
+pub(crate) fn build_lines_for_message_after(
+    previous: Option<&ChatMessage>,
+    message: &ChatMessage,
+    theme: &Theme,
+    width: usize,
+    tick: u64,
+    force_expand: bool,
+    refined_diff: Option<&crate::diff_highlight::RefinedDiffStyles>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    if leading_blank(previous, message) {
+        lines.push(Line::from(""));
+    }
     append_message_lines(
         &mut lines,
+        previous,
         message,
         theme,
         width,
@@ -2941,8 +3028,10 @@ pub(crate) fn build_lines_for_message(
 
 /// Append the rendered lines for a single chat message. Pure with respect to global
 /// state: the only dynamic input is `tick`, which drives the running-tool spinner.
+#[allow(clippy::too_many_arguments)]
 fn append_message_lines(
     lines: &mut Vec<Line<'static>>,
+    previous: Option<&ChatMessage>,
     msg: &ChatMessage,
     theme: &Theme,
     width: usize,
@@ -2952,42 +3041,36 @@ fn append_message_lines(
 ) {
     match msg {
         ChatMessage::User(text) => {
-            let text = compact_long_text(text, width.saturating_sub(2).max(1), 3);
+            let text = compact_long_text(text, width.saturating_sub(GUTTER_WIDTH).max(1), 3);
+            let mut rows = text.lines();
+            let first = rows.next().unwrap_or_default().to_string();
             lines.push(Line::from(vec![
-                Span::styled("> ", Style::default().fg(theme.user)),
-                Span::styled(text, Style::default().fg(theme.user)),
+                crate::chrome::gutter(theme, "›", theme.user)
+                    .patch_style(Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(first, Style::default().fg(theme.user)),
             ]));
-            lines.push(Line::from(""));
+            for row in rows {
+                lines.push(Line::from(vec![
+                    Span::raw(GUTTER_CONTINUATION),
+                    Span::styled(row.to_string(), Style::default().fg(theme.user)),
+                ]));
+            }
         }
         ChatMessage::Image(image) => {
             lines.extend(crate::image_preview::thumbnail_lines(image, width, theme));
         }
-        ChatMessage::Reasoning(text) => {
-            let prefix = Span::styled(
-                "[thinking] ",
-                Style::default()
-                    .fg(theme.muted)
-                    .add_modifier(Modifier::ITALIC),
-            );
-            let truncated = truncate_lines(text, 3);
-            lines.push(Line::from(vec![
-                prefix,
-                Span::styled(
-                    truncated,
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]));
+        ChatMessage::Reasoning { text, expanded } => {
+            append_reasoning_lines(lines, text, *expanded, force_expand, width, theme);
         }
         ChatMessage::Assistant(text) => {
-            append_assistant_markdown(lines, text, width, theme, true);
+            append_assistant_markdown(lines, text, width, theme, false, true);
         }
         ChatMessage::AssistantChunk {
             text,
             trailing_blank,
         } => {
-            append_assistant_markdown(lines, text, width, theme, *trailing_blank);
+            let first_of_turn = !matches!(previous, Some(ChatMessage::AssistantChunk { .. }));
+            append_assistant_markdown(lines, text, width, theme, *trailing_blank, first_of_turn);
         }
         ChatMessage::ProposedPlan(text) => {
             append_proposed_plan_lines(lines, text, width, theme);
@@ -3071,11 +3154,18 @@ fn append_message_lines(
             append_diagnostic_lines(lines, diagnostic, theme);
         }
         ChatMessage::System(text) => {
-            lines.push(Line::from(Span::styled(
-                text.clone(),
-                Style::default().fg(theme.muted),
-            )));
-            lines.push(Line::from(""));
+            let mut rows = text.lines();
+            let first = rows.next().unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::raw(GUTTER_CONTINUATION),
+                Span::styled(format!("ℹ {first}"), theme.muted_style()),
+            ]));
+            for row in rows {
+                lines.push(Line::from(Span::styled(
+                    format!("      {row}"),
+                    theme.muted_style(),
+                )));
+            }
         }
     }
 }
@@ -3126,16 +3216,69 @@ fn append_labeled_diagnostic_text(
     }
 }
 
+/// Render assistant markdown with the role gutter: the first non-empty line
+/// gets the `●` glyph (only when `first_of_turn`; a mid-turn streamed chunk
+/// gets the plain continuation indent instead), every later non-empty line
+/// gets the continuation indent, and blank paragraph-break rows stay empty.
 fn append_assistant_markdown(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     width: usize,
     theme: &Theme,
     trailing_blank: bool,
+    first_of_turn: bool,
 ) {
-    lines.extend(render_markdown(text, width, theme));
+    let mut placed_first = false;
+    for mut line in render_markdown(text, width.saturating_sub(GUTTER_WIDTH), theme) {
+        if line.to_string().is_empty() {
+            lines.push(line);
+            continue;
+        }
+        let prefix = if !placed_first && first_of_turn {
+            crate::chrome::gutter(theme, "●", theme.border)
+        } else {
+            Span::raw(GUTTER_CONTINUATION)
+        };
+        placed_first = true;
+        line.spans.insert(0, prefix);
+        lines.push(line);
+    }
     if trailing_blank {
         lines.push(Line::from(""));
+    }
+}
+
+/// Render a collapsed (or expanded) reasoning block: `⋯ thinking · <first line>`
+/// when collapsed, the full text (still line-capped unless `force_expand`)
+/// when expanded. `force_expand` is set only when flushing to the immutable
+/// scrollback, where a truncated view could never be re-expanded.
+fn append_reasoning_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    expanded: bool,
+    force_expand: bool,
+    width: usize,
+    theme: &Theme,
+) {
+    let style = theme.muted_style().add_modifier(Modifier::ITALIC);
+    let mut rows = text.lines().filter(|row| !row.trim().is_empty());
+    let first = rows.next().unwrap_or_default();
+    let prefix = "    ⋯ thinking · ";
+    if !(expanded || force_expand) {
+        let budget = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), style),
+            Span::styled(truncate_to_display_width(first, budget), style),
+        ]));
+        return;
+    }
+    lines.push(Line::from(vec![
+        Span::styled(prefix.to_string(), style),
+        Span::styled(first.to_string(), style),
+    ]));
+    let limit = if force_expand { usize::MAX } else { 11 };
+    for row in rows.take(limit) {
+        lines.push(Line::from(Span::styled(format!("      {row}"), style)));
     }
 }
 
@@ -4479,7 +4622,7 @@ fn current_tool_label(state: &AppState) -> Option<String> {
 
 fn stream_phase_label(state: &AppState) -> &'static str {
     match state.transcript.messages.last() {
-        Some(ChatMessage::Reasoning(_)) => "thinking",
+        Some(ChatMessage::Reasoning { .. }) => "thinking",
         Some(ChatMessage::AssistantChunk { .. }) | Some(ChatMessage::Assistant(_)) => "writing",
         _ => "working",
     }
@@ -6107,16 +6250,6 @@ fn flush_line(spans: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>) {
     }
 }
 
-fn truncate_lines(text: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= max_lines {
-        lines.join(" ")
-    } else {
-        let joined: String = lines[..max_lines].join(" ");
-        format!("{joined}...")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7263,9 +7396,12 @@ mod tests {
             second_lines.last().map(ToString::to_string),
             Some(String::new())
         );
+        // A standalone `Assistant` message no longer self-appends a trailing
+        // blank row: cross-message spacing is `leading_blank`'s job now, and
+        // nothing follows this message here.
         assert_eq!(
             tail_lines.last().map(ToString::to_string),
-            Some(String::new())
+            Some(" ●  tail".to_string())
         );
     }
 
@@ -7284,6 +7420,128 @@ mod tests {
             .expect("frozen fenced source");
 
         assert!(foregrounds(code_line).len() >= 2);
+    }
+
+    fn lines_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn message_text(previous: Option<&ChatMessage>, message: &ChatMessage) -> Vec<String> {
+        lines_text(&build_lines_for_message_after(
+            previous,
+            message,
+            &Theme::named(ThemeName::Dark),
+            80,
+            0,
+            false,
+            None,
+        ))
+    }
+
+    #[test]
+    fn user_message_gets_a_gutter_and_a_leading_blank_after_any_message() {
+        let user = ChatMessage::User("hello".into());
+        assert_eq!(message_text(None, &user), vec![" ›  hello"]);
+        let after = message_text(Some(&ChatMessage::Assistant("x".into())), &user);
+        assert_eq!(after, vec!["", " ›  hello"]);
+    }
+
+    #[test]
+    fn assistant_message_gets_a_gutter_and_indented_continuation() {
+        let message = ChatMessage::Assistant("first line\n\nsecond paragraph".into());
+        let text = message_text(None, &message);
+        assert_eq!(text[0], " ●  first line");
+        assert!(
+            text.iter()
+                .skip(1)
+                .all(|line| line.is_empty() || line.starts_with("    ")),
+            "{text:?}"
+        );
+        let after_tool = message_text(
+            Some(&ChatMessage::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                target: None,
+                status: "completed".into(),
+                output: None,
+                diff: None,
+                kind: None,
+                expanded: false,
+            }),
+            &message,
+        );
+        assert_eq!(after_tool[0], "");
+    }
+
+    #[test]
+    fn reasoning_collapses_to_one_line_and_expands_on_request() {
+        let long = "The user asks something.\nSecond thought here.\nThird.".to_string();
+        let collapsed = message_text(
+            None,
+            &ChatMessage::Reasoning {
+                text: long.clone(),
+                expanded: false,
+            },
+        );
+        assert_eq!(collapsed.len(), 1);
+        assert!(
+            collapsed[0].starts_with("    ⋯ thinking · The user asks something."),
+            "{collapsed:?}"
+        );
+        let expanded = message_text(
+            None,
+            &ChatMessage::Reasoning {
+                text: long.clone(),
+                expanded: true,
+            },
+        );
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded[1], "      Second thought here.");
+        let flushed = lines_text(&build_lines_for_message_after(
+            None,
+            &ChatMessage::Reasoning {
+                text: long,
+                expanded: false,
+            },
+            &Theme::named(ThemeName::Dark),
+            80,
+            0,
+            true,
+            None,
+        ));
+        assert_eq!(flushed.len(), 3, "flush must commit the full text");
+    }
+
+    #[test]
+    fn system_notice_is_a_single_info_row_with_indented_detail() {
+        let text = message_text(
+            None,
+            &ChatMessage::System("Resumed saved conversation.\nmodel deepseek-flash".into()),
+        );
+        assert_eq!(
+            text,
+            vec![
+                "    ℹ Resumed saved conversation.",
+                "      model deepseek-flash",
+            ]
+        );
+    }
+
+    #[test]
+    fn e_toggles_the_latest_reasoning_when_no_tool_follows_it() {
+        let mut state = test_state();
+        state.push_message(ChatMessage::Reasoning {
+            text: "a\nb".into(),
+            expanded: false,
+        });
+        assert!(state.toggle_latest_expandable());
+        assert!(matches!(
+            state.transcript.messages[0],
+            ChatMessage::Reasoning { expanded: true, .. }
+        ));
     }
 
     #[test]
@@ -8521,10 +8779,11 @@ mod tests {
                 kind: None,
                 expanded: false,
             });
-            state.transcript.messages.push(ChatMessage::Reasoning(
-                "The HTML report has been created. Let me verify it and provide a summary to the user."
+            state.transcript.messages.push(ChatMessage::Reasoning {
+                text: "The HTML report has been created. Let me verify it and provide a summary to the user."
                     .to_string(),
-            ));
+                expanded: false,
+            });
             state
                 .transcript
                 .messages
@@ -9092,8 +9351,12 @@ mod tests {
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .expect("draw");
 
+        // Column 0 is now the role gutter's leading space (`GUTTER_CONTINUATION`),
+        // not the message text itself; the assertion cares about reversal being
+        // applied to the selected cell and not its neighbor, not which glyph sits
+        // there.
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
         assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
         assert!(!buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
     }
@@ -9292,7 +9555,10 @@ mod tests {
         let mut state = test_state();
         state.status = AppStatus::Running;
         state.running_started_at = Some(Instant::now() - Duration::from_secs(3));
-        state.push_message(ChatMessage::Reasoning("hmm".into()));
+        state.push_message(ChatMessage::Reasoning {
+            text: "hmm".into(),
+            expanded: false,
+        });
         let text = activity_line(&state, &Theme::named(ThemeName::Dark)).expect("activity");
         assert_eq!(text, " ⠋ Running 3s · thinking · Esc interrupt");
     }
@@ -12233,6 +12499,9 @@ mod tests {
         assert!(completed.contains("visible line"));
         assert!(completed.contains("hidden half"));
 
+        // No trailing blank of its own: a lone `Assistant` message no longer
+        // self-appends spacing (that's `leading_blank`'s job for whatever
+        // message follows), so nothing follows here and nothing is blank.
         let lines = build_lines_for_messages(&state.transcript.messages, &theme, 80, 0, false);
         assert_eq!(
             lines
@@ -12240,7 +12509,7 @@ mod tests {
                 .rev()
                 .take_while(|line| line.to_string().is_empty())
                 .count(),
-            1
+            0
         );
     }
 
@@ -12515,7 +12784,12 @@ mod tests {
                         answer.push_str("\n\n");
                     }
                 }
-                answer.push_str("EXACT_CJK_TAIL_VISIBLE_20260702");
+                // Kept short enough to fit one wrapped row even after the role gutter
+                // claims `GUTTER_WIDTH` columns from the narrowest case tested here
+                // (34 - 4 = 30 available; the marker is 23 cells): the point of this
+                // marker is "is the true tail visible", not stressing the wrapper by
+                // itself, so it must not add its own, unrelated wrap point.
+                answer.push_str("EXACT_CJK_TAIL_20260702");
                 state
                     .transcript
                     .messages
@@ -12531,7 +12805,7 @@ mod tests {
                     .draw(|frame| render(frame, &mut state, &textarea, &theme))
                     .expect("draw");
                 let rendered = format!("{:?}", terminal.backend().buffer());
-                if !rendered.contains("EXACT_CJK_TAIL_VISIBLE_20260702") {
+                if !rendered.contains("EXACT_CJK_TAIL_20260702") {
                     failures.push(format!("{width}x{height}"));
                 }
             }

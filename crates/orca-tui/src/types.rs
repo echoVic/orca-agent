@@ -1331,22 +1331,30 @@ impl AppState {
         }
     }
 
-    pub fn toggle_latest_tool_output(&mut self) -> bool {
+    pub fn toggle_latest_expandable(&mut self) -> bool {
         // Only the live pane is mutable and re-renderable. Anything below `flushed_count`
         // has been committed to the terminal's immutable scrollback (in fully-expanded
-        // form), so `e` can only toggle a live tool/subagent message.
+        // form), so `e` can only toggle a live tool/subagent/reasoning message.
         let live_start = self
             .transcript
             .flushed_count
             .min(self.transcript.messages.len());
         let Some(index) = self.transcript.messages[live_start..]
             .iter()
-            .rposition(|message| matches!(message, ChatMessage::ToolCall { .. }))
+            .rposition(|message| {
+                matches!(
+                    message,
+                    ChatMessage::ToolCall { .. } | ChatMessage::Reasoning { .. }
+                )
+            })
         else {
             return false;
         };
         self.mutate_message(live_start + index, |message| match message {
             ChatMessage::ToolCall { expanded, .. } => {
+                *expanded = !*expanded;
+            }
+            ChatMessage::Reasoning { expanded, .. } => {
                 *expanded = !*expanded;
             }
             _ => unreachable!(),
@@ -1418,7 +1426,7 @@ impl AppState {
             ChatMessage::ToolCall { status, .. } => {
                 !matches!(status.as_str(), "running" | "receiving")
             }
-            ChatMessage::Reasoning(_)
+            ChatMessage::Reasoning { .. }
             | ChatMessage::Assistant(_)
             | ChatMessage::ProposedPlan(_) => turn_ended || !is_last,
             ChatMessage::AssistantChunk { .. }

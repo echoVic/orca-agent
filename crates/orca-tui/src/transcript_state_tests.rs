@@ -359,7 +359,7 @@ fn reconcile_assistant_response_replaces_frozen_chunks_and_open_tail() {
             ChatMessage::User(_),
             ChatMessage::AssistantChunk { .. },
             ChatMessage::Assistant(_),
-            ChatMessage::Reasoning(_),
+            ChatMessage::Reasoning { .. },
         ]
     ));
 
@@ -374,7 +374,7 @@ fn reconcile_assistant_response_replaces_frozen_chunks_and_open_tail() {
         state.transcript.messages.as_slice(),
         [
             ChatMessage::User(_),
-            ChatMessage::Reasoning(reasoning),
+            ChatMessage::Reasoning { text: reasoning, .. },
             ChatMessage::AssistantChunk {
                 text,
                 trailing_blank: true,
@@ -406,7 +406,7 @@ fn reconcile_assistant_response_drops_pending_partial_line() {
         state.transcript.messages.as_slice(),
         [
             ChatMessage::User(_),
-            ChatMessage::Reasoning(reasoning),
+            ChatMessage::Reasoning { text: reasoning, .. },
             ChatMessage::AssistantChunk { text, .. },
         ] if reasoning == "full reasoning" && text == "full answer\n\n"
     ));

@@ -148,7 +148,10 @@ impl Projection {
             self.messages.push(match kind {
                 0 => ChatMessage::User(String::new()),
                 1 => ChatMessage::Assistant(String::new()),
-                _ => ChatMessage::Reasoning(String::new()),
+                _ => ChatMessage::Reasoning {
+                    text: String::new(),
+                    expanded: false,
+                },
             });
             self.indices.insert(key, index);
             index
@@ -156,7 +159,7 @@ impl Projection {
         let buffer = match (&mut self.messages[index], kind) {
             (ChatMessage::User(value), 0)
             | (ChatMessage::Assistant(value), 1)
-            | (ChatMessage::Reasoning(value), 2) => value,
+            | (ChatMessage::Reasoning { text: value, .. }, 2) => value,
             _ => return Err(()),
         };
         let existing = buffer.get(offset..).ok_or(())?;

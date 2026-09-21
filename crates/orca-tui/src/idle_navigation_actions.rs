@@ -60,7 +60,7 @@ pub(crate) fn handle_idle_navigation_shortcut(
             let _ = action_tx.send(UserAction::Backtrack);
         }
         IdleShortcut::ExpandToolOutput => {
-            if textarea_text(textarea).trim().is_empty() && state.toggle_latest_tool_output() {
+            if textarea_text(textarea).trim().is_empty() && state.toggle_latest_expandable() {
                 vim_state.cancel_pending_command();
                 state.scroll_to_bottom();
             } else {

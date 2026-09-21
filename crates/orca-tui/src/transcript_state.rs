@@ -18,7 +18,10 @@ use crate::transcript_view::TranscriptRenderCache;
 pub enum ChatMessage {
     User(String),
     Image(TuiImage),
-    Reasoning(String),
+    Reasoning {
+        text: String,
+        expanded: bool,
+    },
     Assistant(String),
     AssistantChunk {
         text: String,

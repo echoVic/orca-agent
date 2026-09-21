@@ -663,8 +663,10 @@ fn history_message_from_surface_item(
             } else {
                 content.as_str()
             };
-            (!text.trim().is_empty())
-                .then(|| crate::transcript_state::ChatMessage::Reasoning(text.to_string()))
+            (!text.trim().is_empty()).then(|| crate::transcript_state::ChatMessage::Reasoning {
+                text: text.to_string(),
+                expanded: false,
+            })
         }
         SurfaceItem::AssistantPlan { text, .. } => (!text.as_str().trim().is_empty())
             .then(|| crate::transcript_state::ChatMessage::ProposedPlan(text.as_str().to_string())),
@@ -2804,7 +2806,7 @@ mod tests {
             [
                 crate::transcript_state::ChatMessage::User(prompt),
                 crate::transcript_state::ChatMessage::System(system),
-                crate::transcript_state::ChatMessage::Reasoning(reasoning),
+                crate::transcript_state::ChatMessage::Reasoning { text: reasoning, .. },
                 crate::transcript_state::ChatMessage::Assistant(answer),
                 crate::transcript_state::ChatMessage::ProposedPlan(plan),
             ] if prompt == "visible prompt"

@@ -1558,7 +1558,7 @@ mod tests {
     };
     use crate::transcript_state::ChatMessage;
     use crate::types::AppState;
-    use crate::ui::build_lines_for_messages;
+    use crate::ui::{build_lines_for_message_after, build_lines_for_messages};
 
     fn theme() -> Theme {
         Theme::named(orca_core::config::ThemeName::Dark)
@@ -2773,20 +2773,33 @@ mod tests {
             &messages,
             &revisions,
             TranscriptRenderContext::new(&theme, 80, 0, false),
-            |_, message, theme, width, tick, force_expand| {
-                build_lines_for_messages(
-                    std::slice::from_ref(message),
+            |index, message, theme, width, tick, force_expand| {
+                // Unlike the single-message-slice pattern used elsewhere in this
+                // file's cache-mechanics tests, this test renders `AssistantChunk`
+                // sequences, whose first line (the `●` gutter vs. continuation
+                // indent) depends on genuine adjacency, so the real previous
+                // sibling must be threaded through instead of isolating `message`.
+                let previous = index.checked_sub(1).and_then(|i| messages.get(i));
+                build_lines_for_message_after(
+                    previous,
+                    message,
                     theme,
                     width,
                     tick,
                     force_expand,
+                    None,
                 )
             },
         );
 
+        // One `●` opens the turn; the fenced code line is a continuation of the
+        // same streamed answer (indent only); "tail" is a distinct `Assistant`
+        // message, so it opens its own `●` immediately (no blank separator, since
+        // `leading_blank` doesn't insert one after a plain `AssistantChunk`), and
+        // carries no trailing blank of its own (nothing follows it here).
         assert_eq!(
             cache.extract_text(&selection((0, 0), (99, 99))),
-            "first paragraph\n\n  fn main() {}\ntail\n"
+            " ●  first paragraph\n\n      fn main() {}\n ●  tail"
         );
     }
 

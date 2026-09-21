@@ -718,7 +718,10 @@ pub(crate) fn chat_messages_from_history(message: Message) -> Vec<ChatMessage> {
                 vec![ChatMessage::Assistant(content)]
             } else if let Some(reasoning) = reasoning_content.filter(|text| !text.trim().is_empty())
             {
-                vec![ChatMessage::Reasoning(reasoning)]
+                vec![ChatMessage::Reasoning {
+                    text: reasoning,
+                    expanded: false,
+                }]
             } else if !tool_calls.is_empty() {
                 let names = tool_calls
                     .iter()

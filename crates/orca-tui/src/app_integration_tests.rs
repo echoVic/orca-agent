@@ -4653,7 +4653,7 @@ fn resumed_uuid_session_emits_typed_history_before_accepting_initial_turn() {
             .position(|message| {
                 matches!(
                     message,
-                    ChatMessage::Reasoning(reasoning)
+                    ChatMessage::Reasoning { text: reasoning, .. }
                         if reasoning == "Mock runtime is preserving the DeepSeek reasoning channel."
                 )
             })
@@ -6904,10 +6904,13 @@ fn mouse_selection_over_search_match_wins_and_copy_stays_exact() {
         .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))
         .expect("search draw");
 
+    // Row 0 now reads "    ℹ alpha beta": a 4-cell gutter plus the "ℹ " info
+    // glyph precede the message text, so "lph" (of "alpha") starts 6 columns
+    // later than it used to.
     state.viewport.selection = Some(TranscriptSelection::unit(
         SelectionGranularity::Cell,
-        SelectionPos { row: 0, col: 1 },
-        SelectionPos { row: 0, col: 3 },
+        SelectionPos { row: 0, col: 7 },
+        SelectionPos { row: 0, col: 9 },
     ));
     terminal
         .draw(|frame| ui::render(frame, &mut state, &textarea, &theme))

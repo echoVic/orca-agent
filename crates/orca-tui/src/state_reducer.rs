@@ -228,16 +228,19 @@ impl AppState {
                 let last = self.transcript.messages.len().saturating_sub(1);
                 if matches!(
                     self.transcript.messages.last(),
-                    Some(ChatMessage::Reasoning(_))
+                    Some(ChatMessage::Reasoning { .. })
                 ) {
                     self.mutate_message(last, |message| {
-                        let ChatMessage::Reasoning(existing) = message else {
+                        let ChatMessage::Reasoning { text: existing, .. } = message else {
                             unreachable!();
                         };
                         existing.push_str(&text);
                     });
                 } else {
-                    self.push_message(ChatMessage::Reasoning(text));
+                    self.push_message(ChatMessage::Reasoning {
+                        text,
+                        expanded: false,
+                    });
                 }
             }
             TuiEvent::MessageDelta(text) => {
@@ -934,7 +937,7 @@ impl AppState {
 
     pub(crate) fn promote_trailing_reasoning(&mut self) {
         let index = self.transcript.messages.len().saturating_sub(1);
-        if let Some(ChatMessage::Reasoning(text)) = self.transcript.messages.get(index) {
+        if let Some(ChatMessage::Reasoning { text, .. }) = self.transcript.messages.get(index) {
             let text = text.clone();
             self.replace_message(index, ChatMessage::Assistant(text));
         }
@@ -956,7 +959,7 @@ impl AppState {
                 let keep = index <= last_user
                     || !matches!(
                         item,
-                        ChatMessage::Reasoning(_)
+                        ChatMessage::Reasoning { .. }
                             | ChatMessage::Assistant(_)
                             | ChatMessage::AssistantChunk { .. }
                             | ChatMessage::ProposedPlan(_)
@@ -970,7 +973,10 @@ impl AppState {
         // content being replaced; drop it so the completed response renders alone.
         self.reset_assistant_stream();
         if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
-            self.push_message(ChatMessage::Reasoning(reasoning.to_string()));
+            self.push_message(ChatMessage::Reasoning {
+                text: reasoning.to_string(),
+                expanded: false,
+            });
         }
         if let Some(message) = message.filter(|text| !text.is_empty()) {
             self.handle_message_delta(message);
@@ -981,7 +987,7 @@ impl AppState {
         let boundary = self.transcript.messages.iter().rposition(|message| {
             !matches!(
                 message,
-                ChatMessage::Reasoning(_)
+                ChatMessage::Reasoning { .. }
                     | ChatMessage::Assistant(_)
                     | ChatMessage::AssistantChunk { .. }
                     | ChatMessage::ProposedPlan(_)
@@ -992,7 +998,7 @@ impl AppState {
             let keep = boundary.is_some_and(|boundary| index <= boundary)
                 || !matches!(
                     message,
-                    ChatMessage::Reasoning(_)
+                    ChatMessage::Reasoning { .. }
                         | ChatMessage::Assistant(_)
                         | ChatMessage::AssistantChunk { .. }
                         | ChatMessage::ProposedPlan(_)
