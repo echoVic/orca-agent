@@ -1626,6 +1626,7 @@ pub(crate) fn render_live_messages(
                 width: pill_width,
                 height: 1,
             };
+            frame.render_widget(Clear, pill);
             frame.render_widget(
                 Paragraph::new(Span::styled(label, theme.selection_style().fg(theme.text))),
                 pill,
@@ -9540,6 +9541,45 @@ mod tests {
             buffer[(pill.x + 1, pill.y)]
                 .modifier
                 .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn jump_to_bottom_pill_clears_the_cells_it_covers() {
+        let mut state = test_state();
+        for index in 0..40 {
+            state.push_message(ChatMessage::Assistant(format!(
+                "{} line {index}",
+                "x".repeat(70)
+            )));
+        }
+        state.viewport.auto_scroll = false;
+        state.viewport.scroll_offset = 0;
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .unwrap();
+        let pill = state.viewport.jump_to_bottom_area.expect("pill");
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..80)
+            .map(|x| buffer[(x, pill.y)].symbol().to_string())
+            .collect();
+        let left = &row[..usize::from(pill.x)];
+        assert!(
+            !left.trim().is_empty(),
+            "transcript text should remain left of the pill: {row:?}"
+        );
+        let inside: String = (pill.x..pill.x + pill.width)
+            .map(|x| buffer[(x, pill.y)].symbol().to_string())
+            .collect();
+        assert!(inside.contains("Jump to bottom"), "{inside:?}");
+        assert!(
+            !inside.contains('x'),
+            "pill must not show text through: {inside:?}"
         );
     }
 

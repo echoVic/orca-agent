@@ -1,5 +1,6 @@
 //! Stateless hosted session snapshot and history event shaping.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel as mpsc;
@@ -577,10 +578,11 @@ pub(crate) fn emit_typed_history_snapshot(
         && let HistoryMode::Resume(selector) | HistoryMode::Fork(selector) = mode
     {
         let transcript = load_saved_history_fallback(selector)?;
+        let mut replay = HistoryReplay::default();
         messages = transcript
             .messages
             .into_iter()
-            .flat_map(chat_messages_from_history)
+            .flat_map(|message| replay.convert(message))
             .collect();
         if plan.is_none() {
             plan = transcript.plan;
@@ -775,6 +777,59 @@ pub(crate) fn chat_messages_from_history(message: Message) -> Vec<ChatMessage> {
                 expanded: false,
             }]
         }
+    }
+}
+
+/// Stateful history → transcript conversion. Assistant messages announce tool
+/// calls (id, name, arguments); the matching tool result only carries the id,
+/// so the name and target have to be remembered across messages.
+#[derive(Default)]
+pub(crate) struct HistoryReplay {
+    tool_names: HashMap<String, (String, Option<String>)>,
+}
+
+fn tool_target_from_arguments(name: &str, arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let key = match name {
+        "bash" | "bash_wait" => "command",
+        "grep" | "glob" => "pattern",
+        "subagent" => "description",
+        "ask_user_question" => return None,
+        _ => "path",
+    };
+    value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+impl HistoryReplay {
+    pub(crate) fn convert(&mut self, message: Message) -> Vec<ChatMessage> {
+        if let Message::Assistant { tool_calls, .. } = &message {
+            for call in tool_calls {
+                self.tool_names.insert(
+                    call.id.clone(),
+                    (
+                        call.function_name.clone(),
+                        tool_target_from_arguments(&call.function_name, &call.arguments),
+                    ),
+                );
+            }
+        }
+        let tool_call_id = match &message {
+            Message::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        };
+        let mut messages = chat_messages_from_history(message);
+        if let Some(id) = tool_call_id
+            && let Some((name, target)) = self.tool_names.remove(&id)
+            && let Some(ChatMessage::ToolCall {
+                name: slot,
+                target: target_slot,
+                ..
+            }) = messages.first_mut()
+        {
+            *slot = name;
+            *target_slot = target;
+        }
+        messages
     }
 }
 
@@ -983,5 +1038,34 @@ mod tests {
                 if attached.attachment == Some(attachment)
                     && matches!(attached.event, TuiEvent::HistoryLoaded { .. })
         ));
+    }
+
+    #[test]
+    fn history_replay_restores_tool_names_and_targets_from_assistant_calls() {
+        use orca_core::conversation::{Message, RawToolCall};
+        let mut replay = HistoryReplay::default();
+        let assistant = Message::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![RawToolCall {
+                id: "call_1".into(),
+                function_name: "bash".into(),
+                arguments: r#"{"command":"cargo test"}"#.into(),
+            }],
+            pinned: false,
+        };
+        let _ = replay.convert(assistant);
+        let tool = Message::Tool {
+            tool_call_id: "call_1".into(),
+            content: "ok".into(),
+            terminal: None,
+            pinned: false,
+        };
+        let messages = replay.convert(tool);
+        let ChatMessage::ToolCall { name, target, .. } = &messages[0] else {
+            panic!("tool call")
+        };
+        assert_eq!(name, "bash");
+        assert_eq!(target.as_deref(), Some("cargo test"));
     }
 }

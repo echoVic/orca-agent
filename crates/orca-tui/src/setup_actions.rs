@@ -377,4 +377,50 @@ mod tests {
             Ok(UserAction::Submit(prompt)) if prompt == "hello"
         ));
     }
+
+    /// Reproduces the reported leak: a key typed into the composer while the
+    /// welcome step is on screen must not survive into the main UI once setup
+    /// finishes, even though `handle_setup_key` never routed that key into the
+    /// textarea itself (the leak was about carrying stale textarea content
+    /// across the setup -> main-UI transition, not about the key handler).
+    #[test]
+    fn finishing_setup_starts_with_an_empty_composer() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(workspace.path().to_path_buf());
+        folder_trust::set_trust_with_config_dir(workspace.path(), home.path(), TrustLevel::Trusted)
+            .unwrap();
+        let mut state = welcome_state();
+        state.first_run =
+            Some(orca_runtime::onboarding::inspect_first_run_in(&config, home.path()).unwrap());
+        state.setup_selection = SETUP_TRUST_SELECTION;
+        config.api_key = Some("sk-test".into());
+
+        let shared = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let vim = VimState::new(false);
+        let mut textarea = make_textarea(&vim, &theme);
+        textarea.insert_str("t");
+
+        let (event, key) = press(KeyCode::Enter);
+        let flow = handle_setup_key(
+            &event,
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &vim,
+            &theme,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(flow, SetupFlow::Continue));
+        assert_eq!(state.status, AppStatus::Idle);
+        assert!(textarea.is_empty());
+    }
 }

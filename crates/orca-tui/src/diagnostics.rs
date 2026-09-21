@@ -18,16 +18,6 @@ pub(crate) enum DiagnosticLevel {
     Info,
 }
 
-impl DiagnosticLevel {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Error => "ERROR",
-            Self::Warning => "WARNING",
-            Self::Info => "INFO",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DiagnosticContext {
     Runtime,
