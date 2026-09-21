@@ -1547,7 +1547,7 @@ pub(crate) fn render_live_messages(
             .clear_matches(state.transcript.render_cache.content_generation());
         // The welcome screen renders through its own cache so its text is
         // selectable and copyable exactly like transcript content.
-        let lines = build_welcome_lines(state, theme);
+        let lines = build_welcome_lines(state, theme, width);
         let welcome_message = [ChatMessage::System(String::new())];
         // Sentinel revision: never collides with allocated ones, and the
         // explicit invalidate below forces a rebuild whenever we redraw.
@@ -2949,77 +2949,157 @@ fn current_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn build_welcome_lines<'a>(state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
-    let whale = Style::default().fg(theme.border);
-    let water = Style::default().fg(theme.plan_mode);
+// The terminal mark is a compact braille rendering of the same spraying whale
+// used by the site icon, so the startup screen keeps the product's actual
+// silhouette instead of a generic whale emoji or blob. None of these rows
+// exceed `WELCOME_ART_WIDTH` display columns, and every glyph here is
+// single-width, so plain character-count padding lines the art up with the
+// right column without pulling in unicode-width machinery.
+const WELCOME_WHALE_ART: [&str; 14] = [
+    r"             ⢀⣤⣶⣶⣶⣶⣄⢀⣤⣶",
+    r"           ⡠⠾⠿⠿⢿⣿⠻⠿⢻⣿⠿⠋",
+    r"                 ⣿⣿",
+    r"               ⢀⣀⣿⣿⡀    ⢠⡄",
+    r"    ⣀⣤⣴⣶⣶⣿⣿⣿⣶⣾⣿⣿⣿⣿⠋     ⣿⣿⣶⣤⡀    ⣀⣠⣦",
+    r"  ⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣄   ⢻⣿⣿⣿⣿⣴⣿⣿⣿⣿⣿⠇",
+    r"⢀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀ ⠙⠻⣿⣿⣿⣿⣿⠿⠟⠁",
+    r"⣼⣿⡏⠉⠉⠉⠉⠙⠛⠻⢿⣿⣿⣿⣿⣿⣿⣿⡿⠛⠻⢿⣿⣿⣷⣦⣼⣿⣿⣿",
+    r"⣿⣿⣧        ⠈⠙⠿⣿⣿⣿⣿⣿⣹⡆ ⠙⢿⣿⣿⣿⣿⣿⠏",
+    r"⢸⣿⣿⣆          ⠈⠻⣿⣿⣿⣿⣿⣦⣤⣴⣿⣿⣿⣿⡟",
+    r" ⠻⣿⣿⣧⡀          ⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠋",
+    r"  ⠙⢿⣿⣿⣶⣄⡀  ⠘⢿⣷⣦⣄  ⠙⢿⣿⣿⣿⣿⣿⣟⠁",
+    r"    ⠉⠻⢿⣿⣿⣷⣶⣶⣾⣿⣿⣿⣿⣶⣤⣤⣬⣿⠿⠿⣿⣿⣿⡷⠆",
+    r"       ⠈⠉⠛⠻⠿⠿⠿⠿⠿⠿⠿⠛⠋⠉",
+];
+
+/// Art column width the whale silhouette is padded to in the two-column
+/// layout, and the threshold below which the art is dropped entirely.
+const WELCOME_ART_WIDTH: usize = 36;
+/// Gap between the padded art column and the right (wordmark/status) column.
+const WELCOME_COLUMN_GAP: usize = 4;
+/// Minimum transcript width that fits the whale and the right column side by side.
+const WELCOME_TWO_COLUMN_MIN_WIDTH: usize = 80;
+/// Below this width the whale art is dropped; only the right column renders.
+const WELCOME_TEXT_ONLY_MAX_WIDTH: usize = 44;
+
+/// The wordmark/status/tips column shown beside (or, below `WELCOME_TWO_COLUMN_MIN_WIDTH`,
+/// beneath) the whale art. Indexed 1:1 with `WELCOME_WHALE_ART` so each row can be zipped
+/// with its matching art row in the two-column layout.
+fn welcome_right_column(state: &AppState, theme: &Theme) -> Vec<Vec<Span<'static>>> {
+    let whale = theme.accent_style();
+    let muted = theme.muted_style();
     let text = Style::default().fg(theme.text);
-    let muted = Style::default().fg(theme.muted);
-
-    // The terminal mark is a compact braille rendering of the same spraying
-    // whale used by the site icon, so the startup screen keeps the product's
-    // actual silhouette instead of a generic whale emoji or blob.
-    let whale_art = [
-        r"             ⢀⣤⣶⣶⣶⣶⣄⢀⣤⣶",
-        r"           ⡠⠾⠿⠿⢿⣿⠻⠿⢻⣿⠿⠋",
-        r"                 ⣿⣿",
-        r"               ⢀⣀⣿⣿⡀    ⢠⡄",
-        r"    ⣀⣤⣴⣶⣶⣿⣿⣿⣶⣾⣿⣿⣿⣿⠋     ⣿⣿⣶⣤⡀    ⣀⣠⣦",
-        r"  ⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣄   ⢻⣿⣿⣿⣿⣴⣿⣿⣿⣿⣿⠇",
-        r"⢀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀ ⠙⠻⣿⣿⣿⣿⣿⠿⠟⠁",
-        r"⣼⣿⡏⠉⠉⠉⠉⠙⠛⠻⢿⣿⣿⣿⣿⣿⣿⣿⡿⠛⠻⢿⣿⣿⣷⣦⣼⣿⣿⣿",
-        r"⣿⣿⣧        ⠈⠙⠿⣿⣿⣿⣿⣿⣹⡆ ⠙⢿⣿⣿⣿⣿⣿⠏",
-        r"⢸⣿⣿⣆          ⠈⠻⣿⣿⣿⣿⣿⣦⣤⣴⣿⣿⣿⣿⡟",
-        r" ⠻⣿⣿⣧⡀          ⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠋",
-        r"  ⠙⢿⣿⣿⣶⣄⡀  ⠘⢿⣷⣦⣄  ⠙⢿⣿⣿⣿⣿⣿⣟⠁",
-        r"    ⠉⠻⢿⣿⣿⣷⣶⣶⣾⣿⣿⣿⣿⣶⣤⣤⣬⣿⠿⠿⣿⣿⣿⡷⠆",
-        r"       ⠈⠉⠛⠻⠿⠿⠿⠿⠿⠿⠿⠛⠋⠉",
-    ];
-
-    let mut lines = vec![Line::from("")];
-    for (index, art_line) in whale_art.into_iter().enumerate() {
-        lines.push(Line::from(Span::styled(
-            format!("  {art_line}"),
-            if index < 2 { water } else { whale },
-        )));
-    }
-    lines.extend([
-        Line::from(Span::styled("   ___                ", whale)),
-        Line::from(Span::styled("  / _ \\ _ __ ___ __ _ ", whale)),
-        Line::from(Span::styled(" | | | | '__/ __/ _` |", whale)),
-        Line::from(Span::styled(" | |_| | | | (_| (_| |", whale)),
-        Line::from(vec![
+    let mode = Span::styled(
+        state.approval_mode.as_str().to_string(),
+        Style::default().fg(approval_mode_color(state.approval_mode, theme)),
+    );
+    let branch = state
+        .workspace_git
+        .as_ref()
+        .map(GitIdentity::label)
+        .map(|git| format!(" · {git}"))
+        .unwrap_or_default();
+    let first_tip = if state
+        .first_run
+        .as_ref()
+        .is_some_and(|first_run| !first_run.workspace_trusted)
+    {
+        vec![
+            Span::styled("› ", whale),
+            Span::styled("/trust", muted),
+            Span::styled(" to let Orca read and edit this directory", text),
+        ]
+    } else {
+        vec![
+            Span::styled("› ", whale),
+            Span::styled("/resume", muted),
+            Span::styled(" to continue a saved conversation", text),
+        ]
+    };
+    vec![
+        vec![],
+        vec![Span::styled("   ___                ", whale)],
+        vec![Span::styled("  / _ \\ _ __ ___ __ _ ", whale)],
+        vec![Span::styled(" | | | | '__/ __/ _` |", whale)],
+        vec![Span::styled(" | |_| | | | (_| (_| |", whale)],
+        vec![
             Span::styled("  \\___/|_|  \\___\\__,_|", whale),
             Span::styled(format!("  v{}", state.app_version), muted),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  model:      ", muted),
-            Span::styled(state.model_name.clone(), text),
-        ]),
-        Line::from(vec![
-            Span::styled("  directory:  ", muted),
-            Span::styled(state.cwd.clone(), text),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("  Tips", Style::default().fg(theme.success))),
-        Line::from(Span::styled(
-            "  • Enter to send, Alt+Enter (or Shift+Enter) for newline",
-            muted,
-        )),
-        Line::from(Span::styled(
-            "  • / commands, @ to mention files, $ to invoke skills",
-            muted,
-        )),
-        Line::from(Span::styled(
-            "  • /model to switch model, /compact to compress context",
-            muted,
-        )),
-        Line::from(Span::styled(
-            "  • Ctrl+K or F1 for keyboard shortcuts",
-            muted,
-        )),
-        Line::from(""),
-    ]);
+        ],
+        vec![],
+        vec![
+            Span::styled("model   ", muted),
+            Span::styled(displayed_model_name(&state.model_name).to_string(), text),
+            Span::styled(format!(" · {} · ", state.reasoning_effort.as_str()), muted),
+            mode,
+        ],
+        vec![
+            Span::styled("cwd     ", muted),
+            Span::styled(compact_cwd(&state.cwd, 48), text),
+            Span::styled(branch, muted),
+        ],
+        vec![],
+        first_tip,
+        vec![
+            Span::styled("› ", whale),
+            Span::styled("? ", muted),
+            Span::styled("keys · ", text),
+            Span::styled("/ ", muted),
+            Span::styled("commands · ", text),
+            Span::styled("@ ", muted),
+            Span::styled("files · ", text),
+            Span::styled("$ ", muted),
+            Span::styled("skills", text),
+        ],
+        vec![],
+        vec![],
+    ]
+}
+
+/// Builds the welcome screen: the braille whale mark beside the wordmark, current
+/// model/directory status and two contextual tips. `width` picks the layout: two
+/// columns when there's room for both side by side, the art stacked above the text
+/// when there's room for the art alone, and text-only once the transcript is too
+/// narrow for the art to read as a whale.
+fn build_welcome_lines<'a>(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'a>> {
+    let art_style = |index: usize| {
+        if index < 2 {
+            Style::default().fg(theme.plan_mode)
+        } else {
+            theme.accent_style()
+        }
+    };
+    let right = welcome_right_column(state, theme);
+
+    let mut lines = vec![Line::from("")];
+    if width >= WELCOME_TWO_COLUMN_MIN_WIDTH {
+        let column = 2 + WELCOME_ART_WIDTH + WELCOME_COLUMN_GAP;
+        for (index, art_row) in WELCOME_WHALE_ART.iter().enumerate() {
+            let padded = format!("  {art_row:<WELCOME_ART_WIDTH$}");
+            let mut spans = vec![Span::styled(padded, art_style(index))];
+            let art_width = 2 + UnicodeWidthStr::width(art_row.trim_end());
+            spans.push(Span::raw(" ".repeat(
+                column.saturating_sub(art_width.max(2 + WELCOME_ART_WIDTH)),
+            )));
+            spans.extend(right[index].clone());
+            lines.push(Line::from(spans));
+        }
+    } else {
+        if width > WELCOME_TEXT_ONLY_MAX_WIDTH {
+            for (index, art_row) in WELCOME_WHALE_ART.iter().enumerate() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {art_row}"),
+                    art_style(index),
+                )));
+            }
+        }
+        for row in right.into_iter() {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(row);
+            lines.push(Line::from(spans));
+        }
+    }
+    lines.push(Line::from(""));
     lines
 }
 
@@ -8432,7 +8512,7 @@ mod tests {
         );
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let rendered = build_welcome_lines(&state, &theme)
+        let rendered = build_welcome_lines(&state, &theme, 100)
             .into_iter()
             .map(|line| {
                 line.spans
@@ -8457,7 +8537,7 @@ mod tests {
         );
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
 
-        let rendered = build_welcome_lines(&state, &theme)
+        let rendered = build_welcome_lines(&state, &theme, 100)
             .into_iter()
             .map(|line| {
                 line.spans
@@ -8483,6 +8563,71 @@ mod tests {
             rendered.contains("   ___"),
             "brand wordmark missing: {rendered}"
         );
+    }
+
+    fn welcome_text(state: &AppState, width: usize) -> Vec<String> {
+        lines_text(&build_welcome_lines(
+            state,
+            &Theme::named(ThemeName::Dark),
+            width,
+        ))
+    }
+
+    #[test]
+    fn wide_welcome_puts_the_wordmark_and_status_beside_the_whale() {
+        let mut state = test_state();
+        state.model_name = "auto".into();
+        state.approval_mode = ApprovalMode::Suggest;
+        state.reasoning_effort = orca_core::config::ReasoningEffort::Max;
+        let text = welcome_text(&state, 100);
+        assert_eq!(
+            text.len(),
+            16,
+            "one blank, 14 art rows, one blank: {text:?}"
+        );
+        let wordmark_row = text
+            .iter()
+            .find(|row| row.contains("___"))
+            .expect("wordmark");
+        assert!(wordmark_row.find("___").unwrap() >= 42, "{wordmark_row}");
+        assert!(
+            text.iter()
+                .any(|row| row.contains("model   deepseek-flash · max · suggest")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|row| row.contains("› /resume to continue a saved conversation")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|row| row.contains("› ? keys · / commands · @ files · $ skills")),
+            "{text:?}"
+        );
+        assert!(!text.iter().any(|row| row.contains("Tips")), "{text:?}");
+    }
+
+    #[test]
+    fn narrow_welcome_stacks_the_whale_above_the_text_and_tiny_drops_it() {
+        let state = test_state();
+        let stacked = welcome_text(&state, 70);
+        assert!(stacked.len() > 16, "{stacked:?}");
+        assert!(stacked[1].trim_start().starts_with('⢀'), "{stacked:?}");
+        let tiny = welcome_text(&state, 40);
+        assert!(!tiny.iter().any(|row| row.contains('⣿')), "{tiny:?}");
+        assert!(tiny.iter().any(|row| row.contains("___")), "{tiny:?}");
+    }
+
+    #[test]
+    fn untrusted_workspace_welcome_points_at_trust() {
+        let mut state = test_state();
+        state.first_run = Some(orca_runtime::onboarding::FirstRunState {
+            workspace_trusted: false,
+            ..first_run_fixture()
+        });
+        let text = welcome_text(&state, 100);
+        assert!(text.iter().any(|row| row.contains("› /trust")), "{text:?}");
     }
 
     #[test]
@@ -8530,6 +8675,31 @@ mod tests {
             "deepseek".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    fn first_run_fixture() -> orca_runtime::onboarding::FirstRunState {
+        orca_runtime::onboarding::FirstRunState {
+            schema_version: 1,
+            workspace: std::path::PathBuf::from("/tmp/workspace"),
+            config_dir: std::path::PathBuf::from("/tmp/orca-config"),
+            auth_path: std::path::PathBuf::from("/tmp/orca-config/auth.json"),
+            acknowledgement_path: std::path::PathBuf::from("/tmp/orca-config/onboarding.toml"),
+            security_policy_digest: "digest".to_string(),
+            acknowledged: true,
+            workspace_trusted: true,
+            diagnostics: orca_runtime::diagnostics::DiagnosticReport {
+                schema_version: orca_runtime::diagnostics::DOCTOR_SCHEMA_VERSION,
+                package: orca_runtime::diagnostics::CANONICAL_PACKAGE,
+                website: orca_runtime::diagnostics::CANONICAL_WEBSITE,
+                version: "test".to_string(),
+                platform: "test".to_string(),
+                cwd: orca_runtime::diagnostics::DiagnosticCwd {
+                    requested: "/tmp".to_string(),
+                    canonical: None,
+                },
+                checks: Vec::new(),
+            },
+        }
     }
 
     fn monochrome_theme() -> Theme {
