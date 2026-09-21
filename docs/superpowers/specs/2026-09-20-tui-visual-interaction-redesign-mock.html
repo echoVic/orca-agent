@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body style="margin:0">
+<title>Orca TUI 交互稿</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;700&display=swap">
+<style>
+:root{
+  --bg:#F4F6FC; --surface:#FFFFFF; --text:#151A2D; --muted:#5C6479; --line:#DCE2F0; --chip:#EAEEF9; --chip-on:#4D6BFE; --accent:#4D6BFE; --accent-ink:#2E46C9;
+  --t-bg:#0B0E1A; --t-fg:#E8ECF6; --t-mu:#8B93A7; --t-dim:#4C536A; --t-br:#4D6BFE; --t-ok:#2FB170; --t-wa:#D9A441; --t-er:#D65151; --t-ap:#A98BF5; --t-pl:#40AAAA; --t-sel:#2E3E84; --t-add:#213A2B; --t-rem:#4A221D; --t-code:#151A2C; --t-us:#4D6BFE;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){ --bg:#0F1220; --surface:#161A2B; --text:#E8ECF6; --muted:#8B93A7; --line:#2A3049; --chip:#1E2338; --chip-on:#4D6BFE; --accent:#6F86FF; --accent-ink:#A7B6FF; }
+}
+:root[data-theme="dark"]{ --bg:#0F1220; --surface:#161A2B; --text:#E8ECF6; --muted:#8B93A7; --line:#2A3049; --chip:#1E2338; --chip-on:#4D6BFE; --accent:#6F86FF; --accent-ink:#A7B6FF; }
+
+body{background:var(--bg);color:var(--text);font-family:"IBM Plex Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;font-size:14px;line-height:1.55}
+.wrap{max-width:1240px;margin:0 auto;padding-inline:20px;padding-block:28px 72px}
+header h1{font-size:26px;font-weight:600;margin:0 0 6px;letter-spacing:-.01em;text-wrap:balance}
+header p{margin:0;color:var(--muted);max-width:70ch}
+.legend{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.legend span{font-size:12px;color:var(--muted);background:var(--chip);border-radius:6px;padding:3px 9px}
+.legend kbd{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--text)}
+
+.grid{display:grid;grid-template-columns:232px minmax(0,1fr);gap:26px;margin-top:26px;align-items:start}
+nav{position:sticky;top:16px;display:flex;flex-direction:column;gap:2px}
+nav .k{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:10px 0 4px 10px}
+nav .k:first-child{margin-top:0}
+nav button{all:unset;cursor:pointer;display:flex;align-items:baseline;gap:8px;padding:7px 10px;border-radius:7px;font-size:13.5px;color:var(--text)}
+nav button:hover{background:var(--chip)}
+nav button[aria-current="true"]{background:var(--chip);color:var(--accent-ink);font-weight:600}
+nav button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+nav button .n{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--muted);min-width:1.4em}
+
+.stage h2{font-size:19px;font-weight:600;margin:0 0 4px}
+.stage .note{color:var(--muted);margin:0 0 12px;max-width:80ch}
+.bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:10px}
+.seg{display:inline-flex;background:var(--chip);border-radius:8px;padding:3px}
+.seg button{all:unset;cursor:pointer;padding:4px 12px;border-radius:6px;font-size:13px;color:var(--muted)}
+.seg button[aria-pressed="true"]{background:var(--surface);color:var(--text);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.12)}
+.seg button:focus-visible{outline:2px solid var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips button{all:unset;cursor:pointer;font-size:12.5px;padding:4px 10px;border-radius:6px;background:var(--chip);color:var(--text)}
+.chips button:hover{filter:brightness(.96)}
+.chips button:focus-visible{outline:2px solid var(--accent)}
+.try{font-size:12.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px}
+.try kbd{font-family:"JetBrains Mono",monospace;font-size:11.5px;background:var(--chip);color:var(--text);padding:1px 6px;border-radius:4px}
+
+.term{width:fit-content;max-width:100%;background:var(--t-bg);border-radius:10px;overflow-x:auto;box-shadow:0 8px 30px rgba(10,14,40,.18);outline:2px solid transparent;outline-offset:2px;transition:outline-color .15s}
+.term:focus-visible{outline-color:var(--accent)}
+.term .tb{display:flex;justify-content:space-between;align-items:center;padding:8px 16px 0;font:11.5px "JetBrains Mono",monospace;color:var(--t-dim);min-width:100ch}
+.term .tb .foc{color:var(--t-mu)}
+.term pre{position:relative;margin:0;padding:10px 16px 14px;font:12.5px/1.5 "JetBrains Mono","SF Mono",Menlo,Consolas,"Noto Sans Mono CJK SC",monospace;color:var(--t-fg);white-space:pre;min-width:100ch;tab-size:4}
+.term pre .w{display:inline-block;white-space:pre;vertical-align:baseline}
+.term pre .art{display:inline-block;white-space:pre;vertical-align:baseline;transform-origin:0 50%;transform:scaleX(var(--bfix,1))}
+.term pre .ov{position:absolute;margin:0;padding:0;background:var(--t-bg);min-width:0;box-shadow:0 0 0 1px var(--t-bg)}
+.act{cursor:pointer}
+.act:hover{text-decoration:underline;text-decoration-color:var(--t-mu)}
+.fg{color:var(--t-fg)} .mu{color:var(--t-mu)} .dim{color:var(--t-dim)} .br{color:var(--t-br)} .us{color:var(--t-us)} .ok{color:var(--t-ok)} .wa{color:var(--t-wa)} .er{color:var(--t-er)} .ap{color:var(--t-ap)} .pl{color:var(--t-pl)}
+.b{font-weight:700} .i{font-style:italic}
+.sel{background:var(--t-sel);color:var(--t-fg)} .selb{background:var(--t-sel);color:var(--t-fg);font-weight:700}
+.da{background:var(--t-add);color:#B9E6C6} .dr{background:var(--t-rem);color:#F0B9B0}
+.cb{background:var(--t-code);color:#C9D1E6}
+.h1{color:var(--t-br);font-weight:700} .h3{color:var(--t-wa);font-weight:700}
+.code{color:var(--t-pl)}
+
+.tokens{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}
+.tk{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.tk h3{margin:0 0 10px;font-size:14px;font-weight:600}
+.tk table{border-collapse:collapse;width:100%;font-size:13px}
+.tk td{padding:5px 6px;border-top:1px solid var(--line);vertical-align:top}
+.tk tr:first-child td{border-top:0}
+.tk td:first-child{font-family:"JetBrains Mono",monospace;white-space:nowrap;color:var(--accent-ink);width:1%}
+.tk .sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;margin-right:6px}
+.tk .g{font-family:"JetBrains Mono",monospace;background:var(--t-bg);color:var(--t-fg);padding:8px 10px;border-radius:6px;white-space:pre;overflow-x:auto;font-size:12px;line-height:1.5}
+.foot{margin-top:28px;color:var(--muted);font-size:12.5px;max-width:80ch}
+
+@media (max-width: 900px){
+  .grid{grid-template-columns:1fr;gap:16px}
+  nav{position:static;flex-direction:row;overflow-x:auto;gap:6px;padding-bottom:4px}
+  nav .k{display:none}
+  nav button{white-space:nowrap;background:var(--chip)}
+  .term pre{font-size:12px}
+}
+@media (prefers-reduced-motion: reduce){ .term{transition:none} }
+</style>
+
+<div class="wrap">
+<header>
+  <h1>Orca TUI 交互稿</h1>
+  <p>把 spec 里的方案一和方案二画出来。每个场景按 100 列 × 34 行的终端网格排版，终端内颜色取自 <code>theme.rs</code> 的 Dark 调色板（品牌蓝 #4D6BFE）。关键场景可以切换「改前 / 改后」，改前画面来自今晚实际抓取的终端截图。</p>
+  <div class="legend">
+    <span>点一下终端画面获得键盘焦点，然后按场景提示里的键</span>
+    <span>终端里带下划线悬停效果的行可以点击</span>
+    <span><kbd>改前</kbd> = 当前实现 · <kbd>改后</kbd> = 方案效果</span>
+  </div>
+</header>
+
+<div class="grid">
+  <nav id="nav" aria-label="场景"></nav>
+  <section class="stage" id="stage"></section>
+</div>
+
+<p class="foot">画面里的会话内容来自真实历史会话（ego-browser 那段）和 spec 里的示例；工具耗时、token、成本等数字是示意值。鲸鱼字符画取自当前工作树里的实现。</p>
+</div>
+
+<script>
+(function(){
+'use strict';
+var H = 34;
+var W = 100;
+var FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ---------- text metrics & rendering ---------- */
+function isWide(ch){ var c = ch.codePointAt(0);
+  return (c>=0x1100&&c<=0x115F)||(c>=0x2E80&&c<=0xA4CF)||(c>=0xAC00&&c<=0xD7A3)||(c>=0xF900&&c<=0xFAFF)||(c>=0xFE30&&c<=0xFE4F)||(c>=0xFF00&&c<=0xFF60)||(c>=0xFFE0&&c<=0xFFE6)||(c>=0x20000&&c<=0x3FFFD); }
+function dw(s){ var n=0; for (var ch of s) n += isWide(ch)?2:1; return n; }
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function txt(s){ var out='', run='';
+  function flush(){ if(run){ out += '<span class="w" style="width:'+(2*Array.from(run).length)+'ch">'+esc(run)+'</span>'; run=''; } }
+  for (var ch of s){ if (isWide(ch)) run += ch; else { flush(); out += esc(ch); } }
+  flush(); return out; }
+function S(cls, text, act){ return {cls:cls, text:String(text), act:act}; }
+function rowW(segs){ var n=0; for (var i=0;i<segs.length;i++) n += dw(segs[i].text); return n; }
+function fit(segs, width){ var total = rowW(segs); if (total <= width) return segs;
+  var out=[], used=0, limit=width-1;
+  for (var i=0;i<segs.length;i++){ var s=segs[i], t='';
+    for (var ch of s.text){ var w=dw(ch); if (used+w>limit) break; t+=ch; used+=w; }
+    if (t) out.push({cls:s.cls,text:t,act:s.act});
+    if (used>=limit) break; }
+  out.push(S('mu','…')); return out; }
+function padTo(segs, width){ var n = width - rowW(segs); return n>0 ? segs.concat([S('fg',' '.repeat(n))]) : segs; }
+function html(segs){ return segs.map(function(s){
+  if (s.art) return '<span class="'+s.cls+' art" style="width:'+s.art+'ch">'+esc(s.text)+'</span>';
+  return '<span class="'+s.cls+(s.act?' act':'')+'"'+(s.act?' data-act="'+s.act+'"':'')+'>'+txt(s.text)+'</span>'; }).join(''); }
+/* Braille glyphs are one cell wide in a real terminal but often come from a
+   fallback font in the browser; measure the mismatch once and scale the art
+   horizontally so the right-hand column lines up like it would in a terminal. */
+function measureBraille(){ var probe = document.createElement('pre'); probe.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;margin:0;font:12.5px/1.5 "JetBrains Mono","SF Mono",Menlo,Consolas,monospace;white-space:pre';
+  probe.innerHTML = '<span id="bp0">0000000000000000</span><span id="bp1">⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿</span>'; document.body.appendChild(probe);
+  var w0 = document.getElementById('bp0').getBoundingClientRect().width, w1 = document.getElementById('bp1').getBoundingClientRect().width;
+  if (w0 > 0 && w1 > 0) document.documentElement.style.setProperty('--bfix', (w0 / w1).toFixed(4)); probe.remove(); }
+function line(){ return fit(Array.prototype.slice.call(arguments), W); }
+function blank(){ return []; }
+function rep(ch,n){ return n>0 ? ch.repeat(n) : ''; }
+
+function box(title, rows, opt){ opt = opt||{}; var w = opt.width||W, bc = opt.border||'br', inner = w-4, round = opt.round!==false;
+  var tl=round?'╭':'┌', tr=round?'╮':'┐', bl=round?'╰':'└', br_=round?'╯':'┘';
+  var t = title ? ' '+title+' ' : '';
+  var out = [[S(bc, tl+'─'), S(opt.titleCls||bc, t), S(bc, rep('─', w-3-dw(t))+tr)]];
+  for (var i=0;i<rows.length;i++){ out.push([S(bc,'│'), S('fg',' ')].concat(padTo(fit(rows[i], inner), inner), [S('fg',' '), S(bc,'│')])); }
+  out.push([S(bc, bl+rep('─', w-2)+br_)]);
+  return out; }
+
+function screen(top, bottom){ var fill = H - top.length - bottom.length; var t = top;
+  if (fill < 0) { t = top.slice(-fill); fill = 0; }
+  var rows = t.slice(); for (var i=0;i<fill;i++) rows.push([]); return rows.concat(bottom); }
+
+function spread(left, right, width){ var gap = width - rowW(left) - rowW(right); if (gap < 1) return fit(left.concat([S('fg',' ')], right), width);
+  return left.concat([S('fg', rep(' ', gap))], right); }
+
+/* ---------- chrome builders (after) ---------- */
+var MODE_CLS = {'suggest':'br','auto-edit':'ap','full-auto':'er','plan':'pl'};
+function composerAfter(text, opt){ opt=opt||{}; var focused = opt.focused!==false;
+  var prompt = text ? [S('br',' › '), S('fg', text)] : [S('br',' › '), S('mu','Message Orca…  / commands · @ files · $ skills')];
+  var rule = [S(focused?'br':'dim', rep('─', W))];
+  return [rule, line.apply(null, prompt), rule.slice()]; }
+function statusAfter(opt){ opt=opt||{}; var mode = opt.mode||'auto-edit', w = opt.width||W;
+  var left = opt.side ? [S('fg',' '), S('pl','Side'), S('mu',' · Ctrl+/ back')] : [S('fg',' '), S(MODE_CLS[mode]+' b','⇧Tab '+mode)];
+  if (opt.vim) left = left.concat([S('mu','  '), S('wa','NORMAL')]);
+  var mid = [S('mu','~/Documents/GitHub/blade-deepseek · main')];
+  var right = [S('mu','deepseek-flash · max · ctx '+(opt.ctx||'96')+'% · '+(opt.tok||'8.7k')+' · '+(opt.cost||'$0.03') + ' · '), S('mu','? help'), S('fg',' ')];
+  var need = rowW(left)+rowW(mid)+rowW(right)+6;
+  if (need > w) return spread(left, right, w);
+  var gapL = Math.floor((w - rowW(left) - rowW(mid) - rowW(right))/2);
+  return left.concat([S('fg',rep(' ',gapL))], mid, [S('fg', rep(' ', w-rowW(left)-gapL-rowW(mid)-rowW(right)))], right); }
+function activityAfter(frame, secs, tool){ return line(S('wa',' '+FRAMES[frame%10]+' Running '+secs+'s'), S('mu',' · '+tool), S('dim',' · Esc interrupt')); }
+
+/* ---------- chrome builders (before) ---------- */
+function composerBefore(text){ var content = text ? [S('fg', text)] : [S('mu',' Type a message…  / commands · @ files · $ skills  (Alt+Enter newline)')];
+  return box('Input', [content], {round:false, titleCls:'fg'}); }
+function statusBefore(opt){ opt=opt||{}; return line(S('mu',' deepseek-flash (max)  ·  '), S(MODE_CLS[opt.mode||'auto-edit'], opt.mode||'auto-edit'), S(opt.ctxCls||'ok','  ·  context '+(opt.ctx||'96')+'%'), S('mu','  ·  ~/Documents/GitHub/blade-deepseek  ·  git:main  ·  F1 shortcuts')); }
+
+/* ---------- transcript pieces (after) ---------- */
+function user(text){ return line(S('us b',' ›  '), S('us', text)); }
+function agent(text){ return line(S('br',' ●  '), S('fg', text)); }
+function cont(text, cls){ return line(S('fg','    '), S(cls||'fg', text)); }
+function thinking(text, act){ return line(S('mu i','    ⋯ thinking · '), S('mu i', text, act)); }
+function tool(icon, cls, name, target, dur, act){ var left = [S('fg','    '), S(cls, icon+' '), S('fg b', name), S('mu', target?'  '+target:'')];
+  var right = dur ? [S('dim', dur), S('fg',' ')] : []; var r = spread(left, right, W); if (act) r[0].act = act; return r; }
+function rail(text, cls){ return line(S('dim','    │ '), S(cls||'mu', text)); }
+function railEnd(text, act){ return line(S('dim','    └ '), S('mu', text, act)); }
+function notice(icon, cls, title){ return line(S('fg','    '), S(cls, icon+' '), S(cls+' b', title)); }
+function noticeLine(label, text){ return line(S('fg','      '), S('dim', label ? label+'  ' : ''), S('mu', text)); }
+function diffRow(kind, text){ var cls = kind==='+'?'da':'dr'; return line(S('dim','    │ '), S(cls, ' '+kind+' '+text+rep(' ', Math.max(0, 62-dw(text))))); }
+function codeRow(text){ return line(S('fg','      '), S('cb', ' '+text+rep(' ', Math.max(0, 60-dw(text))))); }
+
+/* ---------- scenes ---------- */
+var scenes = [];
+
+/* 1. welcome */
+var WHALE = [
+'             ⢀⣤⣶⣶⣶⣶⣄⢀⣤⣶',
+'           ⡠⠾⠿⠿⢿⣿⠻⠿⢻⣿⠿⠋',
+'                 ⣿⣿',
+'               ⢀⣀⣿⣿⡀    ⢠⡄',
+'    ⣀⣤⣴⣶⣶⣿⣿⣿⣶⣾⣿⣿⣿⣿⠋     ⣿⣿⣶⣤⡀    ⣀⣠⣦',
+'  ⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣄   ⢻⣿⣿⣿⣿⣴⣿⣿⣿⣿⣿⠇',
+'⢀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡀ ⠙⠻⣿⣿⣿⣿⣿⠿⠟⠁',
+'⣼⣿⡏⠉⠉⠉⠉⠙⠛⠻⢿⣿⣿⣿⣿⣿⣿⣿⡿⠛⠻⢿⣿⣿⣷⣦⣼⣿⣿⣿',
+'⣿⣿⣧        ⠈⠙⠿⣿⣿⣿⣿⣿⣹⡆ ⠙⢿⣿⣿⣿⣿⣿⠏',
+'⢸⣿⣿⣆          ⠈⠻⣿⣿⣿⣿⣿⣦⣤⣴⣿⣿⣿⣿⡟',
+' ⠻⣿⣿⣧⡀          ⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠋',
+'  ⠙⢿⣿⣿⣶⣄⡀  ⠘⢿⣷⣦⣄  ⠙⢿⣿⣿⣿⣿⣿⣟⠁',
+'    ⠉⠻⢿⣿⣿⣷⣶⣶⣾⣿⣿⣿⣿⣶⣤⣤⣬⣿⠿⠿⣿⣿⣿⡷⠆',
+'       ⠈⠉⠛⠻⠿⠿⠿⠿⠿⠿⠿⠛⠋⠉'];
+var FIGLET = [
+'   ___                ',
+'  / _ \\ _ __ ___ __ _ ',
+' | | | | \'__/ __/ _` |',
+' | |_| | | | (_| (_| |',
+'  \\___/|_|  \\___\\__,_|'];
+scenes.push({ id:'welcome', group:'方案一', title:'空态 / 欢迎', hasBefore:true,
+  note:'欢迎页改成左右两栏：braille 鲸鱼在左，figlet 字标、版本、两行当前状态和两条随状态变化的提示在右，整块只占鲸鱼的 14 行（改前是 28 行）；窄于 80 列时上下堆叠，窄于 44 列时只留文字。输入框去掉两侧竖线，只留上下两条横线和 › 提示符（像 Claude Code；› 与你消息的 gutter 对齐），状态栏左侧变成可切换的模式 chip，右侧是模型与用量，F1 改成 ?。',
+  tryList:[['⇧Tab','切换模式 chip'],['?','打开帮助（见「菜单与帮助」场景）']],
+  init:function(){ return {mode:'auto-edit'}; },
+  keys:function(k, st){ if (k==='stab'){ var m=['suggest','auto-edit','full-auto','plan']; st.mode = m[(m.indexOf(st.mode)+1)%4]; return true; } return false; },
+  render:function(st, mode){
+    if (mode==='before'){
+      var top = [blank()].concat(WHALE.map(function(l,i){ var seg = S(i<2?'pl':'br','  '+l); seg.art = 42; return [seg]; })).concat(FIGLET.map(function(l,i){ return i===4 ? line(S('br',l), S('mu','  v0.4.32')) : line(S('br',l)); }));
+      top = top.concat([blank(), line(S('mu','  model:      '), S('fg','deepseek-flash')), line(S('mu','  directory:  '), S('fg','~/Documents/GitHub/blade-deepseek')), blank(),
+        line(S('ok','  Tips')), line(S('mu','  • Enter to send, Alt+Enter (or Shift+Enter) for newline')), line(S('mu','  • / commands, @ to mention files, $ to invoke skills')),
+        line(S('mu','  • /model to switch model, /compact to compress context')), line(S('mu','  • Ctrl+K or F1 for keyboard shortcuts')), blank()]);
+      return {rows: screen(top, composerBefore('').concat([statusBefore({mode:st.mode, ctx:'100'})]))};
+    }
+    var right = [ [], [S('br',FIGLET[0])], [S('br',FIGLET[1])], [S('br',FIGLET[2])], [S('br',FIGLET[3])], [S('br',FIGLET[4]), S('mu','  v0.4.32')], [],
+      [S('mu','model   '), S('fg','deepseek-flash'), S('mu',' · max · '), S(MODE_CLS[st.mode], st.mode)],
+      [S('mu','cwd     '), S('fg','~/Documents/GitHub/blade-deepseek'), S('mu',' · main')], [],
+      [S('br','› '), S('mu','/resume'), S('fg',' to continue a saved conversation')],
+      [S('br','› '), S('mu','? '), S('fg','keys · '), S('mu','/ '), S('fg','commands · '), S('mu','@ '), S('fg','files · '), S('mu','$ '), S('fg','skills')], [], [] ];
+    var top = [blank()];
+    WHALE.forEach(function(l,i){ var art = '  '+l; art = art + rep(' ', 42-art.length); var seg = S(i<2?'pl':'br', art); seg.art = 42; top.push(line.apply(null, [seg].concat(right[i]||[]))); });
+    top.push(blank());
+    return {rows: screen(top, composerAfter('').concat([statusAfter({mode:st.mode, ctx:'100', tok:'0', cost:'$0.00'})]))};
+  }});
+
+/* 2. transcript */
+scenes.push({ id:'transcript', group:'方案一', title:'对话 transcript', hasBefore:true,
+  note:'所有消息共用 3 列 gutter：› 是你，● 是 Orca，工具行缩进 4 列并用 │ 左栏承载输出。thinking 折叠成一行；连续工具调用成组；resume 后显示真实工具名而不是 call id；系统通知和诊断变成带图标的单行标题 + 缩进详情。',
+  tryList:[['点击 +26 lines','展开工具输出'],['e','展开最新一条'],['点击 thinking','展开思考']],
+  init:function(){ return {exp1:false, exp2:false, think:false}; },
+  keys:function(k, st){ if (k==='e'){ st.exp2 = !st.exp2; return true; } return false; },
+  acts:function(a, st){ if (a==='exp1') st.exp1=!st.exp1; else if (a==='exp2') st.exp2=!st.exp2; else if (a==='think') st.think=!st.think; else return false; return true; },
+  render:function(st, mode){
+    if (mode==='before'){
+      var top = [
+        line(S('us','> '), S('us','你会用ego-browser skill吗')), blank(),
+        line(S('mu i','[thinking] '), S('mu i','The user asks if I can use the "ego-browser" skill. Let me check available skills with list_skills.')),
+        line(S('fg','让我看看有哪些可用的 skill。')), blank(),
+        line(S('ok','  ✓ tool:call_00_K4F1mpXw2mhvXDMTm50C2141'), S('mu',' (completed)')),
+        line(S('mu','    baoyu-article-illustrator [user] - Analyzes article structure, identifies positions requiring visual aids,')),
+        line(S('mu','generates illustrations with Type × Style × Palette three-dimension approach. Use when user asks to')),
+        line(S('mu','"illustrate article", "add images", "generate images for article", or "为文章配图".')),
+        line(S('mu','    baoyu-comic [user] - Knowledge comic creator supporting multiple art styles and tones. Creates original')),
+        line(S('mu','educational comics with detailed panel layouts and batch-capable image generation. Use when user asks to')),
+        line(S('mu','    [+26 lines]')),
+        line(S('mu i','[thinking] '), S('mu i','There is an `ego-browser` skill. Let me read it to understand how to use it.')),
+        line(S('fg','有 '), S('code','`ego-browser`'), S('fg',' skill。让我读一下它的使用说明。')), blank(),
+        line(S('ok','  ✓ tool:call_00_3UOTyPrT1WGR83kBjw5S1278'), S('mu',' (completed)')),
+        line(S('mu','    # ego-browser')), line(S('mu','    source: user')), line(S('mu','    [+204 lines]')),
+        line(S('fg','会。'), S('code','`ego-browser`'), S('fg',' 已安装（'), S('code','`~/.local/bin/ego-browser`'), S('fg','），我已掌握它的用法：')),
+        line(S('fg','核心概念：ego-browser 是 Chromium 浏览器，为 AI 提供独立的 task')),
+        line(S('fg','space（隔离标签页空间），复用你的登录态但不干扰你正常浏览。')),
+        line(S('fg','用法：通过 heredoc 跑 Node.js 脚本，helper 预加载：')),
+        line(S('fg','  ego-browser nodejs <<\'EOF\'')), line(S('fg','  const task = await useOrCreateTaskSpace(\'任务名\')')), line(S('fg','  EOF')), blank(),
+        line(S('mu','Resumed saved conversation.')), blank(),
+        line(S('mu','Runtime settings updated: model deepseek-flash, reasoning effort max, approval mode full-auto.')), blank(),
+        line(S('mu','Shell unavailable under the current restricted policy: no OS-enforced sandbox backend on this host: seatbelt')),
+        line(S('mu','probe terminated by signal 6 at /usr/bin/sandbox-exec (backend=seatbelt). run Orca on a host that permits OS')),
+        line(S('mu','sandbox enforcement; a parent sandbox or container may forbid nested profiles, and /trust does not change that')),
+        line(S('mu','boundary. Dedicated file tools remain available.'))];
+      return {rows: screen(top, composerBefore('').concat([statusBefore({mode:'full-auto'})]))};
+    }
+    var top = [ user('你会用 ego-browser skill 吗'), blank(), agent('让我看看有哪些可用的 skill。') ];
+    if (st.think){ top.push(thinking('The user asks if I can use the "ego-browser" skill. Let me check available', 'think'));
+      top.push(cont('  skills with list_skills. There is an ego-browser skill; read it to learn how to use it.', 'mu i')); }
+    else top.push(thinking('The user asks if I can use the "ego-browser" skill. Let me check available skills…', 'think'));
+    top.push(blank());
+    top.push(tool('✓','ok','list_skills','', '0.3s', 'exp1'));
+    top.push(rail('baoyu-article-illustrator [user] - Analyzes article structure, identifies positions requiring vi…'));
+    top.push(rail('baoyu-comic [user] - Knowledge comic creator supporting multiple art styles and tones. Creates or…'));
+    if (st.exp1){
+      top.push(rail('baoyu-cover-image [user] - Generates article cover images with 5 dimensions (type, palette, ren…'));
+      top.push(rail('brainstorming [plugin] - You MUST use this before any creative work - creating features, buildi…'));
+      top.push(rail('ego-browser [user] - When you need a browser, read this Skill by default. Use it to open and op…'));
+      top.push(rail('playwright [user] - Use when the task requires automating a real browser from the terminal.'));
+      top.push(rail('… 22 more'));
+      top.push(railEnd('28 lines · click or e to collapse', 'exp1'));
+    } else top.push(railEnd('+26 lines · click or e to expand', 'exp1'));
+    top.push(tool('✓','ok','read_skill','ego-browser', '0.1s', 'exp2'));
+    if (st.exp2){ top.push(rail('# ego-browser')); top.push(rail('source: user')); top.push(rail('Chromium browser with task spaces for AI agents; reuses your login state.')); top.push(railEnd('204 lines · e to collapse','exp2')); }
+    else top.push(railEnd('204 lines · e to expand', 'exp2'));
+    top.push(tool('✎','wa','edit','src/main.rs', '0.0s'));
+    top.push(line(S('dim','    │ '), S('mu','@@ -2,1 +2,1 @@  '), S('ok','+1'), S('mu',' '), S('er','−1')));
+    top.push(diffRow('-','    let greeting = "hello";'));
+    top.push(diffRow('+','    let greeting = "hello, whale";'));
+    top.push(blank());
+    top.push(agent('有 ego-browser skill，我已掌握它的用法：'));
+    top.push(cont('核心概念：ego-browser 是 Chromium 浏览器，为 AI 提供独立的 task space，复用你的登录态但不干扰你。'));
+    top.push(cont('用法：通过 heredoc 跑 Node.js 脚本，helper 预加载：'));
+    top.push(codeRow('ego-browser nodejs <<\'EOF\'')); top.push(codeRow('const task = await useOrCreateTaskSpace(\'任务名\')')); top.push(codeRow('EOF'));
+    top.push(blank());
+    top.push(notice('⚠','wa','Shell unavailable under the current restricted policy'));
+    top.push(noticeLine('', 'no OS-enforced sandbox backend on this host (seatbelt probe terminated by signal 6)'));
+    top.push(noticeLine('next', 'run Orca on a host that permits sandbox enforcement, or pick a trusted-host policy'));
+    top.push(blank());
+    top.push(line(S('fg','    '), S('mu','ℹ Resumed saved conversation · deepseek-flash · max · full-auto')));
+    return {rows: screen(top, composerAfter('').concat([statusAfter({mode:'full-auto'})]))};
+  }});
+
+/* 3. running */
+scenes.push({ id:'running', group:'方案一', title:'运行中', hasBefore:true, animated:true,
+  note:'活动行不再只有「running 12s」：显示当前阶段和正在跑的工具，以及怎么打断。工具行的 spinner 与活动行同步；输出边跑边流进 │ 左栏；排队的追问显示在输入框上方。',
+  tryList:[['Esc','中断（演示）'],['Enter','把输入排到队列'],['Ctrl+Enter','跳过队列立即发送']],
+  init:function(){ return {frame:0, secs:12, interrupted:false, queued:1, sentNow:false}; },
+  tick:function(st){ st.frame++; if (st.frame%10===0) st.secs++; },
+  keys:function(k, st){ if (k==='esc'){ st.interrupted = true; return true; } if (k==='enter'){ st.queued++; return true; } if (k==='center'){ st.queued = 0; st.sentNow = true; return true; } return false; },
+  render:function(st, mode){
+    var f = reduced ? 0 : st.frame;
+    if (mode==='before'){
+      var top = [ line(S('us','> 把 welcome 的 figlet 换成鲸鱼字符画，并让 pending 的测试通过')), blank(),
+        line(S('fg','先看一下现有的 build_welcome_lines 和那条测试。')),
+        line(S('ok','  ✓ read_file: crates/orca-tui/src/ui.rs'), S('mu',' (completed)')), line(S('mu','    fn build_welcome_lines<\'a>(state: &AppState, theme: &Theme) -> Vec<Line<\'a>> {')), line(S('mu','        let cyan = Style::default().fg(theme.border);')), line(S('mu','    [+61 lines]')),
+        line(S('ok','  ✓ grep: welcome_lines_show_a_spraying_whale_mark'), S('mu',' (completed)')), line(S('mu','    crates/orca-tui/src/ui.rs:7503')),
+        line(S('wa','  '+FRAMES[f%10]+' bash: cargo test -p orca-tui welcome_lines'), S('mu',' (running)')), line(S('mu','       Compiling orca-tui v0.1.0')), line(S('mu','    running 1 test'))];
+      var bottom = [blank(), line(S('wa',' ● running '+st.secs+'s')), line(S('mu',' Queued '+st.queued+' · Alt+Up edit latest')), line(S('mu i',' ↳ 然后把 README 里的截图也换掉'))].concat(composerBefore('')).concat([statusBefore({mode:'auto-edit'})]);
+      return {rows: screen(top, bottom)};
+    }
+    var top = [ user('把 welcome 的 figlet 换成鲸鱼字符画，并让 pending 的测试通过'), blank(), agent('先看一下现有的 build_welcome_lines 和那条测试。'), blank(),
+      tool('✓','ok','read','crates/orca-tui/src/ui.rs:2807-2870','0.1s'), railEnd('64 lines · e to expand'),
+      tool('✓','ok','grep','welcome_lines_show_a_spraying_whale_mark','0.2s'), rail('crates/orca-tui/src/ui.rs:7503') ];
+    if (st.interrupted){ top.push(tool('×','wa','bash','cargo test -p orca-tui welcome_lines','interrupted')); top.push(rail('Compiling orca-tui v0.1.0')); top.push(blank());
+      top.push(line(S('fg','    '), S('mu','ℹ Interrupted · the queued message stays in the queue · Enter to resume'))); }
+    else { top.push(tool(FRAMES[f%10],'wa','bash','cargo test -p orca-tui welcome_lines', st.secs+'s')); top.push(rail('Compiling orca-tui v0.1.0')); top.push(rail('running 1 test')); }
+    if (st.sentNow){ top.push(blank()); top.push(user('然后把 README 里的截图也换掉')); top.push(line(S('fg','    '), S('mu','ℹ sent now with Ctrl+Enter · the running turn sees it at its next step'))); }
+    var bottom = [];
+    if (!st.interrupted) bottom.push(activityAfter(f, st.secs, 'bash cargo test -p orca-tui welcome_lines'));
+    if (st.queued > 0) bottom.push(line(S('mu','    ↳ '), S('mu','queued '+st.queued+' · '), S('mu i','然后把 README 里的截图也换掉'), S('dim','  · Ctrl+Enter send now · Alt+↑ edit')));
+    bottom = bottom.concat(composerAfter('')).concat([statusAfter({mode:'auto-edit', tok:'12.4k', cost:'$0.05'})]);
+    return {rows: screen(top, bottom)};
+  }});
+
+/* 4. approval */
+var APPROVAL_OPTS = [['Allow once','run this command now'],['Allow bash for this session','skip approval for bash until you quit'],['Allow this exact command','remember only this command line'],['Deny','tell Orca to find another way']];
+scenes.push({ id:'approval', group:'方案二', title:'审批内联', hasBefore:true,
+  note:'审批不再居中盖屏。它占用输入框的槽位，和问卷共用同一套头行、选项行、提示行组件；transcript 完整可见可滚动。按键统一为 ↑↓ / 数字 / Enter / Esc。',
+  tryList:[['↑ ↓','移动'],['1-4','直接选择'],['Enter','确认'],['Esc','拒绝'],['点「重来」','复位']],
+  init:function(){ return {sel:0, decided:0}; },
+  keys:function(k, st){ if (st.decided) return false;
+    if (k==='up'||k==='k'){ st.sel=(st.sel+3)%4; return true; } if (k==='down'||k==='j'){ st.sel=(st.sel+1)%4; return true; }
+    if (/^[1-4]$/.test(k)){ st.decided=+k; return true; } if (k==='enter'){ st.decided=st.sel+1; return true; } if (k==='esc'){ st.decided=4; return true; } return false; },
+  acts:function(a, st){ if (a==='reset'){ st.decided=0; st.sel=0; return true; } var m=/^opt(\d)$/.exec(a); if (m){ st.decided=+m[1]; return true; } return false; },
+  render:function(st, mode){
+    var cmd = 'cargo test -p orca-tui welcome_lines -- --nocapture';
+    if (mode==='before'){
+      var top = [ user('把 welcome 的 figlet 换成鲸鱼字符画，并让 pending 的测试通过'), blank(), agent('先看一下现有的 build_welcome_lines 和那条测试。'), blank(),
+        tool('✓','ok','read','crates/orca-tui/src/ui.rs:2807-2870','0.1s'), railEnd('64 lines · e to expand'), tool('✓','ok','grep','welcome_lines_show_a_spraying_whale_mark','0.2s'), rail('crates/orca-tui/src/ui.rs:7503'), blank(),
+        agent('测试在，实现还是 figlet。我先跑一下这条测试确认它现在失败。'), blank(), line(S('fg','    '), S('ap','● approval')) ];
+      var rows = screen(top, [blank(), statusBefore({mode:'suggest'})]);
+      var modal = box('Approve Command', [
+        [S('mu',' tool   '), S('wa b','bash')], [S('mu',' target '), S('fg', cmd)], [],
+        [S('br','  $ '+cmd)], [],
+        [S('br','▸ '), S('ok b','[1] '), S('fg b','allow once')], [S('fg','  '), S('ok b','[2] '), S('mu','always allow "bash"')], [S('fg','  '), S('ok b','[3] '), S('mu','always allow this exact call')], [S('fg','  '), S('er b','[4] '), S('mu','deny')], [],
+        [S('mu',' ↑↓ select · Enter · 1/2/3/4 · legacy y/A/a/n')] ], {width:60, border:'ap'});
+      return {rows: rows, overlay:{x:20, y:8, rows:modal}, caption:'改前：居中弹窗盖住对话，输入框被藏起来，transcript 不能滚动。'};
+    }
+    var top = [ user('把 welcome 的 figlet 换成鲸鱼字符画，并让 pending 的测试通过'), blank(), agent('先看一下现有的 build_welcome_lines 和那条测试。'), blank(),
+      tool('✓','ok','read','crates/orca-tui/src/ui.rs:2807-2870','0.1s'), railEnd('64 lines · e to expand'), tool('✓','ok','grep','welcome_lines_show_a_spraying_whale_mark','0.2s'), rail('crates/orca-tui/src/ui.rs:7503'), blank(),
+      agent('测试在，实现还是 figlet。我先跑一下这条测试确认它现在失败。'), blank() ];
+    var bottom;
+    if (st.decided){
+      var d = st.decided;
+      if (d===4){ top.push(tool('✗','er','bash',cmd,'denied')); top.push(rail('you denied this command · Orca will look for another way')); }
+      else { top.push(tool(FRAMES[0],'wa','bash',cmd,'0s')); top.push(rail(d===2?'allowed for this session':d===3?'this exact command remembered':'allowed once')); }
+      top.push(blank()); top.push(line(S('fg','    '), S('dim','[ 重来 ]', 'reset')));
+      bottom = [ d===4 ? [] : activityAfter(0, 0, 'bash '+cmd) ].concat(composerAfter('')).concat([statusAfter({mode:'suggest'})]);
+      return {rows: screen(top, bottom)};
+    }
+    var panel = [ spread([S('ap b','◆ Approve · bash'), S('mu','  workspace sandbox · network off')], [S('mu','suggest')], W-4),
+      [S('fg', cmd)], [S('dim','│ '), S('mu','writes limited to ~/Documents/GitHub/blade-deepseek · PgUp/PgDn to preview more')], [] ];
+    APPROVAL_OPTS.forEach(function(o, i){ var on = i===st.sel;
+      panel.push([S(on?'br b':'mu', on?'› ':'  '), S(on?'fg b':'fg', (i+1)+'  ', 'opt'+(i+1)), S(on?'selb':'fg', o[0]+rep(' ', 28-dw(o[0])), 'opt'+(i+1)), S('mu','  '+o[1], 'opt'+(i+1))]); });
+    panel.push([]); panel.push([S('br','↑↓'), S('mu',' move · '), S('br','1-4'), S('mu',' pick · '), S('br','Enter'), S('mu',' confirm · '), S('br','Esc'), S('mu',' deny')]);
+    bottom = box('', panel, {border:'ap'}).concat([statusAfter({mode:'suggest'})]);
+    return {rows: screen(top, bottom)};
+  }});
+
+/* 5. questionnaire */
+var QS = [
+  {h:'架构方向', q:'你希望优先收敛哪条路径？', opts:[['收敛 special-dispatch','统一到 interaction 能力 (Recommended)'],['先做结构化传输','先去扁平化耦合，风险最低'],['一起做','两个 PR 合并推进']]},
+  {h:'发布门禁', q:'这次 patch 前要跑哪些校验？（可多选）', multi:true, opts:[['contracts','契约测试'],['clippy','lint'],['站点构建','site build']]},
+  {h:'命名', q:'新的共享组件文件叫什么？', opts:[['chrome.rs','边框、标记、提示行'],['design.rs','更泛的名字，以后放 token']]} ];
+scenes.push({ id:'questionnaire', group:'方案二', title:'问卷 ask_user_question', hasBefore:false,
+  note:'这是已经内联的现有功能，只是换成共享组件：头行显示问题标签页与进度，选项行与审批同款，提示行同一语法。多选用 Space，←→ 在问题间切换，全部答完后 Submit 变绿。',
+  tryList:[['↑ ↓','移动'],['1-3','选择'],['Space','多选切换'],['← →','切换问题'],['Enter','下一题 / 提交']],
+  init:function(){ return {qi:0, sel:[0,0,0], chk:[[false,false,false],[true,true,false],[false,false,false]], ans:[false,false,false], done:false}; },
+  keys:function(k, st){ if (st.done){ if (k==='esc'){ st.done=false; st.ans=[false,false,false]; return true; } return false; }
+    var q = QS[st.qi], n = q.opts.length+1;
+    if (k==='up'||k==='k'){ st.sel[st.qi]=(st.sel[st.qi]+n-1)%n; return true; } if (k==='down'||k==='j'){ st.sel[st.qi]=(st.sel[st.qi]+1)%n; return true; }
+    if (k==='left'){ st.qi=(st.qi+2)%3; return true; } if (k==='right'){ st.qi=(st.qi+1)%3; return true; }
+    if (/^[1-3]$/.test(k) && +k<=q.opts.length){ if (q.multi){ st.chk[st.qi][+k-1]=!st.chk[st.qi][+k-1]; } else { st.sel[st.qi]=+k-1; st.ans[st.qi]=true; st.qi=Math.min(2, st.qi+1); } return true; }
+    if (k==='space' && q.multi){ var i=st.sel[st.qi]; if (i<q.opts.length) st.chk[st.qi][i]=!st.chk[st.qi][i]; return true; }
+    if (k==='enter'){ st.ans[st.qi]=true; if (st.ans.every(Boolean)) st.done=true; else st.qi=(st.qi+1)%3; return true; }
+    return false; },
+  render:function(st){
+    var top = [ user('先把 special-dispatch 收敛了'), blank(), agent('动手前我要确认几件事，避免改错方向。'), blank() ];
+    if (st.done){ top.push(tool('✓','ok','ask_user_question','3 questions answered','')); top.push(rail('架构方向 → 收敛 special-dispatch · 发布门禁 → contracts, clippy · 命名 → '+QS[2].opts[st.sel[2]][0])); top.push(blank());
+      top.push(agent('好，那就从 runtime_special.rs 的 classify_dispatch 开始。')); top.push(blank()); top.push(line(S('fg','    '), S('dim','[ Esc 重来 ]')));
+      return {rows: screen(top, composerAfter('').concat([statusAfter({mode:'auto-edit'})]))}; }
+    var q = QS[st.qi];
+    var tabs = [S('ap b','◆ ')];
+    QS.forEach(function(x, i){ var on=i===st.qi; tabs.push(S(on?'ap b':(st.ans[i]?'ok':'mu'), (on?'':(st.ans[i]?'✓ ':'○ '))+x.h+'   ')); });
+    var all = st.ans.every(Boolean);
+    var head = spread(tabs, [S('mu','问题 '+(st.qi+1)+'/3 · '), S(all?'ok b':'dim', all?'⏎ Submit':'○ Submit')], W-4);
+    var panel = [head, [S('dim', rep('─', W-4))], [S('fg', q.q)], []];
+    var lw = Math.max.apply(null, q.opts.map(function(o){ return dw(o[0]); }));
+    q.opts.forEach(function(o, i){ var on = st.sel[st.qi]===i; var mark = q.multi ? (st.chk[st.qi][i]?'[x] ':'[ ] ') : '';
+      panel.push([S(on?'br b':'mu', on?'› ':'  '), S(on?'fg b':'fg', mark+(i+1)+'  '), S(on?'selb':'fg', o[0]+rep(' ', lw-dw(o[0]))), S('mu','   '+o[1])]); });
+    var cf = st.sel[st.qi]===q.opts.length;
+    panel.push([S(cf?'br b':'mu', cf?'› ':'  '), S(cf?'fg b':'mu','z  Type a custom answer')]);
+    panel.push([]);
+    var hint = q.multi ? [S('br','↑↓'),S('mu',' move · '),S('br','Space'),S('mu',' toggle · '),S('br','←→'),S('mu',' questions · '),S('br','Enter'),S('mu',' next · '),S('br','Ctrl+T'),S('mu',' chat · '),S('br','Esc'),S('mu',' cancel')]
+                       : [S('br','↑↓'),S('mu',' move · '),S('br','1-'+q.opts.length),S('mu',' pick · '),S('br','←→'),S('mu',' questions · '),S('br','Enter'),S('mu',' next · '),S('br','Ctrl+T'),S('mu',' chat · '),S('br','Esc'),S('mu',' cancel')];
+    panel.push(hint);
+    return {rows: screen(top, box('', panel, {border:'ap'}).concat([statusAfter({mode:'auto-edit'})]))};
+  }});
+
+/* 6. tasks dock */
+var TASKS = [
+  {n:'explore-auth', kind:'subagent · turn 4', st:'run', el:'1m 12s', act:'reading crates/orca-runtime/src/acp/agent.rs'},
+  {n:'run-clippy', kind:'background', st:'run', el:'48s', act:'cargo clippy --workspace --all-targets'},
+  {n:'review-diff', kind:'subagent · turn 2', st:'appr', el:'3m 05s', act:'wants to run bash: git diff --stat main'},
+  {n:'index-files', kind:'background', st:'done', el:'done 2m ago', act:'3,880 files indexed'} ];
+scenes.push({ id:'tasks', group:'方案二', title:'Tasks dock', hasBefore:true, animated:true,
+  note:'/tasks 不再替换整个对话区，而是在输入框上方展开一个最多 6 行的 dock；每行一个任务，看得到状态、阶段、耗时和它此刻在做什么。Enter 打开该任务的 transcript 详情，Esc 收起。',
+  tryList:[['↑ ↓','选择任务'],['Enter','打开详情'],['Esc','返回 / 收起 dock'],['t','重新打开 dock']],
+  init:function(){ return {open:true, sel:0, detail:false, frame:0}; },
+  tick:function(st){ st.frame++; },
+  keys:function(k, st){ if (st.detail){ if (k==='esc'){ st.detail=false; return true; } return false; }
+    if (!st.open){ if (k==='t'){ st.open=true; return true; } return false; }
+    if (k==='up'||k==='k'){ st.sel=(st.sel+3)%4; return true; } if (k==='down'||k==='j'){ st.sel=(st.sel+1)%4; return true; }
+    if (k==='enter'){ st.detail=true; return true; } if (k==='esc'){ st.open=false; return true; } return false; },
+  acts:function(a, st){ var m=/^task(\d)$/.exec(a); if (m){ st.sel=+m[1]; return true; } if (a==='opendock'){ st.open=true; return true; } return false; },
+  render:function(st, mode){
+    var f = reduced ? 0 : st.frame;
+    if (mode==='before'){
+      var body = [[], [S('mu','No tasks yet. They will appear here as soon as background work starts.')]];
+      for (var i=0;i<24;i++) body.push([]);
+      return {rows: screen(box('Tasks Workspace', body), composerBefore('').concat([statusBefore({mode:'auto-edit', ctx:'100'})])), caption:'改前：/tasks 把整个对话区换成一个 30 行的空框（今晚实际截图）。'};
+    }
+    var top = [ user('并行做三件事：探索 auth 模块、跑 clippy、让另一个子代理 review 我的 diff'), blank(), agent('已经派出三个任务，我在这里等它们回报。'), blank(),
+      tool('✓','ok','subagent','explore-auth · async','0.2s'), tool('✓','ok','bash','cargo clippy --workspace --all-targets · background','0.1s'), tool('✓','ok','subagent','review-diff · async','0.2s'), blank() ];
+    if (st.detail){
+      var t = TASKS[st.sel];
+      var body = [ [S('mu','Esc back · '), S('fg b', t.n), S('mu','  · '+t.kind+' · checkpoint 12 · '+(t.st==='done'?'complete':'live'))], [S('mu','7 tool calls · '+t.el)], [],
+        [S('us b','you ›  '), S('fg','Explore the auth module and summarise how tokens are refreshed.')], [],
+        [S('br','agent ›  '), S('fg','Starting from crates/orca-runtime/src/acp/agent.rs.')],
+        [S('fg','   '), S('ok','✓ '), S('fg b','read'), S('mu','  crates/orca-runtime/src/acp/agent.rs')], [S('dim','   │ '), S('mu','pub struct AcpAgent { … }')],
+        [S('fg','   '), S('ok','✓ '), S('fg b','grep'), S('mu','  refresh_token')], [S('dim','   │ '), S('mu','3 matches in 2 files')],
+        [S('fg','   '), S('wa',FRAMES[f%10]+' '), S('fg b','read'), S('mu','  crates/orca-runtime/src/acp/supervisor.rs')] ];
+      return {rows: screen(box('Task · '+t.n, body), composerAfter('', {focused:false}).concat([statusAfter({mode:'auto-edit'})]))};
+    }
+    var bottom = [];
+    if (st.open){
+      bottom.push(spread([S('ap b',' ◆ Tasks'), S('mu','  3 active · 1 needs approval')], [S('br','↑↓'), S('mu',' select · '), S('br','Enter'), S('mu',' open · '), S('br','Esc'), S('mu',' close '), S('fg','')], W));
+      TASKS.forEach(function(t, i){ var on = i===st.sel; var icon = t.st==='run' ? S('wa', FRAMES[f%10]) : t.st==='appr' ? S('ap','●') : S('ok','✓');
+        var name = t.n + rep(' ', 16-dw(t.n)), meta = t.kind+' · '+t.el; meta = meta + rep(' ', 26-dw(meta));
+        bottom.push(line(S(on?'br b':'fg', on?' › ':'   ', 'task'+i), icon, S(on?'selb':'fg',' '+name, 'task'+i), S('mu','  '+meta, 'task'+i), S(t.st==='appr'?'ap':'mu', '  '+t.act, 'task'+i))); });
+    } else bottom.push(line(S('fg',' '), S('mu','◆ Tasks · 3 active · 1 needs approval · '), S('br','/tasks', 'opendock'), S('mu',' or t to open')));
+    bottom = bottom.concat(composerAfter('', {focused:!st.open})).concat([statusAfter({mode:'auto-edit', tok:'31k', cost:'$0.11'})]);
+    return {rows: screen(top, bottom)};
+  }});
+
+/* 7. menus & help */
+var SLASH = [['/new','Start a new conversation'],['/model','Switch model and reasoning effort'],['/compact','Compress conversation context'],['/resume','Resume a saved conversation'],['/fork','Fork this conversation'],['/side','Ask without disrupting the main conversation'],['/rename','Rename this conversation'],['/status','Show session status'],['/copy','Copy an assistant response'],['/cost','Show session cost'],['/config','Configure runtime settings'],['/tasks','Open the tasks dock']];
+var MENTIONS = [['file','crates/orca-tui/src/ui.rs',''],['file','crates/orca-tui/src/user_input_dialog.rs',''],['file','crates/orca-runtime/src/runtime_user_input.rs',''],['skill','brainstorming','You MUST use this before any creative work - creating features, building components…'],['skill','ego-browser','When you need a browser, read this Skill by default. Use it to open and operate websites…'],['mcp','cmux-cua/get_window_state','Refresh the accessibility snapshot of a window']];
+var HELP = [['Global',[['?  F1  Ctrl+K','toggle this help'],['Ctrl+F','find in transcript when input is empty'],['Ctrl+/','open or return from side conversation'],['Shift+Tab','cycle approval mode'],['Ctrl+Home / End','jump to top or bottom'],['Ctrl+L','clear screen'],['Ctrl+C','cancel · press twice to quit']]],
+  ['Editor',[['Ctrl+A / E','line start or end'],['Ctrl+B / F · Alt+B / F','move by character or word'],['Ctrl+W / U / K','delete word · clear input · delete to line end'],['Ctrl+V','attach image from clipboard']]],
+  ['Composer',[['Enter','send · queues while a turn is running'],['Ctrl+Enter','send now, skipping the queue'],['Alt+Enter','insert newline'],['Alt+↑','edit latest queued message'],['↑ / ↓','history when empty, otherwise move'],['PgUp / PgDn','scroll one page'],['e · Shift+E','expand latest tool output · expand all'],['Esc','close the top layer, else interrupt or backtrack']]]];
+scenes.push({ id:'menus', group:'方案一', title:'菜单与帮助', hasBefore:true,
+  note:'三个弹层共用 panel_block：/ 菜单命令列对齐、选中行用选择背景；@ 候选把类型做成定宽标签列，描述超宽用 … 截断，索引预热时在底部显示进度；帮助面板按最长按键算列宽、说明列悬挂缩进，并把 ? 作为 F1 的别名。',
+  tryList:[['↑ ↓','移动'],['/ @ ?','切换三个弹层'],['Esc','关闭']],
+  init:function(){ return {tab:'slash', sel:0, closed:false}; },
+  keys:function(k, st){ if (k==='/'){ st.tab='slash'; st.closed=false; st.sel=0; return true; } if (k==='@'){ st.tab='mention'; st.closed=false; st.sel=0; return true; } if (k==='?'){ st.tab='help'; st.closed=false; return true; }
+    if (k==='esc'){ st.closed=true; return true; } var n = st.tab==='slash'?SLASH.length:MENTIONS.length;
+    if (k==='up'||k==='k'){ st.sel=(st.sel+n-1)%n; return true; } if (k==='down'||k==='j'){ st.sel=(st.sel+1)%n; return true; } return false; },
+  acts:function(a, st){ if (/^tab:/.test(a)){ st.tab=a.slice(4); st.closed=false; st.sel=0; return true; } return false; },
+  render:function(st, mode){
+    var typed = st.tab==='slash'?'/':st.tab==='mention'?'@ui':'';
+    var top = [ line(S('mu','    ℹ Resumed saved conversation · deepseek-flash · max · auto-edit')) ];
+    if (st.closed) return {rows: screen(top, (mode==='before'?composerBefore(''):composerAfter('')).concat([mode==='before'?statusBefore({}):statusAfter({})])), caption:'弹层已关闭 · 按 / @ ? 再打开'};
+    var popup;
+    if (mode==='before'){
+      if (st.tab==='slash') popup = box('Commands', SLASH.map(function(c,i){ var on=i===st.sel; return [S(on?'br b':'fg',(on?'▸ ':'  ')+c[0]), S('mu','  '+c[1])]; }), {titleCls:'fg'});
+      else if (st.tab==='mention') popup = box('Mentions', [
+        [S('br b','▸ @playwright'), S('mu','  [skill] playwright — Use when the task requires automating a real browser from the terminal (')],
+        [S('fg','  @ego-browser'), S('mu','  [skill] ego-browser — When you need a browser, read this Skill by default. Use it to open an')],
+        [S('fg','  @brainstorming'), S('mu','  [skill] brainstorming — You MUST use this before any creative work - creating features, bu')],
+        [S('fg','  @find-skills'), S('mu','  [skill] find-skills — Helps users discover and install agent skills when they ask questions')],
+        [S('fg','  @crates/orca-tui/src/ui.rs'), S('mu','  [file] /Users/qingyun/Documents/GitHub/blade-deepseek')] ], {titleCls:'fg'});
+      else popup = box('Shortcuts', [ [S('pl','Global')], [S('wa','  ctrl+/            '), S('fg','open or return from side')], [S('fg','conversation')], [S('wa','  ctrl+f            '), S('fg','find in transcript when input is')], [S('fg','empty')],
+        [S('wa','  F1 / ctrl+k       '), S('fg','show shortcuts; ctrl+k requires')], [S('fg','empty input')], [S('wa','  ctrl+c            '), S('fg','cancel and quit')], [S('wa','  +/- · arrows · 0  '), S('fg','zoom, pan, or fit image')], [],
+        [S('pl','Editor')], [S('wa','  ctrl+b/f / alt+b/f'), S('fg','move by character or word')], [S('wa','  ctrl+w/d/k/u      '), S('fg','delete word, character, line end, or')], [S('fg','clear input')], [S('wa','  ctrl+v / win alt+v'), S('fg','attach image from clipboard')], [],
+        [S('pl','Composer')], [S('wa','  alt+enter / shift+enter'), S('fg','insert newline')], [S('wa','  up/down / ctrl+p/ctrl+n'), S('fg','history when empty; otherwise')], [S('fg','edit input')] ], {width:58, titleCls:'fg'});
+      var bottom = composerBefore(typed).concat([statusBefore({})]);
+      if (st.tab==='help') return {rows: screen(top, bottom), overlay:{x:21, y:4, rows:popup}, caption:'改前：固定 58 列，按键列被撑爆，换行没有缩进，颜色写死。'};
+      return {rows: screen(top, popup.concat(bottom))};
+    }
+    if (st.tab==='slash'){ var cw = Math.max.apply(null, SLASH.map(function(c){ return dw(c[0]); }));
+      popup = box('Commands', SLASH.map(function(c,i){ var on=i===st.sel; return [S(on?'br b':'mu', on?'› ':'  '), S(on?'selb':'fg', c[0]+rep(' ', cw-dw(c[0]))), S('mu','   '+c[1])]; }).concat([[S('br','↑↓'),S('mu',' move · '),S('br','Enter'),S('mu',' run · '),S('br','Esc'),S('mu',' close')]])); }
+    else if (st.tab==='mention'){ popup = box('Mentions · @ui', MENTIONS.map(function(m,i){ var on=i===st.sel; var kind = m[0]+rep(' ', 6-dw(m[0]));
+      return [S(on?'br b':'mu', on?'› ':'  '), S(m[0]==='file'?'pl':m[0]==='skill'?'wa':'ap', kind), S(on?'selb':'fg', m[1]), S('mu', m[2]?'   '+m[2]:'')]; }).concat([[S('dim','⋯ indexing files · 1,204 / 3,880')], [S('br','↑↓'),S('mu',' move · '),S('br','Tab'),S('mu',' insert · '),S('br','Esc'),S('mu',' close')]])); }
+    else { var kw = 0; HELP.forEach(function(s){ s[1].forEach(function(h){ kw = Math.max(kw, dw(h[0])); }); });
+      var body = []; HELP.forEach(function(s, si){ if (si) body.push([]); body.push([S('br b', s[0])]); s[1].forEach(function(h){ body.push([S('fg','  '+h[0]+rep(' ', kw-dw(h[0]))), S('mu','   '+h[1])]); }); });
+      body.push([]); body.push([S('br','?'), S('mu',' or '), S('br','Esc'), S('mu',' close · this list follows the current state: running, approval and editor keys appear only when they apply')]);
+      popup = box('Help', body, {width:78});
+      return {rows: screen(top, composerAfter('').concat([statusAfter({})])), overlay:{x:11, y:2, rows:popup}}; }
+    return {rows: screen(top, popup.concat(composerAfter(typed)).concat([statusAfter({})]))};
+  }});
+
+/* 8. session picker */
+var SESS = [ {g:'blade-deepseek', cur:true, items:[['升级 dsh 到最新版','2h ago','185 tool calls','full-auto'],['修复 special-dispatch 收敛','yesterday','42 tool calls','auto-edit'],['TUI 快照测试整理','3d ago','12 tool calls','suggest']]},
+  {g:'blade-agent-sdk', items:[['修复这些问题：这次优化解决了不少结构性问题，但还不能认为恢复和隔离已经闭环…','7d ago','1,215 tool calls','full-auto']]},
+  {g:'~', items:[['为什么 dsh 频繁这个问题啊？ NODE_OPTIONS=--max-old-space-size=8192 dsh web','18d ago','215 tool calls','full-auto']]} ];
+var MOCKS = ['schema_ok','mock_fail','surface operation test','retry transient provider attempt','runtime-owned tool completion'];
+scenes.push({ id:'picker', group:'方案一', title:'会话选择器', hasBefore:true,
+  note:'按项目分组，当前项目置顶；每行是标题、相对时间、工具调用数和当时的模式；测试写入的 mock 会话默认隐藏，按 t 才显示；提示行走同一语法。',
+  tryList:[['↑ ↓','移动'],['t','显示 / 隐藏测试会话（实现里用 Ctrl+T，因为 t 会进入过滤）'],['Tab','动作菜单（示意）']],
+  init:function(){ return {sel:0, tests:false}; },
+  keys:function(k, st){ if (k==='t'){ st.tests=!st.tests; return true; } var n=5+(st.tests?MOCKS.length:0); if (k==='up'||k==='k'){ st.sel=(st.sel+n-1)%n; return true; } if (k==='down'||k==='j'){ st.sel=(st.sel+1)%n; return true; } return false; },
+  render:function(st, mode){
+    if (mode==='before'){
+      var rows = [ [S('br','⌕ '), S('mu','type to filter…    20 loaded')], [S('mu','↑↓ select · PgUp/PgDn page · Enter resume · Tab actions · Backspace edit · Esc quit')], [],
+        [S('br b','> P/config'), S('mu','  2026-09-20 15:24  deepseek')], [S('fg','  inspect repo'), S('mu','  2026-09-17 13:32  mock')], [S('fg','  schema_ok'), S('mu','  2026-09-17 13:32  mock')], [S('fg','  schema_fail'), S('mu','  2026-09-17 13:32  mock')], [S('fg','  mock_fail'), S('mu','  2026-09-17 13:32  mock')],
+        [S('fg','  subagent sync inner task'), S('mu','  2026-09-17 13:32  mock')], [S('fg','  surface operation test'), S('mu','  2026-09-16 09:13  mock')], [S('fg','  retry transient provider attempt'), S('mu','  2026-09-16 09:13  mock')], [S('fg','  升级dsh 到最新版'), S('mu','  2026-09-11 01:04  deepseek')], [S('fg','  为什么dsh 频繁这个问题啊？ NODE_OPTIONS=--max-old-space-size=8192 dsh web'), S('mu','  2026-09-02 01:02  deepseek')] ];
+      for (var i=0;i<14;i++) rows.push([]);
+      return {rows: box('Resume Conversation', rows, {titleCls:'fg'}), caption:'改前：全部项目混排，测试产生的 mock 会话夹在中间（今晚实际截图）。'};
+    }
+    var rows = [ spread([S('br','⌕ '), S('mu','type to filter…')], [S('mu', st.tests?'25 sessions · showing 5 test sessions':'20 sessions · 5 test sessions hidden'), S('fg',' ')], W-4), [] ];
+    var idx = 0;
+    SESS.forEach(function(g){ rows.push([S('fg b', g.g), S('mu', g.cur?'   current project':'')]);
+      g.items.forEach(function(it){ var on = idx===st.sel; rows.push([S(on?'br b':'mu', on?'› ':'  '), S(on?'selb':'fg', fit([S('fg', it[0])], 50)[0].text + (dw(it[0])>50?'…':'') + rep(' ', Math.max(0, 51-Math.min(51, dw(it[0])+ (dw(it[0])>50?1:0))))), S('mu','  '+it[1]+rep(' ', 10-dw(it[1]))+' · '+it[2]+rep(' ', 16-dw(it[2]))+' · '), S(MODE_CLS[it[3]], it[3])]); idx++; });
+      rows.push([]); });
+    if (st.tests){ rows.push([S('dim','tests · written by the test suite into ORCA_HOME')]); MOCKS.forEach(function(m){ var on = idx===st.sel; rows.push([S(on?'br b':'mu', on?'› ':'  '), S(on?'selb':'dim', m+rep(' ', 51-dw(m))), S('dim','  3d ago     · 0 tool calls      · mock')]); idx++; }); rows.push([]); }
+    rows.push([S('br','↑↓'),S('mu',' move · '),S('br','Enter'),S('mu',' resume · '),S('br','Tab'),S('mu',' actions · '),S('br','t'),S('mu',' '+(st.tests?'hide':'show')+' test sessions · '),S('br','Esc'),S('mu',' back')]);
+    while (rows.length < 28) rows.splice(rows.length-1, 0, []);
+    return {rows: box('Resume', rows)};
+  }});
+
+/* 9. mode & status */
+var MODES = ['suggest','auto-edit','full-auto','plan'];
+scenes.push({ id:'mode', group:'方案二', title:'模式与状态栏', hasBefore:false,
+  note:'Shift+Tab 循环审批模式，chip 颜色沿用现有 approval_mode_color。进入 full-auto 时 Full Access 确认也内联到输入框槽位。plan 模式下计划面板用同一套 panel_block。窄终端下状态栏先裁中间的路径。',
+  tryList:[['⇧Tab','循环模式'],['Enter / Esc','确认或取消 Full Access'],['80 / 100 列','看裁剪优先级']],
+  init:function(){ return {mi:1, confirm:false, w:100}; },
+  keys:function(k, st){ if (st.confirm){ if (k==='enter'){ st.confirm=false; st.mi=2; return true; } if (k==='esc'){ st.confirm=false; return true; } return false; }
+    if (k==='stab'){ var next=(st.mi+1)%4; if (next===2) st.confirm=true; else st.mi=next; return true; } return false; },
+  acts:function(a, st){ if (a==='w80'){ st.w=80; return true; } if (a==='w100'){ st.w=100; return true; } return false; },
+  render:function(st){
+    W = st.w;
+    var mode = MODES[st.mi];
+    var top = [ user('把 welcome 的 figlet 换成鲸鱼字符画'), blank(), agent('先看一下现有的 build_welcome_lines 和那条测试。'), blank(), tool('✓','ok','read','crates/orca-tui/src/ui.rs:2807-2870','0.1s'), railEnd('64 lines · e to expand'), blank(),
+      line(S('fg','    '), S('mu','ℹ approval mode → '), S(MODE_CLS[mode]+' b', mode), S('mu', mode==='suggest'?' · every command and edit asks first':mode==='auto-edit'?' · edits inside the workspace sandbox run without asking':mode==='full-auto'?' · no approvals, no OS sandbox':' · read-only planning, edits are proposed')) ];
+    var bottom = [];
+    if (st.confirm){
+      var panel = [ [S('er b','◆ Enable Full Access?')], [S('fg','Removes command approvals and OS sandbox restrictions. Commands may modify any file and reach the network.')], [S('mu','Tools already running keep the policy they started with; the active task switches at its next tool call.')], [],
+        [S('br b','› '), S('fg b','1  '), S('selb','Continue with Full Access')], [S('mu','  '), S('fg','2  '), S('fg','Cancel')], [], [S('br','↑↓'),S('mu',' move · '),S('br','Enter'),S('mu',' confirm · '),S('br','Esc'),S('mu',' cancel')] ];
+      bottom = box('', panel, {border:'er'});
+    } else if (mode==='plan'){
+      bottom = box('Plan', [ [S('ok','✓ '), S('mu','Inspect build_welcome_lines and the pending test')], [S('wa','→ '), S('fg','Replace the figlet block with the whale mark')], [S('mu','• '), S('mu','Run cargo test -p orca-tui welcome_lines')], [S('mu','• '), S('mu','Update the two welcome snapshot assertions')] ], {border:'pl'}).concat(composerAfter(''));
+    } else bottom = composerAfter('');
+    bottom.push(statusAfter({mode:mode, width:st.w}));
+    var out = {rows: screen(top, bottom), caption: st.w===80 ? '80 列：中间的 cwd · branch 先被裁掉，模式 chip 和用量保留。' : ''};
+    W = 100; return out;
+  }});
+
+/* 10. tokens */
+scenes.push({ id:'tokens', group:'规范', title:'设计 token', hasBefore:false, custom:true,
+  note:'方案一落地时新建 chrome.rs 承载这些常量与组件；颜色沿用 theme.rs，经 Theme::resolve 降级到 256/16/单色。',
+  render:function(){ return {html:
+    '<div class="tokens">'+
+    '<div class="tk"><h3>Gutter 与状态图标</h3><table>'+
+    '<tr><td>›</td><td>你说的话 · 品牌蓝 · 粗体</td></tr><tr><td>●</td><td>Orca 的回复 · 品牌蓝 · 只在首行</td></tr><tr><td>⋯</td><td>thinking 折叠行 · muted 斜体</td></tr>'+
+    '<tr><td>✓ ✗ ×</td><td>工具完成 / 失败 · 拒绝 / 中断 · success / error / warning</td></tr><tr><td>⠋⠙⠹⠸</td><td>运行中 spinner · warning · 工具行与活动行同步</td></tr><tr><td>✎</td><td>编辑类工具 · 头行附 +a −b</td></tr>'+
+    '<tr><td>│ └</td><td>工具输出左栏与尾行 · dim</td></tr><tr><td>ℹ ⚠ ✗</td><td>系统通知 / 警告 / 错误的单行标题</td></tr><tr><td>◆</td><td>需要你决定的内联面板头行（审批、问卷、Full Access、Tasks）</td></tr></table></div>'+
+    '<div class="tk"><h3>颜色角色（Dark）</h3><table>'+
+    '<tr><td><span class="sw" style="background:#4D6BFE"></span>border / user</td><td>边框、选中标记、你的消息、Orca gutter</td></tr>'+
+    '<tr><td><span class="sw" style="background:#E8ECF6"></span>text</td><td>正文</td></tr><tr><td><span class="sw" style="background:#8B93A7"></span>muted</td><td>次要信息、提示动作词、工具输出</td></tr>'+
+    '<tr><td><span class="sw" style="background:#2FB170"></span>success</td><td>完成、已回答</td></tr><tr><td><span class="sw" style="background:#D9A441"></span>warning</td><td>运行中、警告、编辑类工具</td></tr>'+
+    '<tr><td><span class="sw" style="background:#D65151"></span>error</td><td>失败、拒绝、full-auto</td></tr><tr><td><span class="sw" style="background:#A98BF5"></span>approval</td><td>审批/问卷面板、auto-edit</td></tr>'+
+    '<tr><td><span class="sw" style="background:#40AAAA"></span>plan</td><td>plan 模式、side 会话、水纹</td></tr><tr><td><span class="sw" style="background:#2E3E84"></span>selection</td><td>选中行背景，不再只靠颜色区分</td></tr></table></div>'+
+    '<div class="tk"><h3>提示行语法</h3><div class="g"><span class="br">↑↓</span><span class="mu"> move · </span><span class="br">1-4</span><span class="mu"> pick · </span><span class="br">Enter</span><span class="mu"> confirm · </span><span class="br">Esc</span><span class="mu"> deny</span>\n\n<span class="mu">按键用 accent，动作用 muted，项之间 ·，超宽从右侧逐项裁掉。\n所有弹层与内联面板都从 hint_line() 生成，不再手写。</span></div></div>'+
+    '<div class="tk"><h3>容器</h3><div class="g"><span class="br">╭ Title ─────────────────╮</span>\n<span class="br">│</span> content padded         <span class="br">│</span>\n<span class="br">╰────────────────────────╯</span>\n\n<span class="mu">panel_block()：一律圆角，标题左对齐带空格，\naccent 只作用于边框和标题；高度按内容自适应。\n审批、问卷、帮助、菜单、Plan、Tasks 详情共用。\n输入框不用容器：上下各一条横线（有焦点 accent，否则 dim）+ › 提示符，没有竖线。</span></div></div>'+
+    '<div class="tk"><h3>间距规则</h3><table><tr><td>用户消息后</td><td>空 1 行</td></tr><tr><td>Orca 正文后</td><td>空 1 行（流式 chunk 沿用 trailing_blank）</td></tr><tr><td>连续工具行</td><td>不空行，成组</td></tr><tr><td>工具组 → 正文</td><td>空 1 行</td></tr><tr><td>通知 / 诊断</td><td>前后各空 1 行</td></tr></table></div>'+
+    '<div class="tk"><h3>Esc 规则</h3><table><tr><td>有弹层</td><td>关闭最上层，不做别的</td></tr><tr><td>运行中</td><td>中断当前 turn</td></tr><tr><td>空闲 · 输入非空</td><td>清空输入</td></tr><tr><td>空闲 · 输入为空</td><td>回退（保持现状）</td></tr><tr><td>会话选择器</td><td>返回对话</td></tr></table></div>'+
+    '</div>'}; }});
+
+/* ---------- app ---------- */
+var nav = document.getElementById('nav'), stage = document.getElementById('stage');
+var current = 0, modeSel = {}, states = {}, timer = null;
+function state(sc){ if (!states[sc.id]) states[sc.id] = sc.init ? sc.init() : {}; return states[sc.id]; }
+function keyName(e){ if (e.key==='Tab' && e.shiftKey) return 'stab'; if (e.key==='ArrowUp') return 'up'; if (e.key==='ArrowDown') return 'down'; if (e.key==='ArrowLeft') return 'left'; if (e.key==='ArrowRight') return 'right';
+  if (e.key==='Enter' && e.ctrlKey) return 'center'; if (e.key==='Enter') return 'enter'; if (e.key==='Escape') return 'esc'; if (e.key===' ') return 'space'; if (e.key.length===1) return e.key; return null; }
+
+function buildNav(){ nav.innerHTML=''; var last=null; scenes.forEach(function(sc, i){ if (sc.group!==last){ var k=document.createElement('div'); k.className='k'; k.textContent=sc.group; nav.appendChild(k); last=sc.group; }
+  var b=document.createElement('button'); b.type='button'; b.innerHTML='<span class="n">'+(i+1)+'</span><span>'+sc.title+'</span>'; b.setAttribute('aria-current', i===current?'true':'false'); b.addEventListener('click', function(){ select(i); }); nav.appendChild(b); }); }
+
+function select(i){ current = i; buildNav(); draw(true); }
+
+function draw(rebuild){ var sc = scenes[current], st = state(sc), mode = modeSel[sc.id]||'after';
+  if (timer){ clearInterval(timer); timer=null; }
+  if (rebuild){
+    var h = '<h2>'+sc.title+'</h2><p class="note">'+sc.note+'</p>';
+    if (!sc.custom){
+      h += '<div class="bar">';
+      if (sc.hasBefore) h += '<div class="seg" role="group" aria-label="改前改后"><button type="button" id="seg-before-'+sc.id+'" data-mode="before" aria-pressed="'+(mode==='before')+'">改前</button><button type="button" id="seg-after-'+sc.id+'" data-mode="after" aria-pressed="'+(mode==='after')+'">改后</button></div>';
+      if (sc.id==='menus') h += '<div class="chips"><button type="button" data-act="tab:slash">/ 命令菜单</button><button type="button" data-act="tab:mention">@ 候选</button><button type="button" data-act="tab:help">? 帮助</button></div>';
+      if (sc.id==='mode') h += '<div class="chips"><button type="button" data-act="w100">100 列</button><button type="button" data-act="w80">80 列</button></div>';
+      if (sc.id==='approval') h += '<div class="chips"><button type="button" data-act="reset">重来</button></div>';
+      if (sc.id==='tasks') h += '<div class="chips"><button type="button" data-act="opendock">打开 dock</button></div>';
+      h += '</div>';
+      h += '<div class="term" id="term" tabindex="0" aria-label="终端画面"><div class="tb"><span>orca · 100×34 · '+(mode==='before'?'当前实现':'方案效果')+'</span><span class="foc" id="foc">点击获得键盘焦点</span></div><pre id="pre"></pre></div>';
+      if (sc.tryList) h += '<div class="try">'+sc.tryList.map(function(t){ return '<span><kbd>'+t[0]+'</kbd> '+t[1]+'</span>'; }).join('')+'</div>';
+      h += '<p class="note" id="cap" style="margin-top:8px"></p>';
+    } else h += '<div id="custom"></div>';
+    stage.innerHTML = h;
+    if (!sc.custom){
+      var term = document.getElementById('term');
+      term.addEventListener('keydown', function(e){ var k = keyName(e); if (!k) return; if (k==='?'||k==='/'||k==='@'||k==='space'||k==='stab'||k==='up'||k==='down'||k==='left'||k==='right'||k==='enter'||k==='center'||k==='esc'||k==='t'||k==='e'||/^[1-9jk]$/.test(k)){ if (sc.keys && sc.keys(k, st)){ e.preventDefault(); draw(false); } else if (k==='stab'||k==='up'||k==='down'||k==='space') e.preventDefault(); } });
+      term.addEventListener('focus', function(){ document.getElementById('foc').textContent = '键盘已接管 · 按提示里的键'; });
+      term.addEventListener('blur', function(){ document.getElementById('foc').textContent = '点击获得键盘焦点'; });
+      term.addEventListener('click', function(e){ var el = e.target.closest('[data-act]'); if (el && sc.acts && sc.acts(el.getAttribute('data-act'), st)) draw(false); });
+      stage.querySelectorAll('.seg button').forEach(function(b){ b.addEventListener('click', function(){ modeSel[sc.id] = b.getAttribute('data-mode'); draw(true); }); });
+      stage.querySelectorAll('.chips button').forEach(function(b){ b.addEventListener('click', function(){ if (sc.acts && sc.acts(b.getAttribute('data-act'), st)) draw(false); document.getElementById('term').focus(); }); });
+    }
+  }
+  if (sc.custom){ document.getElementById('custom').innerHTML = sc.render(st).html; return; }
+  var out = sc.render(st, mode);
+  var pre = document.getElementById('pre');
+  var body = out.rows.map(function(r){ return html(r); }).join('\n');
+  if (out.overlay){ var o = out.overlay; body += '<pre class="ov" style="left:calc(16px + '+o.x+'ch);top:calc(10px + '+(o.y*1.5)+'em)">'+o.rows.map(function(r){ return html(r); }).join('\n')+'</pre>'; }
+  pre.innerHTML = body;
+  var cap = document.getElementById('cap'); if (cap) cap.textContent = out.caption||'';
+  if (sc.animated && sc.tick && !reduced){ timer = setInterval(function(){ sc.tick(st); var o2 = sc.render(st, modeSel[sc.id]||'after'); var p = document.getElementById('pre'); if (!p) { clearInterval(timer); return; } p.innerHTML = o2.rows.map(function(r){ return html(r); }).join('\n'); }, 120); }
+}
+
+measureBraille(); if (document.fonts && document.fonts.ready) document.fonts.ready.then(measureBraille);
+buildNav(); draw(true);
+})();
+</script>
+
+</body>
+</html>
