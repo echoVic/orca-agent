@@ -243,56 +243,49 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 }
 
 fn render_recovery_prompt(frame: &mut Frame, state: &AppState, theme: &Theme) {
-    let area = centered_rect(frame.area(), 58, 7);
-    frame.render_widget(Clear, area);
-    let continue_style = if state.recovery_prompt_selected == 0 {
-        Style::default()
-            .fg(theme.border)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.text)
-    };
-    let cancel_style = if state.recovery_prompt_selected == 1 {
-        Style::default()
-            .fg(theme.error)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.muted)
-    };
+    let popup = crate::chrome::dialog_rect(frame.area(), 60, 6, 12);
+    frame.render_widget(Clear, popup);
+    let inner_width = usize::from(popup.width.saturating_sub(4));
+
+    let labels = ["Continue", "Cancel operation"];
+    let label_width = labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(*label))
+        .max()
+        .unwrap_or(0);
     let content = vec![
-        Line::from("A suspended operation can continue from its last checkpoint."),
+        Line::from(Span::styled(
+            "A suspended operation can continue from its last checkpoint.",
+            Style::default().fg(theme.text),
+        )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                if state.recovery_prompt_selected == 0 {
-                    "> Continue"
-                } else {
-                    "  Continue"
-                },
-                continue_style,
-            ),
-            Span::raw("    "),
-            Span::styled(
-                if state.recovery_prompt_selected == 1 {
-                    "> Cancel operation"
-                } else {
-                    "  Cancel operation"
-                },
-                cancel_style,
-            ),
-        ]),
+        crate::chrome::option_line(
+            theme,
+            state.recovery_prompt_selected == 0,
+            "1",
+            labels[0],
+            label_width,
+            "",
+            inner_width,
+        ),
+        crate::chrome::option_line(
+            theme,
+            state.recovery_prompt_selected == 1,
+            "2",
+            labels[1],
+            label_width,
+            "",
+            inner_width,
+        ),
+        Line::from(""),
+        crate::chrome::hint_line(
+            theme,
+            inner_width,
+            &[("↑↓", "move"), ("Enter", "confirm"), ("Esc", "cancel")],
+        ),
     ];
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Recover Operation ")
-        .border_style(Style::default().fg(theme.border));
-    frame.render_widget(
-        Paragraph::new(content)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let block = crate::chrome::panel_block(theme, "Recover operation", theme.border);
+    frame.render_widget(Paragraph::new(content).block(block), popup);
 }
 
 fn main_layout(
@@ -796,12 +789,9 @@ fn render_config_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let Some(dialog) = state.config_dialog.as_ref() else {
         return;
     };
-    let popup = centered_rect(
-        frame.area(),
-        72u16.min(frame.area().width.saturating_sub(4)),
-        10u16.min(frame.area().height.saturating_sub(2)),
-    );
+    let popup = crate::chrome::dialog_rect(frame.area(), 72, 7, 12);
     frame.render_widget(Clear, popup);
+    let inner_width = usize::from(popup.width.saturating_sub(4));
 
     let rows = [
         ("Model", dialog.model.as_str()),
@@ -810,27 +800,37 @@ fn render_config_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
     ];
     let mut lines = vec![
         Line::from(Span::styled(
-            "  Changes apply to the current session.",
-            Style::default().fg(theme.muted),
+            "Changes apply to the current session.",
+            theme.muted_style(),
         )),
         Line::from(""),
     ];
     for (index, (label, value)) in rows.into_iter().enumerate() {
-        lines.push(config_dialog_row(dialog, index, label, value, theme));
+        lines.push(config_dialog_row(
+            dialog,
+            index,
+            label,
+            value,
+            18,
+            theme,
+            inner_width,
+        ));
     }
     lines.extend([
         Line::from(""),
-        Line::from(Span::styled(
-            "  ↑↓ select · ←→ change · Enter apply · Esc cancel",
-            Style::default().fg(theme.muted),
-        )),
+        crate::chrome::hint_line(
+            theme,
+            inner_width,
+            &[
+                ("↑↓", "move"),
+                ("←→", "change"),
+                ("Enter", "apply"),
+                ("Esc", "cancel"),
+            ],
+        ),
     ]);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Runtime Configuration ")
-        .border_style(Style::default().fg(theme.border));
+    let block = crate::chrome::panel_block(theme, "Runtime settings", theme.border);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -838,84 +838,75 @@ fn render_full_access_confirmation(frame: &mut Frame, state: &AppState, theme: &
     let Some(confirmation) = state.full_access_confirmation.as_ref() else {
         return;
     };
-    let popup = centered_rect(
-        frame.area(),
-        72u16.min(frame.area().width.saturating_sub(4)),
-        12u16.min(frame.area().height.saturating_sub(2)),
-    );
+    let popup = crate::chrome::dialog_rect(frame.area(), 72, 8, 14);
     frame.render_widget(Clear, popup);
+    let inner_width = usize::from(popup.width.saturating_sub(4));
 
-    let continue_style = if confirmation.selected == 0 {
-        Style::default()
-            .fg(theme.error)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.muted)
-    };
-    let cancel_style = if confirmation.selected == 1 {
-        Style::default()
-            .fg(theme.border)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.text)
-    };
+    let labels = ["Continue with Full Access", "Cancel"];
+    let label_width = labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(*label))
+        .max()
+        .unwrap_or(0);
     let lines = vec![
         Line::from(Span::styled(
-            "  Full Access removes command approvals and OS sandbox restrictions.",
+            "Full Access removes command approvals and OS sandbox restrictions.",
             Style::default().fg(theme.warning),
         )),
-        Line::from(""),
-        Line::from("  Commands may modify any file and access the network."),
-        Line::from("  The active task will use this authority from its next tool call."),
-        Line::from("  Tools already running keep the policy they started with."),
-        Line::from(""),
         Line::from(Span::styled(
-            if confirmation.selected == 0 {
-                "  > Continue with Full Access"
-            } else {
-                "    Continue with Full Access"
-            },
-            continue_style,
+            "Commands may modify any file and access the network.",
+            Style::default().fg(theme.text),
         )),
         Line::from(Span::styled(
-            if confirmation.selected == 1 {
-                "  > Cancel"
-            } else {
-                "    Cancel"
-            },
-            cancel_style,
+            "The active task will use this authority from its next tool call.",
+            Style::default().fg(theme.text),
         )),
+        Line::from(""),
+        crate::chrome::option_line(
+            theme,
+            confirmation.selected == 0,
+            "",
+            labels[0],
+            label_width,
+            "",
+            inner_width,
+        ),
+        crate::chrome::option_line(
+            theme,
+            confirmation.selected == 1,
+            "",
+            labels[1],
+            label_width,
+            "",
+            inner_width,
+        ),
+        Line::from(""),
+        crate::chrome::hint_line(
+            theme,
+            inner_width,
+            &[("↑↓", "move"), ("Enter", "confirm"), ("Esc", "cancel")],
+        ),
     ];
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Enable Full Access? ")
-        .border_style(Style::default().fg(theme.error));
+    let block = crate::chrome::panel_block(theme, "Enable Full Access?", theme.error);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn config_dialog_row<'a>(
+fn config_dialog_row(
     dialog: &ConfigDialog,
     index: usize,
-    label: &'a str,
-    value: &'a str,
+    label: &str,
+    value: &str,
+    label_width: usize,
     theme: &Theme,
-) -> Line<'a> {
+    width: usize,
+) -> Line<'static> {
     let selected = dialog.selected == index;
-    let style = if selected {
-        Style::default()
-            .fg(theme.border)
-            .add_modifier(Modifier::BOLD)
+    let value_text = if selected {
+        format!("‹ {value} ›")
     } else {
-        Style::default().fg(theme.text)
+        value.to_string()
     };
-    Line::from(vec![
-        Span::styled(if selected { "▸ " } else { "  " }, style),
-        Span::styled(format!("{label:<20}"), style),
-        Span::styled(if selected { "‹ " } else { "  " }, style),
-        Span::styled(value, style),
-        Span::styled(if selected { " ›" } else { "  " }, style),
-    ])
+    crate::chrome::option_line(theme, selected, "", label, label_width, &value_text, width)
 }
 
 fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line<'static>> {
@@ -1001,11 +992,7 @@ fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         ThreadGoalStatus::Complete => theme.success,
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" ⌖ Goal ")
-        .border_style(Style::default().fg(theme.border));
+    let block = crate::chrome::panel_block(theme, "Goal", theme.border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1663,29 +1650,41 @@ fn render_jump_to_bottom_pill(frame: &mut Frame, state: &mut AppState, theme: &T
     state.viewport.jump_to_bottom_area = Some(pill);
 }
 
-fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Tasks ")
-        .border_style(Style::default().fg(theme.border));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+/// A short, centered notice shown instead of a full-height panel when there
+/// is nothing to list yet, so an empty view doesn't pad a whole screen of
+/// blank space under a single sentence.
+fn render_empty_tasks_notice(frame: &mut Frame, area: Rect, theme: &Theme, title: &str) {
+    let popup = crate::chrome::dialog_rect(area, 60, 3, 5);
+    frame.render_widget(Clear, popup);
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "No tasks yet · they appear here when background work starts",
+            theme.muted_style(),
+        )),
+        Line::from(Span::styled("Esc back", theme.muted_style())),
+    ];
+    let block = crate::chrome::panel_block(theme, title, theme.border);
+    frame.render_widget(
+        Paragraph::new(content)
+            .alignment(Alignment::Center)
+            .block(block),
+        popup,
+    );
+}
 
+fn render_workflows_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let selected_index = state.workflow_selected_index();
     let task_rows = state.workflow_visible_tasks();
 
     if task_rows.is_empty() {
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " No background tasks available in this view yet.",
-                Style::default().fg(theme.muted),
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        render_empty_tasks_notice(frame, area, theme, "Tasks");
         return;
     }
+
+    let block = crate::chrome::panel_block(theme, "Tasks", theme.border);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
     // One hint row + one header row + task rows. The selected workflow expands into
     // phase and per-agent rows so the panel can act as a lightweight dashboard.
@@ -1870,15 +1869,18 @@ fn is_foregroundable_task(task: &BackgroundTaskSummary) -> bool {
 
 fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let showing_transcript = state.task_transcript().is_some();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(if showing_transcript {
-            " Agent Transcript "
-        } else {
-            " Tasks Workspace "
-        })
-        .border_style(Style::default().fg(theme.border));
+    let title = if showing_transcript {
+        "Agent Transcript"
+    } else {
+        "Tasks Workspace"
+    };
+
+    if !showing_transcript && state.agent_rows().is_empty() {
+        render_empty_tasks_notice(frame, area, theme, title);
+        return;
+    }
+
+    let block = crate::chrome::panel_block(theme, title, theme.border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1888,18 +1890,6 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
     }
 
     let rows = state.agent_rows();
-
-    if rows.is_empty() {
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " No tasks yet. They will appear here as soon as background work starts.",
-                Style::default().fg(theme.muted),
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-        return;
-    }
 
     if inner.height < 3 || inner.width == 0 {
         return;
@@ -3349,19 +3339,12 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         return;
     };
 
-    let (title, border_color) = if state.plan_update_failed() {
-        (
-            " Task Plan (last update failed — may be stale) ",
-            theme.warning,
-        )
+    let (title, accent) = if state.plan_update_failed() {
+        ("Plan · last update failed", theme.warning)
     } else {
-        (" Task Plan ", theme.border)
+        ("Plan", theme.border)
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(title)
-        .border_style(Style::default().fg(border_color));
+    let block = crate::chrome::panel_block(theme, title, accent);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -5329,57 +5312,50 @@ fn render_plan_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Them
     };
     let popup = plan_approval_popup(frame.area());
     frame.render_widget(Clear, popup);
+    let inner_width = usize::from(popup.width.saturating_sub(4));
 
     let target_mode = state.pre_plan_approval_mode.unwrap_or_default().as_str();
-    let options = [
-        (
-            "Yes, implement this plan",
-            format!("Switch to {target_mode} and start coding."),
-        ),
-        (
-            "No, stay in Plan mode",
-            "Continue planning with feedback.".to_string(),
-        ),
+    let labels = ["Yes, implement this plan", "No, stay in Plan mode"];
+    let details = [
+        format!("Switch to {target_mode} and start coding."),
+        "Continue planning with feedback.".to_string(),
     ];
-    let inner_width = popup.width.saturating_sub(4) as usize;
+    let label_width = labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(*label))
+        .max()
+        .unwrap_or(0);
     let mut lines = vec![
         Line::from(Span::styled(
-            "  The plan is ready. Choose whether to start implementation.",
+            "The plan is ready. Choose whether to start implementation.",
             Style::default().fg(theme.text),
         )),
         Line::from(""),
     ];
-    for (index, (label, description)) in options.into_iter().enumerate() {
-        let selected = index == dialog.selected;
-        let marker = if selected { "▸ " } else { "  " };
-        let label_style = if selected {
-            Style::default()
-                .fg(theme.plan_mode)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        let prefix = format!("{marker}{}. {label}", index + 1);
-        let description_width = inner_width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
-        lines.push(Line::from(vec![
-            Span::styled(prefix, label_style),
-            Span::styled(
-                truncate_to_display_width(&format!("  {description}"), description_width),
-                Style::default().fg(theme.muted),
-            ),
-        ]));
+    for (index, label) in labels.iter().enumerate() {
+        lines.push(crate::chrome::option_line(
+            theme,
+            index == dialog.selected,
+            &(index + 1).to_string(),
+            label,
+            label_width,
+            &details[index],
+            inner_width,
+        ));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  ↑↓ select · Enter confirm · PgUp/PgDn review plan · Esc stay in Plan mode",
-        Style::default().fg(theme.muted),
-    )));
+    lines.push(crate::chrome::hint_line(
+        theme,
+        inner_width,
+        &[
+            ("↑↓", "select"),
+            ("Enter", "confirm"),
+            ("PgUp/PgDn", "review plan"),
+            ("Esc", "stay in Plan mode"),
+        ],
+    ));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Implement this plan? ")
-        .border_style(Style::default().fg(theme.plan_mode));
+    let block = crate::chrome::panel_block(theme, "Plan ready", theme.plan_mode);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -5396,12 +5372,14 @@ fn approval_dialog_geometry(
     area: Rect,
     dialog: &crate::types::ApprovalDialog,
 ) -> ApprovalDialogGeometry {
-    let width = 64u16.min(area.width.saturating_sub(4));
-    let max_height = area.height.saturating_sub(4).max(8);
-    let fixed_content_rows = 3 + dialog.options.len() as u16 + 2 + u16::from(dialog.diff.is_some());
-    let available_diff_rows = max_height
-        .saturating_sub(2)
-        .saturating_sub(fixed_content_rows) as usize;
+    let width = 72u16.min(area.width.saturating_sub(4));
+    let max_height = area.height.saturating_sub(2);
+    // Content rows once laid out: target (0/1) + diff + truncation row + a
+    // blank separator + one row per option + a trailing blank + the hint row.
+    let target_rows = u16::from(dialog.target.is_some());
+    let fixed_content_rows = target_rows + dialog.options.len() as u16 + 3;
+    let max_content_rows = max_height.saturating_sub(2);
+    let available_diff_rows = max_content_rows.saturating_sub(fixed_content_rows) as usize;
     let source_diff_lines = dialog
         .diff
         .as_ref()
@@ -5413,20 +5391,12 @@ fn approval_dialog_geometry(
     let truncation_row = usize::from(diff_truncated && available_diff_rows > 0);
     let shown_diff_lines =
         desired_diff_lines.min(available_diff_rows.saturating_sub(truncation_row));
-    let height = (fixed_content_rows
-        + shown_diff_lines as u16
-        + u16::from(diff_truncated && available_diff_rows > 0)
-        + 2)
-    .min(max_height)
-    .max(8);
-    let popup = centered_rect(area, width, height);
-    // Border, then tool/target/blank, then the bounded diff block.
-    let first_option_row = popup.y
-        + 1
-        + 3
-        + shown_diff_lines as u16
-        + truncation_row as u16
-        + u16::from(dialog.diff.is_some());
+    let content_rows = fixed_content_rows + shown_diff_lines as u16 + truncation_row as u16;
+    let popup = crate::chrome::dialog_rect(area, width, content_rows, max_height);
+    // Border, then the target line, then the bounded diff block, then the
+    // blank separator before the first option.
+    let first_option_row =
+        popup.y + 1 + target_rows + shown_diff_lines as u16 + truncation_row as u16 + 1;
     ApprovalDialogGeometry {
         popup,
         shown_diff_lines,
@@ -5458,113 +5428,105 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let Some(dialog) = &state.approval_dialog else {
         return;
     };
-
     let area = frame.area();
     let geometry = approval_dialog_geometry(area, dialog);
-    let popup_area = geometry.popup;
-    let shown_diff_lines = geometry.shown_diff_lines;
-    let diff_truncated = geometry.diff_truncated;
-    let target_str = dialog.target.as_deref().unwrap_or("(none)");
-    let inner_width = popup_area.width.saturating_sub(2) as usize;
-    let target_str = truncate_to_display_width(target_str, inner_width.saturating_sub(9));
-
-    // Build the diff/preview lines (colored) if a preview is present.
-    let diff_lines: Vec<Line<'static>> = match &dialog.diff {
-        Some(diff) => diff
-            .lines()
-            .take(shown_diff_lines)
-            .map(|line| {
-                let color = if line.starts_with('+') {
-                    theme.diff_add
-                } else if line.starts_with('-') {
-                    theme.diff_remove
-                } else if line.starts_with("@@") || line.starts_with('$') {
-                    theme.border
-                } else {
-                    theme.muted
-                };
-                Line::from(Span::styled(
-                    truncate_to_display_width(&format!("  {line}"), inner_width),
-                    Style::default().fg(color),
-                ))
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
-    frame.render_widget(Clear, popup_area);
-
-    let mut content: Vec<Line<'static>> = vec![
-        Line::from(vec![
-            Span::styled("  tool   ", Style::default().fg(theme.muted)),
-            Span::styled(
-                dialog.tool.clone(),
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  target ", Style::default().fg(theme.muted)),
-            Span::styled(target_str.clone(), Style::default().fg(theme.text)),
-        ]),
-        Line::from(""),
-    ];
-
-    content.extend(diff_lines);
-    if diff_truncated {
+    let popup = geometry.popup;
+    let inner_width = usize::from(popup.width.saturating_sub(4));
+    let mut content: Vec<Line<'static>> = Vec::new();
+    if let Some(target) = dialog.target.as_deref() {
         content.push(Line::from(Span::styled(
-            "  … (preview truncated)",
-            Style::default().fg(theme.muted),
+            truncate_to_display_width(target, inner_width),
+            Style::default().fg(theme.text),
         )));
     }
-    if dialog.diff.is_some() {
-        content.push(Line::from(""));
+    if let Some(diff) = &dialog.diff {
+        let rail = Span::styled("│ ".to_string(), theme.dim_style());
+        for line in diff.lines().take(geometry.shown_diff_lines) {
+            let color = if line.starts_with('+') {
+                theme.diff_add
+            } else if line.starts_with('-') {
+                theme.diff_remove
+            } else if line.starts_with("@@") || line.starts_with('$') {
+                theme.border
+            } else {
+                theme.muted
+            };
+            content.push(Line::from(vec![
+                rail.clone(),
+                Span::styled(
+                    truncate_to_display_width(line, inner_width.saturating_sub(2)),
+                    Style::default().fg(color),
+                ),
+            ]));
+        }
+        if geometry.diff_truncated {
+            content.push(Line::from(Span::styled(
+                "… preview truncated",
+                theme.dim_style(),
+            )));
+        }
     }
-
-    // The options, one per line, highlighted when selected.
-    for (i, option) in dialog.options.iter().enumerate() {
-        let selected = i == dialog.selected;
-        let prefix = if selected { "▸ " } else { "  " };
-        let key_color = match option {
-            ApprovalOption::Deny => theme.error,
-            _ => theme.success,
-        };
-        let label_style = if selected {
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.muted)
-        };
-        let label_text = match option {
-            ApprovalOption::AlwaysTool => format!("always allow \"{}\"", dialog.tool),
-            ApprovalOption::AlwaysTarget => "always allow this exact call".to_string(),
-            _ => option.label().to_string(),
-        };
-        let label_text = truncate_to_display_width(&label_text, inner_width.saturating_sub(8));
-        content.push(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(theme.border)),
-            Span::styled(
-                format!("[{}] ", option.key()),
-                Style::default().fg(key_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(label_text, label_style),
-        ]));
-    }
-
     content.push(Line::from(""));
-    content.push(Line::from(Span::styled(
-        "  ↑↓ select · Enter · 1/2/3/4 · legacy y/A/a/n",
-        Style::default().fg(theme.muted),
-    )));
+    let labels: Vec<String> = dialog
+        .options
+        .iter()
+        .map(|option| approval_option_label(*option, &dialog.tool))
+        .collect();
+    let label_width = labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(label.as_str()))
+        .max()
+        .unwrap_or(0);
+    for (index, option) in dialog.options.iter().enumerate() {
+        content.push(crate::chrome::option_line(
+            theme,
+            index == dialog.selected,
+            &option.key().to_string(),
+            &labels[index],
+            label_width,
+            approval_option_detail(*option),
+            inner_width,
+        ));
+    }
+    content.push(Line::from(""));
+    content.push(crate::chrome::hint_line(
+        theme,
+        inner_width,
+        &[
+            ("↑↓", "move"),
+            ("1-4", "pick"),
+            ("Enter", "confirm"),
+            ("Esc", "deny"),
+            ("PgUp/PgDn", "preview"),
+        ],
+    ));
+    frame.render_widget(Clear, popup);
+    // Permission-specific risk titles stay in `ApprovalDialog::title()`; the
+    // ordinary case names the tool being approved instead of a generic label.
+    let title = match dialog.permission_kind {
+        None => format!("Approve · {}", dialog.tool),
+        Some(_) => dialog.title().trim().to_string(),
+    };
+    let block = crate::chrome::panel_block(theme, &title, theme.approval);
+    frame.render_widget(Paragraph::new(content).block(block), popup);
+}
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(dialog.title())
-        .border_style(Style::default().fg(theme.approval));
+fn approval_option_label(option: ApprovalOption, tool: &str) -> String {
+    match option {
+        ApprovalOption::Once => "Allow once".to_string(),
+        ApprovalOption::AlwaysTool => format!("Allow {tool} this session"),
+        ApprovalOption::AlwaysTarget => "Allow this exact call".to_string(),
+        ApprovalOption::Deny => "Deny".to_string(),
+    }
+}
 
-    let paragraph = Paragraph::new(content).block(block);
-    frame.render_widget(paragraph, popup_area);
+fn approval_option_detail(option: ApprovalOption) -> &'static str {
+    match option {
+        ApprovalOption::Once => "run it now",
+        ApprovalOption::AlwaysTool => "skip approval for this tool until you quit",
+        ApprovalOption::AlwaysTarget => "remember only this exact call",
+        ApprovalOption::Deny => "ask Orca for another way",
+    }
 }
 
 /// Which session (index into `session_picker_sessions`) a click lands on,
@@ -5664,12 +5626,7 @@ pub(crate) fn composer_click_target(
 /// marked with a caret and a brighter foreground so keyboard focus is visible
 /// without inverting the background.
 fn setup_option_line<'a>(selected: bool, label: &str, key: &str, theme: &Theme) -> Line<'a> {
-    let marker = if selected { "❯ " } else { "  " };
-    let mut style = Style::default().fg(if selected { theme.border } else { theme.muted });
-    if selected {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    Line::from(Span::styled(format!("  {marker}[{key}] {label}"), style))
+    crate::chrome::option_line(theme, selected, key, label, 20, "", 60)
 }
 
 fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme: &Theme) {
@@ -5678,25 +5635,24 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
     match state.setup_step {
         0 => {
             let width = 78u16.min(area.width.saturating_sub(4));
-            let height = 22u16.min(area.height.saturating_sub(2));
-            let popup_area = centered_rect(area, width, height);
+            let inner_width = usize::from(width.saturating_sub(4));
             let mut content = vec![Line::from(Span::styled(
-                "  Before the first run, review this workspace security boundary.",
-                Style::default().fg(Color::White),
+                "Before the first run, review this workspace security boundary.",
+                Style::default().fg(theme.text),
             ))];
             if let Some(first_run) = &state.first_run {
                 content.extend([
                     Line::from(Span::styled(
-                        format!("  Workspace: {}", first_run.workspace.display()),
-                        Style::default().fg(Color::Cyan),
+                        format!("Workspace: {}", first_run.workspace.display()),
+                        Style::default().fg(theme.border),
                     )),
                     Line::from(Span::styled(
-                        format!("  Auth file: {}", first_run.auth_path.display()),
-                        Style::default().fg(Color::DarkGray),
+                        format!("Auth file: {}", first_run.auth_path.display()),
+                        Style::default().fg(theme.muted),
                     )),
                     Line::from(Span::styled(
                         format!(
-                            "  Folder trust: {}",
+                            "Folder trust: {}",
                             if first_run.workspace_trusted {
                                 "trusted"
                             } else {
@@ -5704,18 +5660,18 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                             }
                         ),
                         Style::default().fg(if first_run.workspace_trusted {
-                            Color::Yellow
+                            theme.warning
                         } else {
-                            Color::Green
+                            theme.success
                         }),
                     )),
                     Line::from(Span::styled(
-                        "  Generated tools remain sandboxed and may request explicit access.",
-                        Style::default().fg(Color::White),
+                        "Generated tools remain sandboxed and may request explicit access.",
+                        Style::default().fg(theme.text),
                     )),
                     Line::from(Span::styled(
                         format!(
-                            "  Local doctor checks: {} pass, {} warn, {} fail",
+                            "Local doctor checks: {} pass, {} warn, {} fail",
                             first_run
                                 .diagnostics
                                 .checks
@@ -5744,13 +5700,13 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                                 })
                                 .count(),
                         ),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.muted),
                     )),
                 ]);
             } else if let Some(error) = &state.first_run_error {
                 content.push(Line::from(Span::styled(
-                    format!("  Cannot inspect security state: {error}"),
-                    Style::default().fg(Color::Red),
+                    format!("Cannot inspect security state: {error}"),
+                    Style::default().fg(theme.error),
                 )));
             }
             content.extend([
@@ -5774,21 +5730,18 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                     theme,
                 ),
                 Line::from(""),
-                Line::from(Span::styled(
-                    "  [↑/↓] Move   [Enter] Select   [Esc] Exit",
-                    Style::default().fg(Color::DarkGray),
-                )),
+                crate::chrome::hint_line(
+                    theme,
+                    inner_width,
+                    &[("↑↓", "move"), ("Enter", "select"), ("Esc", "exit")],
+                ),
             ]);
 
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Welcome ")
-                .border_style(Style::default().fg(Color::Cyan));
-
-            let paragraph = Paragraph::new(content)
-                .wrap(Wrap { trim: false })
-                .block(block);
+            // Sized to the security notice's real content instead of a fixed
+            // height so a trust-state-free first run doesn't pad with blank rows.
+            let popup_area = crate::chrome::dialog_rect(area, width, content.len() as u16, 26);
+            let block = crate::chrome::panel_block(theme, "Welcome", theme.border);
+            let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
         }
         1 => {
@@ -5809,30 +5762,26 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                 Line::from(Span::styled(
                     "  Step 1: API Key",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.border)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  Orca needs a DeepSeek API key to function.",
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme.text),
                 )),
                 Line::from(Span::styled(
                     "  https://platform.deepseek.com/api_keys",
-                    Style::default().fg(Color::Blue),
+                    Style::default().fg(theme.plan_mode),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  Paste below and press Enter:",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.muted),
                 )),
             ];
 
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Setup ")
-                .border_style(Style::default().fg(Color::Cyan));
+            let block = crate::chrome::panel_block(theme, "Setup", theme.border);
 
             let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
@@ -5853,31 +5802,27 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                 Line::from(Span::styled(
                     "  ✓ API key saved successfully!",
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(theme.success)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     format!("  Saved to: {auth_path}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.muted),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  You're all set! Orca is ready to use.",
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme.text),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  Press Enter to start...",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.muted),
                 )),
             ];
 
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Setup Complete ")
-                .border_style(Style::default().fg(Color::Green));
+            let block = crate::chrome::panel_block(theme, "Setup Complete", theme.success);
 
             let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
@@ -6355,7 +6300,7 @@ mod tests {
     use super::*;
     use crate::protocol::{TuiEvent, TuiInteractionKey, TuiInteractionKind};
     use crate::surface_projection::SurfaceProjectionState;
-    use crate::types::{PlanApprovalDialog, SlashMenu, SlashMenuItem};
+    use crate::types::{ApprovalDialog, PlanApprovalDialog, SlashMenu, SlashMenuItem};
     use chrono::Utc;
     use crossbeam_channel as mpsc;
     use orca_core::config::{AdditionalWorkingDirectory, ThemeName};
@@ -7025,7 +6970,7 @@ mod tests {
             .expect("draw");
 
         let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("Runtime Configuration"));
+        assert!(rendered.contains("Runtime settings"));
         assert!(rendered.contains("deepseek-v4-pro"));
         assert!(rendered.contains("Reasoning effort"));
         assert!(rendered.contains("auto-edit"));
@@ -7060,7 +7005,7 @@ mod tests {
         assert!(rendered.contains("Enable Full Access?"));
         assert!(rendered.contains("OS sandbox restrictions"));
         assert!(rendered.contains("next tool call"));
-        assert!(rendered.contains("> Cancel"));
+        assert!(rendered.contains("› Cancel"));
     }
 
     #[test]
@@ -7530,6 +7475,118 @@ mod tests {
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    /// Renders the whole app to a `width`x`height` `TestBackend` and returns the
+    /// buffer as a newline-joined string (each row trimmed of trailing spaces) so
+    /// dialog tests can assert on visible text with plain `contains` checks.
+    fn frame_string(state: &mut AppState, width: u16, height: u16) -> String {
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea =
+            crate::composer_textarea::make_textarea(&crate::vim::VimState::new(false), &theme);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render(frame, state, &textarea, &theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn approval_dialog_uses_shared_options_and_hints() {
+        let mut state = test_state();
+        state.status = AppStatus::WaitingApproval;
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "1".into(),
+            interaction: None,
+            tool: "bash".into(),
+            target: Some("cargo test".into()),
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::AlwaysTarget,
+                ApprovalOption::Deny,
+            ],
+            diff: None,
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("╭ Approve · bash"), "{frame}");
+        assert!(frame.contains("› 1  Allow once"), "{frame}");
+        assert!(frame.contains("  4  Deny"), "{frame}");
+        assert!(
+            frame.contains("↑↓ move · 1-4 pick · Enter confirm · Esc deny"),
+            "{frame}"
+        );
+        assert!(!frame.contains("legacy"), "{frame}");
+        assert!(!frame.contains("▸"), "{frame}");
+    }
+
+    #[test]
+    fn config_dialog_height_fits_its_rows() {
+        let mut state = test_state();
+        state.config_dialog = Some(ConfigDialog {
+            selected: 0,
+            model: "deepseek-flash".into(),
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            approval_mode: ApprovalMode::AutoEdit,
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        let box_rows = frame.lines().filter(|line| line.contains('│')).count();
+        assert_eq!(box_rows, 7, "{frame}");
+        assert!(frame.contains("› Model"), "{frame}");
+        assert!(
+            frame.contains("↑↓ move · ←→ change · Enter apply · Esc cancel"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn setup_security_notice_uses_theme_colors_and_no_empty_rows() {
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.setup_step = 0;
+        let theme = Theme::named(ThemeName::Dark);
+        let textarea = crate::composer_textarea::make_setup_textarea(&theme);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(!rendered.contains("Cyan"), "{rendered}");
+        let box_rows = (0..30u16)
+            .filter(|y| (0..100u16).any(|x| buffer[(x, *y)].symbol() == "│"))
+            .count();
+        assert!(
+            box_rows <= 12,
+            "security notice should not pad with empty rows: {box_rows}"
+        );
+        assert!(rendered.contains("› T  Trust workspace"), "{rendered}");
+    }
+
+    #[test]
+    fn empty_tasks_panel_is_a_short_centered_notice() {
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Agents;
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("No tasks yet"), "{frame}");
+        assert!(frame.contains("Esc back"), "{frame}");
+        let box_rows = frame.lines().filter(|line| line.contains('│')).count();
+        assert!(box_rows <= 5, "{frame}");
     }
 
     fn message_text(previous: Option<&ChatMessage>, message: &ChatMessage) -> Vec<String> {
@@ -8497,7 +8554,7 @@ mod tests {
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
 
-        assert!(rendered.contains("Approval Required"));
+        assert!(rendered.contains("Approve · web_search"));
         assert!(
             !rendered.contains("Input"),
             "approval modal should own the foreground without drawing the idle composer"
@@ -8523,7 +8580,7 @@ mod tests {
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
 
-        assert!(rendered.contains("Implement this plan?"));
+        assert!(rendered.contains("Plan ready"));
         assert!(rendered.contains("Yes, implement this plan"));
         assert!(rendered.contains("Switch to auto-edit and start coding."));
         assert!(rendered.contains("No, stay in Plan mode"));
@@ -8550,20 +8607,20 @@ mod tests {
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
 
-        let once = rendered.find("[1] allow this once").expect("once option");
+        let once = rendered.find("1  Allow once").expect("once option");
         let exact = rendered
-            .find("[2] always allow this exact call")
+            .find("2  Allow this exact call")
             .expect("exact-call option");
         let tool = rendered
-            .find("[3] always allow \"edit\"")
+            .find("3  Allow edit this session")
             .expect("tool-wide option");
-        let deny = rendered.find("[4] deny").expect("deny option");
+        let deny = rendered.find("4  Deny").expect("deny option");
 
         assert!(once < exact);
         assert!(exact < tool);
         assert!(tool < deny);
-        assert!(rendered.contains("1/2/3/4"));
-        assert!(rendered.contains("legacy y/A/a/n"));
+        assert!(rendered.contains("1-4 pick"));
+        assert!(!rendered.contains("legacy"));
     }
 
     #[test]
@@ -8616,12 +8673,12 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
 
         assert!(rendered.contains('…'));
-        assert!(rendered.contains("[1] allow this once"));
-        assert!(rendered.contains("[2] always allow this exact call"));
-        assert!(rendered.contains("[3] always allow \"bash\""));
-        assert!(rendered.contains("[4] deny"));
+        assert!(rendered.contains("1  Allow once"));
+        assert!(rendered.contains("2  Allow this exact call"));
+        assert!(rendered.contains("3  Allow bash this session"));
+        assert!(rendered.contains("4  Deny"));
         assert!(rendered.contains("preview truncated"));
-        assert!(rendered.contains("↑↓ select · Enter · 1/2/3/4"));
+        assert!(rendered.contains("↑↓ move · 1-4 pick"));
     }
 
     #[test]
@@ -12311,9 +12368,9 @@ mod tests {
         // All three actions are visible as selectable rows.
         assert!(rendered.contains("Trust workspace"), "{rendered}");
         assert!(rendered.contains("Continue untrusted"), "{rendered}");
-        assert!(rendered.contains("[E] Exit"), "{rendered}");
+        assert!(rendered.contains("E  Exit"), "{rendered}");
         // The focus caret marks the currently selected row (Exit here).
-        assert!(rendered.contains("❯ [E] Exit"), "{rendered}");
+        assert!(rendered.contains("› E  Exit"), "{rendered}");
     }
 
     #[test]

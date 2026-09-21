@@ -11,11 +11,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::display_text::truncate_to_display_width;
 use crate::theme::Theme;
 
-#[allow(dead_code)] // consumed by panel_block and later ui.rs border migrations
 pub(crate) const BORDER: BorderType = BorderType::Rounded;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MARK_SELECTED: &str = "›";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MARK_IDLE: &str = " ";
 /// Transcript gutter: one leading space, a one-cell glyph, two spaces.
 pub(crate) const GUTTER_WIDTH: usize = 4;
@@ -27,7 +24,6 @@ const HINT_SEPARATOR: &str = " · ";
 
 /// Rounded panel with a bold, accent-colored title. Every dialog and side
 /// panel goes through here so titles and borders never drift apart.
-#[allow(dead_code)] // consumed by dialogs and panels in later tasks
 pub(crate) fn panel_block(theme: &Theme, title: &str, accent: Color) -> Block<'static> {
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -70,7 +66,6 @@ pub(crate) fn hint_line(theme: &Theme, width: usize, items: &[(&str, &str)]) -> 
 
 /// `› 1  label   detail`. The selected row gets the selection background so
 /// it still reads on 16-color and monochrome terminals.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn option_line(
     theme: &Theme,
     selected: bool,
@@ -140,7 +135,6 @@ pub(crate) fn gutter(theme: &Theme, glyph: &str, color: Color) -> Span<'static> 
 
 /// A centered rectangle sized to `content_rows` plus the two border rows,
 /// clamped to `max_height` and to `area` (with a two-cell margin).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn dialog_rect(area: Rect, width: u16, content_rows: u16, max_height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(4)).max(1);
     let height = content_rows
