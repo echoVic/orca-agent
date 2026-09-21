@@ -1560,11 +1560,15 @@ mod tests {
         });
         let now = Instant::now();
 
-        // Popup: 2 items + border = height 4, sits at rows 16..20; content
-        // rows 17 (item 0) and 18 (item 1).
+        // Popup: 2 items + hint row + border = height 5, sits at rows
+        // 15..20; content rows 16 (item 0), 17 (item 1), 18 (hint row).
+        // `popup_geometry`'s `show_status` reserves that hint row whenever
+        // the renderer does (see the whole-branch review's C1), so the hit
+        // test and `render_slash_menu` must agree on it or a click lands on
+        // the row above the one the user clicked.
         assert_eq!(
             handle_mouse_event(
-                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 18),
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 17),
                 &mut state,
                 now,
             ),
@@ -1573,12 +1577,50 @@ mod tests {
         assert_eq!(state.slash_menu.as_ref().map(|menu| menu.selected), Some(1));
         assert_eq!(
             handle_mouse_event(
-                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 18),
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 17),
                 &mut state,
                 now,
             ),
             MouseFlow::SyntheticEnter
         );
+    }
+
+    #[test]
+    fn slash_menu_click_on_the_hint_row_does_not_select_the_last_command() {
+        // Regression guard for the exact user-visible failure mode in C1:
+        // before the fix, a click on the trailing hint row resolved to the
+        // last command (here, item 1) because the hit test believed the
+        // popup was one row shorter than the one actually drawn.
+        let mut state = state_with_transcript();
+        state.viewport.frame_area = Some(Rect::new(0, 0, 60, 24));
+        state.viewport.input_area = Some(Rect::new(0, 20, 60, 3));
+        state.slash_menu = Some(crate::types::SlashMenu {
+            items: vec![
+                crate::types::SlashMenuItem {
+                    command: "/help".to_string(),
+                    description: "help".to_string(),
+                },
+                crate::types::SlashMenuItem {
+                    command: "/model".to_string(),
+                    description: "model".to_string(),
+                },
+            ],
+            selected: 0,
+            sub_menu: None,
+        });
+        let now = Instant::now();
+
+        // Row 18 is the hint row (see the geometry note above): clicking it
+        // must not change the selection or accept anything.
+        assert_eq!(
+            handle_mouse_event(
+                &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 18),
+                &mut state,
+                now,
+            ),
+            MouseFlow::Handled
+        );
+        assert_eq!(state.slash_menu.as_ref().map(|menu| menu.selected), Some(0));
     }
 
     #[test]

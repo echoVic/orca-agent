@@ -824,9 +824,9 @@ fn render_full_access_confirmation(frame: &mut Frame, state: &AppState, theme: &
     let Some(confirmation) = state.full_access_confirmation.as_ref() else {
         return;
     };
-    let popup = crate::chrome::dialog_rect(frame.area(), 72, 9, 14);
-    frame.render_widget(Clear, popup);
-    let inner_width = usize::from(popup.width.saturating_sub(4));
+    let area = frame.area();
+    let width = 72u16.min(area.width.saturating_sub(4));
+    let inner_width = usize::from(width.saturating_sub(4));
 
     let labels = ["Continue with Full Access", "Cancel"];
     let label_width = labels
@@ -834,49 +834,63 @@ fn render_full_access_confirmation(frame: &mut Frame, state: &AppState, theme: &
         .map(|label| UnicodeWidthStr::width(*label))
         .max()
         .unwrap_or(0);
-    let lines = vec![
-        Line::from(Span::styled(
+    // Pre-wrap instead of relying on `Paragraph::wrap`: the popup below is
+    // sized from `lines.len()`, so the row count has to be known first. This
+    // is security-consent text, so it must never silently clip.
+    let notices = [
+        (
             "Full Access removes command approvals and OS sandbox restrictions.",
             Style::default().fg(theme.warning),
-        )),
-        Line::from(Span::styled(
+        ),
+        (
             "Commands may modify any file and access the network.",
             Style::default().fg(theme.text),
-        )),
-        Line::from(Span::styled(
+        ),
+        (
             "The active task will use this authority from its next tool call.",
             Style::default().fg(theme.text),
-        )),
-        Line::from(Span::styled(
+        ),
+        (
             "Tools already running keep the policy they started with.",
             Style::default().fg(theme.text),
-        )),
-        Line::from(""),
-        crate::chrome::option_line(
-            theme,
-            confirmation.selected == 0,
-            "",
-            labels[0],
-            label_width,
-            "",
-            inner_width,
-        ),
-        crate::chrome::option_line(
-            theme,
-            confirmation.selected == 1,
-            "",
-            labels[1],
-            label_width,
-            "",
-            inner_width,
-        ),
-        Line::from(""),
-        crate::chrome::hint_line(
-            theme,
-            inner_width,
-            &[("↑↓", "move"), ("Enter", "confirm"), ("Esc", "cancel")],
         ),
     ];
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (text, style) in notices {
+        lines.extend(
+            wrap_text(text, inner_width)
+                .into_iter()
+                .map(|row| Line::from(Span::styled(row, style))),
+        );
+    }
+    lines.push(Line::from(""));
+    lines.push(crate::chrome::option_line(
+        theme,
+        confirmation.selected == 0,
+        "",
+        labels[0],
+        label_width,
+        "",
+        inner_width,
+    ));
+    lines.push(crate::chrome::option_line(
+        theme,
+        confirmation.selected == 1,
+        "",
+        labels[1],
+        label_width,
+        "",
+        inner_width,
+    ));
+    lines.push(Line::from(""));
+    lines.push(crate::chrome::hint_line(
+        theme,
+        inner_width,
+        &[("↑↓", "move"), ("Enter", "confirm"), ("Esc", "cancel")],
+    ));
+
+    let popup = crate::chrome::dialog_rect(area, width, lines.len() as u16, 14);
+    frame.render_widget(Clear, popup);
     let block = crate::chrome::panel_block(theme, "Enable Full Access?", theme.error);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
@@ -1762,16 +1776,21 @@ fn render_jump_to_bottom_pill(frame: &mut Frame, state: &mut AppState, theme: &T
 /// is nothing to list yet, so an empty view doesn't pad a whole screen of
 /// blank space under a single sentence.
 fn render_empty_tasks_notice(frame: &mut Frame, area: Rect, theme: &Theme, title: &str) {
-    let popup = crate::chrome::dialog_rect(area, 64, 3, 5);
-    frame.render_widget(Clear, popup);
-    let content = vec![
-        Line::from(""),
-        Line::from(Span::styled(
+    let width = 64u16.min(area.width.saturating_sub(4));
+    let inner_width = usize::from(width.saturating_sub(4));
+    let mut content = vec![Line::from("")];
+    content.extend(
+        wrap_text(
             "No tasks yet · they appear here when background work starts",
-            theme.muted_style(),
-        )),
-        Line::from(Span::styled("Esc back", theme.muted_style())),
-    ];
+            inner_width,
+        )
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, theme.muted_style()))),
+    );
+    content.push(Line::from(Span::styled("Esc back", theme.muted_style())));
+
+    let popup = crate::chrome::dialog_rect(area, width, content.len() as u16, 9);
+    frame.render_widget(Clear, popup);
     let block = crate::chrome::panel_block(theme, title, theme.border);
     frame.render_widget(
         Paragraph::new(content)
@@ -3161,8 +3180,11 @@ pub(crate) fn build_lines_for_message(
 }
 
 /// Whether `message` starts with a blank separator row. Decided from the
-/// previous message's kind only: kinds never change once a later message
-/// exists, so the per-message render cache stays valid.
+/// previous message's kind only. A message's predecessor can change when an
+/// earlier message is removed (a turn collapsing tool calls, a discarded
+/// attempt); `TranscriptRenderCache::retain` marks a survivor dirty whenever
+/// its predecessor was dropped, so this may assume `previous` is always the
+/// message immediately before `message` in the *current* transcript.
 fn leading_blank(previous: Option<&ChatMessage>, message: &ChatMessage) -> bool {
     let Some(previous) = previous else {
         return false;
@@ -5131,9 +5153,9 @@ fn context_cell(state: &AppState, theme: &Theme) -> Span<'static> {
 fn render_shortcuts(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let area = frame.area();
     let width = 78u16.min(area.width.saturating_sub(4));
-    // The true content width inside the panel's left/right border cells;
-    // `shortcut_lines` sizes its wrapped action column to fit exactly.
-    let inner_width = usize::from(width.saturating_sub(2));
+    // The true content width inside the panel's left/right border-and-padding
+    // cells; `shortcut_lines` sizes its wrapped action column to fit exactly.
+    let inner_width = usize::from(width.saturating_sub(4));
     let scopes = active_shortcut_scopes(state);
     let mut lines = shortcuts::shortcut_lines(&scopes, theme, inner_width);
     lines.push(Line::from(""));
@@ -5246,7 +5268,10 @@ pub(crate) fn slash_menu_hit_index(state: &AppState, column: u16, row: u16) -> O
         Some(sub) => (sub.items.len(), sub.selected),
         None => (menu.items.len(), menu.selected),
     };
-    let geometry = popup_geometry(frame_area, input_area, len, selected, false)?;
+    // Must match `render_slash_menu`'s `wants_status` (always `true`: the
+    // menu always reserves a hint row) or the hit test's popup geometry
+    // drifts from what's on screen — see the whole-branch review's C1.
+    let geometry = popup_geometry(frame_area, input_area, len, selected, true)?;
     hit_bordered_list_row(geometry.area, column, row).and_then(|offset| {
         let index = geometry.start + offset;
         (index < geometry.end).then_some(index)
@@ -5320,7 +5345,7 @@ fn render_slash_menu(frame: &mut Frame, input_area: Rect, state: &AppState, them
     };
 
     frame.render_widget(Clear, geometry.area);
-    let inner_width = usize::from(geometry.area.width.saturating_sub(2));
+    let inner_width = usize::from(geometry.area.width.saturating_sub(4));
     let command_width = items
         .iter()
         .map(|(cmd, _)| UnicodeWidthStr::width(*cmd))
@@ -5379,7 +5404,7 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
     };
 
     frame.render_widget(Clear, geometry.area);
-    let inner_width = usize::from(geometry.area.width.saturating_sub(2));
+    let inner_width = usize::from(geometry.area.width.saturating_sub(4));
 
     let mut lines: Vec<Line> = candidates
         .iter()
@@ -5494,18 +5519,35 @@ fn mention_status_text(
     }
 }
 
+/// Fixed (not state-dependent) notice shown above the plan-approval
+/// options; how many rows it wraps to at a given width is the only thing
+/// that varies, and `plan_approval_popup`/`plan_approval_option_hit_index`/
+/// `render_plan_approval_dialog` all need to agree on that row count.
+const PLAN_READY_NOTICE: &str = "The plan is ready. Choose whether to start implementation.";
+
 fn plan_approval_popup(area: Rect) -> Rect {
     let width = 72u16.min(area.width.saturating_sub(4));
-    // description + blank + 2 options + blank + hint = 6 content rows, plus
-    // the 2 border rows `render_plan_approval_dialog` always draws.
-    let content_rows = 6u16;
+    let inner_width = usize::from(width.saturating_sub(4));
+    let notice_rows = wrap_text(PLAN_READY_NOTICE, inner_width).len() as u16;
+    // notice + blank + 2 options + blank + hint, plus the 2 border rows
+    // `render_plan_approval_dialog` always draws.
+    let content_rows = notice_rows + 5;
     let height = content_rows
         .saturating_add(2)
         .min(area.height.saturating_sub(2))
-        .max(1);
+        .max(1)
+        // Belt-and-suspenders: keeps the popup inside `area` even if a
+        // future non-zero-origin viewport hits the `.max(1)` floor above at
+        // `area.height <= 2`, where the bottom-anchor math below would
+        // otherwise place it above `area.y`.
+        .min(area.height);
+    let y = area
+        .bottom()
+        .saturating_sub(height.saturating_add(1))
+        .max(area.y);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
-        area.bottom().saturating_sub(height + 1),
+        y,
         width,
         height,
     )
@@ -5521,7 +5563,9 @@ pub(crate) fn plan_approval_option_hit_index(
     if column <= popup.x || column + 1 >= popup.right() {
         return None;
     }
-    let first_option_row = popup.y + 3;
+    let inner_width = usize::from(popup.width.saturating_sub(4));
+    let notice_rows = wrap_text(PLAN_READY_NOTICE, inner_width).len() as u16;
+    let first_option_row = popup.y + 1 + notice_rows + 1;
     let index = row.checked_sub(first_option_row)? as usize;
     (index < 2).then_some(index)
 }
@@ -5545,13 +5589,11 @@ fn render_plan_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Them
         .map(|label| UnicodeWidthStr::width(*label))
         .max()
         .unwrap_or(0);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "The plan is ready. Choose whether to start implementation.",
-            Style::default().fg(theme.text),
-        )),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line<'static>> = wrap_text(PLAN_READY_NOTICE, inner_width)
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, Style::default().fg(theme.text))))
+        .collect();
+    lines.push(Line::from(""));
     for (index, label) in labels.iter().enumerate() {
         lines.push(crate::chrome::option_line(
             theme,
@@ -5568,7 +5610,7 @@ fn render_plan_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Them
         theme,
         inner_width,
         &[
-            ("↑↓", "select"),
+            ("↑↓", "move"),
             ("Enter", "confirm"),
             ("PgUp/PgDn", "review plan"),
             ("Esc", "stay in Plan mode"),
@@ -5726,12 +5768,22 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
         ));
     }
     content.push(Line::from(""));
+    // `dialog.options` is never all four `ApprovalOption`s in numeric order
+    // (see `ApprovalDialog::options_for`): a target-less call skips key 2
+    // and offers 1, 3, 4. List the keys that actually exist instead of
+    // advertising a `1-4` range that can pick nothing on key 2.
+    let pick_keys = dialog
+        .options
+        .iter()
+        .map(|option| option.key().to_string())
+        .collect::<Vec<_>>()
+        .join("/");
     content.push(crate::chrome::hint_line(
         theme,
         inner_width,
         &[
             ("↑↓", "move"),
-            ("1-4", "pick"),
+            (pick_keys.as_str(), "pick"),
             ("Enter", "confirm"),
             ("Esc", "deny"),
             ("PgUp/PgDn", "preview"),
@@ -6032,15 +6084,13 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
             let popup_area =
                 crate::chrome::dialog_rect(area, width, content.len() as u16 + textarea_rows, 14);
 
-            let inner = Layout::vertical([Constraint::Min(3), Constraint::Length(textarea_rows)])
-                .split(Rect::new(
-                    popup_area.x + 1,
-                    popup_area.y + 1,
-                    popup_area.width.saturating_sub(2),
-                    popup_area.height.saturating_sub(2),
-                ));
-
             let block = crate::chrome::panel_block(theme, "Setup", theme.border);
+            // Derive the textarea's rect from the block's own inset instead
+            // of re-deriving the border offset by hand, so it always lines
+            // up with the padded text above it (`panel_block` reserves one
+            // cell of padding beyond the border on each side).
+            let inner = Layout::vertical([Constraint::Min(3), Constraint::Length(textarea_rows)])
+                .split(block.inner(popup_area));
 
             let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
@@ -6048,13 +6098,14 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
         }
         2 => {
             let width = 60u16.min(area.width.saturating_sub(4));
+            let inner_width = usize::from(width.saturating_sub(4));
 
             let auth_path = state
                 .first_run
                 .as_ref()
                 .map(|first_run| first_run.auth_path.display().to_string())
                 .unwrap_or_else(|| "~/.orca/auth.json".to_string());
-            let content = vec![
+            let mut content = vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "  ✓ API key saved successfully!",
@@ -6063,10 +6114,15 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                Line::from(Span::styled(
-                    format!("  Saved to: {auth_path}"),
-                    Style::default().fg(theme.muted),
-                )),
+            ];
+            // Pre-wrap: a real support-directory path can exceed the popup
+            // width, and the popup below is sized from `content.len()`.
+            content.extend(wrap_notice_line(
+                &format!("  Saved to: {auth_path}"),
+                inner_width,
+                Style::default().fg(theme.muted),
+            ));
+            content.extend([
                 Line::from(""),
                 Line::from(Span::styled(
                     "  You're all set! Orca is ready to use.",
@@ -6077,7 +6133,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                     "  Press Enter to start...",
                     Style::default().fg(theme.muted),
                 )),
-            ];
+            ]);
             let popup_area = crate::chrome::dialog_rect(area, width, content.len() as u16, 12);
 
             let block = crate::chrome::panel_block(theme, "Setup Complete", theme.success);
@@ -7790,6 +7846,79 @@ mod tests {
     }
 
     #[test]
+    fn plan_approval_popup_never_places_the_popup_above_a_non_zero_origin_area() {
+        // Whole-branch review M1: the old `.max(1)` height floor let the
+        // bottom-anchored popup land above `area.y` whenever `area.height`
+        // was small and the origin wasn't zero, which panics `Clear` on an
+        // out-of-buffer index. Unreachable today (the inline terminal is
+        // always origin-zero), but nothing should compute a rect outside
+        // its own area regardless.
+        for height in 0u16..=6 {
+            let area = Rect::new(3, 5, 40, height);
+            let popup = plan_approval_popup(area);
+            assert!(
+                popup.y >= area.y,
+                "popup y={} must not sit above area.y={} at height {height}",
+                popup.y,
+                area.y
+            );
+            assert!(
+                popup.y.saturating_add(popup.height) <= area.y.saturating_add(area.height),
+                "popup must stay within area's vertical bounds at height {height}: {popup:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_approval_dialog_wraps_its_notice_and_keeps_the_hit_test_in_sync() {
+        // Whole-branch review M2 (this dialog's clipping instance) and the
+        // M1 fix both touch `plan_approval_popup`'s row count, which used to
+        // be a hand-maintained constant; this pins that the notice wraps
+        // instead of clipping and that the option hit test still lands on
+        // the rows the renderer actually draws once it does.
+        let mut state = test_state();
+        state.plan_approval_dialog = Some(PlanApprovalDialog {
+            plan: "1. do a thing\n2. do another".to_string(),
+            selected: 0,
+        });
+        // Narrow enough that the 60-column notice wraps to two rows inside
+        // the dialog's padded interior.
+        let frame = frame_string(&mut state, 40, 20);
+        let rows: Vec<&str> = frame.lines().collect();
+        let first_row = rows
+            .iter()
+            .position(|line| line.contains("The plan is ready."))
+            .unwrap_or_else(|| panic!("first half of the notice not rendered:\n{frame}"));
+        let second_row = rows
+            .iter()
+            .position(|line| line.contains("start implementation."))
+            .unwrap_or_else(|| panic!("second half of the notice not rendered:\n{frame}"));
+        assert_ne!(
+            first_row, second_row,
+            "notice must wrap, not clip:\n{frame}"
+        );
+
+        let first_option_row = rows
+            .iter()
+            .position(|line| line.contains("Yes, implement this plan"))
+            .unwrap_or_else(|| panic!("first option not rendered:\n{frame}"));
+        assert_eq!(
+            plan_approval_option_hit_index(&state, 5, first_option_row as u16),
+            Some(0),
+            "hit test must land on the option row the renderer actually drew:\n{frame}"
+        );
+        let second_option_row = rows
+            .iter()
+            .position(|line| line.contains("No, stay in Plan mode"))
+            .unwrap_or_else(|| panic!("second option not rendered:\n{frame}"));
+        assert_eq!(
+            plan_approval_option_hit_index(&state, 5, second_option_row as u16),
+            Some(1),
+            "hit test must land on the option row the renderer actually drew:\n{frame}"
+        );
+    }
+
+    #[test]
     fn approval_dialog_uses_shared_options_and_hints() {
         let mut state = test_state();
         state.status = AppStatus::WaitingApproval;
@@ -7801,10 +7930,14 @@ mod tests {
             permission_kind: None,
             background_task_id: None,
             selected: 0,
+            // Canonical order for a tool called with a target (see
+            // `ApprovalDialog::options_for`): keys 1, 2, 3, 4 in sequence,
+            // so the "pick" hint below collapses to the same text a real
+            // `1-4` range would have shown.
             options: vec![
                 ApprovalOption::Once,
-                ApprovalOption::AlwaysTool,
                 ApprovalOption::AlwaysTarget,
+                ApprovalOption::AlwaysTool,
                 ApprovalOption::Deny,
             ],
             diff: None,
@@ -7814,11 +7947,38 @@ mod tests {
         assert!(frame.contains("› 1  Allow once"), "{frame}");
         assert!(frame.contains("  4  Deny"), "{frame}");
         assert!(
-            frame.contains("↑↓ move · 1-4 pick · Enter confirm · Esc deny"),
+            frame.contains("↑↓ move · 1/2/3/4 pick · Enter confirm · Esc deny"),
             "{frame}"
         );
         assert!(!frame.contains("legacy"), "{frame}");
         assert!(!frame.contains("▸"), "{frame}");
+    }
+
+    #[test]
+    fn approval_dialog_hint_lists_only_the_keys_the_options_actually_have() {
+        // Whole-branch review M6: without a target, `options_for` skips
+        // `AlwaysTarget` (key 2) entirely, so the old hardcoded `1-4 pick`
+        // advertised a key that does nothing. The hint must list exactly
+        // the keys present, in the order `dialog.options` has them.
+        let mut state = test_state();
+        state.status = AppStatus::WaitingApproval;
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "1".into(),
+            interaction: None,
+            tool: "web_search".into(),
+            target: None,
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: ApprovalDialog::options_for("web_search", None),
+            diff: None,
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(
+            frame.contains("↑↓ move · 1/3/4 pick · Enter confirm · Esc deny"),
+            "{frame}"
+        );
+        assert!(!frame.contains("1-4"), "{frame}");
     }
 
     #[test]
@@ -9125,7 +9285,17 @@ mod tests {
                     title: "Current session".to_string(),
                     selected: 0,
                 },
-                "Permanently delete \"Current session\"?",
+                // Shorter than the full sentence on purpose: at the 40-wide
+                // frame below, the confirmation line's real width (36, after
+                // the panel's border and padding) is one cell narrower than
+                // the full phrase, so `Paragraph`'s word-wrap legitimately
+                // (and correctly) breaks it across two rows. The raw
+                // cell-concatenated `rendered` string below has no row
+                // separators, so a phrase spanning a wrap point wouldn't be
+                // found as one substring even though it's fully visible on
+                // screen; a substring guaranteed to land on the first row
+                // still confirms this phase renders.
+                "Permanently delete",
             ),
         ];
 
@@ -9300,7 +9470,9 @@ mod tests {
         assert!(once < exact);
         assert!(exact < tool);
         assert!(tool < deny);
-        assert!(rendered.contains("1-4 pick"));
+        // All four `ApprovalOption` keys are present here (a target that
+        // isn't a dynamic-target tool), so the hint lists them in order.
+        assert!(rendered.contains("1/2/3/4 pick"));
         assert!(!rendered.contains("legacy"));
     }
 
@@ -9359,7 +9531,7 @@ mod tests {
         assert!(rendered.contains("3  Allow bash this session"));
         assert!(rendered.contains("4  Deny"));
         assert!(rendered.contains("preview truncated"));
-        assert!(rendered.contains("↑↓ move · 1-4 pick"));
+        assert!(rendered.contains("↑↓ move · 1/2/3/4 pick"));
     }
 
     #[test]
@@ -9419,7 +9591,10 @@ mod tests {
     fn help_panel_is_wide_enough_for_its_longest_key_and_hints_the_alias() {
         let mut state = test_state();
         state.show_shortcuts = true;
-        let frame = frame_string(&mut state, 110, 34);
+        // Tall enough that the panel's own height ceiling (`render_shortcuts`
+        // caps at `area.height - 4`) isn't what clips the footer — this test
+        // is about the *width* budget, matching `golden_help_panel`'s frame.
+        let frame = frame_string(&mut state, 110, 40);
         assert!(frame.contains("╭ Help"), "{frame}");
         assert!(
             !frame.contains("alt+b/fmove"),
@@ -9481,7 +9656,8 @@ mod tests {
         let frame = frame_string(&mut state, 80, 20);
         let row = frame.lines().find(|l| l.contains("brainstorming")).unwrap();
         assert!(row.contains("skill   brainstorming"), "{row}");
-        assert!(row.trim_end().ends_with("…│"), "{row}");
+        // One cell of padding sits inside the right border (I2).
+        assert!(row.trim_end().ends_with("… │"), "{row}");
     }
 
     #[test]
@@ -9532,22 +9708,52 @@ mod tests {
 
     #[test]
     fn compact_popup_hit_testing_matches_constrained_render_geometry() {
+        // Regression guard for the whole-branch review's C1: the hit test
+        // previously called `popup_geometry` with a `show_status` flag that
+        // disagreed with `render_slash_menu`'s, so the popup it assumed was
+        // one row shorter than the one actually drawn and every click landed
+        // on the row above the one clicked. Rendering with `frame_string`
+        // and asserting against the *drawn* text (rather than a second,
+        // independently computed geometry) is what would have caught that:
+        // a self-referential comparison of two `popup_geometry` calls can't
+        // detect that both call sites agree on a value the renderer doesn't
+        // use.
         let mut state = test_state();
-        state.viewport.frame_area = Some(Rect::new(0, 0, 40, 16));
-        state.viewport.input_area = Some(Rect::new(0, 12, 40, 3));
+        let items: Vec<SlashMenuItem> = (0..12)
+            .map(|index| SlashMenuItem {
+                command: format!("/command-{index:02}"),
+                description: format!("command {index}"),
+            })
+            .collect();
         state.slash_menu = Some(SlashMenu {
-            items: (0..12)
-                .map(|index| SlashMenuItem {
-                    command: format!("/command-{index:02}"),
-                    description: format!("command {index}"),
-                })
-                .collect(),
+            items: items.clone(),
             selected: 11,
             sub_menu: None,
         });
-
-        assert_eq!(slash_menu_hit_index(&state, 5, 10), Some(11));
-        assert_eq!(slash_menu_hit_index(&state, 5, 12), None);
+        let frame = frame_string(&mut state, 40, 16);
+        let rows: Vec<&str> = frame.lines().collect();
+        // `selected: 11` scrolls the window (see `popup_window`), so the
+        // popup shows items 3..12; check the first, a middle, and the last
+        // visible command all resolve from the row they actually render on.
+        for &index in &[3usize, 7, 11] {
+            let command = items[index].command.as_str();
+            let row = rows
+                .iter()
+                .position(|line| line.contains(command))
+                .unwrap_or_else(|| panic!("{command} not rendered:\n{frame}"));
+            assert_eq!(
+                slash_menu_hit_index(&state, 5, row as u16),
+                Some(index),
+                "clicking the row showing {command} must select item {index}\n{frame}"
+            );
+        }
+        // The trailing hint row is not a command and must not resolve to one
+        // (this is exactly the click that used to run the wrong command).
+        let hint_row = rows
+            .iter()
+            .position(|line| line.contains("Enter run"))
+            .unwrap_or_else(|| panic!("hint row not rendered:\n{frame}"));
+        assert_eq!(slash_menu_hit_index(&state, 5, hint_row as u16), None);
 
         state.slash_menu = None;
         state.mention.candidates = (0..12)
@@ -9565,10 +9771,20 @@ mod tests {
             .collect();
         state.mention.selected = 11;
         state.mention.phase = Some(SearchPhase::Scanning);
-
-        assert_eq!(mention_menu_hit_index(&state, 5, 9), Some(11));
-        assert_eq!(mention_menu_hit_index(&state, 5, 10), None);
-        assert_eq!(mention_menu_hit_index(&state, 5, 12), None);
+        let frame = frame_string(&mut state, 40, 16);
+        let rows: Vec<&str> = frame.lines().collect();
+        for &index in &[3usize, 7, 11] {
+            let target = format!("file-{index:02}.rs");
+            let row = rows
+                .iter()
+                .position(|line| line.contains(target.as_str()))
+                .unwrap_or_else(|| panic!("{target} not rendered:\n{frame}"));
+            assert_eq!(
+                mention_menu_hit_index(&state, 5, row as u16),
+                Some(index),
+                "clicking the row showing {target} must select item {index}\n{frame}"
+            );
+        }
     }
 
     #[test]
@@ -12993,7 +13209,10 @@ mod tests {
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .unwrap();
 
-        let cursor = Position::new(12, 13);
+        // x=13: one border cell plus one padding cell in from the popup's
+        // left edge (`panel_block`'s interior padding, I2), then the
+        // textarea's own inset up to the masked cursor cell.
+        let cursor = Position::new(13, 13);
         terminal.backend_mut().assert_cursor_position(cursor);
         let buffer = terminal.backend().buffer();
         let rendered = buffer
@@ -13051,9 +13270,11 @@ mod tests {
                     0,
                     "{cursor_events:?}"
                 );
+                // x=13: `panel_block`'s border-plus-padding inset (I2); see
+                // `setup_cursor_uses_masked_api_key_cell`.
                 assert_eq!(
                     moves,
-                    [CursorEvent::Move(Position::new(12, 13))],
+                    [CursorEvent::Move(Position::new(13, 13))],
                     "{cursor_events:?}"
                 );
                 let rendered = terminal

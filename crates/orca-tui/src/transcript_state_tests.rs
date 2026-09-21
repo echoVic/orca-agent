@@ -293,7 +293,13 @@ fn retaining_messages_rebases_watermarks_and_cache_entries() {
     assert_eq!(state.transcript.finalized_count, 2);
     assert_eq!(state.transcript.flushed_count, 1);
     assert_eq!(state.transcript.render_cache.len(), 2);
-    assert_eq!(state.transcript.render_cache.populated_len(), 2);
+    // "keep after" survives, but its predecessor ("remove before") did not:
+    // its first rendered line can depend on the predecessor's kind
+    // (`leading_blank`/`first_of_turn` in `ui.rs`), so `retain` drops its
+    // cached entry rather than leaving a stale render in place (I1 in the
+    // whole-branch review). Only "keep before" (whose predecessor, `None`,
+    // didn't change) is still populated.
+    assert_eq!(state.transcript.render_cache.populated_len(), 1);
 
     state.touch_message(1);
     let built_indices = RefCell::new(Vec::new());

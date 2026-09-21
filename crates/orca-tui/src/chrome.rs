@@ -5,7 +5,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders};
+use ratatui::widgets::{Block, BorderType, Borders, Padding};
 use unicode_width::UnicodeWidthStr;
 
 use crate::display_text::truncate_to_display_width;
@@ -17,18 +17,19 @@ pub(crate) const MARK_IDLE: &str = " ";
 /// Transcript gutter: one leading space, a one-cell glyph, two spaces.
 pub(crate) const GUTTER_WIDTH: usize = 4;
 pub(crate) const GUTTER_CONTINUATION: &str = "    ";
-#[cfg_attr(not(test), allow(dead_code))]
 const RULE: &str = "─";
-#[cfg_attr(not(test), allow(dead_code))]
 const HINT_SEPARATOR: &str = " · ";
 
-/// Rounded panel with a bold, accent-colored title. Every dialog and side
-/// panel goes through here so titles and borders never drift apart.
+/// Rounded panel with a bold, accent-colored title and one cell of interior
+/// padding on each side (border, space, content, space, border — matching
+/// the mock's `box()` line builder). Every dialog and side panel goes
+/// through here so titles, borders and padding never drift apart.
 pub(crate) fn panel_block(theme: &Theme, title: &str, accent: Color) -> Block<'static> {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BORDER)
-        .border_style(Style::default().fg(accent));
+        .border_style(Style::default().fg(accent))
+        .padding(Padding::horizontal(1));
     if !title.is_empty() {
         block = block.title(Span::styled(
             format!(" {title} "),
@@ -41,7 +42,6 @@ pub(crate) fn panel_block(theme: &Theme, title: &str, accent: Color) -> Block<'s
 
 /// `↑↓ move · Enter confirm · Esc cancel`: keys in accent, verbs muted. Items
 /// are dropped from the right until the line fits `width`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn hint_line(theme: &Theme, width: usize, items: &[(&str, &str)]) -> Line<'static> {
     let mut spans = Vec::new();
     let mut used = 0usize;

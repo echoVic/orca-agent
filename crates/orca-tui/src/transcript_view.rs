@@ -713,11 +713,27 @@ impl TranscriptRenderCache {
         let old_spinners = mem::take(&mut self.spinner_indices);
         self.entries.reserve(old_entries.len().min(keep.len()));
 
+        let mut predecessor_dropped = false;
         for (old_index, entry) in old_entries.into_iter().enumerate() {
             if !keep.get(old_index).copied().unwrap_or(false) {
+                predecessor_dropped = true;
                 continue;
             }
             let new_index = self.entries.len();
+            // A message's leading blank row and (for `AssistantChunk`) its
+            // role glyph are decided from whichever message immediately
+            // precedes it (see `leading_blank`/`first_of_turn` in `ui.rs`).
+            // If that predecessor was just dropped, this survivor's cached
+            // lines can be stale even though nothing about the message
+            // itself changed — `revision`/`width`/`theme` all still match,
+            // so `prepare_entry`'s cache check alone would keep the stale
+            // render. Treat it like an unbuilt entry so it is rebuilt
+            // against its new (current) predecessor.
+            let entry = if mem::take(&mut predecessor_dropped) {
+                None
+            } else {
+                entry
+            };
             if old_dirty.contains(&old_index) || entry.is_none() {
                 self.dirty_indices.insert(new_index);
             }
@@ -1935,6 +1951,38 @@ mod tests {
         );
     }
 
+    /// Like `prepare_exact`, but builds each message together with whichever
+    /// message immediately precedes it in `messages` — the way `render()`'s
+    /// real `cache.prepare` closure does in `ui.rs` (see `previous =
+    /// index.checked_sub(1).and_then(|i| messages.get(i))`). `prepare_exact`
+    /// builds each message alone, so it can't exercise predecessor-dependent
+    /// rendering (`leading_blank`, `first_of_turn`) the way this does.
+    fn prepare_with_predecessors(
+        cache: &mut TranscriptRenderCache,
+        messages: &[ChatMessage],
+        revisions: &[u64],
+        width: usize,
+    ) {
+        let theme = theme();
+        cache.prepare(
+            messages,
+            revisions,
+            TranscriptRenderContext::new(&theme, width, 0, false),
+            |index, message, theme, width, tick, force_expand| {
+                let previous = index.checked_sub(1).and_then(|i| messages.get(i));
+                build_lines_for_message_after(
+                    previous,
+                    message,
+                    theme,
+                    width,
+                    tick,
+                    force_expand,
+                    None,
+                )
+            },
+        );
+    }
+
     #[test]
     fn content_generation_changes_only_when_searchable_cache_content_changes() {
         let messages = vec![ChatMessage::Assistant("alpha".to_string())];
@@ -2002,6 +2050,126 @@ mod tests {
 
         cache.clear();
         assert_ne!(cache.content_generation(), truncated);
+    }
+
+    #[test]
+    fn retain_drops_stale_spacing_between_consecutive_tool_calls_after_a_turn_collapses() {
+        // Whole-branch review I1: a turn that interleaved streamed text with
+        // tool calls (`User, chunk, ToolCall, chunk, ToolCall`) collapses to
+        // `User, ToolCall, ToolCall` once the turn completes
+        // (`reconcile_assistant_response`). The second tool call's cached
+        // `leading_blank` was computed against the chunk that used to sit
+        // right before it; if `retain` doesn't invalidate that cache entry,
+        // the stale blank row survives even though the tool call's own
+        // revision never changed.
+        let tool_call = |id: &str, target: &str| ChatMessage::ToolCall {
+            id: id.to_string(),
+            name: "read".to_string(),
+            target: Some(target.to_string()),
+            status: "completed".to_string(),
+            output: None,
+            diff: None,
+            kind: None,
+            expanded: false,
+        };
+        let chunk = |text: &str| ChatMessage::AssistantChunk {
+            text: text.to_string(),
+            trailing_blank: false,
+        };
+        let messages = vec![
+            ChatMessage::User("do it".to_string()),
+            chunk("on it"),
+            tool_call("call-1", "a.rs"),
+            chunk("next"),
+            tool_call("call-2", "b.rs"),
+        ];
+        let revisions = vec![1, 1, 1, 1, 1];
+        let mut cache = TranscriptRenderCache::default();
+        prepare_with_predecessors(&mut cache, &messages, &revisions, 60);
+
+        let retained_messages = vec![
+            messages[0].clone(),
+            messages[2].clone(),
+            messages[4].clone(),
+        ];
+        let retained_revisions = vec![1, 1, 1];
+        cache.retain(&[true, false, true, false, true]);
+        prepare_with_predecessors(&mut cache, &retained_messages, &retained_revisions, 60);
+
+        let viewport = cache.viewport(0, 0, 20);
+        let rows: Vec<String> = viewport
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let first_tool_row = rows
+            .iter()
+            .position(|row| row.contains("a.rs"))
+            .unwrap_or_else(|| panic!("first tool row not rendered: {rows:#?}"));
+        let second_tool_row = rows
+            .iter()
+            .position(|row| row.contains("b.rs"))
+            .unwrap_or_else(|| panic!("second tool row not rendered: {rows:#?}"));
+        assert_eq!(
+            second_tool_row,
+            first_tool_row + 1,
+            "consecutive tool calls must form one group with no blank row between them: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn retain_recomputes_first_of_turn_after_a_removed_tool_call_between_chunks() {
+        // Whole-branch review I1's second symptom: the `receiving`-tool
+        // cleanup path can remove a tool call sitting between two streamed
+        // chunks. The chunk that follows it should then flip `first_of_turn`
+        // to `false` and drop its role bullet, since it now directly
+        // continues the previous chunk's stream instead of resuming after an
+        // interruption.
+        let messages = vec![
+            ChatMessage::AssistantChunk {
+                text: "alpha".to_string(),
+                trailing_blank: false,
+            },
+            ChatMessage::ToolCall {
+                id: "call-1".to_string(),
+                name: "read".to_string(),
+                target: Some("a.rs".to_string()),
+                status: "receiving".to_string(),
+                output: None,
+                diff: None,
+                kind: None,
+                expanded: false,
+            },
+            ChatMessage::AssistantChunk {
+                text: "beta".to_string(),
+                trailing_blank: false,
+            },
+        ];
+        let revisions = vec![1, 1, 1];
+        let mut cache = TranscriptRenderCache::default();
+        prepare_with_predecessors(&mut cache, &messages, &revisions, 60);
+
+        let retained_messages = vec![messages[0].clone(), messages[2].clone()];
+        let retained_revisions = vec![1, 1];
+        cache.retain(&[true, false, true]);
+        prepare_with_predecessors(&mut cache, &retained_messages, &retained_revisions, 60);
+
+        let viewport = cache.viewport(0, 0, 20);
+        let bullets = viewport
+            .lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref().contains('●'))
+            })
+            .count();
+        assert_eq!(
+            bullets, 1,
+            "the second chunk must not render its own role bullet once it directly \
+             follows the first: {:#?}",
+            viewport.lines
+        );
     }
 
     fn prepared_search_cache(

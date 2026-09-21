@@ -211,7 +211,6 @@ impl Theme {
         theme
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn selection_style(self) -> Style {
         match self.color_level {
             TerminalColorLevel::Monochrome => Style::default().add_modifier(Modifier::REVERSED),

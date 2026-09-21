@@ -148,19 +148,6 @@ impl VimState {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn title(&self) -> &'static str {
-        if !self.enabled {
-            " Input "
-        } else {
-            match self.mode {
-                VimMode::Insert => " Input [vi insert] ",
-                VimMode::Normal => " Input [vi normal] ",
-                VimMode::Visual => " Input [vi visual] ",
-            }
-        }
-    }
-
     /// Label for the status bar; `None` when vim mode is off.
     pub fn status_label(&self) -> Option<&'static str> {
         if !self.enabled {
