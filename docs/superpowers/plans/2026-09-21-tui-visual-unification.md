@@ -508,7 +508,7 @@ fn composer_click_target_accounts_for_prompt_and_top_rule() {
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cargo test -p orca-tui --lib composer_renders_two_rules composer_click_target_accounts -- --test-threads=1`
+Run: `cargo test -p orca-tui --lib -- composer_renders_two_rules composer_click_target_accounts --test-threads=1`
 Expected: 第一个断言 `row(input.y)` 是 `┌ Input …` 失败；第二个因 `textarea.block()` 为 `Some` 时 inner 从 x+1 起而失败。
 
 - [ ] **Step 3: vim.rs**
@@ -771,7 +771,7 @@ fn question_mark_toggles_help() {
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cargo test -p orca-tui --lib status_line_has_mode_chip question_mark -- --test-threads=1`
+Run: `cargo test -p orca-tui --lib -- status_line_has_mode_chip question_mark --test-threads=1`
 Expected: FAIL（无 `vim_mode_label` 字段编译失败；`?` 未绑定）。
 
 - [ ] **Step 3: 实现**
@@ -910,7 +910,7 @@ fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
 
 - [ ] **Step 4: 运行并更新旧断言**
 
-Run: `cargo test -p orca-tui --lib status_line context_cell -- --test-threads=1`
+Run: `cargo test -p orca-tui --lib -- status_line context_cell --test-threads=1`
 Expected: 新测试 PASS。更新这些旧测试的期望串：`status_line_renders_each_approval_mode_in_its_semantic_color`（chip 文案 `⇧Tab <mode>`，颜色断言取 `spans[1]`）、`status_line_prioritizes_context_workspace_then_usage_and_shortcuts`（`F1 shortcuts` → `? help`，裁剪顺序按上面的 while 循环）、`status_line_reserves_known_context_before_truncating_a_long_model`、`status_line_is_pure_and_deterministic_for_captured_workspace_state`、`responsive_status_line_keeps_mode_and_context_before_optional_metadata`、`status_line_hides_usage_until_tokens_accumulate`、`context_cell_starts_at_full_remaining_capacity`（`"  ·  context 100%"` → `" · ctx 100%"`）。
 
 - [ ] **Step 5: 全量 + 提交**
@@ -1185,7 +1185,7 @@ fn e_toggles_the_latest_reasoning_when_no_tool_follows_it() {
 
 - [ ] **Step 3: 运行，确认失败**
 
-Run: `cargo test -p orca-tui --lib gutter reasoning_collapses system_notice_is e_toggles -- --test-threads=1`
+Run: `cargo test -p orca-tui --lib -- gutter reasoning_collapses system_notice_is e_toggles --test-threads=1`
 Expected: 编译失败（`build_lines_for_message_after`、`toggle_latest_expandable` 不存在）。
 
 - [ ] **Step 4: 实现间距规则与新入口**
@@ -1447,7 +1447,7 @@ fn diagnostics_render_as_an_icon_title_with_indented_cause_and_next() {
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cargo test -p orca-tui --lib tool_rows tool_id_placeholders flushed_tool_output edit_tool_rows diagnostics_render -- --test-threads=1`
+Run: `cargo test -p orca-tui --lib -- tool_rows tool_id_placeholders flushed_tool_output edit_tool_rows diagnostics_render --test-threads=1`
 
 - [ ] **Step 3: 实现**
 
@@ -1907,7 +1907,7 @@ fn empty_tasks_panel_is_a_short_centered_notice() {
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cargo test -p orca-tui --lib approval_dialog_uses_shared config_dialog_height setup_security_notice empty_tasks_panel -- --test-threads=1`
+Run: `cargo test -p orca-tui --lib -- approval_dialog_uses_shared config_dialog_height setup_security_notice empty_tasks_panel --test-threads=1`
 
 - [ ] **Step 3: 实现**
 
@@ -2082,7 +2082,7 @@ fn mention_popup_shows_kind_column_and_truncates_with_an_ellipsis() {
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cargo test -p orca-tui --lib shortcut_lines_align help_panel_is slash_menu_aligns mention_popup_shows_kind -- --test-threads=1`
+Run: `cargo test -p orca-tui --lib -- shortcut_lines_align help_panel_is slash_menu_aligns mention_popup_shows_kind --test-threads=1`
 
 - [ ] **Step 3: 实现**
 
@@ -2262,7 +2262,7 @@ fn picker_rows_group_by_project_with_the_current_project_first() {
 
 - [ ] **Step 2: 运行，确认失败**
 
-Run: `cargo test -p orca-tui --lib mock_sessions_are_hidden picker_rows_group -- --test-threads=1`
+Run: `cargo test -p orca-tui --lib -- mock_sessions_are_hidden picker_rows_group --test-threads=1`
 
 - [ ] **Step 3: 实现**
 
