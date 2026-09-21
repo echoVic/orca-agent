@@ -42,6 +42,29 @@ use crate::user_input_dialog::{UserInputDialog, UserInputDialogMode};
 use crate::viewport_state::CopyNotice;
 use crate::workspace_status::{GitIdentity, compact_cwd};
 
+/// What the user sees for the model: an unset/auto selection shows the model
+/// it routes to by default, so the welcome screen and status bar never read "auto".
+#[allow(dead_code)] // consumed by the status bar and welcome screen in later tasks
+pub(crate) fn displayed_model_name(model_name: &str) -> &str {
+    if model_name == orca_core::model::AUTO_MODEL {
+        orca_core::model::FLASH_MODEL
+    } else {
+        model_name
+    }
+}
+
+#[cfg(test)]
+mod displayed_model_tests {
+    #[test]
+    fn auto_displays_as_flash_and_explicit_models_pass_through() {
+        assert_eq!(super::displayed_model_name("auto"), "deepseek-flash");
+        assert_eq!(
+            super::displayed_model_name("deepseek-v4-pro"),
+            "deepseek-v4-pro"
+        );
+    }
+}
+
 pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, theme: &Theme) {
     // Recomputed below when the widgets are actually shown; cleared here so
     // panel/status switches never leave stale mouse hit targets behind.

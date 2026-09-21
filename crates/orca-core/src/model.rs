@@ -28,7 +28,10 @@ pub struct ModelSelection {
 #[serde(rename_all = "snake_case")]
 pub enum ModelRouteReason {
     Explicit,
+    /// Emitted by releases before the default moved to deepseek-flash; kept so
+    /// stored JSONL events still deserialize.
     DefaultPro,
+    DefaultFlash,
     SubagentType,
     SubagentOverride,
 }
@@ -156,7 +159,9 @@ impl ModelSelection {
             )
         } else {
             match self.value.as_deref() {
-                Some(AUTO_MODEL) | None => (PRO_MODEL.to_string(), ModelRouteReason::DefaultPro),
+                Some(AUTO_MODEL) | None => {
+                    (FLASH_MODEL.to_string(), ModelRouteReason::DefaultFlash)
+                }
                 Some(model) => (model.to_string(), ModelRouteReason::Explicit),
             }
         };
@@ -241,11 +246,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_defaults_to_pro() {
+    fn auto_defaults_to_flash() {
         let selection = ModelSelection::parse(None).unwrap();
         let decision = selection.route(context());
-        assert_eq!(decision.actual_model, PRO_MODEL);
-        assert_eq!(decision.reason, ModelRouteReason::DefaultPro);
+        assert_eq!(decision.actual_model, FLASH_MODEL);
+        assert_eq!(decision.reason, ModelRouteReason::DefaultFlash);
     }
 
     #[test]
@@ -301,8 +306,8 @@ mod tests {
         ctx.has_images = true;
 
         let auto = ModelSelection::parse(None).unwrap().route(ctx.clone());
-        assert_eq!(auto.actual_model, PRO_MODEL);
-        assert_eq!(auto.image_route, ImageRouteDecision::DescribeThenContinue);
+        assert_eq!(auto.actual_model, FLASH_MODEL);
+        assert_eq!(auto.image_route, ImageRouteDecision::Direct);
 
         let pro = ModelSelection::parse(Some(PRO_MODEL.to_string()))
             .unwrap()
@@ -454,5 +459,19 @@ mod tests {
         assert_eq!(max_context_tokens(Some(AUTO_MODEL)), 1_000_000);
         assert_eq!(max_context_tokens(Some("vendor/private-model")), 1_000_000);
         assert_eq!(max_context_tokens(None), 1_000_000);
+    }
+
+    #[test]
+    fn unset_and_auto_selections_route_to_flash_by_default() {
+        for value in [None, Some(AUTO_MODEL.to_string())] {
+            let selection = ModelSelection::parse(value).unwrap();
+            let decision = selection.route(ModelRouteContext {
+                subagent_type: &SubagentType::default(),
+                subagent_model: None,
+                has_images: false,
+            });
+            assert_eq!(decision.actual_model, FLASH_MODEL);
+            assert_eq!(decision.reason, ModelRouteReason::DefaultFlash);
+        }
     }
 }

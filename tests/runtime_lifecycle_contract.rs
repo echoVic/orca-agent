@@ -8,7 +8,7 @@ use orca_core::config::{
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::hook_types::{HookConfig, HookEvent};
-use orca_core::model::{ModelSelection, PRO_MODEL};
+use orca_core::model::{FLASH_MODEL, ModelSelection, PRO_MODEL};
 use orca_core::provider_types::{ProviderStep, Usage};
 use orca_core::subagent_config::SubagentConfig;
 use orca_core::subagent_types::SubagentType;
@@ -363,7 +363,10 @@ fn task_actor_routes_model_turn_and_updates_cost_model() {
     let mut lifecycle = RuntimeSessionLifecycle::new("run-actor");
     lifecycle.start_task(RuntimeTaskKind::Agent);
     let mut actor = RuntimeTaskActor::new(&mut lifecycle);
-    let mut cost_tracker = CostTracker::new(Some("deepseek-flash"));
+    // Seeded with a different model than the auto route resolves to, so the
+    // assertion below actually proves route_model_turn overrides the
+    // tracker's pricing rather than merely leaving it unchanged.
+    let mut cost_tracker = CostTracker::new(Some(PRO_MODEL));
     let provider_config = ProviderConfig {
         api_key: None,
         base_url: None,
@@ -383,15 +386,15 @@ fn task_actor_routes_model_turn_and_updates_cost_model() {
         &mut cost_tracker,
     );
 
-    assert_eq!(routed.decision.actual_model, PRO_MODEL);
-    assert_eq!(routed.provider_config.model.as_deref(), Some(PRO_MODEL));
+    assert_eq!(routed.decision.actual_model, FLASH_MODEL);
+    assert_eq!(routed.provider_config.model.as_deref(), Some(FLASH_MODEL));
     let totals = cost_tracker.add_usage(Usage {
         input_tokens: 100,
         output_tokens: 50,
         cache_tokens: 0,
     });
-    let expected_pro_cost = (100.0 * 0.435 + 50.0 * 0.87) / 1_000_000.0;
-    assert!((totals.estimated_cost_usd - expected_pro_cost).abs() < 1e-12);
+    let expected_flash_cost = (100.0 * 0.14 + 50.0 * 0.28) / 1_000_000.0;
+    assert!((totals.estimated_cost_usd - expected_flash_cost).abs() < 1e-12);
 }
 
 #[test]

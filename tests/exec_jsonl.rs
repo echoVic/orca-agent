@@ -291,7 +291,7 @@ command = {}
 }
 
 #[test]
-fn exec_auto_model_defaults_to_pro() {
+fn exec_auto_model_defaults_to_flash() {
     let home = TempDir::new().expect("temporary ORCA_HOME");
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
@@ -314,12 +314,12 @@ fn exec_auto_model_defaults_to_pro() {
         .find(|event| event["type"] == "model.routed")
         .expect("model routed event");
     assert_eq!(routed["payload"]["requested_model"], "auto");
-    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-pro");
-    assert_eq!(routed["payload"]["reason"], "default_pro");
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-flash");
+    assert_eq!(routed["payload"]["reason"], "default_flash");
 }
 
 #[test]
-fn exec_auto_model_routes_any_prompt_to_pro() {
+fn exec_auto_model_routes_any_prompt_to_flash() {
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .args([
             "exec",
@@ -342,8 +342,8 @@ fn exec_auto_model_routes_any_prompt_to_pro() {
         .find(|event| event["type"] == "model.routed")
         .expect("model routed event");
     assert_eq!(routed["payload"]["requested_model"], "auto");
-    assert_eq!(routed["payload"]["actual_model"], "deepseek-v4-pro");
-    assert_eq!(routed["payload"]["reason"], "default_pro");
+    assert_eq!(routed["payload"]["actual_model"], "deepseek-flash");
+    assert_eq!(routed["payload"]["reason"], "default_flash");
 }
 
 #[test]

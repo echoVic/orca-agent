@@ -1991,7 +1991,7 @@ mod tests {
                 assert_eq!(provider_config.api_key.as_deref(), Some("test-key"));
                 assert_eq!(
                     provider_config.model.as_deref(),
-                    Some(orca_core::model::PRO_MODEL)
+                    Some(orca_core::model::FLASH_MODEL)
                 );
             }
             RuntimeTurnOpeningResult::Return(_) => panic!("opening should continue"),
@@ -2116,12 +2116,12 @@ mod tests {
         assert_eq!(result.provider_config.api_key.as_deref(), Some("test-key"));
         assert_eq!(
             result.provider_config.model.as_deref(),
-            Some(orca_core::model::PRO_MODEL)
+            Some(orca_core::model::FLASH_MODEL)
         );
-        assert_eq!(result.decision.actual_model, orca_core::model::PRO_MODEL);
+        assert_eq!(result.decision.actual_model, orca_core::model::FLASH_MODEL);
         let output = String::from_utf8(output).expect("jsonl is utf8");
         assert!(output.contains("\"type\":\"model.routed\""));
-        assert!(output.contains(orca_core::model::PRO_MODEL));
+        assert!(output.contains(orca_core::model::FLASH_MODEL));
     }
 
     #[test]
