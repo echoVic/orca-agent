@@ -4094,8 +4094,15 @@ impl TextareaCursorCell {
     }
 }
 
+/// Layout without an explicit selection style: the production caller
+/// (`composer_click_target`) only reads cursor/row geometry and never paints
+/// `.lines()`, so the exact selection color is moot there; tests that do
+/// inspect styled spans need a real, theme-adapted style to tell selected
+/// text apart from plain text, so this falls back to the dark theme's own
+/// `selection_style()` instead of an arbitrary literal color.
 fn textarea_visual_layout(textarea: &TextArea, width: usize) -> TextareaVisualLayout {
-    textarea_visual_layout_with_selection(textarea, width, Style::default().bg(Color::LightBlue))
+    let theme = Theme::named(orca_core::config::ThemeName::Dark);
+    textarea_visual_layout_with_selection(textarea, width, theme.selection_style())
 }
 
 fn textarea_visual_layout_with_selection(
@@ -5432,7 +5439,7 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
         })
         .collect();
     if geometry.show_status
-        && let Some((text, _color)) = status
+        && let Some(text) = status
     {
         lines.push(Line::from(Span::styled(text, theme.dim_style())));
     }
@@ -5446,21 +5453,18 @@ fn render_mention_candidates(frame: &mut Frame, input_area: Rect, state: &AppSta
     frame.render_widget(paragraph, geometry.area);
 }
 
-fn mention_popup_status(state: &AppState) -> Option<(String, Color)> {
+fn mention_popup_status(state: &AppState) -> Option<String> {
     let candidates = &state.mention.candidates;
     if state.mention.sigil == Some(orca_runtime::mentions::MentionSigil::Dollar) {
-        Some((
-            if candidates.is_empty() {
-                "⋯ No matching skills".to_string()
-            } else {
-                format!(
-                    "⋯ {}/{} · ↑↓ select · PgUp/PgDn page · Home/End · Enter insert · Esc close",
-                    state.mention.selected.saturating_add(1),
-                    candidates.len()
-                )
-            },
-            Color::DarkGray,
-        ))
+        Some(if candidates.is_empty() {
+            "⋯ No matching skills".to_string()
+        } else {
+            format!(
+                "⋯ {}/{} · ↑↓ select · PgUp/PgDn page · Home/End · Enter insert · Esc close",
+                state.mention.selected.saturating_add(1),
+                candidates.len()
+            )
+        })
     } else {
         let phase = state.mention.phase.as_ref()?;
         mention_status_text(
@@ -5471,24 +5475,22 @@ fn mention_popup_status(state: &AppState) -> Option<(String, Color)> {
     }
 }
 
+/// Text for the trailing status row in the mention popup; always rendered in
+/// the popup's dim style (`render_mention_candidates`), so no color travels
+/// with it.
 fn mention_status_text(
     phase: &SearchPhase,
     scanned_paths: usize,
     candidates_empty: bool,
-) -> Option<(String, Color)> {
+) -> Option<String> {
     match phase {
-        SearchPhase::Searching => Some(("⋯ Searching files…".to_string(), Color::DarkGray)),
-        SearchPhase::Scanning => Some((
-            format!("⋯ Scanning… {scanned_paths} paths"),
-            Color::DarkGray,
-        )),
-        SearchPhase::Refreshing => Some(("⋯ Refreshing…".to_string(), Color::DarkGray)),
-        SearchPhase::Complete if candidates_empty => {
-            Some(("⋯ No matches".to_string(), Color::DarkGray))
-        }
+        SearchPhase::Searching => Some("⋯ Searching files…".to_string()),
+        SearchPhase::Scanning => Some(format!("⋯ Scanning… {scanned_paths} paths")),
+        SearchPhase::Refreshing => Some("⋯ Refreshing…".to_string()),
+        SearchPhase::Complete if candidates_empty => Some("⋯ No matches".to_string()),
         SearchPhase::Complete => None,
-        SearchPhase::Incomplete { .. } => Some(("⋯ Search incomplete".to_string(), Color::Red)),
-        SearchPhase::Stopping => Some(("⋯ Stopping search…".to_string(), Color::DarkGray)),
+        SearchPhase::Incomplete { .. } => Some("⋯ Search incomplete".to_string()),
+        SearchPhase::Stopping => Some("⋯ Stopping search…".to_string()),
     }
 }
 
@@ -9589,19 +9591,19 @@ mod tests {
     fn mention_popup_reports_every_streaming_phase() {
         assert_eq!(
             mention_status_text(&SearchPhase::Searching, 0, true),
-            Some(("⋯ Searching files…".to_string(), Color::DarkGray))
+            Some("⋯ Searching files…".to_string())
         );
         assert_eq!(
             mention_status_text(&SearchPhase::Scanning, 42, false),
-            Some(("⋯ Scanning… 42 paths".to_string(), Color::DarkGray))
+            Some("⋯ Scanning… 42 paths".to_string())
         );
         assert_eq!(
             mention_status_text(&SearchPhase::Refreshing, 42, false),
-            Some(("⋯ Refreshing…".to_string(), Color::DarkGray))
+            Some("⋯ Refreshing…".to_string())
         );
         assert_eq!(
             mention_status_text(&SearchPhase::Complete, 42, true),
-            Some(("⋯ No matches".to_string(), Color::DarkGray))
+            Some("⋯ No matches".to_string())
         );
         assert_eq!(
             mention_status_text(
@@ -9611,11 +9613,11 @@ mod tests {
                 42,
                 false,
             ),
-            Some(("⋯ Search incomplete".to_string(), Color::Red))
+            Some("⋯ Search incomplete".to_string())
         );
         assert_eq!(
             mention_status_text(&SearchPhase::Stopping, 42, false),
-            Some(("⋯ Stopping search…".to_string(), Color::DarkGray))
+            Some("⋯ Stopping search…".to_string())
         );
         assert_eq!(mention_status_text(&SearchPhase::Complete, 42, false), None);
     }
@@ -13361,7 +13363,7 @@ mod tests {
             layout.lines[2].spans.last().unwrap().style,
             textarea.cursor_style()
         );
-        let selection_style = Style::default().bg(Color::LightBlue);
+        let selection_style = theme.selection_style();
         let selected_chars = layout
             .lines
             .iter()
@@ -14233,5 +14235,161 @@ mod tests {
             .join("\n");
         assert!(expanded_text.contains("JavaScript"));
         assert!(expanded_text.contains("export default await phase"));
+    }
+
+    #[test]
+    fn ui_sources_do_not_hardcode_ansi_colors() {
+        for (name, source) in [
+            ("ui.rs", include_str!("ui.rs")),
+            ("chrome.rs", include_str!("chrome.rs")),
+            ("shortcuts.rs", include_str!("shortcuts.rs")),
+        ] {
+            let production = source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(source);
+            let offenders: Vec<&str> = production
+                .lines()
+                .filter(|line| {
+                    line.contains("Color::")
+                        && !line.contains("Color::Reset")
+                        && !line.trim_start().starts_with("//")
+                })
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "{name} hardcodes colors:\n{}",
+                offenders.join("\n")
+            );
+        }
+    }
+
+    /// Regression guard for the two-column welcome layout (flagged in the
+    /// Task 11 review): every row of the whale art must fit within
+    /// `WELCOME_ART_WIDTH` display columns, or `welcome_right_column` gets
+    /// pushed out of alignment with it.
+    #[test]
+    fn welcome_whale_art_rows_stay_within_the_art_column_width() {
+        for (index, row) in WELCOME_WHALE_ART.iter().enumerate() {
+            let width = UnicodeWidthStr::width(*row);
+            assert!(
+                width <= WELCOME_ART_WIDTH,
+                "WELCOME_WHALE_ART row {index} is {width} columns wide (max {WELCOME_ART_WIDTH}): {row:?}"
+            );
+        }
+    }
+
+    /// Compares `actual` against `src/golden/<name>.txt`. With
+    /// `ORCA_UPDATE_GOLDEN` set, (re)writes the file instead of asserting —
+    /// run once by hand, then reviewed like any other diff. A missing golden
+    /// file with the variable unset is a hard failure rather than a silent
+    /// pass against empty text, so a first run always says how to fix itself.
+    fn assert_golden(name: &str, actual: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/golden")
+            .join(format!("{name}.txt"));
+        if std::env::var_os("ORCA_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, actual).expect("write golden");
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!(
+                "golden `{name}` is missing at {}; rerun with ORCA_UPDATE_GOLDEN=1 set \
+                 (e.g. `ORCA_UPDATE_GOLDEN=1 cargo test -p orca-tui --lib golden_ -- --test-threads=1`) \
+                 to generate it",
+                path.display()
+            )
+        });
+        assert_eq!(
+            actual,
+            expected.trim_end_matches('\n'),
+            "golden `{name}` differs; review and rerun with ORCA_UPDATE_GOLDEN=1 to accept"
+        );
+    }
+
+    /// Fixed app identity/cwd/version and a pinned tick, so nothing in these
+    /// frames depends on the wall clock or an advancing spinner.
+    fn golden_state() -> AppState {
+        let mut state = test_state();
+        state.model_name = "auto".into();
+        state.cwd = "/Users/dev/Documents/GitHub/blade-deepseek".into();
+        state.app_version = "0.4.32".into();
+        state.tick = 0;
+        state
+    }
+
+    #[test]
+    fn golden_welcome() {
+        let mut state = golden_state();
+        assert_golden("welcome", &frame_string(&mut state, 100, 34));
+    }
+
+    #[test]
+    fn golden_transcript_with_tools_thinking_and_notices() {
+        let mut state = golden_state();
+        state.push_message(ChatMessage::User("你会用 ego-browser skill 吗".into()));
+        state.push_message(ChatMessage::Assistant(
+            "让我看看有哪些可用的 skill。".into(),
+        ));
+        state.push_message(ChatMessage::Reasoning {
+            text: "The user asks if I can use the skill.\nCheck the list.".into(),
+            expanded: false,
+        });
+        state.push_message(tool_call(
+            "list_skills",
+            None,
+            "completed",
+            Some(
+                "baoyu-comic [user] - Knowledge comic creator\nego-browser [user] - Browser automation\nplaywright [user] - Browser automation\nzeta [user] - misc",
+            ),
+            false,
+        ));
+        state.push_message(tool_call(
+            "read_skill",
+            Some("ego-browser"),
+            "completed",
+            Some("# ego-browser\nsource: user"),
+            false,
+        ));
+        state.push_message(ChatMessage::Assistant(
+            "有 ego-browser skill，我读一下它的使用说明。".into(),
+        ));
+        state.push_message(ChatMessage::System("Resumed saved conversation.".into()));
+        state.push_message(ChatMessage::Error(
+            "DeepSeek provider error: 429 rate limit exceeded".into(),
+        ));
+        assert_golden("transcript", &frame_string(&mut state, 100, 34));
+    }
+
+    #[test]
+    fn golden_approval_dialog() {
+        let mut state = golden_state();
+        state.push_message(ChatMessage::User("跑一下测试".into()));
+        state.status = AppStatus::WaitingApproval;
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "1".into(),
+            interaction: None,
+            tool: "bash".into(),
+            target: Some("cargo test -p orca-tui".into()),
+            permission_kind: None,
+            background_task_id: None,
+            selected: 0,
+            options: vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::AlwaysTarget,
+                ApprovalOption::Deny,
+            ],
+            diff: None,
+        });
+        assert_golden("approval", &frame_string(&mut state, 100, 30));
+    }
+
+    #[test]
+    fn golden_help_panel() {
+        let mut state = golden_state();
+        state.show_shortcuts = true;
+        assert_golden("help", &frame_string(&mut state, 110, 40));
     }
 }

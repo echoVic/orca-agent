@@ -1,0 +1,34 @@
+ ›  你 会 用  ego-browser skill 吗
+
+ ●  让 我 看 看 有 哪 些 可 用 的  skill。
+    ⋯ thinking · The user asks if I can use the skill.
+
+    ✓ list_skills
+    │ baoyu-comic [user] - Knowledge comic creator
+    │ ego-browser [user] - Browser automation
+    └ +2 lines · e to expand
+    ✓ read_skill  ego-browser
+    │ # ego-browser
+    │ source: user
+
+ ●  有  ego-browser skill， 我 读 一 下 它 的 使 用 说 明 。
+
+    ℹ Resumed saved conversation.
+
+    ✗ Provider limit reached  [provider.rate_limit]
+      cause  DeepSeek provider error: 429 rate limit exceeded
+      next   Wait before retrying and check the provider account quota if the error persists.
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ›  Message Orca…  / commands · @ files · $ skills
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ⇧Tab auto-edit      /Users/dev/Documents/GitHub/blade-deepseek       deepseek-flash · max · ? help

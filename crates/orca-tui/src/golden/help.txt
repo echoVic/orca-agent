@@ -1,0 +1,40 @@
+
+               ⢀⣤⣶⣶⣶⣶⣄⢀⣤⣶
+             ⡠⠾⠿⠿⢿⣿⠻⠿⢻⣿⠿⠋                    ___
+                   ⣿⣿                       / _ \ _ __ ___ __ _
+                 ⢀⣀⣿⣿⡀    ⢠⡄               | | | | '__/ __/ _` |
+      ⣀⣤⣴⣶⣶⣿⣿⣿⣶⣾╭ Help ──────────────────────────────────────────────────────────────────────╮
+    ⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿│Global                                                                      │
+  ⢀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿│  ctrl+/                    open or return from side conversation           │
+  ⣼⣿⡏⠉⠉⠉⠉⠙⠛⠻⢿⣿⣿⣿│  ctrl+f                    find in transcript when input is empty          │
+  ⣿⣿⣧        ⠈⠙⠿│  ? / F1 / ctrl+k           show this help (input must be empty)            │
+  ⢸⣿⣿⣆          │  ctrl+c                    cancel and quit                                 │
+   ⠻⣿⣿⣧⡀        │  ctrl+home/end             jump to top or bottom                           │
+    ⠙⢿⣿⣿⣶⣄⡀  ⠘⢿⣷│  ctrl+l                    clear screen                                    │
+      ⠉⠻⢿⣿⣿⣷⣶⣶⣾⣿│  shift+tab                 cycle approval mode                             │
+         ⠈⠉⠛⠻⠿⠿⠿│                                                                            │
+                │Editor                                                                      │
+                │  ctrl+a/e                  move to line start or end                       │
+                │  ctrl+b/f / alt+b/f        move by character or word                       │
+                │  ctrl+w/d/k/u              delete word, character, line end, or clear input│
+                │  ctrl+v / win alt+v        attach image from clipboard                     │
+                │  enter on image            open image preview                              │
+                │                                                                            │
+                │Composer                                                                    │
+                │  enter                     send message                                    │
+                │  alt+enter / shift+enter   insert newline                                  │
+                │  alt+up                    edit latest queued message                      │
+                │  up/down / ctrl+p/ctrl+n   history when empty; otherwise edit input        │
+                │  pgup/pgdn                 scroll one page                                 │
+                │  ctrl+u                    clear input, or scroll half page when empty     │
+                │  ctrl+d                    delete forward, or scroll when input is empty   │
+                │  esc                       backtrack only when input is empty              │
+                │  e                         expand latest tool output                       │
+                │                                                                            │
+                │? or Esc close                                                              │
+                ╰────────────────────────────────────────────────────────────────────────────╯
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ›  Message Orca…  / commands · @ files · $ skills
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ⇧Tab auto-edit           /Users/dev/Documents/GitHub/blade-deepseek            deepseek-flash · max · ? help
