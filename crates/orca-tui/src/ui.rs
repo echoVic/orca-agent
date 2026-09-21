@@ -39,7 +39,6 @@ use crate::types::{
     AppState, AppStatus, ApprovalOption, ConfigDialog, PanelMode, SessionPickerPhase,
 };
 use crate::user_input_dialog::{UserInputDialog, UserInputDialogMode};
-use crate::viewport_state::CopyNotice;
 use crate::workspace_status::{GitIdentity, compact_cwd};
 
 /// What the user sees for the model: an unset/auto selection shows the model
@@ -3521,7 +3520,6 @@ fn render_composer(
         composer_inner(area),
         textarea,
         Some(layout),
-        None,
         theme,
         show_hardware_cursor,
     );
@@ -3578,7 +3576,6 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         Rect::new(area.x + prefix_width, area.y, query_width, 1),
         &textarea,
         None,
-        None,
         theme,
         !state.show_shortcuts
             && state.status != AppStatus::WaitingApproval
@@ -3591,11 +3588,10 @@ fn render_textarea_surface(
     area: Rect,
     textarea: &TextArea,
     precomputed_layout: Option<&TextareaVisualLayout>,
-    notice: Option<CopyNotice>,
     theme: &Theme,
     show_hardware_cursor: bool,
 ) {
-    let inner = render_textarea_block_and_notice(frame, area, textarea, notice, theme);
+    let inner = render_textarea_block(frame, area, textarea);
     if inner.is_empty() {
         return;
     }
@@ -3625,41 +3621,18 @@ fn render_textarea_surface(
     }
 }
 
-fn render_textarea_block_and_notice(
-    frame: &mut Frame,
-    area: Rect,
-    textarea: &TextArea,
-    notice: Option<CopyNotice>,
-    theme: &Theme,
-) -> Rect {
-    let inner = if let Some(block) = textarea.block() {
+/// Renders the textarea's own block (search bar and setup screens still use a
+/// bordered `Block`; the composer no longer does) and returns its inner rect,
+/// or `area` unchanged when the textarea carries no block. The transient copy
+/// notice is composer-only chrome now; see `render_composer`.
+fn render_textarea_block(frame: &mut Frame, area: Rect, textarea: &TextArea) -> Rect {
+    if let Some(block) = textarea.block() {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         inner
     } else {
         area
-    };
-
-    // Transient "copied N chars" feedback overlays the right end of the top
-    // border, mirroring the " Input " title on the left.
-    if let Some(notice) = notice {
-        let text = if notice.local_only {
-            format!(" copied {} chars (local clipboard only) ", notice.chars)
-        } else {
-            format!(" copied {} chars to clipboard ", notice.chars)
-        };
-        let text_width = UnicodeWidthStr::width(text.as_str()) as u16;
-        // Keep one border cell visible on each side of the overlay.
-        if area.height > 0 && text_width + 2 < area.width {
-            let overlay = Rect::new(area.x + area.width - text_width - 2, area.y, text_width, 1);
-            frame.render_widget(
-                Paragraph::new(Span::styled(text, Style::default().fg(theme.approval))),
-                overlay,
-            );
-        }
     }
-
-    inner
 }
 
 /// Total composer height: the visible textarea lines plus the top and bottom
@@ -5546,7 +5519,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
 
             let paragraph = Paragraph::new(content).block(block);
             frame.render_widget(paragraph, popup_area);
-            render_textarea_surface(frame, inner[1], textarea, None, None, theme, true);
+            render_textarea_surface(frame, inner[1], textarea, None, theme, true);
         }
         2 => {
             let width = 60u16.min(area.width.saturating_sub(4));
@@ -8495,9 +8468,33 @@ mod tests {
                 rendered.contains("支持响应式布局"),
                 "completed answer tail should be visible immediately at {width}x{height}, not only after the next prompt"
             );
+
+            // Pin the composer's own rows rather than checking for "─" anywhere on
+            // screen: every rounded panel border also draws that glyph, so a bare
+            // substring check can pass even if the composer itself were squeezed off.
+            let input = state
+                .viewport
+                .input_area
+                .unwrap_or_else(|| panic!("composer area at {width}x{height}"));
+            let buffer = terminal.backend().buffer();
+            let composer_row = |y: u16| -> String {
+                (0..input.width)
+                    .map(|x| buffer[(input.x + x, y)].symbol().to_string())
+                    .collect()
+            };
+            assert_eq!(
+                composer_row(input.y),
+                "─".repeat(input.width as usize),
+                "composer top rule should remain pinned below the transcript at {width}x{height}"
+            );
+            assert_eq!(
+                composer_row(input.y + input.height - 1),
+                "─".repeat(input.width as usize),
+                "composer bottom rule should remain pinned below the transcript at {width}x{height}"
+            );
             assert!(
-                rendered.contains("─"),
-                "composer rule should remain pinned below the transcript at {width}x{height}"
+                composer_row(input.y + 1).starts_with(" › "),
+                "composer prompt should remain pinned below the transcript at {width}x{height}"
             );
         }
     }
@@ -11077,7 +11074,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_textarea_surface(frame, frame.area(), &visible, None, None, &theme, true);
+                render_textarea_surface(frame, frame.area(), &visible, None, &theme, true);
             })
             .unwrap();
         assert_eq!(
@@ -11087,15 +11084,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_textarea_surface(
-                    frame,
-                    frame.area(),
-                    &unrenderable,
-                    None,
-                    None,
-                    &theme,
-                    true,
-                );
+                render_textarea_surface(frame, frame.area(), &unrenderable, None, &theme, true);
             })
             .unwrap();
 
@@ -11122,7 +11111,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_textarea_surface(frame, frame.area(), &textarea, None, None, &theme, true);
+                render_textarea_surface(frame, frame.area(), &textarea, None, &theme, true);
             })
             .unwrap();
 
@@ -11793,7 +11782,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_textarea_surface(frame, frame.area(), &textarea, None, None, &theme, false);
+                render_textarea_surface(frame, frame.area(), &textarea, None, &theme, false);
             })
             .expect("draw");
 
@@ -12580,9 +12569,23 @@ mod tests {
             |y: u16| -> String { (0..50).map(|x| buf[(x, y)].symbol().to_string()).collect() };
         let has = |needle: &str| (0..h).any(|y| row_text(y).contains(needle));
 
+        // Pin the composer's own rows rather than checking for "─" anywhere on
+        // screen: every rounded panel border also draws that glyph, so a bare
+        // substring check can pass even if the composer itself were squeezed off.
+        let input = state.viewport.input_area.expect("composer area");
+        assert_eq!(
+            row_text(input.y),
+            "─".repeat(input.width as usize),
+            "composer top rule must stay visible when the transcript overflows"
+        );
+        assert_eq!(
+            row_text(input.y + input.height - 1),
+            "─".repeat(input.width as usize),
+            "composer bottom rule must stay visible when the transcript overflows"
+        );
         assert!(
-            has("─"),
-            "input box must stay visible when the transcript overflows"
+            row_text(input.y + 1).starts_with(" › "),
+            "composer prompt must stay visible when the transcript overflows"
         );
         assert!(
             has("auto-edit"),
