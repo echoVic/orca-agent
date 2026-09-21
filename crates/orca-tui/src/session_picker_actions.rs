@@ -172,7 +172,7 @@ where
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.session_picker_show_tests = !state.session_picker_show_tests;
-                state.session_picker_selected = 0;
+                state.reset_session_selection_to_first_match();
             }
             KeyCode::Char(c) => {
                 state.session_query_push(c);
@@ -463,8 +463,8 @@ pub(crate) fn open_session_picker(state: &mut AppState) -> io::Result<bool> {
         RuntimeSurfaceHostHandle::list_saved_session_page(0, SESSION_PICKER_PAGE_SIZE, None)?;
     state.reset_queued_user_messages();
     state.session_picker_sessions = page.sessions;
-    state.session_picker_selected = 0;
     state.session_picker_query.clear();
+    state.reset_session_selection_to_first_match();
     state.session_picker_phase = SessionPickerPhase::Browsing;
     state.session_picker_error = None;
     state.session_picker_next_offset = page.next_offset;
@@ -547,7 +547,7 @@ fn reload_session_picker(state: &mut AppState) {
             state.session_picker_next_offset = page.next_offset;
             state.session_picker_backfill_complete = page.backfill_complete;
             state.session_picker_error = None;
-            state.session_picker_selected = 0;
+            state.reset_session_selection_to_first_match();
         }
         Err(error) => {
             state.session_picker_error =
@@ -766,10 +766,67 @@ mod tests {
         let tx = state.event_tx.clone();
         handle_session_picker_key(&ctrl_t, &mut state, &tx, || Ok(())).unwrap();
         assert!(state.session_picker_show_tests);
-        assert_eq!(state.session_picker_selected, 0);
         assert_eq!(state.filtered_session_indices(), vec![0, 1, 2]);
+        // Selection resets to the first VISIBLE session, derived from
+        // filtered_session_indices() rather than assumed to be a bare `0`.
+        assert_eq!(
+            Some(state.session_picker_selected),
+            state.filtered_session_indices().first().copied()
+        );
 
         handle_session_picker_key(&ctrl_t, &mut state, &tx, || Ok(())).unwrap();
         assert!(!state.session_picker_show_tests);
+        assert_eq!(
+            Some(state.session_picker_selected),
+            state.filtered_session_indices().first().copied()
+        );
+    }
+
+    #[test]
+    fn hiding_tests_never_leaves_the_selector_pointed_at_a_hidden_session() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(tx, "test".into(), "auto".into(), ".".into());
+        state.status = AppStatus::SessionPicker;
+        let mut mock_first = session("mock-id", "Hidden fixture");
+        mock_first.provider = "mock".to_string();
+        state.session_picker_sessions = vec![mock_first, session("real-id", "Deploy pipeline")];
+
+        // Mirrors what open_session_picker / reload_session_picker / Ctrl+T
+        // all do after the session list or the test-session filter changes.
+        state.reset_session_selection_to_first_match();
+
+        assert_eq!(
+            selected_session_selector(&state).as_deref(),
+            Some("real-id"),
+            "selection must land on the visible session, never the hidden mock one"
+        );
+    }
+
+    #[test]
+    fn ctrl_t_hiding_tests_moves_the_selection_off_a_now_hidden_session() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(tx.clone(), "test".into(), "auto".into(), ".".into());
+        state.status = AppStatus::SessionPicker;
+        let mut mock_first = session("mock-id", "Hidden fixture");
+        mock_first.provider = "mock".to_string();
+        state.session_picker_sessions = vec![
+            mock_first,
+            session("real-1", "First real"),
+            session("real-2", "Second real"),
+        ];
+        // Browsing the mock session while tests are shown.
+        state.session_picker_show_tests = true;
+        state.session_picker_selected = 0;
+
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        handle_session_picker_key(&ctrl_t, &mut state, &tx, || Ok(())).unwrap();
+
+        assert!(!state.session_picker_show_tests);
+        assert_eq!(state.filtered_session_indices(), vec![1, 2]);
+        assert_eq!(
+            state.session_picker_selected, 1,
+            "hiding tests must move the selection off the now-hidden mock session, \
+             not leave it at raw index 0"
+        );
     }
 }

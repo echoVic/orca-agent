@@ -179,10 +179,18 @@ impl AppState {
         self.reset_session_selection_to_first_match();
     }
 
+    /// Reset the selection to the first row the current filter/query shows.
+    /// When nothing matches, moves the selection out of range (one past the
+    /// last loaded session) instead of leaving it on a stale index that a
+    /// filter change may have just hidden. Every consumer of
+    /// `session_picker_selected` already treats an out-of-range index as "no
+    /// selection" (`Vec::get`), so this is a clean, panic-free sentinel.
     pub(crate) fn reset_session_selection_to_first_match(&mut self) {
-        if let Some(&first) = self.filtered_session_indices().first() {
-            self.session_picker_selected = first;
-        }
+        self.session_picker_selected = self
+            .filtered_session_indices()
+            .first()
+            .copied()
+            .unwrap_or(self.session_picker_sessions.len());
     }
 
     pub fn selected_session_id(&self) -> Option<String> {
@@ -254,6 +262,24 @@ mod tests {
         assert_eq!(state.hidden_test_session_count(), 1);
         state.session_picker_show_tests = true;
         assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn reset_selection_to_first_match_falls_back_out_of_range_when_nothing_matches() {
+        let mut state = test_state_in("/work/orca");
+        state.session_picker_sessions = vec![summary("only", "/work/orca", "mock", 1)];
+        state.session_picker_selected = 0;
+
+        state.reset_session_selection_to_first_match();
+
+        // The only loaded session is a hidden mock session, so nothing
+        // matches; the selection must move out of range rather than stay on
+        // a session the user can no longer see.
+        assert_eq!(
+            state.session_picker_selected,
+            state.session_picker_sessions.len()
+        );
+        assert_eq!(state.selected_session_id(), None);
     }
 
     #[test]

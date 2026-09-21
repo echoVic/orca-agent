@@ -8703,6 +8703,50 @@ mod tests {
     }
 
     #[test]
+    fn session_picker_selects_the_first_visible_row_when_session_zero_is_a_hidden_mock() {
+        let mut state = test_state();
+        state.status = AppStatus::SessionPicker;
+        let mut mock_first = session_summary("mock-id", "Hidden fixture");
+        mock_first.provider = "mock".to_string();
+        state.session_picker_sessions =
+            vec![mock_first, session_summary("real-id", "Deploy pipeline")];
+        // Mirrors what open_session_picker / reload_session_picker / Ctrl+T
+        // all do after the session list or the test-session filter changes.
+        state.reset_session_selection_to_first_match();
+        assert_eq!(state.session_picker_selected, 1);
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            !rendered.contains("Hidden fixture"),
+            "the hidden mock session must never render"
+        );
+
+        // Rows: border(0), query(1), hints(2), blank(3), group header(4),
+        // the one visible session (5).
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 5)].symbol())
+            .collect();
+        let marker_pos = row
+            .find('›')
+            .expect("selection marker present on the visible row");
+        let title_pos = row
+            .find("Deploy pipeline")
+            .expect("visible session's title present");
+        assert!(
+            marker_pos < title_pos,
+            "marker must precede the visible title: {row:?}"
+        );
+    }
+
+    #[test]
     fn session_picker_header_reports_indexing_until_backfill_completes() {
         let mut state = test_state();
         state.status = AppStatus::SessionPicker;
