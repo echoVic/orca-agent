@@ -2,22 +2,105 @@
 //! query editing with the first-match reset invariant. Extracted from
 //! `types.rs` (TUI convergence slice 10).
 
+use orca_runtime::history::SessionSummary;
+
 use crate::types::AppState;
+
+/// One row of the rendered picker: either a project group header, or a
+/// session belonging to the group immediately above it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionPickerRow {
+    Group { label: String, current: bool },
+    Session(usize),
+}
+
+/// Sessions written by the test suite are tagged with the `mock` provider so
+/// they can stay out of the picker until explicitly requested.
+fn is_test_session(session: &SessionSummary) -> bool {
+    session.provider == "mock"
+}
+
+/// Last path segment of `cwd`, used as the group label. Falls back to the
+/// full path when it has no file-name component (e.g. `/`).
+fn project_label(cwd: &str) -> String {
+    std::path::Path::new(cwd)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| cwd.to_string())
+}
 
 impl AppState {
     /// Indices into `session_picker_sessions` whose title matches the current
-    /// query (case-insensitive substring). Empty query matches everything.
+    /// query (case-insensitive substring) and, unless
+    /// `session_picker_show_tests` is set, are not test-suite sessions.
+    /// Empty query matches every title.
     pub fn filtered_session_indices(&self) -> Vec<usize> {
-        if self.session_picker_query.is_empty() {
-            return (0..self.session_picker_sessions.len()).collect();
-        }
         let needle = self.session_picker_query.to_lowercase();
         self.session_picker_sessions
             .iter()
             .enumerate()
-            .filter(|(_, session)| session.title.to_lowercase().contains(&needle))
+            .filter(|(_, session)| self.session_picker_show_tests || !is_test_session(session))
+            .filter(|(_, session)| {
+                needle.is_empty() || session.title.to_lowercase().contains(&needle)
+            })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// How many sessions the mock-session filter is currently hiding. Always
+    /// zero once `session_picker_show_tests` is set.
+    pub(crate) fn hidden_test_session_count(&self) -> usize {
+        if self.session_picker_show_tests {
+            return 0;
+        }
+        self.session_picker_sessions
+            .iter()
+            .filter(|session| is_test_session(session))
+            .count()
+    }
+
+    /// Filtered sessions grouped by project directory. The current project
+    /// comes first; other groups follow by their most recent session;
+    /// sessions inside a group are newest first.
+    pub(crate) fn session_picker_rows(&self) -> Vec<SessionPickerRow> {
+        let mut groups: Vec<(String, bool, Vec<usize>)> = Vec::new();
+        for index in self.filtered_session_indices() {
+            let session = &self.session_picker_sessions[index];
+            let current = session.cwd == self.cwd;
+            match groups.iter_mut().find(|(cwd, _, _)| *cwd == session.cwd) {
+                Some((_, _, members)) => members.push(index),
+                None => groups.push((session.cwd.clone(), current, vec![index])),
+            }
+        }
+        for (_, _, members) in groups.iter_mut() {
+            members.sort_by(|a, b| {
+                let a_time = self.session_picker_sessions[*a].updated_at;
+                let b_time = self.session_picker_sessions[*b].updated_at;
+                b_time.cmp(&a_time)
+            });
+        }
+        groups.sort_by(|(_, a_current, a_members), (_, b_current, b_members)| {
+            let a_newest = a_members
+                .iter()
+                .map(|index| self.session_picker_sessions[*index].updated_at)
+                .max();
+            let b_newest = b_members
+                .iter()
+                .map(|index| self.session_picker_sessions[*index].updated_at)
+                .max();
+            // Current project first, then most-recently-active group first.
+            b_current.cmp(a_current).then(b_newest.cmp(&a_newest))
+        });
+        let mut rows = Vec::new();
+        for (cwd, current, members) in groups {
+            rows.push(SessionPickerRow::Group {
+                label: project_label(&cwd),
+                current,
+            });
+            rows.extend(members.into_iter().map(SessionPickerRow::Session));
+        }
+        rows
     }
 
     pub fn select_previous_session(&mut self) {
@@ -106,5 +189,90 @@ impl AppState {
         self.session_picker_sessions
             .get(self.session_picker_selected)
             .map(|session| session.session_id.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel as mpsc;
+    use orca_runtime::history::SessionSummary;
+
+    fn summary_defaults() -> SessionSummary {
+        SessionSummary {
+            session_id: String::new(),
+            title: String::new(),
+            cwd: String::new(),
+            provider: String::new(),
+            model: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            path: std::path::PathBuf::new(),
+            archived: false,
+            parent_id: None,
+            forked: false,
+            approval_mode: None,
+            active_permission_profile: None,
+            runtime_workspace_roots: Vec::new(),
+            permission_rule_count: 0,
+            additional_working_directories: Vec::new(),
+            network_domain_permissions: Default::default(),
+            health: orca_runtime::history::StoredSessionHealth::Healthy,
+            health_issue: None,
+            source_fingerprint: None,
+            storage_identity: String::new(),
+        }
+    }
+
+    fn summary(title: &str, cwd: &str, provider: &str, minutes_ago: i64) -> SessionSummary {
+        let now = chrono::Utc::now();
+        SessionSummary {
+            session_id: format!("id-{title}"),
+            title: title.into(),
+            cwd: cwd.into(),
+            provider: provider.into(),
+            model: None,
+            created_at: now - chrono::Duration::minutes(minutes_ago),
+            updated_at: now - chrono::Duration::minutes(minutes_ago),
+            ..summary_defaults()
+        }
+    }
+
+    fn test_state_in(cwd: &str) -> AppState {
+        let (tx, _rx) = mpsc::unbounded();
+        AppState::new(tx, "0.0.0".into(), "deepseek".into(), cwd.into())
+    }
+
+    #[test]
+    fn mock_sessions_are_hidden_until_requested() {
+        let mut state = test_state_in("/work/orca");
+        state.session_picker_sessions = vec![
+            summary("real", "/work/orca", "deepseek", 5),
+            summary("schema_ok", "/work/orca", "mock", 1),
+        ];
+        assert_eq!(state.filtered_session_indices(), vec![0]);
+        assert_eq!(state.hidden_test_session_count(), 1);
+        state.session_picker_show_tests = true;
+        assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn picker_rows_group_by_project_with_the_current_project_first() {
+        let mut state = test_state_in("/work/orca");
+        state.session_picker_sessions = vec![
+            summary("other newest", "/work/other", "deepseek", 1),
+            summary("orca older", "/work/orca", "deepseek", 60),
+            summary("orca newer", "/work/orca", "deepseek", 30),
+        ];
+        let rows = state.session_picker_rows();
+        assert!(
+            matches!(&rows[0], SessionPickerRow::Group { label, current: true } if label == "orca")
+        );
+        assert!(matches!(rows[1], SessionPickerRow::Session(2)));
+        assert!(matches!(rows[2], SessionPickerRow::Session(1)));
+        assert!(
+            matches!(&rows[3], SessionPickerRow::Group { label, current: false } if label == "other")
+        );
+        assert!(matches!(rows[4], SessionPickerRow::Session(0)));
     }
 }

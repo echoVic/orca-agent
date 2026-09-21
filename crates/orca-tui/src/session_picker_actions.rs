@@ -2,7 +2,7 @@ use std::io;
 use std::time::Instant;
 
 use crossbeam_channel as mpsc;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use orca_runtime::history::{SessionSummary, StoredSessionHealth};
 use orca_runtime::surface::RuntimeSurfaceHostHandle;
 
@@ -169,6 +169,10 @@ where
             KeyCode::Backspace => {
                 state.session_query_pop();
                 reload_session_picker(state);
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.session_picker_show_tests = !state.session_picker_show_tests;
+                state.session_picker_selected = 0;
             }
             KeyCode::Char(c) => {
                 state.session_query_push(c);
@@ -746,5 +750,26 @@ mod tests {
                 .is_some_and(|message| message.contains("Quarantined"))
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ctrl_t_toggles_test_session_visibility_and_resets_selection() {
+        let (mut state, _rx) = state();
+        let mut hidden = session("three", "Third");
+        hidden.provider = "mock".to_string();
+        state.session_picker_sessions.push(hidden);
+        state.session_picker_selected = 1;
+        assert!(!state.session_picker_show_tests);
+        assert_eq!(state.filtered_session_indices(), vec![0, 1]);
+
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let tx = state.event_tx.clone();
+        handle_session_picker_key(&ctrl_t, &mut state, &tx, || Ok(())).unwrap();
+        assert!(state.session_picker_show_tests);
+        assert_eq!(state.session_picker_selected, 0);
+        assert_eq!(state.filtered_session_indices(), vec![0, 1, 2]);
+
+        handle_session_picker_key(&ctrl_t, &mut state, &tx, || Ok(())).unwrap();
+        assert!(!state.session_picker_show_tests);
     }
 }

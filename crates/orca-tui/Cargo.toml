@@ -39,6 +39,7 @@ syntect = { workspace = true }
 two-face = { workspace = true }
 similar = { workspace = true, features = ["inline"] }
 libc = { workspace = true }
+chrono = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 arboard = { workspace = true }
@@ -53,4 +54,3 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile = { workspace = true }
-chrono = { workspace = true }

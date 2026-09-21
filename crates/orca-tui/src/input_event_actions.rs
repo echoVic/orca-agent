@@ -1505,12 +1505,21 @@ mod tests {
         let mut state = state_with_transcript();
         state.status = AppStatus::SessionPicker;
         state.viewport.frame_area = Some(Rect::new(0, 0, 80, 24));
-        state.session_picker_sessions =
-            vec![test_session_summary("alpha"), test_session_summary("beta")];
+        // Same cwd, so both land in one picker group; pin distinct
+        // `updated_at` values (rather than relying on two back-to-back
+        // `Utc::now()` calls to land in call order) so "beta" deterministically
+        // sorts newest-first ahead of "alpha".
+        let mut alpha = test_session_summary("alpha");
+        let mut beta = test_session_summary("beta");
+        let reference_time = chrono::Utc::now();
+        alpha.updated_at = reference_time - chrono::Duration::minutes(10);
+        beta.updated_at = reference_time;
+        state.session_picker_sessions = vec![alpha, beta];
         state.session_picker_selected = 0;
         let now = Instant::now();
 
-        // Rows: border(0), query(1), hints(2), blank(3), session0(4), session1(5).
+        // Rows: border(0), query(1), hints(2), blank(3), group header(4),
+        // beta [newest] (5), alpha (6).
         assert_eq!(
             handle_mouse_event(
                 &mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 5),

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
@@ -29,6 +30,7 @@ use crate::diagnostics::{DiagnosticContext, DiagnosticLevel, TuiDiagnostic};
 use crate::display_text::{compact_long_text, truncate_to_display_width};
 use crate::protocol::TaskTranscriptResult;
 use crate::selection::{TranscriptSelection, apply_style_to_line_range};
+use crate::session_picker::SessionPickerRow;
 use crate::session_picker_actions::available_session_actions_with_health;
 use crate::shortcuts::{self, ShortcutScope};
 use crate::syntax_highlight::highlight_code;
@@ -1039,118 +1041,167 @@ fn render_goal_banner(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     frame.render_widget(paragraph, inner);
 }
 
+/// Human-friendly age of `updated_at` relative to `now`: `just now` under a
+/// minute, minutes and hours out to a day, `yesterday` for the next day, and
+/// whole days after that. `now` is a parameter so the mapping stays
+/// deterministic under test; the renderer always passes `Utc::now()`.
+fn relative_time(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = (now - updated_at).num_seconds();
+    if seconds < 60 {
+        "just now".to_string()
+    } else if seconds < 60 * 60 {
+        format!("{} min ago", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{} h ago", seconds / 3600)
+    } else if seconds < 48 * 60 * 60 {
+        "yesterday".to_string()
+    } else {
+        format!("{} d ago", seconds / 86_400)
+    }
+}
+
 fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme) {
     let area = frame.area();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Resume Conversation ");
+    let block = crate::chrome::panel_block(theme, "Resume", theme.border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let inner_width = usize::from(inner.width);
     let filtered = state.filtered_session_indices();
-    let loaded = state.session_picker_sessions.len();
+    let hidden = state.hidden_test_session_count();
 
     let mut lines = Vec::new();
 
     // Search field: live query + match count.
     let query_display = if state.session_picker_query.is_empty() {
-        Span::styled("type to filter…", Style::default().fg(theme.muted))
+        Span::styled("type to filter…", theme.muted_style())
     } else {
         Span::styled(
             state.session_picker_query.clone(),
             Style::default().fg(theme.text),
         )
     };
+    let count_text = if hidden > 0 {
+        format!(
+            "{} sessions · {hidden} test sessions hidden",
+            filtered.len()
+        )
+    } else {
+        format!("{} sessions", filtered.len())
+    };
     lines.push(Line::from(vec![
-        Span::styled("⌕ ", Style::default().fg(theme.border)),
+        Span::styled("⌕ ", theme.accent_style()),
         query_display,
-        Span::styled(
-            if state.session_picker_backfill_complete {
-                format!("    {} loaded", filtered.len())
-            } else {
-                format!(
-                    "    {}/{} loaded · indexing history…",
-                    filtered.len(),
-                    loaded
-                )
-            },
-            Style::default().fg(theme.muted),
-        ),
+        Span::styled(format!("    {count_text}"), theme.muted_style()),
     ]));
-    let hints = match state.session_picker_phase {
-        SessionPickerPhase::Browsing => {
-            "↑↓ select · PgUp/PgDn page · Enter resume · Tab actions · Backspace edit · Esc quit"
-        }
-        SessionPickerPhase::Actions { .. } => "↑↓ select action · Enter choose · Esc sessions",
-        SessionPickerPhase::Renaming { .. } => "Enter rename · Esc actions",
+    let hints: &[(&str, &str)] = match state.session_picker_phase {
+        SessionPickerPhase::Browsing => &[
+            ("↑↓", "move"),
+            ("Enter", "resume"),
+            ("Tab", "actions"),
+            ("Ctrl+T", "show/hide test sessions"),
+            ("Esc", "back"),
+        ],
+        SessionPickerPhase::Actions { .. } => &[
+            ("↑↓", "select action"),
+            ("Enter", "choose"),
+            ("Esc", "sessions"),
+        ],
+        SessionPickerPhase::Renaming { .. } => &[("Enter", "rename"), ("Esc", "actions")],
         SessionPickerPhase::ConfirmArchive { .. } | SessionPickerPhase::ConfirmDelete { .. } => {
-            "←→ choose · Enter confirm · Esc cancel"
+            &[("←→", "choose"), ("Enter", "confirm"), ("Esc", "cancel")]
         }
     };
-    lines.push(Line::from(Span::styled(
-        hints,
-        Style::default().fg(theme.muted),
-    )));
+    lines.push(crate::chrome::hint_line(theme, inner_width, hints));
     lines.push(Line::from(""));
 
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No sessions match this filter.",
-            Style::default().fg(theme.muted),
+            theme.muted_style(),
         )));
     }
 
-    let needle = state.session_picker_query.to_lowercase();
-    let visible_sessions = if state.session_picker_phase == SessionPickerPhase::Browsing {
-        filtered.clone()
+    let rows = state.session_picker_rows();
+    let browsing = state.session_picker_phase == SessionPickerPhase::Browsing;
+    let selected_index = state.session_picker_selected;
+    let visible_rows: Vec<&SessionPickerRow> = if browsing {
+        rows.iter().collect()
     } else {
-        filtered
-            .iter()
-            .copied()
-            .filter(|index| *index == state.session_picker_selected)
+        rows.iter()
+            .filter(
+                |row| matches!(row, SessionPickerRow::Session(index) if *index == selected_index),
+            )
             .collect()
     };
+
+    let title_width = visible_rows
+        .iter()
+        .filter_map(|row| match row {
+            SessionPickerRow::Session(index) => Some(UnicodeWidthStr::width(
+                state.session_picker_sessions[*index].title.as_str(),
+            )),
+            SessionPickerRow::Group { .. } => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .min(50);
+
+    let now = Utc::now();
     let mut selected_line_offset: u16 = lines.len() as u16;
-    for index in visible_sessions {
-        let session = &state.session_picker_sessions[index];
-        let selected = index == state.session_picker_selected;
-        let marker = if selected { "> " } else { "  " };
-        let base = if selected {
-            Style::default()
-                .fg(theme.border)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text)
-        };
+    for row in &visible_rows {
+        match row {
+            SessionPickerRow::Group { label, current } => {
+                let mut spans = vec![Span::styled(
+                    label.clone(),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                )];
+                if *current {
+                    spans.push(Span::styled("   current project", theme.muted_style()));
+                }
+                lines.push(Line::from(spans));
+            }
+            SessionPickerRow::Session(index) => {
+                let index = *index;
+                let session = &state.session_picker_sessions[index];
+                let selected = index == state.session_picker_selected;
+                let title = if UnicodeWidthStr::width(session.title.as_str()) > title_width {
+                    truncate_to_display_width(&session.title, title_width)
+                } else {
+                    session.title.clone()
+                };
+                let detail = format!(
+                    "{} · {}",
+                    relative_time(session.updated_at, now),
+                    session.provider
+                );
+                let mut line = crate::chrome::option_line(
+                    theme,
+                    selected,
+                    "",
+                    &title,
+                    title_width,
+                    &detail,
+                    inner_width,
+                );
+                if session.health != StoredSessionHealth::Healthy {
+                    line.spans.push(Span::styled(
+                        format!("  [{:?}]", session.health),
+                        Style::default().fg(theme.error),
+                    ));
+                }
+                lines.push(line);
 
-        let mut spans = vec![Span::styled(marker, base)];
-        // Highlight the matched substring inside the title.
-        spans.extend(highlight_match(&session.title, &needle, base, theme));
-        spans.push(Span::styled(
-            format!(
-                "  {}  {}",
-                session.updated_at.format("%Y-%m-%d %H:%M"),
-                session.provider
-            ),
-            Style::default().fg(theme.muted),
-        ));
-        if session.health != StoredSessionHealth::Healthy {
-            spans.push(Span::styled(
-                format!("  [{:?}]", session.health),
-                Style::default().fg(theme.error),
-            ));
-        }
-        lines.push(Line::from(spans));
-
-        if let Some(metadata) = session_permission_metadata_label(session) {
-            lines.push(Line::from(vec![
-                Span::styled("    ", Style::default()),
-                Span::styled(metadata, Style::default().fg(theme.muted)),
-            ]));
-        }
-        if selected {
-            selected_line_offset = lines.len() as u16;
+                if let Some(metadata) = session_permission_metadata_label(session) {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", Style::default()),
+                        Span::styled(metadata, theme.muted_style()),
+                    ]));
+                }
+                if selected {
+                    selected_line_offset = lines.len() as u16;
+                }
+            }
         }
     }
 
@@ -1335,30 +1386,6 @@ fn workspace_relative_path_label(path: &Path, runtime_workspace_roots: &[PathBuf
         Ok(relative) => format!(":workspace_roots/{}", relative.display()),
         Err(_) => path.display().to_string(),
     }
-}
-
-/// Split `text` into styled spans, highlighting the first case-insensitive
-/// occurrence of `needle` with the theme warning color. Empty needle returns
-/// the whole text in `base` style.
-fn highlight_match(text: &str, needle: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
-    if needle.is_empty() {
-        return vec![Span::styled(text.to_string(), base)];
-    }
-    let lower = text.to_lowercase();
-    let Some(start) = lower.find(needle) else {
-        return vec![Span::styled(text.to_string(), base)];
-    };
-    let end = start + needle.len();
-    let hl = base.fg(theme.warning).add_modifier(Modifier::BOLD);
-    let mut spans = Vec::new();
-    if start > 0 {
-        spans.push(Span::styled(text[..start].to_string(), base));
-    }
-    spans.push(Span::styled(text[start..end].to_string(), hl));
-    if end < text.len() {
-        spans.push(Span::styled(text[end..].to_string(), base));
-    }
-    spans
 }
 
 /// Render the transcript messages into `area` with no border. While `auto_scroll` is on
@@ -5580,11 +5607,19 @@ pub(crate) fn session_picker_hit_index(state: &AppState, row: u16) -> Option<usi
         return None;
     }
     let mut current = inner_top + 3;
-    for index in state.filtered_session_indices() {
-        let session = &state.session_picker_sessions[index];
-        let rows = 1 + u16::from(session_permission_metadata_label(session).is_some());
+    for picker_row in state.session_picker_rows() {
+        let rows = match picker_row {
+            SessionPickerRow::Group { .. } => 1,
+            SessionPickerRow::Session(index) => {
+                let session = &state.session_picker_sessions[index];
+                1 + u16::from(session_permission_metadata_label(session).is_some())
+            }
+        };
         if row >= current && row < current + rows {
-            return Some(index);
+            return match picker_row {
+                SessionPickerRow::Group { .. } => None,
+                SessionPickerRow::Session(index) => Some(index),
+            };
         }
         current = current.saturating_add(rows);
         if current >= inner_bottom {
@@ -8487,6 +8522,91 @@ mod tests {
             source_fingerprint: None,
             storage_identity: id.to_string(),
         }
+    }
+
+    #[test]
+    fn relative_time_buckets_elapsed_seconds_into_human_labels() {
+        let now = Utc::now();
+        assert_eq!(relative_time(now, now), "just now");
+        assert_eq!(
+            relative_time(now - chrono::Duration::seconds(59), now),
+            "just now"
+        );
+        assert_eq!(
+            relative_time(now - chrono::Duration::minutes(1), now),
+            "1 min ago"
+        );
+        assert_eq!(
+            relative_time(now - chrono::Duration::minutes(59), now),
+            "59 min ago"
+        );
+        assert_eq!(
+            relative_time(now - chrono::Duration::hours(1), now),
+            "1 h ago"
+        );
+        assert_eq!(
+            relative_time(now - chrono::Duration::hours(23), now),
+            "23 h ago"
+        );
+        assert_eq!(
+            relative_time(now - chrono::Duration::hours(24), now),
+            "yesterday"
+        );
+        assert_eq!(
+            relative_time(now - chrono::Duration::hours(47), now),
+            "yesterday"
+        );
+        assert_eq!(
+            relative_time(now - chrono::Duration::hours(48), now),
+            "2 d ago"
+        );
+        assert_eq!(
+            relative_time(now - chrono::Duration::days(5), now),
+            "5 d ago"
+        );
+    }
+
+    #[test]
+    fn session_picker_renders_project_groups_and_hidden_test_count() {
+        let mut state = test_state();
+        let mut current_project_session = session_summary("session-1", "Current project session");
+        current_project_session.cwd = "/tmp".to_string();
+        let mut other_project_session = session_summary("session-2", "Other project session");
+        other_project_session.cwd = "/workspace/other".to_string();
+        let mut hidden_session = session_summary("session-3", "Hidden test session");
+        hidden_session.cwd = "/tmp".to_string();
+        hidden_session.provider = "mock".to_string();
+        state.status = AppStatus::SessionPicker;
+        state.session_picker_sessions = vec![
+            current_project_session,
+            other_project_session,
+            hidden_session,
+        ];
+
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16))
+            .expect("test backend");
+
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("2 sessions · 1 test sessions hidden"));
+        assert!(rendered.contains("Ctrl+T"));
+        // The current project ("tmp", from cwd "/tmp") groups first and is
+        // labeled, ahead of the other project's group.
+        let current_group_pos = rendered.find("tmp").expect("current project group label");
+        let other_group_pos = rendered.find("other").expect("other project group label");
+        assert!(current_group_pos < other_group_pos);
+        assert!(rendered.contains("current project"));
     }
 
     #[test]

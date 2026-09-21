@@ -439,6 +439,10 @@ pub struct AppState {
     pub session_picker_error: Option<String>,
     pub session_picker_next_offset: Option<usize>,
     pub session_picker_backfill_complete: bool,
+    /// When false (the default), sessions written by the test suite
+    /// (`provider == "mock"`) are hidden from the picker. Toggled with
+    /// Ctrl+T while browsing.
+    pub session_picker_show_tests: bool,
     pub(crate) surface_metrics: SurfaceMetricsState,
     pub slash_menu: Option<SlashMenu>,
     pub mention: MentionPopupState,
@@ -688,6 +692,7 @@ impl AppState {
             session_picker_error: None,
             session_picker_next_offset: None,
             session_picker_backfill_complete: true,
+            session_picker_show_tests: false,
             surface_metrics: SurfaceMetricsState::default(),
             slash_menu: None,
             mention: MentionPopupState::default(),
