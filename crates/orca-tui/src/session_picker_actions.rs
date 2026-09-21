@@ -527,15 +527,30 @@ fn refresh_after_backfill(state: &mut AppState) {
     state.session_picker_sessions = page.sessions;
     state.session_picker_next_offset = page.next_offset;
     state.session_picker_backfill_complete = true;
-    state.session_picker_selected = selected_id
-        .as_deref()
-        .and_then(|selected_id| {
-            state
-                .session_picker_sessions
-                .iter()
-                .position(|session| session_matches_selector(session, selected_id))
-        })
-        .unwrap_or(0);
+    relocate_selection_after_reload(state, selected_id.as_deref());
+}
+
+/// After `session_picker_sessions` is replaced wholesale (a completed
+/// backfill page, in practice), keep the previously selected session
+/// selected only if it is both still present *and* still visible under the
+/// current filter/query; otherwise fall back to the first visible session
+/// (or the out-of-range "nothing selected" sentinel) via
+/// `reset_session_selection_to_first_match`. A freshly loaded page can put a
+/// hidden (mock) session at index 0, so a raw positional fallback is never
+/// safe here.
+fn relocate_selection_after_reload(state: &mut AppState, previous_selected_id: Option<&str>) {
+    let relocated = previous_selected_id.and_then(|selected_id| {
+        state
+            .session_picker_sessions
+            .iter()
+            .position(|session| session_matches_selector(session, selected_id))
+    });
+    let still_visible =
+        relocated.filter(|position| state.filtered_session_indices().contains(position));
+    match still_visible {
+        Some(position) => state.session_picker_selected = position,
+        None => state.reset_session_selection_to_first_match(),
+    }
 }
 
 fn reload_session_picker(state: &mut AppState) {
@@ -827,6 +842,64 @@ mod tests {
             state.session_picker_selected, 1,
             "hiding tests must move the selection off the now-hidden mock session, \
              not leave it at raw index 0"
+        );
+    }
+
+    #[test]
+    fn relocate_selection_after_reload_keeps_a_still_visible_session_by_id() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(tx, "test".into(), "auto".into(), ".".into());
+        state.status = AppStatus::SessionPicker;
+        // The previously selected session ("kept") reappears at a different
+        // position in the freshly loaded page; it should stay selected.
+        state.session_picker_sessions =
+            vec![session("other", "Other"), session("kept", "Kept session")];
+
+        relocate_selection_after_reload(&mut state, Some("kept"));
+
+        assert_eq!(state.session_picker_selected, 1);
+    }
+
+    #[test]
+    fn relocate_selection_after_reload_never_lands_on_a_hidden_session() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(tx, "test".into(), "auto".into(), ".".into());
+        state.status = AppStatus::SessionPicker;
+        let mut mock_first = session("mock-id", "Hidden fixture");
+        mock_first.provider = "mock".to_string();
+        // A completed backfill page puts a hidden mock session at index 0;
+        // the previous selection (`None` here: nothing was selected before,
+        // or the prior session is gone) must not fall back to raw index 0.
+        state.session_picker_sessions = vec![mock_first, session("real-id", "Deploy pipeline")];
+
+        relocate_selection_after_reload(&mut state, None);
+
+        assert_eq!(
+            selected_session_selector(&state).as_deref(),
+            Some("real-id"),
+            "the backfill-refresh fallback must land on the visible session, \
+             never the hidden mock one"
+        );
+    }
+
+    #[test]
+    fn relocate_selection_after_reload_falls_back_when_the_previous_session_is_now_hidden() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut state = AppState::new(tx, "test".into(), "auto".into(), ".".into());
+        state.status = AppStatus::SessionPicker;
+        let mut now_hidden = session("was-selected", "Now hidden");
+        now_hidden.provider = "mock".to_string();
+        // The session the user had selected is still present by id, but a
+        // freshly loaded page shows it as a mock (test) session that the
+        // current filter hides. Relocating by id alone would silently
+        // select a row the user can no longer see.
+        state.session_picker_sessions = vec![now_hidden, session("still-visible", "Still visible")];
+
+        relocate_selection_after_reload(&mut state, Some("was-selected"));
+
+        assert_eq!(
+            selected_session_selector(&state).as_deref(),
+            Some("still-visible")
         );
     }
 }
