@@ -243,9 +243,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState, textarea: &TextArea, them
 }
 
 fn render_recovery_prompt(frame: &mut Frame, state: &AppState, theme: &Theme) {
-    let popup = crate::chrome::dialog_rect(frame.area(), 60, 6, 12);
-    frame.render_widget(Clear, popup);
-    let inner_width = usize::from(popup.width.saturating_sub(4));
+    let area = frame.area();
+    let width = 72u16.min(area.width.saturating_sub(4));
+    let inner_width = usize::from(width.saturating_sub(4));
 
     let labels = ["Continue", "Cancel operation"];
     let label_width = labels
@@ -253,37 +253,44 @@ fn render_recovery_prompt(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .map(|label| UnicodeWidthStr::width(*label))
         .max()
         .unwrap_or(0);
-    let content = vec![
-        Line::from(Span::styled(
-            "A suspended operation can continue from its last checkpoint.",
-            Style::default().fg(theme.text),
-        )),
-        Line::from(""),
-        crate::chrome::option_line(
-            theme,
-            state.recovery_prompt_selected == 0,
-            "1",
-            labels[0],
-            label_width,
-            "",
-            inner_width,
-        ),
-        crate::chrome::option_line(
-            theme,
-            state.recovery_prompt_selected == 1,
-            "2",
-            labels[1],
-            label_width,
-            "",
-            inner_width,
-        ),
-        Line::from(""),
-        crate::chrome::hint_line(
-            theme,
-            inner_width,
-            &[("↑↓", "move"), ("Enter", "confirm"), ("Esc", "cancel")],
-        ),
-    ];
+    // Pre-wrap instead of relying on `Paragraph::wrap`: the popup is sized from
+    // `content.len()` below, so the row count has to be known before the popup
+    // (and therefore the `Paragraph`) exists.
+    let mut content: Vec<Line<'static>> = wrap_text(
+        "A suspended operation can continue from its last checkpoint.",
+        inner_width,
+    )
+    .into_iter()
+    .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.text))))
+    .collect();
+    content.push(Line::from(""));
+    content.push(crate::chrome::option_line(
+        theme,
+        state.recovery_prompt_selected == 0,
+        "1",
+        labels[0],
+        label_width,
+        "",
+        inner_width,
+    ));
+    content.push(crate::chrome::option_line(
+        theme,
+        state.recovery_prompt_selected == 1,
+        "2",
+        labels[1],
+        label_width,
+        "",
+        inner_width,
+    ));
+    content.push(Line::from(""));
+    content.push(crate::chrome::hint_line(
+        theme,
+        inner_width,
+        &[("↑↓", "move"), ("Enter", "confirm"), ("Esc", "cancel")],
+    ));
+
+    let popup = crate::chrome::dialog_rect(area, width, content.len() as u16, 14);
+    frame.render_widget(Clear, popup);
     let block = crate::chrome::panel_block(theme, "Recover operation", theme.border);
     frame.render_widget(Paragraph::new(content).block(block), popup);
 }
@@ -5285,8 +5292,14 @@ fn mention_status_text(
 }
 
 fn plan_approval_popup(area: Rect) -> Rect {
-    let width = 78u16.min(area.width.saturating_sub(4));
-    let height = 8u16.min(area.height.saturating_sub(2));
+    let width = 72u16.min(area.width.saturating_sub(4));
+    // description + blank + 2 options + blank + hint = 6 content rows, plus
+    // the 2 border rows `render_plan_approval_dialog` always draws.
+    let content_rows = 6u16;
+    let height = content_rows
+        .saturating_add(2)
+        .min(area.height.saturating_sub(2))
+        .max(1);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.bottom().saturating_sub(height + 1),
@@ -5378,10 +5391,13 @@ fn approval_dialog_geometry(
 ) -> ApprovalDialogGeometry {
     let width = 72u16.min(area.width.saturating_sub(4));
     let max_height = area.height.saturating_sub(2);
-    // Content rows once laid out: target (0/1) + diff + truncation row + a
-    // blank separator + one row per option + a trailing blank + the hint row.
+    // Content rows once laid out: tool (0/1, permission requests only) +
+    // target (0/1) + diff + truncation row + a blank separator + one row per
+    // option + a trailing blank + the hint row.
+    let tool_rows = u16::from(dialog.permission_kind.is_some());
     let target_rows = u16::from(dialog.target.is_some());
-    let fixed_content_rows = target_rows + dialog.options.len() as u16 + 3;
+    let header_rows = tool_rows + target_rows;
+    let fixed_content_rows = header_rows + dialog.options.len() as u16 + 3;
     let max_content_rows = max_height.saturating_sub(2);
     let available_diff_rows = max_content_rows.saturating_sub(fixed_content_rows) as usize;
     let source_diff_lines = dialog
@@ -5397,10 +5413,10 @@ fn approval_dialog_geometry(
         desired_diff_lines.min(available_diff_rows.saturating_sub(truncation_row));
     let content_rows = fixed_content_rows + shown_diff_lines as u16 + truncation_row as u16;
     let popup = crate::chrome::dialog_rect(area, width, content_rows, max_height);
-    // Border, then the target line, then the bounded diff block, then the
-    // blank separator before the first option.
+    // Border, then the tool/target header lines, then the bounded diff
+    // block, then the blank separator before the first option.
     let first_option_row =
-        popup.y + 1 + target_rows + shown_diff_lines as u16 + truncation_row as u16 + 1;
+        popup.y + 1 + header_rows + shown_diff_lines as u16 + truncation_row as u16 + 1;
     ApprovalDialogGeometry {
         popup,
         shown_diff_lines,
@@ -5437,6 +5453,20 @@ fn render_approval_dialog(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let popup = geometry.popup;
     let inner_width = usize::from(popup.width.saturating_sub(4));
     let mut content: Vec<Line<'static>> = Vec::new();
+    // A plain tool approval already names the tool in its title ("Approve ·
+    // <tool>"); a permission request's title names the risk instead
+    // ("Network Permission Required"), so the tool has to appear in the body.
+    if dialog.permission_kind.is_some() {
+        content.push(Line::from(vec![
+            Span::styled("tool  ", theme.muted_style()),
+            Span::styled(
+                dialog.tool.clone(),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
     if let Some(target) = dialog.target.as_deref() {
         content.push(Line::from(Span::styled(
             truncate_to_display_width(target, inner_width),
@@ -5633,6 +5663,21 @@ fn setup_option_line<'a>(selected: bool, label: &str, key: &str, theme: &Theme) 
     crate::chrome::option_line(theme, selected, key, label, 20, "", 60)
 }
 
+/// Wraps an unbounded interpolated value (a filesystem path, an error
+/// message) instead of letting an un-`.wrap()`ped `Paragraph` clip it, since
+/// the setup popups are sized from their exact row count. Continuation rows
+/// get a two-space indent so they read as part of the same entry.
+fn wrap_notice_line(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    wrap_text(text, width.saturating_sub(2))
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let row = if index == 0 { row } else { format!("  {row}") };
+            Line::from(Span::styled(row, style))
+        })
+        .collect()
+}
+
 fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme: &Theme) {
     let area = frame.area();
 
@@ -5645,73 +5690,71 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                 Style::default().fg(theme.text),
             ))];
             if let Some(first_run) = &state.first_run {
-                content.extend([
-                    Line::from(Span::styled(
-                        format!("Workspace: {}", first_run.workspace.display()),
-                        Style::default().fg(theme.border),
-                    )),
-                    Line::from(Span::styled(
-                        format!("Auth file: {}", first_run.auth_path.display()),
-                        Style::default().fg(theme.muted),
-                    )),
-                    Line::from(Span::styled(
-                        format!(
-                            "Folder trust: {}",
-                            if first_run.workspace_trusted {
-                                "trusted"
-                            } else {
-                                "untrusted"
-                            }
-                        ),
-                        Style::default().fg(if first_run.workspace_trusted {
-                            theme.warning
-                        } else {
-                            theme.success
-                        }),
-                    )),
-                    Line::from(Span::styled(
-                        "Generated tools remain sandboxed and may request explicit access.",
-                        Style::default().fg(theme.text),
-                    )),
-                    Line::from(Span::styled(
-                        format!(
-                            "Local doctor checks: {} pass, {} warn, {} fail",
-                            first_run
-                                .diagnostics
-                                .checks
-                                .iter()
-                                .filter(|check| {
-                                    check.status
-                                        == orca_runtime::diagnostics::DiagnosticStatus::Pass
-                                })
-                                .count(),
-                            first_run
-                                .diagnostics
-                                .checks
-                                .iter()
-                                .filter(|check| {
-                                    check.status
-                                        == orca_runtime::diagnostics::DiagnosticStatus::Warn
-                                })
-                                .count(),
-                            first_run
-                                .diagnostics
-                                .checks
-                                .iter()
-                                .filter(|check| {
-                                    check.status
-                                        == orca_runtime::diagnostics::DiagnosticStatus::Fail
-                                })
-                                .count(),
-                        ),
-                        Style::default().fg(theme.muted),
-                    )),
-                ]);
-            } else if let Some(error) = &state.first_run_error {
+                content.extend(wrap_notice_line(
+                    &format!("Workspace: {}", first_run.workspace.display()),
+                    inner_width,
+                    Style::default().fg(theme.border),
+                ));
+                content.extend(wrap_notice_line(
+                    &format!("Auth file: {}", first_run.auth_path.display()),
+                    inner_width,
+                    Style::default().fg(theme.muted),
+                ));
                 content.push(Line::from(Span::styled(
-                    format!("Cannot inspect security state: {error}"),
-                    Style::default().fg(theme.error),
+                    format!(
+                        "Folder trust: {}",
+                        if first_run.workspace_trusted {
+                            "trusted"
+                        } else {
+                            "untrusted"
+                        }
+                    ),
+                    Style::default().fg(if first_run.workspace_trusted {
+                        theme.warning
+                    } else {
+                        theme.success
+                    }),
                 )));
+                content.push(Line::from(Span::styled(
+                    "Generated tools remain sandboxed and may request explicit access.",
+                    Style::default().fg(theme.text),
+                )));
+                content.push(Line::from(Span::styled(
+                    format!(
+                        "Local doctor checks: {} pass, {} warn, {} fail",
+                        first_run
+                            .diagnostics
+                            .checks
+                            .iter()
+                            .filter(|check| {
+                                check.status == orca_runtime::diagnostics::DiagnosticStatus::Pass
+                            })
+                            .count(),
+                        first_run
+                            .diagnostics
+                            .checks
+                            .iter()
+                            .filter(|check| {
+                                check.status == orca_runtime::diagnostics::DiagnosticStatus::Warn
+                            })
+                            .count(),
+                        first_run
+                            .diagnostics
+                            .checks
+                            .iter()
+                            .filter(|check| {
+                                check.status == orca_runtime::diagnostics::DiagnosticStatus::Fail
+                            })
+                            .count(),
+                    ),
+                    Style::default().fg(theme.muted),
+                )));
+            } else if let Some(error) = &state.first_run_error {
+                content.extend(wrap_notice_line(
+                    &format!("Cannot inspect security state: {error}"),
+                    inner_width,
+                    Style::default().fg(theme.error),
+                ));
             }
             content.extend([
                 Line::from(""),
@@ -5750,17 +5793,6 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
         }
         1 => {
             let width = 60u16.min(area.width.saturating_sub(4));
-            let height = 14u16.min(area.height.saturating_sub(2));
-            let popup_area = centered_rect(area, width, height);
-
-            let inner =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(Rect::new(
-                    popup_area.x + 1,
-                    popup_area.y + 1,
-                    popup_area.width.saturating_sub(2),
-                    popup_area.height.saturating_sub(2),
-                ));
-
             let content = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -5784,6 +5816,18 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                     Style::default().fg(theme.muted),
                 )),
             ];
+            // Content rows plus the 3-row textarea surface below it.
+            let textarea_rows = 3u16;
+            let popup_area =
+                crate::chrome::dialog_rect(area, width, content.len() as u16 + textarea_rows, 14);
+
+            let inner = Layout::vertical([Constraint::Min(3), Constraint::Length(textarea_rows)])
+                .split(Rect::new(
+                    popup_area.x + 1,
+                    popup_area.y + 1,
+                    popup_area.width.saturating_sub(2),
+                    popup_area.height.saturating_sub(2),
+                ));
 
             let block = crate::chrome::panel_block(theme, "Setup", theme.border);
 
@@ -5793,8 +5837,6 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
         }
         2 => {
             let width = 60u16.min(area.width.saturating_sub(4));
-            let height = 12u16.min(area.height.saturating_sub(2));
-            let popup_area = centered_rect(area, width, height);
 
             let auth_path = state
                 .first_run
@@ -5825,6 +5867,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
                     Style::default().fg(theme.muted),
                 )),
             ];
+            let popup_area = crate::chrome::dialog_rect(area, width, content.len() as u16, 12);
 
             let block = crate::chrome::panel_block(theme, "Setup Complete", theme.success);
 
@@ -7508,6 +7551,34 @@ mod tests {
     }
 
     #[test]
+    fn recovery_prompt_wraps_its_description_instead_of_clipping() {
+        let mut wide_state = test_state();
+        wide_state.recovery_prompt_visible = true;
+        let wide = frame_string(&mut wide_state, 100, 30);
+        assert!(
+            wide.contains("A suspended operation can continue from its last checkpoint."),
+            "{wide}"
+        );
+
+        let mut narrow_state = test_state();
+        narrow_state.recovery_prompt_visible = true;
+        let narrow = frame_string(&mut narrow_state, 50, 20);
+        let rows: Vec<&str> = narrow.lines().collect();
+        let first_row = rows
+            .iter()
+            .position(|line| line.contains("A suspended operation can continue from"))
+            .expect("first wrapped row present");
+        let second_row = rows
+            .iter()
+            .position(|line| line.contains("its last checkpoint."))
+            .expect("second wrapped row present");
+        assert_ne!(
+            first_row, second_row,
+            "description must wrap across two rows without losing text: {narrow}"
+        );
+    }
+
+    #[test]
     fn approval_dialog_uses_shared_options_and_hints() {
         let mut state = test_state();
         state.status = AppStatus::WaitingApproval;
@@ -7537,6 +7608,33 @@ mod tests {
         );
         assert!(!frame.contains("legacy"), "{frame}");
         assert!(!frame.contains("▸"), "{frame}");
+    }
+
+    #[test]
+    fn permission_approval_dialog_keeps_its_risk_title_and_shows_the_tool_line() {
+        let mut state = test_state();
+        state.status = AppStatus::WaitingApproval;
+        state.approval_dialog = Some(ApprovalDialog {
+            id: "1".into(),
+            interaction: None,
+            tool: "bash".into(),
+            target: Some("curl https://api.example.invalid".into()),
+            permission_kind: Some(
+                orca_runtime::runtime_permission::RuntimePermissionRequestKind::NetworkBlock,
+            ),
+            background_task_id: None,
+            selected: 0,
+            options: vec![
+                ApprovalOption::Once,
+                ApprovalOption::AlwaysTool,
+                ApprovalOption::Deny,
+            ],
+            diff: None,
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("Network Permission Required"), "{frame}");
+        assert!(frame.contains("tool  bash"), "{frame}");
+        assert!(!frame.contains("Approve · bash"), "{frame}");
     }
 
     #[test]
@@ -7581,6 +7679,39 @@ mod tests {
             "security notice should not pad with empty rows: {box_rows}"
         );
         assert!(rendered.contains("› T  Trust workspace"), "{rendered}");
+    }
+
+    #[test]
+    fn setup_security_notice_wraps_a_long_workspace_path_without_clipping() {
+        let mut state = test_state();
+        state.status = AppStatus::Setup;
+        state.setup_step = 0;
+        state.first_run = Some(orca_runtime::onboarding::FirstRunState {
+            schema_version: 1,
+            workspace: std::path::PathBuf::from(
+                "/Users/qingyun/very/deeply/nested/workspace/directory/segment/for/wrap/testing/wraptestmarker",
+            ),
+            config_dir: std::path::PathBuf::from("/tmp/orca-config"),
+            auth_path: std::path::PathBuf::from("/tmp/orca-config/auth.json"),
+            acknowledgement_path: std::path::PathBuf::from("/tmp/orca-config/onboarding.toml"),
+            security_policy_digest: "digest".to_string(),
+            acknowledged: true,
+            workspace_trusted: true,
+            diagnostics: orca_runtime::diagnostics::DiagnosticReport {
+                schema_version: orca_runtime::diagnostics::DOCTOR_SCHEMA_VERSION,
+                package: orca_runtime::diagnostics::CANONICAL_PACKAGE,
+                website: orca_runtime::diagnostics::CANONICAL_WEBSITE,
+                version: "test".to_string(),
+                platform: "test".to_string(),
+                cwd: orca_runtime::diagnostics::DiagnosticCwd {
+                    requested: "/tmp".to_string(),
+                    canonical: None,
+                },
+                checks: Vec::new(),
+            },
+        });
+        let frame = frame_string(&mut state, 100, 30);
+        assert!(frame.contains("wraptestmarker"), "{frame}");
     }
 
     #[test]
@@ -12251,7 +12382,7 @@ mod tests {
             .draw(|frame| render(frame, &mut state, &textarea, &theme))
             .unwrap();
 
-        let cursor = Position::new(12, 14);
+        let cursor = Position::new(12, 13);
         terminal.backend_mut().assert_cursor_position(cursor);
         let buffer = terminal.backend().buffer();
         let rendered = buffer
@@ -12311,7 +12442,7 @@ mod tests {
                 );
                 assert_eq!(
                     moves,
-                    [CursorEvent::Move(Position::new(12, 14))],
+                    [CursorEvent::Move(Position::new(12, 13))],
                     "{cursor_events:?}"
                 );
                 let rendered = terminal
