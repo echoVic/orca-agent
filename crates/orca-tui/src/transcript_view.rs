@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span, StyledGrapheme};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
+use crate::chrome::{GUTTER_CONTINUATION, GUTTER_WIDTH};
 use crate::selection::{SelectionPos, TranscriptSelection, slice_row_by_columns};
 use crate::terminal_capabilities::TerminalColorLevel;
 use crate::theme::Theme;
@@ -370,17 +371,23 @@ impl CachedMessage {
         let Some(content) = self.wrapped_lines.first_mut().map(|line| &mut line.text) else {
             return false;
         };
-        let Some(old_icon) = content.get(2..).and_then(|rest| rest.chars().next()) else {
+        // Tool-call rows open with `GUTTER_CONTINUATION` (see `append_message_lines`'s
+        // `ToolCall` arm) immediately followed by the spinner glyph, so the glyph always
+        // starts at byte offset `GUTTER_WIDTH`.
+        let Some(old_icon) = content
+            .get(GUTTER_WIDTH..)
+            .and_then(|rest| rest.chars().next())
+        else {
             return false;
         };
-        let icon_end = 2 + old_icon.len_utf8();
-        if content.get(..2) != Some("  ")
-            || !SPINNER_FRAMES.contains(&content.get(2..icon_end).unwrap_or_default())
+        let icon_end = GUTTER_WIDTH + old_icon.len_utf8();
+        if content.get(..GUTTER_WIDTH) != Some(GUTTER_CONTINUATION)
+            || !SPINNER_FRAMES.contains(&content.get(GUTTER_WIDTH..icon_end).unwrap_or_default())
         {
             return false;
         }
         content.replace_range(
-            2..icon_end,
+            GUTTER_WIDTH..icon_end,
             SPINNER_FRAMES[spinner_phase as usize % SPINNER_FRAMES.len()],
         );
         self.spinner_phase = Some(spinner_phase);
@@ -1483,7 +1490,7 @@ fn searchable_logical_line(
         for (character_index, character) in row.chars().enumerate() {
             let spinner = exclude_spinner
                 && row_within == 0
-                && character_index == 2
+                && character_index == GUTTER_WIDTH
                 && SPINNER_FRAMES
                     .iter()
                     .any(|frame| frame.starts_with(character));
@@ -2124,7 +2131,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(cache.search(0, &SearchQuery::new("read")).len(), 1);
-        assert_eq!(cache.search(0, &SearchQuery::new("running")).len(), 1);
+        assert_eq!(cache.search(0, &SearchQuery::new("src/lib.rs")).len(), 1);
     }
 
     #[test]

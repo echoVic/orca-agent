@@ -17,10 +17,9 @@ fn inserted_source_line<'a>(
         .iter()
         .find(|line| {
             line.to_string().contains(source)
-                && line
-                    .spans
-                    .first()
-                    .is_some_and(|span| span.content.ends_with("+ "))
+                // The diff rail (`    │ `) always leads a diff line now, so the
+                // "+ " added-line gutter marker can be any later span, not just the first.
+                && line.spans.iter().any(|span| span.content.ends_with("+ "))
         })
         .unwrap_or_else(|| panic!("inserted source line containing {source:?}"))
 }
@@ -5082,9 +5081,11 @@ class Item:
     let cold_field = inserted_source_line(&cold, "    field = 1");
     let warm_field = inserted_source_line(&warm, "    field = 1");
 
-    assert_ne!(warm_field.spans[1..], cold_field.spans[1..]);
+    // spans[0] is the `    │ ` output rail and spans[1] is the diff gutter marker;
+    // the syntax-highlighted source content starts at spans[2].
+    assert_ne!(warm_field.spans[2..], cold_field.spans[2..]);
     assert_eq!(
-        normalized_source_spans(&warm_field.spans[1..]),
+        normalized_source_spans(&warm_field.spans[2..]),
         normalized_source_spans(&refined[&4])
     );
     assert!(!state.edit_highlight_needs_tick());

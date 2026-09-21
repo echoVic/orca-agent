@@ -183,10 +183,12 @@ mod tests {
             .iter()
             .find(|line| {
                 line.to_string().contains(source)
+                    // The diff rail (`    │ `) always leads a diff line now, so the
+                    // "+ " added-line gutter marker can be any later span, not just the first.
                     && line
                         .spans
-                        .first()
-                        .is_some_and(|span| span.content.ends_with("+ "))
+                        .iter()
+                        .any(|span| span.content.ends_with("+ "))
             })
             .unwrap_or_else(|| panic!("inserted source line containing {source:?}"))
     }

@@ -3087,42 +3087,65 @@ fn append_message_lines(
         } => {
             let neutral_completed =
                 status == "completed" && matches!(kind.as_deref(), Some("empty" | "no_matches"));
+            let is_edit = diff.is_some() || matches!(name.as_str(), "edit" | "write_file");
             let icon = match status.as_str() {
+                "completed" if is_edit => "✎",
                 "completed" => "✓",
                 "running" | "receiving" => spinner_frame(tick),
-                "denied" => "✗",
-                "failed" => "✗",
+                "denied" | "failed" => "✗",
                 "cancelled" => "×",
                 "indeterminate" => "?",
                 _ => "·",
             };
             let color = match status.as_str() {
                 "completed" if neutral_completed => theme.muted,
+                "completed" if is_edit => theme.warning,
                 "completed" => theme.success,
                 "running" | "receiving" => theme.warning,
                 "denied" | "failed" => theme.error,
                 "cancelled" | "indeterminate" => theme.warning,
                 _ => theme.muted,
             };
-            let display_status = match status.as_str() {
-                "cancelled" => "interrupted",
-                "indeterminate" => "state unknown",
-                status => status,
+            let status_suffix = match status.as_str() {
+                "completed" | "running" | "receiving" => None,
+                "cancelled" => Some("interrupted"),
+                "indeterminate" => Some("state unknown"),
+                other => Some(other),
             };
-            let prefix = format!("  {icon} {name}");
-            let status_text = format!(" ({display_status})");
-            let reserved_width = UnicodeWidthStr::width(prefix.as_str())
-                + UnicodeWidthStr::width(status_text.as_str());
-            let target_width =
-                width.saturating_sub(reserved_width + 2 * usize::from(target.is_some()));
-            let target_str = target
-                .as_deref()
-                .map(|target| format!(": {}", truncate_to_display_width(target, target_width)))
-                .unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::styled(format!("{prefix}{target_str}"), Style::default().fg(color)),
-                Span::styled(status_text, Style::default().fg(theme.muted)),
-            ]));
+            let mut spans = vec![
+                Span::raw(GUTTER_CONTINUATION),
+                Span::styled(format!("{icon} "), Style::default().fg(color)),
+                Span::styled(
+                    tool_display_name(name).to_string(),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            let used = GUTTER_WIDTH + 2 + UnicodeWidthStr::width(tool_display_name(name));
+            if let Some(target) = target {
+                let budget = width.saturating_sub(used + 2 + 24).max(8);
+                spans.push(Span::styled(
+                    format!("  {}", truncate_to_display_width(target, budget)),
+                    theme.muted_style(),
+                ));
+            }
+            if let Some(diff) = diff {
+                let (added, removed) = diff_summary(diff);
+                spans.push(Span::styled(
+                    format!("  +{added} "),
+                    Style::default().fg(theme.diff_add),
+                ));
+                spans.push(Span::styled(
+                    format!("−{removed}"),
+                    Style::default().fg(theme.diff_remove),
+                ));
+            }
+            if let Some(suffix) = status_suffix {
+                spans.push(Span::styled(
+                    format!(" · {suffix}"),
+                    Style::default().fg(color),
+                ));
+            }
+            lines.push(Line::from(spans));
             if let Some(out) = output {
                 if !is_workflow_draft_tool(name)
                     || !append_workflow_draft_preview_lines(
@@ -3175,26 +3198,24 @@ fn append_diagnostic_lines(
     diagnostic: &TuiDiagnostic,
     theme: &Theme,
 ) {
-    let accent = match diagnostic.level() {
-        DiagnosticLevel::Error => theme.error,
-        DiagnosticLevel::Warning => theme.warning,
-        DiagnosticLevel::Info => theme.muted,
+    let (icon, accent) = match diagnostic.level() {
+        DiagnosticLevel::Error => ("✗", theme.error),
+        DiagnosticLevel::Warning => ("⚠", theme.warning),
+        DiagnosticLevel::Info => ("ℹ", theme.muted),
     };
     lines.push(Line::from(vec![
+        Span::raw(GUTTER_CONTINUATION),
+        Span::styled(format!("{icon} "), Style::default().fg(accent)),
         Span::styled(
-            diagnostic.level().label(),
+            diagnostic.title().to_string(),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!(" [{}]: {}", diagnostic.code(), diagnostic.title()),
-            Style::default().fg(accent),
-        ),
+        Span::styled(format!("  [{}]", diagnostic.code()), theme.dim_style()),
     ]));
-    append_labeled_diagnostic_text(lines, "Cause", diagnostic.detail(), theme);
+    append_labeled_diagnostic_text(lines, "cause", diagnostic.detail(), theme);
     if let Some(action) = diagnostic.action() {
-        append_labeled_diagnostic_text(lines, "Next", action, theme);
+        append_labeled_diagnostic_text(lines, "next", action, theme);
     }
-    lines.push(Line::from(""));
 }
 
 fn append_labeled_diagnostic_text(
@@ -3205,13 +3226,13 @@ fn append_labeled_diagnostic_text(
 ) {
     for (index, line) in text.lines().enumerate() {
         let label = if index == 0 {
-            format!("  {label}: ")
+            format!("      {label:<5}  ")
         } else {
-            "         ".to_string()
+            "             ".to_string()
         };
         lines.push(Line::from(vec![
-            Span::styled(label, Style::default().fg(theme.muted)),
-            Span::styled(line.to_string(), Style::default().fg(theme.text)),
+            Span::styled(label, theme.dim_style()),
+            Span::styled(line.to_string(), theme.muted_style()),
         ]));
     }
 }
@@ -3414,15 +3435,58 @@ fn append_proposed_plan_lines(
     lines.push(Line::from(""));
 }
 
+/// Short, human tool names for transcript rows. Unknown names pass through;
+/// `tool:<id>` placeholders (history without a recorded name) become "tool".
+pub(crate) fn tool_display_name(name: &str) -> &str {
+    if name.starts_with("tool:") {
+        return "tool";
+    }
+    match name {
+        "read_file" => "read",
+        "write_file" => "write",
+        "list_files" => "ls",
+        "git_status" => "git status",
+        "ask_user_question" => "ask",
+        "update_plan" => "plan",
+        "web_search" => "search",
+        "task_read_output" => "task output",
+        "task_send_input" => "task input",
+        "task_wait" => "task wait",
+        "task_stop" => "task stop",
+        "task_list" => "tasks",
+        "subagent_message" => "agent message",
+        "WorkflowDraft" | "workflow_draft" => "workflow draft",
+        "WorkflowDraftAction" => "workflow action",
+        "Workflow" => "workflow",
+        other => other,
+    }
+}
+
+fn diff_summary(diff: &str) -> (usize, usize) {
+    diff.lines().fold((0, 0), |(added, removed), line| {
+        if line.starts_with("+++") || line.starts_with("---") {
+            (added, removed)
+        } else if line.starts_with('+') {
+            (added + 1, removed)
+        } else if line.starts_with('-') {
+            (added, removed + 1)
+        } else {
+            (added, removed)
+        }
+    })
+}
+
 fn append_diff_lines(
     lines: &mut Vec<Line<'static>>,
     diff: &str,
     theme: &Theme,
     refined: Option<&crate::diff_highlight::RefinedDiffStyles>,
 ) {
-    lines.extend(crate::diff_highlight::render_unified_diff(
-        diff, theme, refined,
-    ));
+    let rail = Span::styled("    │ ".to_string(), theme.dim_style());
+    for mut line in crate::diff_highlight::render_unified_diff(diff, theme, refined) {
+        line.spans.insert(0, rail.clone());
+        lines.push(line);
+    }
 }
 
 fn append_tool_output_lines(
@@ -3433,30 +3497,38 @@ fn append_tool_output_lines(
     theme: &Theme,
 ) {
     // Flushing to the immutable scrollback (`force_expand`) commits the entire output so
-    // nothing is hidden behind a "[+N lines]" stub that `e` can no longer reveal. The live
-    // pane caps the `e`-expanded view at 40 rows and the collapsed view at 2.
-    let max_lines = if force_expand {
+    // nothing is hidden behind a stub that `e` can no longer reveal. The live pane caps the
+    // `e`-expanded view at 40 rows and the collapsed view at 2.
+    let total = output.lines().count();
+    let shown = if force_expand {
         usize::MAX
     } else if expanded {
         40
     } else {
         2
     };
-    let mut output_lines = output.lines();
-    for line in output_lines.by_ref().take(max_lines) {
-        lines.push(Line::from(Span::styled(
-            format!("    {line}"),
-            Style::default().fg(theme.muted),
-        )));
+    let rail = Span::styled("    │ ".to_string(), theme.dim_style());
+    for line in output.lines().take(shown) {
+        lines.push(Line::from(vec![
+            rail.clone(),
+            Span::styled(line.to_string(), theme.muted_style()),
+        ]));
     }
-
-    let hidden = output_lines.count();
-    if hidden > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("    [+{hidden} lines]"),
-            Style::default().fg(theme.muted),
-        )));
+    if force_expand {
+        return;
     }
+    let hidden = total.saturating_sub(shown);
+    let tail = if hidden > 0 {
+        format!("+{hidden} lines · e to expand")
+    } else if expanded && total > 2 {
+        format!("{total} lines · e to collapse")
+    } else {
+        return;
+    };
+    lines.push(Line::from(vec![
+        Span::styled("    └ ".to_string(), theme.dim_style()),
+        Span::styled(tail, theme.muted_style()),
+    ]));
 }
 
 fn is_workflow_draft_tool(name: &str) -> bool {
@@ -3483,7 +3555,7 @@ fn append_workflow_draft_preview_lines(
         .unwrap_or_else(|| "dynamic agent count".to_string());
     lines.push(Line::from(vec![
         Span::styled(
-            "    Workflow preview · ",
+            "    │ Workflow preview · ",
             Style::default()
                 .fg(theme.approval)
                 .add_modifier(Modifier::BOLD),
@@ -3494,16 +3566,16 @@ fn append_workflow_draft_preview_lines(
         ),
     ]));
     lines.push(Line::from(Span::styled(
-        format!("    {}", draft.description),
+        format!("    │ {}", draft.description),
         Style::default().fg(theme.text),
     )));
     lines.push(Line::from(vec![
-        Span::styled("    phases · ", Style::default().fg(theme.muted)),
+        Span::styled("    │ phases · ", Style::default().fg(theme.muted)),
         Span::styled(draft.phases.join(" → "), Style::default().fg(theme.border)),
     ]));
     lines.push(Line::from(Span::styled(
         format!(
-            "    {agents} · concurrency {} · {risk}",
+            "    │ {agents} · concurrency {} · {risk}",
             draft.max_configured_concurrent_agents
         ),
         Style::default().fg(match draft.source_mutation_risk {
@@ -3512,13 +3584,13 @@ fn append_workflow_draft_preview_lines(
         }),
     )));
     lines.push(Line::from(Span::styled(
-        format!("    draft · {}", draft.draft_id),
+        format!("    │ draft · {}", draft.draft_id),
         Style::default().fg(theme.muted),
     )));
 
     if expanded || force_expand {
         lines.push(Line::from(Span::styled(
-            "    JavaScript",
+            "    │ JavaScript",
             Style::default()
                 .fg(theme.approval)
                 .add_modifier(Modifier::BOLD),
@@ -4610,7 +4682,7 @@ fn current_tool_label(state: &AppState) -> Option<String> {
                 status,
                 ..
             } if matches!(status.as_str(), "running" | "receiving") => {
-                let name = name.strip_suffix("_file").unwrap_or(name);
+                let name = tool_display_name(name);
                 Some(match target {
                     Some(target) => format!("{name} {}", truncate_to_display_width(target, 48)),
                     None => name.to_string(),
@@ -6432,15 +6504,15 @@ mod tests {
         assert_eq!(
             rendered,
             [
-                "ERROR [provider.rate_limit]: Provider limit reached",
-                "  Cause: DeepSeek provider error: 429 rate limit exceeded",
-                "  Next: Wait before retrying and check the provider account quota if the error persists.",
-                "",
+                "    ✗ Provider limit reached  [provider.rate_limit]",
+                "      cause  DeepSeek provider error: 429 rate limit exceeded",
+                "      next   Wait before retrying and check the provider account quota if the error persists.",
             ]
         );
-        assert_eq!(lines[0].spans[0].style.fg, Some(theme.error));
+        assert_eq!(lines[0].spans[1].style.fg, Some(theme.error));
+        assert_eq!(lines[0].spans[2].style.fg, Some(theme.error));
         assert_eq!(lines[1].spans[0].style.fg, Some(theme.muted));
-        assert_eq!(lines[1].spans[1].style.fg, Some(theme.text));
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme.muted));
     }
 
     const REFINED_TOOL_DIFF: &str = "\
@@ -6655,10 +6727,12 @@ mod tests {
             .iter()
             .find(|line| {
                 line.to_string().contains(source)
+                    // The diff rail (`    │ `) always leads a diff line now, so the
+                    // marker (e.g. "+ "/"- ") can be any later span, not just the first.
                     && marker.is_none_or(|marker| {
                         line.spans
-                            .first()
-                            .is_some_and(|span| span.content.ends_with(&format!("{marker} ")))
+                            .iter()
+                            .any(|span| span.content.ends_with(&format!("{marker} ")))
                     })
             })
             .unwrap_or_else(|| panic!("rendered line containing {needle:?}"))
@@ -6692,10 +6766,11 @@ mod tests {
         let warm_insert = line_containing(&warm, "+value = 2");
         let warm_context = line_containing(&warm, "print(value)");
 
-        assert_eq!(warm_insert.spans[0].content.as_ref(), "  1 + ");
-        assert_eq!(warm_insert.spans[1].style.fg, Some(Color::Magenta));
-        assert_eq!(warm_context.spans[0].content.as_ref(), "2 2   ");
-        assert_eq!(warm_context.spans[1].style.fg, Some(Color::Cyan));
+        // spans[0] is the `    │ ` output rail; the diff gutter and content follow it.
+        assert_eq!(warm_insert.spans[1].content.as_ref(), "  1 + ");
+        assert_eq!(warm_insert.spans[2].style.fg, Some(Color::Magenta));
+        assert_eq!(warm_context.spans[1].content.as_ref(), "2 2   ");
+        assert_eq!(warm_context.spans[2].style.fg, Some(Color::Cyan));
         assert_eq!(cold_delete.spans, warm_delete.spans);
     }
 
@@ -7441,6 +7516,138 @@ mod tests {
         ))
     }
 
+    fn tool_call(
+        name: &str,
+        target: Option<&str>,
+        status: &str,
+        output: Option<&str>,
+        expanded: bool,
+    ) -> ChatMessage {
+        ChatMessage::ToolCall {
+            id: "call-1".into(),
+            name: name.into(),
+            target: target.map(str::to_string),
+            status: status.into(),
+            output: output.map(str::to_string),
+            diff: None,
+            kind: None,
+            expanded,
+        }
+    }
+
+    #[test]
+    fn tool_rows_show_short_name_target_and_a_rail_for_output() {
+        let text = message_text(
+            None,
+            &tool_call(
+                "read_file",
+                Some("src/main.rs"),
+                "completed",
+                Some("l1\nl2\nl3\nl4"),
+                false,
+            ),
+        );
+        assert_eq!(text[0], "    ✓ read  src/main.rs");
+        assert_eq!(text[1], "    │ l1");
+        assert_eq!(text[2], "    │ l2");
+        assert_eq!(text[3], "    └ +2 lines · e to expand");
+        let expanded = message_text(
+            None,
+            &tool_call(
+                "read_file",
+                Some("src/main.rs"),
+                "completed",
+                Some("l1\nl2\nl3\nl4"),
+                true,
+            ),
+        );
+        assert_eq!(expanded.last().unwrap(), "    └ 4 lines · e to collapse");
+    }
+
+    #[test]
+    fn tool_rows_only_spell_out_non_completed_statuses() {
+        let running = message_text(
+            None,
+            &tool_call("bash", Some("cargo test"), "running", None, false),
+        );
+        assert_eq!(running[0], "    ⠋ bash  cargo test");
+        let cancelled = message_text(
+            None,
+            &tool_call("bash", Some("cargo test"), "cancelled", None, false),
+        );
+        assert_eq!(cancelled[0], "    × bash  cargo test · interrupted");
+        let failed = message_text(
+            None,
+            &tool_call("bash", None, "failed", Some("boom"), false),
+        );
+        assert_eq!(failed[0], "    ✗ bash · failed");
+        assert_eq!(failed[1], "    │ boom");
+    }
+
+    #[test]
+    fn tool_id_placeholders_render_as_plain_tool() {
+        let text = message_text(
+            None,
+            &tool_call("tool:call_00_abc", None, "completed", None, false),
+        );
+        assert_eq!(text[0], "    ✓ tool");
+    }
+
+    #[test]
+    fn flushed_tool_output_commits_every_line_without_a_stub() {
+        let lines = lines_text(&build_lines_for_message_after(
+            None,
+            &tool_call("bash", None, "completed", Some("a\nb\nc\nd\ne"), false),
+            &Theme::named(ThemeName::Dark),
+            80,
+            0,
+            true,
+            None,
+        ));
+        assert_eq!(lines.len(), 6);
+        assert!(
+            lines.iter().skip(1).all(|line| line.starts_with("    │ ")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn edit_tool_rows_carry_a_diff_summary() {
+        let diff =
+            "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,3 @@\n-old\n+new\n+more\n context\n";
+        let message = ChatMessage::ToolCall {
+            id: "1".into(),
+            name: "edit".into(),
+            target: Some("src/main.rs".into()),
+            status: "completed".into(),
+            output: None,
+            diff: Some(diff.into()),
+            kind: None,
+            expanded: false,
+        };
+        let text = message_text(None, &message);
+        assert_eq!(text[0], "    ✎ edit  src/main.rs  +2 −1");
+        assert!(
+            text[1..].iter().all(|line| line.starts_with("    │ ")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_render_as_an_icon_title_with_indented_cause_and_next() {
+        let text = message_text(
+            None,
+            &ChatMessage::Error("DeepSeek provider error: 429 rate limit exceeded".into()),
+        );
+        assert!(text[0].starts_with("    ✗ "), "{text:?}");
+        assert!(text[0].ends_with("[provider.rate_limit]"), "{text:?}");
+        assert!(text[1].starts_with("      cause  "), "{text:?}");
+        assert!(
+            text.iter().any(|line| line.starts_with("      next   ")),
+            "{text:?}"
+        );
+    }
+
     #[test]
     fn user_message_gets_a_gutter_and_a_leading_blank_after_any_message() {
         let user = ChatMessage::User("hello".into());
@@ -7956,8 +8163,8 @@ mod tests {
             .map(|span| span.content.into_owned())
             .collect::<String>();
 
-        assert!(rendered.contains("(interrupted)"));
-        assert!(rendered.contains("(state unknown)"));
+        assert!(rendered.contains("· interrupted"));
+        assert!(rendered.contains("· state unknown"));
         assert!(!rendered.contains("(completed)"));
     }
 
@@ -8188,8 +8395,8 @@ mod tests {
             }
 
             for (status, expected) in [
-                ("completed", "(completed)"),
-                ("indeterminate", "(state unknown)"),
+                ("completed", "✓ deploy"),
+                ("indeterminate", "· state unknown"),
             ] {
                 let mut state = test_state();
                 state.transcript.messages.push(ChatMessage::ToolCall {
@@ -9522,9 +9729,12 @@ mod tests {
             expanded: false,
         };
         let rendered = build_lines_for_messages(&[tool], &theme, 40, 0, false);
-        assert_eq!(rendered[0].width(), 40);
+        // The target is truncated to a fixed budget rather than filling the row exactly,
+        // so only bound the width here; the row must still stay on a single line.
+        assert!(rendered[0].width() <= 40);
         assert!(rendered[0].to_string().contains('…'));
-        assert!(rendered[0].to_string().ends_with("(completed)"));
+        assert!(rendered[0].to_string().starts_with("    ✓ "));
+        assert!(!rendered[0].to_string().contains("(completed)"));
     }
 
     #[test]
