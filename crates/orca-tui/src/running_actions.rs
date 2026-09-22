@@ -43,7 +43,8 @@ pub(crate) fn handle_running_shortcut(
             let page = state.viewport.visible_height / 2;
             state.scroll_down(page);
         }
-        RunningShortcut::SubmitQueued
+        RunningShortcut::SubmitNow
+        | RunningShortcut::SubmitQueued
         | RunningShortcut::Newline
         | RunningShortcut::EditLatestQueued => {}
     }

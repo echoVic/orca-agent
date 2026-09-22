@@ -945,11 +945,14 @@ fn queued_preview_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line
         || {
             if snapshot.running {
                 format!(
-                    " Running queued task · {} pending · Alt+Up edit latest",
+                    " Running queued task · {} pending · Ctrl+Enter send now · Alt+Up edit latest",
                     snapshot.len.saturating_sub(1)
                 )
             } else {
-                format!(" Queued {} · Alt+Up edit latest", snapshot.len)
+                format!(
+                    " Queued {} · Ctrl+Enter send now · Alt+Up edit latest",
+                    snapshot.len
+                )
             }
         },
         |error| format!(" Queue error · {error}"),

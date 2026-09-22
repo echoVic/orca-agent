@@ -120,6 +120,39 @@ pub(crate) fn enqueue_composer_follow_up_to_runtime(
     true
 }
 
+/// Queues the composer's text like [`enqueue_composer_follow_up_to_runtime`],
+/// then requests that it be moved to the front of the queue once its item
+/// appears in a runtime snapshot (see [`AppState::request_front_prompt`]).
+///
+/// Computes the submission text with the same construction the queued
+/// message itself uses, so the pending-front match in a later snapshot
+/// compares like with like.
+pub(crate) fn enqueue_composer_follow_up_at_front(
+    state: &mut AppState,
+    action_tx: &mpsc::Sender<UserAction>,
+    textarea: &mut TextArea,
+    vim_state: &mut VimState,
+    theme: &Theme,
+) -> bool {
+    let visible_text = textarea_text(textarea);
+    let images = state.composer_images.attachments_for_text(&visible_text);
+    let submission_text = QueuedUserMessage::from_composer_with_images(
+        visible_text,
+        state.pending_pastes.clone(),
+        state.mention_bindings.clone(),
+        images,
+    )
+    .map(|message| message.submission_text().to_string());
+
+    if !enqueue_composer_follow_up_to_runtime(state, action_tx, textarea, vim_state, theme) {
+        return false;
+    }
+    if let Some(submission_text) = submission_text {
+        state.request_front_prompt(submission_text);
+    }
+    true
+}
+
 pub(crate) fn restore_latest_queued_message(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
@@ -220,7 +253,7 @@ pub(crate) fn handle_running_key(
     {
         vim_state.cancel_pending_command();
         match shortcut {
-            RunningShortcut::SubmitQueued => {
+            RunningShortcut::SubmitQueued | RunningShortcut::SubmitNow => {
                 if state.panel_mode != PanelMode::Conversation {
                     return false;
                 }
@@ -257,7 +290,15 @@ pub(crate) fn handle_running_key(
                     }
                     return true;
                 }
-                enqueue_composer_follow_up_to_runtime(state, action_tx, textarea, vim_state, theme);
+                if shortcut == RunningShortcut::SubmitNow {
+                    enqueue_composer_follow_up_at_front(
+                        state, action_tx, textarea, vim_state, theme,
+                    );
+                } else {
+                    enqueue_composer_follow_up_to_runtime(
+                        state, action_tx, textarea, vim_state, theme,
+                    );
+                }
             }
             RunningShortcut::Newline => {
                 if state.panel_mode != PanelMode::Conversation {
@@ -320,6 +361,10 @@ mod tests {
 
     fn state() -> AppState {
         let (tx, _rx) = crossbeam_channel::unbounded();
+        state_with_tx(tx)
+    }
+
+    fn state_with_tx(tx: mpsc::Sender<UserAction>) -> AppState {
         let mut state = AppState::new(
             tx,
             "test".to_string(),
@@ -423,6 +468,202 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, ChatMessage::User(_)))
         );
+    }
+
+    #[test]
+    fn ctrl_enter_queues_the_prompt_then_reorders_it_to_the_front_once_seen() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_tx(action_tx.clone());
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("urgent follow-up", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL);
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+
+        assert!(handle_running_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+
+        assert_eq!(textarea_text(&textarea), "");
+        match action_rx.try_recv() {
+            Ok(UserAction::QueuePrompt { prompt, .. }) => {
+                assert_eq!(prompt, "urgent follow-up");
+            }
+            other => panic!("expected QueuePrompt, got {other:?}"),
+        }
+        // No id is known yet (QueuePrompt is async), so no Reorder fires
+        // until a snapshot shows the matching item.
+        assert!(action_rx.try_recv().is_err());
+
+        // Runtime settles two earlier items ahead of the new one.
+        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "first".into(),
+                },
+                1,
+            )
+            .unwrap();
+        runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "second".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let snapshot = runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "urgent follow-up".into(),
+                },
+                3,
+            )
+            .unwrap();
+        let new_item_id = snapshot.items[2].id.clone();
+
+        state.update(crate::protocol::TuiEvent::PromptQueueUpdated(snapshot));
+
+        let reorder = action_rx.try_recv().expect("Reorder action");
+        match reorder {
+            UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Reorder {
+                    expected_revision,
+                    ordered_ids,
+                },
+            ) => {
+                assert_eq!(expected_revision, state.runtime_queue_revision());
+                assert_eq!(ordered_ids[0], new_item_id);
+                assert_eq!(ordered_ids.len(), 3);
+            }
+            other => panic!("expected Reorder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_enter_queues_without_reordering() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_tx(action_tx.clone());
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("normal follow-up", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+
+        assert!(handle_running_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+
+        match action_rx.try_recv() {
+            Ok(UserAction::QueuePrompt { prompt, .. }) => {
+                assert_eq!(prompt, "normal follow-up");
+            }
+            other => panic!("expected QueuePrompt, got {other:?}"),
+        }
+
+        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        let snapshot = runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "normal follow-up".into(),
+                },
+                1,
+            )
+            .unwrap();
+        state.update(crate::protocol::TuiEvent::PromptQueueUpdated(snapshot));
+
+        // Plain Enter never records a pending-front request, so no Reorder
+        // is emitted once the item shows up.
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ctrl_enter_reorders_to_front_even_when_the_queue_is_paused() {
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let mut state = state_with_tx(action_tx.clone());
+        let theme = theme();
+        let mut vim = VimState::new(false);
+        let mut textarea = make_textarea_with_text("urgent", &vim, &theme);
+        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL);
+        let mut config = crate::test_support::test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+
+        assert!(handle_running_key(
+            &Event::Key(key),
+            &key,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut vim,
+            &theme,
+        ));
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(UserAction::QueuePrompt { .. })
+        ));
+
+        let mut runtime = orca_runtime::prompt_queue::PromptQueueState::from_snapshot(
+            orca_runtime::prompt_queue::PromptQueueSnapshot::default(),
+        );
+        runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "first".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let added = runtime
+            .apply(
+                orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "urgent".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let new_item_id = added.items[1].id.clone();
+        let mut snapshot = added;
+        snapshot.paused = true;
+
+        state.update(crate::protocol::TuiEvent::PromptQueueUpdated(snapshot));
+
+        // The item still moves to the front while paused; we don't silently
+        // unpause on its behalf.
+        let reorder = action_rx.try_recv().expect("Reorder action");
+        match reorder {
+            UserAction::PromptQueueControl(
+                orca_runtime::prompt_queue::PromptQueueAction::Reorder { ordered_ids, .. },
+            ) => {
+                assert_eq!(ordered_ids[0], new_item_id);
+            }
+            other => panic!("expected Reorder, got {other:?}"),
+        }
+        assert!(!state.queued_autosend_enabled());
     }
 
     #[test]

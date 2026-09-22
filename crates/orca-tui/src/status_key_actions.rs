@@ -220,6 +220,7 @@ fn compacting_shortcut_allowed(shortcut: RunningShortcut) -> bool {
         | RunningShortcut::HalfPageUp
         | RunningShortcut::HalfPageDown => true,
         RunningShortcut::BackgroundCurrentTurn
+        | RunningShortcut::SubmitNow
         | RunningShortcut::SubmitQueued
         | RunningShortcut::Newline
         | RunningShortcut::EditLatestQueued => false,

@@ -122,6 +122,7 @@ pub enum IdleShortcut {
 pub enum RunningShortcut {
     BackgroundCurrentTurn,
     Interrupt,
+    SubmitNow,
     SubmitQueued,
     Newline,
     EditLatestQueued,
@@ -392,6 +393,10 @@ const RUNNING_BINDINGS: &[(RunningShortcut, KeyBinding)] = &[
     (
         RunningShortcut::Interrupt,
         KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+    ),
+    (
+        RunningShortcut::SubmitNow,
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL),
     ),
     (
         RunningShortcut::SubmitQueued,
@@ -736,6 +741,11 @@ pub const SHORTCUT_HINTS: &[ShortcutHint] = &[
     },
     ShortcutHint {
         scope: ShortcutScope::Running,
+        keys: "ctrl+enter",
+        action: "send now, skipping the queue (needs a terminal with the kitty keyboard protocol)",
+    },
+    ShortcutHint {
+        scope: ShortcutScope::Running,
         keys: "alt+enter / shift+enter",
         action: "insert newline",
     },
@@ -942,6 +952,19 @@ mod tests {
             .expect("an Idle-scope hint mentioning E");
         assert_eq!(hint.keys, "e · Shift+E");
         assert_eq!(hint.action, "expand latest tool output · expand all");
+    }
+
+    #[test]
+    fn ctrl_enter_submits_now_while_running() {
+        assert_eq!(
+            running_shortcut(key(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Some(RunningShortcut::SubmitNow)
+        );
+        // plain Enter still queues
+        assert_eq!(
+            running_shortcut(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(RunningShortcut::SubmitQueued)
+        );
     }
 
     #[test]
