@@ -688,15 +688,6 @@ impl AppState {
                 if approval_mode == ApprovalMode::FullAuto {
                     self.full_access_confirmation = None;
                 }
-                self.push_message(ChatMessage::System {
-                    text: format!(
-                        "Runtime settings updated: model {}, reasoning effort {}, approval mode {}.",
-                        self.model_name,
-                        self.reasoning_effort.as_str(),
-                        self.approval_mode.as_str()
-                    ),
-                    expanded: false,
-                });
             }
             TuiEvent::PlanImplementationStarted { prompt } => {
                 self.record_prompt(prompt.clone());
